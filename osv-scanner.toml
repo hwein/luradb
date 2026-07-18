@@ -1,0 +1,20 @@
+# Ignore list for `osv-scanner scan source --lockfile=Cargo.lock` (OSV/GHSA/RustSec).
+# Same invocation locally and in CI: see .github/workflows/security.yml.
+#
+# Companion file: deny.toml (cargo-deny policy). Advisory exceptions needed by
+# both tools must be kept in sync between the two files.
+#
+# The two "unmaintained" entries below have no deny.toml ignore counterpart:
+# cargo-deny treats all unmaintained advisories as non-gating via
+# `-W unmaintained` (blanket policy, see deny.toml header), while osv-scanner
+# has no such category and needs every known finding listed individually.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0141"
+ignoreUntil = 2026-08-15
+reason = "bincode 1.3.3 is unmaintained, no safe upgrade available (would be a bincode 2.x migration). Direct dependency for WAL/KV-store encoding; treated as non-gating in deny.toml via unmaintained scope."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+ignoreUntil = 2026-08-15
+reason = "proc-macro-error 1.0.4 is unmaintained, no safe upgrade available. Transitive via utoipa-gen; treated as non-gating in deny.toml via unmaintained scope."

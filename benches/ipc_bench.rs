@@ -14,8 +14,8 @@ use hyper_util::rt::TokioIo;
 use luradb::core::storage_thread::{StorageThread, StorageThreadConfig};
 use luradb::core::wal::WriteAheadLog;
 use luradb::ipc::{
-    DoubleMmapRegion, RingConsumer, RingProducer, RingbufferHeader, ShmCommand, ShmResponse,
-    ShmSegment, ShmSnapshot, SnapshotGuard, StateHeader,
+    DoubleMmapRegion, RingConsumer, RingProducer, RingbufferHeader, ShmCommand, ShmGetValue,
+    ShmResponse, ShmSegment, ShmSnapshot, SnapshotGuard, StateHeader,
 };
 use luradb::storage::sstable::{SSTableBuilder, SSTableReader};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -205,7 +205,8 @@ impl ShmClient {
         let id = self.next_id;
         self.next_id += 1;
         match self.call(ShmCommand::Get { request_id: id, domain: domain.to_string(), key: key.to_vec() }) {
-            ShmResponse::GetOk { value, .. } => value,
+            ShmResponse::GetOk { value: ShmGetValue::Present(v), .. } => Some(v),
+            ShmResponse::GetOk { .. } => None,
             other => panic!("unexpected GET response: {other:?}"),
         }
     }

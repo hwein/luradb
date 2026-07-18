@@ -325,7 +325,8 @@ impl Janitor {
             let (_, dbv) = entry?;
             // Only Pointer entries reference the vLog; Inline entries do not.
             if let DataBlockValue::Pointer(vp) = dbv {
-                // Skip tombstones (file_id == 0, offset == u64::MAX)
+                // Skip the tombstone/NULL sentinels (both file_id == 0, kv/018)
+                // — neither references vLog bytes.
                 if vp.file_id != 0 && vp.value_offset != u64::MAX && vp.value_len > 0 {
                     live.push((vp.value_offset, vp.value_len));
                 }

@@ -8,12 +8,12 @@
 //! from one client, drops just that connection (its `ClientShm` unlinks the
 //! segments). Command semantics match the REST handlers in `api::kv`.
 
-use super::commands::{ShmCommand, ShmResponse};
+use super::commands::{ShmCommand, ShmGetValue, ShmResponse};
 use super::ringbuffer::{
     DoubleMmapRegion, RingConsumer, RingCorrupt, RingProducer, RingSendError, RingbufferHeader,
 };
 use super::shm::ClientShm;
-use crate::engines::lsm::{DomainRegistry, DomainStore};
+use crate::engines::lsm::{DomainRegistry, DomainStore, GetResult};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -249,6 +249,9 @@ async fn execute(registry: &DomainRegistry, cmd: ShmCommand) -> ShmResponse {
         ShmCommand::Delete { request_id, domain, key } => {
             handle_delete(registry, request_id, domain, key).await
         }
+        ShmCommand::SetNull { request_id, domain, key } => {
+            handle_set_null(registry, request_id, domain, key).await
+        }
         ShmCommand::ScanKeys { request_id, domain, prefix } => {
             handle_scan_keys(registry, request_id, domain, prefix).await
         }
@@ -261,7 +264,14 @@ async fn handle_get(registry: &DomainRegistry, request_id: u64, domain: String, 
         Err(r) => return r,
     };
     match store.get(&key).await {
-        Ok(value) => ShmResponse::GetOk { request_id, value },
+        Ok(result) => {
+            let value = match result {
+                GetResult::Present(v) => ShmGetValue::Present(v),
+                GetResult::Null => ShmGetValue::Null,
+                GetResult::Absent => ShmGetValue::Absent,
+            };
+            ShmResponse::GetOk { request_id, value }
+        }
         Err(e) => error_response(request_id, e),
     }
 }
@@ -295,6 +305,17 @@ async fn handle_delete(registry: &DomainRegistry, request_id: u64, domain: Strin
         Err(r) => return r,
     };
     match store.delete(&key).await {
+        Ok(()) => ShmResponse::Ok { request_id },
+        Err(e) => error_response(request_id, e),
+    }
+}
+
+async fn handle_set_null(registry: &DomainRegistry, request_id: u64, domain: String, key: Vec<u8>) -> ShmResponse {
+    let store = match resolve(registry, &domain, request_id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.set_null(&key).await {
         Ok(()) => ShmResponse::Ok { request_id },
         Err(e) => error_response(request_id, e),
     }
@@ -498,15 +519,18 @@ mod tests {
             ShmCommand::Get { request_id: 1, domain: "d1".into(), key: b"k".to_vec() },
         )
         .await;
-        assert_eq!(resp, ShmResponse::GetOk { request_id: 1, value: Some(b"v".to_vec()) });
+        assert_eq!(
+            resp,
+            ShmResponse::GetOk { request_id: 1, value: ShmGetValue::Present(b"v".to_vec()) }
+        );
 
-        // Missing key -> GetOk { None }, not an error (spec §7).
+        // Missing key -> GetOk { Absent }, not an error (spec §7).
         let resp = send_and_dispatch(
             &mut h,
             ShmCommand::Get { request_id: 2, domain: "d1".into(), key: b"absent".to_vec() },
         )
         .await;
-        assert_eq!(resp, ShmResponse::GetOk { request_id: 2, value: None });
+        assert_eq!(resp, ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Absent });
     }
 
     // 9. PUT command -> value lands in the engine, Ok response.
@@ -529,7 +553,7 @@ mod tests {
         assert_eq!(resp, ShmResponse::Ok { request_id: 5 });
 
         let stored = h.registry.store("d1").await.unwrap().get(b"pk").await.unwrap();
-        assert_eq!(stored, Some(b"pv".to_vec()));
+        assert_eq!(stored, GetResult::Present(b"pv".to_vec()));
     }
 
     // DELETE dispatch path: Ok, and the key is gone afterwards (spec quality/003
@@ -548,7 +572,30 @@ mod tests {
         assert_eq!(resp, ShmResponse::Ok { request_id: 3 });
 
         let stored = h.registry.store("d1").await.unwrap().get(b"dk").await.unwrap();
-        assert_eq!(stored, None, "deleted key must be absent");
+        assert_eq!(stored, GetResult::Absent, "deleted key must be absent");
+    }
+
+    // SETNULL dispatch path (spec kv/018): Ok, and a subsequent GET reports the
+    // explicit Null state — distinct from both Present and Absent.
+    #[tokio::test]
+    async fn test_dispatch_set_null_then_get_null() {
+        let mut h = harness().await;
+        h.registry.create_domain("d1").await.unwrap();
+        h.registry.store("d1").await.unwrap().put(b"nk", b"nv").await.unwrap();
+
+        let resp = send_and_dispatch(
+            &mut h,
+            ShmCommand::SetNull { request_id: 8, domain: "d1".into(), key: b"nk".to_vec() },
+        )
+        .await;
+        assert_eq!(resp, ShmResponse::Ok { request_id: 8 });
+
+        let resp = send_and_dispatch(
+            &mut h,
+            ShmCommand::Get { request_id: 9, domain: "d1".into(), key: b"nk".to_vec() },
+        )
+        .await;
+        assert_eq!(resp, ShmResponse::GetOk { request_id: 9, value: ShmGetValue::Null });
     }
 
     // SCANKEYS dispatch path: ScanResult with the sorted prefix matches (spec
@@ -597,7 +644,7 @@ mod tests {
         assert_eq!(resp, ShmResponse::Ok { request_id: 6 });
 
         let stored = h.registry.store("d1").await.unwrap().get(b"tk").await.unwrap();
-        assert_eq!(stored, Some(b"tv".to_vec()));
+        assert_eq!(stored, GetResult::Present(b"tv".to_vec()));
     }
 
     // 10. Unknown domain -> Error with code 404.

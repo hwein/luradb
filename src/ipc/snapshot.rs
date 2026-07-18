@@ -63,6 +63,9 @@ pub struct ShmEntry {
     pub expire_at: u64,
     /// Value lives in the VLog (`value` empty); client falls back to a GET.
     pub is_vlog_pointer: bool,
+    /// Key exists in the explicit NULL state (spec kv/018): `value` empty,
+    /// never a VLog pointer.
+    pub is_null: bool,
 }
 
 fn serialize_snapshot(snapshot: &ShmSnapshot) -> AlignedVec {
@@ -175,11 +178,11 @@ impl SnapshotBuilder {
 }
 
 /// Builds an entry, flagging VLog-backed values (empty `value`, client falls
-/// back to a GET) versus inline values.
+/// back to a GET), NULL keys (kv/018), and inline values.
 fn to_entry(user_key: Vec<u8>, meta: ValueWithMetadata) -> ShmEntry {
     let (value, is_vlog_pointer) =
         if meta.from_vlog { (Vec::new(), true) } else { (meta.data, false) };
-    ShmEntry { key: user_key, value, expire_at: meta.expire_at, is_vlog_pointer }
+    ShmEntry { key: user_key, value, expire_at: meta.expire_at, is_vlog_pointer, is_null: meta.is_null }
 }
 
 // ── SnapshotPublisher (spec §4, §7) ─────────────────────────────────────────────
@@ -332,8 +335,9 @@ mod tests {
             domains: vec![ShmDomainIndex {
                 name: "default".into(),
                 entries: vec![
-                    ShmEntry { key: b"a".to_vec(), value: b"1".to_vec(), expire_at: 0, is_vlog_pointer: false },
-                    ShmEntry { key: b"b".to_vec(), value: Vec::new(), expire_at: 7, is_vlog_pointer: true },
+                    ShmEntry { key: b"a".to_vec(), value: b"1".to_vec(), expire_at: 0, is_vlog_pointer: false, is_null: false },
+                    ShmEntry { key: b"b".to_vec(), value: Vec::new(), expire_at: 7, is_vlog_pointer: true, is_null: false },
+                    ShmEntry { key: b"c".to_vec(), value: Vec::new(), expire_at: 0, is_vlog_pointer: false, is_null: true },
                 ],
             }],
         };
@@ -400,7 +404,23 @@ mod tests {
         let dom = find(&snap, "default").unwrap();
         let entry = dom.entries.iter().find(|e| e.key == b"small").unwrap();
         assert!(!entry.is_vlog_pointer);
+        assert!(!entry.is_null);
         assert_eq!(entry.value, b"hello");
+    }
+
+    // kv/018: a NULL key exists in the snapshot, marked is_null, empty value.
+    #[tokio::test]
+    async fn test_build_null_key_included_and_flagged() {
+        let (engine, registry, _dir) = make_setup().await;
+        let store = registry.default_store().await.unwrap();
+        store.set_null(b"nulled").await.unwrap();
+
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let dom = find(&snap, "default").unwrap();
+        let entry = dom.entries.iter().find(|e| e.key == b"nulled").expect("NULL key present");
+        assert!(entry.is_null);
+        assert!(!entry.is_vlog_pointer);
+        assert!(entry.value.is_empty());
     }
 
     // 6. Over-budget snapshot is truncated (fewer entries than written).

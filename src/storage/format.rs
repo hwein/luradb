@@ -3,6 +3,13 @@ use rkyv::AlignedVec;
 use rkyv_derive::{Archive, Deserialize, Serialize};
 use std::sync::Arc;
 
+/// SSTable `ValuePointer` sentinels for the two "no vLog data" states
+/// (kv/018): a real vLog offset can never reach the top of the `u64` range
+/// (no file grows that large), so both values are free to use as markers.
+/// Both carry `file_id == 0`.
+pub const TOMBSTONE_OFFSET: u64 = u64::MAX;
+pub const NULL_OFFSET: u64 = u64::MAX - 1;
+
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[archive(check_bytes)]
 #[archive_attr(repr(C))] // Force C layout on Archived type
@@ -125,6 +132,8 @@ pub enum CachedValue {
     },
     /// Owned bytes (MemTable hits — already in RAM, not rkyv-formatted).
     Owned { data: Vec<u8>, expire_at: u64 },
+    /// Key is explicitly NULL (kv/018): present, no bytes.
+    Null,
     /// The key was deleted.
     Tombstone,
 }
@@ -139,7 +148,7 @@ impl CachedValue {
                 Some(&block.as_bytes()[*offset..*offset + *len])
             }
             CachedValue::Owned { data, .. } => Some(data),
-            CachedValue::VLogPointer { .. } | CachedValue::Tombstone => None,
+            CachedValue::VLogPointer { .. } | CachedValue::Tombstone | CachedValue::Null => None,
         }
     }
 
@@ -149,16 +158,16 @@ impl CachedValue {
             CachedValue::Cached { expire_at, .. }
             | CachedValue::VLogPointer { expire_at, .. }
             | CachedValue::Owned { expire_at, .. } => *expire_at,
-            CachedValue::Tombstone => 0,
+            CachedValue::Tombstone | CachedValue::Null => 0,
         }
     }
 
     /// Materializes the value as owned bytes — the single copy at the end of
-    /// the lookup path. Panics for `VLogPointer`/`Tombstone` (callers must
-    /// resolve those first).
+    /// the lookup path. Panics for `VLogPointer`/`Tombstone`/`Null` (callers
+    /// must resolve those first).
     pub fn to_owned_bytes(&self) -> Vec<u8> {
         self.as_bytes()
-            .expect("to_owned_bytes on VLogPointer/Tombstone — resolve first")
+            .expect("to_owned_bytes on VLogPointer/Tombstone/Null — resolve first")
             .to_vec()
     }
 }

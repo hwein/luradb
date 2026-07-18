@@ -20,7 +20,8 @@ Pflegeregeln:
 
 | API-Version | Eingeführt mit Server | Kompatible Server-Versionen | Hinweise |
 |---|---|---|---|
-| 0.1.0 | 0.1.0 | ≥ 0.1.0 | Initialer Contract (KV, JSON, Domains, Auth, Metrics) |
+| 0.1.0 | 0.1.0 | 0.1.0 | Initialer Contract (KV, JSON, Domains, Auth, Metrics) |
+| 1.0.0 | 0.1.1 | ≥ 0.1.1 | Breaking (kv/018): `GET` auf einen per `PATCH …/null` genullten Key antwortet 204 statt 404; `set_null` ist ein Update (Key bleibt in Scans sichtbar), kein Soft-Delete mehr |
 
 ## Bezug durch das Client-Repo
 

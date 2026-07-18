@@ -6,7 +6,7 @@
 use crate::config::BlockCacheConfig;
 use crate::engines::lsm::block_cache::BlockCache;
 use crate::engines::lsm::memtable::{MemTable, Value};
-use crate::engines::lsm::reader::{LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata};
+use crate::engines::lsm::reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata};
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::levels::LevelManager;
 use crate::engines::lsm::compaction::{
@@ -337,6 +337,11 @@ impl LsmStorageEngine {
                     let ts = Timestamp::new(timestamp);
                     memtable.set(key, ts, Value::Tombstone);
                 }
+                crate::core::wal::WalEntry::SetNull { timestamp, key } => {
+                    max_ts = max_ts.max(timestamp);
+                    let ts = Timestamp::new(timestamp);
+                    memtable.set(key, ts, Value::Null);
+                }
             }
         }
 
@@ -505,12 +510,13 @@ impl LsmStorageEngine {
 
     // ── Read path ───────────────────────────────────────────────────────────
 
-    /// MVCC-aware point read.
+    /// MVCC-aware point read. Three-valued (spec kv/018): a live value, an
+    /// explicit NULL (`set_null`), or absent.
     pub async fn get_with_snapshot(
         &self,
         key: &[u8],
         snapshot: &Snapshot,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<GetResult> {
         let memtable = { Arc::clone(&*self.memtable.read()) };
         let vlog = { self.vlog.read().clone() };
 
@@ -620,6 +626,32 @@ impl LsmStorageEngine {
 
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+        Ok(())
+    }
+
+    /// Appends a SET_NULL entry to the WAL and inserts a NULL marker into the
+    /// MemTable (spec kv/018): an update, not a delete — the key stays
+    /// visible and overwrites older versions like a Put. Writes without
+    /// expiry (`set_null` never carries a TTL).
+    pub(super) async fn write_null(&self, key: &[u8]) -> Result<()> {
+        let timestamp = self.next_timestamp();
+
+        // WAL entry: [type=4][ts:u64][key_len:u32][key] — type 3 is already
+        // the batch record (json/005), so SetNull uses 4.
+        let mut log_entry = Vec::new();
+        log_entry.push(4u8);
+        log_entry.extend_from_slice(&timestamp.as_u64().to_be_bytes());
+        log_entry.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        log_entry.extend_from_slice(key);
+        self.wal.append(&log_entry).await?;
+
+        // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
+        let _ = self.change_tx.send(WalEvent { key: key.to_vec(), op: OpType::Set });
+
+        self.maybe_freeze_memtable()?;
+
+        let memtable = Arc::clone(&*self.memtable.read());
+        memtable.set(key.to_vec(), timestamp, Value::Null);
         Ok(())
     }
 
@@ -757,14 +789,15 @@ impl LsmStorageEngine {
         }
     }
 
-    /// Writes a tombstone for `key`.
+    /// Sets `key` to the technical NULL state (spec kv/018): an update, not a
+    /// delete. Upserts a non-existent key into the NULL state.
     pub fn set_null<'a>(
         &'a self,
         key: &'a [u8],
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async move {
             validate_key(key, self.engine_config.max_key_length)?;
-            self.write_tombstone(key).await
+            self.write_null(key).await
         }
     }
 
@@ -883,12 +916,23 @@ impl LsmStorageEngine {
                         },
                     );
                 }
+                Value::Null => {
+                    builder.add(
+                        encoded_key,
+                        crate::storage::format::ValuePointer {
+                            file_id: 0,
+                            value_offset: crate::storage::format::NULL_OFFSET,
+                            value_len: 0,
+                            expire_at: 0,
+                        },
+                    );
+                }
                 Value::Tombstone => {
                     builder.add(
                         encoded_key,
                         crate::storage::format::ValuePointer {
                             file_id: 0,
-                            value_offset: u64::MAX,
+                            value_offset: crate::storage::format::TOMBSTONE_OFFSET,
                             value_len: 0,
                             expire_at: 0,
                         },
@@ -1212,10 +1256,13 @@ pub enum BatchOp {
 // ── StorageEngine trait ──────────────────────────────────────────────────────
 
 impl StorageEngine for LsmStorageEngine {
+    // Generic two-valued contract (shared with the unrelated `KvStore` engine):
+    // collapses `Null` into `None`, like every caller outside the KV engine
+    // (spec kv/018). Callers that must distinguish Null use `get_with_snapshot`.
     fn get(&self, key: &[u8]) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
         async move {
             let snapshot = self.snapshot_unregistered();
-            self.get_with_snapshot(key, &snapshot).await
+            Ok(self.get_with_snapshot(key, &snapshot).await?.into_option())
         }
     }
 
@@ -1397,13 +1444,99 @@ mod tests {
         assert_eq!(result, Some(b"value3".to_vec()));
     }
 
+    // ── set_null semantics (spec kv/018 §1): an Update, never a delete ───────
+
     #[tokio::test]
-    async fn test_set_null_acts_as_delete() {
+    async fn test_set_null_is_update_not_delete() {
         let (engine, _dir) = make_engine().await;
         engine.put(b"key1", b"value1").await.unwrap();
         engine.set_null(b"key1").await.unwrap();
-        let result = engine.get(b"key1").await.unwrap();
-        assert_eq!(result, None);
+        let snap = engine.snapshot();
+        assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Null);
+    }
+
+    #[tokio::test]
+    async fn test_put_after_set_null_overwrites() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"key1").await.unwrap();
+        engine.put(b"key1", b"value1").await.unwrap();
+        assert_eq!(engine.get(b"key1").await.unwrap(), Some(b"value1".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_delete_after_set_null_is_absent() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"key1").await.unwrap();
+        engine.delete(b"key1").await.unwrap();
+        let snap = engine.snapshot();
+        assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Absent);
+    }
+
+    #[tokio::test]
+    async fn test_set_null_on_nonexistent_key_creates_it() {
+        let (engine, _dir) = make_engine().await;
+        let snap = engine.snapshot();
+        assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Absent);
+
+        engine.set_null(b"ghost").await.unwrap();
+        let snap = engine.snapshot();
+        assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Null);
+    }
+
+    // empty (0-byte Put) and NULL are distinct value states.
+    #[tokio::test]
+    async fn test_empty_value_distinct_from_null() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"empty", b"").await.unwrap();
+        engine.set_null(b"null_key").await.unwrap();
+
+        let snap = engine.snapshot();
+        assert_eq!(
+            engine.get_with_snapshot(b"empty", snap.snapshot()).await.unwrap(),
+            GetResult::Present(Vec::new())
+        );
+        assert_eq!(engine.get_with_snapshot(b"null_key", snap.snapshot()).await.unwrap(), GetResult::Null);
+    }
+
+    #[tokio::test]
+    async fn test_scan_keys_includes_null() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"user:1").await.unwrap();
+        let keys = engine.scan_keys(b"user:").await.unwrap();
+        assert!(keys.contains(&b"user:1".to_vec()), "NULL keys must appear in scans");
+    }
+
+    // NULL must survive a MemTable flush to SSTable and a subsequent
+    // compaction — never garbage-collected like a tombstone.
+    #[tokio::test]
+    async fn test_set_null_survives_flush_and_compaction() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"n").await.unwrap();
+        freeze_and_flush(&engine).await;
+        let snap = engine.snapshot();
+        assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
+
+        // A second L0 table forces an L0 -> L1 compaction that must preserve it.
+        engine.put(b"other", b"v").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap();
+
+        let snap = engine.snapshot();
+        assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
+        assert!(engine.scan_keys(b"n").await.unwrap().contains(&b"n".to_vec()));
+    }
+
+    // NULL written but never flushed must survive a WAL replay after restart.
+    #[tokio::test]
+    async fn test_set_null_survives_wal_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        engine.set_null(b"n").await.unwrap();
+        drop(engine); // crash: data only in the WAL
+
+        let engine2 = engine_on(&dir).await;
+        let snap = engine2.snapshot();
+        assert_eq!(engine2.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
     }
 
     // ── Validation tests ─────────────────────────────────────────────────────
@@ -1596,7 +1729,7 @@ mod tests {
 
         assert_eq!(
             engine.get_with_snapshot(b"k", snap.snapshot()).await.unwrap(),
-            Some(b"v1".to_vec())
+            GetResult::Present(b"v1".to_vec())
         );
         assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
     }
@@ -1623,6 +1756,17 @@ mod tests {
         engine.put(b"watch_key", b"val").await.unwrap();
         let event = rx.recv().await.unwrap();
         assert_eq!(event.key, b"watch_key");
+        assert!(matches!(event.op, OpType::Set));
+    }
+
+    // kv/018 §2: set_null is an update — watchers receive a Set event.
+    #[tokio::test]
+    async fn test_watcher_receives_set_event_on_set_null() {
+        let (engine, _dir) = make_engine().await;
+        let mut rx = engine.watch_subscribe();
+        engine.set_null(b"null_key").await.unwrap();
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.key, b"null_key");
         assert!(matches!(event.op, OpType::Set));
     }
 

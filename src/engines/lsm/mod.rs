@@ -19,7 +19,7 @@ pub mod rate_limiter;
 pub use block_cache::{BlockCache, BlockCacheKey, BlockCacheMetrics};
 pub use engine::LsmStorageEngine;
 pub use key::{InternalKey, Timestamp};
-pub use reader::{LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata, VersionedEntry};
+pub use reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata, VersionedEntry};
 pub use levels::LevelManager;
 pub use compaction::{CompactionConfig, CompactionJob};
 pub use janitor::{Janitor, JanitorConfig};

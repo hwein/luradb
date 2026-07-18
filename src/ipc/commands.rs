@@ -19,15 +19,26 @@ pub enum ShmCommand {
     Get { request_id: u64, domain: String, key: Vec<u8> },
     Put { request_id: u64, domain: String, key: Vec<u8>, value: Vec<u8>, ttl_secs: u64 },
     Delete { request_id: u64, domain: String, key: Vec<u8> },
+    SetNull { request_id: u64, domain: String, key: Vec<u8> },
     ScanKeys { request_id: u64, domain: String, prefix: Vec<u8> },
     Ping { request_id: u64 },
+}
+
+/// Three-valued GET payload (spec kv/018): mirrors the engine's `GetResult`
+/// on the wire — a key can be absent, explicitly NULL, or carry bytes.
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+#[archive(check_bytes)]
+pub enum ShmGetValue {
+    Absent,
+    Null,
+    Present(Vec<u8>),
 }
 
 /// Server → client response. `code` is an HTTP-analog status (404, 429, …).
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[archive(check_bytes)]
 pub enum ShmResponse {
-    GetOk { request_id: u64, value: Option<Vec<u8>> },
+    GetOk { request_id: u64, value: ShmGetValue },
     Ok { request_id: u64 },
     ScanResult { request_id: u64, keys: Vec<Vec<u8>> },
     Pong { request_id: u64 },
@@ -97,6 +108,7 @@ mod tests {
                 ttl_secs: 60,
             },
             ShmCommand::Delete { request_id: 3, domain: "d".into(), key: b"k".to_vec() },
+            ShmCommand::SetNull { request_id: 6, domain: "d".into(), key: b"k".to_vec() },
             ShmCommand::ScanKeys { request_id: 4, domain: "d".into(), prefix: b"p".to_vec() },
             ShmCommand::Ping { request_id: 5 },
         ];
@@ -109,8 +121,9 @@ mod tests {
     #[test]
     fn test_response_roundtrip_all_variants() {
         let resps = [
-            ShmResponse::GetOk { request_id: 1, value: Some(b"v".to_vec()) },
-            ShmResponse::GetOk { request_id: 2, value: None },
+            ShmResponse::GetOk { request_id: 1, value: ShmGetValue::Present(b"v".to_vec()) },
+            ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Absent },
+            ShmResponse::GetOk { request_id: 7, value: ShmGetValue::Null },
             ShmResponse::Ok { request_id: 3 },
             ShmResponse::ScanResult { request_id: 4, keys: vec![b"a".to_vec(), b"bb".to_vec()] },
             ShmResponse::Pong { request_id: 5 },

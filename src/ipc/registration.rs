@@ -185,7 +185,7 @@ mod tests {
     use super::super::shm::ShmSegment;
     use super::*;
     use crate::core::wal::WriteAheadLog;
-    use crate::ipc::{ShmCommand, ShmResponse};
+    use crate::ipc::{ShmCommand, ShmGetValue, ShmResponse};
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
@@ -445,7 +445,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             recv_response(&mut client_rx).await,
-            ShmResponse::GetOk { request_id: 2, value: Some(b"v".to_vec()) }
+            ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Present(b"v".to_vec()) }
         );
 
         // Disconnect: drop the client mappings, then close the socket.

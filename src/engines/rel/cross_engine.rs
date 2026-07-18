@@ -15,7 +15,7 @@ use super::RelEngine;
 use crate::engines::json::{JsonEngine, JsonStoreError};
 use crate::engines::lsm::domain::DomainRegistry;
 use crate::engines::lsm::engine::BatchOp;
-use crate::engines::lsm::reader::Snapshot;
+use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::metrics::MetricsStore;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,9 +38,8 @@ impl TargetDomain {
     }
 }
 
-/// Outcome of a KVREF point lookup (raw KV value = bytes). `NullValue` is
-/// prepared but never produced by today's KV API (§4 honesty note:
-/// `set_null == delete`, so an emptied key reads as `Absent`).
+/// Outcome of a KVREF point lookup (raw KV value = bytes). `NullValue` is a
+/// key that exists in the explicit NULL state (spec kv/018).
 pub enum KvResolution {
     DomainUnavailable,
     Absent,
@@ -129,8 +128,9 @@ impl CrossEngineResolver {
         let engine = kv.engine();
         let snap = engine.snapshot();
         Ok(match engine.get_with_snapshot(&prefixed, snap.snapshot()).await? {
-            Some(bytes) => KvResolution::Present(bytes),
-            None => KvResolution::Absent,
+            GetResult::Present(bytes) => KvResolution::Present(bytes),
+            GetResult::Null => KvResolution::NullValue,
+            GetResult::Absent => KvResolution::Absent,
         })
     }
 
@@ -405,7 +405,7 @@ impl RelCrossEngineSweeper {
         } else {
             let row_prefix = keys::row_table_prefix(prefix, table.table_id);
             for rk in engine.scan_keys(&row_prefix).await? {
-                if let Some(bytes) = engine.get_with_snapshot(&rk, snap).await? {
+                if let Some(bytes) = engine.get_with_snapshot(&rk, snap).await?.into_option() {
                     if !matches!(decode_value(&bytes, col), ScalarValue::Null) {
                         pk_encs.push(rk[row_prefix.len()..].to_vec());
                     }
@@ -423,7 +423,9 @@ impl RelCrossEngineSweeper {
     ) -> anyhow::Result<Option<(Vec<u8>, ScalarValue)>> {
         let engine = &self.engine.engine;
         // v_snap: state at tick start.
-        let Some(snap_bytes) = engine.get_with_snapshot(row_key, snap).await? else { return Ok(None) };
+        let Some(snap_bytes) = engine.get_with_snapshot(row_key, snap).await?.into_option() else {
+            return Ok(None);
+        };
         let v_snap = decode_value(&snap_bytes, col);
         if matches!(v_snap, ScalarValue::Null) {
             return Ok(None);
@@ -431,7 +433,7 @@ impl RelCrossEngineSweeper {
         // v_now: latest committed. Only null it if untouched since the snapshot
         // (a fresh valid link against a recreated domain must survive, §5).
         let now_guard = engine.snapshot();
-        let Some(now_bytes) = engine.get_with_snapshot(row_key, now_guard.snapshot()).await? else {
+        let Some(now_bytes) = engine.get_with_snapshot(row_key, now_guard.snapshot()).await?.into_option() else {
             return Ok(None);
         };
         let v_now = decode_value(&now_bytes, col);
@@ -651,7 +653,7 @@ mod tests {
         let pk_enc = encode_sortable(&ScalarValue::Integer(pk)).unwrap();
         let row_key = keys::row_key(&prefix, schema.table_id, &pk_enc);
         let snap = rel.engine().snapshot();
-        let bytes = rel.engine().get_with_snapshot(&row_key, snap.snapshot()).await.unwrap().unwrap();
+        let bytes = rel.engine().get_with_snapshot(&row_key, snap.snapshot()).await.unwrap().into_option().unwrap();
         let c = schema.columns.iter().find(|c| c.name == col).unwrap();
         decode_value(&bytes, c)
     }
@@ -848,6 +850,20 @@ mod tests {
         // Masked cell → null entry (rel-NULL), distinct from a resolved exists:false.
         let exp = expand_block(&e.rel, "g", "SELECT * FROM t", &["payload"]).await;
         assert_eq!(colv(&exp, "payload")[0], Value::Null, "masked column expands to null");
+    }
+
+    // ── 10b. Expand KVREF of a nulled key (spec kv/018) ──────────────────────
+
+    #[tokio::test]
+    async fn test_expand_kvref_null_value() {
+        let e = env().await;
+        kv_put(&e.kv, "default", b"k", b"v").await;
+        ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
+        ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'k')").await;
+        // Null the KV key after linking: the key still exists, valueless.
+        e.kv.store("default").await.unwrap().set_null(b"k").await.unwrap();
+        let exp = expand_block(&e.rel, "default", "SELECT * FROM t", &["payload"]).await;
+        assert_eq!(colv(&exp, "payload")[0], json!({ "exists": true, "value": null }));
     }
 
     // ── 11. Expand JSONREF ───────────────────────────────────────────────────
@@ -1098,7 +1114,7 @@ mod tests {
         let mut n = 0;
         for rk in rel.engine().scan_keys(&keys::row_table_prefix(&prefix, schema.table_id)).await.unwrap() {
             let snap = rel.engine().snapshot();
-            if let Some(bytes) = rel.engine().get_with_snapshot(&rk, snap.snapshot()).await.unwrap() {
+            if let Some(bytes) = rel.engine().get_with_snapshot(&rk, snap.snapshot()).await.unwrap().into_option() {
                 if !matches!(decode_value(&bytes, col), ScalarValue::Null) {
                     n += 1;
                 }
@@ -1187,7 +1203,7 @@ mod tests {
 
         let row_key = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
         let snap = e.rel.engine().snapshot();
-        let bytes = e.rel.engine().get_with_snapshot(&row_key, snap.snapshot()).await.unwrap().unwrap();
+        let bytes = e.rel.engine().get_with_snapshot(&row_key, snap.snapshot()).await.unwrap().into_option().unwrap();
         assert_eq!(
             decode_value(&bytes, &col),
             ScalarValue::Text("k".into()),

@@ -13,6 +13,7 @@
 
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
+use crate::engines::lsm::reader::GetResult;
 use crate::engines::lsm::watcher::WalEvent;
 use crate::metrics::MetricsStore;
 use anyhow::{anyhow, Result};
@@ -222,7 +223,7 @@ impl DomainRegistry {
         let mut runtimes = self.runtimes.write();
         for key in sys_keys {
             let snap = self.engine.snapshot();
-            match self.engine.get_with_snapshot(&key, snap.snapshot()).await? {
+            match self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
                 Some(value) => match serde_json::from_slice::<Domain>(&value) {
                     Ok(domain) => {
                         runtimes.insert(domain.name.clone(), self.make_runtime());
@@ -268,7 +269,7 @@ impl DomainRegistry {
         // Engine fallback (e.g. after a cold start that didn't hit load_from_engine).
         let key = sys_key(name);
         let snap = self.engine.snapshot();
-        if let Some(value) = self.engine.get_with_snapshot(&key, snap.snapshot()).await? {
+        if let Some(value) = self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
             let domain: Domain = serde_json::from_slice(&value)?;
             if domain.state == DomainState::Deleting {
                 return Ok(None);
@@ -440,8 +441,10 @@ impl DomainStore {
         Ok(())
     }
 
-    /// Reads a value by user key, recording latency and hit/miss in MetricsStore.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Reads a value by user key — three-valued (spec kv/018): `Present`,
+    /// `Null` (key exists in the NULL state), or `Absent`. Records latency
+    /// and hit/miss in MetricsStore (a `Null` read counts as a hit).
+    pub async fn get(&self, key: &[u8]) -> Result<GetResult> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
@@ -454,7 +457,7 @@ impl DomainStore {
             .get_with_snapshot(&self.prefixed_key(key), snap.snapshot())
             .await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.metrics.record_read(&self.domain.name, elapsed_us, result.is_some());
+        self.metrics.record_read(&self.domain.name, elapsed_us, !matches!(result, GetResult::Absent));
         Ok(result)
     }
 
@@ -471,7 +474,9 @@ impl DomainStore {
         Ok(())
     }
 
-    /// Sets a key to the null/empty state (tombstone, semantically distinct from delete).
+    /// Sets a key to the technical NULL state (spec kv/018): an update, not a
+    /// delete — the key stays visible with no value and appears in scans. A
+    /// non-existent key is upserted into the NULL state.
     pub async fn set_null(&self, key: &[u8]) -> Result<()> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_write() {
@@ -479,7 +484,7 @@ impl DomainStore {
             return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
         }
         let start = std::time::Instant::now();
-        self.engine.write_tombstone(&self.prefixed_key(key)).await?;
+        self.engine.write_null(&self.prefixed_key(key)).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
         Ok(())
     }
@@ -647,7 +652,7 @@ mod tests {
         let store_b = registry.store("tenant-b").await.unwrap();
         store_a.put(b"secret", b"value-a").await.unwrap();
         let result = store_b.get(b"secret").await.unwrap();
-        assert_eq!(result, None, "Domain B must not see Domain A's keys");
+        assert_eq!(result, GetResult::Absent, "Domain B must not see Domain A's keys");
     }
 
     // 4. scan_keys in domain A sees only its own keys.
@@ -842,10 +847,10 @@ mod tests {
         let store = registry.store("utf8-ok").await.unwrap();
 
         store.put("schlüssel".as_bytes(), b"v1").await.unwrap();
-        assert_eq!(store.get("schlüssel".as_bytes()).await.unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(store.get("schlüssel".as_bytes()).await.unwrap(), GetResult::Present(b"v1".to_vec()));
 
         store.put("🎉".as_bytes(), b"v2").await.unwrap();
-        assert_eq!(store.get("🎉".as_bytes()).await.unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(store.get("🎉".as_bytes()).await.unwrap(), GetResult::Present(b"v2".to_vec()));
 
         store.set_null("schlüssel".as_bytes()).await.unwrap();
         store.delete("🎉".as_bytes()).await.unwrap();

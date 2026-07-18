@@ -96,7 +96,7 @@ impl RowSource for RowScan {
                 // A key live during the key-list scan but gone at the
                 // snapshot fetch is a ghost (spec §2 "Snapshot &
                 // Konsistenz") — skip it, not an error.
-                if let Some(bytes) = self.engine.get_with_snapshot(&key, &self.snapshot).await? {
+                if let Some(bytes) = self.engine.get_with_snapshot(&key, &self.snapshot).await?.into_option() {
                     let mut values = decode_row(&bytes, &self.schema);
                     self.mask.apply(&mut values, &self.schema);
                     return Ok(Some(PlanRow::single(self.table_id, self.alias.clone(), values)));
@@ -724,7 +724,9 @@ impl RelEngine {
             // other path derives keys from a live scan, so len() is the count.
             None if matches!(plan.access, AccessPath::PkPoint(_)) => {
                 match row_keys.first() {
-                    Some(k) => i64::from(self.engine.get_with_snapshot(k, &snap).await?.is_some()),
+                    Some(k) => {
+                        i64::from(self.engine.get_with_snapshot(k, &snap).await?.into_option().is_some())
+                    }
                     None => 0,
                 }
             }

@@ -96,7 +96,7 @@ impl RelEngine {
                 None => Value::Null, // NULL/masked link — nothing to resolve
                 Some(pk_enc) => {
                     let key = keys::row_key(prefix, target_schema.table_id, &pk_enc);
-                    match self.engine.get_with_snapshot(&key, snap).await? {
+                    match self.engine.get_with_snapshot(&key, snap).await?.into_option() {
                         None => Value::Null, // hanging link (Konzept 3.4)
                         Some(bytes) => {
                             let values = decode_row(&bytes, &target_schema);
@@ -166,9 +166,9 @@ fn link_key(v: &super::types::ScalarValue) -> Option<&str> {
     }
 }
 
-/// KVREF → JSON (spec §4): valid UTF-8 → `utf8`, else `base64`; a KV null-value
-/// (not producible by today's KV API, §4) → `value:null`; absent/domain-gone →
-/// `exists:false`.
+/// KVREF → JSON (spec §4): valid UTF-8 → `utf8`, else `base64`; a KV
+/// null-value (kv/018 `set_null`) → `exists:true, value:null`;
+/// absent/domain-gone → `exists:false`.
 fn kv_resolution_json(res: KvResolution) -> Value {
     match res {
         KvResolution::Present(bytes) => match String::from_utf8(bytes) {

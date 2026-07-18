@@ -148,7 +148,7 @@ impl JoinProbe {
     async fn probe_pk_point(&self, val_enc: &[u8]) -> Result<Vec<SourceBinding>, RelStoreError> {
         let key = keys::row_key(&self.right_prefix, self.right_table.table_id, val_enc);
         self.metrics.record_rel_select_scanned_keys(1);
-        match self.engine.get_with_snapshot(&key, &self.snapshot).await? {
+        match self.engine.get_with_snapshot(&key, &self.snapshot).await?.into_option() {
             Some(bytes) => Ok(vec![self.row_binding(decode_row(&bytes, &self.right_table))]),
             None => Ok(Vec::new()), // ghost or never existed — not a hit (spec §2 Snapshot & Ghosts)
         }
@@ -163,7 +163,7 @@ impl JoinProbe {
             let pk_enc = &h[scan_prefix.len()..];
             let row_key = keys::row_key(&self.right_prefix, self.right_table.table_id, pk_enc);
             self.metrics.record_rel_select_scanned_keys(1);
-            if let Some(bytes) = self.engine.get_with_snapshot(&row_key, &self.snapshot).await? {
+            if let Some(bytes) = self.engine.get_with_snapshot(&row_key, &self.snapshot).await?.into_option() {
                 out.push(self.row_binding(decode_row(&bytes, &self.right_table)));
             } // ghost: skip, not a hit (spec §2)
         }
@@ -194,7 +194,7 @@ impl JoinProbe {
         };
         let mut out = Vec::new();
         for k in &scan_keys {
-            if let Some(bytes) = self.engine.get_with_snapshot(k, &self.snapshot).await? {
+            if let Some(bytes) = self.engine.get_with_snapshot(k, &self.snapshot).await?.into_option() {
                 let values = decode_row(&bytes, &self.right_table);
                 if matches!(eval(&pred, &values), Bool3::True) {
                     out.push(self.row_binding(values));

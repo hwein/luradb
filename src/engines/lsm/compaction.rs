@@ -15,7 +15,7 @@
 
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
-use crate::storage::format::{DataBlockValue, ValuePointer};
+use crate::storage::format::{DataBlockValue, ValuePointer, TOMBSTONE_OFFSET};
 use crate::storage::manifest::{Manifest, SSTableMetadata};
 use anyhow::Result;
 use std::sync::Arc;
@@ -158,11 +158,13 @@ impl CompactionJob {
         dbv: DataBlockValue,
         timestamp: Timestamp,
     ) -> Option<(Vec<u8>, DataBlockValue)> {
-        // Tombstones are only represented as Pointer entries with the sentinel values.
-        // Inline entries are never tombstones.
+        // Tombstones are only represented as Pointer entries with the sentinel
+        // values. Inline entries are never tombstones. The NULL sentinel
+        // (NULL_OFFSET, kv/018) is data: it falls through to the live path
+        // below — overwrites older versions, is never GC'd, has no TTL.
         let is_tombstone = matches!(
             &dbv,
-            DataBlockValue::Pointer(vp) if vp.file_id == 0 && vp.value_offset == u64::MAX
+            DataBlockValue::Pointer(vp) if vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET
         );
 
         if is_tombstone {
@@ -353,6 +355,15 @@ mod tests {
         })
     }
 
+    fn null_vp() -> DataBlockValue {
+        DataBlockValue::Pointer(ValuePointer {
+            file_id: 0,
+            value_offset: crate::storage::format::NULL_OFFSET,
+            value_len: 0,
+            expire_at: 0,
+        })
+    }
+
     fn encode(user_key: &[u8], ts: u64) -> Vec<u8> {
         InternalKey::new(user_key.to_vec(), Timestamp::new(ts)).encode()
     }
@@ -417,6 +428,28 @@ mod tests {
         match &out[0].1 {
             DataBlockValue::Pointer(vp) => assert_eq!(vp.value_offset, u64::MAX),
             _ => panic!("Expected tombstone Pointer variant"),
+        }
+        Ok(())
+    }
+
+    // kv/018: a NULL record is data — it suppresses older live versions and
+    // is never dropped, even below the tombstone-GC low watermark.
+    #[test]
+    fn test_null_record_survives_compaction_and_suppresses_older() -> Result<()> {
+        let mut cfg = CompactionConfig::default();
+        cfg.low_watermark = Some(Timestamp::new(500)); // everything below 500 GC-eligible
+        let entries = vec![
+            (encode(b"key1", 200), null_vp()),
+            (encode(b"key1", 100), make_vp(500)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], cfg);
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 1, "NULL must survive; older live version suppressed");
+        match &out[0].1 {
+            DataBlockValue::Pointer(vp) => {
+                assert_eq!(vp.value_offset, crate::storage::format::NULL_OFFSET)
+            }
+            _ => panic!("Expected NULL Pointer variant"),
         }
         Ok(())
     }

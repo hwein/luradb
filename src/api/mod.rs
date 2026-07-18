@@ -53,7 +53,7 @@ impl Modify for BearerAuth {
 /// API-Contract-Version (SemVer) — unabhängig von der Server-Version in Cargo.toml.
 /// Bump-Regeln: api/COMPATIBILITY.md. Einzige Quelle; OpenAPI-Contract
 /// und GET /version lesen von hier.
-pub const API_VERSION: &str = "0.1.0";
+pub const API_VERSION: &str = "1.0.0";
 
 struct VersionInfo;
 

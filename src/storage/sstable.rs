@@ -1,7 +1,7 @@
 use crate::engines::lsm::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
 use crate::storage::format::{
     ArchivedDataBlockValue, BlockHandle, BloomFilter, CachedValue, DataBlock, DataBlockValue,
-    IndexBlock, SSTableFooter, ValuePointer,
+    IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer,
 };
 use crate::storage::bloom::BloomFilter as BloomFilterImpl;
 use rkyv::ser::{serializers::AllocSerializer, Serializer};
@@ -602,7 +602,7 @@ impl SSTableReader {
             }
             let live = match &dbv {
                 DataBlockValue::Pointer(vp) => {
-                    !(vp.file_id == 0 && vp.value_offset == u64::MAX)
+                    !(vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET)
                         && !(vp.expire_at != 0 && vp.expire_at <= now)
                 }
                 DataBlockValue::Inline { expire_at, .. } => {
@@ -628,14 +628,17 @@ impl SSTableReader {
 /// copying value bytes (spec perf/002). Inline values become zero-copy
 /// offsets into the block's `Arc<AlignedVec>` allocation — sound because the
 /// `Arc` pins the allocation and the archived bytes live inside it. The
-/// tombstone sentinel (file_id == 0, offset == u64::MAX) is resolved here.
+/// tombstone (file_id == 0, offset == TOMBSTONE_OFFSET) and NULL (file_id ==
+/// 0, offset == NULL_OFFSET) sentinels are resolved here (spec kv/018).
 fn cached_value_from_archived(block: &CachedBlock, value: &ArchivedDataBlockValue) -> CachedValue {
     match value {
         ArchivedDataBlockValue::Pointer(avp) => {
             let file_id = u32::from(avp.file_id);
             let value_offset = u64::from(avp.value_offset);
-            if file_id == 0 && value_offset == u64::MAX {
+            if file_id == 0 && value_offset == TOMBSTONE_OFFSET {
                 CachedValue::Tombstone
+            } else if file_id == 0 && value_offset == NULL_OFFSET {
+                CachedValue::Null
             } else {
                 CachedValue::VLogPointer {
                     file_id,
@@ -739,6 +742,10 @@ mod tests {
             b"tombstone-key".to_vec(),
             ValuePointer { file_id: 0, value_offset: u64::MAX, value_len: 0, expire_at: 0 },
         );
+        builder.add(
+            b"null-key".to_vec(),
+            ValuePointer { file_id: 0, value_offset: NULL_OFFSET, value_len: 0, expire_at: 0 },
+        );
         let bytes = builder.finish()?;
         let reader = SSTableReader::open(bytes)?;
         let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
@@ -762,6 +769,12 @@ mod tests {
         match reader.get_with_cache(b"tombstone-key", &mut cache)? {
             Some(CachedValue::Tombstone) => {}
             other => panic!("expected Tombstone, got {other:?}"),
+        }
+
+        // kv/018: the NULL sentinel is distinct from the tombstone sentinel.
+        match reader.get_with_cache(b"null-key", &mut cache)? {
+            Some(CachedValue::Null) => {}
+            other => panic!("expected Null, got {other:?}"),
         }
 
         assert!(reader.get_with_cache(b"missing-key", &mut cache)?.is_none());

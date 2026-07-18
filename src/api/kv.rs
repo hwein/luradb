@@ -2,21 +2,21 @@
 //!
 //! PUT    /store-api/kv/{domain}/keys/{key}          → put_key   (200 | 429 | 400)
 //! PUT    /store-api/kv/{domain}/keys/{key}?ttl=N    → put_key   (TTL variant)
-//! GET    /store-api/kv/{domain}/keys/{key}          → get_key   (200 | 404 | 429)
+//! GET    /store-api/kv/{domain}/keys/{key}          → get_key   (200 | 204 | 404 | 429)
 //! DELETE /store-api/kv/{domain}/keys/{key}          → delete_key (204 | 429)
 //! PATCH  /store-api/kv/{domain}/keys/{key}/null     → set_null  (200 | 429)
 //! GET    /store-api/kv/{domain}/keys?prefix={p}     → scan_keys (200 | 429)
 //! GET    /store-api/kv/{domain}/watch?prefix={p}    → watch     (SSE stream)
 
 use crate::api::{middleware::ApiError, AppState};
-use crate::engines::lsm::OpType;
+use crate::engines::lsm::{GetResult, OpType};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        Json,
+        IntoResponse, Json, Response,
     },
 };
 use serde::Deserialize;
@@ -94,7 +94,8 @@ pub async fn put_key(
         ("key"    = String, Path, description = "Key (valid UTF-8, max 256 bytes)"),
     ),
     responses(
-        (status = 200, description = "Value (raw bytes)", content_type = "application/octet-stream"),
+        (status = 200, description = "Value (raw bytes; an empty value yields an empty body)", content_type = "application/octet-stream"),
+        (status = 204, description = "Key exists in the explicit null state (set via PATCH …/null)"),
         (status = 404, description = "Key or domain not found"),
         (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
         (status = 400, description = "Invalid key"),
@@ -102,15 +103,16 @@ pub async fn put_key(
     ),
     tag = "Key-Value Store"
 )]
-/// Retrieves the raw byte value for a key. Returns 404 if the key does not exist or has expired.
+/// Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.
 pub async fn get_key(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
-) -> Result<Bytes, ApiError> {
+) -> Result<Response, ApiError> {
     let store = resolve(&state, &domain).await?;
     match store.get(key.as_bytes()).await.map_err(ApiError::from)? {
-        Some(value) => Ok(Bytes::from(value)),
-        None => Err(ApiError::from(anyhow::anyhow!(
+        GetResult::Present(value) => Ok(Bytes::from(value).into_response()),
+        GetResult::Null => Ok(StatusCode::NO_CONTENT.into_response()),
+        GetResult::Absent => Err(ApiError::from(anyhow::anyhow!(
             "404 Not Found: key '{}' not found",
             key
         ))),
@@ -150,15 +152,15 @@ pub async fn delete_key(
         ("key"    = String, Path, description = "Key (valid UTF-8, max 256 bytes)"),
     ),
     responses(
-        (status = 200, description = "Key set to null (tombstone)"),
+        (status = 200, description = "Key set to the null value state"),
         (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
         (status = 400, description = "Invalid key"),
         (status = 410, description = "Domain is being deleted"),
     ),
     tag = "Key-Value Store"
 )]
-/// Writes an explicit null/tombstone marker for a key without removing it from the keyspace.
-/// Useful for signalling soft-deletes in distributed or CDC scenarios.
+/// Sets the key to an explicit null value (upsert): the key stays registered and appears in scans,
+/// but carries no data — GET answers 204. A write like any other; it resets a previously set TTL.
 pub async fn set_null(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
@@ -329,6 +331,67 @@ mod tests {
         assert_eq!(get_resp.status(), StatusCode::OK);
         let body = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"world");
+    }
+
+    // ── Spec kv/018: REST contract for the NULL value state ─────────────────
+
+    async fn send(app: &axum::Router, method: Method, uri: &str, body: Body) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(Request::builder().method(method).uri(uri).body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    // PATCH …/null → 200; GET → 204 (empty body); key appears in the scan;
+    // DELETE → 204; GET → 404.
+    #[tokio::test]
+    async fn test_set_null_rest_lifecycle() {
+        let (app, _dir) = make_app().await;
+        let uri = "/store-api/kv/testdom/keys/nkey";
+
+        let resp = send(&app, Method::PATCH, "/store-api/kv/testdom/keys/nkey/null", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "null state must read as 204");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty());
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys", Body::empty()).await;
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let keys: Vec<String> = serde_json::from_slice(&body).unwrap();
+        assert!(keys.iter().any(|k| k == "nkey"), "null key must appear in scans, got {keys:?}");
+
+        let resp = send(&app, Method::DELETE, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "deleted key must be 404");
+    }
+
+    // A 0-byte PUT is an empty value — 200 with an empty body, distinct from 204.
+    #[tokio::test]
+    async fn test_empty_value_reads_as_200_not_204() {
+        let (app, _dir) = make_app().await;
+        let uri = "/store-api/kv/testdom/keys/ekey";
+
+        let resp = send(&app, Method::PUT, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "empty value is 200, not 204");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty());
+    }
+
+    // set_null on a non-existent key creates it in the null state (upsert).
+    #[tokio::test]
+    async fn test_set_null_upserts_missing_key() {
+        let (app, _dir) = make_app().await;
+        let resp = send(&app, Method::PATCH, "/store-api/kv/testdom/keys/fresh/null", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/fresh", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     // Test 6: Domain isolation — PUT in A, GET in B → 404.

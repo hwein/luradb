@@ -17,6 +17,9 @@ use std::sync::Arc;
 pub enum Value {
     Inline(Vec<u8>, Option<u64>),                              // data, expire_at
     Pointer { offset: u64, len: usize, expire_at: Option<u64> }, // vLog pointer + TTL
+    /// Key explicitly set to NULL (kv/018): present, no bytes, no TTL — an
+    /// update, not a delete.
+    Null,
     Tombstone,
 }
 

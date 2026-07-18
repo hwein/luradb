@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.1.0",
+    "version": "1.0.0",
     "x-luradb-server-version": "0.1.1-dev"
   },
   "paths": {
@@ -1206,7 +1206,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Retrieves the raw byte value for a key. Returns 404 if the key does not exist or has expired.",
+        "summary": "Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.",
         "operationId": "get_key",
         "parameters": [
           {
@@ -1230,10 +1230,13 @@
         ],
         "responses": {
           "200": {
-            "description": "Value (raw bytes)",
+            "description": "Value (raw bytes; an empty value yields an empty body)",
             "content": {
               "application/octet-stream": {}
             }
+          },
+          "204": {
+            "description": "Key exists in the explicit null state (set via PATCH …/null)"
           },
           "400": {
             "description": "Invalid key"
@@ -1388,7 +1391,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Writes an explicit null/tombstone marker for a key without removing it from the keyspace.\nUseful for signalling soft-deletes in distributed or CDC scenarios.",
+        "summary": "Sets the key to an explicit null value (upsert): the key stays registered and appears in scans,\nbut carries no data — GET answers 204. A write like any other; it resets a previously set TTL.",
         "operationId": "set_null",
         "parameters": [
           {
@@ -1412,7 +1415,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Key set to null (tombstone)"
+            "description": "Key set to the null value state"
           },
           "400": {
             "description": "Invalid key"

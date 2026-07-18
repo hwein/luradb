@@ -1,0 +1,7 @@
+# Ignore list for `osv-scanner scan source --lockfile=Cargo.lock` (OSV/GHSA/RustSec).
+# Same invocation locally and in CI: see .github/workflows/security.yml.
+#
+# Companion file: deny.toml (cargo-deny policy). Advisory exceptions needed by
+# both tools must be kept in sync between the two files.
+#
+# Currently no exceptions.

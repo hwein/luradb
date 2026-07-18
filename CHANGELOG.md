@@ -2,10 +2,18 @@
 
 All notable changes to LuraDB are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-During 0.x, minor releases may contain breaking changes; such entries are marked
-**BREAKING**. Entries prefixed with `API:` affect the HTTP API contract
-(see `api/COMPATIBILITY.md`).
-
 ## [Unreleased]
+
+## [0.1.0] - 2026-07-18
+
+### Added
+
+- Initial release of the LuraDB server: key-value, JSON document, and slim-relational engines behind a single REST API, with token-based authentication, TLS/reverse-proxy support, and a Debian package with systemd integration.
+
+### Security
+
+- Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
+
+
+[unreleased]: https://github.com/hwein/luradb/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/hwein/luradb/releases/tag/v0.1.0

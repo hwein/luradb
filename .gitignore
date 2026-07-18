@@ -11,6 +11,9 @@
 # Benchmark-Reports (cargo bench)
 /benches/results/
 
+# CycloneDX SBOM output (cargo cyclonedx); a release asset, not tracked here
+/*.cdx.json
+
 # Privater Meta-Teil (eigenes Repo) und lokales Tooling
 /concepts/
 /AGENTS.md

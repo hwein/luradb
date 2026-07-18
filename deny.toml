@@ -1,0 +1,44 @@
+# Dependency policy for `cargo deny check` (advisories, licenses, bans, sources).
+# Same invocation locally and in CI: see .github/workflows/security.yml.
+#
+# `unmaintained` advisories are kept visible (scope "all") but non-gating: the
+# check invocation downgrades them with `-W unmaintained` (cargo-deny 0.20 has
+# no per-severity TOML field for advisory kinds anymore, only this CLI lint
+# override).
+#
+# Companion file: osv-scanner.toml (ignore list for osv-scanner). Advisory
+# exceptions needed by both tools must be kept in sync between the two files.
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+# Exceptions only for advisories without an available fix (or not relevant to
+# our usage profile), each with `reason` and a `# review by YYYY-MM-DD` note.
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+# luradb's own source-available license, not a dependency permissive license -
+# kept out of the general allow list on purpose.
+[[licenses.exceptions]]
+crate = "luradb"
+allow = ["FSL-1.1-ALv2"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

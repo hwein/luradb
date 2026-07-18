@@ -1,5 +1,5 @@
 {
-  "openapi": "3.0.3",
+  "openapi": "3.1.0",
   "info": {
     "title": "LuraDB API",
     "description": "REST-native multi-model database — KeyValue- und JSON-Engine. `version` ist die API-Contract-Version (siehe API_VERSION), unabhängig von der Server-Version; letztere steht in der Extension `x-luradb-server-version`. Kompatibilitäts-Ranges: api/COMPATIBILITY.md. Laufzeit-Check: GET /version.",
@@ -7,7 +7,8 @@
       "name": "Heiko Wein"
     },
     "license": {
-      "name": "FSL-1.1-ALv2"
+      "name": "FSL-1.1-ALv2",
+      "identifier": "FSL-1.1-ALv2"
     },
     "version": "0.1.0",
     "x-luradb-server-version": "0.1.0"
@@ -36,8 +37,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Gibt alle angelegten User zurück (Admins und reguläre User).",
-        "description": "API Keys werden nicht ausgegeben — nur Name, Rolle und Erstellungszeitpunkt.",
+        "summary": "Gibt alle angelegten User zurück (Admins und reguläre User).\nAPI Keys werden nicht ausgegeben — nur Name, Rolle und Erstellungszeitpunkt.",
         "operationId": "list_users",
         "responses": {
           "200": {
@@ -59,8 +59,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Legt einen neuen User mit der Rolle `User` an.",
-        "description": "Der API Key wird **ausschließlich in dieser Response** zurückgegeben und danach nicht mehr gespeichert.\nNur Admins dürfen diesen Endpunkt aufrufen.",
+        "summary": "Legt einen neuen User mit der Rolle `User` an.\nDer API Key wird **ausschließlich in dieser Response** zurückgegeben und danach nicht mehr gespeichert.\nNur Admins dürfen diesen Endpunkt aufrufen.",
         "operationId": "create_user",
         "requestBody": {
           "content": {
@@ -97,8 +96,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Löscht einen User und alle seine Domain-Permissions.",
-        "description": "Der API Key des Users wird sofort ungültig — laufende Requests mit dem alten Key erhalten danach `401`.",
+        "summary": "Löscht einen User und alle seine Domain-Permissions.\nDer API Key des Users wird sofort ungültig — laufende Requests mit dem alten Key erhalten danach `401`.",
         "operationId": "delete_user",
         "parameters": [
           {
@@ -126,8 +124,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Setzt oder überschreibt die Zugriffsberechtigung eines Users auf eine Domain.",
-        "description": "`access` muss `\"read\"`, `\"write\"` oder `\"ddl\"` sein — jede Stufe schließt die\nniedrigeren ein. Für `kv` muss die Domain existieren; `json`/`rel` prüfen nur den Namen.",
+        "summary": "Setzt oder überschreibt die Zugriffsberechtigung eines Users auf eine Domain.\n`access` muss `\"read\"`, `\"write\"` oder `\"ddl\"` sein — jede Stufe schließt die\nniedrigeren ein. Für `kv` muss die Domain existieren; `json`/`rel` prüfen nur den Namen.",
         "operationId": "set_permission",
         "parameters": [
           {
@@ -168,8 +165,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Entzieht einem User die Zugriffsberechtigung auf eine bestimmte Domain.",
-        "description": "`?store_type=json`/`rel` entzieht eine JSON-/rel-Domain-Permission (Default: kv).\nNach diesem Aufruf erhalten Requests des Users auf diese Domain `403 Forbidden`.",
+        "summary": "Entzieht einem User die Zugriffsberechtigung auf eine bestimmte Domain.\n`?store_type=json`/`rel` entzieht eine JSON-/rel-Domain-Permission (Default: kv).\nNach diesem Aufruf erhalten Requests des Users auf diese Domain `403 Forbidden`.",
         "operationId": "remove_permission",
         "parameters": [
           {
@@ -196,8 +192,7 @@
             "description": "'kv' (Default), 'json' oder 'rel'",
             "required": false,
             "schema": {
-              "type": "string",
-              "nullable": true
+              "type": "string"
             }
           }
         ],
@@ -216,8 +211,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Generiert einen neuen API Key für den User und invalidiert den alten sofort.",
-        "description": "Der neue Key wird **ausschließlich in dieser Response** zurückgegeben.\nVerwende dies bei Key-Leaks oder regelmäßiger Key-Rotation.",
+        "summary": "Generiert einen neuen API Key für den User und invalidiert den alten sofort.\nDer neue Key wird **ausschließlich in dieser Response** zurückgegeben.\nVerwende dies bei Key-Leaks oder regelmäßiger Key-Rotation.",
         "operationId": "rotate_key",
         "parameters": [
           {
@@ -274,8 +268,7 @@
         "tags": [
           "Domains"
         ],
-        "summary": "Creates a new logical domain (isolated KV namespace).",
-        "description": "Domain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.",
+        "summary": "Creates a new logical domain (isolated KV namespace).\nDomain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.",
         "operationId": "create_domain",
         "requestBody": {
           "content": {
@@ -345,8 +338,7 @@
         "tags": [
           "Domains"
         ],
-        "summary": "Schedules a domain and all its data for deletion.",
-        "description": "The domain becomes immediately inaccessible; the actual purge runs in the background.",
+        "summary": "Schedules a domain and all its data for deletion.\nThe domain becomes immediately inaccessible; the actual purge runs in the background.",
         "operationId": "delete_domain",
         "parameters": [
           {
@@ -439,8 +431,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Returns metadata for a single JSON domain, including its document count.",
-        "description": "Domains in `deleting` state answer with 410 Gone.",
+        "summary": "Returns metadata for a single JSON domain, including its document count.\nDomains in `deleting` state answer with 410 Gone.",
         "operationId": "get_domain",
         "parameters": [
           {
@@ -579,7 +570,6 @@
             "schema": {
               "type": "integer",
               "format": "int32",
-              "nullable": true,
               "minimum": 0
             }
           },
@@ -591,7 +581,6 @@
             "schema": {
               "type": "integer",
               "format": "int32",
-              "nullable": true,
               "minimum": 0
             }
           },
@@ -601,8 +590,7 @@
             "description": "Return only keys, no content",
             "required": false,
             "schema": {
-              "type": "boolean",
-              "nullable": true
+              "type": "boolean"
             }
           }
         ],
@@ -711,8 +699,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Reads a document; `_key`/`_version` are top-level fields and an opaque",
-        "description": "`ETag` is exposed for use with `If-Match` (json/011).",
+        "summary": "Reads a document; `_key`/`_version` are top-level fields and an opaque\n`ETag` is exposed for use with `If-Match` (json/011).",
         "operationId": "get_document",
         "parameters": [
           {
@@ -750,8 +737,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a",
-        "description": "conditional update that fails with 409 on a version mismatch.",
+        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a\nconditional update that fails with 409 on a version mismatch.",
         "operationId": "put_document",
         "parameters": [
           {
@@ -808,8 +794,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Deletes a document and its index entries. Supports conditional delete via",
-        "description": "`If-Match: \"<etag>\"`.",
+        "summary": "Deletes a document and its index entries. Supports conditional delete via\n`If-Match: \"<etag>\"`.",
         "operationId": "delete_document",
         "parameters": [
           {
@@ -867,7 +852,10 @@
         ],
         "responses": {
           "200": {
-            "description": "NDJSON stream of all documents"
+            "description": "NDJSON stream of all documents",
+            "content": {
+              "application/x-ndjson": {}
+            }
           },
           "404": {
             "description": "Domain not found"
@@ -922,8 +910,7 @@
         "tags": [
           "JSON Indexes"
         ],
-        "summary": "Creates an index definition. Existing documents are NOT back-indexed —",
-        "description": "trigger a re-index for that.",
+        "summary": "Creates an index definition. Existing documents are NOT back-indexed —\ntrigger a re-index for that.",
         "operationId": "create_index",
         "parameters": [
           {
@@ -1069,8 +1056,7 @@
         "tags": [
           "JSON Indexes"
         ],
-        "summary": "Returns the status of a re-index task. Tasks are domain-scoped: a task id",
-        "description": "of another domain answers 404 (tenant isolation).",
+        "summary": "Returns the status of a re-index task. Tasks are domain-scoped: a task id\nof another domain answers 404 (tenant isolation).",
         "operationId": "reindex_status",
         "parameters": [
           {
@@ -1110,8 +1096,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Searches documents via indexed fields. Filters: `\"field\": value` for",
-        "description": "equality or `\"field\": {\"$gt\": …}` for ranges; multiple fields are ANDed.",
+        "summary": "Searches documents via indexed fields. Filters: `\"field\": value` for\nequality or `\"field\": {\"$gt\": …}` for ranges; multiple fields are ANDed.",
         "operationId": "search_documents",
         "parameters": [
           {
@@ -1180,8 +1165,7 @@
             "description": "Key prefix filter",
             "required": false,
             "schema": {
-              "type": "string",
-              "nullable": true
+              "type": "string"
             }
           }
         ],
@@ -1246,7 +1230,10 @@
         ],
         "responses": {
           "200": {
-            "description": "Value (raw bytes)"
+            "description": "Value (raw bytes)",
+            "content": {
+              "application/octet-stream": {}
+            }
           },
           "400": {
             "description": "Invalid key"
@@ -1275,8 +1262,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Inserts or updates a value for the given key (upsert semantics).",
-        "description": "The optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.",
+        "summary": "Inserts or updates a value for the given key (upsert semantics).\nThe optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.",
         "operationId": "put_key",
         "parameters": [
           {
@@ -1305,7 +1291,6 @@
             "schema": {
               "type": "integer",
               "format": "int64",
-              "nullable": true,
               "minimum": 0
             }
           }
@@ -1403,8 +1388,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Writes an explicit null/tombstone marker for a key without removing it from the keyspace.",
-        "description": "Useful for signalling soft-deletes in distributed or CDC scenarios.",
+        "summary": "Writes an explicit null/tombstone marker for a key without removing it from the keyspace.\nUseful for signalling soft-deletes in distributed or CDC scenarios.",
         "operationId": "set_null",
         "parameters": [
           {
@@ -1456,8 +1440,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.",
-        "description": "The connection stays open until the client disconnects; a keep-alive ping is sent automatically.",
+        "summary": "Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.\nThe connection stays open until the client disconnects; a keep-alive ping is sent automatically.",
         "operationId": "watch",
         "parameters": [
           {
@@ -1475,14 +1458,16 @@
             "description": "Key prefix filter",
             "required": false,
             "schema": {
-              "type": "string",
-              "nullable": true
+              "type": "string"
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "SSE stream of key change events"
+            "description": "SSE stream of key change events",
+            "content": {
+              "text/event-stream": {}
+            }
           },
           "410": {
             "description": "Domain is being deleted"
@@ -1584,8 +1569,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Creates a new relational domain (isolated table/view namespace, separate",
-        "description": "from KV and JSON domains).",
+        "summary": "Creates a new relational domain (isolated table/view namespace, separate\nfrom KV and JSON domains).",
         "operationId": "create_domain",
         "requestBody": {
           "content": {
@@ -1625,8 +1609,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Returns metadata for a single relational domain. A domain in `deleting`",
-        "description": "state answers 410 Gone (rel/013 finishes the physical purge).",
+        "summary": "Returns metadata for a single relational domain. A domain in `deleting`\nstate answers 410 Gone (rel/013 finishes the physical purge).",
         "operationId": "get_domain",
         "parameters": [
           {
@@ -1665,8 +1648,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Marks a relational domain as deleting. Its tables/views become",
-        "description": "inaccessible immediately; physical cleanup follows in rel/013.",
+        "summary": "Marks a relational domain as deleting. Its tables/views become\ninaccessible immediately; physical cleanup follows in rel/013.",
         "operationId": "delete_domain",
         "parameters": [
           {
@@ -1700,8 +1682,7 @@
         "tags": [
           "Relational Store"
         ],
-        "summary": "Executes exactly one LuraSQL statement against `domain` and returns its",
-        "description": "typed result. `expand` resolves REFERENCES columns of a SELECT into\nembedded objects (or `\"*\"` for every REFERENCES column).",
+        "summary": "Executes exactly one LuraSQL statement against `domain` and returns its\ntyped result. `expand` resolves REFERENCES columns of a SELECT into\nembedded objects (or `\"*\"` for every REFERENCES column).",
         "operationId": "execute_sql",
         "parameters": [
           {
@@ -1814,8 +1795,7 @@
         "tags": [
           "Relational Browse"
         ],
-        "summary": "Returns a table's schema (columns, indexes) plus HATEOAS links. A view",
-        "description": "name answers 404 here — use `GET …/views` for views.",
+        "summary": "Returns a table's schema (columns, indexes) plus HATEOAS links. A view\nname answers 404 here — use `GET …/views` for views.",
         "operationId": "get_table",
         "parameters": [
           {
@@ -1868,8 +1848,7 @@
         "tags": [
           "Relational Browse"
         ],
-        "summary": "Lists rows of `table`. Every query parameter other than `expand`/`limit`/",
-        "description": "`offset` is an equality filter on the like-named column (`?col=value`,\nAND-combined); parse errors and unknown filter columns answer 400. This\ncompiles onto the same bound `*`-SELECT plan `/sql` would use.",
+        "summary": "Lists rows of `table`. Every query parameter other than `expand`/`limit`/\n`offset` is an equality filter on the like-named column (`?col=value`,\nAND-combined); parse errors and unknown filter columns answer 400. This\ncompiles onto the same bound `*`-SELECT plan `/sql` would use.",
         "operationId": "browse_rows",
         "parameters": [
           {
@@ -1896,8 +1875,7 @@
             "description": "Comma-separated REFERENCES columns to resolve, or \"*\" for all",
             "required": false,
             "schema": {
-              "type": "string",
-              "nullable": true
+              "type": "string"
             }
           },
           {
@@ -1907,8 +1885,7 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "format": "int64",
-              "nullable": true
+              "format": "int64"
             }
           },
           {
@@ -1918,8 +1895,7 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "format": "int64",
-              "nullable": true
+              "format": "int64"
             }
           }
         ],
@@ -1958,8 +1934,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Inserts one row from a JSON object body (`{column: value, …}`). An omitted",
-        "description": "AUTOINCREMENT primary key is assigned the next sequence value (rel/005\n§9); this compiles onto the exact same bound INSERT plan `/sql` would use.",
+        "summary": "Inserts one row from a JSON object body (`{column: value, …}`). An omitted\nAUTOINCREMENT primary key is assigned the next sequence value (rel/005\n§9); this compiles onto the exact same bound INSERT plan `/sql` would use.",
         "operationId": "insert_row",
         "parameters": [
           {
@@ -2028,8 +2003,7 @@
         "tags": [
           "Relational Browse"
         ],
-        "summary": "Fetches a single row by primary key — the same PK-point SELECT plan",
-        "description": "`/sql`'s `WHERE pk = ?` would use.",
+        "summary": "Fetches a single row by primary key — the same PK-point SELECT plan\n`/sql`'s `WHERE pk = ?` would use.",
         "operationId": "get_row",
         "parameters": [
           {
@@ -2065,8 +2039,7 @@
             "description": "Comma-separated REFERENCES columns to resolve, or \"*\"",
             "required": false,
             "schema": {
-              "type": "string",
-              "nullable": true
+              "type": "string"
             }
           }
         ],
@@ -2105,8 +2078,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Partially updates a row by primary key: only the columns named in the",
-        "description": "body are set, everything else stays unchanged (spec §5). Not an upsert —\na PK the table doesn't have answers 404, never a create.",
+        "summary": "Partially updates a row by primary key: only the columns named in the\nbody are set, everything else stays unchanged (spec §5). Not an upsert —\na PK the table doesn't have answers 404, never a create.",
         "operationId": "update_row",
         "parameters": [
           {
@@ -2182,8 +2154,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Deletes a row by primary key. Hanging REFERENCES from other tables are",
-        "description": "not blocked by this (rel/005 §11) — they resolve to `null` afterwards.",
+        "summary": "Deletes a row by primary key. Hanging REFERENCES from other tables are\nnot blocked by this (rel/005 §11) — they resolve to `null` afterwards.",
         "operationId": "delete_row",
         "parameters": [
           {
@@ -2391,8 +2362,10 @@
             "type": "boolean"
           },
           "references": {
-            "type": "string",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "type": {
             "type": "string"
@@ -2615,10 +2588,12 @@
             "minimum": 0
           },
           "document_count": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
             "description": "Number of documents — only set on the detail endpoint.",
-            "nullable": true,
             "minimum": 0
           },
           "name": {
@@ -2634,19 +2609,25 @@
         "type": "object",
         "properties": {
           "keys_only": {
-            "type": "boolean",
-            "nullable": true
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "limit": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
-            "nullable": true,
             "minimum": 0
           },
           "offset": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
-            "nullable": true,
             "minimum": 0
           }
         }
@@ -2666,9 +2647,11 @@
         "type": "object",
         "properties": {
           "field": {
-            "type": "string",
-            "description": "Optional: re-index only this field's index. Omit for all indexes.",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional: re-index only this field's index. Omit for all indexes."
           }
         }
       },
@@ -2755,15 +2738,19 @@
             "description": "Field → value (Eq) or `{\"$gt\": …}` / `$gte` / `$lt` / `$lte` / `$eq`."
           },
           "limit": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
-            "nullable": true,
             "minimum": 0
           },
           "offset": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
-            "nullable": true,
             "minimum": 0
           }
         }
@@ -2817,9 +2804,11 @@
             "description": "Name der Domain."
           },
           "store_type": {
-            "type": "string",
-            "description": "Store-Typ der Domain: `\"kv\"` (Default), `\"json\"` (spec json/012) oder `\"rel\"` (spec rel/011).",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Store-Typ der Domain: `\"kv\"` (Default), `\"json\"` (spec json/012) oder `\"rel\"` (spec rel/011)."
           }
         }
       },

@@ -638,7 +638,7 @@ mod tests {
         StorageThread::new(cfg(sqpoll, capacity), dir.join("wal"), dir.join("vlog")).unwrap()
     }
 
-    // 1. StorageThread startet und stoppt sauber.
+    // 1. StorageThread starts and stops cleanly.
     #[test]
     fn test_storage_thread_starts_and_stops() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -647,7 +647,7 @@ mod tests {
         st.shutdown();
     }
 
-    // 2. wal_append -- Daten geschrieben, Offset korrekt.
+    // 2. wal_append -- data written, offset correct.
     #[tokio::test]
     async fn test_wal_append_offsets_and_bytes() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"helloworld!");
     }
 
-    // 3. vlog_read -- Daten korrekt gelesen.
+    // 3. vlog_read -- data read correctly.
     #[tokio::test]
     async fn test_vlog_append_then_read() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -672,7 +672,7 @@ mod tests {
         st.shutdown();
     }
 
-    // 4. Batching: 100 gleichzeitige wal_append-Requests korrekt verarbeitet.
+    // 4. Batching: 100 concurrent wal_append requests processed correctly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_batching_100_concurrent_wal_appends() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 1000);
     }
 
-    // 5. Backpressure: bounded channel voll -> try_send meldet Full.
+    // 5. Backpressure: bounded channel full -> try_send reports Full.
     #[test]
     fn test_channel_backpressure_is_bounded() {
         let (tx, _rx) = mpsc::channel::<u32>(2);
@@ -704,8 +704,8 @@ mod tests {
         assert!(matches!(tx.try_send(3), Err(mpsc::error::TrySendError::Full(3))));
     }
 
-    // 6. SQPOLL-Fallback: Standard-Modus liefert einen funktionierenden Ring,
-    //    SQPOLL-Anforderung fällt bei Bedarf sauber zurück (kein Fehler).
+    // 6. SQPOLL fallback: standard mode yields a working ring,
+    //    SQPOLL request falls back cleanly when needed (no error).
     #[test]
     fn test_build_ring_fallback_and_sqpoll() {
         let (_ring, sqpoll) = build_ring(false, 500, 64).unwrap();
@@ -714,7 +714,7 @@ mod tests {
         let (_ring2, _sqpoll2) = build_ring(true, 500, 64).unwrap();
     }
 
-    // 6b. End-to-end im echten SQPOLL-Modus (WSL2-Kernel unterstützt es).
+    // 6b. End-to-end in real SQPOLL mode (WSL2 kernel supports it).
     #[tokio::test]
     async fn test_wal_append_sqpoll_mode() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -724,7 +724,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"sqpoll");
     }
 
-    // 7. Shutdown: alle ausstehenden Requests werden vor Thread-Exit abgeschlossen.
+    // 7. Shutdown: all pending requests are completed before thread exit.
     #[tokio::test]
     async fn test_shutdown_drains_pending_requests() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -837,7 +837,7 @@ mod tests {
         st.shutdown();
     }
 
-    // 8. Integration: LsmStorageEngine mit StorageHandle -> Write + Read E2E.
+    // 8. Integration: LsmStorageEngine with StorageHandle -> write + read E2E.
     #[tokio::test]
     async fn test_lsm_engine_with_storage_handle_end_to_end() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -873,7 +873,7 @@ mod tests {
         st.shutdown();
     }
 
-    // 9. io_engine disabled -> Local (tokio::fs) WAL/VLog path, keine Regression.
+    // 9. io_engine disabled -> local (tokio::fs) WAL/VLog path, no regression.
     #[tokio::test]
     async fn test_lsm_engine_local_path_no_regression() {
         let dir = tempfile::TempDir::new().unwrap();

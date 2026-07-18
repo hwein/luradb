@@ -188,7 +188,7 @@ mod tests {
         FixedBufPool::new(std::iter::repeat_with(move || Vec::with_capacity(size)).take(slots))
     }
 
-    // 1. FixedBufPool -- try_next() gibt Buffer zurueck, Drop gibt ihn zurueck an den Pool.
+    // 1. FixedBufPool -- try_next() returns a buffer, Drop returns it to the pool.
     #[test]
     fn test_fixed_buf_pool_checkin_on_drop() {
         tokio_uring::start(async {
@@ -202,7 +202,7 @@ mod tests {
         });
     }
 
-    // 2. FixedBufPool -- Alle Slots belegt -> try_next() gibt None.
+    // 2. FixedBufPool -- all slots occupied -> try_next() returns None.
     #[test]
     fn test_fixed_buf_pool_exhausted() {
         tokio_uring::start(async {
@@ -215,7 +215,7 @@ mod tests {
         });
     }
 
-    // 3. FileHandleMap -- register_file() + get_file() -> korrekter Handle.
+    // 3. FileHandleMap -- register_file() + get_file() -> correct handle.
     #[test]
     fn test_file_handle_map_register_and_get() {
         tokio_uring::start(async {
@@ -228,7 +228,7 @@ mod tests {
         });
     }
 
-    // 4. FileHandleMap -- unregister_file() -> Handle entfernt, get_file() -> None.
+    // 4. FileHandleMap -- unregister_file() -> handle removed, get_file() -> None.
     #[test]
     fn test_file_handle_map_unregister() {
         tokio_uring::start(async {
@@ -241,7 +241,7 @@ mod tests {
         });
     }
 
-    // 5. IoEngine::read_fixed() -- Testdaten schreiben, registrieren, per registered buffer lesen.
+    // 5. IoEngine::read_fixed() -- write test data, register, read via registered buffer.
     #[test]
     fn test_io_engine_read_fixed_reads_correct_data() {
         tokio_uring::start(async {
@@ -258,7 +258,7 @@ mod tests {
         });
     }
 
-    // 6. IoEngine::write_fixed() -- per registered buffer schreiben, mit Standard-Read pruefen.
+    // 6. IoEngine::write_fixed() -- write via registered buffer, verify with a standard read.
     #[test]
     fn test_io_engine_write_fixed_writes_correct_data() {
         tokio_uring::start(async {
@@ -278,7 +278,7 @@ mod tests {
         });
     }
 
-    // 7. IoEngine::fsync() -- kein Fehler nach Write + Fsync.
+    // 7. IoEngine::fsync() -- no error after write + fsync.
     #[test]
     fn test_io_engine_fsync_after_write() {
         tokio_uring::start(async {

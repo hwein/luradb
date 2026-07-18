@@ -8,7 +8,7 @@
 //! INDEX` (ids allocated but no longer in the catalog). Both are batch-bounded
 //! and crash-trivial; job (a)'s emptiness check + finalization run under the
 //! engine write guard so no in-flight writer can land keys after finalization
-//! (rel/013 §3, vorbild json/013).
+//! (rel/013 §3, pattern: json/013).
 
 use super::domain::{RelDomain, RelDomainState};
 use super::keys;
@@ -75,7 +75,7 @@ impl RelDomainPurger {
     /// `ROW:`/`IDX:`/`SEQ:` are all empty, drops the catalog definitions and
     /// then the domain metadata. The whole per-domain body runs under the
     /// engine write guard, so the emptiness check that gates finalization sees
-    /// every committed writer's keys (spec rel/013 §3, vorbild json/013).
+    /// every committed writer's keys (spec rel/013 §3, pattern: json/013).
     async fn purge_one_deleting(&self, domain: &RelDomain) -> anyhow::Result<()> {
         let _wg = self.engine.write_guard.lock().await;
         let engine = self.engine.engine();

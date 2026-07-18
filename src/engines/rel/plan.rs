@@ -139,7 +139,7 @@ pub(crate) fn plan_access(
 /// Flattens top-level `AND`/`Paren` nodes into their leaf conjuncts. A
 /// non-AND node (incl. a top-level `OR`) becomes a single opaque conjunct —
 /// never sargable, so it forces a full scan unless a sibling conjunct drives
-/// (spec §3: "liegt die Kandidatenspalte unter OR/NOT" → not representative).
+/// (spec §3: "the candidate column sits under OR/NOT" → not representative).
 /// `pub(super)`: reused by the join planner (rel/007 `join.rs`) to partition
 /// WHERE conjuncts into base-driving vs. residual-over-the-chain (§6).
 pub(super) fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {

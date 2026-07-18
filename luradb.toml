@@ -60,7 +60,7 @@ default_max_storage_bytes = 0
 [log]
 level = "verbose"
 format = "text"
-# path = "/var/log/luradb"   # leer = stdout
+# path = "/var/log/luradb"   # empty = stdout
 rotation = "daily"
 retention_days = 30
 

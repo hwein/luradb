@@ -7,22 +7,22 @@ Type=simple
 User=luradb
 Group=luradb
 ExecStart=/usr/bin/luradb --config /etc/luradb/luradb.toml
-# Sicherheitsnetz, falls ein Operator relative Storage-Pfade konfiguriert.
+# Safety net in case an operator configures relative storage paths.
 WorkingDirectory=/var/lib/luradb
 StateDirectory=luradb
 StateDirectoryMode=0750
-# 0750: Gruppenmitglieder brauchen +x, um den UDS-Socket zu erreichen.
+# 0750: group members need +x to reach the UDS socket.
 RuntimeDirectory=luradb
 RuntimeDirectoryMode=0750
 UMask=0027
 LimitNOFILE=65536
-# io_uring Registered Buffers (perf/004/005) brauchen memlock.
+# io_uring registered buffers (perf/004/005) need memlock.
 LimitMEMLOCK=infinity
 Restart=on-failure
 RestartSec=2
 
-# Hardening — bewusst OHNE SystemCallFilter: io_uring-Syscalls müssen erlaubt bleiben.
-# /dev/shm bleibt unter ProtectSystem=strict beschreibbar (SHM-Feature).
+# Hardening — deliberately WITHOUT SystemCallFilter: io_uring syscalls must stay allowed.
+# /dev/shm stays writable under ProtectSystem=strict (SHM feature).
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

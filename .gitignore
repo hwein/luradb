@@ -2,19 +2,19 @@
 .idea/
 .vscode/
 
-# Laufzeit-Artefakte des Dev-Servers
+# Runtime artifacts of the dev server
 /luradb.wal
 /luradb.db
 /luradb.vlog
 /luradb_sstables
 
-# Benchmark-Reports (cargo bench)
+# Benchmark reports (cargo bench)
 /benches/results/
 
 # CycloneDX SBOM output (cargo cyclonedx); a release asset, not tracked here
 /*.cdx.json
 
-# Privater Meta-Teil (eigenes Repo) und lokales Tooling
+# Private meta part (separate repo) and local tooling
 /concepts/
 /AGENTS.md
 /.claude/

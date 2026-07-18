@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     // UPDATE -> UniqueViolation: a SET introduces a UNIQUE-column collision
-    // with another row (quality/007 Vorarbeit).
+    // with another row (quality/007 prep work).
     #[tokio::test]
     async fn test_update_unique_violation() {
         let (rel, _d) = make().await;
@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     // UPDATE -> LinkTargetMissing: the FK re-check runs over changed
-    // REFERENCES columns, not just at INSERT time (quality/007 Vorarbeit).
+    // REFERENCES columns, not just at INSERT time (quality/007 prep work).
     #[tokio::test]
     async fn test_update_link_target_missing() {
         let (rel, _d) = make().await;
@@ -1583,7 +1583,7 @@ mod tests {
     }
 
     // UPDATE -> TextTooLong / RowTooLarge: the same size guards as INSERT
-    // apply on the UPDATE path (quality/007 Vorarbeit).
+    // apply on the UPDATE path (quality/007 prep work).
     #[tokio::test]
     async fn test_update_size_guards() {
         let dir = tempfile::TempDir::new().unwrap();

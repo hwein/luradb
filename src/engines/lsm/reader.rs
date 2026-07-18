@@ -694,7 +694,7 @@ mod merge_iterator_tests {
         Ok(())
     }
 
-    // Vorarbeit: advancing a source onto an Err must propagate it without
+    // Note: advancing a source onto an Err must propagate it without
     // re-inserting the entry into the heap (the block moved into advance_source).
     #[test]
     fn test_merge_iterator_propagates_error() -> Result<()> {
@@ -711,7 +711,7 @@ mod merge_iterator_tests {
         Ok(())
     }
 
-    // Vorarbeit: same user key AND timestamp in two sources — the lower
+    // Note: same user key AND timestamp in two sources — the lower
     // source_priority (newer source) wins the tiebreak.
     #[test]
     fn test_merge_iterator_source_priority_tiebreak() -> Result<()> {

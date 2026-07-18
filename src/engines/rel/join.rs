@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-// ── Dynamic RowSource boxing (spec §2 Rust-Hinweis) ──────────────────────────
+// ── Dynamic RowSource boxing (spec §2 Rust note) ──────────────────────────
 //
 // `RowSource::next` is RPITIT (rel/006 §2 pattern), which is not `dyn`-safe.
 // A join chain has dynamic depth (`max_join_depth` stages), so the left input
@@ -389,7 +389,7 @@ enum OnSide {
 
 /// Resolves one ON operand against the two disjoint sets a join stage sees:
 /// the already-established bindings and the newly-joined table. Exactly one
-/// must hit (spec §3's "Verstöße" list; ambiguity/no-match are hard errors).
+/// must hit (spec §3's "violations" list; ambiguity/no-match are hard errors).
 fn resolve_on_side(
     cref: &ColumnRef,
     known: &[BindingInfo],
@@ -1228,7 +1228,7 @@ mod tests {
         assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
     }
 
-    // 9. Index-Pflicht: an unindexed right ON-column with allow_unindexed_joins
+    // 9. Index requirement: an unindexed right ON-column with allow_unindexed_joins
     // = false -> UnindexedJoin with a CREATE INDEX hint.
     #[tokio::test]
     async fn test_unindexed_join_rejected_by_default() {
@@ -1550,7 +1550,7 @@ mod tests {
 
     // 25. COUNT(*) over a join with a WHERE residual (a join-table conjunct,
     // so `other_conjuncts` is non-empty): the `Some(pred)` arm in the COUNT
-    // branch (quality/007 Vorarbeit).
+    // branch (quality/007 prep work).
     #[tokio::test]
     async fn test_count_star_over_join_with_residual() {
         let (rel, _d) = make().await;

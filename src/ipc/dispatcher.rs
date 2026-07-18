@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 /// Idle backoff between empty polls; skipped while commands keep arriving.
 const POLL_IDLE_US: u64 = 10;
 /// Response-ring-full backoff: brief bounded retries before dropping the
-/// response (flow control is out of scope — spec Abgrenzung).
+/// response (flow control is out of scope — spec non-goals).
 const RESPOND_RETRIES: usize = 8;
 /// Max commands drained from one client per poll pass. Bounds the work a single
 /// client can force before the dispatcher round-robins to its peers and `run`
@@ -113,7 +113,7 @@ impl ClientConnection {
     }
 
     /// Enqueues a response. A full ring drops it after bounded retries (no flow
-    /// control — spec Abgrenzung). A response too large for the ring is replaced
+    /// control — spec non-goals). A response too large for the ring is replaced
     /// by a small 413 on the same request_id, so the client fails fast instead of
     /// blocking forever on a response that can never arrive.
     async fn respond(&mut self, response: ShmResponse) {
@@ -557,7 +557,7 @@ mod tests {
     }
 
     // DELETE dispatch path: Ok, and the key is gone afterwards (spec quality/003
-    // Vorarbeit — the Delete arm had no send_and_dispatch test).
+    // prep work — the Delete arm had no send_and_dispatch test).
     #[tokio::test]
     async fn test_dispatch_delete() {
         let mut h = harness().await;
@@ -599,7 +599,7 @@ mod tests {
     }
 
     // SCANKEYS dispatch path: ScanResult with the sorted prefix matches (spec
-    // quality/003 Vorarbeit).
+    // quality/003 prep work).
     #[tokio::test]
     async fn test_dispatch_scan_keys() {
         let mut h = harness().await;
@@ -624,7 +624,7 @@ mod tests {
     }
 
     // PUT with ttl_secs > 0 takes the put_with_ttl branch and answers Ok; the
-    // value is stored (spec quality/003 Vorarbeit).
+    // value is stored (spec quality/003 prep work).
     #[tokio::test]
     async fn test_dispatch_put_with_ttl() {
         let mut h = harness().await;

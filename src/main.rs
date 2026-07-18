@@ -49,7 +49,7 @@ struct Cli {
     #[arg(long)]
     config: Option<std::path::PathBuf>,
 
-    /// Gibt den OpenAPI-Contract als JSON auf stdout aus und beendet sich.
+    /// Prints the OpenAPI contract as JSON to stdout and exits.
     #[arg(long)]
     dump_openapi: bool,
 }
@@ -519,7 +519,7 @@ async fn graceful_shutdown(
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.dump_openapi {
-        println!("{}", ApiDoc::openapi().to_pretty_json().expect("OpenAPI serialisierbar"));
+        println!("{}", ApiDoc::openapi().to_pretty_json().expect("OpenAPI spec must serialize"));
         return Ok(());
     }
     let config_path = resolve_config_path(cli.config, |p| p.exists());

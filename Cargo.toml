@@ -7,48 +7,48 @@ description = "LuraDB: A Linux-first, REST-native multi-model database"
 license = "FSL-1.1-ALv2"
 repository = "https://github.com/hwein/luradb"
 readme = "README.md"
-# Wir optimieren für Linux
+# We optimize for Linux
 exclude = ["/.github/**", "/docs/**"]
 
 [dependencies]
 # --- Core: Async Runtime & Web Interface ---
-# Axum ist unser "Treiber"
+# Axum is our "driver"
 axum = { version = "0.7", features = ["macros", "http2"] }
-# Direkter Zugriff auf die HTTP-Conn-Maschinerie für den UDS-Listener (perf/001);
-# beide sind bereits transitive Abhängigkeiten von Axum.
+# Direct access to the HTTP conn machinery for the UDS listener (perf/001);
+# both are already transitive dependencies of Axum.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 utoipa = { version = "5", features = ["axum_extras"] }
-# 8.1.0 ist die letzte utoipa-swagger-ui-Version vor dem axum-0.8-Sprung (9.x) — passt zu utoipa 5 + axum 0.7.
+# 8.1.0 is the last utoipa-swagger-ui version before the axum-0.8 jump (9.x) — matches utoipa 5 + axum 0.7.
 utoipa-swagger-ui = { version = "8.1.0", features = ["axum"] }
-# Tokio als Basis-Runtime (notwendig für Axum)
+# Tokio as the base runtime (required by Axum)
 tokio = { version = "1", features = ["full"] }
-# Middleware für Tracing und CORS
+# Middleware for tracing and CORS
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
 
 # --- The "Lura" Power: Linux I/O ---
-# Das Herzstück: Asynchrones I/O über io_uring
+# The heart of it: asynchronous I/O via io_uring
 tokio-uring = "0.5"
-# Raw io_uring ring für den SQPOLL Storage Thread (perf/005).
+# Raw io_uring ring for the SQPOLL storage thread (perf/005).
 io-uring = "0.6"
-# Für Low-Level Flags wie O_DIRECT und mmap (Shared Memory)
+# For low-level flags like O_DIRECT and mmap (shared memory)
 libc = "0.2"
-# Effizientes Byte-Handling für Zero-Copy Strategien
+# Efficient byte handling for zero-copy strategies
 bytes = "1.5"
 
 # --- Storage & Data Engines ---
-# Serde für alles (JSON Engine & API Responses)
+# Serde for everything (JSON engine & API responses)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Memmap2 für den Shared-Memory Zugriff
+# Memmap2 for shared-memory access
 memmap2 = "0.9"
 # rkyv for zero-copy deserialization
 rkyv = { version = "0.7", features = ["archive_le", "validation"] }
 rkyv_derive = "0.7"
 
 # --- Concurrency & Safety ---
-# DashMap für hoch-performante, lock-free Maps im RAM
+# DashMap for high-performance, lock-free maps in RAM
 dashmap = "5.5"
 crossbeam-skiplist = "0.1"
 crossbeam-utils = "0.8"

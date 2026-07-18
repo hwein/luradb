@@ -1661,7 +1661,7 @@ mod tests {
         assert_eq!(all.len(), 9);
     }
 
-    // Vorarbeit: the limit break in the SSTable sweep is only reachable once
+    // Note: the limit break in the SSTable sweep is only reachable once
     // keys live in an SSTable (unflushed keys hit the MemTable path). Flush
     // first, then trip the limit during the sweep.
     #[tokio::test]
@@ -1675,7 +1675,7 @@ mod tests {
         assert_eq!(keys.len(), 4);
     }
 
-    // Vorarbeit: the TTL-expiry branch of scan_memtable_for_prefix is otherwise
+    // Note: the TTL-expiry branch of scan_memtable_for_prefix is otherwise
     // only covered by `get`. An expired key must not appear in scan_keys.
     #[tokio::test]
     async fn test_scan_keys_excludes_ttl_expired() {
@@ -1908,7 +1908,7 @@ mod tests {
         assert_eq!(deleted, expected, "must report exactly the compacted-away ids");
     }
 
-    // Vorarbeit: every other compaction test targets an empty L1; this drives
+    // Note: every other compaction test targets an empty L1; this drives
     // the non-empty-target branch (open, drop from manifest, delete). A key
     // inside the existing L1 range forces overlapping-target selection.
     #[tokio::test]
@@ -1988,8 +1988,8 @@ mod tests {
     // engine's own WAL/VLog/SSTable I/O (plain `tokio::fs`) works fine inside
     // one too (this is exactly how `main.rs` already runs the whole server).
 
-    // 8. Integration: SSTable-Flush -> File wird automatisch registriert.
-    // Compaction-Deletion -> File wird deregistriert.
+    // 8. Integration: SSTable flush -> file is automatically registered.
+    // Compaction deletion -> file is deregistered.
     #[test]
     fn test_flush_registers_and_compaction_deregisters_sstable() {
         tokio_uring::start(async {

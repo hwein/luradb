@@ -856,17 +856,17 @@ fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], f
     md.push_str(&format!("Generated: unix timestamp {now}\n\n"));
 
     md.push_str("## GET / PUT Latency + Throughput\n\n");
-    md.push_str("| Szenario | TCP | UDS | SHM Cmd | SHM Snap |\n");
+    md.push_str("| Scenario | TCP | UDS | SHM Cmd | SHM Snap |\n");
     md.push_str("|---|---|---|---|---|\n");
     md.push_str(&format!(
-        "| GET Latenz (Mittelwert, A) | {} | {} | {} | {} |\n",
+        "| GET Latency (mean, A) | {} | {} | {} | {} |\n",
         crit_mean("bench_get_tcp"),
         crit_mean("bench_get_uds"),
         crit_mean("bench_get_shm_command"),
         crit_mean("bench_get_shm_snapshot"),
     ));
     md.push_str(&format!(
-        "| PUT Latenz (Mittelwert, C) | {} | {} | {} | N/A |\n",
+        "| PUT Latency (mean, C) | {} | {} | {} | N/A |\n",
         crit_mean("bench_put_tcp"),
         crit_mean("bench_put_uds"),
         crit_mean("bench_put_shm"),
@@ -882,7 +882,7 @@ fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], f
     md.push_str(
         "SHM reads use the snapshot path, SHM writes use the command ring (how a real client would mix them).\n\n",
     );
-    md.push_str("| Metrik | TCP | UDS | SHM |\n");
+    md.push_str("| Metric | TCP | UDS | SHM |\n");
     md.push_str("|---|---|---|---|\n");
     md.push_str(&format!(
         "| p50 | {} | {} | {} |\n",
@@ -925,7 +925,7 @@ fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], f
     md.push_str("| Benchmark | Old Path | New Path |\n");
     md.push_str("|---|---|---|\n");
     md.push_str(&format!(
-        "| WAL Append (tokio::fs vs. Storage-Thread SQPOLL) | {} | {} |\n",
+        "| WAL Append (tokio::fs vs. storage-thread SQPOLL) | {} | {} |\n",
         crit_mean("bench_wal_append_tokio"),
         crit_mean("bench_wal_append_iouring"),
     ));

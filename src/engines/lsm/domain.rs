@@ -846,13 +846,13 @@ mod tests {
         registry.create_domain("utf8-ok").await.unwrap();
         let store = registry.store("utf8-ok").await.unwrap();
 
-        store.put("schlüssel".as_bytes(), b"v1").await.unwrap();
-        assert_eq!(store.get("schlüssel".as_bytes()).await.unwrap(), GetResult::Present(b"v1".to_vec()));
+        store.put("clé".as_bytes(), b"v1").await.unwrap();
+        assert_eq!(store.get("clé".as_bytes()).await.unwrap(), GetResult::Present(b"v1".to_vec()));
 
         store.put("🎉".as_bytes(), b"v2").await.unwrap();
         assert_eq!(store.get("🎉".as_bytes()).await.unwrap(), GetResult::Present(b"v2".to_vec()));
 
-        store.set_null("schlüssel".as_bytes()).await.unwrap();
+        store.set_null("clé".as_bytes()).await.unwrap();
         store.delete("🎉".as_bytes()).await.unwrap();
     }
 
@@ -877,8 +877,8 @@ mod tests {
         let (registry, _dir) = make_registry().await;
         registry.create_domain("utf8-scan").await.unwrap();
         let store = registry.store("utf8-scan").await.unwrap();
-        store.put("ärger".as_bytes(), b"v1").await.unwrap();
-        store.put("änderung".as_bytes(), b"v2").await.unwrap();
+        store.put("älg".as_bytes(), b"v1").await.unwrap();
+        store.put("äpple".as_bytes(), b"v2").await.unwrap();
         store.put("zebra".as_bytes(), b"v3").await.unwrap();
 
         let found = store.scan_keys(&[0xC3]).await.unwrap();

@@ -264,8 +264,8 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 // ── Physical sweep (spec §5) ──────────────────────────────────────────────────
 
 /// Background task that physically nulls link cells whose same-named target
-/// domain vanished in a foreign engine — the durable half of "genullt bleibt
-/// genullt". Distinct from the rel/013 purger (which tombstones a rel domain's
+/// domain vanished in a foreign engine — the durable half of "nulled stays
+/// nulled". Distinct from the rel/013 purger (which tombstones a rel domain's
 /// own orphaned prefix ranges); this one rewrites cells in *live* tables.
 pub struct RelCrossEngineSweeper {
     engine: Arc<RelEngine>,
@@ -1028,7 +1028,7 @@ mod tests {
         // Recreate the KV domain: the physically-nulled cell stays NULL.
         e.kv.finalize_domain_deletion("d").await.unwrap();
         e.kv.create_domain("d").await.unwrap();
-        assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null, "genullt bleibt genullt");
+        assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null, "nulled stays nulled");
     }
 
     // ── 20. Sweep is optimistic: recreate + fresh valid link survives ────────

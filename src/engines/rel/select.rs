@@ -56,7 +56,7 @@ impl PlanRow {
 
 // ── Volcano operator interface (spec §2) ─────────────────────────────────────
 //
-// `async fn` in a trait is not `dyn`-compatible (spec's Rust-Hinweis); this
+// `async fn` in a trait is not `dyn`-compatible (spec's Rust note); this
 // project's established pattern for async traits (`StorageEngine`,
 // `src/engines/mod.rs`) is RPITIT (`fn(&mut self) -> impl Future<...> + Send`),
 // used here too. v1 needs no dynamic dispatch (no join yet), so the finitely
@@ -68,7 +68,7 @@ impl PlanRow {
 // is not `dyn`-safe, that will need its own boxed-future trait (or an
 // operator enum) at that point — the seam is conceptual, not literal (spec §2).
 // `pub(super)`: the rel/007 join operator (`join.rs`) composes over this same
-// trait — the sanctioned single mechanism (spec rel/006 §2 Rust-Hinweis).
+// trait — the sanctioned single mechanism (spec rel/006 §2 Rust note).
 pub(super) trait RowSource {
     fn next(&mut self) -> impl Future<Output = Result<Option<PlanRow>, RelStoreError>> + Send;
 }
@@ -95,7 +95,7 @@ impl RowSource for RowScan {
                 let Some(key) = self.keys.next() else { return Ok(None) };
                 // A key live during the key-list scan but gone at the
                 // snapshot fetch is a ghost (spec §2 "Snapshot &
-                // Konsistenz") — skip it, not an error.
+                // Ghosts") — skip it, not an error.
                 if let Some(bytes) = self.engine.get_with_snapshot(&key, &self.snapshot).await?.into_option() {
                     let mut values = decode_row(&bytes, &self.schema);
                     self.mask.apply(&mut values, &self.schema);
@@ -697,7 +697,7 @@ impl RelEngine {
     }
 
     /// COUNT(*) (spec §7): counts over the chosen access path without
-    /// materializing rows. ORDER BY/LIMIT are ignored (sinnlos for a count).
+    /// materializing rows. ORDER BY/LIMIT are ignored (meaningless for a count).
     /// No residual ⇒ pure key count (`resolve_candidate_keys` never decodes
     /// a row); a residual ⇒ fetch+decode+`eval` per candidate, as usual.
     async fn exec_count(
@@ -720,7 +720,7 @@ impl RelEngine {
 
         let n: i64 = match plan.residual {
             // PkPoint constructs its single key without scanning — its
-            // existence must be verified (spec §7: "0/1 beim Punkt"). Every
+            // existence must be verified (spec §7: "0/1 at a point"). Every
             // other path derives keys from a live scan, so len() is the count.
             None if matches!(plan.access, AccessPath::PkPoint(_)) => {
                 match row_keys.first() {

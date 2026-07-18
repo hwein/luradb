@@ -1,5 +1,5 @@
 //! Recursive-descent parser for the full LuraSQL grammar (spec rel/004 §4,
-//! concept 004 kap. 4.1). It builds the AST for every statement class; the
+//! concept 004 ch. 4.1). It builds the AST for every statement class; the
 //! binder and `mod.rs` then translate and execute each of them downstream.
 //!
 //! Error positions: every `expect_*`/`parse_*` helper reports a `Syntax`

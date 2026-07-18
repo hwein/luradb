@@ -480,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn test_rest_roundtrip_utf8_umlaut_emoji_key() {
         let (app, _dir) = make_app().await;
-        let key = "über-🎉";
+        let key = "börek-🎉";
         let uri = format!("/store-api/kv/testdom/keys/{}", percent_encode(key));
 
         let put_resp = app

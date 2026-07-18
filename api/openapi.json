@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "LuraDB API",
-    "description": "REST-native multi-model database — KeyValue- und JSON-Engine. `version` ist die API-Contract-Version (siehe API_VERSION), unabhängig von der Server-Version; letztere steht in der Extension `x-luradb-server-version`. Laufzeit-Check: GET /version.",
+    "description": "REST-native multi-model database — KeyValue and JSON engines. `version` is the API contract version (see API_VERSION), independent of the server version; the latter is in the `x-luradb-server-version` extension. Runtime check: GET /version.",
     "contact": {
       "name": "Heiko Wein"
     },
@@ -37,11 +37,11 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Gibt alle angelegten User zurück (Admins und reguläre User).\nAPI Keys werden nicht ausgegeben — nur Name, Rolle und Erstellungszeitpunkt.",
+        "summary": "Returns all created users (admins and regular users).\nAPI keys are not included — only name, role, and creation timestamp.",
         "operationId": "list_users",
         "responses": {
           "200": {
-            "description": "Liste aller User (ohne API Keys)",
+            "description": "List of all users (without API keys)",
             "content": {
               "application/json": {
                 "schema": {
@@ -59,7 +59,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Legt einen neuen User mit der Rolle `User` an.\nDer API Key wird **ausschließlich in dieser Response** zurückgegeben und danach nicht mehr gespeichert.\nNur Admins dürfen diesen Endpunkt aufrufen.",
+        "summary": "Creates a new user with the `User` role.\nThe API key is returned **only in this response** and is not stored afterward.\nOnly admins may call this endpoint.",
         "operationId": "create_user",
         "requestBody": {
           "content": {
@@ -73,7 +73,7 @@
         },
         "responses": {
           "201": {
-            "description": "User angelegt. API Key einmalig in der Response.",
+            "description": "User created. API key is shown once in the response.",
             "content": {
               "application/json": {
                 "schema": {
@@ -83,10 +83,10 @@
             }
           },
           "400": {
-            "description": "Ungültiger Name"
+            "description": "Invalid name"
           },
           "409": {
-            "description": "User existiert bereits"
+            "description": "User already exists"
           }
         }
       }
@@ -96,7 +96,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Löscht einen User und alle seine Domain-Permissions.\nDer API Key des Users wird sofort ungültig — laufende Requests mit dem alten Key erhalten danach `401`.",
+        "summary": "Deletes a user and all of their domain permissions.\nThe user's API key becomes invalid immediately — in-flight requests with the old key then get `401`.",
         "operationId": "delete_user",
         "parameters": [
           {
@@ -111,10 +111,10 @@
         ],
         "responses": {
           "204": {
-            "description": "User und alle Permissions gelöscht"
+            "description": "User and all permissions deleted"
           },
           "404": {
-            "description": "User nicht gefunden"
+            "description": "User not found"
           }
         }
       }
@@ -124,7 +124,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Setzt oder überschreibt die Zugriffsberechtigung eines Users auf eine Domain.\n`access` muss `\"read\"`, `\"write\"` oder `\"ddl\"` sein — jede Stufe schließt die\nniedrigeren ein. Für `kv` muss die Domain existieren; `json`/`rel` prüfen nur den Namen.",
+        "summary": "Sets or overwrites a user's access permission on a domain.\n`access` must be `\"read\"`, `\"write\"`, or `\"ddl\"` — each level includes the\nlower ones. For `kv` the domain must exist; `json`/`rel` only check the name.",
         "operationId": "set_permission",
         "parameters": [
           {
@@ -149,13 +149,13 @@
         },
         "responses": {
           "200": {
-            "description": "Permission gesetzt"
+            "description": "Permission set"
           },
           "400": {
-            "description": "Ungültige access- oder domain-Angabe"
+            "description": "Invalid access or domain value"
           },
           "404": {
-            "description": "User oder Domain nicht gefunden"
+            "description": "User or domain not found"
           }
         }
       }
@@ -165,7 +165,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Entzieht einem User die Zugriffsberechtigung auf eine bestimmte Domain.\n`?store_type=json`/`rel` entzieht eine JSON-/rel-Domain-Permission (Default: kv).\nNach diesem Aufruf erhalten Requests des Users auf diese Domain `403 Forbidden`.",
+        "summary": "Revokes a user's access permission on a specific domain.\n`?store_type=json`/`rel` revokes a JSON/rel domain permission (default: kv).\nAfter this call, the user's requests to this domain get `403 Forbidden`.",
         "operationId": "remove_permission",
         "parameters": [
           {
@@ -180,7 +180,7 @@
           {
             "name": "domain",
             "in": "path",
-            "description": "Domain-Name",
+            "description": "Domain name",
             "required": true,
             "schema": {
               "type": "string"
@@ -189,7 +189,7 @@
           {
             "name": "store_type",
             "in": "query",
-            "description": "'kv' (Default), 'json' oder 'rel'",
+            "description": "'kv' (default), 'json' or 'rel'",
             "required": false,
             "schema": {
               "type": "string"
@@ -198,10 +198,10 @@
         ],
         "responses": {
           "204": {
-            "description": "Permission entzogen"
+            "description": "Permission revoked"
           },
           "404": {
-            "description": "Permission nicht gefunden"
+            "description": "Permission not found"
           }
         }
       }
@@ -211,7 +211,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Generiert einen neuen API Key für den User und invalidiert den alten sofort.\nDer neue Key wird **ausschließlich in dieser Response** zurückgegeben.\nVerwende dies bei Key-Leaks oder regelmäßiger Key-Rotation.",
+        "summary": "Generates a new API key for the user and immediately invalidates the old one.\nThe new key is returned **only in this response**.\nUse this after key leaks or for regular key rotation.",
         "operationId": "rotate_key",
         "parameters": [
           {
@@ -226,7 +226,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Neuer API Key generiert (einmalig sichtbar)",
+            "description": "New API key generated (visible once)",
             "content": {
               "application/json": {
                 "schema": {
@@ -236,7 +236,7 @@
             }
           },
           "404": {
-            "description": "User nicht gefunden"
+            "description": "User not found"
           }
         }
       }
@@ -2273,7 +2273,7 @@
         "operationId": "version",
         "responses": {
           "200": {
-            "description": "Server- und API-Contract-Version",
+            "description": "Server and API contract version",
             "content": {
               "application/json": {
                 "schema": {
@@ -2283,7 +2283,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized — gültiger API-Key erforderlich"
+            "description": "Unauthorized — a valid API key is required"
           }
         },
         "security": [
@@ -2466,7 +2466,7 @@
         "properties": {
           "api_key": {
             "type": "string",
-            "description": "API Key (nur einmalig sichtbar — danach nicht mehr abrufbar)."
+            "description": "API key (visible only once — cannot be retrieved afterward)."
           },
           "name": {
             "type": "string"
@@ -2690,7 +2690,7 @@
         "properties": {
           "api_key": {
             "type": "string",
-            "description": "Neuer API Key (nur einmalig sichtbar — danach nicht mehr abrufbar)."
+            "description": "New API key (visible only once — cannot be retrieved afterward)."
           },
           "name": {
             "type": "string"
@@ -2800,18 +2800,18 @@
         "properties": {
           "access": {
             "type": "string",
-            "description": "Zugriffsebene: `\"read\"`, `\"write\"` oder `\"ddl\"` (spec rel/011)."
+            "description": "Access level: `\"read\"`, `\"write\"` or `\"ddl\"` (spec rel/011)."
           },
           "domain": {
             "type": "string",
-            "description": "Name der Domain."
+            "description": "Domain name."
           },
           "store_type": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Store-Typ der Domain: `\"kv\"` (Default), `\"json\"` (spec json/012) oder `\"rel\"` (spec rel/011)."
+            "description": "Store type of the domain: `\"kv\"` (default), `\"json\"` (spec json/012) or `\"rel\"` (spec rel/011)."
           }
         }
       },
@@ -2936,11 +2936,11 @@
         "properties": {
           "api_version": {
             "type": "string",
-            "description": "API-Contract-Version — identisch mit `info.version` des Contracts."
+            "description": "API contract version — identical to the contract's `info.version`."
           },
           "server_version": {
             "type": "string",
-            "description": "Server-Version (CARGO_PKG_VERSION)."
+            "description": "Server version (CARGO_PKG_VERSION)."
           }
         }
       },
@@ -2970,7 +2970,7 @@
       "bearer_auth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "API Key wie in `luradb.toml` konfiguriert (Admins) oder wie bei User-Anlage / Key-Rotation erhalten. Nur bei `auth.enabled = true` erforderlich."
+        "description": "API key as configured in `luradb.toml` (admins), or as received on user creation / key rotation. Only required when `auth.enabled = true`."
       }
     }
   },
@@ -2982,7 +2982,7 @@
   "tags": [
     {
       "name": "Metrics",
-      "description": "Heartbeat und Performance-Metriken"
+      "description": "Heartbeat and performance metrics"
     },
     {
       "name": "Domains",
@@ -3018,7 +3018,7 @@
     },
     {
       "name": "Auth",
-      "description": "User-Verwaltung und Domain-Permissions — nur für Admins"
+      "description": "User management and domain permissions — admins only"
     }
   ]
 }

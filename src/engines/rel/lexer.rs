@@ -688,7 +688,7 @@ mod tests {
         assert!(tokenize(&sql, 64).is_ok());
     }
 
-    // ── Vorarbeit (spec quality/008): tokenize/scan_number error paths ─────────
+    // ── Prep work (spec quality/008): tokenize/scan_number error paths ─────────
 
     // A lone '!' (no following '=') is a syntax error, not silently consumed.
     #[test]

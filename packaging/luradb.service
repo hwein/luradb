@@ -1,0 +1,35 @@
+[Unit]
+Description=LuraDB multi-model database
+After=network.target
+
+[Service]
+Type=simple
+User=luradb
+Group=luradb
+ExecStart=/usr/bin/luradb --config /etc/luradb/luradb.toml
+# Sicherheitsnetz, falls ein Operator relative Storage-Pfade konfiguriert.
+WorkingDirectory=/var/lib/luradb
+StateDirectory=luradb
+StateDirectoryMode=0750
+# 0750: Gruppenmitglieder brauchen +x, um den UDS-Socket zu erreichen.
+RuntimeDirectory=luradb
+RuntimeDirectoryMode=0750
+UMask=0027
+LimitNOFILE=65536
+# io_uring Registered Buffers (perf/004/005) brauchen memlock.
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=2
+
+# Hardening — bewusst OHNE SystemCallFilter: io_uring-Syscalls müssen erlaubt bleiben.
+# /dev/shm bleibt unter ProtectSystem=strict beschreibbar (SHM-Feature).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

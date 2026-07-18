@@ -1,0 +1,3032 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "LuraDB API",
+    "description": "REST-native multi-model database — KeyValue- und JSON-Engine. `version` ist die API-Contract-Version (siehe API_VERSION), unabhängig von der Server-Version; letztere steht in der Extension `x-luradb-server-version`. Kompatibilitäts-Ranges: api/COMPATIBILITY.md. Laufzeit-Check: GET /version.",
+    "contact": {
+      "name": "Heiko Wein"
+    },
+    "license": {
+      "name": "FSL-1.1-ALv2"
+    },
+    "version": "0.1.0",
+    "x-luradb-server-version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Metrics"
+        ],
+        "summary": "`GET /health` — public heartbeat endpoint.",
+        "description": "Returns a JSON snapshot of system vitals. No authentication required.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "System is healthy"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/store-api/auth/users": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Gibt alle angelegten User zurück (Admins und reguläre User).",
+        "description": "API Keys werden nicht ausgegeben — nur Name, Rolle und Erstellungszeitpunkt.",
+        "operationId": "list_users",
+        "responses": {
+          "200": {
+            "description": "Liste aller User (ohne API Keys)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UserListItem"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Legt einen neuen User mit der Rolle `User` an.",
+        "description": "Der API Key wird **ausschließlich in dieser Response** zurückgegeben und danach nicht mehr gespeichert.\nNur Admins dürfen diesen Endpunkt aufrufen.",
+        "operationId": "create_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "User angelegt. API Key einmalig in der Response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateUserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Ungültiger Name"
+          },
+          "409": {
+            "description": "User existiert bereits"
+          }
+        }
+      }
+    },
+    "/store-api/auth/users/{name}": {
+      "delete": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Löscht einen User und alle seine Domain-Permissions.",
+        "description": "Der API Key des Users wird sofort ungültig — laufende Requests mit dem alten Key erhalten danach `401`.",
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "User und alle Permissions gelöscht"
+          },
+          "404": {
+            "description": "User nicht gefunden"
+          }
+        }
+      }
+    },
+    "/store-api/auth/users/{name}/permissions": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Setzt oder überschreibt die Zugriffsberechtigung eines Users auf eine Domain.",
+        "description": "`access` muss `\"read\"`, `\"write\"` oder `\"ddl\"` sein — jede Stufe schließt die\nniedrigeren ein. Für `kv` muss die Domain existieren; `json`/`rel` prüfen nur den Namen.",
+        "operationId": "set_permission",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Permission gesetzt"
+          },
+          "400": {
+            "description": "Ungültige access- oder domain-Angabe"
+          },
+          "404": {
+            "description": "User oder Domain nicht gefunden"
+          }
+        }
+      }
+    },
+    "/store-api/auth/users/{name}/permissions/{domain}": {
+      "delete": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Entzieht einem User die Zugriffsberechtigung auf eine bestimmte Domain.",
+        "description": "`?store_type=json`/`rel` entzieht eine JSON-/rel-Domain-Permission (Default: kv).\nNach diesem Aufruf erhalten Requests des Users auf diese Domain `403 Forbidden`.",
+        "operationId": "remove_permission",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain-Name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "store_type",
+            "in": "query",
+            "description": "'kv' (Default), 'json' oder 'rel'",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Permission entzogen"
+          },
+          "404": {
+            "description": "Permission nicht gefunden"
+          }
+        }
+      }
+    },
+    "/store-api/auth/users/{name}/rotate-key": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Generiert einen neuen API Key für den User und invalidiert den alten sofort.",
+        "description": "Der neue Key wird **ausschließlich in dieser Response** zurückgegeben.\nVerwende dies bei Key-Leaks oder regelmäßiger Key-Rotation.",
+        "operationId": "rotate_key",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Neuer API Key generiert (einmalig sichtbar)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RotateKeyResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "User nicht gefunden"
+          }
+        }
+      }
+    },
+    "/store-api/domains": {
+      "get": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Returns all active domains with their names and creation timestamps.",
+        "operationId": "list_domains",
+        "responses": {
+          "200": {
+            "description": "List of active domains",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DomainResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Creates a new logical domain (isolated KV namespace).",
+        "description": "Domain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.",
+        "operationId": "create_domain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Domain created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid domain name"
+          },
+          "409": {
+            "description": "Domain already exists"
+          }
+        }
+      }
+    },
+    "/store-api/domains/{name}": {
+      "get": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Returns metadata for a single domain by name. Returns 404 if it does not exist.",
+        "operationId": "get_domain",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Domain found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Schedules a domain and all its data for deletion.",
+        "description": "The domain becomes immediately inaccessible; the actual purge runs in the background.",
+        "operationId": "delete_domain",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deletion accepted — background purge started"
+          },
+          "404": {
+            "description": "Domain not found"
+          }
+        }
+      }
+    },
+    "/store-api/json/domains": {
+      "get": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Returns all active JSON domains.",
+        "operationId": "list_domains",
+        "responses": {
+          "200": {
+            "description": "List of active JSON domains",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JsonDomainResponse"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Creates a new JSON domain (isolated document namespace, separate from KV domains).",
+        "operationId": "create_domain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateJsonDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "JSON domain created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonDomainResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid domain name"
+          },
+          "409": {
+            "description": "Domain already exists"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/domains/{name}": {
+      "get": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Returns metadata for a single JSON domain, including its document count.",
+        "description": "Domains in `deleting` state answer with 410 Gone.",
+        "operationId": "get_domain",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "JSON domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Domain found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonDomainResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "410": {
+            "description": "Domain is being deleted (background purge running)"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Marks a JSON domain as deleting. Documents become inaccessible immediately.",
+        "operationId": "delete_domain",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "JSON domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deletion accepted — background purge follows"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/bulk": {
+      "post": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Imports documents from an NDJSON body in atomic batches.",
+        "operationId": "bulk_load",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "NDJSON — one document per line, optional _key field",
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Import summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkLoadResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/documents": {
+      "get": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Lists documents of a domain without filters (natural key order).",
+        "operationId": "list_documents",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (default 50, max 1000)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Documents to skip",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "nullable": true,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "keys_only",
+            "in": "query",
+            "description": "Return only keys, no content",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated document list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Stores a document under a system-generated UUIDv4 key (create-only).",
+        "operationId": "create_document",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Document created with generated UUIDv4 key"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "413": {
+            "description": "Payload too large"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/documents/count": {
+      "get": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Counts all documents of a domain (key scan only).",
+        "operationId": "count_documents",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Document count",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CountResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/documents/{key}": {
+      "get": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Reads a document; `_key`/`_version` are top-level fields and an opaque",
+        "description": "`ETag` is exposed for use with `If-Match` (json/011).",
+        "operationId": "get_document",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Document key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Document content with _key/_version metadata"
+          },
+          "404": {
+            "description": "Document or domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a",
+        "description": "conditional update that fails with 409 on a version mismatch.",
+        "operationId": "put_document",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Document key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Document updated"
+          },
+          "201": {
+            "description": "Document created"
+          },
+          "400": {
+            "description": "Invalid key or If-Match header"
+          },
+          "404": {
+            "description": "Domain not found, or If-Match on missing document"
+          },
+          "409": {
+            "description": "Version conflict (If-Match mismatch)"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Deletes a document and its index entries. Supports conditional delete via",
+        "description": "`If-Match: \"<etag>\"`.",
+        "operationId": "delete_document",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Document key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Document deleted"
+          },
+          "404": {
+            "description": "Document or domain not found"
+          },
+          "409": {
+            "description": "Version conflict (If-Match mismatch)"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/export": {
+      "get": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Streams all documents of a domain as NDJSON without full buffering.",
+        "operationId": "export_documents",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "NDJSON stream of all documents"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/indexes": {
+      "get": {
+        "tags": [
+          "JSON Indexes"
+        ],
+        "summary": "Lists all index definitions of a domain.",
+        "operationId": "list_indexes",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Index definitions of the domain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/IndexResponse"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "JSON Indexes"
+        ],
+        "summary": "Creates an index definition. Existing documents are NOT back-indexed —",
+        "description": "trigger a re-index for that.",
+        "operationId": "create_index",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIndexRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Index definition created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid field or type"
+          },
+          "409": {
+            "description": "Index already exists"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/indexes/{field}": {
+      "delete": {
+        "tags": [
+          "JSON Indexes"
+        ],
+        "summary": "Removes an index definition.",
+        "operationId": "delete_index",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "field",
+            "in": "path",
+            "description": "Indexed field path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Index definition removed"
+          },
+          "404": {
+            "description": "Index or domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/reindex": {
+      "post": {
+        "tags": [
+          "JSON Indexes"
+        ],
+        "summary": "Starts a background re-index of the domain (all indexes, or one field).",
+        "operationId": "trigger_reindex",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Optional field restriction",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReindexRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Re-index started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReindexAcceptedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request body"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "409": {
+            "description": "Re-index already running for this domain"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/reindex/{task_id}": {
+      "get": {
+        "tags": [
+          "JSON Indexes"
+        ],
+        "summary": "Returns the status of a re-index task. Tasks are domain-scoped: a task id",
+        "description": "of another domain answers 404 (tenant isolation).",
+        "operationId": "reindex_status",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Re-index task id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current re-index status"
+          },
+          "404": {
+            "description": "Unknown task id for this domain"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/json/{domain}/search": {
+      "post": {
+        "tags": [
+          "JSON Document Store"
+        ],
+        "summary": "Searches documents via indexed fields. Filters: `\"field\": value` for",
+        "description": "equality or `\"field\": {\"$gt\": …}` for ranges; multiple fields are ANDed.",
+        "operationId": "search_documents",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "JSON domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching documents",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter or unindexed field"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "503": {
+            "description": "JSON engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/kv/{domain}/keys": {
+      "get": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Lists all keys in the domain, optionally filtered by a prefix. Returns an empty array if no keys match.",
+        "operationId": "scan_keys",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "description": "Key prefix filter",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of matching keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/store-api/kv/{domain}/keys/{key}": {
+      "get": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Retrieves the raw byte value for a key. Returns 404 if the key does not exist or has expired.",
+        "operationId": "get_key",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Key (valid UTF-8, max 256 bytes)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Value (raw bytes)"
+          },
+          "400": {
+            "description": "Invalid key"
+          },
+          "404": {
+            "description": "Key or domain not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Inserts or updates a value for the given key (upsert semantics).",
+        "description": "The optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.",
+        "operationId": "put_key",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Key (valid UTF-8, max 256 bytes)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ttl",
+            "in": "query",
+            "description": "TTL in seconds (optional)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true,
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Key upserted"
+          },
+          "400": {
+            "description": "Invalid key"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Permanently removes a key from the domain. The operation is idempotent; deleting a non-existent key still returns 204.",
+        "operationId": "delete_key",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Key (valid UTF-8, max 256 bytes)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Key deleted"
+          },
+          "400": {
+            "description": "Invalid key"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/store-api/kv/{domain}/keys/{key}/null": {
+      "patch": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Writes an explicit null/tombstone marker for a key without removing it from the keyspace.",
+        "description": "Useful for signalling soft-deletes in distributed or CDC scenarios.",
+        "operationId": "set_null",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Key (valid UTF-8, max 256 bytes)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Key set to null (tombstone)"
+          },
+          "400": {
+            "description": "Invalid key"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/store-api/kv/{domain}/watch": {
+      "get": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.",
+        "description": "The connection stays open until the client disconnects; a keep-alive ping is sent automatically.",
+        "operationId": "watch",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "description": "Key prefix filter",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of key change events"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          }
+        }
+      }
+    },
+    "/store-api/metrics": {
+      "get": {
+        "tags": [
+          "Metrics"
+        ],
+        "summary": "`GET /metrics` — system + all domain metrics. Admin only.",
+        "operationId": "get_metrics",
+        "responses": {
+          "200": {
+            "description": "Metrics snapshot"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden — Admin only"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/store-api/metrics/domains/{name}": {
+      "get": {
+        "tags": [
+          "Metrics"
+        ],
+        "summary": "`GET /metrics/domains/{name}` — metrics for one domain. Admin or domain user.",
+        "operationId": "get_domain_metrics",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Domain metrics snapshot"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Domain not found or no metrics yet"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/store-api/rel/domains": {
+      "get": {
+        "tags": [
+          "Relational Domains"
+        ],
+        "summary": "Returns all active relational domains.",
+        "operationId": "list_domains",
+        "responses": {
+          "200": {
+            "description": "List of active relational domains",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RelDomainResponse"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Relational Domains"
+        ],
+        "summary": "Creates a new relational domain (isolated table/view namespace, separate",
+        "description": "from KV and JSON domains).",
+        "operationId": "create_domain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRelDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Relational domain created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelDomainResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid domain name"
+          },
+          "409": {
+            "description": "Domain already exists"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/rel/domains/{name}": {
+      "get": {
+        "tags": [
+          "Relational Domains"
+        ],
+        "summary": "Returns metadata for a single relational domain. A domain in `deleting`",
+        "description": "state answers 410 Gone (rel/013 finishes the physical purge).",
+        "operationId": "get_domain",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Relational domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Domain found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelDomainResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "410": {
+            "description": "Domain is being deleted (background purge running)"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Relational Domains"
+        ],
+        "summary": "Marks a relational domain as deleting. Its tables/views become",
+        "description": "inaccessible immediately; physical cleanup follows in rel/013.",
+        "operationId": "delete_domain",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Relational domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Deletion accepted — background purge follows (rel/013)"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "410": {
+            "description": "Domain is already being deleted"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/rel/{domain}/sql": {
+      "post": {
+        "tags": [
+          "Relational Store"
+        ],
+        "summary": "Executes exactly one LuraSQL statement against `domain` and returns its",
+        "description": "typed result. `expand` resolves REFERENCES columns of a SELECT into\nembedded objects (or `\"*\"` for every REFERENCES column).",
+        "operationId": "execute_sql",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SqlRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Statement result. Shape depends on the statement class — DDL: {\"ok\":true}; INSERT/UPDATE/DELETE: {\"affected\",\"last_pk\"}; SELECT: {\"columns\":[{\"name\",\"type\"}],\"rows\":[[...]],\"row_count\",\"limit_applied\",\"expanded\"?}. `rows` are arrays (not objects) so same-named JOIN columns don't collide.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Syntax, type, parameter-count, or expand error"
+          },
+          "403": {
+            "description": "Access level too low for this statement (rel/011)"
+          },
+          "404": {
+            "description": "Domain, table, column, or index not found"
+          },
+          "409": {
+            "description": "Conflict — duplicate key, unique violation, name collision, …"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "413": {
+            "description": "Response exceeds max_response_bytes"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/rel/{domain}/tables": {
+      "get": {
+        "tags": [
+          "Relational Browse"
+        ],
+        "summary": "Lists the tables of a domain (views are listed separately, `GET …/views`).",
+        "operationId": "list_tables",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tables of the domain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TableSummary"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/rel/{domain}/tables/{table}": {
+      "get": {
+        "tags": [
+          "Relational Browse"
+        ],
+        "summary": "Returns a table's schema (columns, indexes) plus HATEOAS links. A view",
+        "description": "name answers 404 here — use `GET …/views` for views.",
+        "operationId": "get_table",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Table schema detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain or table not found (a view is not a table)"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/rel/{domain}/tables/{table}/rows": {
+      "get": {
+        "tags": [
+          "Relational Browse"
+        ],
+        "summary": "Lists rows of `table`. Every query parameter other than `expand`/`limit`/",
+        "description": "`offset` is an equality filter on the like-named column (`?col=value`,\nAND-combined); parse errors and unknown filter columns answer 400. This\ncompiles onto the same bound `*`-SELECT plan `/sql` would use.",
+        "operationId": "browse_rows",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "expand",
+            "in": "query",
+            "description": "Comma-separated REFERENCES columns to resolve, or \"*\" for all",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows to return (falls back to the configured default, capped at the configured max)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching rows as objects, with row_count/limit/offset/limit_applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RowsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown filter column, or a filter/limit/offset parse/type error"
+          },
+          "404": {
+            "description": "Domain or table not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "413": {
+            "description": "Response exceeds max_response_bytes"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Relational Rows"
+        ],
+        "summary": "Inserts one row from a JSON object body (`{column: value, …}`). An omitted",
+        "description": "AUTOINCREMENT primary key is assigned the next sequence value (rel/005\n§9); this compiles onto the exact same bound INSERT plan `/sql` would use.",
+        "operationId": "insert_row",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Row inserted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "NOT NULL/type/schema violation"
+          },
+          "404": {
+            "description": "Domain, table, or referenced body column not found"
+          },
+          "409": {
+            "description": "PK collision, unique violation, or missing REFERENCES target"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/rel/{domain}/tables/{table}/rows/{pk}": {
+      "get": {
+        "tags": [
+          "Relational Browse"
+        ],
+        "summary": "Fetches a single row by primary key — the same PK-point SELECT plan",
+        "description": "`/sql`'s `WHERE pk = ?` would use.",
+        "operationId": "get_row",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pk",
+            "in": "path",
+            "description": "Primary key value",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "expand",
+            "in": "query",
+            "description": "Comma-separated REFERENCES columns to resolve, or \"*\"",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The row as an object, with an optional _expanded block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "PK parse/type error"
+          },
+          "404": {
+            "description": "Domain, table, or row not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "413": {
+            "description": "Response exceeds max_response_bytes"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Relational Rows"
+        ],
+        "summary": "Partially updates a row by primary key: only the columns named in the",
+        "description": "body are set, everything else stays unchanged (spec §5). Not an upsert —\na PK the table doesn't have answers 404, never a create.",
+        "operationId": "update_row",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pk",
+            "in": "path",
+            "description": "Primary key value",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Row updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "NOT NULL/type/schema violation, or body primary key != path primary key"
+          },
+          "404": {
+            "description": "Domain, table, column, or row not found"
+          },
+          "409": {
+            "description": "Unique violation, or missing REFERENCES target"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Relational Rows"
+        ],
+        "summary": "Deletes a row by primary key. Hanging REFERENCES from other tables are",
+        "description": "not blocked by this (rel/005 §11) — they resolve to `null` afterwards.",
+        "operationId": "delete_row",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pk",
+            "in": "path",
+            "description": "Primary key value",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Row deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "PK parse/type error"
+          },
+          "404": {
+            "description": "Domain, table, or row not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/store-api/rel/{domain}/views": {
+      "get": {
+        "tags": [
+          "Relational Browse"
+        ],
+        "summary": "Lists the views of a domain, including their raw (unmodified) SQL text.",
+        "operationId": "list_views",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Views of the domain, incl. raw SQL text",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ViewSummary"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
+    "/version": {
+      "get": {
+        "tags": [
+          "Metrics"
+        ],
+        "summary": "`GET /version` — version handshake. Requires any valid API key.",
+        "operationId": "version",
+        "responses": {
+          "200": {
+            "description": "Server- und API-Contract-Version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — gültiger API-Key erforderlich"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BulkErrorEntry": {
+        "type": "object",
+        "required": [
+          "key",
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string",
+            "description": "Document key or \"line N\" for parse errors."
+          }
+        }
+      },
+      "BulkLoadResponse": {
+        "type": "object",
+        "required": [
+          "imported",
+          "failed",
+          "errors"
+        ],
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkErrorEntry"
+            }
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "imported": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ColumnInfo": {
+        "type": "object",
+        "required": [
+          "name",
+          "type",
+          "nullable",
+          "primary_key",
+          "autoincrement",
+          "unique"
+        ],
+        "properties": {
+          "autoincrement": {
+            "type": "boolean"
+          },
+          "default": {
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "primary_key": {
+            "type": "boolean"
+          },
+          "references": {
+            "type": "string",
+            "nullable": true
+          },
+          "type": {
+            "type": "string"
+          },
+          "unique": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CountResponse": {
+        "type": "object",
+        "required": [
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CreateDomainRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "User-visible domain name (max 50 chars, [a-zA-Z0-9_-])."
+          }
+        }
+      },
+      "CreateIndexRequest": {
+        "type": "object",
+        "required": [
+          "field",
+          "type"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "JSON field path, dot notation for nested fields (e.g. \"address.city\")."
+          },
+          "type": {
+            "type": "string",
+            "description": "Value type: \"string\" | \"number\" | \"boolean\"."
+          }
+        }
+      },
+      "CreateJsonDomainRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "User-visible domain name (max 50 chars, [a-zA-Z0-9_-])."
+          }
+        }
+      },
+      "CreateRelDomainRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Domain name (max 50 chars, `[a-zA-Z0-9_-]`; `\"domains\"` is reserved)."
+          }
+        }
+      },
+      "CreateUserRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Username (1-50 chars, only [a-zA-Z0-9_-])."
+          }
+        }
+      },
+      "CreateUserResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "role",
+          "api_key"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "description": "API Key (nur einmalig sichtbar — danach nicht mehr abrufbar)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        }
+      },
+      "DocumentListResponse": {
+        "type": "object",
+        "required": [
+          "documents",
+          "keys",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "documents": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Loaded documents incl. `_key`/`_version` (empty when keys_only)."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Document keys of the page."
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "DomainResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation timestamp (Unix seconds).",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "User-visible domain name."
+          }
+        }
+      },
+      "IndexInfo": {
+        "type": "object",
+        "required": [
+          "name",
+          "column",
+          "unique"
+        ],
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "unique": {
+            "type": "boolean"
+          }
+        }
+      },
+      "IndexResponse": {
+        "type": "object",
+        "required": [
+          "field",
+          "type",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "field": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "JsonDomainResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "created_at",
+          "state"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation timestamp (Unix seconds).",
+            "minimum": 0
+          },
+          "document_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of documents — only set on the detail endpoint.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running)."
+          }
+        }
+      },
+      "ListParams": {
+        "type": "object",
+        "properties": {
+          "keys_only": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "minimum": 0
+          }
+        }
+      },
+      "ReindexAcceptedResponse": {
+        "type": "object",
+        "required": [
+          "task_id"
+        ],
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ReindexRequest": {
+        "type": "object",
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "Optional: re-index only this field's index. Omit for all indexes.",
+            "nullable": true
+          }
+        }
+      },
+      "RelDomainResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "created_at",
+          "state"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation timestamp (Unix seconds).",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running, rel/013).\nAlways present — so rel/013's later `list_domains` visibility change\n(surfacing `Deleting` domains too) needs no REST-contract change."
+          }
+        }
+      },
+      "RotateKeyResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "api_key"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "description": "Neuer API Key (nur einmalig sichtbar — danach nicht mehr abrufbar)."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "RowsResponse": {
+        "type": "object",
+        "required": [
+          "rows",
+          "row_count",
+          "limit",
+          "offset",
+          "limit_applied"
+        ],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "limit_applied": {
+            "type": "boolean"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "row_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "One JSON object per row (catalog column order in principle; `serde_json`'s\ndefault map is unordered/alphabetical here, see rel_browse.rs module docs),\nwith an optional `_expanded` block (spec §6)."
+          }
+        }
+      },
+      "SearchRequest": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "object",
+            "description": "Field → value (Eq) or `{\"$gt\": …}` / `$gte` / `$lt` / `$lte` / `$eq`."
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "minimum": 0
+          }
+        }
+      },
+      "SearchResponse": {
+        "type": "object",
+        "required": [
+          "documents",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "documents": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Matching documents incl. `_key`/`_version` metadata."
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "SetPermissionRequest": {
+        "type": "object",
+        "required": [
+          "domain",
+          "access"
+        ],
+        "properties": {
+          "access": {
+            "type": "string",
+            "description": "Zugriffsebene: `\"read\"`, `\"write\"` oder `\"ddl\"` (spec rel/011)."
+          },
+          "domain": {
+            "type": "string",
+            "description": "Name der Domain."
+          },
+          "store_type": {
+            "type": "string",
+            "description": "Store-Typ der Domain: `\"kv\"` (Default), `\"json\"` (spec json/012) oder `\"rel\"` (spec rel/011).",
+            "nullable": true
+          }
+        }
+      },
+      "SqlRequest": {
+        "type": "object",
+        "required": [
+          "sql"
+        ],
+        "properties": {
+          "expand": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "REFERENCES columns to resolve into embedded objects, or `[\"*\"]` for\nall of them (§5). Only valid for SELECT; non-empty on DML/DDL → 400."
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Positional parameters (JSON array), bound to the `?` placeholders\n(rel/004/005). Omitted ⇒ empty array."
+          },
+          "sql": {
+            "type": "string",
+            "description": "Exactly one LuraSQL statement (more → 400 `MultipleStatements`, rel/004)."
+          }
+        }
+      },
+      "TableDetail": {
+        "type": "object",
+        "required": [
+          "name",
+          "columns",
+          "indexes",
+          "created_at",
+          "_links"
+        ],
+        "properties": {
+          "_links": {
+            "$ref": "#/components/schemas/TableLinks"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnInfo"
+            }
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IndexInfo"
+            }
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "TableLinks": {
+        "type": "object",
+        "required": [
+          "self",
+          "rows"
+        ],
+        "properties": {
+          "rows": {
+            "type": "string"
+          },
+          "self": {
+            "type": "string"
+          }
+        }
+      },
+      "TableSummary": {
+        "type": "object",
+        "required": [
+          "name",
+          "_links"
+        ],
+        "properties": {
+          "_links": {
+            "$ref": "#/components/schemas/TableLinks"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "UserListItem": {
+        "type": "object",
+        "required": [
+          "name",
+          "role",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        }
+      },
+      "VersionResponse": {
+        "type": "object",
+        "required": [
+          "server_version",
+          "api_version"
+        ],
+        "properties": {
+          "api_version": {
+            "type": "string",
+            "description": "API-Contract-Version — identisch mit `info.version` des Contracts."
+          },
+          "server_version": {
+            "type": "string",
+            "description": "Server-Version (CARGO_PKG_VERSION)."
+          }
+        }
+      },
+      "ViewSummary": {
+        "type": "object",
+        "required": [
+          "name",
+          "sql",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "sql": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer_auth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API Key wie in `luradb.toml` konfiguriert (Admins) oder wie bei User-Anlage / Key-Rotation erhalten. Nur bei `auth.enabled = true` erforderlich."
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer_auth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Metrics",
+      "description": "Heartbeat und Performance-Metriken"
+    },
+    {
+      "name": "Domains",
+      "description": "Domain lifecycle — create, list, get, delete"
+    },
+    {
+      "name": "Key-Value Store",
+      "description": "Domain-scoped key-value operations"
+    },
+    {
+      "name": "JSON Document Store",
+      "description": "Domain-scoped JSON document operations"
+    },
+    {
+      "name": "JSON Indexes",
+      "description": "Index management for JSON domains"
+    },
+    {
+      "name": "Relational Domains",
+      "description": "Relational domain lifecycle"
+    },
+    {
+      "name": "Relational Store",
+      "description": "Domain-scoped LuraSQL execution"
+    },
+    {
+      "name": "Relational Browse",
+      "description": "Catalog and row browsing for relational domains"
+    },
+    {
+      "name": "Relational Rows",
+      "description": "Row-level writes on relational tables"
+    },
+    {
+      "name": "Auth",
+      "description": "User-Verwaltung und Domain-Permissions — nur für Admins"
+    }
+  ]
+}

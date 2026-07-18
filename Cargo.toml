@@ -1,0 +1,105 @@
+[package]
+name = "luradb"
+version = "0.1.0"
+edition = "2021"
+authors = ["Heiko Wein"]
+description = "LuraDB: A Linux-first, REST-native multi-model database"
+license = "FSL-1.1-ALv2"
+repository = "https://github.com/hwein/luradb"
+readme = "README.md"
+# Wir optimieren für Linux
+exclude = ["/.github/**", "/docs/**"]
+
+[dependencies]
+# --- Core: Async Runtime & Web Interface ---
+# Axum ist unser "Treiber"
+axum = { version = "0.7", features = ["macros", "http2"] }
+# Direkter Zugriff auf die HTTP-Conn-Maschinerie für den UDS-Listener (perf/001);
+# beide sind bereits transitive Abhängigkeiten von Axum.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+utoipa = { version = "4.2", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "6", features = ["axum"] }
+# Tokio als Basis-Runtime (notwendig für Axum)
+tokio = { version = "1", features = ["full"] }
+# Middleware für Tracing und CORS
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
+
+# --- The "Lura" Power: Linux I/O ---
+# Das Herzstück: Asynchrones I/O über io_uring
+tokio-uring = "0.5"
+# Raw io_uring ring für den SQPOLL Storage Thread (perf/005).
+io-uring = "0.6"
+# Für Low-Level Flags wie O_DIRECT und mmap (Shared Memory)
+libc = "0.2"
+# Effizientes Byte-Handling für Zero-Copy Strategien
+bytes = "1.5"
+
+# --- Storage & Data Engines ---
+# Serde für alles (JSON Engine & API Responses)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Bincode für kompaktes Speichern im WAL und KV-Store
+bincode = "1.3"
+# Memmap2 für den Shared-Memory Zugriff
+memmap2 = "0.9"
+# rkyv for zero-copy deserialization
+rkyv = { version = "0.7", features = ["archive_le", "validation"] }
+rkyv_derive = "0.7"
+
+# --- Concurrency & Safety ---
+# DashMap für hoch-performante, lock-free Maps im RAM
+dashmap = "5.5"
+crossbeam-skiplist = "0.1"
+crossbeam-utils = "0.8"
+parking_lot = "0.12"
+
+# --- Utils ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+thiserror = "1"
+anyhow = "1"
+# TOML config file parsing
+toml = "0.8"
+# CLI Argument Parsing (Server start port etc.)
+clap = { version = "4", features = ["derive"] }
+futures = "0.3.31"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.10"
+# Benchmark harness (perf/011).
+# "async" (not "async_tokio") so criterion doesn't pull its own separate tokio
+# dependency — we supply our own AsyncExecutor wrapping the project's runtime.
+criterion = { version = "0.5", features = ["html_reports", "async"] }
+# Client-side features for the IPC benchmark's hyper HTTP client (TCP + UDS).
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
+
+[[bench]]
+name = "ipc_bench"
+harness = false
+
+[package.metadata.deb]
+maintainer = "Heiko Wein <heiko.wein.hw@gmail.com>"
+copyright = "2026 Heiko Wein"
+license-file = ["LICENSE.md", "0"]
+extended-description = """\
+Linux-first, REST-native multi-model database (key-value + JSON documents)
+built on io_uring. Runs as a systemd service; configuration in /etc/luradb,
+data in /var/lib/luradb, logs via journald."""
+section = "database"
+priority = "optional"
+depends = "$auto, adduser"
+maintainer-scripts = "packaging/deb"
+systemd-units = { unit-scripts = "packaging", enable = true, start = true }
+assets = [
+    ["target/release/luradb", "usr/bin/", "755"],
+    ["packaging/luradb.toml", "etc/luradb/luradb.toml", "640"],
+    ["README.md", "usr/share/doc/luradb/README.md", "644"],
+    ["packaging/INSTALL.md", "usr/share/doc/luradb/INSTALL.md", "644"],
+]
+conf-files = ["/etc/luradb/luradb.toml"]

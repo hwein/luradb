@@ -1,0 +1,76 @@
+[server]
+# Set to false to disable Swagger UI in production
+swagger_enabled = true
+swagger_url = "/test-ui"
+bind_address = "127.0.0.1"
+port = 3000
+
+# Set to false to disable the root "/" route
+hello_enabled = true
+hello_message = "Hello from LuraDB"
+
+[auth]
+enabled = true
+
+[[auth.admins]]
+name = "admin"
+api_key = "lura_changeme_in_production"
+
+[storage]
+db_path = "luradb.db"
+wal_path = "luradb.wal"
+vlog_path = "luradb.vlog"
+sstable_dir = "luradb_sstables"
+
+[buffer_pool]
+pool_size = 1024
+
+[lsm]
+vlog_inline_threshold = 1024
+memtable_size_threshold = 4194304
+max_key_length = 256
+max_value_size = 524288
+flush_check_interval_ms = 100
+compaction_check_interval_ms = 1000
+wal_event_channel_capacity = 256
+
+[compaction]
+l0_threshold = 4
+l1_max_size = 104857600
+level_size_ratio = 10
+max_sstable_size = 67108864
+
+[janitor]
+check_interval_secs = 60
+dead_bytes_threshold = 0.30
+min_vlog_size_bytes = 67108864
+
+[domains]
+max_name_length = 50
+max_user_key_length = 256
+default_domain = "default"
+purger_batch_size = 100
+purger_interval_secs = 5
+
+[rate_limit]
+default_read_iops = 1000
+default_write_iops = 500
+default_max_storage_bytes = 0
+
+[log]
+level = "verbose"
+format = "text"
+# path = "/var/log/luradb"   # leer = stdout
+rotation = "daily"
+retention_days = 30
+
+[log.modules]
+# auth = "info"
+# api = "info"
+# engine = "prod"
+# storage = "prod"
+
+[proxy]
+# IPs and CIDR ranges of trusted reverse proxies.
+# Leave empty when LuraDB is accessed directly (no proxy in front).
+trusted_proxies = ["127.0.0.1", "::1"]

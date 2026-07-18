@@ -1,0 +1,49 @@
+# LuraDB config for benches/ipc_bench.rs (spec perf/011).
+# All paths under /tmp — the bench harness wipes them before each run.
+
+[server]
+bind_address = "127.0.0.1"
+port = 3099
+swagger_enabled = false
+hello_enabled = false
+unix_socket_path = "/tmp/luradb_bench.sock"
+
+[storage]
+db_path = "/tmp/luradb_bench.db"
+wal_path = "/tmp/luradb_bench.wal"
+vlog_path = "/tmp/luradb_bench.vlog"
+sstable_dir = "/tmp/luradb_bench_sstables"
+
+[lsm]
+use_mmap = true
+memtable_size_threshold = 16777216 # 16 MB — delays flushes during the run
+
+[shm]
+enabled = true
+instance_id = "bench"
+data_buffer_size = 67108864 # 64 MB
+command_buffer_size = 1048576 # 1 MB
+snapshot_interval_ms = 50
+# Default would be /run/luradb/{instance_id}.sock (root-owned dir) — use /tmp instead.
+registration_socket_path = "/tmp/luradb_bench_reg.sock"
+
+[io_engine]
+enabled = true
+sqpoll_enabled = true
+ring_depth = 256
+registered_buffer_count = 128
+registered_buffer_size = 65536
+
+[auth]
+enabled = false
+
+# Rate limits default to 1000 read/500 write IOPS per domain — far below the
+# throughput this benchmark drives. Raised so scenarios B/D measure real
+# latency/throughput instead of 429s.
+[rate_limit]
+default_read_iops = 100000000
+default_write_iops = 100000000
+
+# Second LSM instance, not needed for IPC-path benchmarks.
+[json]
+enabled = false

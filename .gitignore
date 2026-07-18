@@ -1,0 +1,18 @@
+/target
+.idea/
+.vscode/
+
+# Laufzeit-Artefakte des Dev-Servers
+/luradb.wal
+/luradb.db
+/luradb.vlog
+/luradb_sstables
+
+# Benchmark-Reports (cargo bench)
+/benches/results/
+
+# Privater Meta-Teil (eigenes Repo) und lokales Tooling
+/concepts/
+/AGENTS.md
+/.claude/
+/tools/

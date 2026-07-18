@@ -1,0 +1,65 @@
+[server]
+swagger_enabled = false
+bind_address = "127.0.0.1"
+port = 3000
+hello_enabled = false
+# UDS für lokale Clients; /run/luradb legt systemd an (RuntimeDirectory).
+# Zugriff: Gruppe luradb (Socket-Mode-Default 0o660).
+unix_socket_path = "/run/luradb/luradb.sock"
+
+[auth]
+enabled = true
+
+[[auth.admins]]
+name = "admin"
+# Platzhalter — postinst ersetzt ihn beim Erstinstall durch einen Zufalls-Key.
+api_key = "@GENERATED_ON_INSTALL@"
+
+[storage]
+db_path = "/var/lib/luradb/luradb.db"
+wal_path = "/var/lib/luradb/luradb.wal"
+vlog_path = "/var/lib/luradb/luradb.vlog"
+sstable_dir = "/var/lib/luradb/sstables"
+
+[buffer_pool]
+pool_size = 1024
+
+[lsm]
+vlog_inline_threshold = 1024
+memtable_size_threshold = 4194304
+max_key_length = 256
+max_value_size = 524288
+flush_check_interval_ms = 100
+compaction_check_interval_ms = 1000
+wal_event_channel_capacity = 256
+
+[compaction]
+l0_threshold = 4
+l1_max_size = 104857600
+level_size_ratio = 10
+max_sstable_size = 67108864
+
+[janitor]
+check_interval_secs = 60
+dead_bytes_threshold = 0.30
+min_vlog_size_bytes = 67108864
+
+[domains]
+max_name_length = 50
+max_user_key_length = 256
+default_domain = "default"
+purger_batch_size = 100
+purger_interval_secs = 5
+
+[rate_limit]
+default_read_iops = 1000
+default_write_iops = 500
+default_max_storage_bytes = 0
+
+[log]
+level = "info"
+format = "text"
+# Kein path: stdout → journald (journalctl -u luradb)
+
+[proxy]
+trusted_proxies = ["127.0.0.1", "::1"]

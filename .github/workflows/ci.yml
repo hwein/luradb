@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, next]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      # io_uring needs the runner VM, not a container (Docker's default
+      # seccomp blocks it) - uname -r is the acceptance proof.
+      - name: Log kernel version
+        run: uname -r
+
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+
+      - name: cargo check --tests
+        run: cargo check --tests
+
+      - name: cargo test
+        run: cargo test
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: cargo-deny check
+        run: |
+          cargo install --locked cargo-deny
+          cargo deny check -W unmaintained

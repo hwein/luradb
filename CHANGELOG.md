@@ -6,7 +6,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Fixed
 
-- API: `PATCH /store-api/kv/{domain}/keys/{key}/null` now sets a real null value state instead of deleting the key (concept 001 §2b): the key stays registered and listed in scans, `GET` answers `204 No Content` (previously a wrong 404), and only `DELETE`/TTL expiry remove it. Breaking status-code change — API contract version bumped to 1.0.0.
+- API: `PATCH /store-api/kv/{domain}/keys/{key}/null` now sets a real null value state instead of deleting the key (concept 001 §2b): the key stays registered and listed in scans, `GET` answers `204 No Content` (previously a wrong 404), and only `DELETE`/TTL expiry remove it. Breaking status-code change — API contract version bumped to 0.2.0.
 
 ## [0.1.0] - 2026-07-18
 

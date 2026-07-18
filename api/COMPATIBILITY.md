@@ -6,12 +6,15 @@ API-Contract-Version funktioniert mit welchem Server?".
 Pflegeregeln:
 
 - Neue Zeile bei jedem Bump von `info.version` (== `API_VERSION`,
-  `src/api/mod.rs`). Bump-Regeln (gelten auch in 0.x): MAJOR bei Breaking
-  (Route/Methode oder Feld entfernt/umbenannt, Typ geändert, neues
-  Pflichtfeld im Request, geänderte Statuscode-/Fehler-Semantik), MINOR
-  bei additiven Änderungen (neue Route, neues optionales Request-Feld,
-  neues Response-Feld), PATCH bei reinen Beschreibungs-/Doku-Texten ohne
-  strukturelle Änderung.
+  `src/api/mod.rs`). Solange der Contract in der 0er-Reihe liegt, gilt das
+  Schema `0.MAJOR.MINOR`: Breaking (Route/Methode oder Feld
+  entfernt/umbenannt, Typ geändert, neues Pflichtfeld im Request, geänderte
+  Statuscode-/Fehler-Semantik) bumpt die **mittlere** Stelle (z. B.
+  0.1.0 → 0.2.0); additive und rein dokumentarische Änderungen bumpen die
+  **dritte** Stelle (0.1.0 → 0.1.1).
+- **Die Version 1.0.0 vergibt ausschließlich der Autor** — sie markiert den
+  bewusst stabilisierten Contract und entsteht niemals als Nebeneffekt einer
+  Spec-Umsetzung, egal wie breaking die Änderung ist.
 - Server-Releases ohne API-Änderung erfordern keine Änderung — die
   bestehende Range gilt fort.
 - Künftige Breaking Changes und Abwärtskompatibilitäts-Aussagen (z. B.
@@ -21,7 +24,7 @@ Pflegeregeln:
 | API-Version | Eingeführt mit Server | Kompatible Server-Versionen | Hinweise |
 |---|---|---|---|
 | 0.1.0 | 0.1.0 | 0.1.0 | Initialer Contract (KV, JSON, Domains, Auth, Metrics) |
-| 1.0.0 | 0.1.1 | ≥ 0.1.1 | Breaking (kv/018): `GET` auf einen per `PATCH …/null` genullten Key antwortet 204 statt 404; `set_null` ist ein Update (Key bleibt in Scans sichtbar), kein Soft-Delete mehr |
+| 0.2.0 | 0.1.1 | ≥ 0.1.1 | Breaking (kv/018): `GET` auf einen per `PATCH …/null` genullten Key antwortet 204 statt 404; `set_null` ist ein Update (Key bleibt in Scans sichtbar), kein Soft-Delete mehr |
 
 ## Bezug durch das Client-Repo
 
@@ -35,8 +38,9 @@ Codegen (z. B. `openapi-typescript`/`openapi-fetch`, `orval`,
 
 - `401` ⇒ Key ungültig — Abbruch mit klarer Fehlermeldung (nützliches
   Pre-Flight-Signal).
-- `200` ⇒ kompatibel genau dann, wenn `api_version.major` der
-  einkompilierten Contract-Major entspricht **und** `api_version >=`
+- `200` ⇒ kompatibel genau dann, wenn die Major-Stelle übereinstimmt — in
+  der 0er-Reihe zusätzlich die **mittlere** Stelle (sie trägt dort die
+  Major-Rolle, Schema `0.MAJOR.MINOR`) — **und** `api_version >=`
   einkompilierte Contract-Version (SemVer-Ordnung). Andernfalls Abbruch
   bzw. deutliche Warnung statt produktiver Kommunikation.
 

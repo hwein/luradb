@@ -1,9 +1,7 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/luradb-mark.svg">
-  <img src=".github/luradb-mark-light.svg" alt="LuraDB logo" width="96" height="96">
+  <source media="(prefers-color-scheme: dark)" srcset=".github/luradb-wordmark.svg">
+  <img src=".github/luradb-wordmark-light.svg" alt="LuraDB" height="40">
 </picture>
-
-# LuraDB
 
 LuraDB is a Linux-first, REST-native multi-model database built on io_uring.
 One small, fast process covers the three shapes of data a typical backend

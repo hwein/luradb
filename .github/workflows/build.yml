@@ -9,6 +9,9 @@ on:
 jobs:
   sonarqube:
     name: SonarQube
+    # SonarCloud free plan (private repo) analyzes only the main branch;
+    # drop this gate once the repo is public.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4

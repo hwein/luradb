@@ -143,6 +143,10 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     container: ubuntu:22.04
+    defaults:
+      run:
+        # Container jobs default to sh (dash); our steps need bash.
+        shell: bash
     steps:
       # Bare image: no git/curl/build tools until installed.
       - name: Install build dependencies

@@ -39,7 +39,7 @@ LuraDB is your friendly neighborhood database.
 
 LuraDB is `0.x`, pre-1.0 software. On-disk formats and the REST API can
 change between minor releases. See [CHANGELOG.md](CHANGELOG.md) for what
-changed in each release — entries touching the HTTP API are marked `API:`,
+changed in each release — entries touching the REST API are marked `API:`,
 breaking changes are marked **BREAKING**.
 
 ## Requirements

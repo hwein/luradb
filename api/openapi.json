@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2"
     },
     "version": "0.1.0",
-    "x-luradb-server-version": "0.1.0-rc.2"
+    "x-luradb-server-version": "0.1.0-rc.1"
   },
   "paths": {
     "/health": {

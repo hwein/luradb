@@ -252,7 +252,10 @@ jobs:
       - name: Checksums
         run: sha256sum luradb_*.deb "luradb-${VERSION}.cdx.json" > SHA256SUMS
 
+      # Attestations are unavailable on user-owned private repos - skipped
+      # until the repository goes public.
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4
+        if: ${{ !github.event.repository.private }}
         with:
           subject-path: luradb_*.deb
 

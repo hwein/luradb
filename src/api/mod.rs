@@ -51,8 +51,8 @@ impl Modify for BearerAuth {
 // ── API contract version (Modify hook) ────────────────────────────────────────
 
 /// API-Contract-Version (SemVer) — unabhängig von der Server-Version in Cargo.toml.
-/// Bump-Regeln: api/COMPATIBILITY.md. Einzige Quelle; OpenAPI-Contract
-/// und GET /version lesen von hier.
+/// Bump-Regeln: COMPATIBILITY.md im privaten concepts-Repo. Einzige Quelle;
+/// OpenAPI-Contract und GET /version lesen von hier.
 pub const API_VERSION: &str = "0.2.0";
 
 struct VersionInfo;
@@ -345,7 +345,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         description = "REST-native multi-model database — KeyValue- und JSON-Engine. \
             `version` ist die API-Contract-Version (siehe API_VERSION), unabhängig von der \
             Server-Version; letztere steht in der Extension `x-luradb-server-version`. \
-            Kompatibilitäts-Ranges: api/COMPATIBILITY.md. Laufzeit-Check: GET /version."
+            Laufzeit-Check: GET /version."
     )
 )]
 pub struct ApiDoc;
@@ -368,8 +368,8 @@ mod contract_tests {
             generated, committed,
             "api/openapi.json ist nicht aktuell. Regenerieren: \
              cargo run -- --dump-openapi > api/openapi.json — und pruefen, ob info.version \
-             gebumpt werden muss (SemVer-Regeln: api/COMPATIBILITY.md) und ob \
-             api/COMPATIBILITY.md eine neue Zeile braucht."
+             gebumpt werden muss und ob COMPATIBILITY.md im concepts-Repo \
+             eine neue Zeile braucht."
         );
     }
 

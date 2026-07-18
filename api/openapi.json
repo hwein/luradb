@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "LuraDB API",
-    "description": "REST-native multi-model database — KeyValue- und JSON-Engine. `version` ist die API-Contract-Version (siehe API_VERSION), unabhängig von der Server-Version; letztere steht in der Extension `x-luradb-server-version`. Kompatibilitäts-Ranges: api/COMPATIBILITY.md. Laufzeit-Check: GET /version.",
+    "description": "REST-native multi-model database — KeyValue- und JSON-Engine. `version` ist die API-Contract-Version (siehe API_VERSION), unabhängig von der Server-Version; letztere steht in der Extension `x-luradb-server-version`. Laufzeit-Check: GET /version.",
     "contact": {
       "name": "Heiko Wein"
     },

@@ -3,6 +3,8 @@
   <img src=".github/luradb-wordmark-light.svg" alt="LuraDB" height="40">
 </picture>
 
+#
+
 LuraDB is a Linux-first, REST-native multi-model database built on io_uring.
 One small, fast process covers the three shapes of data a typical backend
 needs: a key-value store (TTLs, watches), JSON documents (indexes, queries),

@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "0 6 * * 1"  # weekly, Monday 06:00 UTC
   workflow_dispatch:
+  # Scan immediately when the pipeline or policy itself changes. Also required
+  # once: GitHub only registers a workflow (making workflow_dispatch possible)
+  # after an event runs it or it reaches the default branch.
+  push:
+    branches: [next]
+    paths:
+      - ".github/workflows/security.yml"
+      - "deny.toml"
+      - "osv-scanner.toml"
 
 permissions:
   contents: read

@@ -27,7 +27,7 @@ jobs:
       deb_version: ${{ steps.derive.outputs.deb_version }}
       prerelease: ${{ steps.derive.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
         with:
           fetch-depth: 0
 
@@ -89,7 +89,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
       # io_uring needs the runner VM, not a container (Docker's default
       # seccomp blocks it) - uname -r is the acceptance proof.
@@ -112,7 +112,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
       - name: cargo-deny check
         run: |
@@ -150,7 +150,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates curl build-essential dpkg-dev
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
       - name: Install Rust
         run: |
@@ -235,7 +235,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.gate.outputs.version }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:

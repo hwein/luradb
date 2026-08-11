@@ -4,6 +4,12 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
+### Security
+
+- Replaced the retired `rustls-pemfile` dependency with `rustls-pki-types` PEM loading (RUSTSEC-2025-0134).
+
 ## [0.2.0] - 2026-08-12
 
 ### Added
@@ -43,7 +49,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/hwein/luradb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hwein/luradb/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/hwein/luradb/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/hwein/luradb/releases/tag/v0.1.0

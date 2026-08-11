@@ -244,11 +244,12 @@ impl SSTableReader {
         let index_offset = u64::from(footer.index_handle.offset) as usize;
         let index_size = u64::from(footer.index_handle.size) as usize;
 
-        if index_offset + index_size > bytes.len() {
-            bail!("Invalid index block offset/size");
-        }
+        let index_end = index_offset
+            .checked_add(index_size)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid index block offset/size"))?;
 
-        let index_slice = &bytes[index_offset..index_offset + index_size];
+        let index_slice = &bytes[index_offset..index_end];
         let index = rkyv::access::<Archived<IndexBlock>, rancor::Error>(index_slice)
             .map_err(|e| anyhow::anyhow!("Index validation failed: {}", e))?;
 
@@ -259,11 +260,12 @@ impl SSTableReader {
         let bloom_offset = u64::from(footer.bloom_filter_handle.offset) as usize;
         let bloom_size = u64::from(footer.bloom_filter_handle.size) as usize;
 
-        if bloom_offset + bloom_size > bytes.len() {
-            bail!("Invalid bloom filter offset/size");
-        }
+        let bloom_end = bloom_offset
+            .checked_add(bloom_size)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid bloom filter offset/size"))?;
 
-        let bloom_slice = &bytes[bloom_offset..bloom_offset + bloom_size];
+        let bloom_slice = &bytes[bloom_offset..bloom_end];
         let bloom_archived = rkyv::access::<Archived<BloomFilter>, rancor::Error>(bloom_slice)
             .map_err(|e| anyhow::anyhow!("Bloom filter validation failed: {}", e))?;
 
@@ -392,9 +394,10 @@ impl SSTableReader {
         let offset = u64::from(handle.offset) as usize;
         let size = u64::from(handle.size) as usize;
 
-        if offset + size > self.data.len() {
-            bail!("Invalid data block offset/size");
-        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid data block offset/size"))?;
 
         let block = match &self.data {
             // Zero-copy: the cache entry references the shared mapping.
@@ -405,7 +408,7 @@ impl SSTableReader {
             },
             SSTableData::Owned(_) => {
                 let mut aligned = AlignedVec::with_capacity(size);
-                aligned.extend_from_slice(&self.data.as_slice()[offset..offset + size]);
+                aligned.extend_from_slice(&self.data.as_slice()[offset..end]);
                 CachedBlock::Owned(std::sync::Arc::new(aligned))
             }
         };
@@ -557,11 +560,12 @@ impl SSTableReader {
         let offset = u64::from(handle.offset) as usize;
         let size = u64::from(handle.size) as usize;
 
-        if offset + size > self.data.len() {
-            bail!("Invalid data block offset/size");
-        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid data block offset/size"))?;
 
-        let block_slice = &self.data.as_slice()[offset..offset + size];
+        let block_slice = &self.data.as_slice()[offset..end];
         rkyv::access::<Archived<DataBlock>, rancor::Error>(block_slice)
             .map_err(|e| anyhow::anyhow!("DataBlock validation failed: {}", e))
     }
@@ -926,6 +930,156 @@ mod tests {
             }
             DataBlockValue::Pointer(_) => panic!("Expected Inline variant, got Pointer"),
         }
+        Ok(())
+    }
+
+    // kv/019: a corrupted footer whose index_handle overflows `offset + size`
+    // must be rejected with an `Err`, not panic (untrusted on-disk bytes).
+    #[test]
+    fn test_from_data_rejects_overflowing_index_handle() -> anyhow::Result<()> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let mut buf = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = buf[buf.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = buf.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(&buf[footer_offset..footer_end])
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let bloom_filter_handle = BlockHandle {
+            offset: u64::from(footer.bloom_filter_handle.offset),
+            size: u64::from(footer.bloom_filter_handle.size),
+        };
+
+        let corrupt_footer = SSTableFooter {
+            index_handle: BlockHandle { offset: u64::MAX, size: 8 },
+            bloom_filter_handle,
+            checksum: 0,
+        };
+        let corrupt_footer_bytes = rkyv::to_bytes::<rancor::Error>(&corrupt_footer)?;
+        buf[footer_offset..footer_end].copy_from_slice(&corrupt_footer_bytes);
+
+        let result = SSTableReader::open(buf);
+        assert!(result.is_err(), "overflowing index_handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/019: analog for bloom_filter_handle.
+    #[test]
+    fn test_from_data_rejects_overflowing_bloom_filter_handle() -> anyhow::Result<()> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let mut buf = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = buf[buf.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = buf.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(&buf[footer_offset..footer_end])
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let index_handle = BlockHandle {
+            offset: u64::from(footer.index_handle.offset),
+            size: u64::from(footer.index_handle.size),
+        };
+
+        let corrupt_footer = SSTableFooter {
+            index_handle,
+            bloom_filter_handle: BlockHandle { offset: u64::MAX, size: 8 },
+            checksum: 0,
+        };
+        let corrupt_footer_bytes = rkyv::to_bytes::<rancor::Error>(&corrupt_footer)?;
+        buf[footer_offset..footer_end].copy_from_slice(&corrupt_footer_bytes);
+
+        let result = SSTableReader::open(buf);
+        assert!(result.is_err(), "overflowing bloom_filter_handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/019: builds a valid single-block SSTable whose IndexBlock entry
+    // points at an overflowing BlockHandle, to exercise the read path
+    // (as opposed to the footer handles covered above).
+    fn build_sstable_with_corrupt_block_handle() -> anyhow::Result<Vec<u8>> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let valid_bytes = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = valid_bytes[valid_bytes.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = valid_bytes.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(
+            &valid_bytes[footer_offset..footer_end],
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let index_offset = u64::from(footer.index_handle.offset) as usize;
+
+        // Keep the data-block bytes (and their alignment padding) verbatim;
+        // rebuild index/bloom/footer around a corrupted BlockHandle.
+        let mut buf = AlignedVec::new();
+        buf.extend_from_slice(&valid_bytes[..index_offset]);
+
+        fn pad_to_align8(buf: &mut AlignedVec) {
+            let misalign = buf.len() % 8;
+            if misalign != 0 {
+                buf.extend_from_slice(&[0u8; 8][..8 - misalign]);
+            }
+        }
+
+        let index = IndexBlock {
+            entries: vec![(b"key1".to_vec(), BlockHandle { offset: u64::MAX - 4, size: 8 })],
+        };
+        let index_bytes = rkyv::to_bytes::<rancor::Error>(&index)?;
+        let index_handle = BlockHandle { offset: buf.len() as u64, size: index_bytes.len() as u64 };
+        buf.extend_from_slice(&index_bytes);
+        pad_to_align8(&mut buf);
+
+        let mut bloom_filter = BloomFilterImpl::new(10, 0.01);
+        bloom_filter.insert(b"key1");
+        let bloom_filter_fmt = BloomFilter {
+            data: bloom_filter.as_bytes().to_vec(),
+            num_hashes: bloom_filter.num_hashes(),
+        };
+        let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter_fmt)?;
+        let bloom_filter_handle = BlockHandle { offset: buf.len() as u64, size: bloom_bytes.len() as u64 };
+        buf.extend_from_slice(&bloom_bytes);
+        pad_to_align8(&mut buf);
+
+        let footer = SSTableFooter { index_handle, bloom_filter_handle, checksum: 0 };
+        let footer_bytes = rkyv::to_bytes::<rancor::Error>(&footer)?;
+        let footer_offset = buf.len() as u64;
+        buf.extend_from_slice(&footer_bytes);
+        buf.extend_from_slice(&footer_offset.to_le_bytes());
+
+        Ok(buf.into_vec())
+    }
+
+    // kv/019: get_with_cache → get_or_cache_block must return an `Err` for an
+    // overflowing block handle instead of panicking.
+    #[test]
+    fn test_get_or_cache_block_rejects_overflowing_block_handle() -> anyhow::Result<()> {
+        let buf = build_sstable_with_corrupt_block_handle()?;
+        let reader = SSTableReader::open(buf)?;
+        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
+        let result = reader.get_with_cache(b"key1", &mut cache);
+        assert!(result.is_err(), "overflowing block handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/019: get → read_data_block must return an `Err` for an overflowing
+    // block handle instead of panicking.
+    #[test]
+    fn test_read_data_block_rejects_overflowing_block_handle() -> anyhow::Result<()> {
+        let buf = build_sstable_with_corrupt_block_handle()?;
+        let reader = SSTableReader::open(buf)?;
+        let result = reader.get(b"key1");
+        assert!(result.is_err(), "overflowing block handle must be rejected, not panic");
         Ok(())
     }
 }

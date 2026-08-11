@@ -1,6 +1,6 @@
 [package]
 name = "luradb"
-version = "0.2.0"
+version = "0.2.1-dev"
 edition = "2021"
 authors = ["Heiko Wein"]
 description = "LuraDB: A Linux-first, REST-native multi-model database"

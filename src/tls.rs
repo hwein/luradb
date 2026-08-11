@@ -9,7 +9,8 @@ use axum::extract::connect_info::ConnectInfo;
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use std::io::BufReader;
+use rustls_pki_types::pem::{self, PemObject};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -32,9 +33,8 @@ pub fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsA
     // one is already active — safe to ignore.
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let cert_file = std::fs::File::open(cert_path)
-        .map_err(|e| anyhow::anyhow!("cannot open server.tls_cert_path '{cert_path}': {e}"))?;
-    let cert_chain: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| anyhow::anyhow!("cannot open server.tls_cert_path '{cert_path}': {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("cannot parse server.tls_cert_path '{cert_path}': {e}"))?;
     anyhow::ensure!(
@@ -42,11 +42,13 @@ pub fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsA
         "server.tls_cert_path '{cert_path}' contains no certificate"
     );
 
-    let key_file = std::fs::File::open(key_path)
-        .map_err(|e| anyhow::anyhow!("cannot open server.tls_key_path '{key_path}': {e}"))?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|e| anyhow::anyhow!("cannot parse server.tls_key_path '{key_path}': {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("server.tls_key_path '{key_path}' contains no private key"))?;
+    let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| match e {
+        pem::Error::Io(e) => anyhow::anyhow!("cannot open server.tls_key_path '{key_path}': {e}"),
+        pem::Error::NoItemsFound => {
+            anyhow::anyhow!("server.tls_key_path '{key_path}' contains no private key")
+        }
+        e => anyhow::anyhow!("cannot parse server.tls_key_path '{key_path}': {e}"),
+    })?;
 
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -203,8 +205,8 @@ mod tests {
     // Builds a rustls ClientConfig trusting the fixture's self-signed cert
     // (it is its own root), offering exactly the given ALPN protocols.
     fn test_client_config(alpn_protocols: Vec<Vec<u8>>) -> Arc<ClientConfig> {
-        let cert_file = std::fs::File::open(fixture_cert_path()).unwrap();
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(fixture_cert_path())
+            .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         let mut roots = RootCertStore::empty();

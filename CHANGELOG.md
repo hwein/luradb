@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- Replaced the retired `rustls-pemfile` dependency with `rustls-pki-types` PEM loading (RUSTSEC-2025-0134).
+
 ## [0.2.0] - 2026-08-12
 
 ### Added

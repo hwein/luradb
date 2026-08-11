@@ -8,7 +8,7 @@ use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::memtable::{MemTable, Value};
 use crate::storage::format::CachedValue;
 use crate::storage::sstable::SSTableReader;
-use crate::storage::vlog::VLog;
+use crate::storage::vlog::VLogRegistry;
 use anyhow::Result;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -69,8 +69,8 @@ pub struct LsmReader {
     /// SSTables organized by level (L0, L1, ..., Ln)
     sstables: Vec<Vec<Arc<SSTableReader>>>,
 
-    /// Value log for dereferencing large values
-    vlog: Arc<VLog>,
+    /// Value log generations for dereferencing large values
+    vlog: Arc<VLogRegistry>,
 
     /// Shared S3-FIFO block cache — checked before every SSTable block read.
     cache: Arc<Mutex<BlockCache>>,
@@ -118,7 +118,7 @@ impl LsmReader {
     /// Creates a new LSM reader.
     pub fn new(
         memtable: Arc<MemTable>,
-        vlog: Arc<VLog>,
+        vlog: Arc<VLogRegistry>,
         cache: Arc<Mutex<BlockCache>>,
     ) -> Self {
         Self {
@@ -190,9 +190,9 @@ impl LsmReader {
                         if is_expired(expire_at) { return Ok(Some(GetResult::Absent)); }
                         Ok(Some(GetResult::Present(v)))
                     }
-                    Value::Pointer { offset, len, expire_at } => {
+                    Value::Pointer { file_id, offset, len, expire_at } => {
                         if is_expired(expire_at) { return Ok(Some(GetResult::Absent)); }
-                        let v = self.vlog.read(offset, len).await?;
+                        let v = self.vlog.read(file_id, offset, len).await?;
                         Ok(Some(GetResult::Present(v)))
                     }
                     Value::Null => Ok(Some(GetResult::Null)),
@@ -227,11 +227,11 @@ impl LsmReader {
             None => Ok(None),
             Some(CachedValue::Tombstone) => Ok(Some(GetResult::Absent)),
             Some(CachedValue::Null) => Ok(Some(GetResult::Null)),
-            Some(CachedValue::VLogPointer { value_offset, value_len, expire_at, .. }) => {
+            Some(CachedValue::VLogPointer { file_id, value_offset, value_len, expire_at }) => {
                 if expire_at != 0 && expire_at <= now_secs() {
                     return Ok(Some(GetResult::Absent));
                 }
-                let value = self.vlog.read(value_offset, value_len as usize).await?;
+                let value = self.vlog.read(file_id, value_offset, value_len as usize).await?;
                 Ok(Some(GetResult::Present(value)))
             }
             Some(value) => {

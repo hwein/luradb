@@ -826,7 +826,7 @@ mod tests {
         let (mut st, handle) = spawn(dir.path(), false, 64);
         handle.vlog_append(b"old-data".to_vec()).await.unwrap();
 
-        let new_path = dir.path().join("vlog_gc");
+        let new_path = dir.path().join("vlog.2"); // next vLog generation
         std::fs::write(&new_path, b"NEW").unwrap();
         handle.vlog_reopen(new_path.clone()).await.unwrap();
 
@@ -846,7 +846,7 @@ mod tests {
         let (mut st, handle) = spawn(dir.path(), false, 1024);
 
         let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
-        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone()));
+        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1));
         let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
         let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
         let engine = LsmStorageEngine::new(

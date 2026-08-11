@@ -15,8 +15,10 @@ use std::sync::Arc;
 /// `None` means the entry does not expire.
 #[derive(Debug, Clone)]
 pub enum Value {
-    Inline(Vec<u8>, Option<u64>),                              // data, expire_at
-    Pointer { offset: u64, len: usize, expire_at: Option<u64> }, // vLog pointer + TTL
+    Inline(Vec<u8>, Option<u64>), // data, expire_at
+    /// vLog pointer + TTL. `file_id` is the vLog generation the value was
+    /// appended to (spec kv/017).
+    Pointer { file_id: u32, offset: u64, len: usize, expire_at: Option<u64> },
     /// Key explicitly set to NULL (kv/018): present, no bytes, no TTL — an
     /// update, not a delete.
     Null,
@@ -138,7 +140,6 @@ impl MemTable {
     }
 
     /// Returns true if the MemTable is empty.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

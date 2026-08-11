@@ -580,7 +580,7 @@ fn main() -> anyhow::Result<()> {
             None => crate::core::wal::WriteAheadLog::new(&config.storage.wal_path).await?,
         });
         let vlog = Arc::new(match &storage_handle {
-            Some(handle) => VLog::with_storage_handle(&vlog_path, handle.clone()),
+            Some(handle) => VLog::with_storage_handle(&vlog_path, handle.clone(), 1),
             None => VLog::new(&config.storage.vlog_path).await?,
         });
         let file_manager =

@@ -13,21 +13,21 @@ use crate::engines::lsm::compaction::{
     CompactionConfig, CompactionJob, select_sstables_for_level_compaction,
     select_level_to_compact, should_compact,
 };
-use crate::engines::lsm::janitor::{Janitor, JanitorConfig};
+use crate::engines::lsm::janitor::{FlushBarrier, Janitor, JanitorConfig};
 use crate::engines::lsm::hlc::HybridLogicalClock;
 use crate::engines::lsm::watcher::{OpType, WalEvent};
 use crate::engines::StorageEngine;
 use crate::core::io_engine::IoEngine;
 use crate::core::storage_thread::StorageHandle;
 use crate::core::wal::WriteAheadLog;
-use crate::storage::vlog::VLog;
+use crate::storage::vlog::{discover_generations, generation_path, VLog, VLogError, VLogRegistry};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
 use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::{broadcast, Notify};
 use tokio::time::{sleep, Duration};
@@ -142,6 +142,26 @@ fn scan_memtable_for_prefix(
     }
 }
 
+/// Appends `value` to the active vLog generation, returning `(generation id,
+/// offset)` read from the *same* reference so the pointer can never mix ids.
+///
+/// A `Sealed` error means the Janitor swapped the active generation between the
+/// lookup and the append; it publishes the new generation before sealing the
+/// old one, so a single retry converges (spec kv/017).
+async fn append_to_active(vlog: &VLogRegistry, value: &[u8]) -> Result<(u32, u64)> {
+    loop {
+        let active = vlog.active();
+        match active.append(value).await {
+            Ok(offset) => return Ok((active.id(), offset)),
+            Err(VLogError::Sealed { id }) => anyhow::ensure!(
+                vlog.active().id() != id,
+                "active value log generation {id} is sealed"
+            ),
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// True if `value` is neither TTL-expired at `now` nor a tombstone.
 fn is_live_version(value: &Value, now: u64) -> bool {
     let expired = match value {
@@ -194,10 +214,10 @@ pub struct LsmStorageEngine {
 
     wal: Arc<WriteAheadLog>,
 
-    /// Shared vLog reference — swapped atomically by the Janitor after GC.
-    vlog: Arc<RwLock<Arc<VLog>>>,
+    /// All live vLog generations; the active one takes new appends.
+    vlog: Arc<VLogRegistry>,
 
-    /// Filesystem path of the vLog (needed to initialise the Janitor).
+    /// Canonical vLog path (generation 1) — base for every later generation.
     vlog_path: PathBuf,
 
     file_manager: Arc<FileManager>,
@@ -247,6 +267,8 @@ impl LsmStorageEngine {
             block_cache: block_cache_config,
         } = options;
 
+        let vlog = Self::build_vlog_registry(vlog, &vlog_path).await?;
+
         // Recover the MemTable from the WAL first.
         let recovered = Self::recover_from_wal(&wal_path, &vlog, engine_config.vlog_inline_threshold).await?;
 
@@ -270,7 +292,7 @@ impl LsmStorageEngine {
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
             level_manager,
             wal,
-            vlog: Arc::new(RwLock::new(vlog)),
+            vlog,
             vlog_path,
             file_manager,
             manifest: Arc::new(RwLock::new(manifest)),
@@ -306,13 +328,27 @@ impl LsmStorageEngine {
 
     // ── Recovery ────────────────────────────────────────────────────────────
 
+    /// Registers every vLog generation that exists next to `vlog_path`; the
+    /// highest id becomes the active one (spec kv/017). `vlog` is the caller's
+    /// handle on the canonical path, which is generation 1 — a store without
+    /// further generations therefore starts exactly as before.
+    async fn build_vlog_registry(vlog: Arc<VLog>, vlog_path: &Path) -> Result<Arc<VLogRegistry>> {
+        let registry = VLogRegistry::new(vlog);
+        for id in discover_generations(vlog_path).await? {
+            if id > 1 {
+                registry.set_active(Arc::new(VLog::open(generation_path(vlog_path, id), id).await?));
+            }
+        }
+        Ok(Arc::new(registry))
+    }
+
     /// Recovers the MemTable state from the WAL.
     ///
     /// Does NOT truncate the WAL — [`Self::new`] first flushes the recovered
     /// data to an SSTable, so an interrupted startup never loses it.
     async fn recover_from_wal(
         wal_path: &PathBuf,
-        vlog: &Arc<VLog>,
+        vlog: &VLogRegistry,
         vlog_inline_threshold: usize,
     ) -> Result<MemTable> {
         let memtable = MemTable::new();
@@ -326,8 +362,8 @@ impl LsmStorageEngine {
                     let ts = Timestamp::new(timestamp);
                     let expire_at_opt = if expire_at == 0 { None } else { Some(expire_at) };
                     if value.len() >= vlog_inline_threshold {
-                        let offset = vlog.append(&value).await?;
-                        memtable.set(key, ts, Value::Pointer { offset, len: value.len(), expire_at: expire_at_opt });
+                        let (file_id, offset) = append_to_active(vlog, &value).await?;
+                        memtable.set(key, ts, Value::Pointer { file_id, offset, len: value.len(), expire_at: expire_at_opt });
                     } else {
                         memtable.set(key, ts, Value::Inline(value, expire_at_opt));
                     }
@@ -402,7 +438,19 @@ impl LsmStorageEngine {
         tokio::spawn(async move { engine.background_compaction_loop().await });
 
         // Janitor (vLog GC) loop
-        let janitor = Arc::new(Janitor::new(
+        let janitor = Arc::new(self.build_janitor(self.janitor_config.clone()));
+        tokio::spawn(async move { janitor.run_background().await });
+    }
+
+    /// Builds a Janitor over this engine's state, wired with the flush barrier
+    /// its GC needs before the SSTables are the complete live set (kv/017).
+    pub(crate) fn build_janitor(self: &Arc<Self>, config: JanitorConfig) -> Janitor {
+        let engine = Arc::clone(self);
+        let flush_barrier: FlushBarrier = Arc::new(move || {
+            let engine = Arc::clone(&engine);
+            Box::pin(async move { engine.flush_all_memtables().await })
+        });
+        Janitor::new(
             Arc::clone(&self.vlog),
             self.vlog_path.clone(),
             Arc::clone(&self.level_manager),
@@ -411,12 +459,12 @@ impl LsmStorageEngine {
             Arc::clone(&self.file_manager),
             Arc::clone(&self.block_cache),
             Arc::clone(&self.snapshot_registry),
-            self.janitor_config.clone(),
+            config,
             self.engine_config.use_mmap,
             Arc::clone(&self.shutdown),
             self.storage_handle.clone(),
-        ));
-        tokio::spawn(async move { janitor.run_background().await });
+            Some(flush_barrier),
+        )
     }
 
     async fn background_flush_loop(&self) {
@@ -446,28 +494,28 @@ impl LsmStorageEngine {
         }
     }
 
+    /// Freezes the active MemTable and flushes every immutable one, leaving no
+    /// vLog pointer MemTable-resident. Used by the Janitor's flush barrier.
+    pub async fn flush_all_memtables(&self) -> Result<()> {
+        let frozen = {
+            let mut mt = self.memtable.write();
+            std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
+        };
+        if !frozen.is_empty() {
+            self.immutable_memtables.write().push(frozen);
+        }
+        while !self.immutable_memtables.read().is_empty() {
+            self.flush_memtable().await?;
+        }
+        Ok(())
+    }
+
     /// Shuts down all background tasks and flushes remaining MemTables.
     pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
 
-        // Freeze the active memtable if it's not empty.
-        let old_memtable = {
-            let mut mt = self.memtable.write();
-            // Swap the active memtable with a new, empty one.
-            std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
-        };
-
-        // If the old memtable had data, add it to the immutable list to be flushed.
-        if old_memtable.approximate_size() > 0 {
-            self.immutable_memtables.write().push(old_memtable);
-        }
-
-        // Flush all immutable memtables.
-        while !self.immutable_memtables.read().is_empty() {
-            if let Err(e) = self.flush_memtable().await {
-                eprintln!("[Engine] Shutdown flush error: {e}");
-                break;
-            }
+        if let Err(e) = self.flush_all_memtables().await {
+            eprintln!("[Engine] Shutdown flush error: {e}");
         }
 
         // All data is now in SSTables — WAL entries are redundant.
@@ -518,9 +566,8 @@ impl LsmStorageEngine {
         snapshot: &Snapshot,
     ) -> Result<GetResult> {
         let memtable = { Arc::clone(&*self.memtable.read()) };
-        let vlog = { self.vlog.read().clone() };
 
-        let mut reader = LsmReader::new(memtable, vlog, Arc::clone(&self.block_cache));
+        let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
         {
             let imm = self.immutable_memtables.read();
             reader.set_immutable_memtables(imm.clone());
@@ -538,9 +585,8 @@ impl LsmStorageEngine {
         snapshot: &Snapshot,
     ) -> Result<Option<ValueWithMetadata>> {
         let memtable = { Arc::clone(&*self.memtable.read()) };
-        let vlog = { self.vlog.read().clone() };
 
-        let mut reader = LsmReader::new(memtable, vlog, Arc::clone(&self.block_cache));
+        let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
         {
             let imm = self.immutable_memtables.read();
             reader.set_immutable_memtables(imm.clone());
@@ -597,14 +643,17 @@ impl LsmStorageEngine {
 
         self.maybe_freeze_memtable()?;
 
-        let memtable = Arc::clone(&*self.memtable.read());
-        if value.len() >= self.engine_config.vlog_inline_threshold {
-            let vlog = self.vlog.read().clone();
-            let offset = vlog.append(value).await?;
-            memtable.set(key.to_vec(), timestamp, Value::Pointer { offset, len: value.len(), expire_at });
+        // Resolve the value before touching the MemTable (like `write_batch`):
+        // a MemTable captured *before* the vLog append could be frozen and
+        // flushed meanwhile, which would drop the entry.
+        let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
+            let (file_id, offset) = append_to_active(&self.vlog, value).await?;
+            Value::Pointer { file_id, offset, len: value.len(), expire_at }
         } else {
-            memtable.set(key.to_vec(), timestamp, Value::Inline(value.to_vec(), expire_at));
-        }
+            Value::Inline(value.to_vec(), expire_at)
+        };
+        let memtable = Arc::clone(&*self.memtable.read());
+        memtable.set(key.to_vec(), timestamp, resolved);
         Ok(())
     }
 
@@ -713,9 +762,8 @@ impl LsmStorageEngine {
             resolved.push(match op {
                 BatchOp::Put { key, value } => {
                     if value.len() >= self.engine_config.vlog_inline_threshold {
-                        let vlog = self.vlog.read().clone();
-                        let offset = vlog.append(&value).await?;
-                        (key, Value::Pointer { offset, len: value.len(), expire_at: None })
+                        let (file_id, offset) = append_to_active(&self.vlog, &value).await?;
+                        (key, Value::Pointer { file_id, offset, len: value.len(), expire_at: None })
                     } else {
                         (key, Value::Inline(value, None))
                     }
@@ -905,11 +953,11 @@ impl LsmStorageEngine {
                         expire_at.unwrap_or(0),
                     );
                 }
-                Value::Pointer { offset, len, expire_at } => {
+                Value::Pointer { file_id, offset, len, expire_at } => {
                     builder.add(
                         encoded_key,
                         crate::storage::format::ValuePointer {
-                            file_id: 1,
+                            file_id,
                             value_offset: offset,
                             value_len: len as u32,
                             expire_at: expire_at.unwrap_or(0),
@@ -1205,7 +1253,7 @@ impl LsmStorageEngine {
     pub fn heartbeat_data(&self) -> EngineHeartbeatData {
         let mt_len = self.memtable.read().len() as u64;
         let imm_len: u64 = self.immutable_memtables.read().iter().map(|m| m.len() as u64).sum();
-        let vlog_bytes = self.vlog.read().size_bytes();
+        let vlog_bytes = self.vlog.total_size();
         let l0_count = self.level_manager.get_level(0).len();
         EngineHeartbeatData {
             estimated_memtable_keys: mt_len + imm_len,
@@ -1363,7 +1411,7 @@ mod tests {
 
         // Writes to /dev/full fail with ENOSPC. tokio buffers file writes,
         // so the error surfaces on the NEXT vLog op — hence two large Puts.
-        *engine.vlog.write() = Arc::new(VLog::new("/dev/full").await.unwrap());
+        engine.vlog.set_active(Arc::new(VLog::new("/dev/full").await.unwrap()));
         let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog append
         let res = engine
             .write_batch(vec![
@@ -1929,9 +1977,19 @@ mod tests {
         assert_eq!(engine.get(b"z").await.unwrap(), Some(b"26".to_vec()));
     }
 
+    /// GC config that fires on any non-empty vLog.
+    fn gc_always() -> JanitorConfig {
+        JanitorConfig {
+            check_interval_secs: 3600,
+            dead_bytes_threshold: 0.0,
+            min_vlog_size_bytes: 0,
+        }
+    }
+
     #[tokio::test]
     async fn test_janitor_gc_stamps_reader_file_ids_and_invalidates_cache() {
         let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
         let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
         engine.put(b"big", &big).await.unwrap();
         engine.put(b"small", b"v").await.unwrap();
@@ -1942,25 +2000,7 @@ mod tests {
         let pre_gc_key = BlockCacheKey { file_id: 0, block_offset: 0 };
         assert!(engine.block_cache.lock().get(&pre_gc_key).is_some());
 
-        let janitor = Janitor::new(
-            Arc::clone(&engine.vlog),
-            engine.vlog_path.clone(),
-            Arc::clone(&engine.level_manager),
-            Arc::clone(&engine.manifest),
-            Arc::clone(&engine.manifest_manager),
-            Arc::clone(&engine.file_manager),
-            Arc::clone(&engine.block_cache),
-            Arc::clone(&engine.snapshot_registry),
-            JanitorConfig {
-                check_interval_secs: 1,
-                dead_bytes_threshold: 0.0,
-                min_vlog_size_bytes: 0,
-            },
-            engine.engine_config.use_mmap,
-            Arc::clone(&engine.shutdown),
-            None,
-        );
-        let stats = janitor.run_gc().await.unwrap();
+        let stats = engine.build_janitor(gc_always()).run_gc().await.unwrap();
         assert!(stats.ran);
 
         assert_readers_match_manifest(&engine);
@@ -1979,6 +2019,163 @@ mod tests {
         // Data reads correctly through rebuilt readers and the new vLog.
         assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
         assert_eq!(engine.get(b"small").await.unwrap(), Some(b"v".to_vec()));
+    }
+
+    /// vLog generation ids stamped into the pointers of all L0 SSTables.
+    fn l0_pointer_generations(engine: &LsmStorageEngine) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for sstable in engine.level_manager.get_level(0) {
+            for entry in sstable.iter() {
+                if let (_, crate::storage::format::DataBlockValue::Pointer(vp)) = entry.unwrap() {
+                    if vp.file_id != 0 {
+                        ids.push(vp.file_id);
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    // Spec kv/017 test 1 (window A): a large value whose pointer lives only in
+    // the active MemTable — no flush ran — must survive a GC cycle.
+    #[tokio::test]
+    async fn test_gc_preserves_memtable_resident_vlog_value() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+        engine.put(b"big", &big).await.unwrap();
+        // Deliberately no flush: the pointer exists only in the MemTable.
+
+        let stats = engine.build_janitor(gc_always()).run_gc().await.unwrap();
+        assert!(stats.ran);
+        assert_eq!(stats.live_bytes, 4096, "the MemTable pointer counts as live");
+
+        assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+    }
+
+    // Spec kv/017 test 2 (write path): with the old generation sealed and a
+    // new one published, a write lands in — and is stamped with — the new one.
+    #[tokio::test]
+    async fn test_write_after_generation_swap_uses_new_generation() {
+        let (engine, _dir) = make_engine().await;
+        let gen1 = engine.vlog.active();
+        let gen2 =
+            Arc::new(VLog::open(generation_path(&engine.vlog_path, 2), 2).await.unwrap());
+        engine.vlog.set_active(gen2);
+        gen1.seal();
+
+        let big = vec![b'y'; 4096];
+        engine.put(b"big", &big).await.unwrap();
+
+        assert_eq!(gen1.size(), 0, "the sealed generation must not grow");
+        assert_eq!(engine.vlog.active().size(), 4096);
+        assert_eq!(engine.get(b"big").await.unwrap(), Some(big.clone()));
+
+        freeze_and_flush(&engine).await;
+        assert_eq!(l0_pointer_generations(&engine), vec![2]);
+        assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+    }
+
+    // Spec kv/017 test 3 (window B): values written while the GC runs must all
+    // survive — the seal makes racing appends retry against the new generation.
+    // Multi-threaded on purpose: the seal/append race needs real parallelism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_gc_keeps_values_written_concurrently() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let big = vec![b'w'; 2048];
+        engine.put(b"pre", &big).await.unwrap();
+
+        let writers: Vec<_> = (0..4u32)
+            .map(|w| {
+                let engine = Arc::clone(&engine);
+                let value = big.clone();
+                tokio::spawn(async move {
+                    for i in 0..25u32 {
+                        engine.put(format!("k{w}-{i:02}").as_bytes(), &value).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        engine.build_janitor(gc_always()).run_gc().await.unwrap();
+        for writer in writers {
+            writer.await.unwrap();
+        }
+
+        assert_eq!(engine.get(b"pre").await.unwrap(), Some(big.clone()));
+        for w in 0..4u32 {
+            for i in 0..25u32 {
+                assert_eq!(
+                    engine.get(format!("k{w}-{i:02}").as_bytes()).await.unwrap(),
+                    Some(big.clone()),
+                    "value k{w}-{i:02} written during the GC must survive"
+                );
+            }
+        }
+    }
+
+    // A generation that stays sealed (no swap) must fail the write cleanly
+    // instead of spinning in the retry loop.
+    #[tokio::test]
+    async fn test_append_to_permanently_sealed_generation_fails() {
+        let (engine, _dir) = make_engine().await;
+        engine.vlog.active().seal();
+
+        let err = engine.put(b"big", &vec![b'x'; 4096]).await.unwrap_err();
+        assert!(err.to_string().contains("sealed"), "unexpected error: {err}");
+    }
+
+    // Spec kv/017 test 4: values from before and after a GC are both readable,
+    // and a reference to the retired generation taken before the GC keeps
+    // reading correctly from its already-open descriptor.
+    #[tokio::test]
+    async fn test_reads_span_vlog_generations() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let before = vec![b'1'; 4096];
+        engine.put(b"before", &before).await.unwrap();
+        let gen1 = engine.vlog.active();
+
+        engine.build_janitor(gc_always()).run_gc().await.unwrap();
+        assert_eq!(engine.vlog.active().id(), 2);
+        assert_eq!(engine.vlog.ids(), vec![2], "generation 1 is retired");
+
+        let after = vec![b'2'; 4096];
+        engine.put(b"after", &after).await.unwrap();
+
+        assert_eq!(engine.get(b"before").await.unwrap(), Some(before.clone()));
+        assert_eq!(engine.get(b"after").await.unwrap(), Some(after));
+        assert_eq!(gen1.read(0, 4096).await.unwrap(), before);
+    }
+
+    // Spec kv/017 test 5: startup registers every generation found on disk and
+    // activates the highest id; a store with only the canonical file starts as
+    // generation 1, and an orphaned empty generation does not disturb it.
+    #[tokio::test]
+    async fn test_startup_registers_all_generations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vlog_path = dir.path().join("vlog.log");
+
+        let engine = engine_on(&dir).await;
+        assert_eq!(engine.vlog.ids(), vec![1], "legacy store is generation 1");
+        assert_eq!(engine.vlog.active().id(), 1);
+        drop(engine);
+
+        std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
+        let engine = engine_on(&dir).await;
+        assert_eq!(engine.vlog.ids(), vec![1, 2]);
+        assert_eq!(engine.vlog.active().id(), 2);
+        assert_eq!(engine.vlog.read(2, 0, 12).await.unwrap(), b"generation-2");
+        drop(engine);
+
+        std::fs::write(generation_path(&vlog_path, 3), b"").unwrap(); // orphan
+        let engine = engine_on(&dir).await;
+        assert_eq!(engine.vlog.ids(), vec![1, 2, 3]);
+        assert_eq!(engine.vlog.active().id(), 3);
+        let big = vec![b'o'; 4096];
+        engine.put(b"k", &big).await.unwrap();
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(big));
     }
 
     // ── IoEngine integration (spec perf/004) ─────────────────────────────────

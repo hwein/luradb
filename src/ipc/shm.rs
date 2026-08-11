@@ -430,7 +430,7 @@ mod tests {
         }
     }
 
-    // 1. ShmSegment::create() — Segment existiert unter /dev/shm/, korrekte Größe.
+    // 1. ShmSegment::create() — segment exists under /dev/shm/, correct size.
     #[test]
     fn test_create_segment_exists_with_correct_size() {
         let name = unique_name("create");
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(meta.len(), 8192);
     }
 
-    // 2. create() + open() — ein zweiter Handle sieht dieselben Bytes.
+    // 2. create() + open() — a second handle sees the same bytes.
     #[test]
     fn test_create_then_open_second_handle_reads_same_bytes() {
         let name = unique_name("open");
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(read_back, pattern);
     }
 
-    // 3. as_mut_ptr() schreiben, as_ptr() lesen -> identische Bytes.
+    // 3. write via as_mut_ptr(), read via as_ptr() -> identical bytes.
     #[test]
     fn test_write_via_mut_ptr_read_via_ptr_roundtrip() {
         let name = unique_name("roundtrip");
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(read_back, pattern);
     }
 
-    // 4. ShmManager::new() mit stale Segmenten -> Cleanup, dann Neuerstellung.
+    // 4. ShmManager::new() with stale segments -> cleanup, then recreation.
     #[test]
     fn test_manager_new_cleans_up_stale_segments() {
         let instance_id = unique_tag("stale-seg");
@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(manager.get_segment("state").unwrap().len(), 4096);
     }
 
-    // 5. Lock-File: zweiter ShmManager mit gleicher Instance-ID -> Fehler.
+    // 5. Lock file: second ShmManager with the same instance id -> error.
     #[test]
     fn test_second_manager_same_instance_fails_while_first_alive() {
         let instance_id = unique_tag("dup-lock");
@@ -505,8 +505,8 @@ mod tests {
         assert!(err.to_string().contains("already in use"), "{err}");
     }
 
-    // 6. Stale Lock (Datei vom Crash übrig, aber niemand hält den flock) ->
-    //    Neuerstellung erfolgreich, danach entfernt.
+    // 6. Stale lock (file left over from a crash, but nobody holds the flock) ->
+    //    recreation succeeds, then it's removed.
     #[test]
     fn test_stale_lock_is_cleaned_up_and_new_manager_succeeds() {
         let instance_id = unique_tag("stale-lock");
@@ -546,7 +546,7 @@ mod tests {
         let _second = ShmManager::new(small_config(&instance_id)).unwrap();
     }
 
-    // 7. ShmManager::shutdown() -> alle Segmente + Lock-File entfernt.
+    // 7. ShmManager::shutdown() -> all segments + lock file removed.
     #[test]
     fn test_shutdown_removes_segments_and_lock_file() {
         let instance_id = unique_tag("shutdown");
@@ -587,7 +587,7 @@ mod tests {
         }
     }
 
-    // 8. command_buffer_size keine Zweierpotenz -> Validierungsfehler (über ShmManager::new()).
+    // 8. command_buffer_size not a power of two -> validation error (via ShmManager::new()).
     #[test]
     fn test_manager_new_rejects_non_power_of_two_command_buffer() {
         let instance_id = unique_tag("badcfg");

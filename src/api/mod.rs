@@ -40,7 +40,7 @@ impl Modify for BearerAuth {
                 HttpBuilder::new()
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
-                        "API Key wie in `luradb.toml` konfiguriert (Admins) oder wie bei User-Anlage / Key-Rotation erhalten. Nur bei `auth.enabled = true` erforderlich.",
+                        "API key as configured in `luradb.toml` (admins), or as received on user creation / key rotation. Only required when `auth.enabled = true`.",
                     ))
                     .build(),
             ),
@@ -50,10 +50,10 @@ impl Modify for BearerAuth {
 
 // ── API contract version (Modify hook) ────────────────────────────────────────
 
-/// API-Contract-Version (SemVer) — unabhängig von der Server-Version in Cargo.toml.
-/// Bump-Regeln: api/COMPATIBILITY.md. Einzige Quelle; OpenAPI-Contract
-/// und GET /version lesen von hier.
-pub const API_VERSION: &str = "0.1.0";
+/// API contract version (SemVer) — independent of the server version in Cargo.toml.
+/// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
+/// truth; the OpenAPI contract and GET /version both read from here.
+pub const API_VERSION: &str = "0.2.0";
 
 struct VersionInfo;
 
@@ -329,7 +329,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     ),
     security(("bearer_auth" = [])),
     tags(
-        (name = "Metrics", description = "Heartbeat und Performance-Metriken"),
+        (name = "Metrics", description = "Heartbeat and performance metrics"),
         (name = "Domains", description = "Domain lifecycle — create, list, get, delete"),
         (name = "Key-Value Store", description = "Domain-scoped key-value operations"),
         (name = "JSON Document Store", description = "Domain-scoped JSON document operations"),
@@ -338,14 +338,14 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         (name = "Relational Store", description = "Domain-scoped LuraSQL execution"),
         (name = "Relational Browse", description = "Catalog and row browsing for relational domains"),
         (name = "Relational Rows", description = "Row-level writes on relational tables"),
-        (name = "Auth", description = "User-Verwaltung und Domain-Permissions — nur für Admins"),
+        (name = "Auth", description = "User management and domain permissions — admins only"),
     ),
     info(
         title = "LuraDB API",
-        description = "REST-native multi-model database — KeyValue- und JSON-Engine. \
-            `version` ist die API-Contract-Version (siehe API_VERSION), unabhängig von der \
-            Server-Version; letztere steht in der Extension `x-luradb-server-version`. \
-            Kompatibilitäts-Ranges: api/COMPATIBILITY.md. Laufzeit-Check: GET /version."
+        description = "REST-native multi-model database — KeyValue and JSON engines. \
+            `version` is the API contract version (see API_VERSION), independent of the \
+            server version; the latter is in the `x-luradb-server-version` extension. \
+            Runtime check: GET /version."
     )
 )]
 pub struct ApiDoc;
@@ -358,23 +358,23 @@ mod contract_tests {
     use utoipa::OpenApi;
 
     #[test]
-    fn contract_datei_ist_aktuell() {
+    fn contract_file_is_up_to_date() {
         let generated = format!("{}\n", ApiDoc::openapi().to_pretty_json().unwrap());
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/api/openapi.json");
         let committed = std::fs::read_to_string(path).expect(
-            "api/openapi.json fehlt — erzeugen mit: cargo run -- --dump-openapi > api/openapi.json",
+            "api/openapi.json missing — generate with: cargo run -- --dump-openapi > api/openapi.json",
         );
         assert_eq!(
             generated, committed,
-            "api/openapi.json ist nicht aktuell. Regenerieren: \
-             cargo run -- --dump-openapi > api/openapi.json — und pruefen, ob info.version \
-             gebumpt werden muss (SemVer-Regeln: api/COMPATIBILITY.md) und ob \
-             api/COMPATIBILITY.md eine neue Zeile braucht."
+            "api/openapi.json is stale. Regenerate: \
+             cargo run -- --dump-openapi > api/openapi.json — and check whether info.version \
+             needs a bump and whether COMPATIBILITY.md in the concepts repo \
+             needs a new line."
         );
     }
 
     #[test]
-    fn contract_traegt_server_version_extension() {
+    fn contract_carries_server_version_extension() {
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
         assert_eq!(
             json["info"]["x-luradb-server-version"],
@@ -383,30 +383,30 @@ mod contract_tests {
     }
 
     #[test]
-    fn contract_version_ist_api_version_und_semver() {
+    fn contract_version_is_api_version_and_semver() {
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
         assert_eq!(json["info"]["version"], serde_json::json!(API_VERSION));
 
         let segments: Vec<&str> = API_VERSION.split('.').collect();
-        assert_eq!(segments.len(), 3, "API_VERSION muss SemVer (X.Y.Z) sein: {API_VERSION}");
+        assert_eq!(segments.len(), 3, "API_VERSION must be SemVer (X.Y.Z): {API_VERSION}");
         for segment in segments {
             assert!(
                 !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()),
-                "SemVer-Segment nicht rein numerisch: {segment}"
+                "SemVer segment is not purely numeric: {segment}"
             );
         }
     }
 
     #[test]
-    fn contract_enthaelt_version_pfad_mit_bearer_security() {
+    fn contract_contains_version_path_with_bearer_security() {
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let security = &json["paths"]["/version"]["get"]["security"];
-        let requirements = security.as_array().expect("/version GET hat security-Array");
+        let requirements = security.as_array().expect("/version GET has a security array");
         assert!(
             requirements
                 .iter()
                 .any(|req| req.as_object().is_some_and(|o| o.contains_key("bearer_auth"))),
-            "/version muss bearer_auth security tragen, war: {security}"
+            "/version must carry bearer_auth security, was: {security}"
         );
     }
 }
@@ -422,9 +422,9 @@ mod router_coverage_tests {
     const HTTP_METHODS: [&str; 8] =
         ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
 
-    /// `//`-Kommentare entfernen (String-Literale bleiben, inkl. `\"`-Escapes),
-    /// damit auskommentierte Routen und Kommentartext den Parse nicht täuschen.
-    fn ohne_kommentare(src: &str) -> String {
+    /// Strips `//` comments (string literals are kept, including `\"` escapes),
+    /// so that commented-out routes and comment text don't fool the parser.
+    fn without_comments(src: &str) -> String {
         let mut out = String::with_capacity(src.len());
         let mut chars = src.chars().peekable();
         let mut in_string = false;
@@ -457,41 +457,41 @@ mod router_coverage_tests {
         out
     }
 
-    /// Kommentarfreier Quelltext von `create_router` — Signatur bis zur
-    /// schließenden Klammer auf Spalte 0 (rustfmt-Invariante).
-    fn create_router_quelltext() -> String {
-        let src = ohne_kommentare(include_str!("mod.rs"));
-        let start = src.find("fn create_router").expect("fn create_router nicht gefunden");
-        let ende = src[start..]
+    /// Comment-free source text of `create_router` — from the signature to the
+    /// closing brace in column 0 (rustfmt invariant).
+    fn create_router_source() -> String {
+        let src = without_comments(include_str!("mod.rs"));
+        let start = src.find("fn create_router").expect("fn create_router not found");
+        let end = src[start..]
             .find("\n}")
-            .expect("Funktionsende von create_router nicht gefunden");
-        src[start..start + ende].to_string()
+            .expect("end of create_router function not found");
+        src[start..start + end].to_string()
     }
 
-    /// Byte-Index der schließenden Klammer des bereits geöffneten Aufrufs.
-    fn klammer_ende(src: &str) -> usize {
-        let mut tiefe = 1u32;
+    /// Byte index of the closing parenthesis of the already-opened call.
+    fn paren_end(src: &str) -> usize {
+        let mut depth = 1u32;
         let mut in_string = false;
         for (i, c) in src.char_indices() {
             match c {
                 '"' => in_string = !in_string,
-                '(' if !in_string => tiefe += 1,
+                '(' if !in_string => depth += 1,
                 ')' if !in_string => {
-                    tiefe -= 1;
-                    if tiefe == 0 {
+                    depth -= 1;
+                    if depth == 0 {
                         return i;
                     }
                 }
                 _ => {}
             }
         }
-        panic!("unbalancierte Klammern in create_router");
+        panic!("unbalanced parentheses in create_router");
     }
 
-    /// HTTP-Methoden-Aufrufe (`get(…)`, `.post(…)`, …) in einer `.route`-Argumentliste.
-    fn http_methoden(args: &str) -> Vec<String> {
+    /// HTTP method calls (`get(…)`, `.post(…)`, …) in a `.route` argument list.
+    fn http_methods(args: &str) -> Vec<String> {
         let bytes = args.as_bytes();
-        let mut gefunden = Vec::new();
+        let mut found = Vec::new();
         let mut in_string = false;
         let mut i = 0;
         while i < bytes.len() {
@@ -506,20 +506,20 @@ mod router_coverage_tests {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                let wort = &args[start..i];
-                if HTTP_METHODS.contains(&wort) && bytes.get(i) == Some(&b'(') {
-                    gefunden.push(wort.to_string());
+                let word = &args[start..i];
+                if HTTP_METHODS.contains(&word) && bytes.get(i) == Some(&b'(') {
+                    found.push(word.to_string());
                 }
             } else {
                 i += 1;
             }
         }
-        gefunden
+        found
     }
 
-    /// axum-`:param` → OpenAPI-`{param}`.
-    fn normalisiert(pfad: &str) -> String {
-        pfad.split('/')
+    /// axum `:param` → OpenAPI `{param}`.
+    fn normalize_path(path: &str) -> String {
+        path.split('/')
             .map(|seg| match seg.strip_prefix(':') {
                 Some(name) => format!("{{{name}}}"),
                 None => seg.to_string(),
@@ -528,85 +528,85 @@ mod router_coverage_tests {
             .join("/")
     }
 
-    /// Alle `.route("<pfad>", …)`-Registrierungen eines Quelltext-Abschnitts
-    /// als (Methode, Präfix+Pfad)-Paare.
-    fn routen_paare(abschnitt: &str, prefix: &str) -> BTreeSet<(String, String)> {
-        let mut paare = BTreeSet::new();
-        let mut rest = abschnitt;
+    /// All `.route("<path>", …)` registrations of a source-text section,
+    /// as (method, prefix+path) pairs.
+    fn route_pairs(section: &str, prefix: &str) -> BTreeSet<(String, String)> {
+        let mut pairs = BTreeSet::new();
+        let mut rest = section;
         while let Some(pos) = rest.find(".route(") {
             rest = &rest[pos + ".route(".len()..];
-            let args = &rest[..klammer_ende(rest)];
-            let von = args.find('"').expect(".route ohne Pfad-Literal") + 1;
-            let bis = von + args[von..].find('"').expect("Pfad-Literal nicht terminiert");
-            let pfad = format!("{prefix}{}", normalisiert(&args[von..bis]));
-            let methoden = http_methoden(args);
-            assert!(!methoden.is_empty(), "keine HTTP-Methode in .route({pfad:?}, …) erkannt");
-            for methode in methoden {
-                paare.insert((methode, pfad.clone()));
+            let args = &rest[..paren_end(rest)];
+            let path_start = args.find('"').expect(".route without a path literal") + 1;
+            let path_end = path_start + args[path_start..].find('"').expect("path literal not terminated");
+            let path = format!("{prefix}{}", normalize_path(&args[path_start..path_end]));
+            let methods = http_methods(args);
+            assert!(!methods.is_empty(), "no HTTP method detected in .route({path:?}, …)");
+            for method in methods {
+                pairs.insert((method, path.clone()));
             }
             rest = &rest[args.len()..];
         }
-        paare
+        pairs
     }
 
-    /// (Methode, Pfad)-Paare der Contract-Definition. Bewusst `ApiDoc::openapi()`
-    /// statt `api/openapi.json`: das Drift-Gate oben hält Definition und Datei
-    /// identisch, so wird bei veralteter Datei genau ein Test rot statt zwei.
-    fn contract_paare() -> BTreeSet<(String, String)> {
+    /// (method, path) pairs of the contract definition. Deliberately `ApiDoc::openapi()`
+    /// instead of `api/openapi.json`: the drift gate above keeps the definition and the
+    /// file identical, so a stale file turns exactly one test red instead of two.
+    fn contract_pairs() -> BTreeSet<(String, String)> {
         let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let mut paare = BTreeSet::new();
-        for (pfad, item) in doc["paths"].as_object().expect("Contract ohne paths") {
-            for methode in item.as_object().expect("Path-Item kein Objekt").keys() {
-                if HTTP_METHODS.contains(&methode.as_str()) {
-                    paare.insert((methode.clone(), pfad.clone()));
+        let mut pairs = BTreeSet::new();
+        for (path, item) in doc["paths"].as_object().expect("contract without paths") {
+            for method in item.as_object().expect("path item is not an object").keys() {
+                if HTTP_METHODS.contains(&method.as_str()) {
+                    pairs.insert((method.clone(), path.clone()));
                 }
             }
         }
-        paare
+        pairs
     }
 
-    /// Das Drift-Gate sichert nur Definition == Datei; eine in `create_router`
-    /// registrierte Route ohne `paths(...)`-Eintrag fehlte still auf beiden
-    /// Seiten. Axum bietet keine Router-Introspektion, daher Quelltext-Parse.
-    /// Swagger-Laufzeitrouten und Hello-Route (main.rs) sind bewusst kein
-    /// Contract-Bestandteil und liegen außerhalb von `create_router`.
+    /// The drift gate only guarantees definition == file; a route registered in
+    /// `create_router` without a `paths(...)` entry would be silently missing on
+    /// both sides. Axum offers no router introspection, hence the source-text parse.
+    /// Swagger's runtime routes and the hello route (main.rs) are deliberately not
+    /// part of the contract and live outside `create_router`.
     #[test]
-    fn jede_registrierte_route_steht_methodengenau_im_contract() {
-        let body = create_router_quelltext();
+    fn every_registered_route_matches_contract_exactly() {
+        let body = create_router_source();
 
-        // Struktur-Annahmen absichern: bei Umbau von create_router laut
-        // fehlschlagen statt still falsch parsen.
-        assert_eq!(body.matches(".nest(").count(), 1, "Nesting geändert — Parse anpassen");
-        assert!(body.contains(".nest(\"/store-api\""), "Nest-Präfix geändert — Parse anpassen");
-        for weg in [".route_service(", ".nest_service(", ".fallback("] {
-            assert!(!body.contains(weg), "{weg} registriert Routen am Parser vorbei");
+        // Guard the structural assumptions: fail loudly on a create_router
+        // refactor instead of silently mis-parsing.
+        assert_eq!(body.matches(".nest(").count(), 1, "nesting changed — adjust the parser");
+        assert!(body.contains(".nest(\"/store-api\""), "nest prefix changed — adjust the parser");
+        for bypass in [".route_service(", ".nest_service(", ".fallback("] {
+            assert!(!body.contains(bypass), "{bypass} registers routes past the parser");
         }
         for (i, _) in body.match_indices(".merge(") {
             let arg = &body[i + ".merge(".len()..];
-            let arg = &arg[..arg.find(')').expect(".merge ohne schließende Klammer")];
+            let arg = &arg[..arg.find(')').expect(".merge without a closing parenthesis")];
             assert!(
                 body.contains(&format!("let {arg} = Router::new()"))
                     || body.contains(&format!("let mut {arg} = Router::new()")),
-                ".merge({arg}): kein lokal gebauter Router — Parse sieht dessen Routen nicht"
+                ".merge({arg}): not a locally built router — the parser won't see its routes"
             );
         }
 
-        let wurzel_ab = body
+        let root_at = body
             .find("let mut router = Router::new()")
-            .expect("Root-Router-Marker nicht gefunden — Parse anpassen");
-        let (genestet, wurzel) = body.split_at(wurzel_ab);
-        let mut registriert = routen_paare(genestet, "/store-api");
-        registriert.extend(routen_paare(wurzel, ""));
-        assert!(!registriert.is_empty(), "Parser fand keine .route-Registrierungen");
+            .expect("root router marker not found — adjust the parser");
+        let (nested, root) = body.split_at(root_at);
+        let mut registered = route_pairs(nested, "/store-api");
+        registered.extend(route_pairs(root, ""));
+        assert!(!registered.is_empty(), "parser found no .route registrations");
 
-        let contract = contract_paare();
-        let ohne_contract: Vec<_> = registriert.difference(&contract).collect();
-        let ohne_route: Vec<_> = contract.difference(&registriert).collect();
+        let contract = contract_pairs();
+        let not_in_contract: Vec<_> = registered.difference(&contract).collect();
+        let not_registered: Vec<_> = contract.difference(&registered).collect();
         assert!(
-            ohne_contract.is_empty() && ohne_route.is_empty(),
-            "Router-Registrierung und OpenAPI-Contract weichen ab.\n\
-             Registriert, aber nicht im Contract — #[utoipa::path] + paths(...)-Eintrag ergänzen: {ohne_contract:?}\n\
-             Im Contract, aber nicht registriert — paths(...)-Leiche oder fehlende .route(): {ohne_route:?}"
+            not_in_contract.is_empty() && not_registered.is_empty(),
+            "Router registration and OpenAPI contract diverge.\n\
+             Registered but missing from the contract — add a #[utoipa::path] + paths(...) entry: {not_in_contract:?}\n\
+             In the contract but not registered — stale paths(...) entry or missing .route(): {not_registered:?}"
         );
     }
 }

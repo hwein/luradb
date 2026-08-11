@@ -1,4 +1,4 @@
-//! AST for LuraSQL (spec rel/004, concept 004 kap. 4).
+//! AST for LuraSQL (spec rel/004, concept 004 ch. 4).
 //!
 //! The parser (`parser.rs`) builds these types via recursive descent; the
 //! binder (`binder.rs`) translates the DDL subset into catalog inputs

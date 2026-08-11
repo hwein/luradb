@@ -8,7 +8,7 @@ use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::memtable::{MemTable, Value};
 use crate::storage::format::CachedValue;
 use crate::storage::sstable::SSTableReader;
-use crate::storage::vlog::VLog;
+use crate::storage::vlog::VLogRegistry;
 use anyhow::Result;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -69,11 +69,35 @@ pub struct LsmReader {
     /// SSTables organized by level (L0, L1, ..., Ln)
     sstables: Vec<Vec<Arc<SSTableReader>>>,
 
-    /// Value log for dereferencing large values
-    vlog: Arc<VLog>,
+    /// Value log generations for dereferencing large values
+    vlog: Arc<VLogRegistry>,
 
     /// Shared S3-FIFO block cache — checked before every SSTable block read.
     cache: Arc<Mutex<BlockCache>>,
+}
+
+/// Three-valued result of a KV point read (spec kv/018): a live value, an
+/// explicit NULL (key present, no bytes), or nothing at all. Replaces the
+/// former `Option<Vec<u8>>` returned by `get`/`get_with_snapshot` — `Null` is
+/// only ever produced inside the KV engine (via `set_null`); every caller
+/// outside it treats `Null` defensively like `Absent` via
+/// [`GetResult::into_option`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum GetResult {
+    Absent,
+    Null,
+    Present(Vec<u8>),
+}
+
+impl GetResult {
+    /// Collapses `Null` into `Absent` — for callers where a NULL version can
+    /// never occur (JSON/rel never write it; only the KV engine's `set_null` does).
+    pub fn into_option(self) -> Option<Vec<u8>> {
+        match self {
+            GetResult::Present(v) => Some(v),
+            GetResult::Null | GetResult::Absent => None,
+        }
+    }
 }
 
 /// A value plus the metadata the SHM snapshot builder needs (spec perf/009 §3).
@@ -86,13 +110,15 @@ pub struct ValueWithMetadata {
     pub data: Vec<u8>,
     pub expire_at: u64,
     pub from_vlog: bool,
+    /// Key is explicitly NULL (kv/018): `data` is empty, `from_vlog` is false.
+    pub is_null: bool,
 }
 
 impl LsmReader {
     /// Creates a new LSM reader.
     pub fn new(
         memtable: Arc<MemTable>,
-        vlog: Arc<VLog>,
+        vlog: Arc<VLogRegistry>,
         cache: Arc<Mutex<BlockCache>>,
     ) -> Self {
         Self {
@@ -136,7 +162,7 @@ impl LsmReader {
     /// then [`Self::sstables_newest_first`]); each yields its newest version
     /// <= snapshot timestamp, so the first hit decides for good. Returns None
     /// if the key is absent or that version is a tombstone.
-    pub async fn get(&self, user_key: &[u8], snapshot: &Snapshot) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&self, user_key: &[u8], snapshot: &Snapshot) -> Result<GetResult> {
         for memtable in self.memtables_newest_first() {
             if let Some(result) = self.get_from_memtable(memtable, user_key, snapshot).await? {
                 return Ok(result);
@@ -147,7 +173,7 @@ impl LsmReader {
                 return Ok(result);
             }
         }
-        Ok(None)
+        Ok(GetResult::Absent)
     }
 
     /// Gets a value from a MemTable with MVCC filtering.
@@ -156,20 +182,21 @@ impl LsmReader {
         memtable: &MemTable,
         user_key: &[u8],
         snapshot: &Snapshot,
-    ) -> Result<Option<Option<Vec<u8>>>> {
+    ) -> Result<Option<GetResult>> {
         match memtable.get(user_key, snapshot.timestamp()) {
             Some(value) => {
                 match value {
                     Value::Inline(v, expire_at) => {
-                        if is_expired(expire_at) { return Ok(Some(None)); }
-                        Ok(Some(Some(v)))
+                        if is_expired(expire_at) { return Ok(Some(GetResult::Absent)); }
+                        Ok(Some(GetResult::Present(v)))
                     }
-                    Value::Pointer { offset, len, expire_at } => {
-                        if is_expired(expire_at) { return Ok(Some(None)); }
-                        let v = self.vlog.read(offset, len).await?;
-                        Ok(Some(Some(v)))
+                    Value::Pointer { file_id, offset, len, expire_at } => {
+                        if is_expired(expire_at) { return Ok(Some(GetResult::Absent)); }
+                        let v = self.vlog.read(file_id, offset, len).await?;
+                        Ok(Some(GetResult::Present(v)))
                     }
-                    Value::Tombstone => Ok(Some(None)),
+                    Value::Null => Ok(Some(GetResult::Null)),
+                    Value::Tombstone => Ok(Some(GetResult::Absent)),
                 }
             }
             None => Ok(None),
@@ -185,7 +212,7 @@ impl LsmReader {
         sstable: &SSTableReader,
         user_key: &[u8],
         snapshot: &Snapshot,
-    ) -> Result<Option<Option<Vec<u8>>>> {
+    ) -> Result<Option<GetResult>> {
         let search_key = InternalKey::new(user_key.to_vec(), snapshot.timestamp());
         let encoded_key = search_key.encode();
 
@@ -198,20 +225,21 @@ impl LsmReader {
         // exactly once, after the visible version has been found.
         match maybe_value {
             None => Ok(None),
-            Some(CachedValue::Tombstone) => Ok(Some(None)),
-            Some(CachedValue::VLogPointer { value_offset, value_len, expire_at, .. }) => {
+            Some(CachedValue::Tombstone) => Ok(Some(GetResult::Absent)),
+            Some(CachedValue::Null) => Ok(Some(GetResult::Null)),
+            Some(CachedValue::VLogPointer { file_id, value_offset, value_len, expire_at }) => {
                 if expire_at != 0 && expire_at <= now_secs() {
-                    return Ok(Some(None));
+                    return Ok(Some(GetResult::Absent));
                 }
-                let value = self.vlog.read(value_offset, value_len as usize).await?;
-                Ok(Some(Some(value)))
+                let value = self.vlog.read(file_id, value_offset, value_len as usize).await?;
+                Ok(Some(GetResult::Present(value)))
             }
             Some(value) => {
                 let expire_at = value.expire_at();
                 if expire_at != 0 && expire_at <= now_secs() {
-                    return Ok(Some(None));
+                    return Ok(Some(GetResult::Absent));
                 }
-                Ok(Some(Some(value.to_owned_bytes())))
+                Ok(Some(GetResult::Present(value.to_owned_bytes())))
             }
         }
     }
@@ -250,11 +278,14 @@ impl LsmReader {
         match memtable.get(user_key, snapshot.timestamp()) {
             Some(Value::Inline(v, expire_at)) => {
                 if is_expired(expire_at) { return Ok(Some(None)); }
-                Ok(Some(Some(ValueWithMetadata { data: v, expire_at: expire_at.unwrap_or(0), from_vlog: false })))
+                Ok(Some(Some(ValueWithMetadata { data: v, expire_at: expire_at.unwrap_or(0), from_vlog: false, is_null: false })))
             }
             Some(Value::Pointer { expire_at, .. }) => {
                 if is_expired(expire_at) { return Ok(Some(None)); }
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: expire_at.unwrap_or(0), from_vlog: true })))
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: expire_at.unwrap_or(0), from_vlog: true, is_null: false })))
+            }
+            Some(Value::Null) => {
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true })))
             }
             Some(Value::Tombstone) => Ok(Some(None)),
             None => Ok(None),
@@ -280,18 +311,21 @@ impl LsmReader {
         match maybe_value {
             None => Ok(None),
             Some(CachedValue::Tombstone) => Ok(Some(None)),
+            Some(CachedValue::Null) => {
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true })))
+            }
             Some(CachedValue::VLogPointer { expire_at, .. }) => {
                 if expire_at != 0 && expire_at <= now_secs() {
                     return Ok(Some(None));
                 }
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at, from_vlog: true })))
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at, from_vlog: true, is_null: false })))
             }
             Some(value) => {
                 let expire_at = value.expire_at();
                 if expire_at != 0 && expire_at <= now_secs() {
                     return Ok(Some(None));
                 }
-                Ok(Some(Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false })))
+                Ok(Some(Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false, is_null: false })))
             }
         }
     }
@@ -660,7 +694,7 @@ mod merge_iterator_tests {
         Ok(())
     }
 
-    // Vorarbeit: advancing a source onto an Err must propagate it without
+    // Note: advancing a source onto an Err must propagate it without
     // re-inserting the entry into the heap (the block moved into advance_source).
     #[test]
     fn test_merge_iterator_propagates_error() -> Result<()> {
@@ -677,7 +711,7 @@ mod merge_iterator_tests {
         Ok(())
     }
 
-    // Vorarbeit: same user key AND timestamp in two sources — the lower
+    // Note: same user key AND timestamp in two sources — the lower
     // source_priority (newer source) wins the tiebreak.
     #[test]
     fn test_merge_iterator_source_priority_tiebreak() -> Result<()> {

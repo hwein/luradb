@@ -14,12 +14,12 @@ use hyper_util::rt::TokioIo;
 use luradb::core::storage_thread::{StorageThread, StorageThreadConfig};
 use luradb::core::wal::WriteAheadLog;
 use luradb::ipc::{
-    DoubleMmapRegion, RingConsumer, RingProducer, RingbufferHeader, ShmCommand, ShmResponse,
-    ShmSegment, ShmSnapshot, SnapshotGuard, StateHeader,
+    DoubleMmapRegion, RingConsumer, RingProducer, RingbufferHeader, ShmCommand, ShmGetValue,
+    ShmResponse, ShmSegment, ShmSnapshot, SnapshotGuard, StateHeader,
 };
 use luradb::storage::sstable::{SSTableBuilder, SSTableReader};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use rkyv::{check_archived_root, AlignedVec};
+use rkyv::{rancor, util::AlignedVec, Archived};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -205,7 +205,8 @@ impl ShmClient {
         let id = self.next_id;
         self.next_id += 1;
         match self.call(ShmCommand::Get { request_id: id, domain: domain.to_string(), key: key.to_vec() }) {
-            ShmResponse::GetOk { value, .. } => value,
+            ShmResponse::GetOk { value: ShmGetValue::Present(v), .. } => Some(v),
+            ShmResponse::GetOk { .. } => None,
             other => panic!("unexpected GET response: {other:?}"),
         }
     }
@@ -264,9 +265,10 @@ impl ShmSnapshotClient {
     fn get(&self, domain: &str, key: &[u8]) -> Option<Vec<u8>> {
         let (a, b) = self.bufs();
         let guard = SnapshotGuard::acquire(self.header(), a, b)?;
-        let mut aligned = AlignedVec::with_capacity(guard.data().len());
+        let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
         aligned.extend_from_slice(guard.data());
-        let archived = check_archived_root::<ShmSnapshot>(aligned.as_slice()).ok()?;
+        let archived =
+            rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).ok()?;
         let dom = archived.domains.iter().find(|d| d.name == domain)?;
         let idx = dom.entries.binary_search_by(|e| e.key.as_slice().cmp(key)).ok()?;
         let entry = &dom.entries[idx];
@@ -855,17 +857,17 @@ fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], f
     md.push_str(&format!("Generated: unix timestamp {now}\n\n"));
 
     md.push_str("## GET / PUT Latency + Throughput\n\n");
-    md.push_str("| Szenario | TCP | UDS | SHM Cmd | SHM Snap |\n");
+    md.push_str("| Scenario | TCP | UDS | SHM Cmd | SHM Snap |\n");
     md.push_str("|---|---|---|---|---|\n");
     md.push_str(&format!(
-        "| GET Latenz (Mittelwert, A) | {} | {} | {} | {} |\n",
+        "| GET Latency (mean, A) | {} | {} | {} | {} |\n",
         crit_mean("bench_get_tcp"),
         crit_mean("bench_get_uds"),
         crit_mean("bench_get_shm_command"),
         crit_mean("bench_get_shm_snapshot"),
     ));
     md.push_str(&format!(
-        "| PUT Latenz (Mittelwert, C) | {} | {} | {} | N/A |\n",
+        "| PUT Latency (mean, C) | {} | {} | {} | N/A |\n",
         crit_mean("bench_put_tcp"),
         crit_mean("bench_put_uds"),
         crit_mean("bench_put_shm"),
@@ -881,7 +883,7 @@ fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], f
     md.push_str(
         "SHM reads use the snapshot path, SHM writes use the command ring (how a real client would mix them).\n\n",
     );
-    md.push_str("| Metrik | TCP | UDS | SHM |\n");
+    md.push_str("| Metric | TCP | UDS | SHM |\n");
     md.push_str("|---|---|---|---|\n");
     md.push_str(&format!(
         "| p50 | {} | {} | {} |\n",
@@ -924,7 +926,7 @@ fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], f
     md.push_str("| Benchmark | Old Path | New Path |\n");
     md.push_str("|---|---|---|\n");
     md.push_str(&format!(
-        "| WAL Append (tokio::fs vs. Storage-Thread SQPOLL) | {} | {} |\n",
+        "| WAL Append (tokio::fs vs. storage-thread SQPOLL) | {} | {} |\n",
         crit_mean("bench_wal_append_tokio"),
         crit_mean("bench_wal_append_iouring"),
     ));

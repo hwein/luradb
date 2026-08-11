@@ -2,17 +2,25 @@
 swagger_enabled = false
 bind_address = "127.0.0.1"
 port = 3000
+http_enabled = true
 hello_enabled = false
-# UDS für lokale Clients; /run/luradb legt systemd an (RuntimeDirectory).
-# Zugriff: Gruppe luradb (Socket-Mode-Default 0o660).
+# UDS for local clients; /run/luradb is created by systemd (RuntimeDirectory).
+# Access: group luradb (socket mode default 0o660).
 unix_socket_path = "/run/luradb/luradb.sock"
+
+# Native HTTPS listener (spec general/011), opt-in. Quickstart to enable:
+# packaging/INSTALL.md "Enabling HTTPS".
+tls_enabled = false
+tls_port = 3443
+tls_cert_path = "/etc/luradb/tls/server.crt"
+tls_key_path = "/etc/luradb/tls/server.key"
 
 [auth]
 enabled = true
 
 [[auth.admins]]
 name = "admin"
-# Platzhalter — postinst ersetzt ihn beim Erstinstall durch einen Zufalls-Key.
+# Placeholder — postinst replaces it with a random key on first install.
 api_key = "@GENERATED_ON_INSTALL@"
 
 [storage]
@@ -59,7 +67,7 @@ default_max_storage_bytes = 0
 [log]
 level = "info"
 format = "text"
-# Kein path: stdout → journald (journalctl -u luradb)
+# No path: stdout → journald (journalctl -u luradb)
 
 [proxy]
 trusted_proxies = ["127.0.0.1", "::1"]

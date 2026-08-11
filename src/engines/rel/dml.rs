@@ -214,7 +214,7 @@ impl RelEngine {
         self.guard_key_len(&row_key)?;
 
         if !seen_pk.insert(pk_enc.clone())
-            || self.engine.get_with_snapshot(&row_key, snap).await?.is_some()
+            || self.engine.get_with_snapshot(&row_key, snap).await?.into_option().is_some()
         {
             return Err(RelStoreError::DuplicateKey { table: schema.name.clone() });
         }
@@ -407,7 +407,7 @@ impl RelEngine {
                     return Ok(Vec::new());
                 };
                 let key = keys::row_key(prefix, schema.table_id, &pk_enc);
-                return Ok(match self.engine.get_with_snapshot(&key, snap).await? {
+                return Ok(match self.engine.get_with_snapshot(&key, snap).await?.into_option() {
                     Some(bytes) => vec![Candidate { values: decode_row(&bytes, schema), key }],
                     None => Vec::new(),
                 });
@@ -422,7 +422,7 @@ impl RelEngine {
         let mut out = Vec::new();
         let mut scanned = 0u64;
         for key in keys {
-            let Some(bytes) = self.engine.get_with_snapshot(&key, snap).await? else {
+            let Some(bytes) = self.engine.get_with_snapshot(&key, snap).await?.into_option() else {
                 continue;
             };
             scanned += 1;
@@ -548,7 +548,7 @@ impl RelEngine {
             return Ok(());
         };
         let key = keys::row_key(prefix, table_id, &pk_enc);
-        if self.engine.get_with_snapshot(&key, snap).await?.is_none() {
+        if self.engine.get_with_snapshot(&key, snap).await?.into_option().is_none() {
             return Err(missing());
         }
         Ok(())
@@ -628,7 +628,7 @@ impl RelEngine {
         snap: &Snapshot,
     ) -> Result<u64, RelStoreError> {
         let key = keys::seq_key(prefix, table_id);
-        match self.engine.get_with_snapshot(&key, snap).await? {
+        match self.engine.get_with_snapshot(&key, snap).await?.into_option() {
             Some(b) if b.len() == 8 => Ok(u64::from_be_bytes(b.try_into().unwrap())),
             _ => Ok(0),
         }
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     // UPDATE -> UniqueViolation: a SET introduces a UNIQUE-column collision
-    // with another row (quality/007 Vorarbeit).
+    // with another row (quality/007 prep work).
     #[tokio::test]
     async fn test_update_unique_violation() {
         let (rel, _d) = make().await;
@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     // UPDATE -> LinkTargetMissing: the FK re-check runs over changed
-    // REFERENCES columns, not just at INSERT time (quality/007 Vorarbeit).
+    // REFERENCES columns, not just at INSERT time (quality/007 prep work).
     #[tokio::test]
     async fn test_update_link_target_missing() {
         let (rel, _d) = make().await;
@@ -1583,7 +1583,7 @@ mod tests {
     }
 
     // UPDATE -> TextTooLong / RowTooLarge: the same size guards as INSERT
-    // apply on the UPDATE path (quality/007 Vorarbeit).
+    // apply on the UPDATE path (quality/007 prep work).
     #[tokio::test]
     async fn test_update_size_guards() {
         let dir = tempfile::TempDir::new().unwrap();

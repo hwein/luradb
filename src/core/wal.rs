@@ -27,6 +27,10 @@ pub enum WalEntry {
         timestamp: u64,
         key: Vec<u8>,
     },
+    SetNull {
+        timestamp: u64,
+        key: Vec<u8>,
+    },
 }
 
 /// Recovers database state by reading and parsing all entries from the WAL.
@@ -84,6 +88,12 @@ pub async fn recover(path: impl AsRef<Path>) -> Result<Vec<WalEntry>, WalError> 
                         _ => return Err(invalid_entry_error()),
                     }
                 }
+            }
+            // SET_NULL: [ts:u64][key_len:u32][key] (kv/018; type 3 is the batch record above)
+            4 => {
+                let timestamp = file.read_u64().await?;
+                let key = read_len_prefixed(&mut file).await?;
+                entries.push(WalEntry::SetNull { timestamp, key });
             }
             _ => return Err(invalid_entry_error()),
         }

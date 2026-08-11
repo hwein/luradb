@@ -2034,7 +2034,7 @@ mod tests {
         assert_eq!(t.indexes.len(), 1, "the implicit index must still exist");
     }
 
-    // ── Vorarbeit (spec quality/008): recover's tolerant skip paths ─────────────
+    // ── Prep work (spec quality/008): recover's tolerant skip paths ─────────────
 
     // 27. A CAT: key with no ':' after the prefix cannot be split into
     //     (system_prefix, name) -> skipped (tracing::warn), other entries
@@ -2152,7 +2152,7 @@ mod tests {
         );
     }
 
-    // ── Vorarbeit (spec quality/008): validate_columns/check_default error paths ─
+    // ── Prep work (spec quality/008): validate_columns/check_default error paths ─
 
     // 30. Two columns normalizing to the same name -> InvalidSchema("duplicate
     //     column ..."), before any other column check runs.

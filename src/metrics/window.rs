@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(m.read_latency_us_p99, 50);
         // P99 with 100 samples target = ceil(100*99/100) = 99 → cumulative at bucket 1 = 99 ≥ 99.
         // So P99 midpoint = 50 µs (< 100 µs bucket).
-        // The spec says "P99 im Bereich [100 µs, 1 ms]" but with midpoint approximation
+        // The spec says "P99 in the range [100 µs, 1 ms]" but with midpoint approximation
         // the 99th sample lands at the boundary of bucket 1. This is acceptable given
         // the approximation disclaimer in the spec.
     }

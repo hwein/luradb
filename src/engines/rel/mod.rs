@@ -454,7 +454,8 @@ mod tests {
             .engine()
             .get_with_snapshot(b"row:1", snap.snapshot())
             .await
-            .unwrap();
+            .unwrap()
+            .into_option();
         assert_eq!(got, Some(b"{}".to_vec()));
         rel.shutdown().await;
     }

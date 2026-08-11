@@ -1,83 +1,120 @@
-# LuraDB installieren (Debian-Paket)
+# Installing LuraDB (Debian package)
 
-## Paket bauen
+## Building the package
 
 ```sh
 cargo deb
 ```
 
-Erzeugt `target/debian/luradb_<version>-1_amd64.deb`. Voraussetzung: `cargo-deb` (`cargo install cargo-deb`) und `dpkg-dev` (`sudo apt install dpkg-dev`) sind installiert.
+Produces `target/debian/luradb_<version>-1_amd64.deb`. Requires `cargo-deb` (`cargo install cargo-deb`) and `dpkg-dev` (`sudo apt install dpkg-dev`) to be installed.
 
-## Installieren
+## Installing
 
 ```sh
 sudo apt install ./target/debian/luradb_*.deb
 ```
 
-`apt` löst die Laufzeitabhängigkeiten automatisch auf. Beim Erstinstall passiert Folgendes:
+`apt` resolves the runtime dependencies automatically. On first install, the following happens:
 
-- Der Systembenutzer `luradb` wird angelegt (kein Login, kein Home-Verzeichnis).
-- `/etc/luradb/luradb.toml` gehört `root:luradb`, Modus `640` (enthält den Admin-API-Key).
-- Ein zufälliger Admin-API-Key wird generiert (siehe unten).
-- Der systemd-Dienst wird aktiviert und gestartet.
+- The system user `luradb` is created (no login, no home directory).
+- `/etc/luradb/luradb.toml` is owned by `root:luradb`, mode `640` (contains the admin API key).
+- A random admin API key is generated (see below).
+- The systemd service is enabled and started.
 
-## Dienststatus & Logs
+## Service status & logs
 
 ```sh
 systemctl status luradb
 journalctl -u luradb
-journalctl -u luradb -f    # live mitlesen
+journalctl -u luradb -f    # follow live
 ```
 
-## Admin-API-Key auslesen
+## Reading the admin API key
 
 ```sh
 sudo grep api_key /etc/luradb/luradb.toml
 ```
 
-Der Key beginnt mit `lura_`. Er wird nur beim Erstinstall generiert (Platzhalter `@GENERATED_ON_INSTALL@`) und bleibt über Updates und Reinstalls hinweg unverändert erhalten.
+The key starts with `lura_`. It is generated only on first install (placeholder `@GENERATED_ON_INSTALL@`) and stays unchanged across updates and reinstalls.
 
-## Smoke-Test
+## Smoke test
 
 ```sh
 curl -fs http://127.0.0.1:3000/health
 ```
 
-## Konfig ändern
+## Changing the config
 
 ```sh
 sudoedit /etc/luradb/luradb.toml
 sudo systemctl restart luradb
 ```
 
-`luradb.toml` ist ein dpkg-Conffile: lokale Änderungen bleiben bei Updates erhalten (dpkg fragt bei Konflikten zwischen lokaler Änderung und neuer Paketversion nach).
+`luradb.toml` is a dpkg conffile: local changes survive updates (dpkg prompts on conflicts between a local change and the new package version).
 
-## UDS-Zugriff
+## Enabling HTTPS (quickstart)
 
-Lokale Clients erreichen LuraDB auch über den Unix-Domain-Socket `/run/luradb/luradb.sock` (Modus `0660`, Gruppe `luradb`; das Verzeichnis `/run/luradb` legt systemd über `RuntimeDirectory=` an). Einen weiteren Systembenutzer für den Zugriff freischalten:
+LuraDB can terminate TLS itself, on its own port (`tls_port`, default `3443`), in parallel to the plain HTTP listener. This is a quick start with a self-signed certificate; for a certificate from a public or internal CA (e.g. via `certbot`), just point `tls_cert_path`/`tls_key_path` at those files instead — or keep operating behind a reverse proxy.
+
+1. Generate a self-signed certificate:
+
+   ```sh
+   sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+       -keyout /etc/luradb/tls/server.key -out /etc/luradb/tls/server.crt \
+       -days 365 -nodes -subj "/CN=localhost" \
+       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+       -addext "basicConstraints=critical,CA:FALSE"
+   ```
+
+2. Restrict access to the private key (LuraDB does not enforce this — it's on the operator):
+
+   ```sh
+   sudo chown root:luradb /etc/luradb/tls/server.key
+   sudo chmod 640 /etc/luradb/tls/server.key
+   ```
+
+3. Enable TLS and restart:
+
+   ```sh
+   sudoedit /etc/luradb/luradb.toml   # tls_enabled = true
+   sudo systemctl restart luradb
+   ```
+
+4. Test:
+
+   ```sh
+   curl --cacert /etc/luradb/tls/server.crt https://127.0.0.1:3443/health
+   curl -k https://127.0.0.1:3443/health   # without pinning the self-signed cert
+   ```
+
+5. Certificate rotation has no hot-reload — replace the files under `/etc/luradb/tls/` and run `sudo systemctl restart luradb`. For a CA-issued certificate, keep it renewed there (e.g. via `certbot`), or continue terminating TLS at a reverse proxy instead.
+
+## UDS access
+
+Local clients can also reach LuraDB via the Unix domain socket `/run/luradb/luradb.sock` (mode `0660`, group `luradb`; the directory `/run/luradb` is created by systemd via `RuntimeDirectory=`). To grant another system user access:
 
 ```sh
-sudo usermod -aG luradb <benutzer>
+sudo usermod -aG luradb <username>
 ```
 
-Neu anmelden, damit die Gruppenmitgliedschaft wirksam wird.
+Log in again for the group membership to take effect.
 
 ## Update
 
 ```sh
-sudo apt install ./target/debian/luradb_*.deb
+sudo apt reinstall ./target/debian/luradb_*.deb
 ```
 
-Erneutes Installieren (gleiche oder neuere Paketversion) aktualisiert Binary und systemd-Unit. Das Conffile `/etc/luradb/luradb.toml` bleibt unverändert (dpkg-Standardverhalten für Conffiles), der bestehende Admin-API-Key bleibt erhalten, der Dienst wird danach neu gestartet.
+Updates the binary and systemd unit — even for the same package version, for which `apt install` would be a no-op. The conffile `/etc/luradb/luradb.toml` stays unchanged (standard dpkg behavior for conffiles), the existing admin API key is kept, and the service is restarted afterward.
 
-## Deinstallation
+## Uninstallation
 
 ```sh
-sudo apt remove luradb    # Binary + systemd-Unit weg, Conffile bleibt
-sudo apt purge luradb     # zusätzlich das Conffile /etc/luradb/luradb.toml weg
+sudo apt remove luradb    # binary + systemd unit gone, conffile stays
+sudo apt purge luradb     # additionally removes the conffile /etc/luradb/luradb.toml
 ```
 
-`/var/lib/luradb` (Datenbankdateien: WAL, VLog, SSTables) und der Systembenutzer `luradb` werden **nie automatisch gelöscht** — das ist beabsichtigt destruktiv und bleibt manuell:
+`/var/lib/luradb` (database files: WAL, VLog, SSTables) and the system user `luradb` are **never deleted automatically** — that's deliberately destructive and stays manual:
 
 ```sh
 sudo rm -rf /var/lib/luradb

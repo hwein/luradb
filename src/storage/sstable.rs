@@ -1,12 +1,11 @@
 use crate::engines::lsm::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
 use crate::storage::format::{
     ArchivedDataBlockValue, BlockHandle, BloomFilter, CachedValue, DataBlock, DataBlockValue,
-    IndexBlock, SSTableFooter, ValuePointer,
+    IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer,
 };
 use crate::storage::bloom::BloomFilter as BloomFilterImpl;
-use rkyv::ser::{serializers::AllocSerializer, Serializer};
 use rkyv::util::AlignedVec;
-use rkyv::{check_archived_root, Archived};
+use rkyv::{rancor, Archived};
 use anyhow::{Result, bail};
 
 const BLOCK_SIZE_TARGET: usize = 4096; // 4KB target for data blocks
@@ -118,9 +117,7 @@ impl SSTableBuilder {
         }
 
         for (i, data_block) in self.data_blocks.iter().enumerate() {
-            let mut serializer = AllocSerializer::<0>::default();
-            serializer.serialize_value(data_block)?;
-            let block_bytes = serializer.into_serializer().into_inner();
+            let block_bytes = rkyv::to_bytes::<rancor::Error>(data_block)?;
 
             let block_offset = buf.len() as u64;
             let block_len = block_bytes.len() as u64;
@@ -131,9 +128,7 @@ impl SSTableBuilder {
             pad_to_align8(&mut buf);
         }
 
-        let mut serializer = AllocSerializer::<0>::default();
-        serializer.serialize_value(&self.index)?;
-        let index_bytes = serializer.into_serializer().into_inner();
+        let index_bytes = rkyv::to_bytes::<rancor::Error>(&self.index)?;
         let index_handle = BlockHandle {
             offset: buf.len() as u64,
             size: index_bytes.len() as u64,
@@ -145,9 +140,7 @@ impl SSTableBuilder {
             data: self.bloom_filter.as_bytes().to_vec(),
             num_hashes: self.bloom_filter.num_hashes(),
         };
-        let mut serializer = AllocSerializer::<0>::default();
-        serializer.serialize_value(&bloom_filter)?;
-        let bloom_bytes = serializer.into_serializer().into_inner();
+        let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter)?;
         let bloom_filter_handle = BlockHandle {
             offset: buf.len() as u64,
             size: bloom_bytes.len() as u64,
@@ -160,9 +153,7 @@ impl SSTableBuilder {
             bloom_filter_handle,
             checksum: 0,
         };
-        let mut serializer = AllocSerializer::<0>::default();
-        serializer.serialize_value(&footer)?;
-        let footer_bytes = serializer.into_serializer().into_inner();
+        let footer_bytes = rkyv::to_bytes::<rancor::Error>(&footer)?;
         let footer_offset = buf.len() as u64;
         buf.extend_from_slice(&footer_bytes);
 
@@ -243,7 +234,7 @@ impl SSTableReader {
         }
 
         let footer_slice = &bytes[footer_offset..footer_end];
-        let footer = check_archived_root::<SSTableFooter>(footer_slice)
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(footer_slice)
             .map_err(|e| anyhow::anyhow!("Footer validation failed: {}", e))?;
 
         let footer: &'static Archived<SSTableFooter> = unsafe {
@@ -253,12 +244,13 @@ impl SSTableReader {
         let index_offset = u64::from(footer.index_handle.offset) as usize;
         let index_size = u64::from(footer.index_handle.size) as usize;
 
-        if index_offset + index_size > bytes.len() {
-            bail!("Invalid index block offset/size");
-        }
+        let index_end = index_offset
+            .checked_add(index_size)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid index block offset/size"))?;
 
-        let index_slice = &bytes[index_offset..index_offset + index_size];
-        let index = check_archived_root::<IndexBlock>(index_slice)
+        let index_slice = &bytes[index_offset..index_end];
+        let index = rkyv::access::<Archived<IndexBlock>, rancor::Error>(index_slice)
             .map_err(|e| anyhow::anyhow!("Index validation failed: {}", e))?;
 
         let index: &'static Archived<IndexBlock> = unsafe {
@@ -268,12 +260,13 @@ impl SSTableReader {
         let bloom_offset = u64::from(footer.bloom_filter_handle.offset) as usize;
         let bloom_size = u64::from(footer.bloom_filter_handle.size) as usize;
 
-        if bloom_offset + bloom_size > bytes.len() {
-            bail!("Invalid bloom filter offset/size");
-        }
+        let bloom_end = bloom_offset
+            .checked_add(bloom_size)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid bloom filter offset/size"))?;
 
-        let bloom_slice = &bytes[bloom_offset..bloom_offset + bloom_size];
-        let bloom_archived = check_archived_root::<BloomFilter>(bloom_slice)
+        let bloom_slice = &bytes[bloom_offset..bloom_end];
+        let bloom_archived = rkyv::access::<Archived<BloomFilter>, rancor::Error>(bloom_slice)
             .map_err(|e| anyhow::anyhow!("Bloom filter validation failed: {}", e))?;
 
         let bloom_filter = BloomFilterImpl::from_bytes(
@@ -313,12 +306,12 @@ impl SSTableReader {
         // ── 1. Exact-match path ───────────────────────────────────────────────
         let block_idx = self.find_block(key)?;
         if let Some(idx) = block_idx {
-            let (_, block_handle) = &self.index.entries[idx];
+            let block_handle = &self.index.entries[idx].1;
             let block_offset = u64::from(block_handle.offset);
             let cache_key = BlockCacheKey { file_id: self.file_id, block_offset };
 
             let raw = self.get_or_cache_block(block_handle, &cache_key, cache)?;
-            let data_block = check_archived_root::<DataBlock>(raw.as_bytes())
+            let data_block = rkyv::access::<Archived<DataBlock>, rancor::Error>(raw.as_bytes())
                 .map_err(|e| anyhow::anyhow!("DataBlock validation failed: {}", e))?;
 
             for entry in data_block.entries.iter() {
@@ -348,12 +341,12 @@ impl SSTableReader {
         let start_idx = self.find_block_by_user_key(search_user_key)?.map_or(0, |i| i.saturating_sub(1));
 
         for bi in start_idx..self.index.entries.len() {
-            let (_, block_handle) = &self.index.entries[bi];
+            let block_handle = &self.index.entries[bi].1;
             let block_offset = u64::from(block_handle.offset);
             let cache_key = BlockCacheKey { file_id: self.file_id, block_offset };
 
             let raw = self.get_or_cache_block(block_handle, &cache_key, cache)?;
-            let data_block = check_archived_root::<DataBlock>(raw.as_bytes())
+            let data_block = rkyv::access::<Archived<DataBlock>, rancor::Error>(raw.as_bytes())
                 .map_err(|e| anyhow::anyhow!("DataBlock validation failed: {}", e))?;
 
             let mut passed_user_key = false;
@@ -401,9 +394,10 @@ impl SSTableReader {
         let offset = u64::from(handle.offset) as usize;
         let size = u64::from(handle.size) as usize;
 
-        if offset + size > self.data.len() {
-            bail!("Invalid data block offset/size");
-        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid data block offset/size"))?;
 
         let block = match &self.data {
             // Zero-copy: the cache entry references the shared mapping.
@@ -414,7 +408,7 @@ impl SSTableReader {
             },
             SSTableData::Owned(_) => {
                 let mut aligned = AlignedVec::with_capacity(size);
-                aligned.extend_from_slice(&self.data.as_slice()[offset..offset + size]);
+                aligned.extend_from_slice(&self.data.as_slice()[offset..end]);
                 CachedBlock::Owned(std::sync::Arc::new(aligned))
             }
         };
@@ -443,7 +437,7 @@ impl SSTableReader {
         // ── 1. Exact-match path (works when snapshot timestamp == write timestamp) ──
         let block_idx = self.find_block(key)?;
         if let Some(idx) = block_idx {
-            let (_, block_handle) = &self.index.entries[idx];
+            let block_handle = &self.index.entries[idx].1;
             let data_block = self.read_data_block(block_handle)?;
             for entry in data_block.entries.iter() {
                 if entry.0.as_slice() == key {
@@ -478,7 +472,7 @@ impl SSTableReader {
         let start_idx = self.find_block_by_user_key(search_user_key)?.map_or(0, |i| i.saturating_sub(1));
 
         for bi in start_idx..self.index.entries.len() {
-            let (_, block_handle) = &self.index.entries[bi];
+            let block_handle = &self.index.entries[bi].1;
             let data_block = self.read_data_block(block_handle)?;
             let mut passed_user_key = false;
 
@@ -522,7 +516,7 @@ impl SSTableReader {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let (block_first_key, _) = &self.index.entries[mid];
+            let block_first_key = &self.index.entries[mid].0;
 
             if block_first_key.as_slice() <= key {
                 result = Some(mid);
@@ -548,7 +542,7 @@ impl SSTableReader {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let (bfk, _) = &self.index.entries[mid];
+            let bfk = &self.index.entries[mid].0;
             let bfk_user = mvcc_user_key(bfk.as_slice());
 
             if bfk_user <= user_key {
@@ -566,12 +560,13 @@ impl SSTableReader {
         let offset = u64::from(handle.offset) as usize;
         let size = u64::from(handle.size) as usize;
 
-        if offset + size > self.data.len() {
-            bail!("Invalid data block offset/size");
-        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| anyhow::anyhow!("Invalid data block offset/size"))?;
 
-        let block_slice = &self.data.as_slice()[offset..offset + size];
-        check_archived_root::<DataBlock>(block_slice)
+        let block_slice = &self.data.as_slice()[offset..end];
+        rkyv::access::<Archived<DataBlock>, rancor::Error>(block_slice)
             .map_err(|e| anyhow::anyhow!("DataBlock validation failed: {}", e))
     }
 
@@ -602,7 +597,7 @@ impl SSTableReader {
             }
             let live = match &dbv {
                 DataBlockValue::Pointer(vp) => {
-                    !(vp.file_id == 0 && vp.value_offset == u64::MAX)
+                    !(vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET)
                         && !(vp.expire_at != 0 && vp.expire_at <= now)
                 }
                 DataBlockValue::Inline { expire_at, .. } => {
@@ -628,14 +623,17 @@ impl SSTableReader {
 /// copying value bytes (spec perf/002). Inline values become zero-copy
 /// offsets into the block's `Arc<AlignedVec>` allocation — sound because the
 /// `Arc` pins the allocation and the archived bytes live inside it. The
-/// tombstone sentinel (file_id == 0, offset == u64::MAX) is resolved here.
+/// tombstone (file_id == 0, offset == TOMBSTONE_OFFSET) and NULL (file_id ==
+/// 0, offset == NULL_OFFSET) sentinels are resolved here (spec kv/018).
 fn cached_value_from_archived(block: &CachedBlock, value: &ArchivedDataBlockValue) -> CachedValue {
     match value {
         ArchivedDataBlockValue::Pointer(avp) => {
             let file_id = u32::from(avp.file_id);
             let value_offset = u64::from(avp.value_offset);
-            if file_id == 0 && value_offset == u64::MAX {
+            if file_id == 0 && value_offset == TOMBSTONE_OFFSET {
                 CachedValue::Tombstone
+            } else if file_id == 0 && value_offset == NULL_OFFSET {
+                CachedValue::Null
             } else {
                 CachedValue::VLogPointer {
                     file_id,
@@ -693,7 +691,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
                     return None;
                 }
 
-                let (_, handle) = &self.reader.index.entries[self.block_idx];
+                let handle = &self.reader.index.entries[self.block_idx].1;
                 match self.reader.read_data_block(handle) {
                     Ok(block) => {
                         self.current_block = Some(block);
@@ -723,7 +721,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
 mod tests {
     use super::*;
     use crate::storage::format::ArchivedDataBlockValue;
-    use rkyv::{check_archived_root, Archived};
+    use rkyv::Archived;
 
     // Zero-copy lookups (spec perf/002): inline values reference the cached
     // block; pointers and the tombstone sentinel map to their variants.
@@ -738,6 +736,10 @@ mod tests {
         builder.add(
             b"tombstone-key".to_vec(),
             ValuePointer { file_id: 0, value_offset: u64::MAX, value_len: 0, expire_at: 0 },
+        );
+        builder.add(
+            b"null-key".to_vec(),
+            ValuePointer { file_id: 0, value_offset: NULL_OFFSET, value_len: 0, expire_at: 0 },
         );
         let bytes = builder.finish()?;
         let reader = SSTableReader::open(bytes)?;
@@ -762,6 +764,12 @@ mod tests {
         match reader.get_with_cache(b"tombstone-key", &mut cache)? {
             Some(CachedValue::Tombstone) => {}
             other => panic!("expected Tombstone, got {other:?}"),
+        }
+
+        // kv/018: the NULL sentinel is distinct from the tombstone sentinel.
+        match reader.get_with_cache(b"null-key", &mut cache)? {
+            Some(CachedValue::Null) => {}
+            other => panic!("expected Null, got {other:?}"),
         }
 
         assert!(reader.get_with_cache(b"missing-key", &mut cache)?.is_none());
@@ -833,7 +841,7 @@ mod tests {
         let footer_end = footer_offset as usize + footer_size;
         let footer_slice = &buf[footer_offset as usize..footer_end];
 
-        let footer = check_archived_root::<SSTableFooter>(footer_slice)
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(footer_slice)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert_eq!(u64::from(footer.checksum), 0);
 
@@ -841,21 +849,21 @@ mod tests {
         let index_offset = u64::from(index_handle.offset) as usize;
         let index_size = u64::from(index_handle.size) as usize;
         let index_slice = &buf[index_offset..index_offset + index_size];
-        let index_block = check_archived_root::<IndexBlock>(index_slice)
+        let index_block = rkyv::access::<Archived<IndexBlock>, rancor::Error>(index_slice)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         assert!(!index_block.entries.is_empty());
 
-        let (first_key, first_block_handle) = &index_block.entries[0];
+        let (first_key, first_block_handle) = (&index_block.entries[0].0, &index_block.entries[0].1);
         assert_eq!(first_key.as_slice(), b"key1");
 
         let data_offset = u64::from(first_block_handle.offset) as usize;
         let data_size = u64::from(first_block_handle.size) as usize;
         let data_slice = &buf[data_offset..data_offset + data_size];
-        let data_block = check_archived_root::<DataBlock>(data_slice)
+        let data_block = rkyv::access::<Archived<DataBlock>, rancor::Error>(data_slice)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-        let (key, dbv) = &data_block.entries[0];
+        let (key, dbv) = (&data_block.entries[0].0, &data_block.entries[0].1);
         assert_eq!(key.as_slice(), b"key1");
         match dbv {
             ArchivedDataBlockValue::Pointer(avp) => {
@@ -922,6 +930,156 @@ mod tests {
             }
             DataBlockValue::Pointer(_) => panic!("Expected Inline variant, got Pointer"),
         }
+        Ok(())
+    }
+
+    // kv/019: a corrupted footer whose index_handle overflows `offset + size`
+    // must be rejected with an `Err`, not panic (untrusted on-disk bytes).
+    #[test]
+    fn test_from_data_rejects_overflowing_index_handle() -> anyhow::Result<()> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let mut buf = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = buf[buf.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = buf.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(&buf[footer_offset..footer_end])
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let bloom_filter_handle = BlockHandle {
+            offset: u64::from(footer.bloom_filter_handle.offset),
+            size: u64::from(footer.bloom_filter_handle.size),
+        };
+
+        let corrupt_footer = SSTableFooter {
+            index_handle: BlockHandle { offset: u64::MAX, size: 8 },
+            bloom_filter_handle,
+            checksum: 0,
+        };
+        let corrupt_footer_bytes = rkyv::to_bytes::<rancor::Error>(&corrupt_footer)?;
+        buf[footer_offset..footer_end].copy_from_slice(&corrupt_footer_bytes);
+
+        let result = SSTableReader::open(buf);
+        assert!(result.is_err(), "overflowing index_handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/019: analog for bloom_filter_handle.
+    #[test]
+    fn test_from_data_rejects_overflowing_bloom_filter_handle() -> anyhow::Result<()> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let mut buf = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = buf[buf.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = buf.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(&buf[footer_offset..footer_end])
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let index_handle = BlockHandle {
+            offset: u64::from(footer.index_handle.offset),
+            size: u64::from(footer.index_handle.size),
+        };
+
+        let corrupt_footer = SSTableFooter {
+            index_handle,
+            bloom_filter_handle: BlockHandle { offset: u64::MAX, size: 8 },
+            checksum: 0,
+        };
+        let corrupt_footer_bytes = rkyv::to_bytes::<rancor::Error>(&corrupt_footer)?;
+        buf[footer_offset..footer_end].copy_from_slice(&corrupt_footer_bytes);
+
+        let result = SSTableReader::open(buf);
+        assert!(result.is_err(), "overflowing bloom_filter_handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/019: builds a valid single-block SSTable whose IndexBlock entry
+    // points at an overflowing BlockHandle, to exercise the read path
+    // (as opposed to the footer handles covered above).
+    fn build_sstable_with_corrupt_block_handle() -> anyhow::Result<Vec<u8>> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let valid_bytes = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = valid_bytes[valid_bytes.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = valid_bytes.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(
+            &valid_bytes[footer_offset..footer_end],
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let index_offset = u64::from(footer.index_handle.offset) as usize;
+
+        // Keep the data-block bytes (and their alignment padding) verbatim;
+        // rebuild index/bloom/footer around a corrupted BlockHandle.
+        let mut buf = AlignedVec::new();
+        buf.extend_from_slice(&valid_bytes[..index_offset]);
+
+        fn pad_to_align8(buf: &mut AlignedVec) {
+            let misalign = buf.len() % 8;
+            if misalign != 0 {
+                buf.extend_from_slice(&[0u8; 8][..8 - misalign]);
+            }
+        }
+
+        let index = IndexBlock {
+            entries: vec![(b"key1".to_vec(), BlockHandle { offset: u64::MAX - 4, size: 8 })],
+        };
+        let index_bytes = rkyv::to_bytes::<rancor::Error>(&index)?;
+        let index_handle = BlockHandle { offset: buf.len() as u64, size: index_bytes.len() as u64 };
+        buf.extend_from_slice(&index_bytes);
+        pad_to_align8(&mut buf);
+
+        let mut bloom_filter = BloomFilterImpl::new(10, 0.01);
+        bloom_filter.insert(b"key1");
+        let bloom_filter_fmt = BloomFilter {
+            data: bloom_filter.as_bytes().to_vec(),
+            num_hashes: bloom_filter.num_hashes(),
+        };
+        let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter_fmt)?;
+        let bloom_filter_handle = BlockHandle { offset: buf.len() as u64, size: bloom_bytes.len() as u64 };
+        buf.extend_from_slice(&bloom_bytes);
+        pad_to_align8(&mut buf);
+
+        let footer = SSTableFooter { index_handle, bloom_filter_handle, checksum: 0 };
+        let footer_bytes = rkyv::to_bytes::<rancor::Error>(&footer)?;
+        let footer_offset = buf.len() as u64;
+        buf.extend_from_slice(&footer_bytes);
+        buf.extend_from_slice(&footer_offset.to_le_bytes());
+
+        Ok(buf.into_vec())
+    }
+
+    // kv/019: get_with_cache → get_or_cache_block must return an `Err` for an
+    // overflowing block handle instead of panicking.
+    #[test]
+    fn test_get_or_cache_block_rejects_overflowing_block_handle() -> anyhow::Result<()> {
+        let buf = build_sstable_with_corrupt_block_handle()?;
+        let reader = SSTableReader::open(buf)?;
+        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
+        let result = reader.get_with_cache(b"key1", &mut cache);
+        assert!(result.is_err(), "overflowing block handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/019: get → read_data_block must return an `Err` for an overflowing
+    // block handle instead of panicking.
+    #[test]
+    fn test_read_data_block_rejects_overflowing_block_handle() -> anyhow::Result<()> {
+        let buf = build_sstable_with_corrupt_block_handle()?;
+        let reader = SSTableReader::open(buf)?;
+        let result = reader.get(b"key1");
+        assert!(result.is_err(), "overflowing block handle must be rejected, not panic");
         Ok(())
     }
 }

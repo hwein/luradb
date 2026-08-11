@@ -42,7 +42,7 @@ pub struct CreateUserRequest {
 pub struct CreateUserResponse {
     pub name: String,
     pub role: String,
-    /// API Key (nur einmalig sichtbar — danach nicht mehr abrufbar).
+    /// API key (visible only once — cannot be retrieved afterward).
     pub api_key: String,
 }
 
@@ -55,17 +55,17 @@ pub struct UserListItem {
 
 #[derive(Deserialize, ToSchema)]
 pub struct SetPermissionRequest {
-    /// Name der Domain.
+    /// Domain name.
     pub domain: String,
-    /// Zugriffsebene: `"read"`, `"write"` oder `"ddl"` (spec rel/011).
+    /// Access level: `"read"`, `"write"` or `"ddl"` (spec rel/011).
     pub access: String,
-    /// Store-Typ der Domain: `"kv"` (Default), `"json"` (spec json/012) oder `"rel"` (spec rel/011).
+    /// Store type of the domain: `"kv"` (default), `"json"` (spec json/012) or `"rel"` (spec rel/011).
     pub store_type: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct RemovePermissionParams {
-    /// Store-Typ der Domain: `"kv"` (Default), `"json"` oder `"rel"`.
+    /// Store type of the domain: `"kv"` (default), `"json"` or `"rel"`.
     pub store_type: Option<String>,
 }
 
@@ -85,7 +85,7 @@ fn parse_store_type(value: &Option<String>) -> Result<StoreType, Response> {
 #[derive(Serialize, ToSchema)]
 pub struct RotateKeyResponse {
     pub name: String,
-    /// Neuer API Key (nur einmalig sichtbar — danach nicht mehr abrufbar).
+    /// New API key (visible only once — cannot be retrieved afterward).
     pub api_key: String,
 }
 
@@ -119,15 +119,15 @@ fn now_secs() -> u64 {
     path = "/store-api/auth/users",
     request_body = CreateUserRequest,
     responses(
-        (status = 201, description = "User angelegt. API Key einmalig in der Response.", body = CreateUserResponse),
-        (status = 409, description = "User existiert bereits"),
-        (status = 400, description = "Ungültiger Name"),
+        (status = 201, description = "User created. API key is shown once in the response.", body = CreateUserResponse),
+        (status = 409, description = "User already exists"),
+        (status = 400, description = "Invalid name"),
     ),
     tag = "Auth"
 )]
-/// Legt einen neuen User mit der Rolle `User` an.
-/// Der API Key wird **ausschließlich in dieser Response** zurückgegeben und danach nicht mehr gespeichert.
-/// Nur Admins dürfen diesen Endpunkt aufrufen.
+/// Creates a new user with the `User` role.
+/// The API key is returned **only in this response** and is not stored afterward.
+/// Only admins may call this endpoint.
 pub async fn create_user(
     State(state): State<AuthState>,
     Json(body): Json<CreateUserRequest>,
@@ -169,12 +169,12 @@ pub async fn create_user(
     get,
     path = "/store-api/auth/users",
     responses(
-        (status = 200, description = "Liste aller User (ohne API Keys)", body = Vec<UserListItem>),
+        (status = 200, description = "List of all users (without API keys)", body = Vec<UserListItem>),
     ),
     tag = "Auth"
 )]
-/// Gibt alle angelegten User zurück (Admins und reguläre User).
-/// API Keys werden nicht ausgegeben — nur Name, Rolle und Erstellungszeitpunkt.
+/// Returns all created users (admins and regular users).
+/// API keys are not included — only name, role, and creation timestamp.
 pub async fn list_users(State(state): State<AuthState>) -> Json<Vec<UserListItem>> {
     let users = state.cache.all_users().await;
     let items = users
@@ -193,13 +193,13 @@ pub async fn list_users(State(state): State<AuthState>) -> Json<Vec<UserListItem
     path = "/store-api/auth/users/{name}",
     params(("name" = String, Path, description = "Username")),
     responses(
-        (status = 204, description = "User und alle Permissions gelöscht"),
-        (status = 404, description = "User nicht gefunden"),
+        (status = 204, description = "User and all permissions deleted"),
+        (status = 404, description = "User not found"),
     ),
     tag = "Auth"
 )]
-/// Löscht einen User und alle seine Domain-Permissions.
-/// Der API Key des Users wird sofort ungültig — laufende Requests mit dem alten Key erhalten danach `401`.
+/// Deletes a user and all of their domain permissions.
+/// The user's API key becomes invalid immediately — in-flight requests with the old key then get `401`.
 pub async fn delete_user(
     State(state): State<AuthState>,
     Path(name): Path<String>,
@@ -219,15 +219,15 @@ pub async fn delete_user(
     params(("name" = String, Path, description = "Username")),
     request_body = SetPermissionRequest,
     responses(
-        (status = 200, description = "Permission gesetzt"),
-        (status = 404, description = "User oder Domain nicht gefunden"),
-        (status = 400, description = "Ungültige access- oder domain-Angabe"),
+        (status = 200, description = "Permission set"),
+        (status = 404, description = "User or domain not found"),
+        (status = 400, description = "Invalid access or domain value"),
     ),
     tag = "Auth"
 )]
-/// Setzt oder überschreibt die Zugriffsberechtigung eines Users auf eine Domain.
-/// `access` muss `"read"`, `"write"` oder `"ddl"` sein — jede Stufe schließt die
-/// niedrigeren ein. Für `kv` muss die Domain existieren; `json`/`rel` prüfen nur den Namen.
+/// Sets or overwrites a user's access permission on a domain.
+/// `access` must be `"read"`, `"write"`, or `"ddl"` — each level includes the
+/// lower ones. For `kv` the domain must exist; `json`/`rel` only check the name.
 pub async fn set_permission(
     State(state): State<AuthState>,
     Path(name): Path<String>,
@@ -278,18 +278,18 @@ pub async fn set_permission(
     path = "/store-api/auth/users/{name}/permissions/{domain}",
     params(
         ("name" = String, Path, description = "Username"),
-        ("domain" = String, Path, description = "Domain-Name"),
-        ("store_type" = Option<String>, Query, description = "'kv' (Default), 'json' oder 'rel'"),
+        ("domain" = String, Path, description = "Domain name"),
+        ("store_type" = Option<String>, Query, description = "'kv' (default), 'json' or 'rel'"),
     ),
     responses(
-        (status = 204, description = "Permission entzogen"),
-        (status = 404, description = "Permission nicht gefunden"),
+        (status = 204, description = "Permission revoked"),
+        (status = 404, description = "Permission not found"),
     ),
     tag = "Auth"
 )]
-/// Entzieht einem User die Zugriffsberechtigung auf eine bestimmte Domain.
-/// `?store_type=json`/`rel` entzieht eine JSON-/rel-Domain-Permission (Default: kv).
-/// Nach diesem Aufruf erhalten Requests des Users auf diese Domain `403 Forbidden`.
+/// Revokes a user's access permission on a specific domain.
+/// `?store_type=json`/`rel` revokes a JSON/rel domain permission (default: kv).
+/// After this call, the user's requests to this domain get `403 Forbidden`.
 pub async fn remove_permission(
     State(state): State<AuthState>,
     Path((name, domain)): Path<(String, String)>,
@@ -314,14 +314,14 @@ pub async fn remove_permission(
     path = "/store-api/auth/users/{name}/rotate-key",
     params(("name" = String, Path, description = "Username")),
     responses(
-        (status = 200, description = "Neuer API Key generiert (einmalig sichtbar)", body = RotateKeyResponse),
-        (status = 404, description = "User nicht gefunden"),
+        (status = 200, description = "New API key generated (visible once)", body = RotateKeyResponse),
+        (status = 404, description = "User not found"),
     ),
     tag = "Auth"
 )]
-/// Generiert einen neuen API Key für den User und invalidiert den alten sofort.
-/// Der neue Key wird **ausschließlich in dieser Response** zurückgegeben.
-/// Verwende dies bei Key-Leaks oder regelmäßiger Key-Rotation.
+/// Generates a new API key for the user and immediately invalidates the old one.
+/// The new key is returned **only in this response**.
+/// Use this after key leaks or for regular key rotation.
 pub async fn rotate_key(
     State(state): State<AuthState>,
     Path(name): Path<String>,

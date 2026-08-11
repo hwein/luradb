@@ -13,7 +13,7 @@ mod shm;
 mod snapshot;
 
 pub use crate::config::ShmConfig;
-pub use commands::{DecodeError, ShmCommand, ShmResponse};
+pub use commands::{DecodeError, ShmCommand, ShmGetValue, ShmResponse};
 pub use dispatcher::{ClientConnection, ClientEvent, ShmDispatcher};
 pub use protocol::{
     ProtocolError, PublishOutcome, SnapshotGuard, SnapshotWriter, StateHeader, PUBLISH_WAIT_TIMEOUT_US,

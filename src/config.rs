@@ -103,6 +103,16 @@ pub struct ServerConfig {
     pub unix_socket_path: Option<String>,
     /// Filesystem mode for the socket (e.g. 432 = 0o660). Default: 0o660.
     pub unix_socket_mode: Option<u32>,
+    /// Set to `false` to disable the plain HTTP listener (spec general/011).
+    pub http_enabled: bool,
+    /// Enables the native HTTPS listener on `tls_port` (spec general/011).
+    pub tls_enabled: bool,
+    /// Port for the native HTTPS listener. Must differ from `port`.
+    pub tls_port: u16,
+    /// PEM certificate (optionally with chain) for the native HTTPS listener.
+    pub tls_cert_path: String,
+    /// PEM private key (PKCS#8, RSA, or EC) for the native HTTPS listener.
+    pub tls_key_path: String,
 }
 
 impl Default for ServerConfig {
@@ -116,7 +126,32 @@ impl Default for ServerConfig {
             hello_message: "Hello from LuraDB".to_string(),
             unix_socket_path: None,
             unix_socket_mode: None,
+            http_enabled: true,
+            tls_enabled: false,
+            tls_port: 3443,
+            tls_cert_path: "/etc/luradb/tls/server.crt".to_string(),
+            tls_key_path: "/etc/luradb/tls/server.key".to_string(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// Startup validation (spec general/011): at least one TCP listener must
+    /// be enabled, and HTTP/HTTPS cannot share the same port. Cert/key
+    /// readability and parsability are checked when the TLS listener is
+    /// actually built (`tls::load_tls_acceptor`), not here.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.http_enabled || self.tls_enabled,
+            "invalid config: server.http_enabled and server.tls_enabled are both false — no listener would start"
+        );
+        anyhow::ensure!(
+            self.tls_port != self.port,
+            "invalid config: server.tls_port ({}) must differ from server.port ({})",
+            self.tls_port,
+            self.port
+        );
+        Ok(())
     }
 }
 
@@ -896,6 +931,70 @@ mod tests {
         assert!(config.server.unix_socket_path.is_none());
         assert!(config.server.unix_socket_mode.is_none());
         assert!(config.auth.trusted_uids.is_empty());
+    }
+
+    #[test]
+    fn test_tls_defaults() {
+        let config = LuraConfig::default();
+        assert!(config.server.http_enabled);
+        assert!(!config.server.tls_enabled);
+        assert_eq!(config.server.tls_port, 3443);
+        assert_eq!(config.server.tls_cert_path, "/etc/luradb/tls/server.crt");
+        assert_eq!(config.server.tls_key_path, "/etc/luradb/tls/server.key");
+    }
+
+    // An old config predating spec general/011 has no [server] tls_* or
+    // http_enabled keys — it must still parse, with the new keys defaulted.
+    #[test]
+    fn test_tls_old_config_without_new_keys_parses_with_defaults() {
+        let toml_str = r#"
+            [server]
+            bind_address = "127.0.0.1"
+            port = 3000
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.server.http_enabled);
+        assert!(!config.server.tls_enabled);
+        assert_eq!(config.server.tls_port, 3443);
+    }
+
+    #[test]
+    fn test_tls_toml_overrides() {
+        let toml_str = r#"
+            [server]
+            http_enabled = false
+            tls_enabled = true
+            tls_port = 8443
+            tls_cert_path = "/tmp/server.crt"
+            tls_key_path = "/tmp/server.key"
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.server.http_enabled);
+        assert!(config.server.tls_enabled);
+        assert_eq!(config.server.tls_port, 8443);
+        assert_eq!(config.server.tls_cert_path, "/tmp/server.crt");
+        assert_eq!(config.server.tls_key_path, "/tmp/server.key");
+    }
+
+    #[test]
+    fn test_server_validate_default_ok() {
+        assert!(ServerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_server_validate_rejects_both_listeners_disabled() {
+        let mut server = ServerConfig::default();
+        server.http_enabled = false;
+        server.tls_enabled = false;
+        assert!(server.validate().is_err());
+    }
+
+    #[test]
+    fn test_server_validate_rejects_port_collision() {
+        let mut server = ServerConfig::default();
+        server.tls_enabled = true;
+        server.tls_port = server.port;
+        assert!(server.validate().is_err());
     }
 
     #[test]

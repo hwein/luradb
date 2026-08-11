@@ -10,16 +10,13 @@
 
 use crate::engines::lsm::{Domain, DomainRegistry, LsmStorageEngine, RegistrySnapshot, ValueWithMetadata};
 use anyhow::Result;
-use rkyv::ser::{serializers::AllocSerializer, Serializer};
-use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
+use rkyv::util::AlignedVec;
+use rkyv::{rancor, Archive, Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
 use super::{PublishOutcome, ShmManager, SnapshotWriter, StateHeader};
-
-/// Inline serialization scratch; larger snapshots spill to the heap.
-const SCRATCH: usize = 4096;
 
 /// Per-entry byte estimate on top of key+value: covers rkyv relative pointers,
 /// length fields, the fixed `ShmEntry` fields and alignment padding. Kept
@@ -29,9 +26,8 @@ const PER_ENTRY_OVERHEAD: usize = 64;
 // ── SHM snapshot format (spec §1) ──────────────────────────────────────────────
 
 /// Root of the SHM snapshot. rkyv-serialized into the active data buffer and
-/// read back by clients via a validated pointer-cast (`check_archived_root`).
+/// read back by clients via a validated pointer-cast (`rkyv::access`).
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub struct ShmSnapshot {
     /// Monotonic snapshot version (HLC value at build time).
     pub version: u64,
@@ -43,7 +39,6 @@ pub struct ShmSnapshot {
 
 /// One domain's key index inside the snapshot.
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub struct ShmDomainIndex {
     /// User-facing domain name.
     pub name: String,
@@ -53,7 +48,6 @@ pub struct ShmDomainIndex {
 
 /// A single key-value entry in the snapshot.
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub struct ShmEntry {
     /// User key (domain prefix stripped).
     pub key: Vec<u8>,
@@ -63,14 +57,14 @@ pub struct ShmEntry {
     pub expire_at: u64,
     /// Value lives in the VLog (`value` empty); client falls back to a GET.
     pub is_vlog_pointer: bool,
+    /// Key exists in the explicit NULL state (spec kv/018): `value` empty,
+    /// never a VLog pointer.
+    pub is_null: bool,
 }
 
 fn serialize_snapshot(snapshot: &ShmSnapshot) -> AlignedVec {
-    let mut serializer = AllocSerializer::<SCRATCH>::default();
-    serializer
-        .serialize_value(snapshot)
-        .expect("rkyv serialization is infallible for in-memory values");
-    serializer.into_serializer().into_inner()
+    rkyv::to_bytes::<rancor::Error>(snapshot)
+        .expect("rkyv serialization is infallible for in-memory values")
 }
 
 // ── SnapshotBuilder (spec §2, §3, §6) ──────────────────────────────────────────
@@ -175,11 +169,11 @@ impl SnapshotBuilder {
 }
 
 /// Builds an entry, flagging VLog-backed values (empty `value`, client falls
-/// back to a GET) versus inline values.
+/// back to a GET), NULL keys (kv/018), and inline values.
 fn to_entry(user_key: Vec<u8>, meta: ValueWithMetadata) -> ShmEntry {
     let (value, is_vlog_pointer) =
         if meta.from_vlog { (Vec::new(), true) } else { (meta.data, false) };
-    ShmEntry { key: user_key, value, expire_at: meta.expire_at, is_vlog_pointer }
+    ShmEntry { key: user_key, value, expire_at: meta.expire_at, is_vlog_pointer, is_null: meta.is_null }
 }
 
 // ── SnapshotPublisher (spec §4, §7) ─────────────────────────────────────────────
@@ -277,7 +271,7 @@ mod tests {
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
-    use rkyv::check_archived_root;
+    use rkyv::Archived;
 
     async fn make_setup() -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -313,10 +307,11 @@ mod tests {
 
     /// Deserializes (and validates) a serialized snapshot the way a client would.
     fn decode(bytes: &[u8]) -> ShmSnapshot {
-        let mut aligned = AlignedVec::with_capacity(bytes.len());
+        let mut aligned: AlignedVec = AlignedVec::with_capacity(bytes.len());
         aligned.extend_from_slice(bytes);
-        let archived = check_archived_root::<ShmSnapshot>(aligned.as_slice()).unwrap();
-        archived.deserialize(&mut rkyv::Infallible).unwrap()
+        let archived =
+            rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).unwrap();
+        rkyv::deserialize::<ShmSnapshot, rancor::Error>(archived).unwrap()
     }
 
     fn find<'a>(snap: &'a ShmSnapshot, name: &str) -> Option<&'a ShmDomainIndex> {
@@ -332,8 +327,9 @@ mod tests {
             domains: vec![ShmDomainIndex {
                 name: "default".into(),
                 entries: vec![
-                    ShmEntry { key: b"a".to_vec(), value: b"1".to_vec(), expire_at: 0, is_vlog_pointer: false },
-                    ShmEntry { key: b"b".to_vec(), value: Vec::new(), expire_at: 7, is_vlog_pointer: true },
+                    ShmEntry { key: b"a".to_vec(), value: b"1".to_vec(), expire_at: 0, is_vlog_pointer: false, is_null: false },
+                    ShmEntry { key: b"b".to_vec(), value: Vec::new(), expire_at: 7, is_vlog_pointer: true, is_null: false },
+                    ShmEntry { key: b"c".to_vec(), value: Vec::new(), expire_at: 0, is_vlog_pointer: false, is_null: true },
                 ],
             }],
         };
@@ -400,7 +396,23 @@ mod tests {
         let dom = find(&snap, "default").unwrap();
         let entry = dom.entries.iter().find(|e| e.key == b"small").unwrap();
         assert!(!entry.is_vlog_pointer);
+        assert!(!entry.is_null);
         assert_eq!(entry.value, b"hello");
+    }
+
+    // kv/018: a NULL key exists in the snapshot, marked is_null, empty value.
+    #[tokio::test]
+    async fn test_build_null_key_included_and_flagged() {
+        let (engine, registry, _dir) = make_setup().await;
+        let store = registry.default_store().await.unwrap();
+        store.set_null(b"nulled").await.unwrap();
+
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let dom = find(&snap, "default").unwrap();
+        let entry = dom.entries.iter().find(|e| e.key == b"nulled").expect("NULL key present");
+        assert!(entry.is_null);
+        assert!(!entry.is_vlog_pointer);
+        assert!(entry.value.is_empty());
     }
 
     // 6. Over-budget snapshot is truncated (fewer entries than written).
@@ -419,7 +431,7 @@ mod tests {
     }
 
     // 7 & 8. End-to-end: build → publish into an SHM arena → client reads via
-    // SnapshotGuard + check_archived_root, incl. the zero-copy value view and a
+    // SnapshotGuard + rkyv::access, incl. the zero-copy value view and a
     // binary search over the sorted entries.
     #[tokio::test]
     async fn test_publisher_end_to_end_client_read() {
@@ -447,9 +459,10 @@ mod tests {
         let guard = SnapshotGuard::acquire(&*header, &buf_a, &buf_b).expect("snapshot available");
 
         // Client side: validate, then read zero-copy from the mapped bytes.
-        let mut aligned = AlignedVec::with_capacity(guard.data().len());
+        let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
         aligned.extend_from_slice(guard.data());
-        let archived = check_archived_root::<ShmSnapshot>(aligned.as_slice()).unwrap();
+        let archived =
+            rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).unwrap();
         let dom = archived.domains.iter().find(|d| d.name == "default").unwrap();
         // entries are sorted → binary search, then a zero-copy value slice.
         let idx = dom.entries.binary_search_by(|e| e.key.as_slice().cmp(b"alpha".as_ref())).unwrap();
@@ -457,7 +470,7 @@ mod tests {
         assert!(!dom.entries[idx].is_vlog_pointer);
 
         // Full owned view for the remaining assertions.
-        let snap: ShmSnapshot = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        let snap = rkyv::deserialize::<ShmSnapshot, rancor::Error>(archived).unwrap();
         let dom = find(&snap, "default").unwrap();
         assert_eq!(dom.entries.iter().find(|e| e.key == b"beta").unwrap().value, b"2");
     }

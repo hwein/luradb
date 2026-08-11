@@ -172,7 +172,7 @@ impl RelDomainRegistry {
     }
 
     /// Lists **all** domains including `Deleting` ones, each carrying its
-    /// `state` (rel/013, vorbild json/013): operators can watch purge
+    /// `state` (rel/013, pattern: json/013): operators can watch purge
     /// progress. This deliberately supersedes the rel/002 default (concept
     /// 3.1 "hidden from get/list") — `get_domain`/`require_active` stay
     /// active-only, so CRUD resolution is unchanged and the 410 detail path

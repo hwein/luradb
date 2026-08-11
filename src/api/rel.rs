@@ -73,8 +73,8 @@ impl From<RelStoreError> for ApiError {
             // 429 — per-domain request budget exhausted (rel/009 §7).
             RelStoreError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             // 500 — practically-unreachable resource exhaustion, or a wrapped
-            // serialization/storage error (spec's "jede sonst nicht
-            // klassifizierte Variante").
+            // serialization/storage error (spec's "any otherwise
+            // unclassified variant").
             RelStoreError::IdSpaceExhausted(_)
             | RelStoreError::SerializationError(_)
             | RelStoreError::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -559,7 +559,7 @@ mod tests {
     /// target exists (rel/005), so a "dangling link" row can only be created
     /// by inserting against a *real* row and deleting it afterwards — not by
     /// inserting a bad id directly (that fails the INSERT itself, tolerant
-    /// links are about deletes, not constraint bypass; Konzept 3.4).
+    /// links are about deletes, not constraint bypass; concept 3.4).
     async fn setup_orders(app: &axum::Router) {
         sql(app, "default", r#"{"sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)"}"#).await;
         sql(
@@ -579,7 +579,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "setup insert must succeed: {body}");
-        // No FK-based delete restriction (Konzept 3.4) — this leaves order 3's
+        // No FK-based delete restriction (concept 3.4) — this leaves order 3's
         // customer_id=99 as a genuine hanging link.
         let (status, body) = sql(app, "default", r#"{"sql": "DELETE FROM customers WHERE id = 99"}"#).await;
         assert_eq!(status, StatusCode::OK, "setup delete must succeed: {body}");
@@ -623,7 +623,7 @@ mod tests {
         );
     }
 
-    // 11. expand KVREF explicitly named now resolves (rel/012 scharf) — no
+    // 11. expand KVREF explicitly named now resolves (rel/012 live) — no
     //     longer a 400 CrossEngineExpand.
     #[tokio::test]
     async fn test_expand_cross_engine_explicit_resolves() {
@@ -811,7 +811,7 @@ mod tests {
     // rel/011 §8 item 8: middleware auth over real rel routes. A Read grant
     // passes a SELECT via /sql (the middleware's /sql exception only demands
     // Read) but the handler's enforce_sql_level still blocks DDL — that's the
-    // actual authorization (Masterplan Widerspruch 4). A Read grant is
+    // actual authorization (Masterplan contradiction 4). A Read grant is
     // rejected on the path-based row-write route; no permission -> 403;
     // Admin/TrustedPeer bypass both checks via AuthOutcome::Full.
     #[tokio::test]

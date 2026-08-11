@@ -74,7 +74,7 @@ impl RelEngine {
     }
 
     /// REFERENCES resolution (rel/009 §5): per row, `v == NULL` or a missing
-    /// target row (hanging link, Konzept 3.4) yields `null`; a hit decodes the
+    /// target row (hanging link, concept 3.4) yields `null`; a hit decodes the
     /// target row into a JSON object keyed by the target table's columns.
     async fn resolve_one_column(
         &self,
@@ -96,8 +96,8 @@ impl RelEngine {
                 None => Value::Null, // NULL/masked link — nothing to resolve
                 Some(pk_enc) => {
                     let key = keys::row_key(prefix, target_schema.table_id, &pk_enc);
-                    match self.engine.get_with_snapshot(&key, snap).await? {
-                        None => Value::Null, // hanging link (Konzept 3.4)
+                    match self.engine.get_with_snapshot(&key, snap).await?.into_option() {
+                        None => Value::Null, // hanging link (concept 3.4)
                         Some(bytes) => {
                             let values = decode_row(&bytes, &target_schema);
                             let mut obj = serde_json::Map::with_capacity(target_schema.columns.len());
@@ -166,9 +166,9 @@ fn link_key(v: &super::types::ScalarValue) -> Option<&str> {
     }
 }
 
-/// KVREF → JSON (spec §4): valid UTF-8 → `utf8`, else `base64`; a KV null-value
-/// (not producible by today's KV API, §4) → `value:null`; absent/domain-gone →
-/// `exists:false`.
+/// KVREF → JSON (spec §4): valid UTF-8 → `utf8`, else `base64`; a KV
+/// null-value (kv/018 `set_null`) → `exists:true, value:null`;
+/// absent/domain-gone → `exists:false`.
 fn kv_resolution_json(res: KvResolution) -> Value {
     match res {
         KvResolution::Present(bytes) => match String::from_utf8(bytes) {

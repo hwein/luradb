@@ -10,4 +10,5 @@ pub mod ipc;
 pub mod logging;
 pub mod metrics;
 pub mod storage;
+pub mod tls;
 pub mod uds;

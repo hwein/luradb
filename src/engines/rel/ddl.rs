@@ -162,7 +162,7 @@ pub async fn execute_create_index(
     let mut idx_keys: Vec<Vec<u8>> = Vec::new();
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     for rk in engine.scan_keys(&keys::row_table_prefix(prefix, schema.table_id)).await? {
-        let Some(bytes) = engine.get_with_snapshot(&rk, snap).await? else {
+        let Some(bytes) = engine.get_with_snapshot(&rk, snap).await?.into_option() else {
             continue;
         };
         let Some(val_enc) = encode_sortable(&decode_value(&bytes, col)) else {

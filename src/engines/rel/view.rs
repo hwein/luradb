@@ -610,7 +610,7 @@ fn and_opt(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
 
 /// Builds (and discards) the flat plan for an already-inlined `flat` select,
 /// reusing the exact rel/006/007 binder rel/006/007 execution would use
-/// (spec §3: "das Bauen leistet alle Prüfungen") — including, for joins, the
+/// (spec §3: "building performs all checks") — including, for joins, the
 /// rel/007 index requirement and `max_join_depth`. No engine I/O: no
 /// snapshot read ever happens, `build_join_probe`'s `JoinProbe` is built and
 /// immediately dropped.
@@ -1122,7 +1122,7 @@ mod tests {
         ok(&rel, "DROP TABLE unrelated").await;
     }
 
-    // 15. Dependency — DROP COLUMN: a namentlich referenced column blocks
+    // 15. Dependency — DROP COLUMN: an explicitly named referenced column blocks
     // (transitively through a `SELECT *` view too); a column only covered by
     // `SELECT *` (never named) does not block it directly.
     #[tokio::test]

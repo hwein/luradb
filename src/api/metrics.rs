@@ -39,9 +39,9 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct VersionResponse {
-    /// Server-Version (CARGO_PKG_VERSION).
+    /// Server version (CARGO_PKG_VERSION).
     pub server_version: String,
-    /// API-Contract-Version — identisch mit `info.version` des Contracts.
+    /// API contract version — identical to the contract's `info.version`.
     pub api_version: String,
 }
 
@@ -50,8 +50,8 @@ pub struct VersionResponse {
     get,
     path = "/version",
     responses(
-        (status = 200, description = "Server- und API-Contract-Version", body = VersionResponse),
-        (status = 401, description = "Unauthorized — gültiger API-Key erforderlich"),
+        (status = 200, description = "Server and API contract version", body = VersionResponse),
+        (status = 401, description = "Unauthorized — a valid API key is required"),
     ),
     security(("bearer_auth" = [])),
     tag = "Metrics"

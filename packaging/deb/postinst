@@ -12,13 +12,17 @@ case "$1" in
         chown root:luradb "$CONFIG"
         chmod 640 "$CONFIG"
 
-        # Idempotent: nur beim Erstinstall ist der Platzhalter noch da, ein
-        # bestehender Key bleibt bei Upgrade/Reinstall unangetastet.
+        # Holds the native HTTPS listener's cert/key (spec general/011,
+        # opt-in). Operator drops files here; LuraDB itself never writes here.
+        install -d -o root -g luradb -m 0750 /etc/luradb/tls
+
+        # Idempotent: only on first install is the placeholder still there; an
+        # existing key stays untouched on upgrade/reinstall.
         if grep -q '@GENERATED_ON_INSTALL@' "$CONFIG"; then
             key="lura_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
             sed -i "s/@GENERATED_ON_INSTALL@/$key/" "$CONFIG"
-            # Der Platzhalter-Kommentar beschreibt danach nichts mehr — weg damit.
-            sed -i '/^# Platzhalter/d' "$CONFIG"
+            # The placeholder comment no longer describes anything afterward — remove it.
+            sed -i '/^# Placeholder/d' "$CONFIG"
         fi
     ;;
 esac

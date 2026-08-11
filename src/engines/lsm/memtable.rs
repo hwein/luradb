@@ -15,8 +15,13 @@ use std::sync::Arc;
 /// `None` means the entry does not expire.
 #[derive(Debug, Clone)]
 pub enum Value {
-    Inline(Vec<u8>, Option<u64>),                              // data, expire_at
-    Pointer { offset: u64, len: usize, expire_at: Option<u64> }, // vLog pointer + TTL
+    Inline(Vec<u8>, Option<u64>), // data, expire_at
+    /// vLog pointer + TTL. `file_id` is the vLog generation the value was
+    /// appended to (spec kv/017).
+    Pointer { file_id: u32, offset: u64, len: usize, expire_at: Option<u64> },
+    /// Key explicitly set to NULL (kv/018): present, no bytes, no TTL — an
+    /// update, not a delete.
+    Null,
     Tombstone,
 }
 
@@ -61,16 +66,16 @@ impl MemTable {
     /// * `Some(Value)` if a visible version is found
     /// * `None` if no visible version exists
     pub fn get(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<Value> {
-        // Suchschlüssel erstellen: UserKey + SnapshotTimestamp
+        // Build the search key: UserKey + SnapshotTimestamp
         let search_key = InternalKey::new(user_key.to_vec(), snapshot_ts);
         let encoded_search_key = search_key.encode();
 
-        // KORREKTUR: Wir nutzen `encoded_search_key..` (RangeFrom), nicht `..=`.
-        // Da wir "Newest First" (Inverted TS) sortieren, bedeutet ein höherer Timestamp
-        // einen kleineren numerischen Wert.
-        // Wir suchen Einträge, deren Timestamp <= SnapshotTimestamp ist.
-        // Im Inverted-Space bedeutet das: EntryKey >= SearchKey.
-        // Deshalb starten wir beim SearchKey und gehen vorwärts.
+        // CORRECTION: We use `encoded_search_key..` (RangeFrom), not `..=`.
+        // Since we sort "Newest First" (inverted TS), a higher timestamp
+        // means a smaller numeric value.
+        // We're looking for entries whose timestamp is <= SnapshotTimestamp.
+        // In inverted space that means: EntryKey >= SearchKey.
+        // So we start at SearchKey and move forward.
         for entry in self.map.range(encoded_search_key..) {
             let key_bytes = entry.key();
             let value = entry.value();
@@ -79,8 +84,8 @@ impl MemTable {
                 if entry_user_key == user_key {
                     return Some(value.clone());
                 } else {
-                    // Sobald der UserKey nicht mehr übereinstimmt, können wir abbrechen,
-                    // da die Map nach UserKey sortiert ist.
+                    // As soon as the UserKey no longer matches, we can stop,
+                    // since the map is sorted by UserKey.
                     break;
                 }
             }
@@ -135,7 +140,6 @@ impl MemTable {
     }
 
     /// Returns true if the MemTable is empty.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

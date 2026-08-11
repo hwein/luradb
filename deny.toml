@@ -14,7 +14,10 @@ yanked = "deny"
 unmaintained = "all"
 # Exceptions only for advisories without an available fix (or not relevant to
 # our usage profile), each with `reason` and a `# review by YYYY-MM-DD` note.
-ignore = []
+ignore = [
+    # review by 2026-11-11 (or earlier when the rkyv 0.8 upgrade lands)
+    { id = "RUSTSEC-2026-0235", reason = "shared-pointer validation flaw; no archived type in luradb contains Rc/Arc/Weak, so the vulnerable validation path is unreachable" },
+]
 
 [licenses]
 allow = [

@@ -39,6 +39,7 @@ pub mod ipc;
 pub mod logging;
 pub mod metrics;
 pub mod storage;
+pub mod tls;
 pub mod uds;
 
 #[derive(Parser)]
@@ -452,10 +453,31 @@ fn spawn_uds_listener(
     Ok((uds_task, uds_shutdown_tx))
 }
 
+// --- TLS listener (parallel to HTTP, same router — spec general/011) ---
+async fn spawn_tls_listener(
+    cfg: &LuraConfig,
+    app: &Router,
+    bind: std::net::IpAddr,
+) -> anyhow::Result<(Option<tokio::task::JoinHandle<()>>, tokio::sync::watch::Sender<bool>)> {
+    let (tls_shutdown_tx, tls_shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut tls_task = None;
+    if cfg.server.tls_enabled {
+        let acceptor = tls::load_tls_acceptor(&cfg.server.tls_cert_path, &cfg.server.tls_key_path)?;
+        let addr = SocketAddr::from((bind, cfg.server.tls_port));
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("Listening on https://{}", addr);
+        let tls_router = app.clone();
+        tls_task = Some(tokio::spawn(tls::serve_tls(listener, acceptor, tls_router, tls_shutdown_rx)));
+    }
+    Ok((tls_task, tls_shutdown_tx))
+}
+
 async fn graceful_shutdown(
     uds_shutdown_tx: tokio::sync::watch::Sender<bool>,
     uds_task: Option<tokio::task::JoinHandle<()>>,
     uds_path: Option<String>,
+    tls_shutdown_tx: tokio::sync::watch::Sender<bool>,
+    tls_task: Option<tokio::task::JoinHandle<()>>,
     shm_services: Option<ShmServices>,
     shutdown_flag: Arc<AtomicBool>,
     lsm_store: Arc<LsmStorageEngine>,
@@ -465,10 +487,16 @@ async fn graceful_shutdown(
     buffer_pool: Arc<BufferPoolManager>,
     storage_thread: Option<StorageThread>,
 ) {
-    // Stop the UDS accept loop and wait for it to drain in-flight
-    // connections — engine shutdown below would race them otherwise.
+    // Stop the UDS/TLS accept loops and wait for them to drain in-flight
+    // connections — engine shutdown below would race them otherwise. Both
+    // signals fire before either await, so the two 5s drain caps overlap
+    // instead of stacking.
     let _ = uds_shutdown_tx.send(true);
+    let _ = tls_shutdown_tx.send(true);
     if let Some(task) = uds_task {
+        let _ = task.await;
+    }
+    if let Some(task) = tls_task {
         let _ = task.await;
     }
     if let Some(path) = &uds_path {
@@ -524,6 +552,7 @@ fn main() -> anyhow::Result<()> {
     }
     let config_path = resolve_config_path(cli.config, |p| p.exists());
     let config = Arc::new(LuraConfig::load(&config_path)?);
+    config.server.validate()?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {
@@ -642,23 +671,31 @@ fn main() -> anyhow::Result<()> {
         };
         let app = build_router(&config, state, trusted_cidrs);
 
-        let uds_path = config.server.unix_socket_path.clone();
-        let (uds_task, uds_shutdown_tx) = spawn_uds_listener(&config, &app, &uds_path)?;
-
         let bind: std::net::IpAddr = config.server.bind_address.parse()
             .map_err(|e| anyhow::anyhow!("Invalid bind_address '{}': {}", config.server.bind_address, e))?;
-        let addr = SocketAddr::from((bind, config.server.port));
-        tracing::info!("Listening on http://{}", addr);
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        let uds_path = config.server.unix_socket_path.clone();
+        let (uds_task, uds_shutdown_tx) = spawn_uds_listener(&config, &app, &uds_path)?;
+        let (tls_task, tls_shutdown_tx) = spawn_tls_listener(&config, &app, bind).await?;
+
+        if config.server.http_enabled {
+            let addr = SocketAddr::from((bind, config.server.port));
+            tracing::info!("Listening on http://{}", addr);
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        } else {
+            tracing::info!("HTTP listener disabled by config (server.http_enabled = false).");
+            shutdown_signal().await;
+        }
 
         graceful_shutdown(
             uds_shutdown_tx,
             uds_task,
             uds_path,
+            tls_shutdown_tx,
+            tls_task,
             shm_services,
             shutdown_flag,
             lsm_store,

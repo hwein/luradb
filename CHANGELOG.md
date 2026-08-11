@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Native HTTPS listener: separate port, opt-in (`server.tls_enabled`).
+
 ### Security
 
 - Upgraded rkyv to 0.8.17+, resolving RUSTSEC-2026-0235 and removing the scan exception.

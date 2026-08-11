@@ -2,10 +2,18 @@
 swagger_enabled = false
 bind_address = "127.0.0.1"
 port = 3000
+http_enabled = true
 hello_enabled = false
 # UDS for local clients; /run/luradb is created by systemd (RuntimeDirectory).
 # Access: group luradb (socket mode default 0o660).
 unix_socket_path = "/run/luradb/luradb.sock"
+
+# Native HTTPS listener (spec general/011), opt-in. Quickstart to enable:
+# packaging/INSTALL.md "Enabling HTTPS".
+tls_enabled = false
+tls_port = 3443
+tls_cert_path = "/etc/luradb/tls/server.crt"
+tls_key_path = "/etc/luradb/tls/server.key"
 
 [auth]
 enabled = true

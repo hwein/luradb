@@ -12,6 +12,10 @@ case "$1" in
         chown root:luradb "$CONFIG"
         chmod 640 "$CONFIG"
 
+        # Holds the native HTTPS listener's cert/key (spec general/011,
+        # opt-in). Operator drops files here; LuraDB itself never writes here.
+        install -d -o root -g luradb -m 0750 /etc/luradb/tls
+
         # Idempotent: only on first install is the placeholder still there; an
         # existing key stays untouched on upgrade/reinstall.
         if grep -q '@GENERATED_ON_INSTALL@' "$CONFIG"; then

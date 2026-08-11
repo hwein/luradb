@@ -18,6 +18,10 @@ axum = { version = "0.7", features = ["macros", "http2"] }
 # both are already transitive dependencies of Axum.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+# Native HTTPS listener (spec general/011); rustls itself comes as a re-export
+# via tokio_rustls::rustls (default provider: aws-lc-rs).
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 utoipa = { version = "5", features = ["axum_extras"] }
 # 8.1.0 is the last utoipa-swagger-ui version before the axum-0.8 jump (9.x) — matches utoipa 5 + axum 0.7.
 utoipa-swagger-ui = { version = "8.1.0", features = ["axum"] }

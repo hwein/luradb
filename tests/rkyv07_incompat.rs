@@ -34,7 +34,12 @@ fn rkyv07_data_block_fails_validation() {
     let err = rkyv::access::<Archived<DataBlock>, rancor::Error>(bytes.as_slice())
         .err()
         .expect("0.7 data block must not validate under 0.8");
-    assert!(err.to_string().contains("subtree pointer"), "unexpected error: {err}");
+    // rancor carries error details only with debug assertions; release builds
+    // report "failed without error information", so the message check would
+    // fail there despite the (asserted) rejection.
+    if cfg!(debug_assertions) {
+        assert!(err.to_string().contains("subtree pointer"), "unexpected error: {err}");
+    }
 }
 
 /// Footer, index and bloom block are built from fixed-size integers and plain

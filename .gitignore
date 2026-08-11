@@ -7,6 +7,9 @@
 /luradb.db
 /luradb.vlog
 /luradb_sstables
+/luradb_rel.wal
+/luradb_rel.vlog
+/luradb_rel_sstables
 
 # Benchmark reports (cargo bench)
 /benches/results/

@@ -247,6 +247,16 @@ pub struct LsmStorageEngine {
     /// Notified after every MemTable flush — the SHM snapshot publisher
     /// (spec perf/009 §4) rebuilds on this event in addition to its interval.
     flush_notify: Arc<Notify>,
+
+    /// In-flight guard for the vLog-pointer-creating write sequence (spec
+    /// kv/020). Writers hold the `read()` side from the active-generation
+    /// fetch through `memtable.set`; the Janitor's flush barrier drains by
+    /// taking `write()` once and dropping it immediately. `tokio::sync::RwLock`
+    /// is task-fair (write-preferring), so the drain waits only for guards
+    /// already in flight, never for ones started after it — no starvation
+    /// under sustained write load, and no deadlock: the drain holds no other
+    /// lock a writer needs while it waits.
+    in_flight_writes: tokio::sync::RwLock<()>,
 }
 
 impl LsmStorageEngine {
@@ -307,6 +317,7 @@ impl LsmStorageEngine {
             block_cache,
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
+            in_flight_writes: tokio::sync::RwLock::new(()),
         };
 
         // Recovered WAL data is RAM-only: flush it to an SSTable BEFORE
@@ -497,6 +508,16 @@ impl LsmStorageEngine {
     /// Freezes the active MemTable and flushes every immutable one, leaving no
     /// vLog pointer MemTable-resident. Used by the Janitor's flush barrier.
     pub async fn flush_all_memtables(&self) -> Result<()> {
+        // Drain (spec kv/020). Order anchor: Seal (Janitor, before it calls this
+        // barrier) -> Drain (here) -> Freeze/Flush (below). Taking and instantly
+        // dropping the write side waits out every pointer-write that acquired
+        // its read guard before this point -- each has, by the time it releases
+        // the guard, already applied its `memtable.set`. Combined with the
+        // preceding seal (no *new* pointer into the sealed generations can
+        // appear), every live pointer into a sealed generation is now
+        // MemTable-resident and gets picked up by the freeze/flush below.
+        drop(self.in_flight_writes.write().await);
+
         let frozen = {
             let mut mt = self.memtable.write();
             std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
@@ -646,11 +667,18 @@ impl LsmStorageEngine {
         // Resolve the value before touching the MemTable (like `write_batch`):
         // a MemTable captured *before* the vLog append could be frozen and
         // flushed meanwhile, which would drop the entry.
-        let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
+        //
+        // In-flight guard (spec kv/020): held from the active-generation fetch
+        // through `memtable.set` below, so the Janitor's flush-barrier drain
+        // cannot complete while a pointer into a generation it just sealed is
+        // still on its way into a MemTable. Inline values carry no generation,
+        // so they need no guard.
+        let (resolved, _guard) = if value.len() >= self.engine_config.vlog_inline_threshold {
+            let guard = self.in_flight_writes.read().await;
             let (file_id, offset) = append_to_active(&self.vlog, value).await?;
-            Value::Pointer { file_id, offset, len: value.len(), expire_at }
+            (Value::Pointer { file_id, offset, len: value.len(), expire_at }, Some(guard))
         } else {
-            Value::Inline(value.to_vec(), expire_at)
+            (Value::Inline(value.to_vec(), expire_at), None)
         };
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, resolved);
@@ -790,6 +818,13 @@ impl LsmStorageEngine {
         self.broadcast_batch_events(&ops);
 
         self.maybe_freeze_memtable()?;
+
+        // In-flight guard (spec kv/020), held across the whole batch: batches
+        // are bounded, so one guard per batch is simpler than tracking which
+        // individual ops end up pointer-creating. Acquired before Phase 1's
+        // first `vlog.active()` fetch and held through every `memtable.set`
+        // in Phase 2 below.
+        let _guard = self.in_flight_writes.read().await;
 
         // Phase 1 (fallible): offload large values to the vLog BEFORE any
         // MemTable mutation — a vLog error must not leave the batch
@@ -2036,6 +2071,44 @@ mod tests {
         ids
     }
 
+    /// Every vLog-pointer `file_id` reachable from any MemTable (active +
+    /// immutable) or any SSTable at any level — a full scan (spec kv/020 test
+    /// 3), not just a read-back, so a dangling pointer into a retired
+    /// generation would show up here even if no test happens to read that key.
+    fn all_pointer_generations(engine: &LsmStorageEngine) -> Vec<u32> {
+        let mut ids = Vec::new();
+
+        let active = engine.memtable.read();
+        for (_, value) in active.iter() {
+            if let Value::Pointer { file_id, .. } = value {
+                ids.push(file_id);
+            }
+        }
+        drop(active);
+
+        for mt in engine.immutable_memtables.read().iter() {
+            for (_, value) in mt.iter() {
+                if let Value::Pointer { file_id, .. } = value {
+                    ids.push(file_id);
+                }
+            }
+        }
+
+        for level in engine.level_manager.get_all_levels() {
+            for sstable in level {
+                for entry in sstable.iter() {
+                    if let (_, crate::storage::format::DataBlockValue::Pointer(vp)) = entry.unwrap() {
+                        if vp.file_id != 0 {
+                            ids.push(vp.file_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        ids
+    }
+
     // Spec kv/017 test 1 (window A): a large value whose pointer lives only in
     // the active MemTable — no flush ran — must survive a GC cycle.
     #[tokio::test]
@@ -2112,6 +2185,87 @@ mod tests {
                     "value k{w}-{i:02} written during the GC must survive"
                 );
             }
+        }
+    }
+
+    // Spec kv/020 test 1: a held writer guard blocks the barrier's drain step;
+    // dropping it unblocks immediately. Exercises the guard mechanism directly
+    // (not the public write path) since the real race window is instruction-
+    // width and cannot be hit deterministically. Timeout-guarded so a bug that
+    // makes the drain hang fails the test instead of the suite.
+    #[tokio::test]
+    async fn test_drain_waits_for_held_writer_guard_then_proceeds() {
+        let (engine, _dir) = make_engine().await;
+
+        // Simulates a write in flight: it has fetched the active generation
+        // and is somewhere before its `memtable.set`.
+        let guard = engine.in_flight_writes.read().await;
+
+        let blocked = tokio::time::timeout(Duration::from_millis(200), engine.flush_all_memtables()).await;
+        assert!(blocked.is_err(), "drain must block while a writer guard is held");
+
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_millis(200), engine.flush_all_memtables())
+            .await
+            .expect("drain must complete promptly once the guard is released")
+            .unwrap();
+    }
+
+    // Spec kv/020 tests 2+3: sharpens test_gc_keeps_values_written_concurrently
+    // (kv/017) for the in-flight guard introduced here -- that test is left
+    // unchanged and must stay green on its own. Adds two properties the guard
+    // must not break: (2) the GC cycle terminates under concurrent write load
+    // instead of deadlocking against the drain, and (3) once everything has
+    // settled, no stored pointer names a generation the GC retired -- checked
+    // via a full MemTable/SSTable scan, not just successful reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_gc_drain_no_deadlock_and_no_dangling_pointers_under_load() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let big = vec![b'w'; 2048];
+        engine.put(b"pre", &big).await.unwrap();
+
+        let writers: Vec<_> = (0..4u32)
+            .map(|w| {
+                let engine = Arc::clone(&engine);
+                let value = big.clone();
+                tokio::spawn(async move {
+                    for i in 0..25u32 {
+                        engine.put(format!("k{w}-{i:02}").as_bytes(), &value).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        // A stuck drain (guard never released, or a deadlock against the
+        // writers) fails the test instead of hanging the suite.
+        tokio::time::timeout(Duration::from_secs(10), engine.build_janitor(gc_always()).run_gc())
+            .await
+            .expect("GC must not deadlock against concurrent writers")
+            .unwrap();
+
+        for writer in writers {
+            writer.await.unwrap();
+        }
+
+        assert_eq!(engine.get(b"pre").await.unwrap(), Some(big.clone()));
+        for w in 0..4u32 {
+            for i in 0..25u32 {
+                assert_eq!(
+                    engine.get(format!("k{w}-{i:02}").as_bytes()).await.unwrap(),
+                    Some(big.clone()),
+                    "value k{w}-{i:02} written during the GC must survive"
+                );
+            }
+        }
+
+        let live_ids = engine.vlog.ids();
+        for id in all_pointer_generations(&engine) {
+            assert!(
+                live_ids.contains(&id),
+                "pointer references retired generation {id}, live={live_ids:?}"
+            );
         }
     }
 

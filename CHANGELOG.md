@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- Security scans: RUSTSEC-2026-0235 (rkyv 0.7) ignored as not exploitable in LuraDB.
+
 ## [0.1.0] - 2026-07-18
 
 ### Added

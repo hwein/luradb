@@ -4,8 +4,13 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- Upgraded rkyv to 0.8.17+, resolving RUSTSEC-2026-0235 and removing the scan exception.
+
 ### Changed
 
+- **BREAKING** on-disk format: stores written by v0.1.1 or earlier are incompatible and must be rebuilt.
 - API: OpenAPI descriptions and CLI help text are now in English (previously partly German).
 
 ### Fixed

@@ -10,16 +10,13 @@
 
 use crate::engines::lsm::{Domain, DomainRegistry, LsmStorageEngine, RegistrySnapshot, ValueWithMetadata};
 use anyhow::Result;
-use rkyv::ser::{serializers::AllocSerializer, Serializer};
-use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
+use rkyv::util::AlignedVec;
+use rkyv::{rancor, Archive, Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
 use super::{PublishOutcome, ShmManager, SnapshotWriter, StateHeader};
-
-/// Inline serialization scratch; larger snapshots spill to the heap.
-const SCRATCH: usize = 4096;
 
 /// Per-entry byte estimate on top of key+value: covers rkyv relative pointers,
 /// length fields, the fixed `ShmEntry` fields and alignment padding. Kept
@@ -29,9 +26,8 @@ const PER_ENTRY_OVERHEAD: usize = 64;
 // ── SHM snapshot format (spec §1) ──────────────────────────────────────────────
 
 /// Root of the SHM snapshot. rkyv-serialized into the active data buffer and
-/// read back by clients via a validated pointer-cast (`check_archived_root`).
+/// read back by clients via a validated pointer-cast (`rkyv::access`).
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub struct ShmSnapshot {
     /// Monotonic snapshot version (HLC value at build time).
     pub version: u64,
@@ -43,7 +39,6 @@ pub struct ShmSnapshot {
 
 /// One domain's key index inside the snapshot.
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub struct ShmDomainIndex {
     /// User-facing domain name.
     pub name: String,
@@ -53,7 +48,6 @@ pub struct ShmDomainIndex {
 
 /// A single key-value entry in the snapshot.
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub struct ShmEntry {
     /// User key (domain prefix stripped).
     pub key: Vec<u8>,
@@ -69,11 +63,8 @@ pub struct ShmEntry {
 }
 
 fn serialize_snapshot(snapshot: &ShmSnapshot) -> AlignedVec {
-    let mut serializer = AllocSerializer::<SCRATCH>::default();
-    serializer
-        .serialize_value(snapshot)
-        .expect("rkyv serialization is infallible for in-memory values");
-    serializer.into_serializer().into_inner()
+    rkyv::to_bytes::<rancor::Error>(snapshot)
+        .expect("rkyv serialization is infallible for in-memory values")
 }
 
 // ── SnapshotBuilder (spec §2, §3, §6) ──────────────────────────────────────────
@@ -280,7 +271,7 @@ mod tests {
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
-    use rkyv::check_archived_root;
+    use rkyv::Archived;
 
     async fn make_setup() -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -316,10 +307,11 @@ mod tests {
 
     /// Deserializes (and validates) a serialized snapshot the way a client would.
     fn decode(bytes: &[u8]) -> ShmSnapshot {
-        let mut aligned = AlignedVec::with_capacity(bytes.len());
+        let mut aligned: AlignedVec = AlignedVec::with_capacity(bytes.len());
         aligned.extend_from_slice(bytes);
-        let archived = check_archived_root::<ShmSnapshot>(aligned.as_slice()).unwrap();
-        archived.deserialize(&mut rkyv::Infallible).unwrap()
+        let archived =
+            rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).unwrap();
+        rkyv::deserialize::<ShmSnapshot, rancor::Error>(archived).unwrap()
     }
 
     fn find<'a>(snap: &'a ShmSnapshot, name: &str) -> Option<&'a ShmDomainIndex> {
@@ -439,7 +431,7 @@ mod tests {
     }
 
     // 7 & 8. End-to-end: build → publish into an SHM arena → client reads via
-    // SnapshotGuard + check_archived_root, incl. the zero-copy value view and a
+    // SnapshotGuard + rkyv::access, incl. the zero-copy value view and a
     // binary search over the sorted entries.
     #[tokio::test]
     async fn test_publisher_end_to_end_client_read() {
@@ -467,9 +459,10 @@ mod tests {
         let guard = SnapshotGuard::acquire(&*header, &buf_a, &buf_b).expect("snapshot available");
 
         // Client side: validate, then read zero-copy from the mapped bytes.
-        let mut aligned = AlignedVec::with_capacity(guard.data().len());
+        let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
         aligned.extend_from_slice(guard.data());
-        let archived = check_archived_root::<ShmSnapshot>(aligned.as_slice()).unwrap();
+        let archived =
+            rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).unwrap();
         let dom = archived.domains.iter().find(|d| d.name == "default").unwrap();
         // entries are sorted → binary search, then a zero-copy value slice.
         let idx = dom.entries.binary_search_by(|e| e.key.as_slice().cmp(b"alpha".as_ref())).unwrap();
@@ -477,7 +470,7 @@ mod tests {
         assert!(!dom.entries[idx].is_vlog_pointer);
 
         // Full owned view for the remaining assertions.
-        let snap: ShmSnapshot = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        let snap = rkyv::deserialize::<ShmSnapshot, rancor::Error>(archived).unwrap();
         let dom = find(&snap, "default").unwrap();
         assert_eq!(dom.entries.iter().find(|e| e.key == b"beta").unwrap().value, b"2");
     }

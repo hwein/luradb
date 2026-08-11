@@ -1,6 +1,6 @@
 use memmap2::Mmap;
-use rkyv::AlignedVec;
-use rkyv_derive::{Archive, Deserialize, Serialize};
+use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::sync::Arc;
 
 /// SSTable `ValuePointer` sentinels for the two "no vLog data" states
@@ -11,8 +11,7 @@ pub const TOMBSTONE_OFFSET: u64 = u64::MAX;
 pub const NULL_OFFSET: u64 = u64::MAX - 1;
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(repr(C))] // Force C layout on Archived type
+#[rkyv(attr(repr(C)))] // Force C layout on Archived type
 #[repr(C)]
 pub struct ValuePointer {
     pub file_id: u32,
@@ -23,8 +22,7 @@ pub struct ValuePointer {
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Copy, Clone)]
-#[archive(check_bytes)]
-#[archive_attr(repr(C))] // Force C layout on Archived type
+#[rkyv(attr(repr(C)))] // Force C layout on Archived type
 #[repr(C)]
 pub struct BlockHandle {
     pub offset: u64,
@@ -32,8 +30,7 @@ pub struct BlockHandle {
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(repr(C))] // Force C layout on Archived type
+#[rkyv(attr(repr(C)))] // Force C layout on Archived type
 #[repr(C)]
 pub struct SSTableFooter {
     pub index_handle: BlockHandle,
@@ -42,8 +39,7 @@ pub struct SSTableFooter {
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(repr(C))] // Force C layout on Archived type
+#[rkyv(attr(repr(C)))] // Force C layout on Archived type
 #[repr(C)]
 pub struct IndexBlock {
     pub entries: Vec<(Vec<u8>, BlockHandle)>, // (key, block_handle)
@@ -52,21 +48,18 @@ pub struct IndexBlock {
 /// Value stored in a DataBlock entry: either a VLog pointer (large values)
 /// or inline bytes (small values below the vLog threshold).
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub enum DataBlockValue {
     Pointer(ValuePointer),
     Inline { data: Vec<u8>, expire_at: u64 },
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
 pub struct DataBlock {
     pub entries: Vec<(Vec<u8>, DataBlockValue)>, // (key, value)
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(repr(C))] // Force C layout on Archived type
+#[rkyv(attr(repr(C)))] // Force C layout on Archived type
 #[repr(C)]
 pub struct BloomFilter {
     /// Bit array for the bloom filter

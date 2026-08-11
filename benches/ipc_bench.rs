@@ -19,7 +19,7 @@ use luradb::ipc::{
 };
 use luradb::storage::sstable::{SSTableBuilder, SSTableReader};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use rkyv::{check_archived_root, AlignedVec};
+use rkyv::{rancor, util::AlignedVec, Archived};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -265,9 +265,10 @@ impl ShmSnapshotClient {
     fn get(&self, domain: &str, key: &[u8]) -> Option<Vec<u8>> {
         let (a, b) = self.bufs();
         let guard = SnapshotGuard::acquire(self.header(), a, b)?;
-        let mut aligned = AlignedVec::with_capacity(guard.data().len());
+        let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
         aligned.extend_from_slice(guard.data());
-        let archived = check_archived_root::<ShmSnapshot>(aligned.as_slice()).ok()?;
+        let archived =
+            rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).ok()?;
         let dom = archived.domains.iter().find(|d| d.name == domain)?;
         let idx = dom.entries.binary_search_by(|e| e.key.as_slice().cmp(key)).ok()?;
         let entry = &dom.entries[idx];

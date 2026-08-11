@@ -23,6 +23,7 @@ All notable changes to LuraDB are documented in this file.
 - vLog GC now waits for in-flight writes before collecting, closing the last liveness window.
 - SSTable: corrupted block handles fail with an error instead of a panic.
 - API: `PATCH /store-api/kv/{domain}/keys/{key}/null` now sets a real null value state instead of deleting the key: the key stays registered and listed in scans, `GET` answers `204 No Content` (previously a wrong 404), and only `DELETE`/TTL expiry remove it. **Breaking** status-code Change.
+- Storage-thread vLog I/O now validates the generation, and the active generation is routed through the thread after restart.
 
 ## [0.1.1] - 2026-08-11
 

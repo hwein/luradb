@@ -615,6 +615,11 @@ fn main() -> anyhow::Result<()> {
         // let the Janitor reopen the VLog through it after GC.
         if let Some(handle) = &storage_handle {
             lsm_engine.set_storage_handle(handle.clone());
+            // perf/013: if recovery found an active generation > 1, point the
+            // thread at it too instead of leaving it on generation 1 until
+            // the next GC cycle. Safe here: `LsmStorageEngine::new` above
+            // already awaited WAL recovery to completion.
+            lsm_engine.route_active_vlog_to_thread(handle).await?;
         }
         let lsm_store = Arc::new(lsm_engine);
         if let Some(engine) = io_engine.as_mut() {

@@ -312,13 +312,15 @@ impl Janitor {
         // length at reopen time — everything written after that stat would be
         // overwritten. Roll one more generation that only the thread writes.
         //
-        // Remaining one-fd window (perf/005, not solved there): a reader holding
-        // a stale remote `Arc` of a source generation reads the reopened fd,
-        // i.e. the wrong file.
+        // One-fd window (perf/013): a reader holding a stale remote `Arc` of a
+        // source generation now gets a clean generation-mismatch error from
+        // the reopened fd instead of silently reading the wrong file — the
+        // window is detected, not avoided (avoidance needs multi-fd, out of
+        // scope).
         if let Some(handle) = &self.storage_handle {
             let thread_id = new_id + 1;
             let thread_path = generation_path(&self.vlog_base_path, thread_id);
-            handle.vlog_reopen(thread_path.clone()).await?;
+            handle.vlog_reopen(thread_path.clone(), thread_id).await?;
             self.vlog.set_active(Arc::new(VLog::with_storage_handle(
                 &thread_path,
                 handle.clone(),
@@ -702,7 +704,34 @@ mod tests {
         let new_off = swapped.append(b"AFTER-GC").await.unwrap();
         assert_eq!(new_off, 0);
         assert_eq!(swapped.read(new_off, 8).await.unwrap(), b"AFTER-GC");
-        assert_eq!(fx.handle.vlog_read(0, 8).await.unwrap(), b"AFTER-GC");
+        assert_eq!(fx.handle.vlog_read(0, 8, 3).await.unwrap(), b"AFTER-GC");
+
+        fx.st.shutdown();
+    }
+
+    // Spec perf/013 test 2: a remote `Arc` of the source generation grabbed
+    // before the GC gets a clean error after the reopen instead of bytes read
+    // from the thread's new file -- the one-fd read window is detected, not
+    // just theoretically possible in a race.
+    #[tokio::test]
+    async fn test_gc_stale_source_generation_read_fails_after_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut fx = storage_thread_fixture(dir.path()).await;
+
+        // Grab the Arc for the source generation (1) before GC swaps and
+        // retires it -- deterministic, no race required.
+        let stale = fx.registry.get(1).unwrap();
+        assert_eq!(stale.id(), 1);
+
+        assert!(fx.janitor.run_gc().await.unwrap().ran);
+
+        // The thread now owns generation 3; a read through the stale handle
+        // is a generation mismatch, not silently-wrong bytes from file 3.
+        let err = stale.read(0, 100).await.unwrap_err();
+        match err {
+            VLogError::Io(e) => assert!(e.to_string().contains("generation mismatch"), "{e}"),
+            other => panic!("expected an I/O error wrapping a generation mismatch, got {other:?}"),
+        }
 
         fx.st.shutdown();
     }

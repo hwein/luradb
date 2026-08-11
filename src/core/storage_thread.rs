@@ -39,16 +39,30 @@ pub enum IoRequest {
     WalAppend { data: Vec<u8>, response: oneshot::Sender<Result<u64>> },
     /// Reset the WAL to length 0.
     WalTruncate { response: oneshot::Sender<Result<()>> },
-    /// Append bytes to the VLog; responds with `(offset, len)`.
-    VlogAppend { data: Vec<u8>, response: oneshot::Sender<Result<(u64, usize)>> },
-    /// Read `len` bytes at `offset` from the VLog.
-    VlogRead { offset: u64, len: usize, response: oneshot::Sender<Result<Vec<u8>>> },
+    /// Append bytes to the VLog; responds with `(offset, len)`. Rejected with
+    /// an `Err` if `expected_generation` does not match the generation the
+    /// thread currently has open (spec perf/013).
+    VlogAppend {
+        data: Vec<u8>,
+        expected_generation: u32,
+        response: oneshot::Sender<Result<(u64, usize)>>,
+    },
+    /// Read `len` bytes at `offset` from the VLog. Rejected the same way as
+    /// `VlogAppend` on a generation mismatch (spec perf/013).
+    VlogRead {
+        offset: u64,
+        len: usize,
+        expected_generation: u32,
+        response: oneshot::Sender<Result<Vec<u8>>>,
+    },
     /// Write a complete SSTable to `path` (temp file + fsync + atomic rename).
     /// Returns `data` back so a non-mmap flush can build the reader without a copy.
     SstableWrite { path: PathBuf, data: Vec<u8>, response: oneshot::Sender<Result<Vec<u8>>> },
-    /// Reopen the VLog on the canonical `path` after GC: close the old fd,
-    /// reset the offset to the file length, refresh the fixed-file slot.
-    VlogReopen { path: PathBuf, response: oneshot::Sender<Result<()>> },
+    /// Reopen the VLog on `path` after GC: close the old fd, reset the offset
+    /// to the file length, refresh the fixed-file slot, and record
+    /// `generation` as the id now open (checked against by `VlogRead`/
+    /// `VlogAppend`, spec perf/013).
+    VlogReopen { path: PathBuf, generation: u32, response: oneshot::Sender<Result<()>> },
     /// Drain pending requests, then stop the thread.
     Shutdown,
 }
@@ -78,19 +92,19 @@ impl StorageHandle {
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
     }
 
-    pub async fn vlog_append(&self, data: Vec<u8>) -> Result<(u64, usize)> {
+    pub async fn vlog_append(&self, data: Vec<u8>, expected_generation: u32) -> Result<(u64, usize)> {
         let (tx, rx) = oneshot::channel();
         self.request_tx
-            .send(IoRequest::VlogAppend { data, response: tx })
+            .send(IoRequest::VlogAppend { data, expected_generation, response: tx })
             .await
             .map_err(|_| anyhow!("storage thread shut down"))?;
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
     }
 
-    pub async fn vlog_read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub async fn vlog_read(&self, offset: u64, len: usize, expected_generation: u32) -> Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
         self.request_tx
-            .send(IoRequest::VlogRead { offset, len, response: tx })
+            .send(IoRequest::VlogRead { offset, len, expected_generation, response: tx })
             .await
             .map_err(|_| anyhow!("storage thread shut down"))?;
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
@@ -105,10 +119,10 @@ impl StorageHandle {
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
     }
 
-    pub async fn vlog_reopen(&self, path: PathBuf) -> Result<()> {
+    pub async fn vlog_reopen(&self, path: PathBuf, generation: u32) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.request_tx
-            .send(IoRequest::VlogReopen { path, response: tx })
+            .send(IoRequest::VlogReopen { path, generation, response: tx })
             .await
             .map_err(|_| anyhow!("storage thread shut down"))?;
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
@@ -193,6 +207,12 @@ struct StorageState {
     wal_offset: u64,
     vlog: File,
     vlog_offset: u64,
+    /// Generation id of the currently open `vlog` file (spec perf/013);
+    /// starts at 1 (the thread always spawns on the canonical path) and is
+    /// updated by `VlogReopen`. Checked against `VlogRead`/`VlogAppend` so a
+    /// caller holding a stale generation gets a clean error instead of I/O
+    /// against the wrong file.
+    vlog_generation: u32,
     /// WAL and VLog are registered as fixed files (slots 0 and 1); `false` after
     /// a failed `register_files` — ops then fall back to raw fds.
     fixed_files: bool,
@@ -248,7 +268,10 @@ fn storage_thread_main(
                 false
             }
         };
-        Ok((StorageState { ring, wal, wal_offset, vlog, vlog_offset, fixed_files }, sqpoll_active))
+        Ok((
+            StorageState { ring, wal, wal_offset, vlog, vlog_offset, vlog_generation: 1, fixed_files },
+            sqpoll_active,
+        ))
     })();
 
     let mut state = match init {
@@ -317,18 +340,18 @@ fn process_batch(state: &mut StorageState, batch: Vec<IoRequest>) -> bool {
             IoRequest::WalTruncate { response } => {
                 let _ = response.send(do_wal_truncate(state));
             }
-            IoRequest::VlogAppend { data, response } => {
-                let _ = response.send(do_vlog_append(state, &data));
+            IoRequest::VlogAppend { data, expected_generation, response } => {
+                let _ = response.send(do_vlog_append(state, &data, expected_generation));
             }
-            IoRequest::VlogRead { offset, len, response } => {
-                let _ = response.send(do_vlog_read(state, offset, len));
+            IoRequest::VlogRead { offset, len, expected_generation, response } => {
+                let _ = response.send(do_vlog_read(state, offset, len, expected_generation));
             }
             IoRequest::SstableWrite { path, data, response } => {
                 let result = do_sstable_write(state, &path, &data).map(|()| data);
                 let _ = response.send(result);
             }
-            IoRequest::VlogReopen { path, response } => {
-                let _ = response.send(do_vlog_reopen(state, &path));
+            IoRequest::VlogReopen { path, generation, response } => {
+                let _ = response.send(do_vlog_reopen(state, &path, generation));
             }
         }
     }
@@ -381,7 +404,21 @@ fn do_wal_truncate(state: &mut StorageState) -> Result<()> {
     Ok(())
 }
 
-fn do_vlog_append(state: &mut StorageState, data: &[u8]) -> Result<(u64, usize)> {
+/// Rejects a request made against any generation other than the one the
+/// thread currently has open — the one-fd read/write window becomes a clean
+/// `Err` instead of silent I/O against the wrong file (spec perf/013).
+fn check_vlog_generation(state: &StorageState, expected: u32) -> Result<()> {
+    if expected != state.vlog_generation {
+        return Err(anyhow!(
+            "vLog generation mismatch: expected {expected}, thread has {}",
+            state.vlog_generation
+        ));
+    }
+    Ok(())
+}
+
+fn do_vlog_append(state: &mut StorageState, data: &[u8], expected_generation: u32) -> Result<(u64, usize)> {
+    check_vlog_generation(state, expected_generation)?;
     if data.is_empty() {
         return Ok((state.vlog_offset, 0));
     }
@@ -392,7 +429,8 @@ fn do_vlog_append(state: &mut StorageState, data: &[u8]) -> Result<(u64, usize)>
     Ok((offset, data.len()))
 }
 
-fn do_vlog_read(state: &mut StorageState, offset: u64, len: usize) -> Result<Vec<u8>> {
+fn do_vlog_read(state: &mut StorageState, offset: u64, len: usize, expected_generation: u32) -> Result<Vec<u8>> {
+    check_vlog_generation(state, expected_generation)?;
     let mut buf = vec![0u8; len];
     let vlog = state.vlog_file();
     ring_read_exact(&mut state.ring, vlog, offset, &mut buf)?;
@@ -400,8 +438,9 @@ fn do_vlog_read(state: &mut StorageState, offset: u64, len: usize) -> Result<Vec
 }
 
 /// Reopens the VLog on `path` after GC: swaps in the new fd (refreshing fixed
-/// slot 1 when registered) and resets the write cursor to the file length.
-fn do_vlog_reopen(state: &mut StorageState, path: &Path) -> Result<()> {
+/// slot 1 when registered), resets the write cursor to the file length, and
+/// records `generation` as the id now open (spec perf/013).
+fn do_vlog_reopen(state: &mut StorageState, path: &Path, generation: u32) -> Result<()> {
     let new = open_rw(path)?;
     let new_offset = new.metadata()?.len();
     if state.fixed_files {
@@ -413,6 +452,7 @@ fn do_vlog_reopen(state: &mut StorageState, path: &Path) -> Result<()> {
     }
     state.vlog = new; // drops the old fd (frees the stale GC'd inode)
     state.vlog_offset = new_offset;
+    state.vlog_generation = generation;
     Ok(())
 }
 
@@ -665,10 +705,39 @@ mod tests {
     async fn test_vlog_append_then_read() {
         let dir = tempfile::TempDir::new().unwrap();
         let (mut st, handle) = spawn(dir.path(), false, 64);
-        let (off, len) = handle.vlog_append(b"payload-XYZ".to_vec()).await.unwrap();
+        let (off, len) = handle.vlog_append(b"payload-XYZ".to_vec(), 1).await.unwrap();
         assert_eq!((off, len), (0, 11));
-        let got = handle.vlog_read(off, len).await.unwrap();
+        let got = handle.vlog_read(off, len, 1).await.unwrap();
         assert_eq!(got, b"payload-XYZ");
+        st.shutdown();
+    }
+
+    // Spec perf/013 test 1: vlog_read/vlog_append reject a request whose
+    // expected generation does not match the one the thread has open, and
+    // vlog_reopen's id becomes the new expectation.
+    #[tokio::test]
+    async fn test_vlog_generation_mismatch_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut st, handle) = spawn(dir.path(), false, 64);
+
+        // Thread spawns on generation 1; any other id is rejected.
+        let err = handle.vlog_append(b"x".to_vec(), 2).await.unwrap_err();
+        assert!(err.to_string().contains("generation mismatch"), "{err}");
+        let err = handle.vlog_read(0, 1, 2).await.unwrap_err();
+        assert!(err.to_string().contains("generation mismatch"), "{err}");
+
+        // The right id still performs unchanged I/O.
+        let (off, len) = handle.vlog_append(b"hello".to_vec(), 1).await.unwrap();
+        assert_eq!(handle.vlog_read(off, len, 1).await.unwrap(), b"hello");
+
+        // After a reopen to generation 2, the old id is rejected and the new
+        // one succeeds.
+        let new_path = dir.path().join("vlog.2");
+        handle.vlog_reopen(new_path, 2).await.unwrap();
+        assert!(handle.vlog_append(b"y".to_vec(), 1).await.is_err());
+        let (off2, len2) = handle.vlog_append(b"world".to_vec(), 2).await.unwrap();
+        assert_eq!(handle.vlog_read(off2, len2, 2).await.unwrap(), b"world");
+
         st.shutdown();
     }
 
@@ -824,16 +893,16 @@ mod tests {
     async fn test_vlog_reopen_switches_file_and_offset() {
         let dir = tempfile::TempDir::new().unwrap();
         let (mut st, handle) = spawn(dir.path(), false, 64);
-        handle.vlog_append(b"old-data".to_vec()).await.unwrap();
+        handle.vlog_append(b"old-data".to_vec(), 1).await.unwrap();
 
         let new_path = dir.path().join("vlog.2"); // next vLog generation
         std::fs::write(&new_path, b"NEW").unwrap();
-        handle.vlog_reopen(new_path.clone()).await.unwrap();
+        handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
 
         // Offset now tracks the new file: the append lands after its 3 bytes.
-        let (off, len) = handle.vlog_append(b"XY".to_vec()).await.unwrap();
+        let (off, len) = handle.vlog_append(b"XY".to_vec(), 2).await.unwrap();
         assert_eq!((off, len), (3, 2));
-        assert_eq!(handle.vlog_read(0, 5).await.unwrap(), b"NEWXY");
+        assert_eq!(handle.vlog_read(0, 5, 2).await.unwrap(), b"NEWXY");
         st.shutdown();
     }
 

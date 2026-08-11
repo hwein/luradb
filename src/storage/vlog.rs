@@ -139,7 +139,8 @@ impl VLog {
                 Ok(offset)
             }
             VLogMode::Remote(handle) => {
-                let (offset, len) = handle.vlog_append(value.to_vec()).await.map_err(vlog_remote_err)?;
+                let (offset, len) =
+                    handle.vlog_append(value.to_vec(), self.id).await.map_err(vlog_remote_err)?;
                 self.offset.fetch_max(offset + len as u64, Ordering::SeqCst);
                 Ok(offset)
             }
@@ -161,7 +162,9 @@ impl VLog {
                 file.read_exact(&mut buf).await?;
                 Ok(buf)
             }
-            VLogMode::Remote(handle) => handle.vlog_read(offset, len).await.map_err(vlog_remote_err),
+            VLogMode::Remote(handle) => {
+                handle.vlog_read(offset, len, self.id).await.map_err(vlog_remote_err)
+            }
         }
     }
 

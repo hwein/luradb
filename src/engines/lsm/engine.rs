@@ -337,6 +337,38 @@ impl LsmStorageEngine {
         self.storage_handle = Some(handle);
     }
 
+    /// Points the storage thread at the vLog generation that startup
+    /// discovered as active and swaps in a handle-backed `VLog` for it, so
+    /// its I/O takes the io_uring path instead of bypassing it until the
+    /// next GC cycle (spec perf/013). A no-op when the active generation is
+    /// already 1 — the thread already owns that file, since it always spawns
+    /// on the canonical path (see `main.rs`).
+    ///
+    /// Must run after `recover_from_wal` has completed; `LsmStorageEngine::new`
+    /// already awaits that internally, so calling this once `new` has
+    /// returned is always safe. Reopening earlier would race WAL recovery,
+    /// which still appends locally while the handle-backed `VLog` seeds its
+    /// cursor from the file length.
+    ///
+    /// The thread's single fd can back only one generation at a time, so
+    /// generation 1 — no longer thread-owned once this swap runs — is
+    /// reopened locally afterward; every other generation was already local
+    /// (`build_vlog_registry` opens ids > 1 via `tokio::fs`).
+    pub async fn route_active_vlog_to_thread(&self, handle: &StorageHandle) -> Result<()> {
+        let active = self.vlog.active();
+        let id = active.id();
+        if id <= 1 {
+            return Ok(());
+        }
+        let path = active.path().to_path_buf();
+        handle.vlog_reopen(path.clone(), id).await?;
+        self.vlog.set_active(Arc::new(VLog::with_storage_handle(path, handle.clone(), id)));
+
+        let gen1 = VLog::open(&self.vlog_path, 1).await?;
+        self.vlog.register(Arc::new(gen1));
+        Ok(())
+    }
+
     // ── Recovery ────────────────────────────────────────────────────────────
 
     /// Registers every vLog generation that exists next to `vlog_path`; the
@@ -1371,6 +1403,7 @@ impl StorageEngine for LsmStorageEngine {
 mod tests {
     use super::*;
     use crate::core::wal::WriteAheadLog;
+    use crate::core::storage_thread::{StorageThread, StorageThreadConfig};
     use crate::storage::vlog::VLog;
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
@@ -2330,6 +2363,65 @@ mod tests {
         let big = vec![b'o'; 4096];
         engine.put(b"k", &big).await.unwrap();
         assert_eq!(engine.get(b"k").await.unwrap(), Some(big));
+    }
+
+    // Spec perf/013 test 3: startup with an active generation > 1 and a live
+    // storage thread repoints the thread at that generation instead of
+    // leaving it on the canonical file until the next GC. Generation 1 (no
+    // longer thread-owned) stays correctly readable through a local handle.
+    #[tokio::test]
+    async fn test_startup_routes_active_generation_through_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let vlog_path = dir.path().join("vlog.log");
+        std::fs::write(&vlog_path, b"generation-1").unwrap();
+        std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
+
+        let st_config = StorageThreadConfig {
+            sqpoll_enabled: false,
+            sqpoll_idle_ms: 500,
+            ring_depth: 64,
+            channel_capacity: 64,
+            cpu: -1,
+        };
+        let (mut st, handle) =
+            StorageThread::new(st_config, wal_path.clone(), vlog_path.clone()).unwrap();
+
+        let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
+        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1));
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        let engine = LsmStorageEngine::new(
+            wal,
+            wal_path,
+            vlog,
+            vlog_path,
+            file_manager,
+            manifest_manager,
+            LsmEngineOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Before the repoint: registry-only bookkeeping, thread still on gen 1.
+        assert_eq!(engine.vlog.active().id(), 2, "generation 2 is the highest on disk");
+
+        engine.route_active_vlog_to_thread(&handle).await.unwrap();
+
+        let active = engine.vlog.active();
+        assert_eq!(active.id(), 2, "active reference is handle-backed generation 2");
+        let off = active.append(b"-added").await.unwrap();
+        assert_eq!(off, 12, "cursor seeded from generation 2's on-disk length");
+        assert_eq!(
+            handle.vlog_read(off, 6, 2).await.unwrap(),
+            b"-added",
+            "the append routed through the thread's own fd"
+        );
+
+        // Generation 1 is no longer thread-owned but stays correctly readable.
+        assert_eq!(engine.vlog.read(1, 0, 12).await.unwrap(), b"generation-1");
+
+        st.shutdown();
     }
 
     // ── IoEngine integration (spec perf/004) ─────────────────────────────────

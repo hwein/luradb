@@ -9,39 +9,43 @@ toolchain, no package install on the host.
   Windows/macOS/Linux).
 - git.
 
-## Get the package
-
-Download the latest `luradb_*.deb` from the [Releases
-page](https://github.com/hwein/luradb/releases) and place it in
-`target/debian/` at the repo root (`mkdir -p target/debian` first if it
-doesn't exist yet).
-
-Building it yourself works too: `cargo deb` places the package there
-automatically — see the main README's "Build from source" section for the
-toolchain setup.
-
 ## Quickstart
 
-```sh
-git clone https://github.com/hwein/luradb.git
-```
+1. Clone the repo:
 
-Place `luradb_*.deb` in `luradb/target/debian/` (see above), then:
+   ```sh
+   git clone https://github.com/hwein/luradb.git
+   ```
 
-```sh
-cd luradb/packaging/docker
-docker compose up -d
-```
+2. Download the latest `luradb_*.deb` from the
+   [Releases page](https://github.com/hwein/luradb/releases) and drop it
+   into the cloned repo under `target/debian/`:
 
-The build installs the package like a real target system — nothing is
-compiled, and nothing beyond the `ubuntu:24.04` base image is pulled from a
-registry. Once the container is `healthy`:
+   ```sh
+   mkdir -p luradb/target/debian
+   ```
 
-```sh
-curl http://localhost:3000/health
-```
+   Building it yourself works too — `cargo deb` places the package there
+   automatically (toolchain setup: main README, "Build from source").
 
-The Swagger UI is enabled in this setup: <http://localhost:3000/test-ui>.
+3. Build the image and start the container:
+
+   ```sh
+   cd luradb/packaging/docker
+   docker compose up -d
+   ```
+
+   The build installs the package like a real target system — nothing is
+   compiled, and nothing beyond the `ubuntu:24.04` base image is pulled
+   from a registry.
+
+4. Once the container is `healthy`:
+
+   ```sh
+   curl http://localhost:3000/health
+   ```
+
+   The Swagger UI is enabled in this setup: <http://localhost:3000/test-ui>.
 
 ## Admin key
 
@@ -62,7 +66,7 @@ requires; `compose.yaml` carries the exemption (`security_opt:
 seccomp=unconfined`). A bare `docker run` without that option fails at
 startup.
 
-## Data & lifecycle
+## Update, reset, remove
 
 - **Update:** place the new `.deb` in `target/debian/`, then
   `docker compose up -d --build` — if several packages are there, the most

@@ -540,8 +540,17 @@ fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
         .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(|t| t == "checksum"))
         .unwrap_or(false);
 
+    // The file name, not the manifest, is a backup's identity: an uploaded
+    // archive keeps its original manifest id (rewriting it would break the
+    // checksum) but is addressed by its fresh server-assigned name.
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("backup file {} has no valid name stem", path.display()))?
+        .to_string();
+
     Ok(BackupSummary {
-        id: manifest.id,
+        id,
         state: if is_complete { BackupState::Complete } else { BackupState::Incomplete },
         scope: manifest.scope,
         created_at: manifest.created_at,
@@ -896,6 +905,26 @@ mod manager_tests {
 
         manager.delete_backup("bk_del").unwrap();
         assert!(matches!(manager.delete_backup("bk_del").unwrap_err(), BackupError::NotFound));
+    }
+
+    // 9b. The file name wins over the manifest id (upload case: the server
+    //     assigns a fresh name; the archive keeps its original manifest id).
+    #[tokio::test]
+    async fn test_backup_identity_is_the_file_name_not_the_manifest_id() {
+        let (manager, _e, backup_dir) = make_manager().await;
+        write_fake_backup(backup_dir.path(), "bk_original", "all", 1000, None, true);
+        std::fs::rename(
+            backup_dir.path().join("bk_original.ndjson"),
+            backup_dir.path().join("bk_uploaded.ndjson"),
+        )
+        .unwrap();
+
+        let summary = manager.get_backup("bk_uploaded").unwrap();
+        assert_eq!(summary.id, "bk_uploaded");
+        let list = manager.list_backups().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "bk_uploaded");
+        assert!(matches!(manager.get_backup("bk_original").unwrap_err(), BackupError::NotFound));
     }
 
     // 10. delete_backup refuses a backup whose id only has a lingering

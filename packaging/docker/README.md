@@ -19,8 +19,12 @@ cd luradb/packaging/docker
 docker compose up -d
 ```
 
-The first run builds the image from source, which takes a few minutes;
-later runs reuse the Docker layer cache. Once the container is `healthy`:
+The first run builds the image from the cloned sources: a builder stage
+compiles LuraDB and packages the .deb entirely inside the container, a
+second stage then installs that .deb like a real target system — nothing
+is downloaded from a registry and no prebuilt package is required. This
+takes a few minutes; later runs reuse the Docker layer cache. Once the
+container is `healthy`:
 
 ```sh
 curl http://localhost:3000/health

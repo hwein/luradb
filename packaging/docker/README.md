@@ -65,15 +65,3 @@ Docker's default seccomp profile blocks the io_uring syscalls LuraDB
 requires; `compose.yaml` carries the exemption (`security_opt:
 seccomp=unconfined`). A bare `docker run` without that option fails at
 startup.
-
-## Update, reset, remove
-
-- **Update:** place the new `.deb` in `target/debian/`, then
-  `docker compose up -d --build` — if several packages are there, the most
-  recently added one is installed. Data and the admin key are kept (they
-  live in named volumes, not the image).
-- **Reset:** `docker compose down -v` — drops both volumes; the next
-  `up -d` starts with an empty store, and the admin key reverts to the one
-  generated at image build time.
-- **Remove entirely:** `docker compose down -v`, then
-  `docker image rm luradb:local`.

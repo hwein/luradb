@@ -500,6 +500,30 @@ impl DomainStore {
         Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
     }
 
+    /// Restore-path upsert (spec general/006): same key validation as
+    /// [`Self::put`]/[`Self::put_with_ttl`] but takes the absolute
+    /// `expire_at` directly (no now-relative round trip) and bypasses the
+    /// rate limiter (admin maintenance operation, per spec general/006
+    /// Autorisierung — the restore throttle is `scan_batch_size`/
+    /// `scan_pause_ms`).
+    pub(crate) async fn put_unthrottled(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
+        self.validate_user_key(key)?;
+        let start = std::time::Instant::now();
+        self.engine.write_kv_pair(&self.prefixed_key(key), value, expire_at).await?;
+        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
+    /// Restore-path variant of [`Self::set_null`] — same rate-limiter bypass
+    /// rationale as [`Self::put_unthrottled`].
+    pub(crate) async fn set_null_unthrottled(&self, key: &[u8]) -> Result<()> {
+        self.validate_user_key(key)?;
+        let start = std::time::Instant::now();
+        self.engine.write_null(&self.prefixed_key(key)).await?;
+        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
     /// Reads a value against an externally held snapshot, with `expire_at`
     /// (spec general/006 backup export) instead of acquiring a snapshot
     /// internally like [`Self::get`] — lets the backup writer pin every read

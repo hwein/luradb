@@ -127,6 +127,62 @@ fn parse_bound(part: &str, min: u32, max: u32, name: &str) -> Result<u32> {
     Ok(v)
 }
 
+// ── Civil calendar time ──────────────────────────────────────────────────
+//
+// Shared by backup/restore ID timestamps (spec general/006) and, in the
+// scheduler follow-up, the cron minute-match against "now". This project has
+// no chrono/time dependency, so date math is done by hand: proleptic
+// Gregorian civil-from-days (Howard Hinnant's algorithm,
+// http://howardhinnant.github.io/date_algorithms.html).
+
+/// UTC calendar breakdown of a Unix timestamp. Weekday: 0 = Sunday, matching
+/// the cron weekday field above; 1970-01-01 was a Thursday (weekday 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CivilTime {
+    pub year: i64,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    pub weekday: u32,
+}
+
+/// Breaks a Unix timestamp (seconds since epoch, UTC) into calendar fields.
+pub fn civil_from_unix(unix_secs: u64) -> CivilTime {
+    let secs = unix_secs as i64;
+    let days = secs.div_euclid(86400);
+    let time_of_day = secs.rem_euclid(86400);
+    let hour = (time_of_day / 3600) as u32;
+    let minute = ((time_of_day % 3600) / 60) as u32;
+    let second = (time_of_day % 60) as u32;
+    let weekday = (days.rem_euclid(7) + 4).rem_euclid(7) as u32;
+
+    // civil_from_days: shift the epoch to 0000-03-01 so leap days fall at
+    // the end of the internal "year", which keeps the month/day split simple.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097); // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month, shifted so March = 0 [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+
+    CivilTime { year, month, day, hour, minute, second, weekday }
+}
+
+/// Formats a Unix timestamp as `YYYYMMDDTHHMMSSZ` (spec general/006 backup/restore IDs).
+pub fn format_utc_timestamp(unix_secs: u64) -> String {
+    let t = civil_from_unix(unix_secs);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +339,107 @@ mod tests {
     #[test]
     fn test_reject_empty_list_items() {
         assert!(CronSchedule::parse("1,,2 * * * *").is_err());
+    }
+
+    // ── civil_from_unix / format_utc_timestamp ───────────────────────────
+
+    #[test]
+    fn test_civil_from_unix_epoch() {
+        let t = civil_from_unix(0);
+        assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(t.weekday, 4, "1970-01-01 was a Thursday");
+    }
+
+    #[test]
+    fn test_civil_from_unix_end_of_first_day() {
+        let t = civil_from_unix(86399);
+        assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (1970, 1, 1, 23, 59, 59));
+    }
+
+    #[test]
+    fn test_civil_from_unix_day_rollover_and_weekday() {
+        let t = civil_from_unix(86400);
+        assert_eq!((t.year, t.month, t.day), (1970, 1, 2));
+        assert_eq!(t.weekday, 5, "1970-01-02 was a Friday");
+    }
+
+    /// Independent day-count reference (not sharing any code with
+    /// `civil_from_unix`) so the boundary tests below cross-check the
+    /// implementation instead of just re-asserting hand-picked constants.
+    fn is_leap(y: i64) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+
+    fn unix_for_date(year: i64, month: u32, day: u32) -> u64 {
+        let mut days: i64 = 0;
+        for y in 1970..year {
+            days += if is_leap(y) { 366 } else { 365 };
+        }
+        let month_days = [31, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        days += month_days[..(month as usize - 1)].iter().sum::<i64>();
+        days += day as i64 - 1;
+        (days * 86400) as u64
+    }
+
+    #[test]
+    fn test_civil_from_unix_leap_year_feb_29() {
+        // 2024-02-29T00:00:00Z, a leap day (2024 divisible by 4, not by 100).
+        let t = civil_from_unix(unix_for_date(2024, 2, 29));
+        assert_eq!((t.year, t.month, t.day), (2024, 2, 29));
+    }
+
+    #[test]
+    fn test_civil_from_unix_non_leap_year_feb_rolls_to_march() {
+        // 2023-02-28T00:00:00Z + 1 day must land on 2023-03-01 (no Feb 29).
+        let t = civil_from_unix(unix_for_date(2023, 2, 28) + 86400);
+        assert_eq!((t.year, t.month, t.day), (2023, 3, 1));
+    }
+
+    #[test]
+    fn test_civil_from_unix_century_non_leap_year() {
+        // 2100 is divisible by 100 but not 400, so it is NOT a leap year:
+        // 2100-02-28 + 1 day must land on 2100-03-01.
+        let t = civil_from_unix(unix_for_date(2100, 2, 28) + 86400);
+        assert_eq!((t.year, t.month, t.day), (2100, 3, 1));
+    }
+
+    #[test]
+    fn test_civil_from_unix_year_boundary() {
+        // 2023-12-31T00:00:00Z + 1 day must land on 2024-01-01.
+        let t = civil_from_unix(unix_for_date(2023, 12, 31) + 86400);
+        assert_eq!((t.year, t.month, t.day), (2024, 1, 1));
+    }
+
+    #[test]
+    fn test_civil_from_unix_matches_independent_reference_over_a_wide_range() {
+        // Sweep many dates across a wide span (incl. multiple century
+        // boundaries) against the independent day-counter above.
+        for year in [1970, 1999, 2000, 2001, 2023, 2024, 2100, 2200, 2400, 2500] {
+            for &(month, day) in &[(1u32, 1u32), (2, 28), (6, 15), (12, 31)] {
+                let expected = unix_for_date(year, month, day);
+                let t = civil_from_unix(expected);
+                assert_eq!(
+                    (t.year, t.month, t.day),
+                    (year, month, day),
+                    "mismatch for {year}-{month:02}-{day:02}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_civil_from_unix_weekday_cycle_matches_epoch_offset() {
+        // Every 7 days must land on the same weekday.
+        let t0 = civil_from_unix(0);
+        for n in 1..=10u64 {
+            let t = civil_from_unix(n * 7 * 86400);
+            assert_eq!(t.weekday, t0.weekday, "day {n}*7 must be a Thursday too");
+        }
+    }
+
+    #[test]
+    fn test_format_utc_timestamp() {
+        assert_eq!(format_utc_timestamp(0), "19700101T000000Z");
+        assert_eq!(format_utc_timestamp(1_709_164_800), "20240229T000000Z");
     }
 }

@@ -72,6 +72,12 @@ path, updates and removal.
 Releases publish prebuilt binaries starting with the first tagged version;
 earlier, untagged history makes no binary guarantee.
 
+## Try it with Docker
+
+No Linux machine handy? With just Docker and git, clone the repo and build
+the image locally — no Rust toolchain, no package install on the host. See
+[packaging/docker/README.md](packaging/docker/README.md) for the quickstart.
+
 ## Build from source
 
 ```sh

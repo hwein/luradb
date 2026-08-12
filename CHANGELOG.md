@@ -8,6 +8,10 @@ All notable changes to LuraDB are documented in this file.
 
 - `packaging/docker/`: Docker try-setup (Dockerfile, compose.yaml, entrypoint) that installs a user-provided `.deb` from `target/debian/` to run LuraDB via `docker compose up -d` without a Rust toolchain or Linux host.
 
+### Fixed
+
+- API: `/health` now reports the crate version (previously hardcoded `0.1.0`).
+
 ## [0.2.1] - 2026-08-12
 
 ### Security

@@ -8,6 +8,7 @@ use super::document::{
 use super::error::JsonStoreError;
 use super::JsonEngine;
 use crate::engines::lsm::engine::BatchOp;
+use crate::engines::lsm::reader::Snapshot;
 use futures::Stream;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -241,6 +242,27 @@ impl JsonEngine {
             },
         ))
     }
+
+    /// Lists all live document keys of a domain visible under `snapshot`
+    /// (spec general/006 backup export) — the snapshot-pinned counterpart of
+    /// the key-scan step in [`Self::bulk_export`], pairing with
+    /// [`JsonEngine::get_document_with_snapshot`] for the per-document read.
+    /// Unparseable LSM keys are skipped, like `bulk_export`.
+    pub async fn scan_document_keys_with_snapshot(
+        &self,
+        domain: &str,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<String>, JsonStoreError> {
+        let dom = self.domains.require_active(domain)?;
+        let keys = self
+            .engine
+            .scan_keys_with_snapshot(&doc_scan_prefix(&dom.system_prefix), snapshot)
+            .await?;
+        Ok(keys
+            .into_iter()
+            .filter_map(|lsm_key| parse_doc_key(&lsm_key).map(|(_, document_key)| document_key))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +374,61 @@ mod tests {
         let stream = json.bulk_export("empty").await.unwrap();
         let docs: Vec<Document> = stream.collect().await;
         assert!(docs.is_empty());
+    }
+
+    // ── Snapshot-pinned export (spec general/006 backup export) ─────────────
+
+    // A document created/updated after the snapshot must not appear via the
+    // pinned scan/read pair, while the live (unpinned) read sees the update.
+    #[tokio::test]
+    async fn test_export_with_snapshot_hides_later_writes() {
+        let (json, _dir) = make_engine_with_batch(100).await;
+        json.put_document("default", "d1", json!({"n": 1})).await.unwrap();
+        let snap = json.engine().snapshot();
+
+        json.put_document("default", "d1", json!({"n": 2})).await.unwrap(); // update after snapshot
+        json.put_document("default", "d2", json!({"n": 99})).await.unwrap(); // new doc after snapshot
+
+        let keys = json
+            .scan_document_keys_with_snapshot("default", snap.snapshot())
+            .await
+            .unwrap();
+        assert_eq!(keys, vec!["d1".to_string()], "d2 was created after the snapshot");
+
+        let doc = json
+            .get_document_with_snapshot("default", "d1", snap.snapshot())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.content, json!({"n": 1}), "must see the pre-snapshot version");
+        assert_eq!(doc.version, 1);
+
+        let live = json.get_document("default", "d1").await.unwrap().unwrap();
+        assert_eq!(live.content, json!({"n": 2}), "live state must show the update");
+    }
+
+    // A document deleted after the snapshot must still be readable/listed
+    // through the pinned snapshot, even though the live view has moved on.
+    #[tokio::test]
+    async fn test_export_with_snapshot_sees_doc_deleted_after_snapshot() {
+        let (json, _dir) = make_engine_with_batch(100).await;
+        json.put_document("default", "gone", json!({"n": 1})).await.unwrap();
+        let snap = json.engine().snapshot();
+        json.delete_document("default", "gone").await.unwrap();
+
+        let keys = json
+            .scan_document_keys_with_snapshot("default", snap.snapshot())
+            .await
+            .unwrap();
+        assert_eq!(keys, vec!["gone".to_string()]);
+        let doc = json
+            .get_document_with_snapshot("default", "gone", snap.snapshot())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.content, json!({"n": 1}));
+
+        assert!(json.get_document("default", "gone").await.unwrap().is_none(), "live state must show it deleted");
     }
 
     // 7. NDJSON parsing: _key extraction, missing _key → generated UUID.

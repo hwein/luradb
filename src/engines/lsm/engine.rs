@@ -118,11 +118,17 @@ fn now_secs() -> u64 {
 /// user-key anywhere is its newest and decides for good (`decided`): live
 /// versions land in `live`, tombstoned or TTL-expired ones suppress the key.
 /// Stops early once `live` holds `limit` keys.
+///
+/// `snapshot` of `None` matches every version (today's `scan_keys`
+/// behavior); `Some` skips versions newer than the snapshot instead of
+/// deciding the key, so an older, visible version further along can still
+/// decide it (spec general/006 backup export).
 fn scan_memtable_for_prefix(
     mt: &MemTable,
     prefix: &[u8],
     now: u64,
     limit: usize,
+    snapshot: Option<&Snapshot>,
     live: &mut BTreeSet<Vec<u8>>,
     decided: &mut BTreeSet<Vec<u8>>,
 ) {
@@ -133,6 +139,14 @@ fn scan_memtable_for_prefix(
         if let Some(user_key) = InternalKey::extract_user_key(&encoded_key) {
             if !user_key.starts_with(prefix) || decided.contains(user_key) {
                 continue;
+            }
+            if let Some(snap) = snapshot {
+                let visible = InternalKey::extract_timestamp(&encoded_key)
+                    .map(|ts| snap.is_visible(ts))
+                    .unwrap_or(false);
+                if !visible {
+                    continue;
+                }
             }
             decided.insert(user_key.to_vec());
             if is_live_version(&value, now) {
@@ -173,16 +187,21 @@ fn is_live_version(value: &Value, now: u64) -> bool {
 }
 
 /// Sweeps one SSTable for keys with `prefix` (see [`scan_memtable_for_prefix`]
-/// for the newest-first decision protocol). Returns `true` once `live` holds
-/// `limit` keys so the caller can stop.
+/// for the newest-first decision protocol and the `snapshot` contract).
+/// Returns `true` once `live` holds `limit` keys so the caller can stop.
 fn scan_sstable_for_prefix(
     sstable: &SSTableReader,
     prefix: &[u8],
     limit: usize,
+    snapshot: Option<&Snapshot>,
     live: &mut BTreeSet<Vec<u8>>,
     decided: &mut BTreeSet<Vec<u8>>,
 ) -> Result<bool> {
-    for entry in sstable.keys_with_prefix(prefix) {
+    let entries: Box<dyn Iterator<Item = Result<(Vec<u8>, bool)>> + '_> = match snapshot {
+        Some(snap) => Box::new(sstable.keys_with_prefix_at(prefix, snap.timestamp().inverted())),
+        None => Box::new(sstable.keys_with_prefix(prefix)),
+    };
+    for entry in entries {
         if live.len() >= limit {
             return Ok(true);
         }
@@ -648,6 +667,26 @@ impl LsmStorageEngine {
         reader.get_with_metadata(key, snapshot).await
     }
 
+    /// Like [`Self::get_with_snapshot`], but also returns `expire_at`
+    /// (absolute Unix seconds, 0 = no TTL) — spec general/006 backup export,
+    /// which needs the remaining TTL alongside the value. Unlike
+    /// [`Self::get_with_metadata`], VLog pointers are dereferenced.
+    pub async fn get_with_expiry(
+        &self,
+        key: &[u8],
+        snapshot: &Snapshot,
+    ) -> Result<(GetResult, u64)> {
+        let memtable = { Arc::clone(&*self.memtable.read()) };
+
+        let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
+        {
+            let imm = self.immutable_memtables.read();
+            reader.set_immutable_memtables(imm.clone());
+        }
+        reader.set_sstables(self.level_manager.get_all_levels());
+        reader.get_with_expiry(key, snapshot).await
+    }
+
     /// Returns a handle to the block cache metrics for the `/metrics` endpoint.
     pub fn block_cache_metrics(&self) -> Arc<crate::engines::lsm::block_cache::BlockCacheMetrics> {
         self.block_cache.lock().metrics()
@@ -935,19 +974,39 @@ impl LsmStorageEngine {
     /// lexicographically smallest ones); an empty result means no live key
     /// with `prefix` exists.
     pub async fn scan_keys_limited(&self, prefix: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        self.scan_keys_inner(prefix, limit, None).await
+    }
+
+    /// Like [`Self::scan_keys`], but against an externally supplied MVCC
+    /// `snapshot` instead of "now" (spec general/006 backup export): a write
+    /// committed after the snapshot was acquired never appears, matching
+    /// [`Self::get_with_snapshot`]'s consistency guarantee for point reads.
+    pub async fn scan_keys_with_snapshot(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
+        self.scan_keys_inner(prefix, usize::MAX, Some(snapshot)).await
+    }
+
+    /// Shared implementation for [`Self::scan_keys_limited`]/
+    /// [`Self::scan_keys_with_snapshot`]: `snapshot` of `None` matches every
+    /// version currently live (today's `scan_keys` behavior).
+    async fn scan_keys_inner(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        snapshot: Option<&Snapshot>,
+    ) -> Result<Vec<Vec<u8>>> {
         let mut live: BTreeSet<Vec<u8>> = BTreeSet::new();
         // User keys already decided by a newer version (live OR dead).
         let mut decided: BTreeSet<Vec<u8>> = BTreeSet::new();
         let now = now_secs();
 
         let memtable = { Arc::clone(&*self.memtable.read()) };
-        scan_memtable_for_prefix(&memtable, prefix, now, limit, &mut live, &mut decided);
+        scan_memtable_for_prefix(&memtable, prefix, now, limit, snapshot, &mut live, &mut decided);
 
         {
             let imm = self.immutable_memtables.read();
             // Frozen MemTables are pushed to the back — iterate newest-first.
             for mt in imm.iter().rev() {
-                scan_memtable_for_prefix(mt, prefix, now, limit, &mut live, &mut decided);
+                scan_memtable_for_prefix(mt, prefix, now, limit, snapshot, &mut live, &mut decided);
             }
         }
 
@@ -958,7 +1017,7 @@ impl LsmStorageEngine {
         }
         for level_sstables in levels {
             for sstable in level_sstables {
-                if scan_sstable_for_prefix(&sstable, prefix, limit, &mut live, &mut decided)? {
+                if scan_sstable_for_prefix(&sstable, prefix, limit, snapshot, &mut live, &mut decided)? {
                     return Ok(live.into_iter().collect());
                 }
             }
@@ -1804,6 +1863,74 @@ mod tests {
         assert!(keys.contains(&b"user:2".to_vec()));
     }
 
+    // ── scan_keys_with_snapshot tests (spec general/006 backup export) ──────
+
+    // Writes after the snapshot (put, delete, set_null) must not change what
+    // the pinned scan sees, while the unpinned scan_keys sees the new state.
+    #[tokio::test]
+    async fn test_scan_keys_with_snapshot_hides_later_writes() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"user:1", b"alice").await.unwrap();
+        engine.put(b"user:2", b"bob").await.unwrap();
+        let snap = engine.snapshot();
+
+        engine.put(b"user:3", b"carol").await.unwrap(); // new key after snapshot
+        engine.delete(b"user:1").await.unwrap(); // delete after snapshot
+        engine.set_null(b"user:2").await.unwrap(); // set_null after snapshot
+
+        let pinned = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        assert_eq!(pinned, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+
+        let live = engine.scan_keys(b"user:").await.unwrap();
+        assert_eq!(live, vec![b"user:2".to_vec(), b"user:3".to_vec()]);
+    }
+
+    // Same guarantee once the pre-snapshot data has been flushed to SSTables
+    // and the post-snapshot write lands in a newer SSTable: a key tombstoned
+    // as of the snapshot and later resurrected must stay invisible.
+    #[tokio::test]
+    async fn test_scan_keys_with_snapshot_respects_flushed_versions() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"user:1", b"v1").await.unwrap();
+        freeze_and_flush(&engine).await; // SSTable 1: user:1 = v1
+        engine.delete(b"user:1").await.unwrap();
+        freeze_and_flush(&engine).await; // SSTable 2: user:1 tombstoned
+
+        let snap = engine.snapshot();
+
+        engine.put(b"user:1", b"v2").await.unwrap(); // resurrection after snapshot
+        freeze_and_flush(&engine).await; // SSTable 3: user:1 = v2
+
+        let pinned = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        assert!(pinned.is_empty(), "key tombstoned as of the snapshot must not appear");
+
+        let live = engine.scan_keys(b"user:").await.unwrap();
+        assert_eq!(live, vec![b"user:1".to_vec()], "current state must show the resurrection");
+    }
+
+    // NULL keys count as live under a pinned snapshot too (kv/018).
+    #[tokio::test]
+    async fn test_scan_keys_with_snapshot_includes_null() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"user:1").await.unwrap();
+        let snap = engine.snapshot();
+        let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        assert_eq!(keys, vec![b"user:1".to_vec()]);
+    }
+
+    // Expiry uses wall-clock time, not the snapshot timestamp -- an entry
+    // that was live when the snapshot was acquired but has since expired
+    // must not appear (matches every other read path).
+    #[tokio::test]
+    async fn test_scan_keys_with_snapshot_excludes_expired() {
+        let (engine, _dir) = make_engine().await;
+        engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+        let snap = engine.snapshot();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
+    }
+
     // ── Point-read MVCC ordering tests (overlapping L0 / frozen MemTables) ───
 
     // Regression: with two overlapping L0 tables, get must return the newest
@@ -1861,6 +1988,69 @@ mod tests {
         engine.freeze_active_memtable();
 
         assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+    }
+
+    // ── get_with_expiry tests (spec general/006 backup export) ──────────────
+
+    // expire_at is 0 for a plain put, and the absolute TTL deadline for
+    // put_with_ttl -- both against an externally acquired snapshot.
+    #[tokio::test]
+    async fn test_get_with_expiry_reports_ttl_and_zero() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"plain", b"v").await.unwrap();
+        engine.put_with_ttl(b"ttl", b"v", 3600).await.unwrap();
+        let snap = engine.snapshot();
+
+        let (result, expire_at) = engine.get_with_expiry(b"plain", snap.snapshot()).await.unwrap();
+        assert_eq!(result, GetResult::Present(b"v".to_vec()));
+        assert_eq!(expire_at, 0);
+
+        let (result, expire_at) = engine.get_with_expiry(b"ttl", snap.snapshot()).await.unwrap();
+        assert_eq!(result, GetResult::Present(b"v".to_vec()));
+        assert!(expire_at > now_secs(), "expire_at must be an absolute future timestamp");
+    }
+
+    // A NULL entry is reported distinctly, with expire_at 0 (set_null never
+    // carries a TTL).
+    #[tokio::test]
+    async fn test_get_with_expiry_distinguishes_null() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"n").await.unwrap();
+        let snap = engine.snapshot();
+        assert_eq!(
+            engine.get_with_expiry(b"n", snap.snapshot()).await.unwrap(),
+            (GetResult::Null, 0)
+        );
+    }
+
+    // A missing key reports Absent with expire_at 0.
+    #[tokio::test]
+    async fn test_get_with_expiry_absent_for_missing_key() {
+        let (engine, _dir) = make_engine().await;
+        let snap = engine.snapshot();
+        assert_eq!(
+            engine.get_with_expiry(b"ghost", snap.snapshot()).await.unwrap(),
+            (GetResult::Absent, 0)
+        );
+    }
+
+    // Snapshot isolation holds for the expiry-carrying read too, including
+    // across a flush to SSTable and a VLog-backed (large) value.
+    #[tokio::test]
+    async fn test_get_with_expiry_snapshot_consistency_across_flush() {
+        let (engine, _dir) = make_engine().await;
+        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold -> VLog pointer
+        engine.put(b"k", &big).await.unwrap();
+        freeze_and_flush(&engine).await;
+        let snap = engine.snapshot();
+
+        engine.put(b"k", b"newer").await.unwrap();
+        freeze_and_flush(&engine).await;
+
+        let (result, expire_at) = engine.get_with_expiry(b"k", snap.snapshot()).await.unwrap();
+        assert_eq!(result, GetResult::Present(big));
+        assert_eq!(expire_at, 0);
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"newer".to_vec()));
     }
 
     // ── Watcher tests ─────────────────────────────────────────────────────────

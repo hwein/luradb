@@ -24,6 +24,7 @@ use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
 use crate::engines::lsm::janitor::JanitorConfig;
+use crate::engines::lsm::reader::Snapshot;
 use crate::engines::StorageEngine;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::ManifestManager;
@@ -308,6 +309,27 @@ impl JsonEngine {
         }))
     }
 
+    /// Like [`Self::get_document`], but against an externally held snapshot
+    /// instead of one acquired internally (spec general/006 backup export) —
+    /// lets the backup writer pin every document read of a domain export to
+    /// the same point in time.
+    pub async fn get_document_with_snapshot(
+        &self,
+        domain: &str,
+        key: &str,
+        snapshot: &Snapshot,
+    ) -> Result<Option<Document>, JsonStoreError> {
+        validate_document_key(key, self.max_document_key_length)?;
+        let dom = self.domains.require_active(domain)?;
+        Ok(self.read_stored_with_snapshot(&dom, key, snapshot).await?.map(|stored| Document {
+            key: key.to_string(),
+            domain: dom.name.clone(),
+            content: stored.content,
+            version: stored.version,
+            generation: stored.generation,
+        }))
+    }
+
     /// Deletes a document and all its index entries in one atomic batch.
     /// Returns `false` if it did not exist.
     pub async fn delete_document(&self, domain: &str, key: &str) -> Result<bool, JsonStoreError> {
@@ -360,6 +382,25 @@ impl JsonEngine {
         key: &str,
     ) -> Result<Option<StoredDocument>, JsonStoreError> {
         let raw = self.engine.get(&doc_key(&dom.system_prefix, key)).await?;
+        match raw {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`Self::read_stored`], but against an externally held snapshot
+    /// (spec general/006 backup export) instead of one acquired internally.
+    async fn read_stored_with_snapshot(
+        &self,
+        dom: &JsonDomain,
+        key: &str,
+        snapshot: &Snapshot,
+    ) -> Result<Option<StoredDocument>, JsonStoreError> {
+        let raw = self
+            .engine
+            .get_with_snapshot(&doc_key(&dom.system_prefix, key), snapshot)
+            .await?
+            .into_option();
         match raw {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),

@@ -6,6 +6,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Added
 
+- API: logical backup & restore — consistent NDJSON export per scope (`all`, engine, single domain) with on-demand jobs, cron schedules with retention, download/upload, and restore with optional domain remapping (admin-only, opt-in via `backup.enabled`).
 - `packaging/docker/`: Docker try-setup (Dockerfile, compose.yaml, entrypoint) that installs a user-provided `.deb` from `target/debian/` to run LuraDB via `docker compose up -d` without a Rust toolchain or Linux host.
 
 ### Fixed

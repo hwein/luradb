@@ -88,17 +88,22 @@ pub(crate) async fn run_restore(params: RestoreParams<'_>) -> anyhow::Result<Res
 
 // ── Pass 1: checksum verification + domain-name collection ─────────────
 
-struct ArchiveScan {
+pub(crate) struct ArchiveScan {
     kv_domains: Vec<(String, u64)>,
     json_domains: Vec<(String, u64)>,
+    /// Exposed for the upload endpoint's "manifest fields" response (spec
+    /// general/006 POST /backups/upload) — restore itself only needs the
+    /// domain-name lists above.
+    pub(crate) manifest: ManifestLine,
 }
 
 /// Full read pass (spec general/006: a complete read pass ahead of any
 /// write): verifies the SHA-256 checksum line and, along the way, collects
 /// every kv-domain/json-domain name — needed up front so `fail_if_exists`/
 /// `replace` and the `into_domain` single-name check can run before any
-/// write in pass 2.
-async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> {
+/// write in pass 2. Also reused as-is by the upload endpoint's validation
+/// pass (`crate::api::backup`), which only needs the checksum/manifest check.
+pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> {
     let file = tokio::fs::File::open(path).await?;
     let mut lines = BufReader::new(file).lines();
 
@@ -107,6 +112,7 @@ async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> {
     let mut kv_domains = Vec::new();
     let mut json_domains = Vec::new();
     let mut saw_checksum = false;
+    let mut manifest_line: Option<ManifestLine> = None;
 
     while let Some(raw) = lines.next_line().await? {
         // The writer never emits blank lines; rejecting them keeps the
@@ -130,6 +136,7 @@ async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> {
             if manifest.format_version != FORMAT_VERSION {
                 return Err(BackupError::UnsupportedFormatVersion(manifest.format_version).into());
             }
+            manifest_line = Some(manifest);
         }
 
         if t == "checksum" {
@@ -182,7 +189,11 @@ async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> {
         );
     }
 
-    Ok(ArchiveScan { kv_domains, json_domains })
+    Ok(ArchiveScan {
+        kv_domains,
+        json_domains,
+        manifest: manifest_line.expect("checked above: the first line is always a manifest when saw_checksum is true"),
+    })
 }
 
 /// Validates `into_domain` (spec general/006: only legal when the archive
@@ -1270,7 +1281,7 @@ mod tests {
     }
 
     // 12. Restore KV writes bypass the domain rate limiter (spec general/006
-    //     Autorisierung: admin maintenance operation): with a 1-write/s
+    //     authorization section: admin maintenance operation): with a 1-write/s
     //     quota, all five entries still land instead of being dropped as
     //     per-entry failures.
     #[tokio::test]

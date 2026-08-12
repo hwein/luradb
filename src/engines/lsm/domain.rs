@@ -503,8 +503,8 @@ impl DomainStore {
     /// Restore-path upsert (spec general/006): same key validation as
     /// [`Self::put`]/[`Self::put_with_ttl`] but takes the absolute
     /// `expire_at` directly (no now-relative round trip) and bypasses the
-    /// rate limiter (admin maintenance operation, per spec general/006
-    /// Autorisierung — the restore throttle is `scan_batch_size`/
+    /// rate limiter (admin maintenance operation, per spec general/006's
+    /// authorization section — the restore throttle is `scan_batch_size`/
     /// `scan_pause_ms`).
     pub(crate) async fn put_unthrottled(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
         self.validate_user_key(key)?;
@@ -528,8 +528,8 @@ impl DomainStore {
     /// (spec general/006 backup export) instead of acquiring a snapshot
     /// internally like [`Self::get`] — lets the backup writer pin every read
     /// of a domain export to the same point in time. Bypasses the rate
-    /// limiter (admin maintenance operation, per spec general/006
-    /// Autorisierung).
+    /// limiter (admin maintenance operation, per spec general/006's
+    /// authorization section).
     pub async fn get_with_snapshot(&self, key: &[u8], snapshot: &Snapshot) -> Result<(GetResult, u64)> {
         self.validate_user_key(key)?;
         self.engine.get_with_expiry(&self.prefixed_key(key), snapshot).await

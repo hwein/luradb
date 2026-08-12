@@ -188,7 +188,7 @@ pub(crate) struct BackupParams<'a> {
 
 /// Runs the full export: `<id>.ndjson.part` -> fsync -> rename to
 /// `<id>.ndjson`. On any error the `.part` file is removed (spec general/006
-/// job-ablauf step 5) and the error propagates for the caller to log.
+/// job flow step 5) and the error propagates for the caller to log.
 pub(crate) async fn run_backup(params: BackupParams<'_>) -> anyhow::Result<()> {
     let part_path = params.dir.join(format!("{}.ndjson.part", params.id));
     let final_path = params.dir.join(format!("{}.ndjson", params.id));

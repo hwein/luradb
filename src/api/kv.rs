@@ -295,6 +295,7 @@ mod tests {
             json_engine: None,
             rel_engine: None,
             shm_manager: None,
+            backup_manager: None,
         };
         let app = crate::api::create_router(state, Arc::new(vec![]));
         (app, dir)

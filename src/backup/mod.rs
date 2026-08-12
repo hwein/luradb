@@ -3,11 +3,12 @@
 //! `BackupManager` owns the global backup/restore job slot, ID assignment,
 //! the on-disk backup listing, retention, and the in-RAM restore-status
 //! registry. The actual NDJSON export/import pipelines live in `writer`/
-//! `restore`; the cron subset lives in `cron`. HTTP handlers, the scheduler
-//! task and `main.rs` wiring are a later step.
+//! `restore`; the cron subset and minute-tick scheduler live in `cron`/
+//! `scheduler`. HTTP handlers live in `crate::api::backup`.
 
 pub mod cron;
 pub mod restore;
+pub mod scheduler;
 pub mod writer;
 
 use crate::config::BackupConfig;
@@ -15,10 +16,11 @@ use crate::engines::json::JsonEngine;
 use crate::engines::lsm::domain::{now_secs, DomainRegistry};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Which data a backup covers (spec general/006 "Scope-Syntax"). Parsing is
+/// Which data a backup covers (spec general/006 scope syntax). Parsing is
 /// syntax-only — domain existence is checked when a backup job actually runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupScope {
@@ -207,6 +209,45 @@ pub struct RestoreStatus {
     pub finished_at: Option<u64>,
 }
 
+// ── Metrics (spec general/006 metrics section) ──────────────────────────
+
+/// Lifetime backup counters, updated by `start_backup`'s job task on
+/// completion. Held directly on `BackupManager` (not `MetricsStore`) so the
+/// `/store-api/metrics` handler is the only cross-module coupling point.
+#[derive(Default)]
+struct BackupMetrics {
+    last_success_at: AtomicU64,
+    last_duration_ms: AtomicU64,
+    last_size_bytes: AtomicU64,
+    failed_total: AtomicU64,
+    last_success_at_by_schedule: parking_lot::RwLock<HashMap<String, u64>>,
+}
+
+impl BackupMetrics {
+    fn record_success(&self, schedule: Option<&str>, at: u64, duration_ms: u64, size_bytes: u64) {
+        self.last_success_at.store(at, Ordering::Relaxed);
+        self.last_duration_ms.store(duration_ms, Ordering::Relaxed);
+        self.last_size_bytes.store(size_bytes, Ordering::Relaxed);
+        if let Some(name) = schedule {
+            self.last_success_at_by_schedule.write().insert(name.to_string(), at);
+        }
+    }
+
+    fn record_failure(&self) {
+        self.failed_total.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `GET /store-api/metrics` "backup" block projection (spec general/006).
+#[derive(Debug, Clone, Default)]
+pub struct BackupMetricsSnapshot {
+    pub last_success_at: u64,
+    pub last_duration_ms: u64,
+    pub last_size_bytes: u64,
+    pub failed_total: u64,
+    pub last_success_at_by_schedule: HashMap<String, u64>,
+}
+
 // ── BackupManager ────────────────────────────────────────────────────────
 
 /// Owns the global backup/restore job slot, ID assignment, the on-disk
@@ -224,6 +265,12 @@ pub struct BackupManager {
     json_engine: Option<Arc<JsonEngine>>,
     slot: parking_lot::Mutex<Option<RunningJobInfo>>,
     restores: parking_lot::RwLock<HashMap<String, RestoreStatus>>,
+    /// Serializes upload id-allocation + finalize-rename (spec general/006
+    /// POST /backups/upload) — uploads don't take the job `slot` (pure file
+    /// I/O, no engine access), so this narrower lock is the only thing
+    /// preventing two concurrent uploads from racing onto the same id.
+    upload_lock: parking_lot::Mutex<()>,
+    metrics: BackupMetrics,
 }
 
 impl BackupManager {
@@ -243,7 +290,20 @@ impl BackupManager {
             json_engine,
             slot: parking_lot::Mutex::new(None),
             restores: parking_lot::RwLock::new(HashMap::new()),
+            upload_lock: parking_lot::Mutex::new(()),
+            metrics: BackupMetrics::default(),
         }))
+    }
+
+    /// `GET /store-api/metrics` "backup" block (spec general/006 metrics section).
+    pub fn metrics_snapshot(&self) -> BackupMetricsSnapshot {
+        BackupMetricsSnapshot {
+            last_success_at: self.metrics.last_success_at.load(Ordering::Relaxed),
+            last_duration_ms: self.metrics.last_duration_ms.load(Ordering::Relaxed),
+            last_size_bytes: self.metrics.last_size_bytes.load(Ordering::Relaxed),
+            failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
+            last_success_at_by_schedule: self.metrics.last_success_at_by_schedule.read().clone(),
+        }
     }
 
     /// The currently running job, if any (backup list's `running` field and
@@ -286,6 +346,7 @@ impl BackupManager {
         let job_id = id.clone();
         let handle = tokio::spawn(async move {
             let _guard = SlotGuard(Arc::clone(&manager));
+            let started = std::time::Instant::now();
             let params = writer::BackupParams {
                 dir: &manager.dir,
                 id: &job_id,
@@ -299,15 +360,23 @@ impl BackupManager {
                 scan_pause_ms: manager.scan_pause_ms,
             };
             match writer::run_backup(params).await {
-                Ok(()) => tracing::info!("[Backup] job '{job_id}' completed"),
-                Err(e) => tracing::warn!("[Backup] job '{job_id}' failed: {e:#}"),
+                Ok(()) => {
+                    tracing::info!("[Backup] job '{job_id}' completed");
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let size_bytes = std::fs::metadata(manager.ndjson_path(&job_id)).map(|m| m.len()).unwrap_or(0);
+                    manager.metrics.record_success(schedule.as_deref(), now_secs(), duration_ms, size_bytes);
+                }
+                Err(e) => {
+                    tracing::warn!("[Backup] job '{job_id}' failed: {e:#}");
+                    manager.metrics.record_failure();
+                }
             }
         });
 
         Ok((id, handle))
     }
 
-    fn allocate_backup_id(&self, suffix: &str) -> String {
+    pub(crate) fn allocate_backup_id(&self, suffix: &str) -> String {
         let base = format!("bk_{}_{suffix}", cron::format_utc_timestamp(now_secs()));
         if !self.backup_id_taken(&base) {
             return base;
@@ -440,8 +509,44 @@ impl BackupManager {
 
     // ── Listing, detail, deletion ────────────────────────────────────────
 
-    fn ndjson_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn ndjson_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.ndjson"))
+    }
+
+    // ── Upload (spec general/006 POST /backups/upload) ──────────────────
+
+    /// Collision-safe scratch path for a streamed upload, before its
+    /// identity (checksum-verified manifest -> allocated id) is known. Named
+    /// outside the `bk_*.ndjson`/`bk_*.ndjson.part` address space so it is
+    /// invisible to `list_backups`/`backup_id_taken` while streaming.
+    pub(crate) fn upload_scratch_path(&self) -> PathBuf {
+        self.dir.join(format!("upload-{:016x}.part", rand::random::<u64>()))
+    }
+
+    /// Allocates the server-assigned `bk_..._upload[_N]` id and atomically
+    /// renames the validated scratch file onto it (spec: the manifest's own
+    /// id is never adopted). Locked so two concurrent uploads can never race
+    /// onto the same id (uploads don't take the job `slot`).
+    pub(crate) fn finalize_upload(&self, temp_path: &Path) -> Result<String, BackupError> {
+        let _guard = self.upload_lock.lock();
+        let id = self.allocate_backup_id("upload");
+        std::fs::rename(temp_path, self.ndjson_path(&id)).map_err(|e| BackupError::Other(e.into()))?;
+        Ok(id)
+    }
+
+    /// Full manifest-line read for `GET /backups/{id}` and the upload
+    /// response (spec general/006: full manifest fields), alongside the same
+    /// cheap Complete/Incomplete classification `list_backups`/`get_backup`
+    /// use (no full SHA-256 pass).
+    pub(crate) fn get_backup_manifest(&self, id: &str) -> Result<(writer::ManifestLine, BackupState, u64), BackupError> {
+        validate_backup_id(id)?;
+        let path = self.ndjson_path(id);
+        if !path.exists() {
+            return Err(BackupError::NotFound);
+        }
+        let (manifest, is_complete, size) = read_backup_manifest_raw(&path).map_err(BackupError::Other)?;
+        let state = if is_complete { BackupState::Complete } else { BackupState::Incomplete };
+        Ok((manifest, state, size))
     }
 
     /// Directory scan for `GET /backups`: every `bk_*.ndjson` file (never
@@ -526,10 +631,11 @@ impl BackupManager {
     }
 }
 
-/// Reads a backup's manifest line (first line) plus a cheap tail-peek to
-/// classify it `Complete`/`Incomplete` without a full SHA-256 pass (spec
-/// general/006: the real verification runs only in the restore/upload path).
-fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
+/// Shared low-level read: manifest line + completeness (checksum-line
+/// presence, not a full SHA-256 pass) + file size. Backs both
+/// `read_backup_summary` (list/get_backup) and `BackupManager::get_backup_manifest`
+/// (the API layer's fuller "full manifest fields" projection).
+fn read_backup_manifest_raw(path: &Path) -> anyhow::Result<(writer::ManifestLine, bool, u64)> {
     let metadata = std::fs::metadata(path)?;
     let first = read_first_line(path)?
         .ok_or_else(|| anyhow::anyhow!("empty backup file {}", path.display()))?;
@@ -539,6 +645,15 @@ fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
         .and_then(|last| serde_json::from_str::<serde_json::Value>(&last).ok())
         .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(|t| t == "checksum"))
         .unwrap_or(false);
+
+    Ok((manifest, is_complete, metadata.len()))
+}
+
+/// Reads a backup's manifest line (first line) plus a cheap tail-peek to
+/// classify it `Complete`/`Incomplete` without a full SHA-256 pass (spec
+/// general/006: the real verification runs only in the restore/upload path).
+fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
+    let (manifest, is_complete, size_bytes) = read_backup_manifest_raw(path)?;
 
     // The file name, not the manifest, is a backup's identity: an uploaded
     // archive keeps its original manifest id (rewriting it would break the
@@ -554,7 +669,7 @@ fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
         state: if is_complete { BackupState::Complete } else { BackupState::Incomplete },
         scope: manifest.scope,
         created_at: manifest.created_at,
-        size_bytes: metadata.len(),
+        size_bytes,
         schedule: manifest.schedule,
         format_version: manifest.format_version,
     })

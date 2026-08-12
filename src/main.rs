@@ -240,6 +240,39 @@ async fn init_rel_engine(
     }
 }
 
+// --- Backup manager + scheduler (spec general/006) ---
+// Spawns its own scheduler task directly (like `start_shm` spawns its own
+// background tasks) rather than going through `spawn_background_tasks`,
+// since it needs `shutdown_flag`, which that function only returns once it
+// is done.
+fn init_backup(
+    cfg: &LuraConfig,
+    registry: &Arc<DomainRegistry>,
+    json_engine: &Option<Arc<JsonEngine>>,
+    shutdown_flag: &Arc<AtomicBool>,
+) -> anyhow::Result<Option<Arc<backup::BackupManager>>> {
+    if !cfg.backup.enabled {
+        tracing::info!("Backup disabled by config.");
+        return Ok(None);
+    }
+    // Startup warning (spec general/006): anyone who reaches the port can
+    // then pull full data exports.
+    if !cfg.auth.enabled {
+        tracing::warn!(
+            "backup.enabled is true but auth.enabled is false — any client that reaches this port can create and download full backups."
+        );
+    }
+    let manager = backup::BackupManager::new(&cfg.backup, Arc::clone(registry), json_engine.clone())?;
+    let scheduler = Arc::new(backup::scheduler::BackupScheduler::new(
+        Arc::clone(&manager),
+        &cfg.backup.schedule,
+        Arc::clone(shutdown_flag),
+    )?);
+    tokio::spawn(async move { scheduler.run().await });
+    tracing::info!("Backup manager ready ({} schedule(s)).", cfg.backup.schedule.len());
+    Ok(Some(manager))
+}
+
 fn spawn_background_tasks(
     cfg: &LuraConfig,
     lsm_store: &Arc<LsmStorageEngine>,
@@ -652,6 +685,8 @@ fn main() -> anyhow::Result<()> {
             purger_interval_secs,
         );
 
+        let backup_manager = init_backup(&config, &registry, &json_engine, &shutdown_flag)?;
+
         // --- Auth cache ---
         let auth_cache = Arc::new(AuthCache::new(Arc::clone(&lsm_store)));
         auth_cache.load_from_engine().await?;
@@ -675,6 +710,7 @@ fn main() -> anyhow::Result<()> {
             json_engine: json_engine.clone(),
             rel_engine: rel_engine.clone(),
             shm_manager: shm_manager.clone(),
+            backup_manager,
         };
         let app = build_router(&config, state, trusted_cidrs);
 

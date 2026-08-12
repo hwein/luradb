@@ -1,4 +1,4 @@
-//! 5-field cron subset (spec general/006 "Konfigurationsschema"): minute,
+//! 5-field cron subset (spec general/006 configuration schema): minute,
 //! hour, day-of-month, month, weekday. Supports `*`, single values, lists
 //! (`a,b,c`), ranges (`a-b`) and steps (`*/n`, `a-b/n`). No names (`MON`,
 //! `JAN`), no special characters (`@daily`, `L`, `#`).

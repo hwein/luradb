@@ -59,7 +59,7 @@ The key starts with `lura_`. Use it for the first authenticated request:
 curl -H "Authorization: Bearer <key>" http://localhost:3000/version
 ```
 
-## Why compose (io_uring)
+## Why compose
 
 Docker's default seccomp profile blocks the io_uring syscalls LuraDB
 requires; `compose.yaml` carries the exemption (`security_opt:

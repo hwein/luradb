@@ -6,7 +6,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Added
 
-- `packaging/docker/`: self-build Docker try-setup (Dockerfile, compose.yaml, entrypoint) to run LuraDB via `docker compose up -d` without a Rust toolchain or Linux host.
+- `packaging/docker/`: Docker try-setup (Dockerfile, compose.yaml, entrypoint) that installs a user-provided `.deb` from `target/debian/` to run LuraDB via `docker compose up -d` without a Rust toolchain or Linux host.
 
 ## [0.2.1] - 2026-08-12
 

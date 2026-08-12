@@ -3,8 +3,9 @@ name: luradb
 services:
   luradb:
     build:
-      context: ../..
-      dockerfile: packaging/docker/Dockerfile
+      context: .
+      additional_contexts:
+        debdir: ../../target/debian
     image: luradb:local
     init: true
     # Docker's default seccomp profile blocks io_uring — LuraDB requires it.

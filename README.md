@@ -72,11 +72,17 @@ path, updates and removal.
 Releases publish prebuilt binaries starting with the first tagged version;
 earlier, untagged history makes no binary guarantee.
 
+As an alternative to installing on the host, the same package can run in
+Docker — see [packaging/docker/README.md](packaging/docker/README.md).
+
 ## Try it with Docker
 
-No Linux machine handy? With just Docker and git, clone the repo and build
-the image locally — no Rust toolchain, no package install on the host. See
-[packaging/docker/README.md](packaging/docker/README.md) for the quickstart.
+No Linux machine handy? Get a `.deb` — from the [Releases
+page](https://github.com/hwein/luradb/releases) or built yourself — drop
+it into `target/debian/` and run `docker compose up -d`; no Rust toolchain
+or package install on the host. See
+[packaging/docker/README.md](packaging/docker/README.md) for the
+quickstart.
 
 ## Build from source
 

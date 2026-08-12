@@ -32,6 +32,7 @@ use utoipa_swagger_ui::SwaggerUi;
 // Declare modules
 pub mod api;
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod core;
 pub mod engines;
@@ -553,6 +554,7 @@ fn main() -> anyhow::Result<()> {
     let config_path = resolve_config_path(cli.config, |p| p.exists());
     let config = Arc::new(LuraConfig::load(&config_path)?);
     config.server.validate()?;
+    config.backup.validate(&config.storage, &config.json, &config.rel)?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {

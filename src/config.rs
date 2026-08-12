@@ -21,6 +21,7 @@ pub struct LuraConfig {
     pub json: JsonStoreConfig,
     pub rel: RelStoreConfig,
     pub shm: ShmConfig,
+    pub backup: BackupConfig,
 }
 
 impl Default for LuraConfig {
@@ -43,6 +44,7 @@ impl Default for LuraConfig {
             json: JsonStoreConfig::default(),
             rel: RelStoreConfig::default(),
             shm: ShmConfig::default(),
+            backup: BackupConfig::default(),
         }
     }
 }
@@ -798,6 +800,124 @@ impl ShmConfig {
     }
 }
 
+// ── Backup & Restore (spec general/006) ───────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    /// Master switch. `false` = no scheduler task, backup endpoints answer 404.
+    pub enabled: bool,
+    /// Target directory for backup artifacts. Must not collide with any
+    /// storage.*/json.*/rel.* path.
+    pub dir: String,
+    /// Entries scanned per batch and the pause between batches (pattern:
+    /// json.reindex_batch_size/reindex_pause_ms) — keeps the foreground
+    /// latency impact small.
+    pub scan_batch_size: usize,
+    pub scan_pause_ms: u64,
+    /// Zero to many schedules; without one there are only on-demand backups.
+    /// `[[backup.schedule]]` in TOML (singular) maps to this plural Vec field.
+    pub schedule: Vec<BackupScheduleConfig>,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: "luradb_backups".to_string(),
+            scan_batch_size: 500,
+            scan_pause_ms: 10,
+            schedule: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BackupScheduleConfig {
+    /// Unique across all schedules; `[a-zA-Z0-9_-]{1,50}`.
+    pub name: String,
+    /// 5-field cron subset, evaluated in UTC (see `crate::backup::cron`).
+    pub cron: String,
+    /// See `crate::backup::BackupScope` for the grammar.
+    pub scope: String,
+    #[serde(default)]
+    pub include_auth: bool,
+    /// Retention: how many of this schedule's most recent backups to keep (>= 1).
+    pub keep_last: usize,
+}
+
+impl BackupConfig {
+    /// Startup validation (spec general/006, fail fast). A no-op when
+    /// `enabled = false` — a disabled backup config runs no scheduler and
+    /// serves no endpoints, so its contents are never acted on.
+    pub fn validate(&self, storage: &StorageConfig, json: &JsonStoreConfig, rel: &RelStoreConfig) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(!self.dir.is_empty(), "invalid config: backup.dir must not be empty");
+
+        // The spec names only storage.*/json.* explicitly, but rel.* paths
+        // are the same failure class (a third LSM instance's files) — included
+        // here for consistency with `RelStoreConfig::validate_paths`.
+        let other_paths = [
+            ("storage.db_path", storage.db_path.as_str()),
+            ("storage.wal_path", storage.wal_path.as_str()),
+            ("storage.vlog_path", storage.vlog_path.as_str()),
+            ("storage.sstable_dir", storage.sstable_dir.as_str()),
+            ("json.wal_path", json.wal_path.as_str()),
+            ("json.vlog_path", json.vlog_path.as_str()),
+            ("json.sstable_dir", json.sstable_dir.as_str()),
+            ("rel.wal_path", rel.wal_path.as_str()),
+            ("rel.vlog_path", rel.vlog_path.as_str()),
+            ("rel.sstable_dir", rel.sstable_dir.as_str()),
+        ];
+        for (name, path) in other_paths {
+            anyhow::ensure!(
+                Path::new(&self.dir) != Path::new(path),
+                "invalid config: backup.dir and {name} point to the same path '{}' — backups need a dedicated directory",
+                self.dir
+            );
+        }
+
+        let mut seen_names = std::collections::HashSet::new();
+        for sched in &self.schedule {
+            anyhow::ensure!(
+                !sched.name.is_empty()
+                    && sched.name.len() <= 50
+                    && sched.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "invalid config: backup schedule name '{}' must be 1-50 characters of [a-zA-Z0-9_-]",
+                sched.name
+            );
+            anyhow::ensure!(
+                seen_names.insert(sched.name.clone()),
+                "invalid config: duplicate backup schedule name '{}'",
+                sched.name
+            );
+            crate::backup::cron::CronSchedule::parse(&sched.cron).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid config: backup schedule '{}' has an invalid cron expression '{}': {e}",
+                    sched.name,
+                    sched.cron
+                )
+            })?;
+            crate::backup::BackupScope::parse(&sched.scope).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid config: backup schedule '{}' has an invalid scope '{}': {e}",
+                    sched.name,
+                    sched.scope
+                )
+            })?;
+            anyhow::ensure!(
+                sched.keep_last >= 1,
+                "invalid config: backup schedule '{}' keep_last must be >= 1, got {}",
+                sched.name,
+                sched.keep_last
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,5 +1272,185 @@ mod tests {
         // Both exist: ./luradb.toml (dev workflow) must win over /etc.
         let resolved = resolve_config_path(None, |_| true);
         assert_eq!(resolved, PathBuf::from("luradb.toml"));
+    }
+
+    // ── Backup & Restore ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_backup_defaults() {
+        let config = LuraConfig::default();
+        assert!(!config.backup.enabled);
+        assert_eq!(config.backup.dir, "luradb_backups");
+        assert_eq!(config.backup.scan_batch_size, 500);
+        assert_eq!(config.backup.scan_pause_ms, 10);
+        assert!(config.backup.schedule.is_empty());
+    }
+
+    #[test]
+    fn test_backup_toml_example_from_spec_parses() {
+        let toml_str = r#"
+            [backup]
+            enabled = false
+            dir = "luradb_backups"
+            scan_batch_size = 500
+            scan_pause_ms = 10
+
+            [[backup.schedule]]
+            name = "nightly-all"
+            cron = "0 3 * * *"
+            scope = "all"
+            include_auth = false
+            keep_last = 7
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.backup.enabled);
+        assert_eq!(config.backup.schedule.len(), 1);
+        let sched = &config.backup.schedule[0];
+        assert_eq!(sched.name, "nightly-all");
+        assert_eq!(sched.cron, "0 3 * * *");
+        assert_eq!(sched.scope, "all");
+        assert!(!sched.include_auth);
+        assert_eq!(sched.keep_last, 7);
+    }
+
+    #[test]
+    fn test_backup_schedule_include_auth_defaults_false() {
+        let toml_str = r#"
+            [[backup.schedule]]
+            name = "s1"
+            cron = "0 3 * * *"
+            scope = "all"
+            keep_last = 3
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.backup.schedule[0].include_auth);
+    }
+
+    fn valid_backup_schedule(name: &str) -> BackupScheduleConfig {
+        BackupScheduleConfig {
+            name: name.to_string(),
+            cron: "0 3 * * *".to_string(),
+            scope: "all".to_string(),
+            include_auth: false,
+            keep_last: 7,
+        }
+    }
+
+    #[test]
+    fn test_backup_validate_disabled_skips_all_checks() {
+        let mut config = LuraConfig::default();
+        // Every field below would fail validation if checked — enabled=false
+        // must short-circuit before any of them are looked at.
+        config.backup.dir = String::new();
+        config.backup.schedule.push(BackupScheduleConfig {
+            name: String::new(),
+            cron: "not a cron".to_string(),
+            scope: "not a scope".to_string(),
+            include_auth: false,
+            keep_last: 0,
+        });
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_ok());
+    }
+
+    #[test]
+    fn test_backup_validate_enabled_with_valid_config_ok() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        config.backup.schedule.push(valid_backup_schedule("nightly-all"));
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_ok());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_empty_dir() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        config.backup.dir = String::new();
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_path_collision_with_storage() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        config.backup.dir = config.storage.sstable_dir.clone();
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_path_collision_with_json() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        config.backup.dir = config.json.sstable_dir.clone();
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_path_collision_with_rel() {
+        // Not literally named in the spec text (which says storage.*/json.*
+        // only) but the same failure class as the other two — a third LSM
+        // instance's files, so it is included here too (see BackupConfig::validate).
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        config.backup.dir = config.rel.sstable_dir.clone();
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_invalid_cron() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        let mut sched = valid_backup_schedule("s1");
+        sched.cron = "not a cron".to_string();
+        config.backup.schedule.push(sched);
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_invalid_scope() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        let mut sched = valid_backup_schedule("s1");
+        sched.scope = "not-a-scope".to_string();
+        config.backup.schedule.push(sched);
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_keep_last_zero() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        let mut sched = valid_backup_schedule("s1");
+        sched.keep_last = 0;
+        config.backup.schedule.push(sched);
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_duplicate_schedule_names() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        config.backup.schedule.push(valid_backup_schedule("dup"));
+        config.backup.schedule.push(valid_backup_schedule("dup"));
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_invalid_schedule_name_characters() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        let mut sched = valid_backup_schedule("s1");
+        sched.name = "bad name!".to_string();
+        config.backup.schedule.push(sched);
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    #[test]
+    fn test_backup_validate_rejects_schedule_name_too_long() {
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        let mut sched = valid_backup_schedule("s1");
+        sched.name = "a".repeat(51);
+        config.backup.schedule.push(sched);
+        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
     }
 }

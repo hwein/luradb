@@ -979,15 +979,13 @@ mod tests {
     async fn test_expired_ttl_entry_is_skipped() {
         let (_engine, kv_src, _d1) = make_kv_registry().await;
         kv_src.create_domain("shop").await.unwrap();
-        // Expiry is an absolute second, so a 1s TTL can already be up while the
-        // backup is still running - 3s keeps the entry alive past the export.
-        kv_src.store("shop").await.unwrap().put_with_ttl(b"soon-gone", b"v", 3).await.unwrap();
+        kv_src.store("shop").await.unwrap().put_with_ttl(b"soon-gone", b"v", 1).await.unwrap();
 
         let out_dir = tempfile::TempDir::new().unwrap();
         make_backup(out_dir.path(), "bk_ttl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
-        // Wait on the clock the expiry check itself reads: a fixed sleep misses
-        // the boundary whenever the wall clock shifts under us.
-        let deadline = now_secs() + 3;
+        // Polls the expiry clock: a backwards clock correction cuts a fixed
+        // sleep short before the stamp is reached.
+        let deadline = now_secs() + 1 + 1;
         while now_secs() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

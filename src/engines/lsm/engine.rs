@@ -917,8 +917,8 @@ impl LsmStorageEngine {
 
     /// Validated upsert with a TTL in seconds.
     ///
-    /// The entry becomes invisible (treated as a tombstone) once
-    /// `now() + ttl_secs` is reached.
+    /// The entry stays visible for at least `ttl_secs` and becomes invisible
+    /// (treated as a tombstone) within a second after that.
     pub fn put_with_ttl<'a>(
         &'a self,
         key: &'a [u8],
@@ -928,7 +928,7 @@ impl LsmStorageEngine {
         async move {
             validate_key(key, self.engine_config.max_key_length)?;
             validate_value(value, self.engine_config.max_value_size)?;
-            let expire_at = now_secs() + ttl_secs;
+            let expire_at = super::domain::expire_at_from_ttl(ttl_secs);
             self.write_kv_pair(key, value, Some(expire_at)).await
         }
     }
@@ -1746,10 +1746,34 @@ mod tests {
         let (engine, _dir) = make_engine().await;
         // Immediate readability is covered by test_ttl_key_readable_before_expiry.
         engine.put_with_ttl(b"ttl_key", b"value", 1).await.unwrap();
-        // Wait 1.1 seconds for the 1s TTL to expire.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        wait_past_ttl(1).await;
         // Must be None after expiry
         assert!(engine.get(b"ttl_key").await.unwrap().is_none());
+    }
+
+    fn subsec_ms() -> u32 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis()
+    }
+
+    /// Polls the expiry clock instead of sleeping a fixed span, which a
+    /// backwards clock correction would cut short.
+    async fn wait_past_ttl(ttl_secs: u64) {
+        let deadline = now_secs() + ttl_secs + 1;
+        while now_secs() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Writing just before a second boundary is the worst case for the stamp.
+    #[tokio::test]
+    async fn test_ttl_holds_for_the_full_ttl_span() {
+        let (engine, _dir) = make_engine().await;
+        while subsec_ms() < 950 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        engine.put_with_ttl(b"ttl_key", b"value", 2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(engine.get(b"ttl_key").await.unwrap(), Some(b"value".to_vec()), "a 2s TTL must survive 1.1s");
     }
 
     // ── scan_keys tests ──────────────────────────────────────────────────────
@@ -1847,7 +1871,7 @@ mod tests {
         let (engine, _dir) = make_engine().await;
         engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
         engine.put(b"user:2", b"bob").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        wait_past_ttl(1).await;
         let keys = engine.scan_keys(b"user:").await.unwrap();
         assert!(!keys.contains(&b"user:1".to_vec()));
         assert!(keys.contains(&b"user:2".to_vec()));
@@ -1916,7 +1940,7 @@ mod tests {
         let (engine, _dir) = make_engine().await;
         engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
         let snap = engine.snapshot();
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        wait_past_ttl(1).await;
         let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
         assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
     }

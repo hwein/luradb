@@ -69,6 +69,12 @@ pub(crate) fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Absolute expiry stamp for a TTL in seconds. The extra second compensates the
+/// sub-second remainder `now_secs()` drops, which would expire the entry early.
+pub(crate) fn expire_at_from_ttl(ttl_secs: u64) -> u64 {
+    if ttl_secs == 0 { now_secs() } else { now_secs() + ttl_secs + 1 }
+}
+
 pub(crate) fn fnv64(data: &[u8]) -> u64 {
     const OFFSET: u64 = 14695981039346656037;
     const PRIME: u64 = 1099511628211;
@@ -434,7 +440,7 @@ impl DomainStore {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
         }
-        let expire_at = now_secs() + ttl_secs;
+        let expire_at = expire_at_from_ttl(ttl_secs);
         let start = std::time::Instant::now();
         self.engine.write_kv_pair(&self.prefixed_key(key), value, Some(expire_at)).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);

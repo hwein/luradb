@@ -8,6 +8,14 @@
 //! `SnapshotRegistry`. This guarantees that no live reader can still observe
 //! the pre-deletion state of the key.
 //!
+//! # Version safety rule
+//! Older versions may only be dropped behind a version at `T <= low_watermark`:
+//! that one is visible to the oldest active snapshot and therefore shadows
+//! everything older for every registered reader. Versions above the watermark
+//! may still be the newest visible version of a pinned snapshot — e.g. a
+//! running backup export (spec general/006), which would otherwise silently
+//! miss the key.
+//!
 //! # Multi-level cascade
 //! - **L0**: triggers when file count reaches `l0_compaction_threshold`.
 //! - **L1**: triggers when total size exceeds `l1_max_size`.
@@ -108,20 +116,23 @@ impl CompactionJob {
         self.build_sstables(filtered)
     }
 
-    /// Filters the merged, sorted entry stream.
+    /// Filters the merged, sorted entry stream (newest version first per key).
     ///
     /// Per user-key group:
-    /// 1. **Tombstone GC**: drop when `timestamp < low_watermark` (safe for all
+    /// 1. **Version deduplication**: keep versions down to and including the
+    ///    first one that shadows all older ones (see
+    ///    [`Self::shadows_older_versions`]); drop the rest.
+    /// 2. **Tombstone GC**: drop when `timestamp < low_watermark` (safe for all
     ///    active snapshots); otherwise retain.
-    /// 2. **Version deduplication**: keep only the single newest live version;
-    ///    discard all older versions.
+    /// 3. **TTL**: expired values are dropped only while no older version of
+    ///    the key survives them.
     fn filter_entries(
         &self,
         entries: Vec<(Vec<u8>, DataBlockValue)>,
     ) -> Result<Vec<(Vec<u8>, DataBlockValue)>> {
         let mut result = Vec::new();
         let mut last_user_key: Option<Vec<u8>> = None;
-        let mut processed_newest = false;
+        let mut group_done = false;
 
         for (encoded_key, dbv) in entries {
             let Some(user_key) = InternalKey::extract_user_key(&encoded_key) else {
@@ -134,29 +145,45 @@ impl CompactionJob {
             let new_key = last_user_key.as_deref() != Some(user_key);
             if new_key {
                 last_user_key = Some(user_key.to_vec());
-                processed_newest = false;
+                group_done = false;
             }
 
-            if processed_newest {
+            if group_done {
                 continue;
             }
 
-            if let Some(kept) = self.retain_newest(encoded_key, dbv, timestamp) {
+            let oldest_kept = self.shadows_older_versions(timestamp);
+            if let Some(kept) = self.retain_version(encoded_key, dbv, timestamp, oldest_kept) {
                 result.push(kept);
             }
-            processed_newest = true;
+            group_done = oldest_kept;
         }
 
         Ok(result)
     }
 
-    /// Keep-or-drop decision for the newest version of a user key: tombstones
-    /// survive unless below the low watermark, live values unless TTL-expired.
-    fn retain_newest(
+    /// Whether a version at `timestamp` hides every older version of its key
+    /// from every registered reader: it is visible to the oldest active
+    /// snapshot, and no snapshot is older than that. Versions above the
+    /// watermark can still be the newest visible version of a pinned snapshot.
+    /// Without active snapshots this holds for the newest version, which is
+    /// the first one tested — the group then ends there, as before.
+    fn shadows_older_versions(&self, timestamp: Timestamp) -> bool {
+        self.config
+            .low_watermark
+            .map(|lw| timestamp.as_u64() <= lw.as_u64())
+            .unwrap_or(true)
+    }
+
+    /// Keep-or-drop decision for one retained version: tombstones survive
+    /// unless below the low watermark, live values unless TTL-expired.
+    /// `oldest_kept` is false while older versions of the key still follow.
+    fn retain_version(
         &self,
         encoded_key: Vec<u8>,
         dbv: DataBlockValue,
         timestamp: Timestamp,
+        oldest_kept: bool,
     ) -> Option<(Vec<u8>, DataBlockValue)> {
         // Tombstones are only represented as Pointer entries with the sentinel
         // values. Inline entries are never tombstones. The NULL sentinel
@@ -168,6 +195,8 @@ impl CompactionJob {
         );
 
         if is_tombstone {
+            // `timestamp < low_watermark` implies `oldest_kept`, so dropping
+            // the tombstone cannot expose an older version kept above.
             let safe_to_drop = self
                 .config
                 .low_watermark
@@ -177,12 +206,13 @@ impl CompactionJob {
             return if safe_to_drop { None } else { Some((encoded_key, dbv)) };
         }
 
-        // Drop TTL-expired live entries.
+        // Drop TTL-expired live entries — but only the oldest kept one:
+        // removing a version that shadows another would resurrect that one.
         let expire_at = match &dbv {
             DataBlockValue::Pointer(vp) => vp.expire_at,
             DataBlockValue::Inline { expire_at, .. } => *expire_at,
         };
-        if expire_at != 0 {
+        if oldest_kept && expire_at != 0 {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -197,6 +227,10 @@ impl CompactionJob {
     }
 
     /// Serialises filtered entries into one or more SSTable byte buffers.
+    ///
+    /// A file is only cut behind the last version of a user key: the read path
+    /// treats the tables of a level as key-disjoint and would otherwise pick an
+    /// older version from a sibling file.
     fn build_sstables(&self, entries: Vec<(Vec<u8>, DataBlockValue)>) -> Result<Vec<Vec<u8>>> {
         let max_sstable_size = self.config.max_sstable_size;
 
@@ -204,12 +238,17 @@ impl CompactionJob {
         let mut builder = SSTableBuilder::new();
         let mut current_size: usize = 0;
 
-        for (key, dbv) in entries {
+        let mut entries = entries.into_iter().peekable();
+        while let Some((key, dbv)) = entries.next() {
             let entry_size = match &dbv {
                 DataBlockValue::Pointer(_) => std::mem::size_of::<ValuePointer>(),
                 DataBlockValue::Inline { data, .. } => data.len() + 8,
             };
             current_size += key.len() + entry_size;
+
+            let group_ends = entries.peek().is_none_or(|(next_key, _)| {
+                InternalKey::extract_user_key(next_key) != InternalKey::extract_user_key(&key)
+            });
 
             match dbv {
                 DataBlockValue::Pointer(vp) => builder.add(key, vp),
@@ -218,7 +257,7 @@ impl CompactionJob {
                 }
             }
 
-            if current_size >= max_sstable_size {
+            if group_ends && current_size >= max_sstable_size {
                 sstables.push(builder.finish()?);
                 builder = SSTableBuilder::new();
                 current_size = 0;
@@ -382,6 +421,92 @@ mod tests {
             DataBlockValue::Pointer(vp) => assert_eq!(vp.value_offset, 1000),
             _ => panic!("Expected Pointer variant"),
         }
+        Ok(())
+    }
+
+    // general/006: while an export snapshot is pinned, the version it can still
+    // read must survive — keeping only the newest one loses the key silently.
+    #[test]
+    fn test_keeps_version_visible_at_low_watermark() -> Result<()> {
+        let mut cfg = CompactionConfig::default();
+        cfg.low_watermark = Some(Timestamp::new(100));
+        let entries = vec![
+            (encode(b"key1", 150), make_vp(1000)),
+            (encode(b"key1", 50), make_vp(2000)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], cfg);
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 2, "the version visible at the watermark must survive");
+        assert_eq!(InternalKey::extract_timestamp(&out[1].0), Some(Timestamp::new(50)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_drops_versions_older_than_the_visible_one() -> Result<()> {
+        let mut cfg = CompactionConfig::default();
+        cfg.low_watermark = Some(Timestamp::new(100));
+        let entries = vec![
+            (encode(b"key1", 150), make_vp(1000)),
+            (encode(b"key1", 100), make_vp(2000)), // visible at the watermark
+            (encode(b"key1", 90), make_vp(3000)),
+            (encode(b"key1", 10), make_vp(4000)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], cfg);
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 2, "no reader can reach anything below ts=100");
+        assert_eq!(InternalKey::extract_timestamp(&out[1].0), Some(Timestamp::new(100)));
+        Ok(())
+    }
+
+    // Without an active snapshot the rule degenerates to keep-newest-only.
+    #[test]
+    fn test_without_low_watermark_only_newest_survives() -> Result<()> {
+        let entries = vec![
+            (encode(b"key1", 150), make_vp(1000)),
+            (encode(b"key1", 100), make_vp(2000)),
+            (encode(b"key1", 50), make_vp(3000)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], CompactionConfig::default());
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 1);
+        assert_eq!(InternalKey::extract_timestamp(&out[0].0), Some(Timestamp::new(150)));
+        Ok(())
+    }
+
+    // A tombstone above the watermark does not end the group: a snapshot at the
+    // watermark still reads the live version behind it.
+    #[test]
+    fn test_tombstone_above_watermark_keeps_older_visible_version() -> Result<()> {
+        let mut cfg = CompactionConfig::default();
+        cfg.low_watermark = Some(Timestamp::new(100));
+        let entries = vec![
+            (encode(b"key1", 200), tombstone_vp()),
+            (encode(b"key1", 60), make_vp(500)),
+            (encode(b"key1", 20), make_vp(600)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], cfg);
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 2, "tombstone plus the version visible at the watermark");
+        assert_eq!(InternalKey::extract_timestamp(&out[1].0), Some(Timestamp::new(60)));
+        Ok(())
+    }
+
+    // An expired version that shadows a kept older one must stay, otherwise
+    // that older value resurfaces for readers above it.
+    #[test]
+    fn test_expired_version_kept_while_it_shadows_an_older_one() -> Result<()> {
+        let mut cfg = CompactionConfig::default();
+        cfg.low_watermark = Some(Timestamp::new(100));
+        let expired = DataBlockValue::Pointer(ValuePointer {
+            file_id: 1, value_offset: 100, value_len: 10, expire_at: unix_now() - 100,
+        });
+        let entries = vec![
+            (encode(b"key1", 150), expired),
+            (encode(b"key1", 50), make_vp(2000)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], cfg);
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 2, "expired version must not expose the older one");
         Ok(())
     }
 

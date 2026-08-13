@@ -455,6 +455,9 @@ pub struct LogConfig {
     /// 0 = never delete.
     pub retention_days: u64,
     pub modules: LogModulesConfig,
+    /// Enables `GET /store-api/logs` + `/logs/files` (spec general/005).
+    /// Requires `path` to be non-empty (stdout is not scrapeable).
+    pub http_access: bool,
 }
 
 impl Default for LogConfig {
@@ -466,7 +469,20 @@ impl Default for LogConfig {
             rotation: "daily".to_string(),
             retention_days: 30,
             modules: LogModulesConfig::default(),
+            http_access: false,
         }
+    }
+}
+
+impl LogConfig {
+    /// Startup validation (spec general/005, fail fast): HTTP log access
+    /// needs file logging as its source, since stdout isn't scrapeable.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.http_access || !self.path.is_empty(),
+            "invalid config: log.http_access requires log.path"
+        );
+        Ok(())
     }
 }
 
@@ -1450,5 +1466,36 @@ mod tests {
         sched.name = "a".repeat(51);
         config.backup.schedule.push(sched);
         assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+    }
+
+    // ── Log HTTP access (spec general/005) ──────────────────────────────────
+
+    #[test]
+    fn test_log_http_access_disabled_by_default() {
+        let config = LuraConfig::default();
+        assert!(!config.log.http_access);
+    }
+
+    // Spec test 2: http_access=true + path="" -> validate() fails.
+    #[test]
+    fn test_log_validate_rejects_http_access_without_path() {
+        let mut log = LogConfig::default();
+        log.http_access = true;
+        log.path = String::new();
+        assert!(log.validate().is_err());
+    }
+
+    #[test]
+    fn test_log_validate_accepts_http_access_with_path() {
+        let mut log = LogConfig::default();
+        log.http_access = true;
+        log.path = "/var/log/luradb".to_string();
+        assert!(log.validate().is_ok());
+    }
+
+    #[test]
+    fn test_log_validate_disabled_ignores_empty_path() {
+        let log = LogConfig::default();
+        assert!(log.validate().is_ok());
     }
 }

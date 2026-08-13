@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.2.1",
+    "version": "0.2.2",
     "x-luradb-server-version": "0.2.2-dev"
   },
   "paths": {
@@ -1757,6 +1757,96 @@
         }
       }
     },
+    "/store-api/logs": {
+      "get": {
+        "tags": [
+          "Logs"
+        ],
+        "summary": "Reads the last N lines of a log file (spec general/005).",
+        "operationId": "get_logs",
+        "parameters": [
+          {
+            "name": "lines",
+            "in": "query",
+            "description": "Tail line count from file end (default 100, capped at 1000). 0 is rejected.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Case-sensitive substring filter; only matching lines count toward `lines`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "file",
+            "in": "query",
+            "description": "Name of a file listed by GET /logs/files. Defaults to the newest luradb.log* file.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tail of the selected log file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "lines = 0, or invalid file name"
+          },
+          "404": {
+            "description": "file does not exist"
+          },
+          "500": {
+            "description": "log directory unreadable, no luradb.log* file found, or read failed"
+          },
+          "503": {
+            "description": "Log HTTP access is disabled"
+          }
+        }
+      }
+    },
+    "/store-api/logs/files": {
+      "get": {
+        "tags": [
+          "Logs"
+        ],
+        "summary": "Lists every `luradb.log*` file in the log directory (spec general/005).\n`files[0]` is exactly the file `GET /logs` reads without a `file` param.",
+        "operationId": "list_files",
+        "responses": {
+          "200": {
+            "description": "All luradb.log* files, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogFilesResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "log directory unreadable"
+          },
+          "503": {
+            "description": "Log HTTP access is disabled"
+          }
+        }
+      }
+    },
     "/store-api/metrics": {
       "get": {
         "tags": [
@@ -3142,6 +3232,100 @@
           }
         }
       },
+      "LogFileInfo": {
+        "type": "object",
+        "required": [
+          "file",
+          "size",
+          "modified"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "modified": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LogFilesResponse": {
+        "type": "object",
+        "required": [
+          "files"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogFileInfo"
+            }
+          }
+        }
+      },
+      "LogQuery": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name of a file listed by `GET /logs/files`. Defaults to the newest `luradb.log*` file."
+          },
+          "lines": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Tail line count from the file end (default 100, capped at 1000). `0` is rejected.",
+            "minimum": 0
+          },
+          "q": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Case-sensitive substring filter; only matching lines count toward `lines`."
+          }
+        }
+      },
+      "LogResponse": {
+        "type": "object",
+        "required": [
+          "file",
+          "format",
+          "lines",
+          "truncated"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Name of the file actually read, without a path."
+          },
+          "format": {
+            "type": "string",
+            "description": "Mirrors `log.format` (\"json\" | \"text\") — the client parses `lines` itself."
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Chronologically ascending (oldest first), like `tail`."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "`true` iff the scan budget was exhausted before `lines` matches and before file start."
+          }
+        }
+      },
       "ReindexAcceptedResponse": {
         "type": "object",
         "required": [
@@ -3662,6 +3846,10 @@
     {
       "name": "Backup",
       "description": "Logical backup & restore — admins only"
+    },
+    {
+      "name": "Logs",
+      "description": "Read-only log tail and file listing — admins only, opt-in via log.http_access"
     }
   ]
 }

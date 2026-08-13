@@ -273,6 +273,28 @@ fn init_backup(
     Ok(Some(manager))
 }
 
+// --- Log Access (spec general/005) ---
+// `LogConfig::validate` already guarantees `path` is non-empty whenever
+// `http_access` is true, so no further checking is needed here.
+fn init_log_access(cfg: &LuraConfig) -> Option<api::logs::LogAccessState> {
+    if !cfg.log.http_access {
+        tracing::info!("Log HTTP access disabled by config.");
+        return None;
+    }
+    // Startup warning (spec general/005): with auth off, these endpoints
+    // are reachable by anyone who reaches the port.
+    if !cfg.auth.enabled {
+        tracing::warn!(
+            "log.http_access is true but auth.enabled is false — any client that reaches this port can read log files."
+        );
+    }
+    tracing::info!("Log HTTP access ready.");
+    Some(api::logs::LogAccessState {
+        dir: std::path::PathBuf::from(&cfg.log.path),
+        format: cfg.log.format.clone(),
+    })
+}
+
 fn spawn_background_tasks(
     cfg: &LuraConfig,
     lsm_store: &Arc<LsmStorageEngine>,
@@ -587,6 +609,7 @@ fn main() -> anyhow::Result<()> {
     let config_path = resolve_config_path(cli.config, |p| p.exists());
     let config = Arc::new(LuraConfig::load(&config_path)?);
     config.server.validate()?;
+    config.log.validate()?;
     config.backup.validate(&config.storage, &config.json, &config.rel)?;
     let _log_guard = logging::init_logging(&config.log)?;
 
@@ -686,6 +709,7 @@ fn main() -> anyhow::Result<()> {
         );
 
         let backup_manager = init_backup(&config, &registry, &json_engine, &shutdown_flag)?;
+        let log_access = init_log_access(&config);
 
         // --- Auth cache ---
         let auth_cache = Arc::new(AuthCache::new(Arc::clone(&lsm_store)));
@@ -711,6 +735,7 @@ fn main() -> anyhow::Result<()> {
             rel_engine: rel_engine.clone(),
             shm_manager: shm_manager.clone(),
             backup_manager,
+            log_access,
         };
         let app = build_router(&config, state, trusted_cidrs);
 

@@ -726,6 +726,7 @@ mod tests {
             rel_engine: None,
             shm_manager: None,
             backup_manager: None,
+            log_access: None,
         };
         (state, dir)
     }

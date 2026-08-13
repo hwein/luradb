@@ -351,6 +351,7 @@ mod tests {
             rel_engine: None,
             shm_manager: None,
             backup_manager: None,
+            log_access: None,
         };
         let app = crate::api::create_router(state, Arc::new(vec![]));
         (app, auth_cache, dir)

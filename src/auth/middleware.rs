@@ -202,7 +202,7 @@ pub async fn auth_layer(
     }
 }
 
-fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?;
     let s = value.to_str().ok()?;
     let token = s.strip_prefix("Bearer ")?;

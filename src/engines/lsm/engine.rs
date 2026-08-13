@@ -630,13 +630,9 @@ impl LsmStorageEngine {
 
     // ── Read path ───────────────────────────────────────────────────────────
 
-    /// MVCC-aware point read. Three-valued (spec kv/018): a live value, an
-    /// explicit NULL (`set_null`), or absent.
-    pub async fn get_with_snapshot(
-        &self,
-        key: &[u8],
-        snapshot: &Snapshot,
-    ) -> Result<GetResult> {
+    /// Reader over the current MemTable, immutables and levels. Every guard is
+    /// released before it returns, so no lock is held across an await.
+    fn build_reader(&self) -> LsmReader {
         let memtable = { Arc::clone(&*self.memtable.read()) };
 
         let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
@@ -645,7 +641,17 @@ impl LsmStorageEngine {
             reader.set_immutable_memtables(imm.clone());
         }
         reader.set_sstables(self.level_manager.get_all_levels());
-        reader.get(key, snapshot).await
+        reader
+    }
+
+    /// MVCC-aware point read. Three-valued (spec kv/018): a live value, an
+    /// explicit NULL (`set_null`), or absent.
+    pub async fn get_with_snapshot(
+        &self,
+        key: &[u8],
+        snapshot: &Snapshot,
+    ) -> Result<GetResult> {
+        self.build_reader().get(key, snapshot).await
     }
 
     /// MVCC-aware point read returning value + metadata without dereferencing
@@ -656,15 +662,7 @@ impl LsmStorageEngine {
         key: &[u8],
         snapshot: &Snapshot,
     ) -> Result<Option<ValueWithMetadata>> {
-        let memtable = { Arc::clone(&*self.memtable.read()) };
-
-        let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
-        {
-            let imm = self.immutable_memtables.read();
-            reader.set_immutable_memtables(imm.clone());
-        }
-        reader.set_sstables(self.level_manager.get_all_levels());
-        reader.get_with_metadata(key, snapshot).await
+        self.build_reader().get_with_metadata(key, snapshot).await
     }
 
     /// Like [`Self::get_with_snapshot`], but also returns `expire_at`
@@ -676,15 +674,7 @@ impl LsmStorageEngine {
         key: &[u8],
         snapshot: &Snapshot,
     ) -> Result<(GetResult, u64)> {
-        let memtable = { Arc::clone(&*self.memtable.read()) };
-
-        let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
-        {
-            let imm = self.immutable_memtables.read();
-            reader.set_immutable_memtables(imm.clone());
-        }
-        reader.set_sstables(self.level_manager.get_all_levels());
-        reader.get_with_expiry(key, snapshot).await
+        self.build_reader().get_with_expiry(key, snapshot).await
     }
 
     /// Returns a handle to the block cache metrics for the `/metrics` endpoint.

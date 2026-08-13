@@ -20,7 +20,7 @@ use window::MetricsWindow;
 
 // ── Version string ────────────────────────────────────────────────────────────
 
-pub const LURADB_VERSION: &str = "0.1.0";
+pub const LURADB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 

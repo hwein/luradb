@@ -32,6 +32,7 @@ use utoipa_swagger_ui::SwaggerUi;
 // Declare modules
 pub mod api;
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod core;
 pub mod engines;
@@ -237,6 +238,61 @@ async fn init_rel_engine(
         tracing::info!("Relational engine disabled by config.");
         Ok(None)
     }
+}
+
+// --- Backup manager + scheduler (spec general/006) ---
+// Spawns its own scheduler task directly (like `start_shm` spawns its own
+// background tasks) rather than going through `spawn_background_tasks`,
+// since it needs `shutdown_flag`, which that function only returns once it
+// is done.
+fn init_backup(
+    cfg: &LuraConfig,
+    registry: &Arc<DomainRegistry>,
+    json_engine: &Option<Arc<JsonEngine>>,
+    shutdown_flag: &Arc<AtomicBool>,
+) -> anyhow::Result<Option<Arc<backup::BackupManager>>> {
+    if !cfg.backup.enabled {
+        tracing::info!("Backup disabled by config.");
+        return Ok(None);
+    }
+    // Startup warning (spec general/006): anyone who reaches the port can
+    // then pull full data exports.
+    if !cfg.auth.enabled {
+        tracing::warn!(
+            "backup.enabled is true but auth.enabled is false — any client that reaches this port can create and download full backups."
+        );
+    }
+    let manager = backup::BackupManager::new(&cfg.backup, Arc::clone(registry), json_engine.clone())?;
+    let scheduler = Arc::new(backup::scheduler::BackupScheduler::new(
+        Arc::clone(&manager),
+        &cfg.backup.schedule,
+        Arc::clone(shutdown_flag),
+    )?);
+    tokio::spawn(async move { scheduler.run().await });
+    tracing::info!("Backup manager ready ({} schedule(s)).", cfg.backup.schedule.len());
+    Ok(Some(manager))
+}
+
+// --- Log Access (spec general/005) ---
+// `LogConfig::validate` already guarantees `path` is non-empty whenever
+// `http_access` is true, so no further checking is needed here.
+fn init_log_access(cfg: &LuraConfig) -> Option<api::logs::LogAccessState> {
+    if !cfg.log.http_access {
+        tracing::info!("Log HTTP access disabled by config.");
+        return None;
+    }
+    // Startup warning (spec general/005): with auth off, these endpoints
+    // are reachable by anyone who reaches the port.
+    if !cfg.auth.enabled {
+        tracing::warn!(
+            "log.http_access is true but auth.enabled is false — any client that reaches this port can read log files."
+        );
+    }
+    tracing::info!("Log HTTP access ready.");
+    Some(api::logs::LogAccessState {
+        dir: std::path::PathBuf::from(&cfg.log.path),
+        format: cfg.log.format.clone(),
+    })
 }
 
 fn spawn_background_tasks(
@@ -553,6 +609,8 @@ fn main() -> anyhow::Result<()> {
     let config_path = resolve_config_path(cli.config, |p| p.exists());
     let config = Arc::new(LuraConfig::load(&config_path)?);
     config.server.validate()?;
+    config.log.validate()?;
+    config.backup.validate(&config.storage, &config.json, &config.rel)?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {
@@ -650,6 +708,9 @@ fn main() -> anyhow::Result<()> {
             purger_interval_secs,
         );
 
+        let backup_manager = init_backup(&config, &registry, &json_engine, &shutdown_flag)?;
+        let log_access = init_log_access(&config);
+
         // --- Auth cache ---
         let auth_cache = Arc::new(AuthCache::new(Arc::clone(&lsm_store)));
         auth_cache.load_from_engine().await?;
@@ -673,6 +734,8 @@ fn main() -> anyhow::Result<()> {
             json_engine: json_engine.clone(),
             rel_engine: rel_engine.clone(),
             shm_manager: shm_manager.clone(),
+            backup_manager,
+            log_access,
         };
         let app = build_router(&config, state, trusted_cidrs);
 

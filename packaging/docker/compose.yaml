@@ -1,0 +1,31 @@
+name: luradb
+
+services:
+  luradb:
+    build:
+      context: .
+      additional_contexts:
+        debdir: ../../target/debian
+    image: luradb:local
+    init: true
+    # Docker's default seccomp profile blocks io_uring — LuraDB requires it.
+    security_opt:
+      - seccomp=unconfined
+    # io_uring registered buffers need memlock (see systemd unit).
+    ulimits:
+      memlock: -1
+    ports:
+      - "127.0.0.1:${LURADB_PORT:-3000}:3000"
+    volumes:
+      - data:/var/lib/luradb
+      - etc:/etc/luradb
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:3000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  data:
+  etc:

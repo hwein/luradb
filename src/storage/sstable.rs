@@ -30,6 +30,19 @@ fn mvcc_inv_ts(key: &[u8]) -> u64 {
     }
 }
 
+/// Liveness for [`SSTableReader::prefix_entries`]: not a tombstone, not
+/// TTL-expired at `now`. NULL entries count as live (kv/018).
+#[inline]
+fn is_entry_live(dbv: &DataBlockValue, now: u64) -> bool {
+    match dbv {
+        DataBlockValue::Pointer(vp) => {
+            !(vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET)
+                && !(vp.expire_at != 0 && vp.expire_at <= now)
+        }
+        DataBlockValue::Inline { expire_at, .. } => !(*expire_at != 0 && *expire_at <= now),
+    }
+}
+
 pub struct SSTableBuilder {
     data_blocks: Vec<DataBlock>,
     current_block: DataBlock,
@@ -578,6 +591,31 @@ impl SSTableReader {
         &'a self,
         prefix: &'a [u8],
     ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
+        self.prefix_entries(prefix, None)
+    }
+
+    /// Like [`Self::keys_with_prefix`], but only considers versions visible
+    /// under an MVCC snapshot ceiling (spec general/006 backup export):
+    /// `max_inv_ts` is the snapshot timestamp in *inverted* form
+    /// (`Timestamp::inverted()`). Entries newer than the snapshot are
+    /// skipped instead of deciding the key, so an older, visible version
+    /// further along can still decide it.
+    pub fn keys_with_prefix_at<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        max_inv_ts: u64,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
+        self.prefix_entries(prefix, Some(max_inv_ts))
+    }
+
+    /// Shared implementation for [`Self::keys_with_prefix`]/
+    /// [`Self::keys_with_prefix_at`]: `max_inv_ts` of `None` matches every
+    /// version (today's `keys_with_prefix` behavior).
+    fn prefix_entries<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        max_inv_ts: Option<u64>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -595,16 +633,12 @@ impl SSTableReader {
             if !user_key.starts_with(prefix) {
                 return None;
             }
-            let live = match &dbv {
-                DataBlockValue::Pointer(vp) => {
-                    !(vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET)
-                        && !(vp.expire_at != 0 && vp.expire_at <= now)
+            if let Some(ceiling) = max_inv_ts {
+                if mvcc_inv_ts(encoded_key) < ceiling {
+                    return None; // newer than the snapshot -- not decisive
                 }
-                DataBlockValue::Inline { expire_at, .. } => {
-                    !(*expire_at != 0 && *expire_at <= now)
-                }
-            };
-            Some(Ok((user_key.to_vec(), live)))
+            }
+            Some(Ok((user_key.to_vec(), is_entry_live(&dbv, now))))
         })
     }
 

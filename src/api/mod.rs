@@ -1,10 +1,12 @@
 //! API module — AppState, router assembly, and sub-module exports.
 
+pub mod backup;
 pub mod domains;
 pub mod json;
 pub mod json_domains;
 pub mod kv;
 pub mod kvpair;
+pub mod logs;
 pub mod metrics;
 pub mod middleware;
 pub mod rel;
@@ -12,6 +14,7 @@ pub mod rel_browse;
 pub mod rel_domains;
 
 use crate::auth::{handlers::AuthState, middleware::auth_layer, AuthCache};
+use crate::backup::BackupManager;
 use crate::engines::json::JsonEngine;
 use crate::engines::lsm::DomainRegistry;
 use crate::engines::rel::RelEngine;
@@ -53,7 +56,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.2.0";
+pub const API_VERSION: &str = "0.2.2";
 
 struct VersionInfo;
 
@@ -86,6 +89,12 @@ pub struct AppState {
     pub rel_engine: Option<Arc<RelEngine>>,
     /// `None` when `shm.enabled = false` (spec perf/006).
     pub shm_manager: Option<Arc<ShmManager>>,
+    /// `None` when `backup.enabled = false` (spec general/006) — routes stay
+    /// registered either way; handlers answer 503 (plaintext `ApiError`).
+    pub backup_manager: Option<Arc<BackupManager>>,
+    /// `None` when `log.http_access = false` (spec general/005) — routes stay
+    /// registered either way; handlers answer 503 (plaintext `ApiError`).
+    pub log_access: Option<logs::LogAccessState>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -147,6 +156,21 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         .route("/json/:domain/export", get(json::export_documents))
         .route("/json/:domain/reindex", post(json::trigger_reindex))
         .route("/json/:domain/reindex/:task_id", get(json::reindex_status))
+        // Backup & Restore (spec general/006). Always registered — like the
+        // JSON engine (and unlike rel), `backup.enabled = false` is a
+        // handler-level 503, not a router-level absence, so on/off never
+        // changes the contract's route surface.
+        .route("/backups", post(backup::create_backup).get(backup::list_backups))
+        .route("/backups/upload", post(backup::upload_backup))
+        .route("/backups/:id", get(backup::get_backup).delete(backup::delete_backup))
+        .route("/backups/:id/download", get(backup::download_backup))
+        .route("/backups/:id/restore", post(backup::restore_backup))
+        .route("/restores/:id", get(backup::get_restore_status))
+        // Log Access (spec general/005). Always registered — like backup and
+        // the JSON engine — so `log.http_access = false` stays a handler-level
+        // 503, keeping 404 free for "wrong URL / old server".
+        .route("/logs", get(logs::get_logs))
+        .route("/logs/files", get(logs::list_files))
         .with_state(state.clone());
 
     // Relational store (spec rel/009 §1): registered *only* when the engine
@@ -290,6 +314,18 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         crate::auth::handlers::set_permission,
         crate::auth::handlers::remove_permission,
         crate::auth::handlers::rotate_key,
+        // Backup & Restore
+        backup::create_backup,
+        backup::list_backups,
+        backup::get_backup,
+        backup::download_backup,
+        backup::delete_backup,
+        backup::upload_backup,
+        backup::restore_backup,
+        backup::get_restore_status,
+        // Log Access
+        logs::get_logs,
+        logs::list_files,
     ),
     modifiers(&BearerAuth, &VersionInfo),
     components(
@@ -325,6 +361,20 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             crate::auth::handlers::UserListItem,
             crate::auth::handlers::SetPermissionRequest,
             crate::auth::handlers::RotateKeyResponse,
+            backup::CreateBackupRequest,
+            backup::BackupAcceptedResponse,
+            backup::BackupSummaryResponse,
+            backup::RunningBackupInfo,
+            backup::BackupListResponse,
+            backup::BackupDetailResponse,
+            backup::RestoreRequest,
+            backup::RestoreAcceptedResponse,
+            backup::RestoreErrorEntry,
+            backup::RestoreStatusResponse,
+            logs::LogQuery,
+            logs::LogResponse,
+            logs::LogFileInfo,
+            logs::LogFilesResponse,
         )
     ),
     security(("bearer_auth" = [])),
@@ -339,6 +389,8 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         (name = "Relational Browse", description = "Catalog and row browsing for relational domains"),
         (name = "Relational Rows", description = "Row-level writes on relational tables"),
         (name = "Auth", description = "User management and domain permissions — admins only"),
+        (name = "Backup", description = "Logical backup & restore — admins only"),
+        (name = "Logs", description = "Read-only log tail and file listing — admins only, opt-in via log.http_access"),
     ),
     info(
         title = "LuraDB API",

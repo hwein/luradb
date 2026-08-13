@@ -4,6 +4,18 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-13
+
+### Added
+
+- API: logical backup & restore — consistent NDJSON export per scope (`all`, engine, single domain) with on-demand jobs, cron schedules with retention, download/upload, and restore with optional domain remapping (admin-only, opt-in via `backup.enabled`). Covers the KV and JSON engines only — relational data is not included yet.
+- API: read-only log access — `GET /store-api/logs` (tail with `lines`/`q`/`file`) and `GET /store-api/logs/files` (file listing), admin-only, opt-in via `log.http_access`.
+- `packaging/docker/`: Docker try-setup (Dockerfile, compose.yaml, entrypoint) that installs a user-provided `.deb` from `target/debian/` to run LuraDB via `docker compose up -d` without a Rust toolchain or Linux host.
+
+### Fixed
+
+- API: `/health` now reports the crate version (previously hardcoded `0.1.0`).
+
 ## [0.2.1] - 2026-08-12
 
 ### Security
@@ -49,7 +61,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.2.1...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hwein/luradb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hwein/luradb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hwein/luradb/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/hwein/luradb/compare/v0.1.0...v0.1.1

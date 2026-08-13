@@ -93,7 +93,7 @@ pub struct RotateKeyResponse {
 /// chars, only [a-zA-Z0-9_-] (same charset as domain names). Keeps the
 /// persisted `__sys:auth:perm:{user}:{domain}` key unambiguous — a ':' in a
 /// name would collide with the key separator.
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 50
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')

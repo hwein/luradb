@@ -13,7 +13,7 @@
 
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
-use crate::engines::lsm::reader::GetResult;
+use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::engines::lsm::watcher::WalEvent;
 use crate::metrics::MetricsStore;
 use anyhow::{anyhow, Result};
@@ -500,6 +500,52 @@ impl DomainStore {
         Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
     }
 
+    /// Restore-path upsert (spec general/006): same key validation as
+    /// [`Self::put`]/[`Self::put_with_ttl`] but takes the absolute
+    /// `expire_at` directly (no now-relative round trip) and bypasses the
+    /// rate limiter (admin maintenance operation, per spec general/006's
+    /// authorization section — the restore throttle is `scan_batch_size`/
+    /// `scan_pause_ms`).
+    pub(crate) async fn put_unthrottled(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
+        self.validate_user_key(key)?;
+        let start = std::time::Instant::now();
+        self.engine.write_kv_pair(&self.prefixed_key(key), value, expire_at).await?;
+        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
+    /// Restore-path variant of [`Self::set_null`] — same rate-limiter bypass
+    /// rationale as [`Self::put_unthrottled`].
+    pub(crate) async fn set_null_unthrottled(&self, key: &[u8]) -> Result<()> {
+        self.validate_user_key(key)?;
+        let start = std::time::Instant::now();
+        self.engine.write_null(&self.prefixed_key(key)).await?;
+        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
+    /// Reads a value against an externally held snapshot, with `expire_at`
+    /// (spec general/006 backup export) instead of acquiring a snapshot
+    /// internally like [`Self::get`] — lets the backup writer pin every read
+    /// of a domain export to the same point in time. Bypasses the rate
+    /// limiter (admin maintenance operation, per spec general/006's
+    /// authorization section).
+    pub async fn get_with_snapshot(&self, key: &[u8], snapshot: &Snapshot) -> Result<(GetResult, u64)> {
+        self.validate_user_key(key)?;
+        self.engine.get_with_expiry(&self.prefixed_key(key), snapshot).await
+    }
+
+    /// Returns all user-keys (raw form) visible under `snapshot` and
+    /// starting with `prefix` (spec general/006 backup export) — the
+    /// snapshot-pinned counterpart of [`Self::scan_keys`]. Bypasses the rate
+    /// limiter (admin maintenance operation).
+    pub async fn scan_keys_with_snapshot(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
+        let full_prefix = self.prefixed_key(prefix);
+        let raw_keys = self.engine.scan_keys_with_snapshot(&full_prefix, snapshot).await?;
+        let prefix_len = self.domain.system_prefix.len();
+        Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
+    }
+
     /// Subscribes to write events for this domain (domain prefix already stripped).
     pub fn watch(&self) -> broadcast::Receiver<WalEvent> {
         let prefix = self.domain.system_prefix.clone();
@@ -883,5 +929,51 @@ mod tests {
 
         let found = store.scan_keys(&[0xC3]).await.unwrap();
         assert_eq!(found.len(), 2, "expected both ä-prefixed keys, got {found:?}");
+    }
+
+    // ── Spec general/006: snapshot-pinned reads/scans (backup export) ───────
+
+    // get_with_snapshot/scan_keys_with_snapshot must strip the domain prefix
+    // like their unpinned counterparts and stay isolated between domains.
+    #[tokio::test]
+    async fn test_get_and_scan_keys_with_snapshot_strip_domain_prefix() {
+        let (engine, registry, _dir) = make_setup().await;
+        registry.create_domain("backup-a").await.unwrap();
+        registry.create_domain("backup-b").await.unwrap();
+        let store_a = registry.store("backup-a").await.unwrap();
+        let store_b = registry.store("backup-b").await.unwrap();
+
+        store_a.put(b"key:1", b"va").await.unwrap();
+        store_b.put(b"key:1", b"vb").await.unwrap();
+        let snap = engine.snapshot();
+
+        let (result_a, _) = store_a.get_with_snapshot(b"key:1", snap.snapshot()).await.unwrap();
+        assert_eq!(result_a, GetResult::Present(b"va".to_vec()));
+        let (result_b, _) = store_b.get_with_snapshot(b"key:1", snap.snapshot()).await.unwrap();
+        assert_eq!(result_b, GetResult::Present(b"vb".to_vec()));
+
+        let keys_a = store_a.scan_keys_with_snapshot(b"key:", snap.snapshot()).await.unwrap();
+        assert_eq!(keys_a, vec![b"key:1".to_vec()], "must be domain-a's raw user key, not prefixed");
+    }
+
+    // Writes after the snapshot are invisible to the pinned domain read/scan,
+    // while the domain's live view has moved on (spec general/006, consistency section).
+    #[tokio::test]
+    async fn test_domain_snapshot_consistency() {
+        let (engine, registry, _dir) = make_setup().await;
+        registry.create_domain("snap-dom").await.unwrap();
+        let store = registry.store("snap-dom").await.unwrap();
+        store.put(b"k1", b"old").await.unwrap();
+        let snap = engine.snapshot();
+        store.put(b"k1", b"new").await.unwrap();
+        store.put(b"k2", b"created-after").await.unwrap();
+
+        let (result, _) = store.get_with_snapshot(b"k1", snap.snapshot()).await.unwrap();
+        assert_eq!(result, GetResult::Present(b"old".to_vec()));
+
+        let keys = store.scan_keys_with_snapshot(b"k", snap.snapshot()).await.unwrap();
+        assert_eq!(keys, vec![b"k1".to_vec()]);
+
+        assert_eq!(store.get(b"k1").await.unwrap(), GetResult::Present(b"new".to_vec()));
     }
 }

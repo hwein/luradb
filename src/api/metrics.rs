@@ -97,7 +97,24 @@ pub async fn get_metrics(State(state): State<AppState>) -> Json<Value> {
         "current_bytes":    bc.current_bytes.load(Ordering::Relaxed),
     });
 
-    Json(json!({ "system": system, "domains": domains, "block_cache": block_cache }))
+    // Backup block (spec general/006 metrics section) — null when backup.enabled = false.
+    let backup = state.backup_manager.as_ref().map(|m| {
+        let snap = m.metrics_snapshot();
+        let running = m
+            .running_job()
+            .filter(|j| j.kind == crate::backup::JobKind::Backup)
+            .map(|j| json!({ "id": j.id, "scope": j.scope, "started_at": j.started_at }));
+        json!({
+            "last_success_at": snap.last_success_at,
+            "last_success_at_by_schedule": snap.last_success_at_by_schedule,
+            "last_duration_ms": snap.last_duration_ms,
+            "last_size_bytes": snap.last_size_bytes,
+            "running": running,
+            "failed_total": snap.failed_total,
+        })
+    });
+
+    Json(json!({ "system": system, "domains": domains, "block_cache": block_cache, "backup": backup }))
 }
 
 /// `GET /metrics/domains/{name}` — metrics for one domain. Admin or domain user.

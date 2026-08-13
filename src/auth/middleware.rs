@@ -202,7 +202,7 @@ pub async fn auth_layer(
     }
 }
 
-fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?;
     let s = value.to_str().ok()?;
     let token = s.strip_prefix("Bearer ")?;
@@ -350,6 +350,8 @@ mod tests {
             json_engine: None,
             rel_engine: None,
             shm_manager: None,
+            backup_manager: None,
+            log_access: None,
         };
         let app = crate::api::create_router(state, Arc::new(vec![]));
         (app, auth_cache, dir)

@@ -10,8 +10,8 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.2.0",
-    "x-luradb-server-version": "0.2.1"
+    "version": "0.2.2",
+    "x-luradb-server-version": "0.3.0"
   },
   "paths": {
     "/health": {
@@ -237,6 +237,285 @@
           },
           "404": {
             "description": "User not found"
+          }
+        }
+      }
+    },
+    "/store-api/backups": {
+      "get": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Lists every backup archive in `backup.dir`, plus the currently running\nbackup job (if any) separately in `running`.",
+        "operationId": "list_backups",
+        "responses": {
+          "200": {
+            "description": "Backup list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupListResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Backup is disabled"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Starts an on-demand backup job (spec general/006 scope syntax for `scope`).",
+        "operationId": "create_backup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBackupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Backup job started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupAcceptedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid scope"
+          },
+          "404": {
+            "description": "Scope targets a missing domain"
+          },
+          "409": {
+            "description": "A backup or restore job is already running"
+          },
+          "503": {
+            "description": "Backup is disabled, or scope requires the JSON engine, which is disabled"
+          }
+        }
+      }
+    },
+    "/store-api/backups/upload": {
+      "post": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Streams the request body to `backup.dir`, verifies its checksum and\nmanifest, then assigns it a fresh server-side id (`bk_..._upload[_N]`) —\nthe id in the manifest is never adopted. Invalid archives are discarded.",
+        "operationId": "upload_backup",
+        "requestBody": {
+          "description": "NDJSON backup archive, raw bytes streamed to disk (no multipart)",
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Archive accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid backup file — checksum/manifest verification failed"
+          },
+          "503": {
+            "description": "Backup is disabled"
+          }
+        }
+      }
+    },
+    "/store-api/backups/{id}": {
+      "get": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Manifest fields + state + size for one backup. A backup whose job is\nstill running (no `.ndjson` file yet, only `.part`) reports `state:\n\"running\"` from the in-RAM job slot instead of 404.",
+        "operationId": "get_backup",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Backup id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Backup details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid backup id"
+          },
+          "404": {
+            "description": "Backup not found"
+          },
+          "503": {
+            "description": "Backup is disabled"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Deletes a backup archive file. Refuses while the id is the currently\nrunning job (or a stale `.part` leftover still exists for it).",
+        "operationId": "delete_backup",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Backup id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Backup deleted"
+          },
+          "400": {
+            "description": "Invalid backup id"
+          },
+          "404": {
+            "description": "Backup not found"
+          },
+          "409": {
+            "description": "The backup job for this id is still running"
+          },
+          "503": {
+            "description": "Backup is disabled"
+          }
+        }
+      }
+    },
+    "/store-api/backups/{id}/download": {
+      "get": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Streams the archive (`ServeFile`/tower-http `fs`) with HTTP Range support\nfor resumable downloads (spec general/006).",
+        "operationId": "download_backup",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Backup id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full NDJSON archive",
+            "content": {
+              "application/x-ndjson": {}
+            }
+          },
+          "206": {
+            "description": "Partial content (Range request)",
+            "content": {
+              "application/x-ndjson": {}
+            }
+          },
+          "400": {
+            "description": "Invalid backup id"
+          },
+          "404": {
+            "description": "Backup not found"
+          },
+          "409": {
+            "description": "The backup job for this id is still running"
+          },
+          "503": {
+            "description": "Backup is disabled"
+          }
+        }
+      }
+    },
+    "/store-api/backups/{id}/restore": {
+      "post": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Starts a restore job from an existing backup archive. The single-domain\nremap and format-version checks happen synchronously here; a domain\nalready existing (`fail_if_exists`) only surfaces asynchronously via\n`GET /restores/{id}`.",
+        "operationId": "restore_backup",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Backup id to restore from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Restore job started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoreAcceptedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid id/mode, remap requires a single domain, unsupported format version, or invalid backup file"
+          },
+          "404": {
+            "description": "Backup not found, or scope targets a missing domain"
+          },
+          "409": {
+            "description": "A backup or restore job is already running"
+          },
+          "503": {
+            "description": "Backup is disabled"
           }
         }
       }
@@ -1478,6 +1757,96 @@
         }
       }
     },
+    "/store-api/logs": {
+      "get": {
+        "tags": [
+          "Logs"
+        ],
+        "summary": "Reads the last N lines of a log file (spec general/005).",
+        "operationId": "get_logs",
+        "parameters": [
+          {
+            "name": "lines",
+            "in": "query",
+            "description": "Tail line count from file end (default 100, capped at 1000). 0 is rejected.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Case-sensitive substring filter; only matching lines count toward `lines`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "file",
+            "in": "query",
+            "description": "Name of a file listed by GET /logs/files. Defaults to the newest luradb.log* file.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tail of the selected log file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "lines = 0, or invalid file name"
+          },
+          "404": {
+            "description": "file does not exist"
+          },
+          "500": {
+            "description": "log directory unreadable, no luradb.log* file found, or read failed"
+          },
+          "503": {
+            "description": "Log HTTP access is disabled"
+          }
+        }
+      }
+    },
+    "/store-api/logs/files": {
+      "get": {
+        "tags": [
+          "Logs"
+        ],
+        "summary": "Lists every `luradb.log*` file in the log directory (spec general/005).\n`files[0]` is exactly the file `GET /logs` reads without a `file` param.",
+        "operationId": "list_files",
+        "responses": {
+          "200": {
+            "description": "All luradb.log* files, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogFilesResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "log directory unreadable"
+          },
+          "503": {
+            "description": "Log HTTP access is disabled"
+          }
+        }
+      }
+    },
     "/store-api/metrics": {
       "get": {
         "tags": [
@@ -2264,6 +2633,44 @@
         }
       }
     },
+    "/store-api/restores/{id}": {
+      "get": {
+        "tags": [
+          "Backup"
+        ],
+        "summary": "Live status of a restore job. Lives in RAM only (spec general/006) — gone\nafter a restart; the outcome is also in the log.",
+        "operationId": "get_restore_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Restore id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restore status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoreStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Restore not found"
+          },
+          "503": {
+            "description": "Backup is disabled"
+          }
+        }
+      }
+    },
     "/version": {
       "get": {
         "tags": [
@@ -2296,6 +2703,180 @@
   },
   "components": {
     "schemas": {
+      "BackupAcceptedResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "BackupDetailResponse": {
+        "type": "object",
+        "description": "Manifest fields + state + size (spec general/006 GET /backups/{id} and\nPOST /backups/upload). Everything but `id`/`state`/`scope` is optional:\nthe currently-running-job shape (`running`) only fills `started_at`; the\ncomplete/incomplete shape fills the rest instead.",
+        "required": [
+          "id",
+          "state",
+          "scope"
+        ],
+        "properties": {
+          "created_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "encoding": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "format_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "include_auth": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "json_snapshot_ts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "kv_snapshot_ts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "luradb_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "started_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "BackupListResponse": {
+        "type": "object",
+        "required": [
+          "backups"
+        ],
+        "properties": {
+          "backups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BackupSummaryResponse"
+            }
+          },
+          "running": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunningBackupInfo"
+              }
+            ]
+          }
+        }
+      },
+      "BackupSummaryResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "state",
+          "scope",
+          "created_at",
+          "size_bytes",
+          "format_version"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "format_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "schedule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
       "BulkErrorEntry": {
         "type": "object",
         "required": [
@@ -2388,6 +2969,22 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "CreateBackupRequest": {
+        "type": "object",
+        "required": [
+          "scope"
+        ],
+        "properties": {
+          "include_auth": {
+            "type": "boolean",
+            "description": "Only effective for `all`/`kv` scopes (auth records live in the KV instance)."
+          },
+          "scope": {
+            "type": "string",
+            "description": "`all` | `kv` | `json` | `kv:<domain>` | `json:<domain>` | `domain:<name>`.\nCovers the KV and JSON engines only — relational data is never included."
           }
         }
       },
@@ -2635,6 +3232,100 @@
           }
         }
       },
+      "LogFileInfo": {
+        "type": "object",
+        "required": [
+          "file",
+          "size",
+          "modified"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "modified": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LogFilesResponse": {
+        "type": "object",
+        "required": [
+          "files"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogFileInfo"
+            }
+          }
+        }
+      },
+      "LogQuery": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name of a file listed by `GET /logs/files`. Defaults to the newest `luradb.log*` file."
+          },
+          "lines": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Tail line count from the file end (default 100, capped at 1000). `0` is rejected.",
+            "minimum": 0
+          },
+          "q": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Case-sensitive substring filter; only matching lines count toward `lines`."
+          }
+        }
+      },
+      "LogResponse": {
+        "type": "object",
+        "required": [
+          "file",
+          "format",
+          "lines",
+          "truncated"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Name of the file actually read, without a path."
+          },
+          "format": {
+            "type": "string",
+            "description": "Mirrors `log.format` (\"json\" | \"text\") — the client parses `lines` itself."
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Chronologically ascending (oldest first), like `tail`."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "`true` iff the scan budget was exhausted before `lines` matches and before file start."
+          }
+        }
+      },
       "ReindexAcceptedResponse": {
         "type": "object",
         "required": [
@@ -2678,6 +3369,117 @@
           "state": {
             "type": "string",
             "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running, rel/013).\nAlways present — so rel/013's later `list_domains` visibility change\n(surfacing `Deleting` domains too) needs no REST-contract change."
+          }
+        }
+      },
+      "RestoreAcceptedResponse": {
+        "type": "object",
+        "required": [
+          "restore_id",
+          "state"
+        ],
+        "properties": {
+          "restore_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "RestoreErrorEntry": {
+        "type": "object",
+        "required": [
+          "key",
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          }
+        }
+      },
+      "RestoreRequest": {
+        "type": "object",
+        "properties": {
+          "include_auth": {
+            "type": "boolean",
+            "description": "Apply auth-user/auth-perm lines from the archive (upsert). Default false."
+          },
+          "into_domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only legal when the archive contains exactly one domain name\n(`kv:*`/`json:*`/`domain:*` scopes)."
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`\"fail_if_exists\"` (default) or `\"replace\"`."
+          }
+        }
+      },
+      "RestoreStatusResponse": {
+        "type": "object",
+        "required": [
+          "restore_id",
+          "backup_id",
+          "state",
+          "imported",
+          "skipped",
+          "failed",
+          "errors",
+          "started_at"
+        ],
+        "properties": {
+          "backup_id": {
+            "type": "string"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RestoreErrorEntry"
+            }
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "imported": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "restore_id": {
+            "type": "string"
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string"
           }
         }
       },
@@ -2730,6 +3532,27 @@
               "type": "object"
             },
             "description": "One JSON object per row (catalog column order in principle; `serde_json`'s\ndefault map is unordered/alphabetical here, see rel_browse.rs module docs),\nwith an optional `_expanded` block (spec §6)."
+          }
+        }
+      },
+      "RunningBackupInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "scope",
+          "started_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -3019,6 +3842,14 @@
     {
       "name": "Auth",
       "description": "User management and domain permissions — admins only"
+    },
+    {
+      "name": "Backup",
+      "description": "Logical backup & restore — admins only"
+    },
+    {
+      "name": "Logs",
+      "description": "Read-only log tail and file listing — admins only, opt-in via log.http_access"
     }
   ]
 }

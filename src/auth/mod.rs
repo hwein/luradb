@@ -21,14 +21,14 @@ use tokio::sync::RwLock;
 
 // ── Key helpers ───────────────────────────────────────────────────────────────
 
-const PREFIX_USER: &str = "__sys:auth:user:";
-const PREFIX_PERM: &str = "__sys:auth:perm:";
+pub(crate) const PREFIX_USER: &str = "__sys:auth:user:";
+pub(crate) const PREFIX_PERM: &str = "__sys:auth:perm:";
 
-fn user_key(name: &str) -> Vec<u8> {
+pub(crate) fn user_key(name: &str) -> Vec<u8> {
     format!("{PREFIX_USER}{name}").into_bytes()
 }
 
-fn perm_key(name: &str, domain: &str) -> Vec<u8> {
+pub(crate) fn perm_key(name: &str, domain: &str) -> Vec<u8> {
     format!("{PREFIX_PERM}{name}:{domain}").into_bytes()
 }
 
@@ -106,35 +106,41 @@ impl AuthCache {
     }
 
     /// Loads all auth data from the engine into the in-memory cache.
+    ///
+    /// Rebuilds both maps rather than merging: a reload after a restore may
+    /// change a user's api_key_hash, and the superseded hash must stop
+    /// authenticating. Built off-lock, then swapped in — no empty-cache window.
     pub async fn load_from_engine(&self) -> Result<()> {
         let user_keys = self
             .engine
             .scan_keys(PREFIX_USER.as_bytes())
             .await?;
 
-        let mut users = self.users.write().await;
+        let mut new_users = HashMap::new();
         for k in &user_keys {
             if let Some(bytes) = self.engine.get(k).await? {
                 if let Ok(record) = serde_json::from_slice::<UserRecord>(&bytes) {
-                    users.insert(record.api_key_hash.clone(), record);
+                    new_users.insert(record.api_key_hash.clone(), record);
                 }
             }
         }
-        drop(users);
 
         let perm_keys = self
             .engine
             .scan_keys(PREFIX_PERM.as_bytes())
             .await?;
 
-        let mut perms = self.permissions.write().await;
+        let mut new_perms = HashMap::new();
         for k in &perm_keys {
             if let Some(bytes) = self.engine.get(k).await? {
                 if let Ok(perm) = serde_json::from_slice::<DomainPermission>(&bytes) {
-                    perms.insert((perm.username.clone(), perm.domain.clone()), perm.access);
+                    new_perms.insert((perm.username.clone(), perm.domain.clone()), perm.access);
                 }
             }
         }
+
+        *self.users.write().await = new_users;
+        *self.permissions.write().await = new_perms;
 
         Ok(())
     }
@@ -357,5 +363,56 @@ mod tests {
         // Pre-rel/011 persisted entries only ever contain "Read"/"Write" —
         // must deserialize unchanged (no migration, spec §3).
         assert_eq!(serde_json::from_str::<AccessLevel>("\"Write\"").unwrap(), AccessLevel::Write);
+    }
+
+    async fn test_cache() -> (AuthCache, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
+        let fm = Arc::new(crate::storage::file_manager::FileManager::new(dir.path()).await.unwrap());
+        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(dir.path()));
+        let engine = Arc::new(
+            crate::engines::lsm::engine::LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, fm, mm,
+                crate::engines::lsm::engine::LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        (AuthCache::new(engine), dir)
+    }
+
+    /// A restore overwrites a user record by name with a different
+    /// api_key_hash — reloading must drop the superseded hash, not keep it
+    /// alongside the new one.
+    #[tokio::test]
+    async fn load_from_engine_drops_superseded_key_hash() {
+        let (cache, _dir) = test_cache().await;
+        let hash_a = hash_api_key("lura_first");
+        let hash_b = hash_api_key("lura_second");
+
+        let mut record = UserRecord {
+            name: "alice".to_string(),
+            api_key_hash: hash_a.clone(),
+            role: UserRole::User,
+            created_at: 0,
+        };
+        let key = user_key(&record.name);
+        let value = serde_json::to_vec(&record).unwrap();
+        cache.engine.put(&key, &value).await.unwrap();
+        cache.load_from_engine().await.unwrap();
+        assert!(cache.get_user_by_key_hash(&hash_a).await.is_some());
+
+        // Restore overwrites the same record by name with a new key hash.
+        record.api_key_hash = hash_b.clone();
+        let value = serde_json::to_vec(&record).unwrap();
+        cache.engine.put(&key, &value).await.unwrap();
+        cache.load_from_engine().await.unwrap();
+
+        assert!(cache.get_user_by_key_hash(&hash_a).await.is_none());
+        assert!(cache.get_user_by_key_hash(&hash_b).await.is_some());
+        assert_eq!(cache.all_users().await.len(), 1);
     }
 }

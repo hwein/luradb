@@ -163,6 +163,15 @@ impl LsmReader {
     /// <= snapshot timestamp, so the first hit decides for good. Returns None
     /// if the key is absent or that version is a tombstone.
     pub async fn get(&self, user_key: &[u8], snapshot: &Snapshot) -> Result<GetResult> {
+        Ok(self.get_with_expiry(user_key, snapshot).await?.0)
+    }
+
+    /// Like [`Self::get`], but also returns `expire_at` (absolute Unix
+    /// seconds, 0 = no TTL — only meaningful when the result is `Present`;
+    /// `set_null` never carries a TTL) — spec general/006 backup export.
+    /// Same newest-first source order and MVCC/TTL/tombstone semantics as
+    /// `get`, VLog pointers are dereferenced.
+    pub async fn get_with_expiry(&self, user_key: &[u8], snapshot: &Snapshot) -> Result<(GetResult, u64)> {
         for memtable in self.memtables_newest_first() {
             if let Some(result) = self.get_from_memtable(memtable, user_key, snapshot).await? {
                 return Ok(result);
@@ -173,37 +182,41 @@ impl LsmReader {
                 return Ok(result);
             }
         }
-        Ok(GetResult::Absent)
+        Ok((GetResult::Absent, 0))
     }
 
-    /// Gets a value from a MemTable with MVCC filtering.
+    /// Gets a value from a MemTable with MVCC filtering. Returns the result
+    /// plus `expire_at` (0 unless `Present`) so both [`Self::get`] and
+    /// [`Self::get_with_expiry`] share one lookup.
     async fn get_from_memtable(
         &self,
         memtable: &MemTable,
         user_key: &[u8],
         snapshot: &Snapshot,
-    ) -> Result<Option<GetResult>> {
+    ) -> Result<Option<(GetResult, u64)>> {
         match memtable.get(user_key, snapshot.timestamp()) {
             Some(value) => {
                 match value {
                     Value::Inline(v, expire_at) => {
-                        if is_expired(expire_at) { return Ok(Some(GetResult::Absent)); }
-                        Ok(Some(GetResult::Present(v)))
+                        if is_expired(expire_at) { return Ok(Some((GetResult::Absent, 0))); }
+                        Ok(Some((GetResult::Present(v), expire_at.unwrap_or(0))))
                     }
                     Value::Pointer { file_id, offset, len, expire_at } => {
-                        if is_expired(expire_at) { return Ok(Some(GetResult::Absent)); }
+                        if is_expired(expire_at) { return Ok(Some((GetResult::Absent, 0))); }
                         let v = self.vlog.read(file_id, offset, len).await?;
-                        Ok(Some(GetResult::Present(v)))
+                        Ok(Some((GetResult::Present(v), expire_at.unwrap_or(0))))
                     }
-                    Value::Null => Ok(Some(GetResult::Null)),
-                    Value::Tombstone => Ok(Some(GetResult::Absent)),
+                    Value::Null => Ok(Some((GetResult::Null, 0))),
+                    Value::Tombstone => Ok(Some((GetResult::Absent, 0))),
                 }
             }
             None => Ok(None),
         }
     }
 
-    /// Gets a value from an SSTable with MVCC filtering.
+    /// Gets a value from an SSTable with MVCC filtering. Returns the result
+    /// plus `expire_at` (0 unless `Present`) so both [`Self::get`] and
+    /// [`Self::get_with_expiry`] share one lookup.
     ///
     /// Checks the block cache before reading from the SSTable's in-memory data.
     /// Handles both inline entries (no VLog access) and pointer entries (VLog read).
@@ -212,7 +225,7 @@ impl LsmReader {
         sstable: &SSTableReader,
         user_key: &[u8],
         snapshot: &Snapshot,
-    ) -> Result<Option<GetResult>> {
+    ) -> Result<Option<(GetResult, u64)>> {
         let search_key = InternalKey::new(user_key.to_vec(), snapshot.timestamp());
         let encoded_key = search_key.encode();
 
@@ -225,21 +238,21 @@ impl LsmReader {
         // exactly once, after the visible version has been found.
         match maybe_value {
             None => Ok(None),
-            Some(CachedValue::Tombstone) => Ok(Some(GetResult::Absent)),
-            Some(CachedValue::Null) => Ok(Some(GetResult::Null)),
+            Some(CachedValue::Tombstone) => Ok(Some((GetResult::Absent, 0))),
+            Some(CachedValue::Null) => Ok(Some((GetResult::Null, 0))),
             Some(CachedValue::VLogPointer { file_id, value_offset, value_len, expire_at }) => {
                 if expire_at != 0 && expire_at <= now_secs() {
-                    return Ok(Some(GetResult::Absent));
+                    return Ok(Some((GetResult::Absent, 0)));
                 }
                 let value = self.vlog.read(file_id, value_offset, value_len as usize).await?;
-                Ok(Some(GetResult::Present(value)))
+                Ok(Some((GetResult::Present(value), expire_at)))
             }
             Some(value) => {
                 let expire_at = value.expire_at();
                 if expire_at != 0 && expire_at <= now_secs() {
-                    return Ok(Some(GetResult::Absent));
+                    return Ok(Some((GetResult::Absent, 0)));
                 }
-                Ok(Some(GetResult::Present(value.to_owned_bytes())))
+                Ok(Some((GetResult::Present(value.to_owned_bytes()), expire_at)))
             }
         }
     }

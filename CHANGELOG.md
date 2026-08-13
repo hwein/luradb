@@ -4,6 +4,8 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-13
+
 ### Fixed
 
 - KV: a TTL of `n` seconds now holds for at least `n` seconds. Expiry stamps are whole seconds and the sub-second remainder was dropped, so entries expired up to a second early — a 1-second TTL could be gone within milliseconds.
@@ -65,7 +67,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/hwein/luradb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hwein/luradb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hwein/luradb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hwein/luradb/compare/v0.1.1...v0.2.0

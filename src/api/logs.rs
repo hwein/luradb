@@ -233,6 +233,12 @@ struct TailResult {
 /// comes first (spec general/005 "Sicherheit": resource caps). Returns
 /// lines in chronological (oldest-first) order, like `tail`.
 async fn tail_lines(path: &Path, lines: usize, q: Option<&str>) -> io::Result<TailResult> {
+    // Same rule as `list_log_files`: regular files only, no symlink traversal
+    // (`File::open` would follow one). Keeps the `file` param confined to what
+    // the listing shows and the read confined to the log directory.
+    if !tokio::fs::symlink_metadata(path).await?.is_file() {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
     let mut file = tokio::fs::File::open(path).await?;
     let file_len = file.metadata().await?.len() as usize;
 
@@ -595,6 +601,32 @@ mod tests {
         let (status, body) = request(&app, "/store-api/logs?file=luradb.log.missing", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert!(body.contains("log file not found"), "{body}");
+    }
+
+    // 9b. Listing and `file=` apply the same regular-file rule: a symlink or
+    // directory named `luradb.log*` is neither listed nor readable.
+    #[tokio::test]
+    async fn test_symlink_and_directory_are_neither_listed_nor_readable() {
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret\n").unwrap();
+        std::os::unix::fs::symlink(&target, log_dir.path().join("luradb.log.link")).unwrap();
+        std::fs::create_dir(log_dir.path().join("luradb.log.dir")).unwrap();
+        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+
+        let (status, body) = request(&app, "/store-api/logs/files", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"files": []})
+        );
+
+        for name in ["luradb.log.link", "luradb.log.dir"] {
+            let (status, body) = request(&app, &format!("/store-api/logs?file={name}"), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{name}: {body}");
+            assert!(body.contains("log file not found"), "{name}: {body}");
+        }
     }
 
     // 10a. Caps: lines=5000 is capped to 1000.

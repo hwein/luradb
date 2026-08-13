@@ -4,9 +4,8 @@
 //! `JAN`), no special characters (`@daily`, `L`, `#`).
 //!
 //! Fields are expanded eagerly into sorted value lists at parse time, so
-//! `matches` is a pure function over already-split time fields — no
-//! wall-clock or date-math access needed here. The unix-seconds → fields
-//! conversion is added in a later step.
+//! `matches` is a pure function over already-split time fields. The
+//! unix-seconds → fields conversion lives in `civil_from_unix` below.
 
 use anyhow::{ensure, Result};
 
@@ -50,8 +49,10 @@ impl CronSchedule {
     }
 
     /// Whether this schedule fires at the given UTC time fields. Day-of-month
-    /// and weekday combine with OR when both are restricted (classic cron
-    /// semantics); if only one of the two is restricted, the other applies alone.
+    /// and weekday combine with OR unless one of them is literally `*`, in
+    /// which case the other applies alone. `*/n` therefore counts as
+    /// restricted here, unlike Vixie cron, which treats every field starting
+    /// with `*` as a star.
     pub fn matches(&self, minute: u32, hour: u32, day_of_month: u32, month: u32, weekday: u32) -> bool {
         if !self.minute.contains(&minute) || !self.hour.contains(&hour) || !self.month.contains(&month) {
             return false;
@@ -272,6 +273,16 @@ mod tests {
         assert!(sched.matches(0, 0, 1, 6, 3)); // day 1, any weekday
         assert!(sched.matches(0, 0, 15, 6, 1)); // any day, Monday
         assert!(!sched.matches(0, 0, 2, 6, 2)); // neither day 1 nor Monday
+    }
+
+    #[test]
+    fn test_dom_step_counts_as_restricted_for_the_or_rule() {
+        // `*/3` is not literally `*`, so day-of-month and weekday are
+        // OR-combined (spec general/006) -- Vixie cron would AND them here.
+        let sched = CronSchedule::parse("30 2 */3 * 1").unwrap();
+        assert!(sched.matches(30, 2, 4, 6, 5)); // day 4 is in */3, any weekday
+        assert!(sched.matches(30, 2, 5, 6, 1)); // Monday, day not in */3
+        assert!(!sched.matches(30, 2, 5, 6, 5)); // neither
     }
 
     #[test]

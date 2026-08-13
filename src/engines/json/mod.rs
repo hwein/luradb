@@ -212,6 +212,28 @@ impl JsonEngine {
         Ok(self.indexes.get_indexes(domain))
     }
 
+    /// Like [`Self::get_indexes`], but read from the persisted definitions
+    /// visible under `snapshot` instead of the live cache (spec general/006
+    /// backup export) — index DDL during an export must not leak into the
+    /// archive that pins its documents to an earlier point in time.
+    pub async fn get_indexes_with_snapshot(
+        &self,
+        domain: &str,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<IndexDefinition>, JsonStoreError> {
+        self.domains.require_active(domain)?;
+        // Key layout of index.rs (its prefix constant is module-private).
+        let prefix = format!("__sys:index:{domain}:");
+        let keys = self.engine.scan_keys_with_snapshot(prefix.as_bytes(), snapshot).await?;
+        let mut defs = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(bytes) = self.engine.get_with_snapshot(&key, snapshot).await?.into_option() {
+                defs.push(serde_json::from_slice(&bytes)?);
+            }
+        }
+        Ok(defs)
+    }
+
     /// Removes an index definition and tombstones the field's `IDX:` entries.
     pub async fn delete_index(&self, domain: &str, field: &str) -> Result<(), JsonStoreError> {
         self.indexes.delete_index(&self.domains, domain, field).await
@@ -312,14 +334,15 @@ impl JsonEngine {
     /// Like [`Self::get_document`], but against an externally held snapshot
     /// instead of one acquired internally (spec general/006 backup export) —
     /// lets the backup writer pin every document read of a domain export to
-    /// the same point in time.
+    /// the same point in time. Keys come from the engine's own scan, so they
+    /// are not re-validated: a lowered key limit must not make stored
+    /// documents unexportable.
     pub async fn get_document_with_snapshot(
         &self,
         domain: &str,
         key: &str,
         snapshot: &Snapshot,
     ) -> Result<Option<Document>, JsonStoreError> {
-        validate_document_key(key, self.max_document_key_length)?;
         let dom = self.domains.require_active(domain)?;
         Ok(self.read_stored_with_snapshot(&dom, key, snapshot).await?.map(|stored| Document {
             key: key.to_string(),
@@ -755,6 +778,23 @@ mod tests {
         json.shutdown().await;
     }
 
+    // 22b. get_indexes_with_snapshot serves the definitions pinned by the
+    //      snapshot, so index DDL during a backup export cannot leak into an
+    //      archive whose documents come from an earlier point in time.
+    #[tokio::test]
+    async fn test_get_indexes_with_snapshot_ignores_later_ddl() {
+        let (json, _dir) = make_engine().await;
+        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+        let snap = json.engine().snapshot();
+        json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
+
+        let defs = json.get_indexes_with_snapshot("default", snap.snapshot()).await.unwrap();
+        assert_eq!(defs.len(), 1, "the index created after the snapshot must not appear");
+        assert_eq!(defs[0].field, "city");
+        assert_eq!(defs[0].field_type, IndexFieldType::String);
+        assert_eq!(json.get_indexes("default").unwrap().len(), 2, "live view sees both");
+    }
+
     // ── Optimistic concurrency (spec json/011) ───────────────────────────────
 
     // 30. Conditional update with the correct version succeeds; the
@@ -1040,6 +1080,41 @@ mod tests {
         assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
         // 235 + 21 bytes overhead = LSM limit 256 → still valid.
         json.put_document("default", &"x".repeat(235), json!({})).await.unwrap();
+    }
+
+    // 36b. Documents stored under a key that a later config lowers below
+    //      stay readable through the snapshot path: the backup export feeds
+    //      back keys the engine itself produced, so re-validating them would
+    //      abort every export of the domain. The live path keeps validating.
+    #[tokio::test]
+    async fn test_snapshot_read_ignores_lowered_key_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = JsonStoreConfig {
+            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+            ..JsonStoreConfig::default()
+        };
+        let long_key = "k".repeat(100);
+        {
+            let json = JsonEngine::bootstrap(&config).await.unwrap();
+            json.put_document("default", &long_key, json!({"n": 1})).await.unwrap();
+            json.shutdown().await;
+        }
+        let lowered = JsonStoreConfig { max_document_key_length: 32, ..config };
+        let json = JsonEngine::bootstrap(&lowered).await.unwrap();
+        let snap = json.engine().snapshot();
+        let doc = json
+            .get_document_with_snapshot("default", &long_key, snap.snapshot())
+            .await
+            .unwrap()
+            .expect("the stored document must stay exportable");
+        assert_eq!(doc.content, json!({"n": 1}));
+        assert!(
+            matches!(json.get_document("default", &long_key).await, Err(JsonStoreError::InvalidKey(_))),
+            "caller input on the live path is still validated"
+        );
+        json.shutdown().await;
     }
 
     // 37. create_document with an effective key limit below the UUID length

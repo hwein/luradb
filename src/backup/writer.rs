@@ -3,7 +3,7 @@
 //! json-domains -> index-definitions -> docs -> auth -> checksum).
 
 use super::{BackupError, BackupScope};
-use crate::auth::{DomainPermission, UserRecord};
+use crate::auth::{DomainPermission, UserRecord, PREFIX_PERM, PREFIX_USER};
 use crate::engines::json::{IndexFieldType, JsonDomain, JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{now_secs, Domain, DomainRegistry};
 use crate::engines::lsm::{GetResult, RegistrySnapshot};
@@ -15,8 +15,6 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 pub(crate) const FORMAT_VERSION: u32 = 1;
-pub(crate) const AUTH_USER_PREFIX: &str = "__sys:auth:user:";
-pub(crate) const AUTH_PERM_PREFIX: &str = "__sys:auth:perm:";
 
 // ── Wire format (shared with `restore`) ─────────────────────────────────
 
@@ -99,11 +97,10 @@ struct AuthPermLine<'a> {
 // ── Scope resolution ─────────────────────────────────────────────────────
 
 /// The concrete domains a scope resolves to, already filtered to `Active`
-/// state (spec general/006: `Deleting` domains are skipped). An empty
-/// `kv_domains`/`json_domains` means that engine is not part of this backup
-/// at all (no snapshot is acquired for it) — this is always correct: the
-/// only way either list is empty on a successful resolution is a
-/// `domain:<name>` scope whose name exists in just the other engine.
+/// state (spec general/006: `Deleting` domains are skipped). Either list can
+/// be empty for any scope — every domain of an engine may be deleted at
+/// runtime — and only means there is no *domain* data to export; auth
+/// records live outside any domain and still need the KV snapshot.
 #[derive(Debug)]
 pub(crate) struct ResolvedScope {
     pub kv_domains: Vec<Domain>,
@@ -187,8 +184,9 @@ pub(crate) struct BackupParams<'a> {
 }
 
 /// Runs the full export: `<id>.ndjson.part` -> fsync -> rename to
-/// `<id>.ndjson`. On any error the `.part` file is removed (spec general/006
-/// job flow step 5) and the error propagates for the caller to log.
+/// `<id>.ndjson` -> fsync of the directory. On any error the `.part` file is
+/// removed (spec general/006 job flow step 5) and the error propagates for
+/// the caller to log.
 pub(crate) async fn run_backup(params: BackupParams<'_>) -> anyhow::Result<()> {
     let part_path = params.dir.join(format!("{}.ndjson.part", params.id));
     let final_path = params.dir.join(format!("{}.ndjson", params.id));
@@ -196,6 +194,9 @@ pub(crate) async fn run_backup(params: BackupParams<'_>) -> anyhow::Result<()> {
     match write_backup_file(&part_path, &params).await {
         Ok(()) => {
             tokio::fs::rename(&part_path, &final_path).await?;
+            // The rename must be durable too: success here lets retention
+            // delete an older generation right away.
+            tokio::fs::File::open(params.dir).await?.sync_all().await?;
             Ok(())
         }
         Err(e) => {
@@ -206,16 +207,22 @@ pub(crate) async fn run_backup(params: BackupParams<'_>) -> anyhow::Result<()> {
 }
 
 async fn write_backup_file(part_path: &PathBuf, params: &BackupParams<'_>) -> anyhow::Result<()> {
+    // include_auth only ever applies to all/kv (spec: auth records live in
+    // the KV instance) -- other scopes silently ignore the flag.
+    let export_auth = params.include_auth && matches!(params.scope, BackupScope::All | BackupScope::Kv);
+
     // One registered snapshot per engine, held for the whole export so the
     // compaction low watermark keeps every visible version around (spec
     // general/006 consistency guarantee). `None` when that engine has
     // nothing to export in this scope, so no snapshot (and no GC
-    // back-pressure) is taken for it.
-    let kv_snapshot: Option<RegistrySnapshot> = if !params.resolved.kv_domains.is_empty() {
-        Some(params.kv_registry.engine().snapshot())
-    } else {
-        None
-    };
+    // back-pressure) is taken for it. Auth records sit on the raw KV engine
+    // outside every domain, so they need the KV snapshot on their own.
+    let kv_snapshot: Option<RegistrySnapshot> =
+        if !params.resolved.kv_domains.is_empty() || export_auth {
+            Some(params.kv_registry.engine().snapshot())
+        } else {
+            None
+        };
     let json_snapshot: Option<RegistrySnapshot> = if !params.resolved.json_domains.is_empty() {
         params.json_engine.as_ref().map(|j| j.engine().snapshot())
     } else {
@@ -226,10 +233,6 @@ async fn write_backup_file(part_path: &PathBuf, params: &BackupParams<'_>) -> an
     let mut out = tokio::io::BufWriter::new(file);
     let mut hasher = Sha256::new();
     let mut lines: u64 = 0;
-
-    // include_auth only ever applies to all/kv (spec: auth records live in
-    // the KV instance) -- other scopes silently ignore the flag.
-    let export_auth = params.include_auth && matches!(params.scope, BackupScope::All | BackupScope::Kv);
 
     let manifest = ManifestLine {
         t: "manifest".to_string(),
@@ -253,9 +256,8 @@ async fn write_backup_file(part_path: &PathBuf, params: &BackupParams<'_>) -> an
     write_json_section(&mut out, &mut hasher, &mut lines, params, json_snapshot.as_ref()).await?;
 
     if export_auth {
-        if let Some(snap) = &kv_snapshot {
-            write_auth_section(&mut out, &mut hasher, &mut lines, params.kv_registry, snap).await?;
-        }
+        let snap = kv_snapshot.as_ref().expect("export_auth implies a kv snapshot");
+        write_auth_section(&mut out, &mut hasher, &mut lines, params.kv_registry, snap).await?;
     }
 
     let sha256 = hex::encode(hasher.finalize());
@@ -319,7 +321,7 @@ async fn write_auth_section<W: tokio::io::AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     let engine = kv_registry.engine();
 
-    let user_keys = engine.scan_keys_with_snapshot(AUTH_USER_PREFIX.as_bytes(), snap.snapshot()).await?;
+    let user_keys = engine.scan_keys_with_snapshot(PREFIX_USER.as_bytes(), snap.snapshot()).await?;
     for key in &user_keys {
         let (result, _) = engine.get_with_expiry(key, snap.snapshot()).await?;
         if let GetResult::Present(bytes) = result {
@@ -328,7 +330,7 @@ async fn write_auth_section<W: tokio::io::AsyncWrite + Unpin>(
         }
     }
 
-    let perm_keys = engine.scan_keys_with_snapshot(AUTH_PERM_PREFIX.as_bytes(), snap.snapshot()).await?;
+    let perm_keys = engine.scan_keys_with_snapshot(PREFIX_PERM.as_bytes(), snap.snapshot()).await?;
     for key in &perm_keys {
         let (result, _) = engine.get_with_expiry(key, snap.snapshot()).await?;
         if let GetResult::Present(bytes) = result {
@@ -358,7 +360,7 @@ async fn write_json_section<W: tokio::io::AsyncWrite + Unpin>(
         )
         .await?;
 
-        for def in json.get_indexes(&domain.name)? {
+        for def in json.get_indexes_with_snapshot(&domain.name, snap.snapshot()).await? {
             write_line(
                 out,
                 hasher,
@@ -413,7 +415,7 @@ async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn maybe_pause(i: usize, batch_size: usize, pause_ms: u64) {
+pub(crate) async fn maybe_pause(i: usize, batch_size: usize, pause_ms: u64) {
     if batch_size > 0 && (i + 1) % batch_size == 0 {
         tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
     }
@@ -677,7 +679,7 @@ mod tests {
             access: crate::auth::AccessLevel::Write,
         };
         engine
-            .put(format!("{AUTH_PERM_PREFIX}carol:shop").as_bytes(), &serde_json::to_vec(&perm).unwrap())
+            .put(format!("{PREFIX_PERM}carol:shop").as_bytes(), &serde_json::to_vec(&perm).unwrap())
             .await
             .unwrap();
 
@@ -711,6 +713,51 @@ mod tests {
         let restored_perm: DomainPermission = serde_json::from_str(perm_line).unwrap();
         assert_eq!(restored_perm.username, "carol");
         assert_eq!(restored_perm.domain, "shop");
+    }
+
+    // 8c. Auth records live outside every domain: an `all` backup taken while
+    //     no KV domain exists at all must still export them (regression: the
+    //     KV snapshot was only acquired for non-empty domain lists, so the
+    //     auth section was silently skipped while the manifest still
+    //     announced include_auth).
+    #[tokio::test]
+    async fn test_backup_exports_auth_without_any_kv_domain() {
+        let (kv, _dir1) = make_kv_registry().await;
+        kv.delete_domain("default").await.unwrap();
+        let record = UserRecord {
+            name: "erin".to_string(),
+            api_key_hash: "cafe".to_string(),
+            role: crate::auth::UserRole::Admin,
+            created_at: 1_700_000_000,
+        };
+        kv.engine()
+            .put(format!("{PREFIX_USER}erin").as_bytes(), &serde_json::to_vec(&record).unwrap())
+            .await
+            .unwrap();
+
+        let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
+        assert!(resolved.kv_domains.is_empty(), "test setup: no domain must be left");
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let scope = BackupScope::All;
+        let params = BackupParams {
+            dir: out_dir.path(),
+            id: "bk_authnodomain",
+            scope: &scope,
+            include_auth: true,
+            schedule: None,
+            resolved: &resolved,
+            kv_registry: &kv,
+            json_engine: &None,
+            scan_batch_size: 500,
+            scan_pause_ms: 0,
+        };
+        run_backup(params).await.unwrap();
+
+        let content = std::fs::read_to_string(out_dir.path().join("bk_authnodomain.ndjson")).unwrap();
+        let user_line = content.lines().find(|l| l.contains("\"auth-user\"")).expect("auth-user line must be present");
+        let restored: UserRecord = serde_json::from_str(user_line).unwrap();
+        assert_eq!(restored.name, "erin");
     }
 
     // 9. JSON domain export: index definitions and documents are exported

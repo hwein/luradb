@@ -58,12 +58,17 @@ impl BackupScheduler {
     /// the purger tasks — not joined during graceful shutdown).
     pub async fn run(self: Arc<Self>) {
         while !self.shutdown.load(Ordering::Relaxed) {
-            self.tick(now_secs()).await;
-            // Sleep to the next minute boundary instead of a flat 60s: a
-            // flat sleep drifts by the tick's own duration each round and
-            // would eventually skip a minute entirely.
+            // Sleep to the next minute boundary before ticking, like classic
+            // cron: ticks only ever land on a boundary, so a start inside an
+            // already-matching minute does not re-fire that slot (no
+            // catch-up). Sleeping to the boundary instead of a flat 60s also
+            // avoids drifting by the tick's own duration each round.
             let sleep_secs = 60 - (now_secs() % 60);
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            self.tick(now_secs()).await;
         }
     }
 
@@ -315,6 +320,25 @@ mod tests {
             manager.list_backups().unwrap().into_iter().map(|b| b.id).collect();
         assert!(remaining.contains("bk_nightly_0"), "retention must not run when the job produced no backup");
         assert!(remaining.contains("bk_nightly_1"));
+    }
+
+    // 7. run() must not tick while shutting down: it returns without starting
+    //    a backup even though the schedule matches every minute.
+    #[tokio::test]
+    async fn test_run_does_not_tick_when_shutdown_is_set() {
+        let (manager, _e, _b) = make_manager().await;
+        let scheduler = Arc::new(
+            BackupScheduler::new(
+                Arc::clone(&manager),
+                &[always_matching_schedule("nightly")],
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap(),
+        );
+
+        scheduler.run().await;
+
+        assert!(manager.running_job().is_none(), "a shutting-down scheduler must not start a backup");
     }
 
     /// Mirrors `backup::mod::manager_tests::write_fake_backup` -- duplicated

@@ -7,7 +7,7 @@
 //! behavior for these new routes).
 //!
 //! Errors follow the project-wide plaintext `ApiError` convention
-//! (`src/api/middleware.rs`; general/005 §Entscheidungen 1+2: plaintext
+//! (`src/api/middleware.rs`; general/005 decisions 1+2: plaintext
 //! `"NNN Reason: Detail"` bodies, 503 when the feature is disabled). The
 //! `{"error":"…"}` / 404-disabled examples in general/006 cite that spec's
 //! superseded draft state and no longer apply.
@@ -35,7 +35,7 @@ use utoipa::ToSchema;
 
 /// Maps every `BackupError` variant to its spec general/006 HTTP status and
 /// a plaintext `ApiError` body (project-wide convention, general/005
-/// §Entscheidungen 1+2). Matched by variant, not by parsing `Display`, so
+/// decisions 1+2). Matched by variant, not by parsing `Display`, so
 /// wire text stays independent of `BackupError`'s internal `Display`.
 impl From<BackupError> for ApiError {
     fn from(e: BackupError) -> Self {
@@ -87,7 +87,7 @@ impl From<BackupError> for ApiError {
 }
 
 /// Resolves the backup manager or fails with 503 (spec general/005
-/// §Entscheidungen 1: "feature disabled" answers 503 project-wide, same as
+/// decision 1: "feature disabled" answers 503 project-wide, same as
 /// the JSON/rel engine guards -- routes are always registered).
 fn backup_manager(state: &AppState) -> Result<&Arc<BackupManager>, ApiError> {
     state.backup_manager.as_ref().ok_or_else(|| {
@@ -98,7 +98,7 @@ fn backup_manager(state: &AppState) -> Result<&Arc<BackupManager>, ApiError> {
     })
 }
 
-// ── Audit logging (spec general/006 "Exfiltrations-Bewusstsein") ───────────
+// ── Audit logging (spec general/006 "exfiltration awareness") ──────────────
 
 /// Best-effort caller identity for the audit log. Independently resolves the
 /// same Bearer key the auth middleware already validated this request
@@ -108,13 +108,7 @@ fn backup_manager(state: &AppState) -> Result<&Arc<BackupManager>, ApiError> {
 /// Trusted UDS peers and auth-disabled deployments have no bearer key at
 /// all, so those log without a name.
 async fn admin_name(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?;
-    let s = value.to_str().ok()?;
-    let token = s.strip_prefix("Bearer ")?;
-    if token.is_empty() {
-        return None;
-    }
-    let hash = crate::auth::hash_api_key(token);
+    let hash = crate::auth::middleware::extract_bearer(headers)?;
     state.auth_cache.get_user_by_key_hash(&hash).await.map(|u| u.name)
 }
 
@@ -130,6 +124,7 @@ fn log_audit(admin: &Option<String>, action: &str, backup_id: &str) {
 #[derive(Deserialize, ToSchema)]
 pub struct CreateBackupRequest {
     /// `all` | `kv` | `json` | `kv:<domain>` | `json:<domain>` | `domain:<name>`.
+    /// Covers the KV and JSON engines only — relational data is never included.
     pub scope: String,
     /// Only effective for `all`/`kv` scopes (auth records live in the KV instance).
     #[serde(default)]
@@ -400,10 +395,8 @@ pub async fn get_backup(
     Path(id): Path<String>,
 ) -> Result<Json<BackupDetailResponse>, ApiError> {
     let manager = backup_manager(&state)?;
-    if let Some(job) = manager.running_job() {
-        if job.id == id {
-            return Ok(Json(BackupDetailResponse::running(&job)));
-        }
+    if let Some(job) = manager.running_job().filter(|j| j.kind == JobKind::Backup && j.id == id) {
+        return Ok(Json(BackupDetailResponse::running(&job)));
     }
     let (manifest, state, size_bytes) = manager.get_backup_manifest(&id)?;
     Ok(Json(BackupDetailResponse::from_manifest(id, state, size_bytes, manifest)))
@@ -433,14 +426,11 @@ pub async fn download_backup(
     let manager = backup_manager(&state)?;
     crate::backup::validate_backup_id(&id)?;
     if manager.running_job().is_some_and(|j| j.id == id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "409 Conflict: the backup job for this id is still running",
-        ));
+        return Err(BackupError::BackupRunning.into());
     }
     let path = manager.ndjson_path(&id);
     if !path.exists() {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "404 Not Found: backup not found"));
+        return Err(BackupError::NotFound.into());
     }
 
     let admin = admin_name(&state, request.headers()).await;
@@ -497,35 +487,49 @@ pub async fn upload_backup(
     body: Body,
 ) -> Result<(StatusCode, Json<BackupDetailResponse>), ApiError> {
     let manager = backup_manager(&state)?;
-    let temp_path = manager.upload_scratch_path();
+    let mut scratch = ScratchGuard { path: manager.upload_scratch_path(), keep: false };
 
-    if let Err(e) = stream_body_to_file(&temp_path, body).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(e);
-    }
+    stream_body_to_file(&scratch.path, body).await?;
 
-    let manifest = match restore::verify_and_scan(&temp_path).await {
+    let manifest = match restore::verify_and_scan(&scratch.path).await {
         Ok(scan) => scan.manifest,
-        Err(_) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "400 Bad Request: invalid backup file: checksum or manifest verification failed",
-            ));
+        // Typed failures (unsupported version, malformed line, checksum
+        // mismatch) keep their own status and message; anything untyped is
+        // a client-side parse problem.
+        Err(e) => {
+            return Err(match e.downcast::<BackupError>() {
+                Ok(typed) => typed.into(),
+                Err(_) => ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "400 Bad Request: invalid backup file: checksum or manifest verification failed",
+                ),
+            });
         }
     };
 
-    let id = match manager.finalize_upload(&temp_path) {
-        Ok(id) => id,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e.into());
-        }
-    };
+    let id = manager.finalize_upload(&scratch.path)?;
+    scratch.keep = true;
 
     log_audit(&admin_name(&state, &headers).await, "backup uploaded", &id);
     let (_, backup_state, size_bytes) = manager.get_backup_manifest(&id)?;
     Ok((StatusCode::CREATED, Json(BackupDetailResponse::from_manifest(id, backup_state, size_bytes, manifest))))
+}
+
+/// Deletes the upload scratch file on every exit path, including the handler
+/// future being dropped mid-stream (client disconnect) — no error arm sees
+/// that one. Defused once `finalize_upload` renamed the file away. `Drop`
+/// cannot await, hence the blocking remove.
+struct ScratchGuard {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Writes the request body to `path` as it arrives — no full-body buffering
@@ -575,25 +579,19 @@ pub async fn restore_backup(
     // start_restore itself only validates id/existence/slot synchronously.
     let summary = manager.get_backup(&id)?;
     if summary.format_version != writer::FORMAT_VERSION {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("400 Bad Request: unsupported backup format version {}", summary.format_version),
-        ));
+        return Err(BackupError::UnsupportedFormatVersion(summary.format_version).into());
     }
     if summary.state == BackupState::Incomplete {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "400 Bad Request: invalid backup file: backup archive is incomplete (missing checksum line)",
-        ));
+        return Err(BackupError::InvalidBackupFile(
+            "backup archive is incomplete (missing checksum line)".to_string(),
+        )
+        .into());
     }
     if body.into_domain.is_some() {
         let single_domain =
             summary.scope.starts_with("kv:") || summary.scope.starts_with("json:") || summary.scope.starts_with("domain:");
         if !single_domain {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "400 Bad Request: into_domain requires a backup with exactly one domain",
-            ));
+            return Err(BackupError::RemapRequiresSingleDomain.into());
         }
     }
 
@@ -789,7 +787,7 @@ mod tests {
     }
 
     // 9. backup.enabled=false -> every new route answers 503 (spec
-    // general/005 §Entscheidungen 1: "feature disabled" is 503 project-wide).
+    // general/005 decision 1: "feature disabled" is 503 project-wide).
     #[tokio::test]
     async fn test_backup_disabled_returns_503_on_all_routes() {
         let (app, _dir) = make_app(None).await;
@@ -925,6 +923,59 @@ mod tests {
         let (del_status, del_body) = request(&app, Method::DELETE, &format!("/store-api/backups/{id}"), None, None).await;
         assert_eq!(del_status, StatusCode::CONFLICT, "{del_body}");
         assert!(del_body.contains("still running"), "{del_body}");
+    }
+
+    // 11d. A running *restore* occupies the same job slot but is not a
+    // backup: GET /backups/{restore_id} must reject the id like every other
+    // route does, and the restored-from backup keeps reporting its own
+    // manifest (regression: the slot early-return ignored the job kind).
+    #[tokio::test]
+    async fn test_get_backup_ignores_running_restore_job() {
+        let (state, _dir) = make_state(Some(slow_backup_config()), false).await;
+        state.registry.create_domain("shop").await.unwrap();
+        let store = state.registry.store("shop").await.unwrap();
+        for i in 0..3 {
+            store.put(format!("order:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+
+        let (status, body) =
+            request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:shop"}"#), None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+        wait_for_backup_completion(&app, &id).await;
+
+        // The slow config throttles the restore, so it is still running for
+        // every assertion below.
+        let (status, body) = request(
+            &app,
+            Method::POST,
+            &format!("/store-api/backups/{id}/restore"),
+            Some(r#"{"mode":"fail_if_exists","into_domain":"shop-restored"}"#),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let restore_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["restore_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, body) = request(&app, Method::GET, &format!("/store-api/restores/{restore_id}"), None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], json!("running"), "{body}");
+
+        let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{restore_id}"), None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid backup id"), "{body}");
+
+        let (status, body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["running"], serde_json::Value::Null);
+
+        let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], json!("complete"), "{body}");
     }
 
     // Happy-path wiring proof: create -> list -> detail -> download
@@ -1098,6 +1149,56 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("invalid backup file"));
     }
 
+    // A client that vanishes mid-upload drops the handler future at the body
+    // stream's await -- no error arm ever runs there, so only the scratch
+    // guard's Drop can discard the half-written file (regression).
+    #[tokio::test]
+    async fn test_aborted_upload_leaves_no_scratch_file() {
+        let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let backup_dir = dir.path().join("backups");
+
+        // One chunk, then a body that never yields again and never ends.
+        let stream = futures::stream::once(async {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"partial upload"))
+        })
+        .chain(futures::stream::pending());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/store-api/backups/upload")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let task = tokio::spawn(async move { app.oneshot(req).await });
+
+        assert!(wait_for_dir_entries(&backup_dir, 1).await, "the handler never streamed into a scratch file");
+        task.abort();
+        assert!(wait_for_dir_entries(&backup_dir, 0).await, "an aborted upload must not leave a scratch file behind");
+    }
+
+    // Typed archive failures keep their own status and message instead of
+    // collapsing into the generic verification-failed 400 (regression).
+    #[tokio::test]
+    async fn test_upload_unsupported_format_version_keeps_its_message() {
+        let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+
+        let manifest = json!({
+            "t": "manifest", "format_version": 99, "id": "bk_x", "created_at": now_secs(),
+            "luradb_version": "test", "scope": "all", "include_auth": false,
+            "kv_snapshot_ts": 0, "json_snapshot_ts": 0, "encoding": "hex", "schedule": null
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/store-api/backups/upload")
+            .body(Body::from(format!("{manifest}\n")))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("unsupported backup format version 99"), "{body}");
+    }
+
     // Happy-path wiring proof: restore with into_domain remap -> status
     // polling reaches "complete" with the expected counts.
     #[tokio::test]
@@ -1205,6 +1306,19 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("restore '{restore_id}' did not finish within the poll budget");
+    }
+
+    /// Bounded poll for exactly `count` entries in `dir` -- an upload scratch
+    /// file appears and vanishes on the handler task's schedule, not the
+    /// test's.
+    async fn wait_for_dir_entries(dir: &std::path::Path, count: usize) -> bool {
+        for _ in 0..100 {
+            if std::fs::read_dir(dir).unwrap().count() == count {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
     }
 
     /// Writes a minimal, well-formed-enough (but NOT checksum-verified)

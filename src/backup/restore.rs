@@ -3,25 +3,38 @@
 //! pass in archive order (domains already exist by then -> indexes -> data).
 
 use super::writer::{
-    ChecksumLine, DocLine, JsonDomainLine, JsonIndexLine, KvDomainLine, KvLine, ManifestLine,
-    AUTH_PERM_PREFIX, AUTH_USER_PREFIX, FORMAT_VERSION,
+    maybe_pause, ChecksumLine, DocLine, JsonDomainLine, JsonIndexLine, KvDomainLine, KvLine, ManifestLine,
+    FORMAT_VERSION,
 };
-use super::BackupError;
-use crate::auth::{DomainPermission, UserRecord};
+use super::{BackupError, MAX_LINE_BYTES};
+use crate::auth::{perm_key, user_key, DomainPermission, UserRecord};
 use crate::engines::json::{JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{now_secs, DomainRegistry, DomainStore};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 /// Poll interval while waiting for the domain purger to finalize a deletion
 /// in `replace` mode. The purger itself runs as an independent background
 /// task (spec general/003 pattern); this loop only observes its progress.
 const PURGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Deadline for that wait. Without it a stalled purger parks the restore
+/// forever and its job slot stays taken for the process lifetime; generous
+/// enough that a large domain on a slow disk still finishes in time.
+const PURGE_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Cap on the per-record errors kept in [`RestoreOutcome::errors`]. The list
+/// is retained in the restore registry for the process lifetime and returned
+/// in full by `GET /restores/{id}`; `failed` still counts every failure.
+const MAX_REPORTED_ERRORS: usize = 100;
+
+/// Cap on the key label of a single error entry (keys can be long).
+const MAX_ERROR_KEY_LEN: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreMode {
@@ -52,8 +65,22 @@ pub(crate) struct RestoreOutcome {
 impl RestoreOutcome {
     fn fail(&mut self, key: impl Into<String>, reason: impl Into<String>) {
         self.failed += 1;
-        self.errors.push((key.into(), reason.into()));
+        if self.errors.len() < MAX_REPORTED_ERRORS {
+            self.errors.push((short_label(key.into()), reason.into()));
+        }
     }
+}
+
+/// Shortens an error entry's key label, cutting on a char boundary.
+fn short_label(mut key: String) -> String {
+    if key.len() > MAX_ERROR_KEY_LEN {
+        let mut end = MAX_ERROR_KEY_LEN;
+        while !key.is_char_boundary(end) {
+            end -= 1;
+        }
+        key.truncate(end);
+    }
+    key
 }
 
 /// Runs the full restore: checksum-verify the archive, prepare (create or
@@ -89,8 +116,8 @@ pub(crate) async fn run_restore(params: RestoreParams<'_>) -> anyhow::Result<Res
 // ── Pass 1: checksum verification + domain-name collection ─────────────
 
 pub(crate) struct ArchiveScan {
-    kv_domains: Vec<(String, u64)>,
-    json_domains: Vec<(String, u64)>,
+    kv_domains: Vec<String>,
+    json_domains: Vec<String>,
     /// Exposed for the upload endpoint's "manifest fields" response (spec
     /// general/006 POST /backups/upload) — restore itself only needs the
     /// domain-name lists above.
@@ -101,28 +128,35 @@ pub(crate) struct ArchiveScan {
 /// write): verifies the SHA-256 checksum line and, along the way, collects
 /// every kv-domain/json-domain name — needed up front so `fail_if_exists`/
 /// `replace` and the `into_domain` single-name check can run before any
-/// write in pass 2. Also reused as-is by the upload endpoint's validation
-/// pass (`crate::api::backup`), which only needs the checksum/manifest check.
+/// write in pass 2. Data lines naming an undeclared domain are rejected
+/// here: the apply pass takes its target from the data line, so an archive
+/// could otherwise write past those checks into a live domain. Also reused
+/// as-is by the upload endpoint's validation pass (`crate::api::backup`),
+/// which only needs the checksum/manifest check.
 pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> {
     let file = tokio::fs::File::open(path).await?;
-    let mut lines = BufReader::new(file).lines();
+    let mut reader = BufReader::new(file);
 
     let mut hasher = Sha256::new();
     let mut line_count: u64 = 0;
-    let mut kv_domains = Vec::new();
-    let mut json_domains = Vec::new();
+    let mut kv_domains: Vec<String> = Vec::new();
+    let mut json_domains: Vec<String> = Vec::new();
+    let mut kv_refs: HashSet<String> = HashSet::new();
+    let mut json_refs: HashSet<String> = HashSet::new();
     let mut saw_checksum = false;
     let mut manifest_line: Option<ManifestLine> = None;
+    let mut raw: Vec<u8> = Vec::new();
 
-    while let Some(raw) = lines.next_line().await? {
+    while read_line_capped(&mut reader, &mut raw).await? > 0 {
         // The writer never emits blank lines; rejecting them keeps the
         // guarantee exact that every file byte before the checksum line went
         // into the hash.
-        if raw.trim().is_empty() {
+        if raw.iter().all(|b| b.is_ascii_whitespace()) {
             return Err(BackupError::InvalidBackupFile("blank line in backup archive".to_string()).into());
         }
-        let value: Value =
-            serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("malformed line in backup archive: {e}"))?;
+        let value: Value = serde_json::from_slice(&raw).map_err(|e| {
+            BackupError::InvalidBackupFile(format!("malformed line in backup archive: {e}"))
+        })?;
         let t = value.get("t").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         if line_count == 0 {
@@ -132,7 +166,7 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
                 )
                 .into());
             }
-            let manifest: ManifestLine = serde_json::from_value(value.clone())?;
+            let manifest: ManifestLine = parse_line(value.clone())?;
             if manifest.format_version != FORMAT_VERSION {
                 return Err(BackupError::UnsupportedFormatVersion(manifest.format_version).into());
             }
@@ -140,7 +174,7 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
         }
 
         if t == "checksum" {
-            let checksum: ChecksumLine = serde_json::from_value(value)?;
+            let checksum: ChecksumLine = parse_line(value)?;
             if checksum.lines != line_count {
                 return Err(BackupError::InvalidBackupFile(format!(
                     "checksum line count mismatch: header says {}, file has {line_count}",
@@ -154,7 +188,7 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
             }
             // Anything after the checksum line is outside the verified
             // range and would otherwise reach the apply pass unchecked.
-            if lines.next_line().await?.is_some() {
+            if read_line_capped(&mut reader, &mut raw).await? > 0 {
                 return Err(BackupError::InvalidBackupFile(
                     "data after the checksum line".to_string(),
                 )
@@ -166,19 +200,19 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
 
         match t.as_str() {
             "kv-domain" => {
-                let line: KvDomainLine = serde_json::from_value(value)?;
-                kv_domains.push((line.name, line.created_at));
+                let line: KvDomainLine = parse_line(value)?;
+                kv_domains.push(line.name);
             }
             "json-domain" => {
-                let line: JsonDomainLine = serde_json::from_value(value)?;
-                json_domains.push((line.name, line.created_at));
+                let line: JsonDomainLine = parse_line(value)?;
+                json_domains.push(line.name);
             }
+            "kv" => collect_ref(&value, &mut kv_refs),
+            "doc" | "json-index" => collect_ref(&value, &mut json_refs),
             _ => {}
         }
 
-        let mut bytes = raw.into_bytes();
-        bytes.push(b'\n');
-        hasher.update(&bytes);
+        hasher.update(&raw);
         line_count += 1;
     }
 
@@ -189,11 +223,79 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
         );
     }
 
+    for name in &kv_refs {
+        if !kv_domains.contains(name) {
+            return Err(BackupError::InvalidBackupFile(format!(
+                "kv data for undeclared domain '{name}'"
+            ))
+            .into());
+        }
+    }
+    for name in &json_refs {
+        if !json_domains.contains(name) {
+            return Err(BackupError::InvalidBackupFile(format!(
+                "json data for undeclared domain '{name}'"
+            ))
+            .into());
+        }
+    }
+
     Ok(ArchiveScan {
         kv_domains,
         json_domains,
         manifest: manifest_line.expect("checked above: the first line is always a manifest when saw_checksum is true"),
     })
+}
+
+fn parse_line<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, BackupError> {
+    serde_json::from_value(value)
+        .map_err(|e| BackupError::InvalidBackupFile(format!("malformed line in backup archive: {e}")))
+}
+
+/// Records the domain a data line writes to, so the scan can check it against
+/// the declared domains.
+fn collect_ref(value: &Value, refs: &mut HashSet<String>) {
+    if let Some(domain) = value.get("domain").and_then(|v| v.as_str()) {
+        if !refs.contains(domain) {
+            refs.insert(domain.to_string());
+        }
+    }
+}
+
+/// Reads one `\n`-terminated line (terminator included, absent at EOF) into
+/// `buf` and returns its length; 0 means end of file. Lines longer than
+/// [`MAX_LINE_BYTES`] are rejected instead of being buffered whole.
+async fn read_line_capped<R: AsyncBufRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> anyhow::Result<usize> {
+    buf.clear();
+    loop {
+        let (consumed, done) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                break;
+            }
+            match available.iter().position(|b| *b == b'\n') {
+                Some(i) => {
+                    buf.extend_from_slice(&available[..=i]);
+                    (i + 1, true)
+                }
+                None => {
+                    buf.extend_from_slice(available);
+                    (available.len(), false)
+                }
+            }
+        };
+        reader.consume(consumed);
+        if buf.len() > MAX_LINE_BYTES {
+            return Err(BackupError::InvalidBackupFile(format!(
+                "line in backup archive exceeds {MAX_LINE_BYTES} bytes"
+            ))
+            .into());
+        }
+        if done {
+            break;
+        }
+    }
+    Ok(buf.len())
 }
 
 /// Validates `into_domain` (spec general/006: only legal when the archive
@@ -203,11 +305,11 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
 fn build_remap(into_domain: Option<&str>, scan: &ArchiveScan) -> anyhow::Result<Option<(String, String)>> {
     let Some(target) = into_domain else { return Ok(None) };
 
-    let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (name, _) in &scan.kv_domains {
+    let mut names: HashSet<&str> = HashSet::new();
+    for name in &scan.kv_domains {
         names.insert(name.as_str());
     }
-    for (name, _) in &scan.json_domains {
+    for name in &scan.json_domains {
         names.insert(name.as_str());
     }
     if names.len() != 1 {
@@ -237,20 +339,20 @@ async fn prepare_domains(
     kv_registry: &Arc<DomainRegistry>,
     json_engine: &Option<Arc<JsonEngine>>,
 ) -> anyhow::Result<()> {
-    for (name, _) in &scan.kv_domains {
+    for name in &scan.kv_domains {
         ready_kv_domain(remapped(remap, name), mode, kv_registry).await?;
     }
     if let Some(json) = json_engine {
-        for (name, _) in &scan.json_domains {
+        for name in &scan.json_domains {
             ready_json_domain(remapped(remap, name), mode, json).await?;
         }
     }
 
-    for (name, _) in &scan.kv_domains {
+    for name in &scan.kv_domains {
         kv_registry.create_domain(remapped(remap, name)).await?;
     }
     if let Some(json) = json_engine {
-        for (name, _) in &scan.json_domains {
+        for name in &scan.json_domains {
             json.create_domain(remapped(remap, name)).await?;
         }
     }
@@ -271,23 +373,20 @@ async fn ready_kv_domain(target: &str, mode: RestoreMode, kv_registry: &Arc<Doma
         RestoreMode::Replace => {
             if active.is_some() {
                 kv_registry.delete_domain(target).await?;
-                wait_for_kv_domain_gone(target, kv_registry).await;
+                wait_for_kv_domain_gone(target, kv_registry).await?;
             } else if deleting {
-                wait_for_kv_domain_gone(target, kv_registry).await;
+                wait_for_kv_domain_gone(target, kv_registry).await?;
             }
             Ok(())
         }
     }
 }
 
-async fn wait_for_kv_domain_gone(name: &str, kv_registry: &Arc<DomainRegistry>) {
-    loop {
-        let still_deleting = kv_registry.list_deleting_domains().into_iter().any(|d| d.name == name);
-        if !still_deleting {
-            return;
-        }
-        tokio::time::sleep(PURGE_POLL_INTERVAL).await;
-    }
+async fn wait_for_kv_domain_gone(name: &str, kv_registry: &Arc<DomainRegistry>) -> anyhow::Result<()> {
+    wait_for_purge(name, PURGE_WAIT_TIMEOUT, || {
+        !kv_registry.list_deleting_domains().into_iter().any(|d| d.name == name)
+    })
+    .await
 }
 
 async fn ready_json_domain(target: &str, mode: RestoreMode, json: &Arc<JsonEngine>) -> anyhow::Result<()> {
@@ -303,9 +402,9 @@ async fn ready_json_domain(target: &str, mode: RestoreMode, json: &Arc<JsonEngin
             match existing {
                 Some(d) if d.state == JsonDomainState::Active => {
                     json.delete_domain(target).await?;
-                    wait_for_json_domain_gone(target, json).await;
+                    wait_for_json_domain_gone(target, json).await?;
                 }
-                Some(_) => wait_for_json_domain_gone(target, json).await,
+                Some(_) => wait_for_json_domain_gone(target, json).await?,
                 None => {}
             }
             Ok(())
@@ -313,14 +412,26 @@ async fn ready_json_domain(target: &str, mode: RestoreMode, json: &Arc<JsonEngin
     }
 }
 
-async fn wait_for_json_domain_gone(name: &str, json: &Arc<JsonEngine>) {
+async fn wait_for_json_domain_gone(name: &str, json: &Arc<JsonEngine>) -> anyhow::Result<()> {
+    wait_for_purge(name, PURGE_WAIT_TIMEOUT, || {
+        !matches!(json.get_domain_any(name), Some(d) if d.state == JsonDomainState::Deleting)
+    })
+    .await
+}
+
+/// Polls `is_gone` until the purger finished the deletion. Bounded by
+/// `timeout`: a stalled purger must not park the restore (and its job slot)
+/// for the process lifetime.
+async fn wait_for_purge(name: &str, timeout: Duration, is_gone: impl Fn() -> bool) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
     loop {
-        match json.get_domain_any(name) {
-            Some(d) if d.state == JsonDomainState::Deleting => {
-                tokio::time::sleep(PURGE_POLL_INTERVAL).await;
-            }
-            _ => return,
+        if is_gone() {
+            return Ok(());
         }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!("domain '{name}' is still being purged"));
+        }
+        tokio::time::sleep(PURGE_POLL_INTERVAL).await;
     }
 }
 
@@ -381,10 +492,8 @@ async fn apply_pass(
                 }
                 let store = kv_stores.get(&target).unwrap();
                 apply_kv_line(store, &line, now, &mut outcome).await;
+                maybe_pause(kv_count, scan_batch_size, scan_pause_ms).await;
                 kv_count += 1;
-                if scan_batch_size > 0 && kv_count % scan_batch_size == 0 {
-                    tokio::time::sleep(Duration::from_millis(scan_pause_ms)).await;
-                }
             }
             "json-index" => {
                 flush_doc_batch(&mut doc_domain, &mut doc_batch, json_engine, &mut outcome).await?;
@@ -454,15 +563,13 @@ async fn apply_kv_line(store: &DomainStore, line: &KvLine, now: u64, outcome: &m
             return;
         }
     };
-    let key_label = String::from_utf8_lossy(&key).into_owned();
-
     let result = match &line.v {
         None => store.set_null_unthrottled(&key).await,
         Some(v_hex) => {
             let val = match hex::decode(v_hex) {
                 Ok(b) => b,
                 Err(e) => {
-                    outcome.fail(key_label, format!("bad hex value: {e}"));
+                    outcome.fail(String::from_utf8_lossy(&key), format!("bad hex value: {e}"));
                     return;
                 }
             };
@@ -476,7 +583,7 @@ async fn apply_kv_line(store: &DomainStore, line: &KvLine, now: u64, outcome: &m
     };
     match result {
         Ok(()) => outcome.imported += 1,
-        Err(e) => outcome.fail(key_label, e.to_string()),
+        Err(e) => outcome.fail(String::from_utf8_lossy(&key), e.to_string()),
     }
 }
 
@@ -500,7 +607,8 @@ async fn flush_doc_batch(
         let result = json.bulk_load(&dom, items).await?;
         outcome.imported += result.imported;
         outcome.failed += result.failed;
-        outcome.errors.extend(result.errors);
+        let room = MAX_REPORTED_ERRORS.saturating_sub(outcome.errors.len());
+        outcome.errors.extend(result.errors.into_iter().take(room));
     }
     Ok(())
 }
@@ -513,7 +621,7 @@ async fn apply_auth_user(value: &Value, kv_registry: &Arc<DomainRegistry>, outco
             return;
         }
     };
-    let key = format!("{AUTH_USER_PREFIX}{}", record.name);
+    let key = user_key(&record.name);
     let bytes = match serde_json::to_vec(&record) {
         Ok(b) => b,
         Err(e) => {
@@ -521,7 +629,7 @@ async fn apply_auth_user(value: &Value, kv_registry: &Arc<DomainRegistry>, outco
             return;
         }
     };
-    match kv_registry.engine().put(key.as_bytes(), &bytes).await {
+    match kv_registry.engine().put(&key, &bytes).await {
         Ok(()) => outcome.imported += 1,
         Err(e) => outcome.fail(record.name, e.to_string()),
     }
@@ -535,7 +643,7 @@ async fn apply_auth_perm(value: &Value, kv_registry: &Arc<DomainRegistry>, outco
             return;
         }
     };
-    let key = format!("{AUTH_PERM_PREFIX}{}:{}", perm.username, perm.domain);
+    let key = perm_key(&perm.username, &perm.domain);
     let label = format!("{}:{}", perm.username, perm.domain);
     let bytes = match serde_json::to_vec(&perm) {
         Ok(b) => b,
@@ -544,7 +652,7 @@ async fn apply_auth_perm(value: &Value, kv_registry: &Arc<DomainRegistry>, outco
             return;
         }
     };
-    match kv_registry.engine().put(key.as_bytes(), &bytes).await {
+    match kv_registry.engine().put(&key, &bytes).await {
         Ok(()) => outcome.imported += 1,
         Err(e) => outcome.fail(label, e.to_string()),
     }
@@ -553,6 +661,7 @@ async fn apply_auth_perm(value: &Value, kv_registry: &Arc<DomainRegistry>, outco
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::PREFIX_PERM;
     use crate::backup::writer::{self, resolve_scope, BackupParams, ResolvedScope};
     use crate::backup::BackupScope;
     use crate::config::JsonStoreConfig;
@@ -631,6 +740,24 @@ mod tests {
         };
         writer::run_backup(params).await.unwrap();
         out_dir.join(format!("{id}.ndjson"))
+    }
+
+    /// Rewrites `path` from `body` plus a matching checksum line, so an
+    /// edited archive verifies again (a hand-crafted archive is exactly the
+    /// case the scan's own checks have to survive).
+    fn reseal(path: &Path, body: &[String]) {
+        let mut hasher = Sha256::new();
+        for line in body {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+        let checksum =
+            json!({"t": "checksum", "sha256": hex::encode(hasher.finalize()), "lines": body.len() as u64});
+        let mut content = body.join("\n");
+        content.push('\n');
+        content.push_str(&checksum.to_string());
+        content.push('\n');
+        std::fs::write(path, content).unwrap();
     }
 
     // 1. Roundtrip: kv:<domain> export -> restore into an empty instance ->
@@ -1144,7 +1271,7 @@ mod tests {
         engine.put(b"__sys:auth:user:alice", &serde_json::to_vec(&record).unwrap()).await.unwrap();
         let perm = DomainPermission { username: "alice".to_string(), domain: "shop".to_string(), access: crate::auth::AccessLevel::Read };
         engine
-            .put(format!("{AUTH_PERM_PREFIX}alice:shop").as_bytes(), &serde_json::to_vec(&perm).unwrap())
+            .put(format!("{PREFIX_PERM}alice:shop").as_bytes(), &serde_json::to_vec(&perm).unwrap())
             .await
             .unwrap();
 
@@ -1204,7 +1331,7 @@ mod tests {
         let raw = engine3.get(b"__sys:auth:user:alice").await.unwrap().unwrap();
         let restored: UserRecord = serde_json::from_slice(&raw).unwrap();
         assert_eq!(restored.api_key_hash, "deadbeef");
-        assert!(engine3.get(format!("{AUTH_PERM_PREFIX}alice:shop").as_bytes()).await.unwrap().is_some());
+        assert!(engine3.get(format!("{PREFIX_PERM}alice:shop").as_bytes()).await.unwrap().is_some());
     }
 
     // 9. Cross-check: backing up with include_auth=false never even writes
@@ -1476,5 +1603,84 @@ mod tests {
 
         assert!(json_dst.get_document("catalog", "new").await.unwrap().is_some());
         assert!(json_dst.get_document("catalog", "old").await.unwrap().is_none(), "replace must wipe the old content");
+    }
+
+    // 15. A data line naming a domain the archive never declares is refused:
+    //     the apply pass takes its target from the data line, so such an
+    //     archive would write straight into a live domain, past both the
+    //     fail_if_exists and the replace handling.
+    #[tokio::test]
+    async fn test_data_line_for_undeclared_domain_rejected() {
+        let (_engine, kv_src, _d1) = make_kv_registry().await;
+        kv_src.create_domain("shop").await.unwrap();
+        kv_src.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let path =
+            make_backup(out_dir.path(), "bk_undecl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None)
+                .await;
+
+        // Retarget the data line at an undeclared domain (the declaration
+        // line carries `name`, not `domain`, so it stays "shop") and reseal.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let body: Vec<String> = content
+            .lines()
+            .take_while(|l| !l.contains("\"t\":\"checksum\""))
+            .map(|l| l.replace("\"domain\":\"shop\"", "\"domain\":\"live\""))
+            .collect();
+        reseal(&path, &body);
+
+        let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+        kv_dst.create_domain("live").await.unwrap();
+        kv_dst.store("live").await.unwrap().put(b"production", b"untouched").await.unwrap();
+
+        let err = run_restore(RestoreParams {
+            dir: out_dir.path(),
+            backup_id: "bk_undecl",
+            mode: RestoreMode::FailIfExists,
+            into_domain: None,
+            include_auth: false,
+            kv_registry: &kv_dst,
+            json_engine: &None,
+            scan_batch_size: 500,
+            scan_pause_ms: 0,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<BackupError>().is_some_and(|e| matches!(e, BackupError::InvalidBackupFile(_))));
+
+        let store = kv_dst.store("live").await.unwrap();
+        assert_eq!(store.get(b"production").await.unwrap(), GetResult::Present(b"untouched".to_vec()));
+        assert_eq!(store.get(b"k").await.unwrap(), GetResult::Absent, "no archive data must land");
+    }
+
+    // 16. The reported error list is capped (it is kept in RAM for the
+    //     process lifetime and serialized by GET /restores/{id}), while
+    //     `failed` keeps counting every record.
+    #[test]
+    fn test_error_list_is_capped_and_labels_shortened() {
+        let mut outcome = RestoreOutcome::default();
+        for i in 0..MAX_REPORTED_ERRORS + 50 {
+            outcome.fail(format!("key{i}"), "boom");
+        }
+        assert_eq!(outcome.failed, MAX_REPORTED_ERRORS as u64 + 50);
+        assert_eq!(outcome.errors.len(), MAX_REPORTED_ERRORS);
+
+        // A 3-byte char forces the cut off the byte cap onto a char boundary.
+        let mut outcome = RestoreOutcome::default();
+        outcome.fail("€".repeat(1000), "boom");
+        assert!(outcome.errors[0].0.len() <= MAX_ERROR_KEY_LEN);
+        assert!(outcome.errors[0].0.chars().all(|c| c == '€'));
+    }
+
+    // 17. The replace-mode wait on the purger is bounded: a purge that never
+    //     finishes fails the restore instead of parking it (and its job slot)
+    //     for the process lifetime.
+    #[tokio::test]
+    async fn test_purge_wait_is_bounded() {
+        let err = wait_for_purge("shop", Duration::from_millis(120), || false).await.unwrap_err();
+        assert!(err.to_string().contains("still being purged"), "{err}");
+
+        wait_for_purge("shop", Duration::from_millis(120), || true).await.unwrap();
     }
 }

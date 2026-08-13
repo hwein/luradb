@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Upper bound for a single NDJSON line (one KV pair or one document) —
+/// keeps a newline-free file from being read into RAM whole.
+pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Which data a backup covers (spec general/006 scope syntax). Parsing is
 /// syntax-only — domain existence is checked when a backup job actually runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,9 +189,16 @@ pub struct BackupSummary {
     pub size_bytes: u64,
     pub schedule: Option<String>,
     pub format_version: u32,
+    /// Uploaded archive: its manifest id differs from the file name it was
+    /// given here. Internal only — not part of the API response.
+    pub uploaded: bool,
 }
 
 // ── Restore status registry ─────────────────────────────────────────────
+
+/// Cap on retained restore statuses — the registry lives in RAM for the
+/// whole process lifetime, and each entry carries its full `errors` list.
+const MAX_RESTORE_STATUSES: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreState {
@@ -274,7 +285,8 @@ pub struct BackupManager {
 }
 
 impl BackupManager {
-    /// Creates the manager and ensures `config.dir` exists.
+    /// Creates the manager, ensures `config.dir` exists, and drops `.part`
+    /// leftovers from a previous process.
     pub fn new(
         config: &BackupConfig,
         kv_registry: Arc<DomainRegistry>,
@@ -282,9 +294,12 @@ impl BackupManager {
     ) -> anyhow::Result<Arc<Self>> {
         let dir = PathBuf::from(&config.dir);
         std::fs::create_dir_all(&dir)?;
+        sweep_scratch_files(&dir);
         Ok(Arc::new(Self {
             dir,
-            scan_batch_size: config.scan_batch_size,
+            // 0 means "no throttling" in the KV paths but "flush after every
+            // document" in the JSON restore path — coerce it once here.
+            scan_batch_size: config.scan_batch_size.max(1),
             scan_pause_ms: config.scan_pause_ms,
             kv_registry,
             json_engine,
@@ -429,20 +444,24 @@ impl BackupManager {
         };
 
         let started_at = now_secs();
-        self.restores.write().insert(
-            restore_id.clone(),
-            RestoreStatus {
-                restore_id: restore_id.clone(),
-                backup_id: backup_id.to_string(),
-                state: RestoreState::Running,
-                imported: 0,
-                skipped: 0,
-                failed: 0,
-                errors: Vec::new(),
-                started_at,
-                finished_at: None,
-            },
-        );
+        {
+            let mut restores = self.restores.write();
+            evict_finished_restores(&mut restores);
+            restores.insert(
+                restore_id.clone(),
+                RestoreStatus {
+                    restore_id: restore_id.clone(),
+                    backup_id: backup_id.to_string(),
+                    state: RestoreState::Running,
+                    imported: 0,
+                    skipped: 0,
+                    failed: 0,
+                    errors: Vec::new(),
+                    started_at,
+                    finished_at: None,
+                },
+            );
+        }
 
         let manager = Arc::clone(self);
         let job_restore_id = restore_id.clone();
@@ -531,6 +550,10 @@ impl BackupManager {
         let _guard = self.upload_lock.lock();
         let id = self.allocate_backup_id("upload");
         std::fs::rename(temp_path, self.ndjson_path(&id)).map_err(|e| BackupError::Other(e.into()))?;
+        // The rename itself must survive power loss, not just a clean shutdown.
+        std::fs::File::open(&self.dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| BackupError::Other(e.into()))?;
         Ok(id)
     }
 
@@ -588,12 +611,18 @@ impl BackupManager {
         read_backup_summary(&path).map_err(BackupError::Other)
     }
 
-    /// `DELETE /backups/{id}`. Refuses while the id is the active job (or a
-    /// `.part` file for it still exists, e.g. a stale leftover) — spec
-    /// general/006 `backup_running`.
+    /// `DELETE /backups/{id}`. Refuses while the id is the active job, while
+    /// a running restore reads this archive (the slot's id is then the
+    /// restore id and the archive id sits in `scope`), or while a `.part`
+    /// file for it exists — spec general/006 `backup_running`.
     pub fn delete_backup(&self, id: &str) -> Result<(), BackupError> {
         validate_backup_id(id)?;
-        if self.slot.lock().as_ref().is_some_and(|j| j.id == id) {
+        let blocked = self
+            .slot
+            .lock()
+            .as_ref()
+            .is_some_and(|j| j.id == id || (j.kind == JobKind::Restore && j.scope == id));
+        if blocked {
             return Err(BackupError::BackupRunning);
         }
         if self.dir.join(format!("{id}.ndjson.part")).exists() {
@@ -608,15 +637,16 @@ impl BackupManager {
 
     /// Retention (spec general/006 Scheduler step 3): keeps the `keep_last`
     /// most recent **complete** backups of `schedule_name`, deletes the
-    /// rest. On-demand/upload backups (`schedule = null`) are never touched
-    /// — the caller-supplied name can never match `None`. Not wired to any
-    /// scheduler here; the follow-up scheduler task calls this after a
-    /// successful scheduled run.
+    /// rest. On-demand backups (`schedule = null`) never match the
+    /// caller-supplied name; uploaded archives are excluded explicitly,
+    /// because they keep their source manifest verbatim and may well carry
+    /// a foreign schedule name. Not wired to any scheduler here; the
+    /// follow-up scheduler task calls this after a successful scheduled run.
     pub fn apply_retention(&self, schedule_name: &str, keep_last: usize) -> anyhow::Result<usize> {
         let mut matching: Vec<BackupSummary> = self
             .list_backups()?
             .into_iter()
-            .filter(|b| b.state == BackupState::Complete && b.schedule.as_deref() == Some(schedule_name))
+            .filter(|b| b.state == BackupState::Complete && !b.uploaded && b.schedule.as_deref() == Some(schedule_name))
             .collect();
         matching.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
@@ -628,6 +658,46 @@ impl BackupManager {
             }
         }
         Ok(deleted)
+    }
+}
+
+/// Removes `.part` leftovers: an upload scratch file whose client vanished
+/// mid-stream, or an export interrupted by a crash (which would otherwise
+/// block `DELETE /backups/{id}` forever). Only safe at construction time,
+/// where no job can be running.
+fn sweep_scratch_files(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("[Backup] cannot scan '{}' for leftover .part files: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let leftover = name.ends_with(".ndjson.part") || (name.starts_with("upload-") && name.ends_with(".part"));
+        if !leftover {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => tracing::info!("[Backup] removed leftover scratch file '{name}'"),
+            Err(e) => tracing::warn!("[Backup] cannot remove leftover scratch file '{name}': {e}"),
+        }
+    }
+}
+
+/// Drops the oldest **finished** statuses until one more entry fits under
+/// [`MAX_RESTORE_STATUSES`]; a running restore is never evicted.
+fn evict_finished_restores(restores: &mut HashMap<String, RestoreStatus>) {
+    while restores.len() >= MAX_RESTORE_STATUSES {
+        let oldest = restores
+            .values()
+            .filter(|s| s.finished_at.is_some())
+            .min_by_key(|s| s.started_at)
+            .map(|s| s.restore_id.clone());
+        let Some(id) = oldest else { break };
+        restores.remove(&id);
     }
 }
 
@@ -665,6 +735,7 @@ fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
         .to_string();
 
     Ok(BackupSummary {
+        uploaded: manifest.id != id,
         id,
         state: if is_complete { BackupState::Complete } else { BackupState::Incomplete },
         scope: manifest.scope,
@@ -675,14 +746,21 @@ fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
     })
 }
 
-fn read_first_line(path: &Path) -> std::io::Result<Option<String>> {
-    use std::io::BufRead;
+fn read_first_line(path: &Path) -> anyhow::Result<Option<String>> {
+    use std::io::{BufRead, Read};
     let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(file).take(MAX_LINE_BYTES as u64 + 1);
     let mut line = String::new();
     let n = reader.read_line(&mut line)?;
     if n == 0 {
         return Ok(None);
+    }
+    if n > MAX_LINE_BYTES {
+        return Err(BackupError::InvalidBackupFile(format!(
+            "first line of {} exceeds {MAX_LINE_BYTES} bytes",
+            path.display()
+        ))
+        .into());
     }
     Ok(Some(line.trim_end().to_string()))
 }
@@ -1052,6 +1130,24 @@ mod manager_tests {
         assert!(matches!(manager.delete_backup("bk_p").unwrap_err(), BackupError::BackupRunning));
     }
 
+    // 10b. delete_backup refuses the archive a running restore reads: the
+    //      slot's id is the restore id, the archive id sits in `scope`.
+    #[tokio::test]
+    async fn test_delete_backup_refuses_source_of_running_restore() {
+        let (manager, _e, backup_dir) = make_manager().await;
+        write_fake_backup(backup_dir.path(), "bk_src", "all", 1000, None, true);
+        *manager.slot.lock() = Some(RunningJobInfo {
+            id: "rs_20260712T030000Z".to_string(),
+            kind: JobKind::Restore,
+            scope: "bk_src".to_string(),
+            started_at: now_secs(),
+        });
+        assert!(matches!(manager.delete_backup("bk_src").unwrap_err(), BackupError::BackupRunning));
+
+        *manager.slot.lock() = None;
+        manager.delete_backup("bk_src").unwrap();
+    }
+
     // 11. Retention keeps only the newest `keep_last` COMPLETE backups of one
     //     schedule; on-demand (`schedule = null`) backups are never touched,
     //     regardless of count, and other schedules are untouched.
@@ -1082,12 +1178,111 @@ mod manager_tests {
         assert!(remaining.contains("bk_ondemand_2"));
     }
 
-    #[test]
-    fn test_civil_time_helper_reexported_for_scheduler_reuse() {
-        // Smoke test that the shared helper (used for ID timestamps here,
-        // and for cron minute-matching in the scheduler follow-up) is
-        // reachable from this module.
-        let t = cron::civil_from_unix(0);
-        assert_eq!(t.year, 1970);
+    // 11b. An uploaded archive keeps its source manifest verbatim, so its
+    //      `schedule` may name a schedule of this server — retention must
+    //      still never prune it.
+    #[tokio::test]
+    async fn test_retention_never_touches_uploaded_backups() {
+        let (manager, _e, backup_dir) = make_manager().await;
+        write_fake_backup(backup_dir.path(), "bk_nightly_0", "all", 1000, Some("nightly"), true);
+        write_fake_backup(backup_dir.path(), "bk_nightly_1", "all", 2000, Some("nightly"), true);
+        // Upload: only the file is renamed, the manifest (id + schedule) stays.
+        write_fake_backup(backup_dir.path(), "bk_foreign", "all", 500, Some("nightly"), true);
+        std::fs::rename(
+            backup_dir.path().join("bk_foreign.ndjson"),
+            backup_dir.path().join("bk_20260712T030000Z_upload.ndjson"),
+        )
+        .unwrap();
+
+        assert!(manager.get_backup("bk_20260712T030000Z_upload").unwrap().uploaded);
+        assert!(!manager.get_backup("bk_nightly_1").unwrap().uploaded);
+
+        let deleted = manager.apply_retention("nightly", 1).unwrap();
+        assert_eq!(deleted, 1, "only the older scheduled backup is pruned");
+
+        let remaining: std::collections::HashSet<String> =
+            manager.list_backups().unwrap().into_iter().map(|b| b.id).collect();
+        assert!(remaining.contains("bk_20260712T030000Z_upload"), "uploads are never pruned by retention");
+        assert!(remaining.contains("bk_nightly_1"));
+        assert!(!remaining.contains("bk_nightly_0"));
+    }
+
+    /// Second manager over the same backup dir (restart simulation), reusing
+    /// the first one's registry.
+    fn restart_manager(manager: &Arc<BackupManager>, dir: &Path, scan_batch_size: usize) -> Arc<BackupManager> {
+        let config = BackupConfig {
+            enabled: true,
+            dir: dir.to_string_lossy().into_owned(),
+            scan_batch_size,
+            ..BackupConfig::default()
+        };
+        BackupManager::new(&config, Arc::clone(&manager.kv_registry), None).unwrap()
+    }
+
+    // 12. Startup sweeps `.part` leftovers (crashed export, abandoned upload
+    //     stream) and leaves finished archives alone.
+    #[tokio::test]
+    async fn test_new_sweeps_leftover_part_files() {
+        let (manager, _e, backup_dir) = make_manager().await;
+        write_fake_backup(backup_dir.path(), "bk_keep", "all", 1000, None, true);
+        std::fs::write(backup_dir.path().join("upload-00000000deadbeef.part"), "x").unwrap();
+        std::fs::write(backup_dir.path().join("bk_crashed.ndjson.part"), "x").unwrap();
+
+        let restarted = restart_manager(&manager, backup_dir.path(), 500);
+
+        assert!(!backup_dir.path().join("upload-00000000deadbeef.part").exists());
+        assert!(!backup_dir.path().join("bk_crashed.ndjson.part").exists());
+        let list = restarted.list_backups().unwrap();
+        assert_eq!(list.len(), 1, "finished archives survive the sweep");
+        assert_eq!(list[0].id, "bk_keep");
+        // The crashed job's id no longer answers `backup_running` forever.
+        assert!(matches!(restarted.delete_backup("bk_crashed").unwrap_err(), BackupError::NotFound));
+    }
+
+    // 13. The restore registry is capped: a new restore evicts the oldest
+    //     finished statuses, never a running one.
+    #[tokio::test]
+    async fn test_restore_registry_evicts_oldest_finished() {
+        let (manager, _e, backup_dir) = make_manager().await;
+        write_fake_backup(backup_dir.path(), "bk_cap", "all", now_secs(), None, true);
+        {
+            let mut restores = manager.restores.write();
+            for i in 0..MAX_RESTORE_STATUSES + 5 {
+                let id = format!("rs_old_{i}");
+                restores.insert(
+                    id.clone(),
+                    RestoreStatus {
+                        restore_id: id,
+                        backup_id: "bk_cap".to_string(),
+                        state: RestoreState::Complete,
+                        imported: 0,
+                        skipped: 0,
+                        failed: 0,
+                        errors: Vec::new(),
+                        started_at: i as u64,
+                        finished_at: Some(i as u64),
+                    },
+                );
+            }
+        }
+
+        let (id, handle) =
+            manager.start_restore("bk_cap", restore::RestoreMode::FailIfExists, None, false).await.unwrap();
+        handle.await.unwrap();
+
+        let restores = manager.restores.read();
+        assert_eq!(restores.len(), MAX_RESTORE_STATUSES);
+        assert!(restores.contains_key(&id), "the new restore must never evict itself");
+        assert!(!restores.contains_key("rs_old_0"), "the oldest finished status goes first");
+        assert!(restores.contains_key(&format!("rs_old_{}", MAX_RESTORE_STATUSES + 4)));
+    }
+
+    // 14. scan_batch_size 0 is coerced at the manager boundary: downstream it
+    //     means "no throttling" in one path and "flush per document" in another.
+    #[tokio::test]
+    async fn test_scan_batch_size_zero_is_coerced_to_one() {
+        let (manager, _e, backup_dir) = make_manager().await;
+        let coerced = restart_manager(&manager, backup_dir.path(), 0);
+        assert_eq!(coerced.scan_batch_size, 1);
     }
 }

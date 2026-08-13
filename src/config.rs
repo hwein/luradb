@@ -805,14 +805,14 @@ impl ShmConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct BackupConfig {
-    /// Master switch. `false` = no scheduler task, backup endpoints answer 404.
+    /// Master switch. `false` = no scheduler task, backup endpoints answer 503.
     pub enabled: bool,
     /// Target directory for backup artifacts. Must not collide with any
     /// storage.*/json.*/rel.* path.
     pub dir: String,
     /// Entries scanned per batch and the pause between batches (pattern:
     /// json.reindex_batch_size/reindex_pause_ms) — keeps the foreground
-    /// latency impact small.
+    /// latency impact small. 0 is treated as 1.
     pub scan_batch_size: usize,
     pub scan_pause_ms: u64,
     /// Zero to many schedules; without one there are only on-demand backups.
@@ -882,9 +882,7 @@ impl BackupConfig {
         let mut seen_names = std::collections::HashSet::new();
         for sched in &self.schedule {
             anyhow::ensure!(
-                !sched.name.is_empty()
-                    && sched.name.len() <= 50
-                    && sched.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                crate::auth::handlers::valid_name(&sched.name),
                 "invalid config: backup schedule name '{}' must be 1-50 characters of [a-zA-Z0-9_-]",
                 sched.name
             );

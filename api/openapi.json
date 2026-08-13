@@ -2894,7 +2894,7 @@
           },
           "scope": {
             "type": "string",
-            "description": "`all` | `kv` | `json` | `kv:<domain>` | `json:<domain>` | `domain:<name>`."
+            "description": "`all` | `kv` | `json` | `kv:<domain>` | `json:<domain>` | `domain:<name>`.\nCovers the KV and JSON engines only — relational data is never included."
           }
         }
       },

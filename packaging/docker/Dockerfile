@@ -9,9 +9,12 @@ RUN apt-get update \
 
 # Docker port mapping reaches the container via its network interface only;
 # the host-side bind stays local (compose.yaml publishes 127.0.0.1 only).
-RUN sed -i 's/^bind_address = "127.0.0.1"$/bind_address = "0.0.0.0"/' /etc/luradb/luradb.toml
+# The grep asserts the patch landed - a drifted pattern is a silent no-op.
+RUN sed -i 's/^bind_address = "127.0.0.1"$/bind_address = "0.0.0.0"/' /etc/luradb/luradb.toml \
+    && grep -q '^bind_address = "0.0.0.0"$' /etc/luradb/luradb.toml
 # Swagger UI on for local exploring; the package default (false) stays untouched.
-RUN sed -i 's/^swagger_enabled = false$/swagger_enabled = true/' /etc/luradb/luradb.toml
+RUN sed -i 's/^swagger_enabled = false$/swagger_enabled = true/' /etc/luradb/luradb.toml \
+    && grep -q '^swagger_enabled = true$' /etc/luradb/luradb.toml
 COPY entrypoint.sh /usr/local/bin/luradb-entrypoint
 RUN chmod +x /usr/local/bin/luradb-entrypoint
 EXPOSE 3000

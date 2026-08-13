@@ -957,7 +957,7 @@ mod tests {
     }
 
     // Writes after the snapshot are invisible to the pinned domain read/scan,
-    // while the domain's live view has moved on (spec general/006 §Konsistenz).
+    // while the domain's live view has moved on (spec general/006, consistency section).
     #[tokio::test]
     async fn test_domain_snapshot_consistency() {
         let (engine, registry, _dir) = make_setup().await;

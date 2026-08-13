@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- KV: a TTL of `n` seconds now holds for at least `n` seconds. Expiry stamps are whole seconds and the sub-second remainder was dropped, so entries expired up to a second early — a 1-second TTL could be gone within milliseconds.
+
 ## [0.3.0] - 2026-08-13
 
 ### Added

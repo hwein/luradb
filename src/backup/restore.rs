@@ -985,7 +985,12 @@ mod tests {
 
         let out_dir = tempfile::TempDir::new().unwrap();
         make_backup(out_dir.path(), "bk_ttl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
-        tokio::time::sleep(Duration::from_millis(3100)).await;
+        // Wait on the clock the expiry check itself reads: a fixed sleep misses
+        // the boundary whenever the wall clock shifts under us.
+        let deadline = now_secs() + 3;
+        while now_secs() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let (_engine2, kv_dst, _d2) = make_kv_registry().await;
         let outcome = run_restore(RestoreParams {

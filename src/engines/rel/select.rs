@@ -9,7 +9,7 @@
 
 use super::ast::{Limit, OrderItem, Select, SelectItem};
 use super::catalog::{CatalogEntry, TableSchema};
-use super::cross_engine::LinkMask;
+use super::cross_engine::{LinkAuth, LinkMask};
 use super::dml::{accepted_quals, resolve_column};
 use super::error::RelStoreError;
 use super::eval::{eval, Bool3, Pred};
@@ -575,6 +575,7 @@ impl RelEngine {
         domain: &str,
         sel: Select,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
         // View-inlining pre-stage (spec rel/008 §1/§4): replaces every FROM/JOIN
         // view reference with its definition, recursively, *before* the rest of
@@ -582,7 +583,7 @@ impl RelEngine {
         // select touching no view pays nothing (returns `sel` unchanged).
         let sel = super::view::inline_views(self, domain, sel)?;
         if !sel.joins.is_empty() {
-            return self.exec_select_joined(domain, sel, params).await;
+            return self.exec_select_joined(domain, sel, params, auth).await;
         }
         let dom = self.domains.require_active(domain)?;
         let schema = match self.catalog.get(&self.domains, domain, &sel.from.name) {
@@ -608,7 +609,7 @@ impl RelEngine {
 
         // One registry lookup per query (spec rel/012 §3), reused for the
         // planner guard and the RowScan materialization.
-        let mask = self.compute_link_mask(domain, &[&schema]).await?;
+        let mask = self.compute_link_mask(domain, &[&schema], auth).await?;
 
         if sel.items.len() == 1 && matches!(sel.items[0], SelectItem::CountStar) {
             return self.exec_count(&schema, &prefix, &sel, &quals, params, mask).await;

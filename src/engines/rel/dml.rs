@@ -6,7 +6,7 @@
 
 use super::ast::{Assignment, CompareOp, Delete, Expr, Insert, Literal, Operand, Select, Statement, Update};
 use super::catalog::{CatalogEntry, ColumnDef, DefaultValue, TableSchema};
-use super::cross_engine::{JsonResolution, KvResolution};
+use super::cross_engine::{JsonResolution, KvResolution, LinkAuth};
 use super::domain::RelDomain;
 use super::error::RelStoreError;
 use super::eval::{eval, Bool3, Pred, PredOperand};
@@ -101,12 +101,13 @@ impl RelEngine {
         domain: &str,
         stmt: Statement,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
         match stmt {
-            Statement::Insert(i) => self.exec_insert(domain, i, params).await.map(ExecOutcome::Dml),
-            Statement::Update(u) => self.exec_update(domain, u, params).await.map(ExecOutcome::Dml),
+            Statement::Insert(i) => self.exec_insert(domain, i, params, auth).await.map(ExecOutcome::Dml),
+            Statement::Update(u) => self.exec_update(domain, u, params, auth).await.map(ExecOutcome::Dml),
             Statement::Delete(d) => self.exec_delete(domain, d, params).await.map(ExecOutcome::Dml),
-            Statement::Select(s) => self.exec_select(domain, s, params).await,
+            Statement::Select(s) => self.exec_select(domain, s, params, auth).await,
             Statement::CreateView(_) | Statement::DropView(_) => {
                 unreachable!("CREATE/DROP VIEW are dispatched in RelEngine::execute (rel/008 view.rs)")
             }
@@ -142,6 +143,7 @@ impl RelEngine {
         domain: &str,
         ins: Insert,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<DmlResult, RelStoreError> {
         let (dom, schema) = self.require_table(domain, &ins.table)?;
         let prefix = &dom.system_prefix;
@@ -169,7 +171,7 @@ impl RelEngine {
 
         for row in &rows {
             let pk_v = self
-                .stage_insert_row(domain, &schema, prefix, row, snap, &mut seen_pk, &mut seen_unique, &mut ops)
+                .stage_insert_row(domain, &schema, prefix, row, snap, &mut seen_pk, &mut seen_unique, &mut ops, auth)
                 .await?;
             if single {
                 last_pk = Some(pk_v);
@@ -202,6 +204,7 @@ impl RelEngine {
         seen_pk: &mut HashSet<Vec<u8>>,
         seen_unique: &mut HashSet<(u32, Vec<u8>)>,
         ops: &mut Vec<BatchOp>,
+        auth: LinkAuth,
     ) -> Result<ScalarValue, RelStoreError> {
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
         self.validate_not_null_and_text(schema, &row.values)?;
@@ -229,7 +232,7 @@ impl RelEngine {
 
         self.check_row_unique(schema, &row.values, prefix, &pk_enc, seen_unique).await?;
         self.check_row_references(domain, schema, &row.values, prefix, snap).await?;
-        self.check_row_cross_engine_links(domain, schema, &row.values).await?;
+        self.check_row_cross_engine_links(domain, schema, &row.values, auth).await?;
 
         for k in row_index_keys(schema, &row.values, prefix, &pk_enc) {
             self.guard_key_len(&k)?;
@@ -246,6 +249,7 @@ impl RelEngine {
         domain: &str,
         upd: Update,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<DmlResult, RelStoreError> {
         let (dom, schema) = self.require_table(domain, &upd.table)?;
         let prefix = &dom.system_prefix;
@@ -283,7 +287,7 @@ impl RelEngine {
             let row_key = keys::row_key(prefix, schema.table_id, &pk_enc);
             self.guard_key_len(&row_key)?;
 
-            self.check_updated_references(domain, prefix, &sets, snap).await?;
+            self.check_updated_references(domain, prefix, &sets, snap, auth).await?;
             self.diff_update_indexes(&schema, prefix, &old, &new, &set_ids, &pk_enc, &mut seen_unique, &mut ops)
                 .await?;
             ops.push(BatchOp::Put { key: row_key, value: row_bytes });
@@ -302,6 +306,7 @@ impl RelEngine {
         prefix: &[u8],
         sets: &[(ColumnDef, ScalarValue)],
         snap: &Snapshot,
+        auth: LinkAuth,
     ) -> Result<(), RelStoreError> {
         for (c, v) in sets {
             if c.references.is_some() && !matches!(c.col_type, ColumnType::KvRef | ColumnType::JsonRef) {
@@ -309,7 +314,7 @@ impl RelEngine {
             }
             if matches!(c.col_type, ColumnType::KvRef | ColumnType::JsonRef) {
                 if let ScalarValue::Text(key) = v {
-                    self.validate_cross_engine_link(domain, c, key).await?;
+                    self.validate_cross_engine_link(domain, c, key, auth).await?;
                 }
             }
         }
@@ -564,20 +569,25 @@ impl RelEngine {
         domain: &str,
         schema: &TableSchema,
         values: &HashMap<u16, ScalarValue>,
+        auth: LinkAuth,
     ) -> Result<(), RelStoreError> {
         for c in &schema.columns {
             if !matches!(c.col_type, ColumnType::KvRef | ColumnType::JsonRef) {
                 continue;
             }
             if let Some(ScalarValue::Text(key)) = values.get(&c.col_id) {
-                self.validate_cross_engine_link(domain, c, key).await?;
+                self.validate_cross_engine_link(domain, c, key, auth).await?;
             }
         }
         Ok(())
     }
 
     /// Validates one non-NULL link value against its same-named target domain
-    /// (existence suffices — a null-value key *exists*). `DomainUnavailable`
+    /// (existence suffices — a null-value key *exists*). Missing read access
+    /// (`auth`, spec rel/016) is rejected first, before any existence lookup
+    /// and without charging the write-validation metric — otherwise an
+    /// unauthorized caller could distinguish an existing from a missing key,
+    /// exactly the oracle this spec closes. `DomainUnavailable`
     /// (disabled/gone/`Deleting`) and `Absent` (active but missing) map to the
     /// two 409 variants (spec §2/§7).
     async fn validate_cross_engine_link(
@@ -585,9 +595,13 @@ impl RelEngine {
         domain: &str,
         col: &ColumnDef,
         key: &str,
+        auth: LinkAuth,
     ) -> Result<(), RelStoreError> {
         match col.col_type {
             ColumnType::KvRef => {
+                if !auth.kv_read {
+                    return Err(RelStoreError::CrossEngineForbidden { engine: "kv".to_string() });
+                }
                 self.cross_engine.record_write_validation("kv");
                 match self.cross_engine.kv_lookup(domain, key).await? {
                     KvResolution::DomainUnavailable => Err(RelStoreError::CrossEngineTargetUnavailable {
@@ -603,6 +617,9 @@ impl RelEngine {
                 }
             }
             ColumnType::JsonRef => {
+                if !auth.json_read {
+                    return Err(RelStoreError::CrossEngineForbidden { engine: "json".to_string() });
+                }
                 self.cross_engine.record_write_validation("json");
                 match self.cross_engine.json_lookup(domain, key).await? {
                     JsonResolution::DomainUnavailable => Err(RelStoreError::CrossEngineTargetUnavailable {

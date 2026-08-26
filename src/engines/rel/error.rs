@@ -163,6 +163,11 @@ pub enum RelStoreError {
     /// does not exist in the `engine` (→ 409).
     #[error("cross-engine link target '{target}' of column '{column}' is missing in {engine}")]
     CrossEngineLinkMissing { column: String, engine: String, target: String },
+    /// DML: the caller lacks read access to the same-named target domain —
+    /// rejected before any existence lookup, so an unauthorized caller cannot
+    /// distinguish an existing from a missing key (spec rel/016) (→ 403).
+    #[error("cross-engine {engine} link forbidden: missing read access to the target domain")]
+    CrossEngineForbidden { engine: String },
 
     #[error("serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),

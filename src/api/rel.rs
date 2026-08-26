@@ -4,10 +4,10 @@
 //! (200 | 400 | 404 | 409 | 410 | 413 | 429 | 503).
 
 use crate::api::{middleware::ApiError, AppState};
-use crate::auth::middleware::{enforce_sql_level, AuthOutcome};
+use crate::auth::middleware::{enforce_sql_level, AuthOutcome, AuthUser};
 use crate::auth::AccessLevel;
 use crate::engines::rel::{
-    scalar_to_json, ColumnType, DmlResult, RelEngine, RelStoreError, SqlOutcome, StatementClass,
+    scalar_to_json, ColumnType, DmlResult, LinkAuth, RelEngine, RelStoreError, SqlOutcome, StatementClass,
 };
 use axum::{
     extract::{Extension, Path, State},
@@ -68,6 +68,10 @@ impl From<RelStoreError> for ApiError {
             | RelStoreError::ViewDependencyConflict { .. }
             | RelStoreError::CrossEngineTargetUnavailable { .. }
             | RelStoreError::CrossEngineLinkMissing { .. } => StatusCode::CONFLICT,
+            // 403 — missing read access to a cross-engine link's target domain
+            // (rel/016), rejected before the existence check that would
+            // otherwise 409.
+            RelStoreError::CrossEngineForbidden { .. } => StatusCode::FORBIDDEN,
             // 410 — domain marked for deletion (rel/013 purges it later).
             RelStoreError::DomainDeleting(_) => StatusCode::GONE,
             // 429 — per-domain request budget exhausted (rel/009 §7).
@@ -95,6 +99,42 @@ pub(crate) fn rel_engine(state: &AppState) -> Result<&Arc<RelEngine>, ApiError> 
             "503 Service Unavailable: relational engine is disabled (rel.enabled = false)",
         )
     })
+}
+
+/// Builds the cross-engine `LinkAuth` for one rel request (spec rel/016):
+/// auth disabled, or an admin/trusted-peer `AuthOutcome::Full`, gets
+/// unrestricted access. A Scoped user's KV/JSON read rights are looked up
+/// against the same-named `{domain}` (bare KV namespace) / `json:{domain}`
+/// permission entries — the same domain-per-engine split the middleware
+/// already enforces elsewhere (spec rel/012 §Kontext). Fail-closed (both
+/// `false`) if auth is on but the outcome/user extension is unexpectedly
+/// missing — a middleware bug must never grant silent access.
+pub(crate) async fn compute_link_auth(
+    state: &AppState,
+    outcome: Option<AuthOutcome>,
+    user: Option<&AuthUser>,
+    domain: &str,
+) -> LinkAuth {
+    if !state.auth_enabled {
+        return LinkAuth::full();
+    }
+    match outcome {
+        Some(AuthOutcome::Full) => LinkAuth::full(),
+        Some(AuthOutcome::Scoped(_)) => {
+            let Some(AuthUser(name)) = user else {
+                return LinkAuth { kv_read: false, json_read: false };
+            };
+            let kv_read =
+                state.auth_cache.get_permission(name, domain).await.is_some_and(|l| l >= AccessLevel::Read);
+            let json_read = state
+                .auth_cache
+                .get_permission(name, &format!("json:{domain}"))
+                .await
+                .is_some_and(|l| l >= AccessLevel::Read);
+            LinkAuth { kv_read, json_read }
+        }
+        None => LinkAuth { kv_read: false, json_read: false },
+    }
 }
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
@@ -210,6 +250,7 @@ pub async fn execute_sql(
     State(state): State<AppState>,
     Path(domain): Path<String>,
     auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
     Json(body): Json<SqlRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let engine = rel_engine(&state)?;
@@ -218,15 +259,21 @@ pub async fn execute_sql(
     // statement-class level *before* execute_sql runs it — this is the real
     // authorization, since the middleware only demanded Read for `/sql`.
     // Doubles the parse (classify + execute_sql's own); accepted (rel/011 §4/§9).
+    let outcome = auth_outcome.map(|Extension(o)| o);
     let required = match engine.classify(&body.sql)? {
         StatementClass::Read => AccessLevel::Read,
         StatementClass::Write => AccessLevel::Write,
         StatementClass::Ddl => AccessLevel::Ddl,
     };
-    enforce_sql_level(state.auth_enabled, auth_outcome.map(|Extension(o)| o), required)
+    enforce_sql_level(state.auth_enabled, outcome, required)
         .map_err(|resp| ApiError::new(resp.status(), "Forbidden"))?;
 
-    let outcome = engine.execute_sql(&domain, &body.sql, &body.params, &body.expand).await?;
+    // rel/016: the caller's cross-engine KV/JSON read rights, gating expand
+    // masking and cross-engine write validation inside `execute_sql` itself.
+    let user = auth_user.map(|Extension(u)| u);
+    let link_auth = compute_link_auth(&state, outcome, user.as_ref(), &domain).await;
+
+    let outcome = engine.execute_sql(&domain, &body.sql, &body.params, &body.expand, link_auth).await?;
     let response = build_response(outcome);
 
     // 413 (spec §6): a handler-side check after serialization, not an
@@ -1027,5 +1074,178 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(cache.get_permission("worker", "rel:shop").await, None);
+    }
+
+    // rel/016: cross-engine LinkAuth via HTTP. A worker with rel:shop
+    // Read+Write but no KV grant on "shop" gets expand masked to null and
+    // INSERT-with-link forbidden — identically for an existing and a missing
+    // key (oracle-proof). Granting KV Read on "shop" (the bare KV namespace,
+    // not "rel:shop") unmasks expand and lets the INSERT through. Admin is
+    // unaffected throughout.
+    #[tokio::test]
+    async fn test_link_auth_cross_engine_http() {
+        use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
+
+        let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
+        let cache = Arc::clone(&state.auth_cache);
+        let kv_registry = Arc::clone(&state.registry);
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+
+        let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {bearer}"));
+            let req = if let Some(b) = body {
+                builder = builder.header("content-type", "application/json");
+                builder.body(Body::from(b.to_string())).unwrap()
+            } else {
+                builder.body(Body::empty()).unwrap()
+            };
+            app.clone().oneshot(req)
+        };
+
+        // KV domain "shop" (bare namespace), seeded directly through the
+        // registry with an existing key.
+        kv_registry.create_domain("shop").await.unwrap();
+        kv_registry.store("shop").await.unwrap().put(b"realkey", b"realvalue").await.unwrap();
+
+        let admin_key = "lura_test_admin_key";
+        cache
+            .upsert_user(UserRecord {
+                name: "boss".to_string(),
+                api_key_hash: hash_api_key(admin_key),
+                role: UserRole::Admin,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        let resp = send(Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#), admin_key)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)"}"#),
+            admin_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "INSERT INTO t VALUES (1, 'realkey')"}"#),
+            admin_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Worker: rel:shop Read+Write, no KV grant on "shop" yet.
+        let user_key = "lura_test_worker_key";
+        cache
+            .upsert_user(UserRecord {
+                name: "worker".to_string(),
+                api_key_hash: hash_api_key(user_key),
+                role: UserRole::User,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        cache
+            .set_permission(DomainPermission {
+                username: "worker".to_string(),
+                domain: "rel:shop".to_string(),
+                access: AccessLevel::Write,
+            })
+            .await
+            .unwrap();
+
+        // Expand without a KV grant: masked to null, same as a gone target
+        // domain (spec rel/016 — indistinguishable, no read-side oracle).
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "SELECT * FROM t WHERE id = 1", "expand": ["payload"]}"#),
+            user_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["expanded"]["payload"], json!([null]), "no KV grant -> masked, {body}");
+
+        // INSERT with a link, no KV grant: 403 for both an existing and a
+        // missing key — identical status either way (oracle-proof).
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "INSERT INTO t VALUES (2, 'realkey')"}"#),
+            user_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "existing key, no KV read grant");
+
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "INSERT INTO t VALUES (3, 'ghost-key')"}"#),
+            user_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "missing key -> same 403 as an existing key");
+
+        // Grant KV Read on "shop" (bare KV namespace, not "rel:shop"): expand
+        // now resolves, and the previously-forbidden INSERT succeeds.
+        cache
+            .set_permission(DomainPermission {
+                username: "worker".to_string(),
+                domain: "shop".to_string(),
+                access: AccessLevel::Read,
+            })
+            .await
+            .unwrap();
+
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "SELECT * FROM t WHERE id = 1", "expand": ["payload"]}"#),
+            user_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(
+            body["expanded"]["payload"],
+            json!([{"exists": true, "value": "realvalue", "encoding": "utf8"}]),
+            "KV read granted -> resolves, {body}"
+        );
+
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "INSERT INTO t VALUES (2, 'realkey')"}"#),
+            user_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "KV read granted -> INSERT with a link succeeds");
+
+        // Admin is unaffected throughout: still gets the ordinary
+        // existence-based 409, never a blanket 403.
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "INSERT INTO t VALUES (4, 'another-ghost')"}"#),
+            admin_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "admin keeps the ordinary CrossEngineLinkMissing 409");
     }
 }

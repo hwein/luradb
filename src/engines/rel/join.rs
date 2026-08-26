@@ -7,7 +7,7 @@
 
 use super::ast::{ColumnRef, CompareOp, Expr, Join, Literal, Operand, OrderItem, Select, SelectItem};
 use super::catalog::{CatalogEntry, TableSchema};
-use super::cross_engine::LinkMask;
+use super::cross_engine::{LinkAuth, LinkMask};
 use super::error::RelStoreError;
 use super::eval::{eval, Bool3, Pred, PredOperand};
 use super::keys;
@@ -885,6 +885,7 @@ impl RelEngine {
         domain: &str,
         sel: Select,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
         check_join_depth(sel.joins.len(), 0, self.max_join_depth)?;
 
@@ -905,7 +906,7 @@ impl RelEngine {
         // One masking lookup for the whole query (spec rel/012 §3): every
         // binding shares this rel domain, so one KV/JSON status pair covers all.
         let schemas: Vec<&TableSchema> = bindings.iter().map(|b| b.schema.as_ref()).collect();
-        let mask = self.compute_link_mask(domain, &schemas).await?;
+        let mask = self.compute_link_mask(domain, &schemas, auth).await?;
 
         self.metrics.record_rel_select_statement();
 

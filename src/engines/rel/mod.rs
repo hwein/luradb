@@ -31,7 +31,7 @@ pub use catalog::{
     CatalogEntry, CatalogLimits, ColumnDef, ColumnInput, DefaultValue, IndexMeta, RelCatalog,
     TableInput, TableSchema, ViewSchema,
 };
-pub use cross_engine::{CrossEngineResolver, RelCrossEngineSweeper};
+pub use cross_engine::{CrossEngineResolver, LinkAuth, RelCrossEngineSweeper};
 pub use ddl::DdlOutcome;
 pub use dml::{DmlResult, SelectResult};
 pub use domain::{RelDomain, RelDomainState};
@@ -350,7 +350,7 @@ impl RelEngine {
         sql: &str,
         params: &[serde_json::Value],
     ) -> Result<ExecOutcome, RelStoreError> {
-        self.execute_checked(domain, sql, params, |_class| Ok(())).await
+        self.execute_checked(domain, sql, params, LinkAuth::full(), |_class| Ok(())).await
     }
 
     /// Shared core of [`Self::execute`] and the REST-edge
@@ -358,13 +358,16 @@ impl RelEngine {
     /// bind/dispatch, with one seam — `mid` runs right after classification,
     /// before binding/dispatch ever touches the engine, so a caller can gate
     /// the statement (rate limit here; rel/011 adds statement-level auth at
-    /// the same seam) without a second parse. `execute` passes a no-op `mid`,
-    /// so its behavior/signature are unchanged.
+    /// the same seam) without a second parse. `execute` passes a no-op `mid`
+    /// and `LinkAuth::full()`, so its behavior/signature are unchanged.
+    /// `auth` flows into `execute_dml` for cross-engine link masking/
+    /// validation (spec rel/016).
     pub(crate) async fn execute_checked(
         &self,
         domain: &str,
         sql: &str,
         params: &[serde_json::Value],
+        auth: LinkAuth,
         mid: impl FnOnce(StatementClass) -> Result<(), RelStoreError> + Send,
     ) -> Result<ExecOutcome, RelStoreError> {
         let tokens = lexer::tokenize(sql, self.max_statement_len).map_err(|e| {
@@ -420,7 +423,7 @@ impl RelEngine {
                 ast::Statement::DropView(dv) => {
                     view::execute_drop_view(self, domain, dv).await.map(ExecOutcome::Ddl)
                 }
-                other => self.execute_dml(domain, other, params).await,
+                other => self.execute_dml(domain, other, params, auth).await,
             },
         }
     }

@@ -118,6 +118,11 @@ impl CrossEngineResolver {
     /// KVREF point lookup **directly on the KV LSM instance** (not via
     /// `DomainStore`): governance is already charged once at the rel REST edge
     /// against the rel domain (§1), so a second KV rate-limit hit is wrong.
+    /// Authorization is likewise handled upstream, not here (spec rel/016): a
+    /// caller lacking KV read access never reaches this function — the read
+    /// path masks the link cell to `NULL` before expand ever resolves it, and
+    /// the write path rejects the link before `validate_cross_engine_link`
+    /// calls this.
     pub async fn kv_lookup(&self, domain: &str, key: &str) -> anyhow::Result<KvResolution> {
         let Some(kv) = &self.kv else { return Ok(KvResolution::DomainUnavailable) };
         let Some(dom) = kv.get_domain(domain).await? else {
@@ -136,7 +141,8 @@ impl CrossEngineResolver {
 
     /// JSONREF point lookup via the rate-limit-free `get_document` primitive.
     /// A key that is not a valid document key cannot reference a document →
-    /// `Absent` (a clean 409/`exists:false`, never a 500).
+    /// `Absent` (a clean 409/`exists:false`, never a 500). Authorization is
+    /// handled upstream, same as `kv_lookup` above (spec rel/016).
     pub async fn json_lookup(&self, domain: &str, key: &str) -> anyhow::Result<JsonResolution> {
         let Some(json) = &self.json else { return Ok(JsonResolution::DomainUnavailable) };
         match json.get_document(domain, key).await {
@@ -162,6 +168,26 @@ impl CrossEngineResolver {
 
     pub(crate) fn record_swept_cells(&self, n: u64) {
         self.metrics.record_rel_cross_engine_swept_cells(n);
+    }
+}
+
+// ── Authorization (spec rel/016) ──────────────────────────────────────────────
+
+/// Per-request cross-engine read rights, resolved by the REST handlers from
+/// the caller's KV/JSON permissions and threaded down to `compute_link_mask`
+/// (read path) and `validate_cross_engine_link` (write path). Plain bools —
+/// no `auth`-crate type reaches this engine module.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkAuth {
+    pub kv_read: bool,
+    pub json_read: bool,
+}
+
+impl LinkAuth {
+    /// Unrestricted: admins, trusted UDS peers, `auth.enabled = false`, and
+    /// every caller going through `RelEngine::execute` (internal/test path).
+    pub fn full() -> Self {
+        Self { kv_read: true, json_read: true }
     }
 }
 
@@ -205,11 +231,15 @@ impl LinkMask {
 impl RelEngine {
     /// Computes the query-wide `LinkMask` for the given schemas (all in the
     /// same rel domain): one KV status read (async) and one JSON status read
-    /// (sync), each only when a column of that type is actually present.
+    /// (sync), each only when a column of that type is actually present. A
+    /// missing `auth` right masks the column outright without even checking
+    /// the target domain's status (spec rel/016) — indistinguishable from
+    /// "target domain gone", so no new read-side oracle is introduced.
     pub(crate) async fn compute_link_mask(
         &self,
         domain: &str,
         schemas: &[&TableSchema],
+        auth: LinkAuth,
     ) -> Result<LinkMask, RelStoreError> {
         let has = |ct: ColumnType| {
             schemas
@@ -217,9 +247,9 @@ impl RelEngine {
                 .any(|s| s.columns.iter().any(|c| c.col_type == ct))
         };
         let kvref = has(ColumnType::KvRef)
-            && !self.cross_engine.kv_domain_status(domain).await?.is_active();
+            && (!auth.kv_read || !self.cross_engine.kv_domain_status(domain).await?.is_active());
         let jsonref = has(ColumnType::JsonRef)
-            && !self.cross_engine.json_domain_status(domain).is_active();
+            && (!auth.json_read || !self.cross_engine.json_domain_status(domain).is_active());
         Ok(LinkMask { kvref, jsonref })
     }
 
@@ -627,10 +657,14 @@ mod tests {
 
     async fn expand_block(rel: &RelEngine, domain: &str, sql: &str, ex: &[&str]) -> ExpandedBlock {
         let ex: Vec<String> = ex.iter().map(|s| s.to_string()).collect();
-        match rel.execute_sql(domain, sql, &[], &ex).await.unwrap() {
+        match rel.execute_sql(domain, sql, &[], &ex, LinkAuth::full()).await.unwrap() {
             SqlOutcome::Select { expanded, .. } => expanded.unwrap_or_default(),
             o => panic!("expected SELECT, got {o:?}"),
         }
+    }
+
+    fn mk_body(v: Value) -> serde_json::Map<String, Value> {
+        v.as_object().unwrap().clone()
     }
 
     fn colv<'a>(exp: &'a ExpandedBlock, name: &str) -> &'a [Value] {
@@ -929,7 +963,11 @@ mod tests {
         kv_put(&e.kv, "default", b"k", b"v").await;
         ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
         ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'k')").await;
-        let out = e.rel.execute_sql("default", "SELECT * FROM t", &[], &["payload".to_string()]).await.unwrap();
+        let out = e
+            .rel
+            .execute_sql("default", "SELECT * FROM t", &[], &["payload".to_string()], LinkAuth::full())
+            .await
+            .unwrap();
         match out {
             SqlOutcome::Select { expanded, .. } => {
                 assert_eq!(colv(&expanded.unwrap(), "payload")[0], json!({ "exists": true, "value": "v", "encoding": "utf8" }));
@@ -946,7 +984,10 @@ mod tests {
         kv_put(&e.kv, "default", b"k", b"v").await;
         ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
         ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'k')").await;
-        let out = e.rel.execute_sql("default", "SELECT * FROM t", &[], &["payload".to_string()]).await;
+        let out = e
+            .rel
+            .execute_sql("default", "SELECT * FROM t", &[], &["payload".to_string()], LinkAuth::full())
+            .await;
         assert!(matches!(out, Err(RelStoreError::JoinDepthExceeded { .. })), "got: {out:?}");
     }
 
@@ -1209,5 +1250,112 @@ mod tests {
             ScalarValue::Text("k".into()),
             "Deleting rel domain untouched by the cross-engine sweeper"
         );
+    }
+
+    // ── LinkAuth (spec rel/016) ────────────────────────────────────────────
+
+    // 26. (a)+(b) missing read right masks only that engine's link columns —
+    // identical to "target domain gone" — the other engine stays untouched;
+    // both rights present resolves exactly as before.
+    #[tokio::test]
+    async fn test_link_auth_masks_select_and_expand_per_engine() {
+        let e = env().await;
+        kv_put(&e.kv, "default", b"k", b"v").await;
+        e.json.put_document("default", "j1", json!({"x": 1})).await.unwrap();
+        ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF, doc JSONREF)").await;
+        ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'k', 'j1')").await;
+
+        // kv_read=false: KVREF masked in SELECT and expand; JSONREF untouched.
+        let no_kv = LinkAuth { kv_read: false, json_read: true };
+        let out = e
+            .rel
+            .execute_sql("default", "SELECT * FROM t", &[], &["*".to_string()], no_kv)
+            .await
+            .unwrap();
+        let SqlOutcome::Select { result, expanded } = out else { panic!("expected SELECT") };
+        assert_eq!(result.rows[0][1], ScalarValue::Null, "KVREF masked in SELECT projection");
+        assert_eq!(result.rows[0][2], ScalarValue::Text("j1".into()), "JSONREF untouched");
+        let expanded = expanded.unwrap();
+        assert_eq!(colv(&expanded, "payload")[0], Value::Null, "masked column expands to null");
+        assert_eq!(colv(&expanded, "doc")[0], json!({ "exists": true, "document": {"x": 1} }));
+
+        // json_read=false: the mirror case.
+        let no_json = LinkAuth { kv_read: true, json_read: false };
+        let out = e
+            .rel
+            .execute_sql("default", "SELECT * FROM t", &[], &["*".to_string()], no_json)
+            .await
+            .unwrap();
+        let SqlOutcome::Select { result, expanded } = out else { panic!("expected SELECT") };
+        assert_eq!(result.rows[0][1], ScalarValue::Text("k".into()), "KVREF untouched");
+        assert_eq!(result.rows[0][2], ScalarValue::Null, "JSONREF masked in SELECT projection");
+        let expanded = expanded.unwrap();
+        assert_eq!(colv(&expanded, "payload")[0], json!({ "exists": true, "value": "v", "encoding": "utf8" }));
+        assert_eq!(colv(&expanded, "doc")[0], Value::Null, "masked column expands to null");
+
+        // Both rights present: unchanged from the rel/012 baseline.
+        let out = e
+            .rel
+            .execute_sql("default", "SELECT * FROM t", &[], &["*".to_string()], LinkAuth::full())
+            .await
+            .unwrap();
+        let SqlOutcome::Select { result, .. } = out else { panic!("expected SELECT") };
+        assert_eq!(result.rows[0][1], ScalarValue::Text("k".into()));
+        assert_eq!(result.rows[0][2], ScalarValue::Text("j1".into()));
+    }
+
+    // 27. (c) write path: missing read right rejects *before* any existence
+    // lookup — an existing and a nonexistent key get the identical
+    // CrossEngineForbidden, proving there is no oracle; no write-validation
+    // metric tick either.
+    #[tokio::test]
+    async fn test_link_auth_forbids_write_before_existence_check() {
+        let e = env().await;
+        kv_put(&e.kv, "default", b"exists", b"v").await;
+        ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
+
+        let no_kv = LinkAuth { kv_read: false, json_read: true };
+        let before = e.metrics.system.rel_cross_engine_write_validations_kv_total.load(Ordering::Relaxed);
+
+        let body_existing = mk_body(json!({"id": 1, "payload": "exists"}));
+        let err = e.rel.insert_row("default", "t", &body_existing, no_kv).await.unwrap_err();
+        assert!(matches!(&err, RelStoreError::CrossEngineForbidden { engine } if engine == "kv"), "got: {err}");
+
+        let body_missing = mk_body(json!({"id": 2, "payload": "does-not-exist"}));
+        let err = e.rel.insert_row("default", "t", &body_missing, no_kv).await.unwrap_err();
+        assert!(matches!(&err, RelStoreError::CrossEngineForbidden { engine } if engine == "kv"), "got: {err}");
+
+        assert_eq!(count(&e.rel, "default", "t").await, 0, "both rejected inserts left no row");
+        assert_eq!(
+            e.metrics.system.rel_cross_engine_write_validations_kv_total.load(Ordering::Relaxed),
+            before,
+            "a forbidden link performs no cross-engine write-validation metric tick"
+        );
+    }
+
+    // 28. (d) WHERE-oracle: a masked column matches nothing under an equality
+    // predicate and everything under IS NULL — mirrors test 18's domain-gone
+    // case, but caused by a missing LinkAuth right instead.
+    #[tokio::test]
+    async fn test_link_auth_where_oracle() {
+        let e = env().await;
+        kv_put(&e.kv, "default", b"k1", b"v").await;
+        kv_put(&e.kv, "default", b"k2", b"v").await;
+        ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
+        ok(&e.rel, "default", "CREATE INDEX ix ON t (payload)").await;
+        ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'k1'), (2, 'k2')").await;
+
+        let no_kv = LinkAuth { kv_read: false, json_read: true };
+
+        async fn count_rows(rel: &RelEngine, sql: &str, auth: LinkAuth) -> usize {
+            match rel.execute_sql("default", sql, &[], &[], auth).await.unwrap() {
+                SqlOutcome::Select { result, .. } => result.rows.len(),
+                o => panic!("expected SELECT, got {o:?}"),
+            }
+        }
+
+        assert_eq!(count_rows(&e.rel, "SELECT id FROM t WHERE payload IS NULL", no_kv).await, 2);
+        assert_eq!(count_rows(&e.rel, "SELECT id FROM t WHERE payload = 'k1'", no_kv).await, 0);
+        assert_eq!(count_rows(&e.rel, "SELECT id FROM t WHERE payload IS NOT NULL", no_kv).await, 0);
     }
 }

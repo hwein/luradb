@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.2.2",
+    "version": "0.3.0",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -2352,6 +2352,9 @@
           "400": {
             "description": "NOT NULL/type/schema violation"
           },
+          "403": {
+            "description": "Missing read access to a linked KV/JSON domain (rel/016)"
+          },
           "404": {
             "description": "Domain, table, or referenced body column not found"
           },
@@ -2504,6 +2507,9 @@
           },
           "400": {
             "description": "NOT NULL/type/schema violation, or body primary key != path primary key"
+          },
+          "403": {
+            "description": "Missing read access to a linked KV/JSON domain (rel/016)"
           },
           "404": {
             "description": "Domain, table, column, or row not found"

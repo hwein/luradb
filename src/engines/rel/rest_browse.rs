@@ -5,6 +5,7 @@
 
 use super::ast::{ColumnRef, CompareOp, Expr, Limit, Operand, Select, SelectItem, TableRef};
 use super::catalog::{CatalogEntry, TableSchema};
+use super::cross_engine::LinkAuth;
 use super::dml::SelectResult;
 use super::error::RelStoreError;
 use super::rest_exec::ExpandedBlock;
@@ -45,6 +46,7 @@ impl RelEngine {
         expand: &[String],
         limit: Option<i64>,
         offset: Option<i64>,
+        auth: LinkAuth,
     ) -> Result<(SelectResult, Option<ExpandedBlock>, u64, u64), RelStoreError> {
         let schema = self.browse_table(domain, table)?;
 
@@ -94,7 +96,7 @@ impl RelEngine {
             limit: limit_clause,
         };
 
-        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &params).await? else {
+        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &params, auth).await? else {
             unreachable!("a Select statement always yields ExecOutcome::Select")
         };
 
@@ -122,6 +124,7 @@ impl RelEngine {
         table: &str,
         pk_raw: &str,
         expand: &[String],
+        auth: LinkAuth,
     ) -> Result<Option<(SelectResult, Option<ExpandedBlock>)>, RelStoreError> {
         let schema = self.browse_table(domain, table)?;
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
@@ -140,7 +143,7 @@ impl RelEngine {
             limit: None,
         };
 
-        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &[pk_value]).await? else {
+        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &[pk_value], auth).await? else {
             unreachable!("a Select statement always yields ExecOutcome::Select")
         };
         if result.rows.is_empty() {
@@ -222,8 +225,8 @@ mod tests {
         rel.create_table("default", TableInput { name: "orders".to_string(), columns: vec![id_col, amount_col] })
             .await
             .unwrap();
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 50}))).await.unwrap();
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 2, "amount": 99}))).await.unwrap();
+        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 50})), LinkAuth::full()).await.unwrap();
+        rel.insert_row("default", "orders", &mk_body(json!({"id": 2, "amount": 99})), LinkAuth::full()).await.unwrap();
     }
 
     // 010-F1(c): a mixed-case `?col=` filter name must resolve against the
@@ -236,7 +239,8 @@ mod tests {
 
         let mut filters = HashMap::new();
         filters.insert("Amount".to_string(), "50".to_string());
-        let (result, _, _, _) = rel.browse_rows("default", "orders", &filters, &[], None, None).await.unwrap();
+        let (result, _, _, _) =
+            rel.browse_rows("default", "orders", &filters, &[], None, None, LinkAuth::full()).await.unwrap();
 
         assert_eq!(result.rows.len(), 1, "exactly the row with amount=50 must match");
         let idx = result.columns.iter().position(|(n, _)| n.as_str() == "id").unwrap();

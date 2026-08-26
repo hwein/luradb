@@ -16,14 +16,14 @@
 //! built here); `rel_engine(&state)?` + a rate-limit charge guard every
 //! handler, matching rel/009's `/sql` handler.
 
-use crate::api::rel::{column_type_name, dml_result_json, rel_engine};
+use crate::api::rel::{column_type_name, compute_link_auth, dml_result_json, rel_engine};
 use crate::api::{middleware::ApiError, AppState};
+use crate::auth::middleware::{AuthOutcome, AuthUser};
 use crate::engines::rel::{
-    scalar_to_json, CatalogEntry, ColumnType, DefaultValue, ExpandedBlock, RelEngine, RelStoreError,
-    ScalarValue,
+    scalar_to_json, CatalogEntry, ColumnType, DefaultValue, ExpandedBlock, RelEngine, RelStoreError, ScalarValue,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
 };
@@ -344,6 +344,8 @@ pub async fn browse_rows(
     State(state): State<AppState>,
     Path((domain, table)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
 ) -> Result<Json<Value>, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, false)?;
@@ -354,8 +356,16 @@ pub async fn browse_rows(
     let filters: HashMap<String, String> =
         params.into_iter().filter(|(k, _)| !RESERVED_QUERY_PARAMS.contains(&k.as_str())).collect();
 
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
     let (result, expanded, applied_limit, applied_offset) =
-        engine.browse_rows(&domain, &table, &filters, &expand, limit, offset).await?;
+        engine.browse_rows(&domain, &table, &filters, &expand, limit, offset, link_auth).await?;
 
     let rows: Vec<Value> = result
         .rows
@@ -400,12 +410,22 @@ pub async fn get_row(
     State(state): State<AppState>,
     Path((domain, table, pk)): Path<(String, String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
 ) -> Result<Json<Value>, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, false)?;
     let expand = parse_expand_param(&params);
 
-    let Some((result, expanded)) = engine.get_row(&domain, &table, &pk, &expand).await? else {
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
+    let Some((result, expanded)) = engine.get_row(&domain, &table, &pk, &expand, link_auth).await? else {
         return Err(ApiError::new(StatusCode::NOT_FOUND, format!("404 Not Found: row '{pk}' not found")));
     };
     let obj = row_to_object(&result.columns, &result.rows[0], expanded.as_ref(), 0);
@@ -448,6 +468,7 @@ fn percent_encode_path_segment(s: &str) -> String {
     responses(
         (status = 201, description = "Row inserted", body = Object),
         (status = 400, description = "NOT NULL/type/schema violation"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)"),
         (status = 404, description = "Domain, table, or referenced body column not found"),
         (status = 409, description = "PK collision, unique violation, or missing REFERENCES target"),
         (status = 410, description = "Domain is being deleted"),
@@ -462,12 +483,22 @@ fn percent_encode_path_segment(s: &str) -> String {
 pub async fn insert_row(
     State(state): State<AppState>,
     Path((domain, table)): Path<(String, String)>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
     Json(body): Json<Map<String, Value>>,
 ) -> Result<Response, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, true)?;
 
-    let result = engine.insert_row(&domain, &table, &body).await?;
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
+    let result = engine.insert_row(&domain, &table, &body, link_auth).await?;
     let pk = result.last_pk.as_ref().expect("single-row INSERT always yields last_pk (rel/005 §9)");
     let location = format!("/store-api/rel/{domain}/tables/{table}/rows/{}", pk_path_segment(pk));
     Ok((StatusCode::CREATED, [(header::LOCATION, location)], Json(dml_result_json(&result))).into_response())
@@ -485,6 +516,7 @@ pub async fn insert_row(
     responses(
         (status = 200, description = "Row updated", body = Object),
         (status = 400, description = "NOT NULL/type/schema violation, or body primary key != path primary key"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)"),
         (status = 404, description = "Domain, table, column, or row not found"),
         (status = 409, description = "Unique violation, or missing REFERENCES target"),
         (status = 410, description = "Domain is being deleted"),
@@ -499,12 +531,22 @@ pub async fn insert_row(
 pub async fn update_row(
     State(state): State<AppState>,
     Path((domain, table, pk)): Path<(String, String, String)>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
     Json(body): Json<Map<String, Value>>,
 ) -> Result<Json<Value>, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, true)?;
 
-    let result = engine.update_row(&domain, &table, &pk, &body).await?;
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
+    let result = engine.update_row(&domain, &table, &pk, &body, link_auth).await?;
     if result.affected == 0 {
         return Err(ApiError::new(StatusCode::NOT_FOUND, format!("404 Not Found: row '{pk}' not found")));
     }

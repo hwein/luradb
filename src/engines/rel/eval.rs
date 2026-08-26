@@ -215,7 +215,7 @@ fn or3(x: Bool3, y: Bool3) -> Bool3 {
 mod tests {
     use super::*;
     use crate::config::RelStoreConfig;
-    use crate::engines::rel::{CrossEngineResolver, RelEngine, SqlOutcome};
+    use crate::engines::rel::{CrossEngineResolver, LinkAuth, RelEngine, SqlOutcome};
     use crate::metrics::{MetricsConfig, MetricsStore};
 
     fn col_eq(col: usize, v: ScalarValue) -> Pred {
@@ -381,16 +381,16 @@ mod tests {
         let cross_engine = CrossEngineResolver::disabled(std::sync::Arc::clone(&metrics));
         let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
 
-        rel.execute_sql("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)", &[], &[])
+        rel.execute_sql("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)", &[], &[], LinkAuth::full())
             .await
             .unwrap();
         let big = format!("{}NEEDLE", "a".repeat(60_000));
-        rel.execute_sql("default", "INSERT INTO t VALUES (1, ?)", &[serde_json::json!(big)], &[])
+        rel.execute_sql("default", "INSERT INTO t VALUES (1, ?)", &[serde_json::json!(big)], &[], LinkAuth::full())
             .await
             .unwrap();
 
         let outcome = rel
-            .execute_sql("default", "SELECT id FROM t WHERE txt LIKE '%NEEDLE'", &[], &[])
+            .execute_sql("default", "SELECT id FROM t WHERE txt LIKE '%NEEDLE'", &[], &[], LinkAuth::full())
             .await
             .unwrap();
         match outcome {

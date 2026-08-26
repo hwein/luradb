@@ -99,6 +99,14 @@ pub enum AuthOutcome {
     Scoped(AccessLevel),
 }
 
+/// Username of a Scoped user, set into the request extensions alongside
+/// `AuthOutcome::Scoped` (spec rel/016). Additive — `AuthOutcome` itself is
+/// unchanged (`backup.rs` depends on its exact shape). Lets handlers that
+/// need a per-engine permission lookup (cross-engine link authorization)
+/// resolve the caller's username without re-deriving it from the request.
+#[derive(Clone, Debug)]
+pub struct AuthUser(pub String);
+
 /// Enforces the statement-exact level in the `/sql` handler (rel/011 §4).
 /// `required` is mapped by the caller from `StatementClass`. `auth_enabled`
 /// comes from `AppState`: a missing outcome may only pass when auth is
@@ -196,6 +204,7 @@ pub async fn auth_layer(
     match perm {
         Some(level) if level >= required_min => {
             request.extensions_mut().insert(AuthOutcome::Scoped(level));
+            request.extensions_mut().insert(AuthUser(user.name.clone()));
             next.run(request).await
         }
         _ => forbidden(),

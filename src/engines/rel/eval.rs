@@ -134,27 +134,41 @@ fn apply_op(op: CompareOp, ord: Option<Ordering>) -> Bool3 {
 
 /// SQL `LIKE`: `%` = any (incl. empty) run, `_` = exactly one char, fully
 /// anchored, no `ESCAPE` (KISS).
+///
+/// Greedy two-pointer scan backtracking to the last unresolved `%` (rel/015):
+/// O(1) extra space instead of the former O(np·nt) DP table. Time stays
+/// O(np·nt) in the worst case (one `%` plus a long near-matching literal);
+/// measured bound in rel/015's implementation note.
 fn like_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (np, nt) = (p.len(), t.len());
-    let mut dp = vec![vec![false; nt + 1]; np + 1];
-    dp[0][0] = true;
-    for i in 1..=np {
-        if p[i - 1] == '%' {
-            dp[i][0] = dp[i - 1][0];
+
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None; // pattern index of the last unresolved '%'
+    let mut star_ti = 0usize; // text index right after that '%'s current match
+
+    while ti < nt {
+        // '%' first: a literal '%' in the text must not consume the wildcard.
+        if pi < np && p[pi] == '%' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if pi < np && (p[pi] == '_' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star_pi {
+            star_ti += 1;
+            pi = sp + 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
     }
-    for i in 1..=np {
-        for j in 1..=nt {
-            dp[i][j] = match p[i - 1] {
-                '%' => dp[i - 1][j] || dp[i][j - 1],
-                '_' => dp[i - 1][j - 1],
-                c => dp[i - 1][j - 1] && c == t[j - 1],
-            };
-        }
+    while pi < np && p[pi] == '%' {
+        pi += 1;
     }
-    dp[np][nt]
+    pi == np
 }
 
 fn from_bool(b: bool) -> Bool3 {
@@ -200,6 +214,9 @@ fn or3(x: Bool3, y: Bool3) -> Bool3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RelStoreConfig;
+    use crate::engines::rel::{CrossEngineResolver, RelEngine, SqlOutcome};
+    use crate::metrics::{MetricsConfig, MetricsStore};
 
     fn col_eq(col: usize, v: ScalarValue) -> Pred {
         Pred::Compare {
@@ -271,5 +288,116 @@ mod tests {
             rhs: PredOperand::Value(ScalarValue::Integer(3)),
         };
         assert_eq!(eval(&gt, &row), Bool3::True);
+    }
+
+    // like_match semantics beyond test_in_like_isnull above (rel/015): empty
+    // pattern/text, bare/doubled '%', leading/middle/trailing '%', '_' at the
+    // edge and repeated, '%_' combinations, a wildcard-free pattern, and
+    // multi-byte chars (char, not byte, semantics).
+    #[test]
+    fn test_like_match_semantics() {
+        assert!(like_match("", ""));
+        assert!(!like_match("", "x"));
+
+        assert!(like_match("%", ""));
+        assert!(like_match("%", "anything"));
+        assert!(like_match("%%", ""));
+        assert!(like_match("%%", "anything"));
+
+        assert!(like_match("%bc", "abc")); // leading %
+        assert!(!like_match("%bc", "abx"));
+        assert!(like_match("a%c", "abbbc")); // middle %
+        assert!(!like_match("a%c", "abbbx"));
+        assert!(like_match("ab%", "abcde")); // trailing %
+        assert!(!like_match("ab%", "xbcde"));
+
+        assert!(like_match("_", "a"));
+        assert!(!like_match("_", "ab"));
+        assert!(!like_match("_", ""));
+        assert!(like_match("__", "ab")); // repeated '_'
+        assert!(!like_match("__", "a"));
+
+        assert!(like_match("%_", "a")); // at least one char
+        assert!(!like_match("%_", ""));
+        assert!(like_match("_%", "a"));
+        assert!(like_match("a%_", "ab"));
+        assert!(!like_match("a%_", "a"));
+
+        assert!(like_match("hello", "hello")); // no wildcards: exact match
+        assert!(!like_match("hello", "hello!"));
+        assert!(!like_match("hello", "hell"));
+
+        assert!(like_match("%b", "%ab")); // literal '%' in text stays matchable by the wildcard
+        assert!(like_match("a%b", "a%b"));
+        assert!(like_match("%_", "%")); // '_' matches a literal '%'
+        assert!(!like_match("%b", "%a"));
+
+        assert!(like_match("cl%", "clé")); // 'é' is one char, not two bytes
+        assert!(like_match("cl_", "clé"));
+        assert!(!like_match("cl__", "clé"));
+        assert!(like_match("_", "🎉")); // emoji is one char
+        assert!(like_match("%🎉%", "party🎉time"));
+        assert!(!like_match("%🎉%", "party time"));
+    }
+
+    // NOT LIKE via eval(): negates True/False; Unknown (NULL column) unchanged.
+    #[test]
+    fn test_not_like() {
+        let row = vec![ScalarValue::Text("hello".to_string())];
+        let not_like = |pat: &str| Pred::Like { col: 0, negated: true, pattern: pat.to_string() };
+        assert_eq!(eval(&not_like("h%o"), &row), Bool3::False);
+        assert_eq!(eval(&not_like("x%"), &row), Bool3::True);
+
+        let null_row = vec![ScalarValue::Null];
+        assert_eq!(eval(&not_like("%"), &null_row), Bool3::Unknown);
+    }
+
+    // Memory-/runtime proof (rel/015): a ~64Ki-char pattern against a
+    // ~64Ki-char text used to allocate an ~4.3 GiB DP table before this fix;
+    // the greedy matcher needs O(1) extra space and returns well under a
+    // second.
+    #[test]
+    fn test_like_large_pattern_no_dp_allocation() {
+        let text: String = "a".repeat(64 * 1024);
+        let pattern = format!("%{text}");
+        let start = std::time::Instant::now();
+        assert!(like_match(&pattern, &text));
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(500), "took {elapsed:?}");
+    }
+
+    // End-to-end (rel/015): SELECT ... WHERE txt LIKE '%...' over
+    // execute_sql against a table holding a large TEXT row runs through.
+    #[tokio::test]
+    async fn test_like_end_to_end_large_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = RelStoreConfig {
+            wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
+            vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
+            sstable_dir: dir.path().join("ss").to_string_lossy().into_owned(),
+            ..RelStoreConfig::default()
+        };
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let cross_engine = CrossEngineResolver::disabled(std::sync::Arc::clone(&metrics));
+        let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
+
+        rel.execute_sql("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)", &[], &[])
+            .await
+            .unwrap();
+        let big = format!("{}NEEDLE", "a".repeat(60_000));
+        rel.execute_sql("default", "INSERT INTO t VALUES (1, ?)", &[serde_json::json!(big)], &[])
+            .await
+            .unwrap();
+
+        let outcome = rel
+            .execute_sql("default", "SELECT id FROM t WHERE txt LIKE '%NEEDLE'", &[], &[])
+            .await
+            .unwrap();
+        match outcome {
+            SqlOutcome::Select { result, .. } => {
+                assert_eq!(result.rows, vec![vec![ScalarValue::Integer(1)]]);
+            }
+            o => panic!("expected SELECT, got {o:?}"),
+        }
     }
 }

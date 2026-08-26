@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- Rel: LIKE matching no longer allocates a table sized by pattern × text length.
+
 ## [0.3.1] - 2026-08-13
 
 ### Fixed

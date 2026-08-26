@@ -3,9 +3,15 @@ FROM ubuntu:24.04
 # The .deb comes from the debdir build context (= target/debian, compose.yaml).
 # Several may lie there (older builds) - install the most recently added one.
 COPY --from=debdir luradb_*.deb /tmp/debs/
+# postinst (run by the install below) bakes a live admin key into this layer;
+# restore the placeholder in the same RUN so entrypoint.sh can generate the
+# key per-container at startup instead (a separate RUN would still leave the
+# key sitting in the previous layer).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl "$(ls -t /tmp/debs/luradb_*.deb | head -n1)" \
-    && rm -rf /var/lib/apt/lists/* /tmp/debs
+    && rm -rf /var/lib/apt/lists/* /tmp/debs \
+    && sed -i 's/^api_key = "lura_[0-9a-f]\{32\}"$/api_key = "@GENERATED_ON_INSTALL@"/' /etc/luradb/luradb.toml \
+    && grep -q '^api_key = "@GENERATED_ON_INSTALL@"$' /etc/luradb/luradb.toml
 
 # Docker port mapping reaches the container via its network interface only;
 # the host-side bind stays local (compose.yaml publishes 127.0.0.1 only).

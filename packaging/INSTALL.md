@@ -52,6 +52,8 @@ sudo systemctl restart luradb
 
 `luradb.toml` is a dpkg conffile: local changes survive updates (dpkg prompts on conflicts between a local change and the new package version).
 
+Disabling authentication (`auth.enabled = false`) only starts if `server.bind_address` is loopback (`127.0.0.1` / `::1`) — binding wider than loopback with auth off is refused at startup, so an unauthenticated listener can never end up reachable from the network. Enable auth, or keep the bind on loopback.
+
 ## Enabling HTTPS (quickstart)
 
 LuraDB can terminate TLS itself, on its own port (`tls_port`, default `3443`), in parallel to the plain HTTP listener. This is a quick start with a self-signed certificate; for a certificate from a public or internal CA (e.g. via `certbot`), just point `tls_cert_path`/`tls_key_path` at those files instead — or keep operating behind a reverse proxy.

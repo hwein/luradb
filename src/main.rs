@@ -611,6 +611,7 @@ fn main() -> anyhow::Result<()> {
     config.server.validate()?;
     config.log.validate()?;
     config.backup.validate(&config.storage, &config.json, &config.rel)?;
+    config.auth.validate(&config.server)?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {
@@ -619,6 +620,15 @@ fn main() -> anyhow::Result<()> {
             tracing::info!("Config loaded from {}", config_path.display());
         } else {
             tracing::info!("No config file found at {}, using defaults", config_path.display());
+        }
+        // `config.auth.validate` already rejected a non-loopback bind above,
+        // so reaching here with auth disabled means the dev-mode loopback
+        // case (spec general/013) — allowed, but not silent.
+        if !config.auth.enabled {
+            tracing::warn!(
+                "auth.enabled is false — the server is unauthenticated. Allowed only because server.bind_address ({}) is loopback-only.",
+                config.server.bind_address
+            );
         }
 
         let (engine_config, compaction_config, janitor_config, domain_config, metrics) =

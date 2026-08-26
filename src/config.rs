@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +88,8 @@ pub fn resolve_config_path(cli_arg: Option<PathBuf>, exists: impl Fn(&Path) -> b
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// TCP bind address for the HTTP/HTTPS listeners. Defaults to loopback,
+    /// not `0.0.0.0` (spec general/013: fail-closed with auth disabled).
     pub bind_address: String,
     pub port: u16,
     /// Set to `false` to disable the Swagger UI entirely (e.g. in production).
@@ -120,7 +123,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "127.0.0.1".to_string(),
             port: 3000,
             swagger_enabled: true,
             swagger_url: "/test-ui".to_string(),
@@ -397,6 +400,27 @@ impl Default for AuthConfig {
             admins: Vec::new(),
             trusted_uids: Vec::new(),
         }
+    }
+}
+
+impl AuthConfig {
+    /// Fail-closed startup check (spec general/013): with auth disabled, the
+    /// server may only serve loopback — otherwise anyone who reaches the
+    /// listener gets unauthenticated full access. `#[serde(default)]` means
+    /// a config without an `[auth]` section still reaches this check.
+    pub fn validate(&self, server: &ServerConfig) -> anyhow::Result<()> {
+        let bind: IpAddr = server.bind_address.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid config: server.bind_address '{}' is not a valid IP address: {e}",
+                server.bind_address
+            )
+        })?;
+        anyhow::ensure!(
+            self.enabled || bind.is_loopback(),
+            "invalid config: auth.enabled = false and server.bind_address = '{}' is not loopback — enable auth (auth.enabled = true) or bind to loopback (127.0.0.1 / ::1)",
+            server.bind_address
+        );
+        Ok(())
     }
 }
 
@@ -1497,5 +1521,90 @@ mod tests {
     fn test_log_validate_disabled_ignores_empty_path() {
         let log = LogConfig::default();
         assert!(log.validate().is_ok());
+    }
+
+    // ── Auth fail-closed (spec general/013) ─────────────────────────────────
+
+    #[test]
+    fn test_server_default_bind_address_is_loopback() {
+        assert_eq!(ServerConfig::default().bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_auth_validate_rejects_disabled_auth_on_all_interfaces_ipv4() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "0.0.0.0".to_string();
+        assert!(AuthConfig::default().validate(&server).is_err());
+    }
+
+    #[test]
+    fn test_auth_validate_rejects_disabled_auth_on_all_interfaces_ipv6() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "::".to_string();
+        assert!(AuthConfig::default().validate(&server).is_err());
+    }
+
+    #[test]
+    fn test_auth_validate_accepts_disabled_auth_on_loopback_ipv4() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "127.0.0.1".to_string();
+        assert!(AuthConfig::default().validate(&server).is_ok());
+    }
+
+    #[test]
+    fn test_auth_validate_accepts_disabled_auth_on_loopback_ipv6() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "::1".to_string();
+        assert!(AuthConfig::default().validate(&server).is_ok());
+    }
+
+    #[test]
+    fn test_auth_validate_accepts_enabled_auth_on_all_interfaces() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "0.0.0.0".to_string();
+        let auth = AuthConfig { enabled: true, ..AuthConfig::default() };
+        assert!(auth.validate(&server).is_ok());
+    }
+
+    #[test]
+    fn test_auth_validate_rejects_unparseable_bind_address() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "not-an-ip".to_string();
+        assert!(AuthConfig::default().validate(&server).is_err());
+    }
+
+    // The address is parsed unconditionally, independent of whether the
+    // loopback rule itself would apply — an unparseable address never binds.
+    #[test]
+    fn test_auth_validate_rejects_unparseable_bind_address_even_when_enabled() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "not-an-ip".to_string();
+        let auth = AuthConfig { enabled: true, ..AuthConfig::default() };
+        assert!(auth.validate(&server).is_err());
+    }
+
+    // A config file without an [auth] section must not bypass the check:
+    // serde fills in AuthConfig::default() (enabled = false), and validate()
+    // still fails once bound beyond loopback.
+    #[test]
+    fn test_auth_validate_missing_auth_section_still_fails_closed() {
+        let toml_str = r#"
+            [server]
+            bind_address = "0.0.0.0"
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.auth.enabled);
+        assert!(config.auth.validate(&config.server).is_err());
+    }
+
+    #[test]
+    fn test_auth_validate_missing_auth_section_loopback_ok() {
+        let toml_str = r#"
+            [server]
+            bind_address = "127.0.0.1"
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.auth.enabled);
+        assert!(config.auth.validate(&config.server).is_ok());
     }
 }

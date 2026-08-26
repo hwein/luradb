@@ -282,6 +282,14 @@ impl SSTableReader {
         let bloom_archived = rkyv::access::<Archived<BloomFilter>, rancor::Error>(bloom_slice)
             .map_err(|e| anyhow::anyhow!("Bloom filter validation failed: {}", e))?;
 
+        // kv/021: an empty bit array paired with num_hashes >= 1 would divide
+        // by zero on every lookup (BloomFilter::hash). A legitimate writer
+        // never produces this combination (see SSTableBuilder::new), so it
+        // only occurs on corrupted/torn/crafted bytes -- reject it here.
+        if bloom_archived.data.is_empty() && u32::from(bloom_archived.num_hashes) >= 1 {
+            bail!("Invalid bloom filter: empty bit array with non-zero hash count");
+        }
+
         let bloom_filter = BloomFilterImpl::from_bytes(
             bloom_archived.data.to_vec(),
             u32::from(bloom_archived.num_hashes),
@@ -1114,6 +1122,86 @@ mod tests {
         let reader = SSTableReader::open(buf)?;
         let result = reader.get(b"key1");
         assert!(result.is_err(), "overflowing block handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/021: builds a valid SSTable whose bloom filter block is structurally
+    // valid (rkyv::access succeeds) but carries an empty bit array combined
+    // with `num_hashes`, to exercise the from_data fail-fast check on a
+    // corrupted/crafted bloom block (as opposed to bloom.rs's own unit test
+    // for the from_bytes/hash defense-in-depth layer).
+    fn build_sstable_with_empty_bloom_block(num_hashes: u32) -> anyhow::Result<Vec<u8>> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let valid_bytes = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = valid_bytes[valid_bytes.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = valid_bytes.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(
+            &valid_bytes[footer_offset..footer_end],
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let bloom_offset = u64::from(footer.bloom_filter_handle.offset) as usize;
+        let index_handle = BlockHandle {
+            offset: u64::from(footer.index_handle.offset),
+            size: u64::from(footer.index_handle.size),
+        };
+
+        // Keep the data-block and index-block bytes (and their alignment
+        // padding) verbatim; rebuild only the bloom block and footer.
+        let mut buf = AlignedVec::new();
+        buf.extend_from_slice(&valid_bytes[..bloom_offset]);
+
+        fn pad_to_align8(buf: &mut AlignedVec) {
+            let misalign = buf.len() % 8;
+            if misalign != 0 {
+                buf.extend_from_slice(&[0u8; 8][..8 - misalign]);
+            }
+        }
+
+        let bloom_filter_fmt = BloomFilter { data: Vec::new(), num_hashes };
+        let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter_fmt)?;
+        let bloom_filter_handle = BlockHandle { offset: buf.len() as u64, size: bloom_bytes.len() as u64 };
+        buf.extend_from_slice(&bloom_bytes);
+        pad_to_align8(&mut buf);
+
+        let footer = SSTableFooter { index_handle, bloom_filter_handle, checksum: 0 };
+        let footer_bytes = rkyv::to_bytes::<rancor::Error>(&footer)?;
+        let footer_offset = buf.len() as u64;
+        buf.extend_from_slice(&footer_bytes);
+        buf.extend_from_slice(&footer_offset.to_le_bytes());
+
+        Ok(buf.into_vec())
+    }
+
+    // kv/021: an empty bloom bit array combined with num_hashes >= 1 can only
+    // come from corrupted/torn/crafted bytes (a real writer never produces
+    // it, see SSTableBuilder::new) -- from_data must reject it, not panic.
+    #[test]
+    fn test_from_data_rejects_empty_bloom_block_with_nonzero_hashes() -> anyhow::Result<()> {
+        let buf = build_sstable_with_empty_bloom_block(3)?;
+        let result = SSTableReader::open(buf);
+        assert!(
+            result.is_err(),
+            "empty bloom bit array with num_hashes >= 1 must be rejected, not panic"
+        );
+        Ok(())
+    }
+
+    // kv/021: num_hashes == 0 is what BloomFilter::new(0, p) legitimately
+    // produces (NaN-cast); the fail-fast must not reject this combination.
+    #[test]
+    fn test_from_data_accepts_empty_bloom_block_with_zero_hashes() -> anyhow::Result<()> {
+        let buf = build_sstable_with_empty_bloom_block(0)?;
+        let result = SSTableReader::open(buf);
+        assert!(
+            result.is_ok(),
+            "empty bloom bit array with num_hashes == 0 must still be accepted"
+        );
         Ok(())
     }
 }

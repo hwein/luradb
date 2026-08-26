@@ -58,8 +58,13 @@ impl BloomFilter {
     /// Creates a Bloom filter from raw data.
     ///
     /// Used when deserializing from disk.
+    ///
+    /// An empty `bits` (num_bits == 0) would make `hash()` divide by zero;
+    /// forcing `num_hashes` to 0 in that case degrades the filter to
+    /// "always contains" instead, which is a safe false positive.
     pub fn from_bytes(bits: Vec<u8>, num_hashes: u32) -> Self {
         let num_bits = (bits.len() * 8) as u64;
+        let num_hashes = if num_bits == 0 { 0 } else { num_hashes };
         Self {
             bits,
             num_hashes,
@@ -210,5 +215,13 @@ mod tests {
         assert!(restored.contains(b"test1"));
         assert!(restored.contains(b"test2"));
         assert!(!restored.contains(b"nonexistent"));
+    }
+
+    // kv/021: from_bytes(empty, num_hashes >= 1) must not panic (division by
+    // zero in hash()) -- degrades to "always contains" instead.
+    #[test]
+    fn test_from_bytes_empty_bits_does_not_panic() {
+        let filter = BloomFilter::from_bytes(Vec::new(), 3);
+        assert!(filter.contains(b"x"));
     }
 }

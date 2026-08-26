@@ -8,6 +8,10 @@ All notable changes to LuraDB are documented in this file.
 
 - Rel: LIKE matching no longer allocates a table sized by pattern × text length.
 
+### Fixed
+
+- SSTable: a corrupted bloom filter block (empty bit array with a non-zero hash count) fails with an error instead of a panic.
+
 ## [0.3.1] - 2026-08-13
 
 ### Fixed

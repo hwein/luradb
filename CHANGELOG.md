@@ -7,6 +7,7 @@ All notable changes to LuraDB are documented in this file.
 ### Security
 
 - Rel: LIKE matching no longer allocates a table sized by pattern × text length.
+- Auth: rotating an API key now immediately invalidates the previous one — it used to stay valid in the cache until a second restart.
 
 ### Fixed
 

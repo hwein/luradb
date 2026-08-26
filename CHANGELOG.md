@@ -10,6 +10,7 @@ All notable changes to LuraDB are documented in this file.
 - Auth: rotating an API key now immediately invalidates the previous one — it used to stay valid in the cache until a second restart.
 - **BREAKING** Rel: cross-engine KVREF/JSONREF links now require read access to the target KV/JSON domain. `/sql` expand of a column the caller can't read now returns `null` instead of the resolved value; INSERT/UPDATE (via `/sql` or row writes) with such a link now answers 403 instead of succeeding or 409.
 - The server refuses to start with authentication disabled on a non-loopback bind — a config without `[auth]`, or a bind to `0.0.0.0`/`::` with `auth.enabled = false`, previously started silently with unauthenticated, network-wide access.
+- **BREAKING** API: the Swagger UI and `/api-docs/openapi.json` now require a valid API key when `auth.enabled = true` (previously open regardless — the same server-version fingerprint that `GET /version` was hardened against was still readable from the OpenAPI contract). `server.swagger_enabled` now defaults to `false`.
 
 ### Changed
 

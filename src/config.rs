@@ -92,11 +92,12 @@ pub struct ServerConfig {
     /// not `0.0.0.0` (spec general/013: fail-closed with auth disabled).
     pub bind_address: String,
     pub port: u16,
-    /// Set to `false` to disable the Swagger UI entirely (e.g. in production).
-    /// While `true`, `/api-docs/openapi.json` (incl. `x-luradb-server-version`)
-    /// is served without auth — exposed/production deployments should set
-    /// `false`, otherwise the `GET /version` auth hardening (spec 004 §7) is
-    /// undermined by the same version info being open via Swagger.
+    /// Set to `true` to enable the Swagger UI + `/api-docs/openapi.json`
+    /// (default: `false`, safe for production). When `auth.enabled = true`,
+    /// these docs routes require the same "any valid key, no domain
+    /// permission" check as `GET /version` (spec 004 §7; enforced by
+    /// `auth::middleware::docs_auth_layer`, spec general/014) — when auth is
+    /// disabled, they're served openly like everything else.
     pub swagger_enabled: bool,
     /// URL path at which Swagger UI is served (default: `/test-ui`).
     pub swagger_url: String,
@@ -125,7 +126,7 @@ impl Default for ServerConfig {
         Self {
             bind_address: "127.0.0.1".to_string(),
             port: 3000,
-            swagger_enabled: true,
+            swagger_enabled: false,
             swagger_url: "/test-ui".to_string(),
             hello_enabled: true,
             hello_message: "Hello from LuraDB".to_string(),
@@ -1137,6 +1138,13 @@ mod tests {
     #[test]
     fn test_server_validate_default_ok() {
         assert!(ServerConfig::default().validate().is_ok());
+    }
+
+    // Spec general/014 test 5: prod-safe default — docs routes stay off
+    // unless explicitly enabled.
+    #[test]
+    fn test_swagger_disabled_by_default() {
+        assert!(!ServerConfig::default().swagger_enabled);
     }
 
     #[test]

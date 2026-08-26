@@ -46,6 +46,9 @@ toolchain, no package install on the host.
    ```
 
    The Swagger UI is enabled in this setup: <http://localhost:3000/test-ui>.
+   Auth is on by default too, so the UI needs a Bearer key before it can load
+   its own `/api-docs/openapi.json` — open its "Authorize" button and paste
+   the admin key from the next section.
 
 ## Admin key
 

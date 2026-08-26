@@ -128,7 +128,11 @@ curl -X POST http://127.0.0.1:3000/store-api/json/default/documents \
 ```
 
 In development, a browsable Swagger UI is available at `/test-ui` (disabled
-by default in the packaged/production config).
+by default; the dev `luradb.toml` turns it on explicitly). When
+`auth.enabled = true`, the UI needs a Bearer key too — it fetches
+`/api-docs/openapi.json` via a browser request, which now requires the same
+valid API key as the rest of the API. Use the UI's "Authorize" button to set
+the key.
 
 ## License
 

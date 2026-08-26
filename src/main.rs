@@ -1,8 +1,8 @@
-use axum::{response::Json, routing::get, Router};
+use axum::{middleware::from_fn_with_state, response::Json, routing::get, Router};
 use clap::Parser;
 use crate::{
     api::{ApiDoc, AppState},
-    auth::{reconcile_admins, AuthCache},
+    auth::{middleware::docs_auth_layer, reconcile_admins, AuthCache},
     config::{resolve_config_path, LuraConfig},
     core::{
         buffer_pool::BufferPoolManager,
@@ -474,10 +474,20 @@ fn build_router(cfg: &LuraConfig, state: AppState, trusted_cidrs: Arc<Vec<crate:
     let mut app = Router::new();
 
     if cfg.server.swagger_enabled {
-        app = app.merge(
+        // Swagger UI is registered here, not inside api::create_router, so it
+        // needs its own auth layer (spec general/014) — the general/009
+        // router-contract gate would otherwise trip on docs routes with no
+        // contract entry. `docs_auth_layer` wraps this whole sub-router, so
+        // every path SwaggerUi registers under `swagger_url` (index, redirect,
+        // static assets) is covered without listing them individually.
+        let mut docs_router = Router::new().merge(
             SwaggerUi::new(cfg.server.swagger_url.clone())
                 .url("/api-docs/openapi.json", ApiDoc::openapi()),
         );
+        if cfg.auth.enabled {
+            docs_router = docs_router.layer(from_fn_with_state(Arc::clone(&state.auth_cache), docs_auth_layer));
+        }
+        app = app.merge(docs_router);
     }
 
     if cfg.server.hello_enabled {

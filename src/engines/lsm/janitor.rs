@@ -485,6 +485,8 @@ impl Janitor {
             smallest_key: smallest_key.unwrap_or_default(),
             largest_key: largest_key.unwrap_or_default(),
             file_size: sstable_data.len() as u64,
+            // Same entries, only their vLog pointers move.
+            max_timestamp: meta.max_timestamp,
         })
     }
 
@@ -640,6 +642,7 @@ mod tests {
             smallest_key: b"live-key".to_vec(),
             largest_key: b"live-key".to_vec(),
             file_size: sst.len() as u64,
+            max_timestamp: 0,
         });
         let manifest = Arc::new(RwLock::new(manifest));
 
@@ -827,6 +830,7 @@ mod tests {
             smallest_key: entries.first().unwrap().0.to_vec(),
             largest_key: entries.last().unwrap().0.to_vec(),
             file_size: sst.len() as u64,
+            max_timestamp: 0,
         }
     }
 
@@ -907,6 +911,7 @@ mod tests {
             smallest_key: b"a".to_vec(),
             largest_key: b"z".to_vec(),
             file_size: 1,
+            max_timestamp: 0,
         });
 
         let janitor = build_janitor(

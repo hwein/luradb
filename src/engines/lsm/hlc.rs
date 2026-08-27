@@ -133,9 +133,19 @@ impl HybridLogicalClock {
                 (current_physical, 0)
             } else if last_physical > received_physical {
                 // Local time is ahead
+                if last_logical == u16::MAX {
+                    // Logical counter overflow - wait for physical time to advance
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
                 (last_physical, last_logical + 1)
             } else if received_physical > last_physical {
                 // Received time is ahead
+                if received_logical == u16::MAX {
+                    // Logical counter overflow - wait for physical time to advance
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
                 (received_physical, received_logical + 1)
             } else {
                 // Same physical time - take max logical + 1
@@ -159,6 +169,12 @@ impl HybridLogicalClock {
                 return new_ts;
             }
         }
+    }
+
+    /// Raises the clock to at least `value` (raw HLC encoding); never lowers
+    /// it. Used at startup to seed from recovered state (spec kv/026 M3).
+    pub fn seed(&self, value: u64) {
+        self.last_timestamp.fetch_max(value, Ordering::SeqCst);
     }
 
     /// Returns the current timestamp value without updating.
@@ -285,6 +301,39 @@ mod tests {
         for i in 1..all_timestamps.len() {
             assert!(all_timestamps[i] > all_timestamps[i - 1]);
         }
+    }
+
+    // Spec kv/026 M3: a saturated logical counter must not overflow the
+    // `+ 1` in either update() branch; the result stays monotonic.
+    #[test]
+    fn test_hlc_update_survives_logical_overflow() {
+        let hlc = HybridLogicalClock::new();
+        let base = HybridLogicalClock::physical_time();
+
+        // Local time ahead of the received one, local logical saturated.
+        hlc.seed(HLCTimestamp::from_components(base + 20, u16::MAX).as_u64());
+        let before = hlc.peek();
+        let ts1 = hlc.update(HLCTimestamp::from_components(base, 0));
+        assert!(ts1.as_u64() > before.as_u64());
+
+        // Received time ahead of the local one, received logical saturated.
+        let received = HLCTimestamp::from_components(ts1.physical() + 20, u16::MAX);
+        let ts2 = hlc.update(received);
+        assert!(ts2.as_u64() > received.as_u64());
+        assert!(ts2.as_u64() > ts1.as_u64());
+    }
+
+    #[test]
+    fn test_hlc_seed_never_lowers_the_clock() {
+        let hlc = HybridLogicalClock::new();
+        let high = hlc.now().as_u64() + 1_000_000;
+
+        hlc.seed(high);
+        assert_eq!(hlc.peek().as_u64(), high);
+
+        hlc.seed(1);
+        assert_eq!(hlc.peek().as_u64(), high);
+        assert!(hlc.now().as_u64() > high);
     }
 
     #[test]

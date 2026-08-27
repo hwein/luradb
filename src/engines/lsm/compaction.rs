@@ -588,6 +588,7 @@ mod tests {
             manifest.add_sstable(SSTableMetadata {
                 file_id: i, level: 0,
                 smallest_key: vec![0], largest_key: vec![255], file_size: 1024,
+                max_timestamp: 0,
             });
         }
         assert!(should_compact(&manifest, &config));
@@ -601,6 +602,7 @@ mod tests {
             file_id: 1, level: 1,
             smallest_key: vec![0], largest_key: vec![255],
             file_size: 101 * 1024 * 1024, // > 100 MB
+            max_timestamp: 0,
         });
         assert!(should_compact(&manifest, &config));
         assert_eq!(select_level_to_compact(&manifest, &config), Some(1));
@@ -619,10 +621,12 @@ mod tests {
         let src = vec![SSTableMetadata {
             file_id: 1, level: 0,
             smallest_key: vec![0], largest_key: vec![255], file_size: 1024,
+            max_timestamp: 0,
         }];
         let tgt = vec![SSTableMetadata {
             file_id: 10, level: 1,
             smallest_key: vec![0], largest_key: vec![255], file_size: 2048,
+            max_timestamp: 0,
         }];
         let mut ids = deleted_file_ids(&src, &tgt);
         ids.sort_unstable();
@@ -635,18 +639,22 @@ mod tests {
         manifest.add_sstable(SSTableMetadata {
             file_id: 1, level: 0,
             smallest_key: b"a".to_vec(), largest_key: b"d".to_vec(), file_size: 1024,
+            max_timestamp: 0,
         });
         manifest.add_sstable(SSTableMetadata {
             file_id: 2, level: 0,
             smallest_key: b"e".to_vec(), largest_key: b"h".to_vec(), file_size: 1024,
+            max_timestamp: 0,
         });
         manifest.add_sstable(SSTableMetadata {
             file_id: 10, level: 1,
             smallest_key: b"c".to_vec(), largest_key: b"f".to_vec(), file_size: 2048,
+            max_timestamp: 0,
         });
         manifest.add_sstable(SSTableMetadata {
             file_id: 11, level: 1,
             smallest_key: b"i".to_vec(), largest_key: b"z".to_vec(), file_size: 2048,
+            max_timestamp: 0,
         });
         let (src, tgt) = select_sstables_for_compaction(&manifest);
         assert_eq!(src.len(), 2);

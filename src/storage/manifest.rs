@@ -26,6 +26,13 @@ pub struct SSTableMetadata {
 
     /// Total size of the SSTable in bytes
     pub file_size: u64,
+
+    /// Highest MVCC write timestamp (raw HLC value) stored in this SSTable.
+    /// Read at startup to seed the HLC (spec kv/026 M3); the inverted key
+    /// order makes it underivable from `largest_key`. Manifests written
+    /// before this field load as 0.
+    #[serde(default)]
+    pub max_timestamp: u64,
 }
 
 /// The manifest contains all metadata about SSTables in the system.
@@ -190,6 +197,7 @@ mod tests {
             smallest_key: b"a".to_vec(),
             largest_key: b"z".to_vec(),
             file_size: 1024,
+            max_timestamp: 0,
         };
 
         manifest.add_sstable(meta.clone());
@@ -209,6 +217,7 @@ mod tests {
             smallest_key: b"a".to_vec(),
             largest_key: b"z".to_vec(),
             file_size: 1024,
+            max_timestamp: 0,
         });
 
         manifest.add_sstable(SSTableMetadata {
@@ -217,6 +226,7 @@ mod tests {
             smallest_key: b"b".to_vec(),
             largest_key: b"y".to_vec(),
             file_size: 2048,
+            max_timestamp: 0,
         });
 
         assert_eq!(manifest.total_sstables(), 2);
@@ -239,6 +249,7 @@ mod tests {
             smallest_key: b"a".to_vec(),
             largest_key: b"d".to_vec(),
             file_size: 1024,
+            max_timestamp: 0,
         });
 
         manifest.add_sstable(SSTableMetadata {
@@ -247,6 +258,7 @@ mod tests {
             smallest_key: b"e".to_vec(),
             largest_key: b"h".to_vec(),
             file_size: 1024,
+            max_timestamp: 0,
         });
 
         manifest.add_sstable(SSTableMetadata {
@@ -255,6 +267,7 @@ mod tests {
             smallest_key: b"i".to_vec(),
             largest_key: b"z".to_vec(),
             file_size: 1024,
+            max_timestamp: 0,
         });
 
         // Find overlapping with range [c, f]
@@ -278,6 +291,7 @@ mod tests {
             smallest_key: b"key1".to_vec(),
             largest_key: b"key999".to_vec(),
             file_size: 4096,
+            max_timestamp: 0,
         });
 
         manager.save(&manifest).await?;

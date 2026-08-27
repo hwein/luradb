@@ -340,10 +340,20 @@ impl LsmStorageEngine {
         let vlog = Self::build_vlog_registry(vlog, &vlog_path).await?;
 
         // Recover the MemTable from the WAL first.
-        let recovered = Self::recover_from_wal(&wal_path, &vlog, engine_config.vlog_inline_threshold).await?;
+        let (recovered, wal_max_ts) =
+            Self::recover_from_wal(&wal_path, &vlog, engine_config.vlog_inline_threshold).await?;
 
         let level_manager = Arc::new(LevelManager::new());
         let manifest = manifest_manager.load().await?;
+
+        // High-water mark of everything already persisted (spec kv/026 M3).
+        let manifest_max_ts = manifest
+            .levels
+            .iter()
+            .flatten()
+            .map(|meta| meta.max_timestamp)
+            .max()
+            .unwrap_or(0);
 
         // Then, recover SSTable levels from the manifest.
         Self::recover_sstables(&manifest, &file_manager, &level_manager, engine_config.use_mmap)
@@ -384,6 +394,13 @@ impl LsmStorageEngine {
             flush_notify: Arc::new(Notify::new()),
             in_flight_writes: tokio::sync::RwLock::new(()),
         };
+
+        // Spec kv/026 M3: a fresh HLC only reads the wall clock, so after a
+        // backwards clock step every snapshot would be older than the data on
+        // disk and hide it. Seeding from recovered state fixes the read side
+        // and keeps new writes above existing versions. Must happen before the
+        // recovery flush below, i.e. before any timestamp can be issued.
+        engine.hlc.seed(wal_max_ts.max(manifest_max_ts));
 
         // Recovered WAL data is RAM-only: flush it to an SSTable BEFORE
         // truncating the WAL, so no later startup failure can lose it.
@@ -450,7 +467,9 @@ impl LsmStorageEngine {
         Ok(Arc::new(registry))
     }
 
-    /// Recovers the MemTable state from the WAL.
+    /// Recovers the MemTable state from the WAL, together with the highest
+    /// raw MVCC timestamp it replayed (0 for an empty WAL) — [`Self::new`]
+    /// seeds the HLC with it (spec kv/026 M3).
     ///
     /// Does NOT truncate the WAL — [`Self::new`] first flushes the recovered
     /// data to an SSTable, so an interrupted startup never loses it.
@@ -458,7 +477,7 @@ impl LsmStorageEngine {
         wal_path: &PathBuf,
         vlog: &VLogRegistry,
         vlog_inline_threshold: usize,
-    ) -> Result<MemTable> {
+    ) -> Result<(MemTable, u64)> {
         let memtable = MemTable::new();
         let entries = crate::core::wal::recover(wal_path).await?;
         let mut max_ts = 0;
@@ -489,7 +508,7 @@ impl LsmStorageEngine {
             }
         }
 
-        Ok(memtable)
+        Ok((memtable, max_ts))
     }
 
     /// Opens an SSTable reader for `file_id` — memory-mapped when `use_mmap`
@@ -1267,6 +1286,7 @@ impl LsmStorageEngine {
         let mut builder = SSTableBuilder::new();
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
+        let mut max_timestamp = 0u64;
 
         for (encoded_key, value) in memtable_to_flush.iter() {
             if smallest_key.is_none() || encoded_key < *smallest_key.as_ref().unwrap() {
@@ -1274,6 +1294,10 @@ impl LsmStorageEngine {
             }
             if largest_key.is_none() || encoded_key > *largest_key.as_ref().unwrap() {
                 largest_key = Some(encoded_key.clone());
+            }
+            // Raw value, not `Timestamp::cmp` — that one sorts newest first.
+            if let Some(ts) = InternalKey::extract_timestamp(&encoded_key) {
+                max_timestamp = max_timestamp.max(ts.as_u64());
             }
 
             match value {
@@ -1356,6 +1380,7 @@ impl LsmStorageEngine {
                 smallest_key: smallest_key.unwrap_or_default(),
                 largest_key: largest_key.unwrap_or_default(),
                 file_size,
+                max_timestamp,
             });
         }
 
@@ -1502,7 +1527,7 @@ impl LsmStorageEngine {
             } else {
                 SSTableReader::open(sstable_data)?
             };
-            let (smallest_key, largest_key) = Self::sstable_key_range(&sstable)?;
+            let (smallest_key, largest_key, max_timestamp) = Self::sstable_key_range(&sstable)?;
 
             new_metas.push(SSTableMetadata {
                 file_id,
@@ -1510,15 +1535,18 @@ impl LsmStorageEngine {
                 smallest_key,
                 largest_key,
                 file_size,
+                max_timestamp,
             });
         }
         Ok(new_metas)
     }
 
-    /// Smallest/largest encoded key in `sstable` (empty vecs when it has none).
-    fn sstable_key_range(sstable: &SSTableReader) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// Smallest/largest encoded key in `sstable` (empty vecs when it has none)
+    /// plus its highest raw MVCC timestamp (`SSTableMetadata::max_timestamp`).
+    fn sstable_key_range(sstable: &SSTableReader) -> Result<(Vec<u8>, Vec<u8>, u64)> {
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
+        let mut max_timestamp = 0u64;
         for entry in sstable.iter() {
             let (key, _) = entry?;
             if smallest_key.is_none() || key < smallest_key.as_ref().unwrap().as_slice() {
@@ -1527,8 +1555,12 @@ impl LsmStorageEngine {
             if largest_key.is_none() || key > largest_key.as_ref().unwrap().as_slice() {
                 largest_key = Some(key.to_vec());
             }
+            // Raw value, not `Timestamp::cmp` — that one sorts newest first.
+            if let Some(ts) = InternalKey::extract_timestamp(key) {
+                max_timestamp = max_timestamp.max(ts.as_u64());
+            }
         }
-        Ok((smallest_key.unwrap_or_default(), largest_key.unwrap_or_default()))
+        Ok((smallest_key.unwrap_or_default(), largest_key.unwrap_or_default(), max_timestamp))
     }
 
     /// Rebuilds `levels`' readers from the manifest (post manifest-swap).
@@ -1675,6 +1707,7 @@ mod tests {
     use crate::storage::manifest::ManifestManager;
     use crate::engines::StorageEngine;
     use crate::engines::lsm::block_cache::BlockCacheKey;
+    use crate::engines::lsm::hlc::HLCTimestamp;
     use crate::engines::lsm::watcher::OpType;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1980,6 +2013,136 @@ mod tests {
         assert!(result.is_err(), "new() must fail when a manifested SSTable cannot be opened");
     }
 
+    // ── Spec kv/026 M3: HLC seeding from recovered state ─────────────────────
+    //
+    // A backwards step of the system clock, reproduced deterministically: the
+    // HLC is pushed ahead of the wall clock before the writes, so a restarted
+    // engine seeding its clock from nothing would take snapshots older than
+    // every stored version and read back nothing. No wall clock is touched.
+
+    const HLC_SKEW_MS: u64 = 5_000;
+
+    fn advance_hlc(engine: &LsmStorageEngine) {
+        let ahead = engine.hlc().now().physical() + HLC_SKEW_MS;
+        engine.hlc().update(HLCTimestamp::from_components(ahead, 0));
+    }
+
+    async fn put_range(engine: &LsmStorageEngine, range: std::ops::Range<u32>) {
+        for i in range {
+            engine.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+    }
+
+    async fn assert_all_readable(engine: &LsmStorageEngine, range: std::ops::Range<u32>) {
+        for i in range {
+            assert_eq!(
+                engine.get(format!("k{i}").as_bytes()).await.unwrap(),
+                Some(b"v".to_vec()),
+                "k{i} must be visible after the restart"
+            );
+        }
+    }
+
+    // Test 1: crash variant — the WAL still holds the advanced stamps.
+    #[tokio::test]
+    async fn test_crash_restart_sees_data_written_ahead_of_the_wall_clock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        put_range(&engine, 0..20).await;
+        drop(engine); // crash: the data lives only in the WAL
+
+        let engine2 = engine_on(&dir).await;
+        assert_all_readable(&engine2, 0..20).await;
+    }
+
+    // Test 2: clean-shutdown variant — the WAL is empty afterwards, so only
+    // the manifest high-water mark can carry the clock across the restart.
+    #[tokio::test]
+    async fn test_clean_shutdown_restart_sees_data_written_ahead_of_the_wall_clock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        put_range(&engine, 0..20).await;
+        engine.shutdown().await;
+        drop(engine);
+
+        assert!(
+            std::fs::read(dir.path().join("wal.log")).unwrap().is_empty(),
+            "a clean shutdown leaves no WAL to seed from"
+        );
+
+        let engine2 = engine_on(&dir).await;
+        assert_all_readable(&engine2, 0..20).await;
+    }
+
+    // Test 3: a re-put after the restart must outrank the stored version.
+    // The compaction is the discriminator — it keeps only the highest-stamped
+    // version of a key, so a re-put stamped below the stored one is not
+    // merely invisible for a while, it is dropped for good.
+    #[tokio::test]
+    async fn test_reput_after_restart_outranks_the_stored_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        engine.put(b"k", b"old").await.unwrap();
+        engine.shutdown().await;
+        drop(engine);
+
+        let engine2 = engine_on(&dir).await;
+        engine2.put(b"k", b"new").await.unwrap();
+        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+
+        // Both versions now meet in one merged SSTable.
+        engine2.flush_all_memtables().await.unwrap();
+        engine2.compact_level(0).await.unwrap();
+        assert_eq!(
+            engine2.get(b"k").await.unwrap(),
+            Some(b"new".to_vec()),
+            "the compaction must keep the re-put value, not the older-stamped one"
+        );
+        engine2.shutdown().await;
+        drop(engine2);
+
+        let engine3 = engine_on(&dir).await;
+        assert_eq!(
+            engine3.get(b"k").await.unwrap(),
+            Some(b"new".to_vec()),
+            "the re-put value must survive a further restart"
+        );
+    }
+
+    // Test 4: a manifest written before M3 has no `max_timestamp` field; it
+    // must still load (serde default 0) with the WAL seed doing the work.
+    #[tokio::test]
+    async fn test_manifest_without_max_timestamp_loads_and_wal_seed_applies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        put_range(&engine, 0..5).await;
+        engine.flush_all_memtables().await.unwrap();
+        put_range(&engine, 5..10).await;
+        drop(engine); // crash: the WAL still holds every key
+
+        // Rewrite the manifest in the pre-M3 format.
+        let manifest_path = dir.path().join("MANIFEST");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        for level in json["levels"].as_array_mut().unwrap() {
+            for meta in level.as_array_mut().unwrap() {
+                assert!(meta.as_object_mut().unwrap().remove("max_timestamp").is_some());
+            }
+        }
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let loaded = ManifestManager::new(dir.path()).load().await.unwrap();
+        let meta = loaded.get_level(0).first().expect("the flush must have produced an SSTable");
+        assert_eq!(meta.max_timestamp, 0, "an old manifest reads as 0, without a migration run");
+
+        let engine2 = engine_on(&dir).await;
+        assert_all_readable(&engine2, 0..10).await;
+    }
+
     // ── Lifecycle tests ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2212,7 +2375,7 @@ mod tests {
         // WAL replay: the live engine hasn't truncated its WAL yet, so
         // recovering it independently reflects exactly what a restart would see.
         let wal_path = dir.path().join("wal.log");
-        let recovered = LsmStorageEngine::recover_from_wal(
+        let (recovered, _) = LsmStorageEngine::recover_from_wal(
             &wal_path,
             &engine.vlog,
             engine.engine_config.vlog_inline_threshold,

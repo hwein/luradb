@@ -38,6 +38,7 @@ All notable changes to LuraDB are documented in this file.
 - SSTable: a corrupted bloom filter block (empty bit array with a non-zero hash count) fails with an error instead of a panic.
 - LSM: shutdown with a failed flush no longer truncates the WAL.
 - LSM: startup fails loudly instead of silently skipping an unopenable SSTable.
+- LSM: a restarted engine now seeds its clock from the recovered WAL and manifest — after a backwards system-clock step it no longer hides existing data or buries a rewritten key under its older version.
 
 ## [0.3.1] - 2026-08-13
 

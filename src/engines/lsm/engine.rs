@@ -30,7 +30,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 use tokio::time::{sleep, Duration};
 
 // Default limits — kept as constants so tests can reference them directly.
@@ -267,6 +267,16 @@ pub struct LsmStorageEngine {
     /// Signals background tasks to stop.
     shutdown: Arc<AtomicBool>,
 
+    /// Wakes background loops immediately on shutdown instead of leaving them
+    /// to sleep out their poll interval (M2) — `watch::Receiver::changed` has
+    /// no lost-wakeup between a loop's flag check and going to sleep, unlike
+    /// `Notify::notify_waiters`.
+    shutdown_tx: watch::Sender<bool>,
+
+    /// Handles of the three background loops; joined by [`Self::shutdown`]
+    /// before it touches MemTables/WAL (M1).
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+
     /// S3-FIFO block cache shared across all read operations.
     block_cache: Arc<Mutex<BlockCache>>,
 
@@ -328,6 +338,7 @@ impl LsmStorageEngine {
             block_cache_config.ghost_capacity,
         )));
 
+        let (shutdown_tx, _) = watch::channel(false);
         let engine = Self {
             memtable: Arc::new(RwLock::new(Arc::new(MemTable::new()))),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
@@ -346,6 +357,8 @@ impl LsmStorageEngine {
             change_tx,
             watch_log,
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
+            background_tasks: Mutex::new(Vec::new()),
             block_cache,
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
@@ -502,19 +515,23 @@ impl LsmStorageEngine {
 
     // ── Background tasks ────────────────────────────────────────────────────
 
-    /// Starts the flush loop, compaction loop, and Janitor GC loop.
+    /// Starts the flush loop, compaction loop, and Janitor GC loop, keeping
+    /// their `JoinHandle`s so [`Self::shutdown`] can join them (M1).
     pub fn start_background_tasks(self: &Arc<Self>) {
+        let mut tasks = self.background_tasks.lock();
+
         // Flush loop
         let engine = Arc::clone(self);
-        tokio::spawn(async move { engine.background_flush_loop().await });
+        tasks.push(tokio::spawn(async move { engine.background_flush_loop().await }));
 
         // Compaction loop
         let engine = Arc::clone(self);
-        tokio::spawn(async move { engine.background_compaction_loop().await });
+        tasks.push(tokio::spawn(async move { engine.background_compaction_loop().await }));
 
         // Janitor (vLog GC) loop
         let janitor = Arc::new(self.build_janitor(self.janitor_config.clone()));
-        tokio::spawn(async move { janitor.run_background().await });
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        tasks.push(tokio::spawn(async move { janitor.run_background(shutdown_rx).await }));
     }
 
     /// Builds a Janitor over this engine's state, wired with the flush barrier
@@ -543,6 +560,7 @@ impl LsmStorageEngine {
     }
 
     async fn background_flush_loop(&self) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         while !self.shutdown.load(Ordering::Relaxed) {
             let has_immutable = !self.immutable_memtables.read().is_empty();
             if has_immutable {
@@ -550,11 +568,18 @@ impl LsmStorageEngine {
                     eprintln!("[Engine] Flush error: {e}");
                 }
             }
-            sleep(Duration::from_millis(self.engine_config.flush_check_interval_ms)).await;
+            // M2: woken immediately on shutdown instead of sleeping out the
+            // full interval; `changed()` cannot miss a signal sent while this
+            // loop was doing the work above (no lost-wakeup, unlike Notify).
+            tokio::select! {
+                _ = sleep(Duration::from_millis(self.engine_config.flush_check_interval_ms)) => {}
+                _ = shutdown_rx.changed() => {}
+            }
         }
     }
 
     async fn background_compaction_loop(&self) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         while !self.shutdown.load(Ordering::Relaxed) {
             let needs = {
                 let manifest = self.manifest.read();
@@ -565,7 +590,10 @@ impl LsmStorageEngine {
                     eprintln!("[Engine] Compaction error: {e}");
                 }
             }
-            sleep(Duration::from_millis(self.engine_config.compaction_check_interval_ms)).await;
+            tokio::select! {
+                _ = sleep(Duration::from_millis(self.engine_config.compaction_check_interval_ms)) => {}
+                _ = shutdown_rx.changed() => {}
+            }
         }
     }
 
@@ -595,10 +623,28 @@ impl LsmStorageEngine {
         Ok(())
     }
 
-    /// Shuts down all background tasks and flushes remaining MemTables.
+    /// Signals background tasks to stop, joins them, then flushes remaining
+    /// MemTables. Idempotent: a second call finds no handles left to join and
+    /// flushes/truncates an already-clean state.
     pub async fn shutdown(&self) {
+        // 1. Signal: flag for cheap sync checks + watch send to wake any
+        // loop that is sleeping (M2) instead of leaving it to poll.
         self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.shutdown_tx.send(true);
 
+        // 2. Join before touching MemTables/WAL below. The lock cannot be
+        // held across the awaits in the loop, so the handles are taken first.
+        let handles = {
+            let mut tasks = self.background_tasks.lock();
+            std::mem::take(&mut *tasks)
+        };
+        for handle in handles {
+            if let Err(e) = handle.await {
+                eprintln!("[Engine] Background task join error: {e}");
+            }
+        }
+
+        // 3. Only now is nothing left running concurrently (M1).
         if let Err(e) = self.flush_all_memtables().await {
             eprintln!("[Engine] Shutdown flush error: {e}");
         }
@@ -1537,6 +1583,97 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Builds an engine on `dir` with `options`, wraps it in `Arc`, and
+    /// starts its background tasks -- the shape every real bootstrap path
+    /// uses (`main.rs`, `JsonEngine::bootstrap`, `RelEngine::bootstrap`).
+    async fn boot_with_tasks(dir: &tempfile::TempDir, options: LsmEngineOptions) -> Arc<LsmStorageEngine> {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        let engine = Arc::new(
+            LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options)
+                .await
+                .unwrap(),
+        );
+        engine.start_background_tasks();
+        engine
+    }
+
+    // Spec general/023 test 1 (wake + join): without M2 the Janitor's
+    // default 60s sleep would blow this timeout; without M1 nothing here
+    // would prove the loops actually stopped. Bound chosen generously on
+    // purpose (lesson from general/008: no tight time windows).
+    #[tokio::test]
+    async fn test_shutdown_wakes_and_joins_background_tasks_promptly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+
+        tokio::time::timeout(Duration::from_secs(10), engine.shutdown())
+            .await
+            .expect("shutdown must be woken, not wait out the 60s Janitor interval");
+    }
+
+    // Spec general/023 test 2 (restart determinism): the test_disabled_smoke
+    // pattern at the LSM level, now overlap-free by construction -- a
+    // shutdown that returns before its tasks fully stop would let the old
+    // instance's flush/compaction/GC race the new instance's recovery on the
+    // same directory (spec general/023 §A2).
+    #[tokio::test]
+    async fn test_restart_determinism_with_background_tasks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Short poll intervals raise the odds that a loop is doing real work
+        // (not just sleeping) at the moment shutdown() fires each iteration.
+        let opts = || LsmEngineOptions {
+            engine: LsmEngineConfig {
+                flush_check_interval_ms: 5,
+                compaction_check_interval_ms: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut engine = boot_with_tasks(&dir, opts()).await;
+        for i in 0..10u32 {
+            let key = format!("k{i}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            engine.put(&key, &value).await.unwrap();
+            engine.shutdown().await;
+
+            engine = boot_with_tasks(&dir, opts()).await;
+            assert_eq!(engine.get(&key).await.unwrap(), Some(value), "iteration {i}");
+        }
+        engine.shutdown().await;
+    }
+
+    // Spec general/023 test 3 (idempotency): a second shutdown() finds an
+    // empty handle list and an already-flushed, already-truncated WAL --
+    // must not panic or return an error.
+    #[tokio::test]
+    async fn test_shutdown_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+        engine.put(b"k", b"v").await.unwrap();
+
+        engine.shutdown().await;
+        engine.shutdown().await; // must not panic
+    }
+
+    // Spec general/023 test 5 (no task leak): shutdown's mem::take leaves no
+    // dangling JoinHandles behind -- checkable directly since the field is
+    // private to this module.
+    #[tokio::test]
+    async fn test_shutdown_leaves_no_task_handles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+
+        engine.shutdown().await;
+
+        assert!(engine.background_tasks.lock().is_empty());
     }
 
     // Batch: all ops visible after write, and WAL replay (record type 3)

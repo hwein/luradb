@@ -39,6 +39,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
 /// Engine callback that freezes and flushes every MemTable. Injected at
@@ -188,11 +189,16 @@ impl Janitor {
 
     /// Runs the Janitor's periodic GC loop.
     ///
-    /// Intended to be spawned as a Tokio task via `tokio::spawn`.
-    pub async fn run_background(self: Arc<Self>) {
+    /// Intended to be spawned as a Tokio task via `tokio::spawn`. `shutdown_rx`
+    /// wakes the loop immediately on shutdown (spec general/023 M2) instead of
+    /// sleeping out the full `check_interval_secs`, which defaults to 60s.
+    pub async fn run_background(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
         let interval = Duration::from_secs(self.config.check_interval_secs);
         while !self.shutdown.load(Ordering::Relaxed) {
-            sleep(interval).await;
+            tokio::select! {
+                _ = sleep(interval) => {}
+                _ = shutdown_rx.changed() => {}
+            }
 
             if self.shutdown.load(Ordering::Relaxed) {
                 break;

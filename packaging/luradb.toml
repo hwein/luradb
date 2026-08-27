@@ -55,6 +55,14 @@ check_interval_secs = 60
 dead_bytes_threshold = 0.30
 min_vlog_size_bytes = 67108864
 
+# Background removal of TTL-expired keys (spec kv/025): each swept key gets a
+# tombstone and a delete event. Disabling it restores purely lazy expiry.
+[ttl_sweeper]
+enabled = true
+interval_secs = 60
+# Candidates checked per tick — discarded ones count too.
+batch_size = 500
+
 [domains]
 max_name_length = 50
 max_user_key_length = 256

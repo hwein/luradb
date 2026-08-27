@@ -31,6 +31,7 @@ All notable changes to LuraDB are documented in this file.
 ### Changed
 
 - **BREAKING** `server.bind_address` now defaults to `127.0.0.1` (previously `0.0.0.0`). Only affects a start without a config file, or one that omits `bind_address`; both shipped configs (`luradb.toml`, `packaging/luradb.toml`) already bind loopback explicitly.
+- KV: expired keys are now removed proactively and emit a `delete` event — a background TTL sweeper tombstones them instead of leaving them to the next compaction, so watch subscribers see the expiry and the space comes back earlier. New `[ttl_sweeper]` config section (`enabled`, `interval_secs`, `batch_size`); `enabled = false` restores the previous purely lazy behavior.
 
 ### Fixed
 

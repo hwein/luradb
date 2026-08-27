@@ -7,7 +7,7 @@ use crate::engines::lsm::block_cache::BlockCache;
 use crate::engines::lsm::hlc::HLCTimestamp;
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::memtable::{MemTable, Value};
-use crate::storage::format::{self, CachedValue};
+use crate::storage::format::{self, CachedValue, VersionState};
 use crate::storage::sstable::SSTableReader;
 use crate::storage::vlog::VLogRegistry;
 use anyhow::Result;
@@ -353,6 +353,36 @@ impl LsmReader {
                 Ok(Some(Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false, is_null: false, last_modified_ms: hlc_physical_ms(ts) })))
             }
         }
+    }
+
+    /// Newest version of `user_key` as (write stamp, liveness) — the TTL
+    /// sweeper's authoritative re-check (spec kv/025 §3.1). Same newest-first
+    /// source order as [`Self::get_with_metadata`] and no VLog access, but it
+    /// reports an expired or tombstoned version instead of collapsing both
+    /// into the same `None` an absent key yields.
+    pub async fn newest_version(
+        &self,
+        user_key: &[u8],
+        snapshot: &Snapshot,
+    ) -> Result<Option<(Timestamp, VersionState)>> {
+        let now = now_secs();
+        for memtable in self.memtables_newest_first() {
+            if let Some((value, ts)) = memtable.get_with_ts(user_key, snapshot.timestamp()) {
+                return Ok(Some((ts, value.version_state(now))));
+            }
+        }
+
+        let encoded_key = InternalKey::new(user_key.to_vec(), snapshot.timestamp()).encode();
+        for sstable in self.sstables_newest_first() {
+            let hit = {
+                let mut cache = self.cache.lock();
+                sstable.get_with_cache_and_ts(&encoded_key, &mut *cache)?
+            };
+            if let Some((value, ts)) = hit {
+                return Ok(Some((ts, value.version_state(now))));
+            }
+        }
+        Ok(None)
     }
 
     /// Adds an SSTable to a specific level.

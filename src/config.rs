@@ -13,6 +13,7 @@ pub struct LuraConfig {
     pub lsm: LsmConfig,
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
+    pub ttl_sweeper: TtlSweeperCfg,
     pub domains: DomainsConfig,
     pub rate_limit: RateLimitConfig,
     pub log: LogConfig,
@@ -38,6 +39,7 @@ impl Default for LuraConfig {
             lsm: LsmConfig::default(),
             compaction: CompactionCfg::default(),
             janitor: JanitorCfg::default(),
+            ttl_sweeper: TtlSweeperCfg::default(),
             domains: DomainsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             log: LogConfig::default(),
@@ -342,6 +344,30 @@ impl Default for JanitorCfg {
             check_interval_secs: 60,
             dead_bytes_threshold: 0.30,
             min_vlog_size_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+// ── TTL sweeper ───────────────────────────────────────────────────────────────
+
+/// Background task that tombstones TTL-expired keys and emits their delete
+/// events (spec kv/025). Only the KV instance runs one.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TtlSweeperCfg {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    /// Candidates *checked* per tick — discarded ones count too, so a tick may
+    /// write fewer tombstones than this.
+    pub batch_size: usize,
+}
+
+impl Default for TtlSweeperCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+            batch_size: 500,
         }
     }
 }

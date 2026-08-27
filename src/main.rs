@@ -16,6 +16,7 @@ use crate::{
         domain::{DomainConfig, DomainPurger, DomainRegistry},
         engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine},
         janitor::JanitorConfig,
+        ttl_sweeper::TtlSweeper,
     },
     engines::rel::RelEngine,
     ipc::ShmManager,
@@ -331,6 +332,18 @@ fn spawn_background_tasks(
         purger_interval_secs,
     ));
     tokio::spawn(async move { purger.run().await });
+
+    // --- TTL sweeper (background, spec kv/025 §6) ---
+    // KV only: JSON and rel never write an `expire_at`.
+    if cfg.ttl_sweeper.enabled {
+        let sweeper = Arc::new(TtlSweeper::new(
+            Arc::clone(lsm_store),
+            Arc::clone(&shutdown_flag),
+            cfg.ttl_sweeper.batch_size,
+            cfg.ttl_sweeper.interval_secs,
+        ));
+        tokio::spawn(async move { sweeper.run().await });
+    }
 
     // --- JSON domain purger (background) ---
     if let Some(engine) = json_engine {

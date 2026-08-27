@@ -189,6 +189,30 @@ fn is_live_version(value: &Value, now: u64) -> bool {
     value.version_state(now) == VersionState::Live
 }
 
+/// Entries the expiry scan checks between two yield points (spec kv/025 §7).
+const SCAN_EXPIRED_YIELD_INTERVAL: usize = 1024;
+
+/// Counts one checked entry and hands the worker back every
+/// [`SCAN_EXPIRED_YIELD_INTERVAL`] entries (spec kv/025 §7) — the SSTable
+/// phase is synchronous and would otherwise block a worker for a whole file.
+async fn scan_expired_yield(checked: &mut usize) {
+    *checked += 1;
+    if *checked % SCAN_EXPIRED_YIELD_INTERVAL == 0 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Adds `key` and drops the largest entry once the set exceeds `limit`, so it
+/// always holds the `limit` smallest candidates seen — independent of the
+/// order the sources deliver them in (spec kv/025 §3). Memory is
+/// O(`batch_size`), never O(keys of the instance).
+fn push_expired_candidate(candidates: &mut BTreeSet<Vec<u8>>, limit: usize, key: Vec<u8>) {
+    candidates.insert(key);
+    if candidates.len() > limit {
+        candidates.pop_last();
+    }
+}
+
 /// Sweeps one SSTable for keys with `prefix` (see [`scan_memtable_for_prefix`]
 /// for the newest-first decision protocol and the `snapshot` contract).
 /// Returns `true` once `live` holds `limit` keys so the caller can stop.
@@ -732,6 +756,60 @@ impl LsmStorageEngine {
         self.build_reader().get_with_expiry(key, snapshot).await
     }
 
+    /// Newest version of `key` as (write stamp, liveness) — the TTL sweeper's
+    /// authoritative re-check (spec kv/025 §3.1). Takes no snapshot argument:
+    /// the sweeper always wants the current state, so it is pulled internally
+    /// and cannot accidentally be a stale one.
+    pub(super) async fn newest_version(&self, key: &[u8]) -> Result<Option<(Timestamp, VersionState)>> {
+        let snapshot = self.snapshot_unregistered();
+        self.build_reader().newest_version(key, &snapshot).await
+    }
+
+    /// Collects the `limit` smallest user-keys above `after` that carry *some*
+    /// expired version (spec kv/025 §3). Deliberately a superset: no
+    /// cross-source newest-first resolution happens here (no `decided` set
+    /// over all keys, §7) — [`Self::newest_version`] decides authoritatively.
+    /// Key-only, no vLog I/O.
+    pub(super) async fn scan_expired(&self, after: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        let mut candidates: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let now = now_secs();
+        let mut checked = 0usize;
+
+        let memtables = {
+            let mut tables = vec![Arc::clone(&*self.memtable.read())];
+            tables.extend(self.immutable_memtables.read().iter().cloned());
+            tables
+        };
+        for mt in &memtables {
+            for (encoded_key, value) in mt.iter() {
+                scan_expired_yield(&mut checked).await;
+                let Some(user_key) = InternalKey::extract_user_key(&encoded_key) else {
+                    continue;
+                };
+                if user_key <= after || value.version_state(now) != VersionState::Expired {
+                    continue;
+                }
+                push_expired_candidate(&mut candidates, limit, user_key.to_vec());
+            }
+        }
+
+        for level_sstables in self.level_manager.get_all_levels() {
+            for sstable in level_sstables {
+                for entry in sstable.prefix_entries(&[], None) {
+                    scan_expired_yield(&mut checked).await;
+                    let (user_key, _ts, state) = entry?;
+                    if state != VersionState::Expired || user_key.as_slice() <= after {
+                        continue;
+                    }
+                    push_expired_candidate(&mut candidates, limit, user_key);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        Ok(candidates.into_iter().collect())
+    }
+
     /// Returns a handle to the block cache metrics for the `/metrics` endpoint.
     pub fn block_cache_metrics(&self) -> Arc<crate::engines::lsm::block_cache::BlockCacheMetrics> {
         self.block_cache.lock().metrics()
@@ -739,7 +817,7 @@ impl LsmStorageEngine {
 
     // ── Write path helpers ──────────────────────────────────────────────────
 
-    fn maybe_freeze_memtable(&self) -> Result<()> {
+    pub(super) fn maybe_freeze_memtable(&self) -> Result<()> {
         let threshold = self.engine_config.memtable_size_threshold;
         let size = { self.memtable.read().approximate_size() };
         if size >= threshold {
@@ -808,23 +886,59 @@ impl LsmStorageEngine {
         Ok(())
     }
 
-    /// Appends a DELETE entry to the WAL and inserts a tombstone into the MemTable.
-    pub(super) async fn write_tombstone(&self, key: &[u8]) -> Result<()> {
-        let timestamp = self.next_timestamp();
-
+    /// Serialises one DELETE record (WAL type 2): [type=2][ts:u64][key_len:u32][key].
+    /// Shared by the client delete path and the TTL sweeper (spec kv/025 §3.2);
+    /// the record format and its replay are unchanged.
+    fn encode_tombstone_wal_record(timestamp: Timestamp, key: &[u8]) -> Vec<u8> {
         let mut log_entry = Vec::new();
         log_entry.push(2u8);
         log_entry.extend_from_slice(&timestamp.as_u64().to_be_bytes());
         log_entry.extend_from_slice(&(key.len() as u32).to_be_bytes());
         log_entry.extend_from_slice(key);
-        self.wal.append(&log_entry).await?;
+        log_entry
+    }
+
+    /// Appends a DELETE entry to the WAL and inserts a tombstone into the MemTable.
+    pub(super) async fn write_tombstone(&self, key: &[u8]) -> Result<()> {
+        let timestamp = self.next_timestamp();
+
+        self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
         // Broadcast after WAL is durable.
         self.publish_change(key, OpType::Delete);
 
         self.maybe_freeze_memtable()?;
 
+        // Pinned only here, after the WAL append: pulling it forward would
+        // stretch this path's inversion window to a whole fsync (spec kv/025 §3.2).
         let memtable = Arc::clone(&*self.memtable.read());
+        memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+        Ok(())
+    }
+
+    /// Pins the active MemTable — every tombstone of one sweep tick goes into
+    /// exactly this one (spec kv/025 §3 step 2, §4.2).
+    pub(super) fn pin_memtable(&self) -> Arc<MemTable> {
+        Arc::clone(&*self.memtable.read())
+    }
+
+    /// Writes a tombstone dated `timestamp` into the *given* MemTable — the
+    /// TTL sweeper's pinned one (spec kv/025 §3.2). Deliberately without
+    /// `maybe_freeze_memtable` and without re-reading `self.memtable`: a
+    /// tombstone that ends up in a newer source than the value it dates
+    /// against would win despite its older stamp (§4.2). Sweeper-exclusive —
+    /// [`Self::write_tombstone`] does not delegate here.
+    pub(super) async fn write_tombstone_at(
+        &self,
+        memtable: &Arc<MemTable>,
+        key: &[u8],
+        timestamp: Timestamp,
+    ) -> Result<()> {
+        self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
+
+        // Broadcast after WAL is durable.
+        self.publish_change(key, OpType::Delete);
+
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
         Ok(())
     }

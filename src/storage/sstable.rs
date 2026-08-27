@@ -626,8 +626,9 @@ impl SSTableReader {
     /// [`Self::keys_with_prefix_at`]: `max_inv_ts` of `None` matches every
     /// version (today's `keys_with_prefix` behavior). Returns each version's
     /// write timestamp and liveness classification (spec kv/025 §2) — the
-    /// callers above collapse it to today's `(user_key, bool)`.
-    fn prefix_entries<'a>(
+    /// callers above collapse it to today's `(user_key, bool)`, the TTL
+    /// sweeper's expiry scan uses it directly.
+    pub(crate) fn prefix_entries<'a>(
         &'a self,
         prefix: &'a [u8],
         max_inv_ts: Option<u64>,

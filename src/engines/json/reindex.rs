@@ -234,7 +234,8 @@ mod tests {
             reindex_pause_ms: pause_ms,
             ..JsonStoreConfig::default()
         };
-        let engine = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         (engine, dir)
     }
 

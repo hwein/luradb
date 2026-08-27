@@ -13,6 +13,7 @@ use super::rest_exec::ExpandedBlock;
 use super::select::resolve_candidate_keys;
 use super::types::ColumnType;
 use super::{ExecOutcome, RelEngine};
+use crate::metrics::EngineKind;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -50,6 +51,7 @@ impl RelEngine {
         offset: Option<i64>,
         auth: LinkAuth,
     ) -> Result<(SelectResult, Option<ExpandedBlock>, u64, u64), RelStoreError> {
+        let start = std::time::Instant::now();
         let schema = self.browse_table(domain, table)?;
 
         let mut params: Vec<Value> = Vec::with_capacity(filters.len());
@@ -101,6 +103,7 @@ impl RelEngine {
         let ExecOutcome::Select(result) = self.exec_select(domain, sel, &params, auth).await? else {
             unreachable!("a Select statement always yields ExecOutcome::Select")
         };
+        self.metrics.record_engine_read(EngineKind::Rel, start.elapsed().as_micros() as u64);
 
         let expanded = if expand.is_empty() {
             None
@@ -128,6 +131,7 @@ impl RelEngine {
         expand: &[String],
         auth: LinkAuth,
     ) -> Result<Option<(SelectResult, Option<ExpandedBlock>)>, RelStoreError> {
+        let start = std::time::Instant::now();
         let schema = self.browse_table(domain, table)?;
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
         let pk_value = parse_raw_value(pk_col.col_type, pk_raw)?;
@@ -148,6 +152,7 @@ impl RelEngine {
         let ExecOutcome::Select(result) = self.exec_select(domain, sel, &[pk_value], auth).await? else {
             unreachable!("a Select statement always yields ExecOutcome::Select")
         };
+        self.metrics.record_engine_read(EngineKind::Rel, start.elapsed().as_micros() as u64);
         if result.rows.is_empty() {
             return Ok(None);
         }

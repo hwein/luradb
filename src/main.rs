@@ -205,10 +205,10 @@ async fn init_io_engine(
 }
 
 // --- JSON engine (dedicated second LSM instance) ---
-async fn init_json_engine(cfg: &LuraConfig) -> anyhow::Result<Option<Arc<JsonEngine>>> {
+async fn init_json_engine(cfg: &LuraConfig, metrics: &Arc<MetricsStore>) -> anyhow::Result<Option<Arc<JsonEngine>>> {
     if cfg.json.enabled {
         cfg.json.validate_paths(&cfg.storage)?;
-        let engine = JsonEngine::bootstrap(&cfg.json).await?;
+        let engine = JsonEngine::bootstrap(&cfg.json, Arc::clone(metrics)).await?;
         tracing::info!("JSON engine ready.");
         Ok(Some(engine))
     } else {
@@ -716,7 +716,7 @@ fn main() -> anyhow::Result<()> {
         );
         tracing::info!("Domain registry recovered.");
 
-        let json_engine = init_json_engine(&config).await?;
+        let json_engine = init_json_engine(&config, &metrics).await?;
         let rel_engine = init_rel_engine(&config, &registry, &json_engine, &metrics).await?;
 
         // --- Global event bus (spec general/018 §1) --- attached before the

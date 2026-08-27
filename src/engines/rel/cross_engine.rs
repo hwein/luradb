@@ -577,14 +577,14 @@ mod tests {
         Arc::new(DomainRegistry::recover(engine, DomainConfig::default(), metrics).await.unwrap())
     }
 
-    async fn make_json(dir: &Path) -> Arc<JsonEngine> {
+    async fn make_json(dir: &Path, metrics: Arc<MetricsStore>) -> Arc<JsonEngine> {
         let cfg = JsonStoreConfig {
             wal_path: dir.join("json.wal").to_string_lossy().into_owned(),
             vlog_path: dir.join("json.vlog").to_string_lossy().into_owned(),
             sstable_dir: dir.join("json_ss").to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
         };
-        JsonEngine::bootstrap(&cfg).await.unwrap()
+        JsonEngine::bootstrap(&cfg, metrics).await.unwrap()
     }
 
     async fn boot_rel(
@@ -619,7 +619,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let metrics = MetricsStore::new(MetricsConfig::default());
         let kv = make_kv(dir.path(), Arc::clone(&metrics)).await;
-        let json = make_json(dir.path()).await;
+        let json = make_json(dir.path(), Arc::clone(&metrics)).await;
         let resolver = CrossEngineResolver::new(
             kv_on.then(|| Arc::clone(&kv)),
             json_on.then(|| Arc::clone(&json)),
@@ -1193,7 +1193,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let metrics = MetricsStore::new(MetricsConfig::default());
         let kv = make_kv(dir.path(), Arc::clone(&metrics)).await;
-        let json = make_json(dir.path()).await;
+        let json = make_json(dir.path(), Arc::clone(&metrics)).await;
 
         {
             let resolver =
@@ -1357,5 +1357,52 @@ mod tests {
         assert_eq!(count_rows(&e.rel, "SELECT id FROM t WHERE payload IS NULL", no_kv).await, 2);
         assert_eq!(count_rows(&e.rel, "SELECT id FROM t WHERE payload = 'k1'", no_kv).await, 0);
         assert_eq!(count_rows(&e.rel, "SELECT id FROM t WHERE payload IS NOT NULL", no_kv).await, 0);
+    }
+
+    // ── Spec general/019: per-engine ops/s + latency percentiles ─────────────
+
+    // Tests 3+4: one op per engine (KV put+get, JSON create+get, rel
+    // INSERT+SELECT) increments exactly that engine's read_ops/write_ops and
+    // fills its latency buckets, while the other two engines stay at 0.
+    #[tokio::test]
+    async fn test_engine_metrics_isolated_per_engine() {
+        let e = env().await;
+        ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+
+        e.kv.store("default").await.unwrap().put(b"k", b"v").await.unwrap();
+        e.kv.store("default").await.unwrap().get(b"k").await.unwrap();
+
+        let doc = e.json.create_document("default", json!({"n": 1})).await.unwrap();
+        e.json.get_document("default", &doc.key).await.unwrap();
+
+        ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'a')").await;
+        rows(&e.rel, "default", "SELECT * FROM t").await;
+        e.metrics.tick_all();
+
+        let [kv, json_m, rel_m] = e.metrics.engine_metrics();
+        assert_eq!((kv.read_ops, kv.write_ops), (1, 1), "kv: only its own ops");
+        assert_eq!((json_m.read_ops, json_m.write_ops), (1, 1), "json: only its own ops");
+        // CREATE TABLE must not count (test 8 below) -- exactly 1 read + 1 write.
+        assert_eq!((rel_m.read_ops, rel_m.write_ops), (1, 1), "rel: only its own ops, DDL excluded");
+
+        assert_ne!(kv.read_latency_us_p99, 0, "kv read latency bucket must be filled");
+        assert_ne!(kv.write_latency_us_p99, 0, "kv write latency bucket must be filled");
+        assert_ne!(json_m.read_latency_us_p99, 0, "json read latency bucket must be filled");
+        assert_ne!(json_m.write_latency_us_p99, 0, "json write latency bucket must be filled");
+        assert_ne!(rel_m.read_latency_us_p99, 0, "rel read latency bucket must be filled");
+        assert_ne!(rel_m.write_latency_us_p99, 0, "rel write latency bucket must be filled");
+    }
+
+    // Test 8: rel DDL (CREATE TABLE) increments neither read_ops nor
+    // write_ops -- it never reaches execute_dml (dml.rs:114).
+    #[tokio::test]
+    async fn test_engine_metrics_rel_ddl_not_counted() {
+        let e = env().await;
+        ok(&e.rel, "default", "CREATE TABLE ddl_only (id INTEGER PRIMARY KEY)").await;
+        e.metrics.tick_all();
+
+        let [_, _, rel_m] = e.metrics.engine_metrics();
+        assert_eq!(rel_m.read_ops, 0);
+        assert_eq!(rel_m.write_ops, 0);
     }
 }

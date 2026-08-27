@@ -16,6 +16,7 @@ use super::types::{encode_sortable, ColumnType, ScalarValue};
 use super::{ExecOutcome, RelEngine};
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::lsm::reader::Snapshot;
+use crate::metrics::EngineKind;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -103,7 +104,11 @@ impl RelEngine {
         params: &[Value],
         auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
-        match stmt {
+        // Spec general/019: one op with one latency sample per call, read for
+        // Select and write for Insert/Update/Delete -- DDL never reaches here.
+        let is_read = matches!(stmt, Statement::Select(_));
+        let start = std::time::Instant::now();
+        let outcome = match stmt {
             Statement::Insert(i) => self.exec_insert(domain, i, params, auth).await.map(ExecOutcome::Dml),
             Statement::Update(u) => self.exec_update(domain, u, params, auth).await.map(ExecOutcome::Dml),
             Statement::Delete(d) => self.exec_delete(domain, d, params).await.map(ExecOutcome::Dml),
@@ -112,7 +117,16 @@ impl RelEngine {
                 unreachable!("CREATE/DROP VIEW are dispatched in RelEngine::execute (rel/008 view.rs)")
             }
             _ => unreachable!("DDL is dispatched before execute_dml"),
+        };
+        if outcome.is_ok() {
+            let latency_us = start.elapsed().as_micros() as u64;
+            if is_read {
+                self.metrics.record_engine_read(EngineKind::Rel, latency_us);
+            } else {
+                self.metrics.record_engine_write(EngineKind::Rel, latency_us);
+            }
         }
+        outcome
     }
 
     /// Resolves a DML target to a table: view → `NotWritable`, missing →

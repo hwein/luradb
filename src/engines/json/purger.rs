@@ -84,6 +84,7 @@ mod tests {
     use super::super::{IndexFieldType, JsonEngine, JsonStoreError};
     use super::*;
     use crate::config::JsonStoreConfig;
+    use crate::metrics::{MetricsConfig, MetricsStore};
     use serde_json::json;
 
     fn config_for(dir: &tempfile::TempDir) -> JsonStoreConfig {
@@ -96,7 +97,8 @@ mod tests {
     }
 
     async fn seeded_engine(dir: &tempfile::TempDir) -> Arc<JsonEngine> {
-        let json = JsonEngine::bootstrap(&config_for(dir)).await.unwrap();
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config_for(dir), metrics).await.unwrap();
         json.create_domain("doomed").await.unwrap();
         json.create_index("doomed", "city", IndexFieldType::String).await.unwrap();
         for i in 0..5 {
@@ -198,7 +200,7 @@ mod tests {
             json.delete_domain("doomed").await.unwrap();
             json.shutdown().await;
         }
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         let deleting = json.domains.list_deleting_domains();
         assert_eq!(deleting.len(), 1, "deleting domain must survive restart");
 
@@ -226,13 +228,13 @@ mod tests {
     async fn test_bootstrap_survives_deleting_default_domain() {
         let dir = tempfile::TempDir::new().unwrap();
         {
-            let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
             json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
             json.delete_domain("default").await.unwrap();
             json.shutdown().await;
         }
         // Restart before the purge finished: boot must succeed, default stays Deleting.
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         assert!(json.get_domain("default").is_none(), "deleting default must not be active");
 
         let purger = purger(&json, 100);
@@ -248,7 +250,7 @@ mod tests {
     async fn test_default_domain_recreated_after_purge() {
         let dir = tempfile::TempDir::new().unwrap();
         {
-            let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
             json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
             json.delete_domain("default").await.unwrap();
             let purger = purger(&json, 100);
@@ -257,7 +259,7 @@ mod tests {
             assert!(json.domains.get_domain_any("default").is_none());
             json.shutdown().await;
         }
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         let default = json.domains.get_domain_any("default").expect("default must be recreated");
         assert_eq!(default.state, super::super::JsonDomainState::Active);
         json.shutdown().await;
@@ -269,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn test_inflight_write_cannot_land_after_finalize() {
         let dir = tempfile::TempDir::new().unwrap();
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         json.create_domain("doomed").await.unwrap();
         let prefix = json.get_domain("doomed").unwrap().system_prefix;
 
@@ -319,7 +321,8 @@ mod tests {
     async fn test_bulk_flush_aborts_when_domain_deleted_mid_import() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = JsonStoreConfig { bulk_batch_size: 1, ..config_for(&dir) };
-        let json = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         json.create_domain("doomed").await.unwrap();
         let prefix = json.get_domain("doomed").unwrap().system_prefix;
 

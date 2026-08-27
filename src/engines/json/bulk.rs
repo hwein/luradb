@@ -9,6 +9,7 @@ use super::error::JsonStoreError;
 use super::JsonEngine;
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::lsm::reader::Snapshot;
+use crate::metrics::EngineKind;
 use futures::Stream;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -138,6 +139,7 @@ impl JsonEngine {
         domain: &str,
         documents: Vec<(Option<String>, Value)>,
     ) -> Result<BulkLoadResult, JsonStoreError> {
+        let start = std::time::Instant::now();
         self.domains.require_active(domain)?;
         let mut result = BulkLoadResult::default();
 
@@ -168,6 +170,7 @@ impl JsonEngine {
         for batch in batches {
             self.load_batch(domain, batch, &mut result).await?;
         }
+        self.metrics.record_engine_write(EngineKind::Json, start.elapsed().as_micros() as u64);
         Ok(result)
     }
 
@@ -204,11 +207,13 @@ impl JsonEngine {
         self: &Arc<Self>,
         domain: &str,
     ) -> Result<impl Stream<Item = Document> + Send + 'static, JsonStoreError> {
+        let start = std::time::Instant::now();
         let dom = self.domains.require_active(domain)?;
         let keys = self
             .engine
             .scan_keys(&doc_scan_prefix(&dom.system_prefix))
             .await?;
+        self.metrics.record_engine_read(EngineKind::Json, start.elapsed().as_micros() as u64);
         let engine = Arc::clone(self);
         Ok(futures::stream::unfold(
             (engine, keys.into_iter(), dom),
@@ -283,7 +288,8 @@ mod tests {
             bulk_batch_size: batch,
             ..JsonStoreConfig::default()
         };
-        let engine = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         (engine, dir)
     }
 
@@ -526,6 +532,30 @@ mod tests {
             entries,
             vec![super::super::index::index_key(&prefix, "city", city.as_bytes(), "k")],
             "exactly one index entry, matching the final content"
+        );
+    }
+
+    // ── Spec general/019: per-engine metrics ─────────────────────────────────
+
+    // Test 6: bulk_load with N documents increments json.write_ops by
+    // exactly 1, not N, with exactly one latency sample -- proof of the
+    // "one call = one op" rule, regardless of how many batches the import
+    // splits into internally.
+    #[tokio::test]
+    async fn test_bulk_load_counts_as_one_write_op() {
+        let (json, _dir) = make_engine_with_batch(2).await; // small batch: several internal flushes
+        let docs = (0..7)
+            .map(|i| (Some(format!("d{i}")), json!({"n": i})))
+            .collect();
+        let result = json.bulk_load("default", docs).await.unwrap();
+        assert_eq!(result.imported, 7);
+
+        // aggregate_engine only sums fully ticked buckets (spec general/019).
+        json.metrics.tick_all();
+        let m = json.metrics.engine_metrics();
+        assert_eq!(
+            m[EngineKind::Json as usize].write_ops, 1,
+            "one call, one op -- not one per document or batch"
         );
     }
 }

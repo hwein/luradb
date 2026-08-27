@@ -748,6 +748,7 @@ mod tests {
             .await
             .unwrap(),
         );
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let json_engine = if json_enabled {
             let config = JsonStoreConfig {
                 wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
@@ -756,12 +757,11 @@ mod tests {
                 reindex_pause_ms: 0,
                 ..JsonStoreConfig::default()
             };
-            Some(JsonEngine::bootstrap(&config).await.unwrap())
+            Some(JsonEngine::bootstrap(&config, Arc::clone(&metrics)).await.unwrap())
         } else {
             None
         };
         let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
-        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             DomainRegistry::recover(engine, DomainConfig::default(), Arc::clone(&metrics))
                 .await

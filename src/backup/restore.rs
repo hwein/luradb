@@ -712,7 +712,8 @@ mod tests {
             sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
         };
-        (JsonEngine::bootstrap(&config).await.unwrap(), dir)
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        (JsonEngine::bootstrap(&config, metrics).await.unwrap(), dir)
     }
 
     /// Runs a backup of `scope` from `kv`/`json` into `out_dir`, returning

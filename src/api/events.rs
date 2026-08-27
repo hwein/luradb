@@ -217,12 +217,15 @@ mod tests {
                 .unwrap(),
         );
 
-        let json_engine = JsonEngine::bootstrap(&JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            ..JsonStoreConfig::default()
-        })
+        let json_engine = JsonEngine::bootstrap(
+            &JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+                ..JsonStoreConfig::default()
+            },
+            Arc::clone(&metrics),
+        )
         .await
         .unwrap();
 

@@ -27,6 +27,7 @@ use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmEngineOptions, Ls
 use crate::engines::lsm::janitor::JanitorConfig;
 use crate::engines::lsm::reader::Snapshot;
 use crate::engines::StorageEngine;
+use crate::metrics::{EngineKind, MetricsStore};
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::ManifestManager;
 use crate::storage::vlog::VLog;
@@ -69,12 +70,15 @@ pub struct JsonEngine {
     /// domain lifecycle events are published by `domains` itself. Unset in
     /// unit tests and a standalone-built engine, which then publish nothing.
     event_bus: OnceLock<Arc<GlobalEventBus>>,
+    /// Engine-aggregate op/latency window (spec general/019). No `Option`,
+    /// no setter — always supplied at bootstrap.
+    metrics: Arc<MetricsStore>,
 }
 
 impl JsonEngine {
     /// Creates the dedicated JSON LSM instance from `config` and starts its
     /// background tasks (flush, compaction, janitor).
-    pub async fn bootstrap(config: &JsonStoreConfig) -> Result<Arc<Self>> {
+    pub async fn bootstrap(config: &JsonStoreConfig, metrics: Arc<MetricsStore>) -> Result<Arc<Self>> {
         let wal_path = PathBuf::from(&config.wal_path);
         let vlog_path = PathBuf::from(&config.vlog_path);
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await?);
@@ -150,6 +154,7 @@ impl JsonEngine {
             reindex_running: SyncMutex::new(HashMap::new()),
             doc_write_lock: tokio::sync::Mutex::new(()),
             event_bus: OnceLock::new(),
+            metrics,
         }))
     }
 
@@ -355,15 +360,18 @@ impl JsonEngine {
         domain: &str,
         key: &str,
     ) -> Result<Option<Document>, JsonStoreError> {
+        let start = std::time::Instant::now();
         validate_document_key(key, self.max_document_key_length)?;
         let dom = self.domains.require_active(domain)?;
-        Ok(self.read_stored(&dom, key).await?.map(|stored| Document {
+        let result = self.read_stored(&dom, key).await?.map(|stored| Document {
             key: key.to_string(),
             domain: dom.name.clone(),
             content: stored.content,
             version: stored.version,
             generation: stored.generation,
-        }))
+        });
+        self.metrics.record_engine_read(EngineKind::Json, start.elapsed().as_micros() as u64);
+        Ok(result)
     }
 
     /// Like [`Self::get_document`], but against an externally held snapshot
@@ -378,14 +386,17 @@ impl JsonEngine {
         key: &str,
         snapshot: &Snapshot,
     ) -> Result<Option<Document>, JsonStoreError> {
+        let start = std::time::Instant::now();
         let dom = self.domains.require_active(domain)?;
-        Ok(self.read_stored_with_snapshot(&dom, key, snapshot).await?.map(|stored| Document {
+        let result = self.read_stored_with_snapshot(&dom, key, snapshot).await?.map(|stored| Document {
             key: key.to_string(),
             domain: dom.name.clone(),
             content: stored.content,
             version: stored.version,
             generation: stored.generation,
-        }))
+        });
+        self.metrics.record_engine_read(EngineKind::Json, start.elapsed().as_micros() as u64);
+        Ok(result)
     }
 
     /// Deletes a document and all its index entries in one atomic batch.
@@ -401,6 +412,7 @@ impl JsonEngine {
         key: &str,
         expected_version: Option<ExpectedVersion>,
     ) -> Result<bool, JsonStoreError> {
+        let start = std::time::Instant::now();
         validate_document_key(key, self.max_document_key_length)?;
         let _guard = self.doc_write_lock.lock().await;
         let dom = self.domains.require_active(domain)?;
@@ -431,6 +443,7 @@ impl JsonEngine {
             .collect();
         ops.push(BatchOp::Delete { key: doc_key(&dom.system_prefix, key) });
         self.engine.write_batch(ops).await?;
+        self.metrics.record_engine_write(EngineKind::Json, start.elapsed().as_micros() as u64);
         Ok(true)
     }
 
@@ -477,6 +490,7 @@ impl JsonEngine {
         version: u64,
         old_content: Option<&Value>,
     ) -> Result<Document, JsonStoreError> {
+        let start = std::time::Instant::now();
         let stored = StoredDocument { version, generation, content };
         let payload = serde_json::to_vec(&stored)?;
         if payload.len() > self.max_value_size {
@@ -502,6 +516,7 @@ impl JsonEngine {
             ops.push(BatchOp::Put { key: idx_key, value: Vec::new() });
         }
         self.engine.write_batch(ops).await?;
+        self.metrics.record_engine_write(EngineKind::Json, start.elapsed().as_micros() as u64);
         Ok(Document {
             key: key.to_string(),
             domain: dom.name.clone(),
@@ -544,7 +559,8 @@ mod tests {
             sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
         };
-        let engine = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         (engine, dir)
     }
 
@@ -575,7 +591,8 @@ mod tests {
             sstable_dir: sstable_dir.to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
         };
-        let json = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         assert!(sstable_dir.is_dir());
         json.shutdown().await;
     }
@@ -800,12 +817,14 @@ mod tests {
             ..JsonStoreConfig::default()
         };
         {
-            let json = JsonEngine::bootstrap(&config).await.unwrap();
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
             json.create_domain("persistent").await.unwrap();
             json.create_index("persistent", "city", IndexFieldType::String).await.unwrap();
             json.shutdown().await;
         }
-        let json = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         assert!(json.get_domain("persistent").is_some(), "domain must survive restart");
         let defs = json.get_indexes("persistent").unwrap();
         assert_eq!(defs.len(), 1);
@@ -1171,12 +1190,14 @@ mod tests {
         };
         let long_key = "k".repeat(100);
         {
-            let json = JsonEngine::bootstrap(&config).await.unwrap();
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
             json.put_document("default", &long_key, json!({"n": 1})).await.unwrap();
             json.shutdown().await;
         }
         let lowered = JsonStoreConfig { max_document_key_length: 32, ..config };
-        let json = JsonEngine::bootstrap(&lowered).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&lowered, metrics).await.unwrap();
         let snap = json.engine().snapshot();
         let doc = json
             .get_document_with_snapshot("default", &long_key, snap.snapshot())
@@ -1204,7 +1225,8 @@ mod tests {
             max_document_key_length: 20,
             ..JsonStoreConfig::default()
         };
-        let json = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         let err = json.create_document("default", json!({})).await.unwrap_err();
         assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
         json.shutdown().await;
@@ -1295,5 +1317,47 @@ mod tests {
         json.delete_domain("no-bus").await.unwrap();
 
         assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
+    }
+
+    // ── Spec general/019: per-engine metrics — no double counting ───────────
+
+    // Test 7: put_document (-> put_document_with_version -> write_document)
+    // is exactly 1 write_op; a conditional put_document_with_version (which
+    // reads the old version first) is still exactly 1 write_op and 0
+    // read_ops -- the read-before-write does not count; delete_document is
+    // exactly 1 write_op.
+    #[tokio::test]
+    async fn test_engine_metrics_no_double_counting() {
+        let (json, _dir) = make_engine().await;
+
+        // aggregate_engine only sums fully ticked buckets (spec general/019).
+        let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+        json.metrics.tick_all();
+        let after_put = json.metrics.engine_metrics();
+        assert_eq!(after_put[EngineKind::Json as usize].write_ops, 1);
+
+        json.put_document_with_version(
+            "default",
+            "k",
+            json!({"n": 2}),
+            Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
+        )
+        .await
+        .unwrap();
+        json.metrics.tick_all();
+        let after_conditional_put = json.metrics.engine_metrics();
+        assert_eq!(
+            after_conditional_put[EngineKind::Json as usize].write_ops, 2,
+            "exactly one more write_op, not two"
+        );
+        assert_eq!(
+            after_conditional_put[EngineKind::Json as usize].read_ops, 0,
+            "the read-before-write inside put_document_with_version must not count"
+        );
+
+        json.delete_document("default", "k").await.unwrap();
+        json.metrics.tick_all();
+        let after_delete = json.metrics.engine_metrics();
+        assert_eq!(after_delete[EngineKind::Json as usize].write_ops, 3);
     }
 }

@@ -26,7 +26,7 @@ use crate::storage::sstable::{SSTableBuilder, SSTableReader};
 use crate::storage::format::VersionState;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -509,6 +509,9 @@ impl LsmStorageEngine {
         Ok(reader)
     }
 
+    /// An unopenable SSTable that the manifest still lists is a startup
+    /// error (spec kv/026 M2), not a warning: silently installing a partial
+    /// level would start the database without a part of its data.
     async fn recover_sstables(
         manifest: &Manifest,
         file_manager: &Arc<FileManager>,
@@ -518,13 +521,10 @@ impl LsmStorageEngine {
         for (level_idx, level_metas) in manifest.levels.iter().enumerate() {
             let mut sstables = Vec::new();
             for meta in level_metas {
-                match Self::open_sstable_reader(file_manager, meta.file_id, use_mmap).await {
-                    Ok(reader) => sstables.push(Arc::new(reader)),
-                    Err(e) => eprintln!(
-                        "Warning: cannot open SSTable {} at L{level_idx}: {e}",
-                        meta.file_id
-                    ),
-                }
+                let reader = Self::open_sstable_reader(file_manager, meta.file_id, use_mmap)
+                    .await
+                    .with_context(|| format!("cannot open SSTable {} at L{level_idx}", meta.file_id))?;
+                sstables.push(Arc::new(reader));
             }
             if !sstables.is_empty() {
                 level_manager.replace_level(level_idx, sstables);
@@ -644,8 +644,20 @@ impl LsmStorageEngine {
     }
 
     /// Signals background tasks to stop, joins them, then flushes remaining
-    /// MemTables. Idempotent: a second call finds no handles left to join and
-    /// flushes/truncates an already-clean state.
+    /// MemTables and truncates the WAL. Idempotent: a second call finds no
+    /// handles left to join and flushes/truncates an already-clean state.
+    ///
+    /// A failed flush skips the truncate (spec kv/026 M1): `flush_memtable`
+    /// already removes a MemTable from `immutable_memtables` before its
+    /// fallible SSTable/manifest I/O, so once that I/O fails the WAL is the
+    /// only remaining copy of its data — truncating anyway would destroy it.
+    /// The next startup replays the WAL instead. The failure stays an
+    /// `eprintln!`, not just `tracing::error!`: no tracing subscriber runs
+    /// under `cargo test`, so this line is the only surviving evidence in a
+    /// captured test log (spec kv/026 §A3). Callers (`main.rs`, `json`/`rel`
+    /// bootstrap) take no `Result` from this method, so a log line like
+    /// "LSM engine shutdown complete." right after it only means the
+    /// shutdown sequence ran to completion, not that the flush succeeded.
     pub async fn shutdown(&self) {
         // 1. Signal: flag for cheap sync checks + watch send to wake any
         // loop that is sleeping (M2) instead of leaving it to poll.
@@ -664,9 +676,11 @@ impl LsmStorageEngine {
             }
         }
 
-        // 3. Only now is nothing left running concurrently (M1).
+        // 3. Only now is nothing left running concurrently (M1). A failed
+        // flush must not be followed by the truncate below — see doc comment.
         if let Err(e) = self.flush_all_memtables().await {
             eprintln!("[Engine] Shutdown flush error: {e}");
+            return;
         }
 
         // All data is now in SSTables — WAL entries are redundant.
@@ -1662,6 +1676,7 @@ mod tests {
     use crate::engines::StorageEngine;
     use crate::engines::lsm::block_cache::BlockCacheKey;
     use crate::engines::lsm::watcher::OpType;
+    use std::os::unix::fs::PermissionsExt;
 
     async fn make_engine() -> (LsmStorageEngine, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1686,6 +1701,24 @@ mod tests {
         let vlog_path = dir.path().join("vlog.log");
         let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
         let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        LsmStorageEngine::new(
+            wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+            LsmEngineOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Like `engine_on`, but with the SSTable directory split out from `dir`
+    /// so a test can make it unwritable (spec kv/026 M1 fault injection)
+    /// without touching the WAL/manifest paths too.
+    async fn engine_with_sstable_dir(dir: &tempfile::TempDir, sstable_dir: &Path) -> LsmStorageEngine {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(sstable_dir).await.unwrap());
         let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
         LsmStorageEngine::new(
             wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
@@ -1786,6 +1819,46 @@ mod tests {
         assert!(engine.background_tasks.lock().is_empty());
     }
 
+    // Spec kv/026 M1: flush_memtable removes the MemTable from
+    // `immutable_memtables` before its fallible SSTable write, so once that
+    // write fails the WAL is the only remaining copy -- shutdown() must not
+    // truncate it in that case. The SSTable directory is split out from the
+    // WAL/manifest one so making it read-only fails only the flush, not the
+    // truncate that would otherwise follow it.
+    #[tokio::test]
+    async fn test_shutdown_skips_wal_truncate_after_failed_flush() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sstable_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&sstable_dir).unwrap();
+        let wal_path = dir.path().join("wal.log");
+
+        let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        engine.put(b"crash-key", b"crash-value").await.unwrap();
+
+        // write_sstable creates a new tmp file in sstable_dir -- a read-only
+        // directory rejects that deterministically (verified non-root).
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        engine.shutdown().await;
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !std::fs::read(&wal_path).unwrap().is_empty(),
+            "a failed shutdown flush must leave the WAL in place"
+        );
+
+        // Re-open replays the WAL and recovers the data.
+        let engine2 = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        assert_eq!(engine2.get(b"crash-key").await.unwrap(), Some(b"crash-value".to_vec()));
+
+        // Success case unchanged: a normal shutdown flush still truncates.
+        engine2.put(b"post-recovery", b"v2").await.unwrap();
+        engine2.shutdown().await;
+        assert!(
+            std::fs::read(&wal_path).unwrap().is_empty(),
+            "a successful shutdown flush still truncates the WAL"
+        );
+    }
+
     // Batch: all ops visible after write, and WAL replay (record type 3)
     // restores them all-or-nothing after a restart without flush.
     #[tokio::test]
@@ -1863,6 +1936,48 @@ mod tests {
 
         let engine3 = engine_on(&dir).await;
         assert_eq!(engine3.get(b"crash-key").await.unwrap(), Some(b"v1".to_vec()));
+    }
+
+    // Spec kv/026 M2: an SSTable the manifest still lists but that can no
+    // longer be opened must fail `new()` instead of silently installing a
+    // partial level.
+    #[tokio::test]
+    async fn test_new_fails_when_manifest_sstable_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        engine.put(b"k", b"v").await.unwrap();
+        engine.flush_all_memtables().await.unwrap();
+        drop(engine);
+
+        async fn try_reopen(dir: &tempfile::TempDir) -> Result<LsmStorageEngine> {
+            let wal_path = dir.path().join("wal.log");
+            let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+            let vlog_path = dir.path().join("vlog.log");
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+            LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+                LsmEngineOptions::default(),
+            )
+            .await
+        }
+
+        // Success case unchanged: the SSTable is intact, re-open succeeds.
+        let engine2 = try_reopen(&dir).await.unwrap();
+        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+        drop(engine2);
+
+        let sst_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("sst"))
+            .expect("flush must have produced an SSTable file");
+        std::fs::remove_file(&sst_path).unwrap();
+
+        let result = try_reopen(&dir).await;
+        assert!(result.is_err(), "new() must fail when a manifested SSTable cannot be opened");
     }
 
     // ── Lifecycle tests ──────────────────────────────────────────────────────

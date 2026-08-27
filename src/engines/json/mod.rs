@@ -20,6 +20,7 @@ pub use query::{DocumentListResult, FilterCondition, ListOptions, SearchQuery, S
 pub use reindex::{ReindexResult, ReindexStatus};
 
 use crate::config::JsonStoreConfig;
+use crate::core::events::GlobalEventBus;
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
@@ -40,7 +41,7 @@ use parking_lot::{Mutex as SyncMutex, RwLock};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Central entry point for all JSON-store operations.
 pub struct JsonEngine {
@@ -63,6 +64,11 @@ pub struct JsonEngine {
     /// json/011) cannot race, and fences writers against the purger's
     /// finalize: domain state is checked under this lock (json/013).
     doc_write_lock: tokio::sync::Mutex<()>,
+    /// Global lifecycle/DDL event bus (spec general/018 §1) — backs
+    /// `create_index`/`delete_index`'s `index_created`/`index_dropped`;
+    /// domain lifecycle events are published by `domains` itself. Unset in
+    /// unit tests and a standalone-built engine, which then publish nothing.
+    event_bus: OnceLock<Arc<GlobalEventBus>>,
 }
 
 impl JsonEngine {
@@ -143,12 +149,21 @@ impl JsonEngine {
             reindex_tasks: RwLock::new(HashMap::new()),
             reindex_running: SyncMutex::new(HashMap::new()),
             doc_write_lock: tokio::sync::Mutex::new(()),
+            event_bus: OnceLock::new(),
         }))
     }
 
     /// The dedicated JSON LSM instance.
     pub fn engine(&self) -> &Arc<LsmStorageEngine> {
         &self.engine
+    }
+
+    /// Wires the global event bus (spec general/018 §1): its own `OnceLock`
+    /// backs `create_index`/`delete_index`, and it forwards to `domains` for
+    /// the domain lifecycle events.
+    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
+        self.domains.attach_event_bus(Arc::clone(&bus));
+        let _ = self.event_bus.set(bus);
     }
 
     /// Max HTTP body size for bulk imports (applied at router build).
@@ -202,9 +217,11 @@ impl JsonEngine {
         field: &str,
         field_type: IndexFieldType,
     ) -> Result<IndexDefinition, JsonStoreError> {
-        self.indexes
-            .create_index(&self.domains, domain, field, field_type)
-            .await
+        let def = self.indexes.create_index(&self.domains, domain, field, field_type).await?;
+        if let Some(bus) = self.event_bus.get() {
+            bus.publish("json", "index_created", domain, Some(field.to_string()));
+        }
+        Ok(def)
     }
 
     /// All index definitions of a domain.
@@ -237,7 +254,11 @@ impl JsonEngine {
 
     /// Removes an index definition and tombstones the field's `IDX:` entries.
     pub async fn delete_index(&self, domain: &str, field: &str) -> Result<(), JsonStoreError> {
-        self.indexes.delete_index(&self.domains, domain, field).await
+        self.indexes.delete_index(&self.domains, domain, field).await?;
+        if let Some(bus) = self.event_bus.get() {
+            bus.publish("json", "index_dropped", domain, Some(field.to_string()));
+        }
+        Ok(())
     }
 
     // ── Core CRUD (spec json/002, domain-aware since json/003) ────────────────
@@ -1135,5 +1156,92 @@ mod tests {
         let err = json.create_document("default", json!({})).await.unwrap_err();
         assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
         json.shutdown().await;
+    }
+
+    // ── Spec general/018: global lifecycle event bus ────────────────────────
+
+    // Test 1 (json slice): create_domain/delete_domain publish domain_created/
+    // domain_deleted with engine "json" and the right domain.
+    #[tokio::test]
+    async fn test_domain_lifecycle_events_published_with_json_engine_tag() {
+        let (json, _dir) = make_engine().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        json.attach_event_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe();
+
+        json.create_domain("evdom").await.unwrap();
+        json.delete_domain("evdom").await.unwrap();
+
+        let created = rx.try_recv().unwrap();
+        assert_eq!(created.engine, "json");
+        assert_eq!(created.kind, "domain_created");
+        assert_eq!(created.domain, "evdom");
+        assert_eq!(created.object, None);
+
+        let deleted = rx.try_recv().unwrap();
+        assert_eq!(deleted.kind, "domain_deleted");
+        assert_eq!(deleted.domain, "evdom");
+    }
+
+    // Test 5: create_index/delete_index publish index_created/index_dropped
+    // with engine "json" and the field name as `object`.
+    #[tokio::test]
+    async fn test_index_events_published_with_field_as_object() {
+        let (json, _dir) = make_engine().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        json.attach_event_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe();
+
+        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+        json.delete_index("default", "city").await.unwrap();
+
+        let created = rx.try_recv().unwrap();
+        assert_eq!(created.engine, "json");
+        assert_eq!(created.kind, "index_created");
+        assert_eq!(created.domain, "default");
+        assert_eq!(created.object.as_deref(), Some("city"));
+
+        let dropped = rx.try_recv().unwrap();
+        assert_eq!(dropped.kind, "index_dropped");
+        assert_eq!(dropped.object.as_deref(), Some("city"));
+    }
+
+    // Test 2 (json slice): after a purge run, domain_purged appears, after
+    // domain_deleted.
+    #[tokio::test]
+    async fn test_domain_purge_event_published_after_domain_deleted() {
+        let (json, _dir) = make_engine().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        json.attach_event_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe();
+
+        json.create_domain("purge-ev").await.unwrap();
+        rx.try_recv().unwrap(); // domain_created, not under test here
+        json.delete_domain("purge-ev").await.unwrap();
+
+        let purger = JsonDomainPurger::new(Arc::clone(&json), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
+        purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
+
+        let deleted = rx.try_recv().unwrap();
+        assert_eq!(deleted.kind, "domain_deleted");
+        let purged = rx.try_recv().unwrap();
+        assert_eq!(purged.kind, "domain_purged");
+        assert_eq!(purged.domain, "purge-ev");
+    }
+
+    // Test 12 (json slice): no bus attached -> domain and index lifecycle ops
+    // succeed unchanged, no panic, and nothing is published anywhere.
+    #[tokio::test]
+    async fn test_lifecycle_and_index_ops_without_event_bus_attached_publish_nothing() {
+        let (json, _dir) = make_engine().await;
+        let bus = GlobalEventBus::new(16, 16); // never attached
+        let mut rx = bus.subscribe();
+
+        json.create_domain("no-bus").await.unwrap();
+        json.create_index("no-bus", "city", IndexFieldType::String).await.unwrap();
+        json.delete_index("no-bus", "city").await.unwrap();
+        json.delete_domain("no-bus").await.unwrap();
+
+        assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
     }
 }

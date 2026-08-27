@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.4",
+    "version": "0.3.5",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -662,6 +662,53 @@
           },
           "404": {
             "description": "Domain not found"
+          }
+        }
+      }
+    },
+    "/store-api/events": {
+      "get": {
+        "tags": [
+          "Events"
+        ],
+        "summary": "Opens a Server-Sent Events stream of global lifecycle/DDL events: domains created, deleted and\npurged across all three engines, plus relational table/view/index DDL and JSON index DDL.\nAdmin-only — the path carries no domain segment, so the standard auth middleware rejects any\nnon-admin caller (spec general/018 §3).",
+        "description": "A `Last-Event-ID` (header or `?last_event_id=`, header wins) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. This\nstream has its own tag (`g`) and sequence, entirely independent of `GET /store-api/kv/{domain}/watch`'s\n(`w`) — an id from one stream is `unknown_id` at the other.",
+        "operationId": "get_events",
+        "parameters": [
+          {
+            "name": "last_event_id",
+            "in": "query",
+            "description": "Resume id from a previous `id:` (or `event: reset`) — for callers that cannot set headers. Ignored when the `Last-Event-ID` header is present.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Resume id from a previous `id:` (or `event: reset`); set automatically by a native `EventSource`'s auto-reconnect. Takes precedence over `?last_event_id=`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of lifecycle/DDL events across the KV, JSON and relational engines: domains created/deleted/purged, and (rel) table/view/index DDL, (json) index DDL. No per-key data events — use a domain's `watch` for those. Every event carries an `id:`; `event:` matches its `type` field (e.g. `domain_created`, `table_altered`). `data:` is JSON `{engine, type, domain, object?, ts}` — `object` is the table/view/index/field name, absent for domain events. `event: reset` (`data: {\"reason\": ...}`) is emitted whenever gapless resume cannot be guaranteed.",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          },
+          "403": {
+            "description": "Non-admin caller — this endpoint has no `{domain}` segment, so it is admin-only"
           }
         }
       }
@@ -4157,6 +4204,10 @@
     {
       "name": "Logs",
       "description": "Read-only log tail and file listing — admins only, opt-in via log.http_access"
+    },
+    {
+      "name": "Events",
+      "description": "Global lifecycle/DDL event stream (SSE) across the KV, JSON and relational engines — admins only"
     }
   ]
 }

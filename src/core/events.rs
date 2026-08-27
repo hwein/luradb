@@ -182,6 +182,103 @@ impl<T: Clone> SeqRing<T> {
     }
 }
 
+// ── Global lifecycle/DDL event stream (spec general/018) ────────────────────
+
+/// Tag for `GET /store-api/events` ids — distinguishes them from `WATCH_TAG`
+/// (`w`, spec kv/024), which shares the same epoch/sequence format but is a
+/// separate stream with its own sequence (spec general/018 §5).
+pub const EVENTS_TAG: &str = "g";
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// One lifecycle/DDL event (spec general/018 §1/§2): a domain created/
+/// deleted/purged, or (rel/json) table/view/index DDL. `seq` is excluded from
+/// the wire JSON (`#[serde(skip)]`) — it only backs the SSE `id:` field and
+/// the live-stream replay-overlap check (spec §5), never the payload itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct GlobalEvent {
+    #[serde(skip)]
+    pub seq: u64,
+    pub engine: &'static str,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    pub ts: u64,
+}
+
+/// AppState-wide broadcast of lifecycle/DDL events across the KV, JSON and
+/// relational engines (spec general/018 §1) — a `SeqRing` of its own, tagged
+/// `g`, entirely independent of any per-domain KV watch (`WATCH_TAG`, `w`).
+pub struct GlobalEventBus {
+    tx: broadcast::Sender<GlobalEvent>,
+    log: SeqRing<GlobalEvent>,
+}
+
+impl GlobalEventBus {
+    pub fn new(channel_capacity: usize, replay_buffer_size: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(channel_capacity);
+        Self { tx, log: SeqRing::new(replay_buffer_size) }
+    }
+
+    /// Subscribes to the live channel. Callers must subscribe *before*
+    /// taking a replay snapshot (spec §5, kv/024 §4.3) so nothing published
+    /// in between is lost — only re-delivered, which the caller discards via
+    /// the replay's own `head`.
+    pub fn subscribe(&self) -> broadcast::Receiver<GlobalEvent> {
+        self.tx.subscribe()
+    }
+
+    /// Current sequence head — the `id:` a live-triggered `reset` carries
+    /// (spec §5), as opposed to one from the initial resume decision, which
+    /// already carries its own `head`.
+    pub fn head(&self) -> u64 {
+        self.log.head()
+    }
+
+    /// Full resume decision for `GET /store-api/events` (spec §5): parses
+    /// and validates against `EVENTS_TAG`/the process epoch, then defers to
+    /// the replay ring.
+    pub fn decide_resume(&self, raw_id: Option<&str>) -> Resume<GlobalEvent> {
+        self.log.decide_resume(raw_id, EVENTS_TAG, stream_epoch())
+    }
+
+    /// Publishes one event, filling `seq`/`ts` and delegating to
+    /// `SeqRing::publish` — same mutex-coupled sequence/broadcast ordering as
+    /// kv/024 (spec §1).
+    pub fn publish(&self, engine: &'static str, kind: &'static str, domain: &str, object: Option<String>) {
+        let domain = domain.to_string();
+        self.log.publish(&self.tx, |seq| GlobalEvent {
+            seq,
+            engine,
+            kind,
+            domain: domain.clone(),
+            object: object.clone(),
+            ts: now_secs(),
+        });
+    }
+
+    /// Publishes `events.len()` consecutive events sharing one `ts` (spec
+    /// §1: `RENAME TABLE` needs two events, `table_dropped` then
+    /// `table_created`, that land adjacent in the stream with no foreign
+    /// event between them — `engine`/`domain` are shared since one
+    /// `publish_many` call always comes from one DDL statement on one domain).
+    pub fn publish_many(&self, engine: &'static str, domain: &str, events: &[(&'static str, Option<String>)]) {
+        let ts = now_secs();
+        let mut items = events.iter();
+        self.log.publish_many(&self.tx, events.len(), |seq| {
+            let (kind, object) = items.next().expect("publish_many: make is called exactly events.len() times");
+            GlobalEvent { seq, engine, kind: *kind, domain: domain.to_string(), object: object.clone(), ts }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +455,65 @@ mod tests {
         let mut sorted = received.clone();
         sorted.sort_unstable();
         assert_eq!(received, sorted, "broadcast order must equal sequence order: {received:?}");
+    }
+
+    // ── GlobalEventBus (spec general/018) ───────────────────────────────────
+
+    #[test]
+    fn test_global_event_bus_publish_populates_fields_and_advances_head() {
+        let bus = GlobalEventBus::new(16, 16);
+        let mut rx = bus.subscribe();
+        bus.publish("kv", "domain_created", "sales", None);
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.seq, 1);
+        assert_eq!(event.engine, "kv");
+        assert_eq!(event.kind, "domain_created");
+        assert_eq!(event.domain, "sales");
+        assert_eq!(event.object, None);
+        assert!(event.ts > 0);
+        assert_eq!(bus.head(), 1);
+    }
+
+    // publish_many assigns consecutive sequences and one shared ts across
+    // the whole call (spec §1: RENAME TABLE's two events).
+    #[test]
+    fn test_global_event_bus_publish_many_consecutive_seq_and_shared_ts() {
+        let bus = GlobalEventBus::new(16, 16);
+        let mut rx = bus.subscribe();
+        bus.publish_many(
+            "rel",
+            "sales",
+            &[("table_dropped", Some("old".to_string())), ("table_created", Some("new".to_string()))],
+        );
+        let first = rx.try_recv().unwrap();
+        let second = rx.try_recv().unwrap();
+        assert_eq!((first.seq, first.kind, first.object.as_deref()), (1, "table_dropped", Some("old")));
+        assert_eq!((second.seq, second.kind, second.object.as_deref()), (2, "table_created", Some("new")));
+        assert_eq!(first.ts, second.ts, "publish_many events must share one ts");
+    }
+
+    #[test]
+    fn test_global_event_serializes_with_type_field_and_omits_absent_object_and_seq() {
+        let bus = GlobalEventBus::new(16, 16);
+        let mut rx = bus.subscribe();
+        bus.publish("kv", "domain_created", "sales", None);
+        let event = rx.try_recv().unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "domain_created");
+        assert!(json.get("object").is_none(), "absent object must be omitted, got {json}");
+        assert!(json.get("seq").is_none(), "seq is wire-internal only, must not appear in data");
+    }
+
+    // A watch id (WATCH_TAG "w") must never validate against the global
+    // stream's own tag (spec §5) — mirrors kv/024's tag-isolation guarantee.
+    #[test]
+    fn test_global_event_bus_decide_resume_rejects_foreign_tag() {
+        let bus = GlobalEventBus::new(16, 16);
+        bus.publish("kv", "domain_created", "sales", None);
+        let foreign = format_event_id("w", stream_epoch(), 1);
+        match bus.decide_resume(Some(&foreign)) {
+            Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
+            _ => panic!("expected unknown_id for a foreign tag"),
+        }
     }
 }

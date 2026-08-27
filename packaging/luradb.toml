@@ -67,6 +67,11 @@ default_read_iops = 1000
 default_write_iops = 500
 default_max_storage_bytes = 0
 
+[events]
+# Live broadcast for GET /store-api/events (spec general/018).
+channel_capacity = 256      # a consumer this far behind gets `reset` (reason: lagged)
+replay_buffer_size = 1024   # ring for Last-Event-ID resume; 0 = resume off
+
 [log]
 level = "info"
 format = "text"

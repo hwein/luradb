@@ -11,7 +11,7 @@
 //!
 //! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
 
-use crate::core::events::Resume;
+use crate::core::events::{GlobalEventBus, Resume};
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
@@ -174,6 +174,10 @@ pub struct DomainRegistry {
     engine: Arc<LsmStorageEngine>,
     config: DomainConfig,
     metrics: Arc<MetricsStore>,
+    /// Global lifecycle/DDL event bus (spec general/018 §1) — unset in unit
+    /// tests and standalone-built registries, which then simply publish
+    /// nothing (`publish_lifecycle_event`'s `if let Some(bus) = ...`).
+    event_bus: OnceLock<Arc<GlobalEventBus>>,
 }
 
 impl DomainRegistry {
@@ -192,6 +196,7 @@ impl DomainRegistry {
             engine,
             config,
             metrics,
+            event_bus: OnceLock::new(),
         };
         registry.load_from_engine().await?;
         // Check in any state: creating over a Deleting default would 409 and
@@ -214,6 +219,22 @@ impl DomainRegistry {
     /// Returns a reference to the underlying storage engine.
     pub fn engine(&self) -> &Arc<LsmStorageEngine> {
         &self.engine
+    }
+
+    /// Wires the global event bus (spec general/018 §1). Must run before the
+    /// purgers are spawned and before the listener accepts requests — set
+    /// only once, during startup; every read afterward goes through
+    /// `publish_lifecycle_event`'s `OnceLock::get`.
+    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
+        let _ = self.event_bus.set(bus);
+    }
+
+    /// `domain_created` / `domain_deleted` / `domain_purged` (spec §2) — a
+    /// no-op when no bus is attached.
+    fn publish_lifecycle_event(&self, kind: &'static str, domain: &str) {
+        if let Some(bus) = self.event_bus.get() {
+            bus.publish("kv", kind, domain, None);
+        }
     }
 
     fn make_runtime(&self) -> Arc<DomainRuntime> {
@@ -259,6 +280,7 @@ impl DomainRegistry {
         self.engine.put(&sys_key(name), &data).await?;
         self.runtimes.write().insert(name.to_string(), self.make_runtime());
         self.domains.write().insert(name.to_string(), domain.clone());
+        self.publish_lifecycle_event("domain_created", name);
         Ok(domain)
     }
 
@@ -319,6 +341,7 @@ impl DomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain);
+        self.publish_lifecycle_event("domain_deleted", name);
         Ok(())
     }
 
@@ -340,6 +363,7 @@ impl DomainRegistry {
         self.runtimes.write().remove(name);
         self.domains.write().remove(name);
         self.metrics.remove_domain(name);
+        self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
 
@@ -1336,5 +1360,103 @@ mod tests {
             }
             _ => panic!("expected a gapless replay"),
         }
+    }
+
+    // ── Spec general/018: global lifecycle event bus ────────────────────────
+
+    // Test 1 (kv slice): create_domain/delete_domain publish domain_created/
+    // domain_deleted with the right engine, domain and a real ts.
+    #[tokio::test]
+    async fn test_domain_lifecycle_events_published_with_engine_domain_and_ts() {
+        let (_engine, registry, _dir) = make_setup().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        registry.attach_event_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("evdom").await.unwrap();
+        registry.delete_domain("evdom").await.unwrap();
+
+        let created = rx.try_recv().unwrap();
+        assert_eq!(created.engine, "kv");
+        assert_eq!(created.kind, "domain_created");
+        assert_eq!(created.domain, "evdom");
+        assert_eq!(created.object, None);
+        assert!(created.ts > 0);
+
+        let deleted = rx.try_recv().unwrap();
+        assert_eq!(deleted.kind, "domain_deleted");
+        assert_eq!(deleted.domain, "evdom");
+    }
+
+    // Test 2: after a purge run, domain_purged appears, and after domain_deleted.
+    #[tokio::test]
+    async fn test_domain_purge_event_published_after_domain_deleted() {
+        let (engine, registry, _dir) = make_setup().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        registry.attach_event_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("purge-ev").await.unwrap();
+        rx.try_recv().unwrap(); // domain_created, not under test here
+
+        registry.delete_domain("purge-ev").await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cfg = DomainConfig::default();
+        let purger = DomainPurger::new(
+            Arc::clone(&engine),
+            Arc::clone(&registry),
+            Arc::clone(&shutdown),
+            cfg.purger_batch_size,
+            cfg.purger_interval_secs,
+        );
+        purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
+
+        let deleted = rx.try_recv().unwrap();
+        assert_eq!(deleted.kind, "domain_deleted");
+        let purged = rx.try_recv().unwrap();
+        assert_eq!(purged.kind, "domain_purged");
+        assert_eq!(purged.domain, "purge-ev");
+    }
+
+    // Test 12 (kv slice): no bus attached -> lifecycle ops succeed unchanged,
+    // no panic, and nothing is published anywhere.
+    #[tokio::test]
+    async fn test_lifecycle_ops_without_event_bus_attached_publish_nothing() {
+        let (_engine, registry, _dir) = make_setup().await;
+        let bus = GlobalEventBus::new(16, 16); // never attached
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("no-bus").await.unwrap();
+        registry.delete_domain("no-bus").await.unwrap();
+
+        assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
+    }
+
+    // Test 13: attach_event_bus, THEN spawn the purger (main.rs's startup
+    // order, spec §1) -- a purge run afterward still delivers domain_purged.
+    #[tokio::test]
+    async fn test_attach_before_purger_spawn_still_delivers_domain_purged() {
+        let (engine, registry, _dir) = make_setup().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        registry.attach_event_bus(Arc::clone(&bus)); // attach first
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("late-purge").await.unwrap();
+        registry.delete_domain("late-purge").await.unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let purger = Arc::new(DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), Arc::clone(&shutdown), 1, 1));
+        tokio::spawn(purger.run()); // spawned after attach, mirroring main.rs's startup order
+
+        // Drain domain_created/domain_deleted, then wait for domain_purged.
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+        let purged = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for domain_purged")
+            .unwrap();
+        assert_eq!(purged.kind, "domain_purged");
+        assert_eq!(purged.domain, "late-purge");
+        shutdown.store(true, Ordering::Relaxed);
     }
 }

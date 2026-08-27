@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod domains;
+pub mod events;
 pub mod json;
 pub mod json_domains;
 pub mod kv;
@@ -15,6 +16,7 @@ pub mod rel_domains;
 
 use crate::auth::{handlers::AuthState, middleware::auth_layer, AuthCache};
 use crate::backup::BackupManager;
+use crate::core::events::GlobalEventBus;
 use crate::engines::json::JsonEngine;
 use crate::engines::lsm::DomainRegistry;
 use crate::engines::rel::RelEngine;
@@ -57,7 +59,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.4";
+pub const API_VERSION: &str = "0.3.5";
 
 struct VersionInfo;
 
@@ -96,6 +98,10 @@ pub struct AppState {
     /// `None` when `log.http_access = false` (spec general/005) — routes stay
     /// registered either way; handlers answer 503 (plaintext `ApiError`).
     pub log_access: Option<logs::LogAccessState>,
+    /// Global lifecycle/DDL event bus backing `GET /store-api/events` (spec
+    /// general/018) — always present; whether anything was ever attached to
+    /// the KV/JSON/rel engines is a startup-wiring concern, not an `Option` here.
+    pub event_bus: Arc<GlobalEventBus>,
 }
 
 // ── Shared DTOs ───────────────────────────────────────────────────────────────
@@ -185,6 +191,10 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         // 503, keeping 404 free for "wrong URL / old server".
         .route("/logs", get(logs::get_logs))
         .route("/logs/files", get(logs::list_files))
+        // Global lifecycle/DDL event stream (spec general/018). No `{domain}`
+        // segment — admin-only via the same path-shape rule as `/metrics`,
+        // `/backups*` etc. (auth::middleware::extract_domain returns `None`).
+        .route("/events", get(events::get_events))
         .with_state(state.clone());
 
     // Relational store (spec rel/009 §1): registered *only* when the engine
@@ -349,6 +359,8 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         // Log Access
         logs::get_logs,
         logs::list_files,
+        // Global event stream
+        events::get_events,
     ),
     modifiers(&BearerAuth, &VersionInfo),
     components(
@@ -417,6 +429,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         (name = "Auth", description = "User management and domain permissions — admins only, except GET /auth/whoami (any authenticated caller)"),
         (name = "Backup", description = "Logical backup & restore — admins only"),
         (name = "Logs", description = "Read-only log tail and file listing — admins only, opt-in via log.http_access"),
+        (name = "Events", description = "Global lifecycle/DDL event stream (SSE) across the KV, JSON and relational engines — admins only"),
     ),
     info(
         title = "LuraDB API",

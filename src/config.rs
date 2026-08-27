@@ -23,6 +23,7 @@ pub struct LuraConfig {
     pub rel: RelStoreConfig,
     pub shm: ShmConfig,
     pub backup: BackupConfig,
+    pub events: EventsConfig,
 }
 
 impl Default for LuraConfig {
@@ -46,6 +47,7 @@ impl Default for LuraConfig {
             rel: RelStoreConfig::default(),
             shm: ShmConfig::default(),
             backup: BackupConfig::default(),
+            events: EventsConfig::default(),
         }
     }
 }
@@ -963,6 +965,31 @@ impl BackupConfig {
     }
 }
 
+// ── Global event stream (spec general/018) ────────────────────────────────────
+
+/// Config for the `GlobalEventBus` behind `GET /store-api/events`: lifecycle/
+/// DDL events across the KV, JSON and relational engines. A section of its
+/// own rather than an `[lsm]` extension, since the bus belongs to no engine.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// Live broadcast channel capacity. A consumer that falls this far behind
+    /// gets `event: reset` (`reason: "lagged"`) instead of a silent gap.
+    pub channel_capacity: usize,
+    /// Replay-ring size backing `Last-Event-ID` resume. `0` disables resume
+    /// (every reconnect gets `reset`); `id:` fields are assigned regardless.
+    pub replay_buffer_size: usize,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            channel_capacity: 256,
+            replay_buffer_size: 1024,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1609,6 +1636,27 @@ mod tests {
         let config: LuraConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.auth.enabled);
         assert!(config.auth.validate(&config.server).is_err());
+    }
+
+    // ── Global event stream (spec general/018) ──────────────────────────────
+
+    #[test]
+    fn test_events_defaults() {
+        let config = LuraConfig::default();
+        assert_eq!(config.events.channel_capacity, 256);
+        assert_eq!(config.events.replay_buffer_size, 1024);
+    }
+
+    #[test]
+    fn test_events_toml_overrides() {
+        let toml_str = r#"
+            [events]
+            channel_capacity = 8
+            replay_buffer_size = 0
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.events.channel_capacity, 8);
+        assert_eq!(config.events.replay_buffer_size, 0);
     }
 
     #[test]

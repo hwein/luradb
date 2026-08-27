@@ -363,6 +363,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
+            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
         };
         (state, dir)
     }

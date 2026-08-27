@@ -525,6 +525,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
+            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
         };
         let app = crate::api::create_router(state, Arc::new(vec![]));
         (app, auth_cache, dir)

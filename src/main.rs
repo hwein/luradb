@@ -718,6 +718,22 @@ fn main() -> anyhow::Result<()> {
         let json_engine = init_json_engine(&config).await?;
         let rel_engine = init_rel_engine(&config, &registry, &json_engine, &metrics).await?;
 
+        // --- Global event bus (spec general/018 §1) --- attached before the
+        // purgers are spawned and before the listener accepts requests: a
+        // finalize_* running against an unattached bus would silently drop
+        // its domain_purged event, which is exactly what this ordering avoids.
+        let event_bus = Arc::new(crate::core::events::GlobalEventBus::new(
+            config.events.channel_capacity,
+            config.events.replay_buffer_size,
+        ));
+        registry.attach_event_bus(Arc::clone(&event_bus));
+        if let Some(engine) = &json_engine {
+            engine.attach_event_bus(Arc::clone(&event_bus));
+        }
+        if let Some(engine) = &rel_engine {
+            engine.attach_event_bus(Arc::clone(&event_bus));
+        }
+
         let shutdown_flag = spawn_background_tasks(
             &config,
             &lsm_store,
@@ -757,6 +773,7 @@ fn main() -> anyhow::Result<()> {
             shm_manager: shm_manager.clone(),
             backup_manager,
             log_access,
+            event_bus,
         };
         let app = build_router(&config, state, trusted_cidrs);
 

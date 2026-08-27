@@ -386,6 +386,9 @@ mod tests {
             backup_manager: None,
             log_access,
             event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(crate::config::LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
         };
         (state, dir)
     }

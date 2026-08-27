@@ -17,6 +17,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: `POST /store-api/json/{domain}/documents`, `PUT /store-api/json/{domain}/documents/{key}`, and `GET /store-api/json/{domain}/documents/{key}` now document their response body as `DocumentResponse` (`_key`, `_version`, plus the document's own fields) in the OpenAPI contract — the JSON returned on the wire is unchanged.
 - **BREAKING** API: `GET /store-api/metrics` now includes an `engines` block (`kv`/`json`/`rel`), each with `read_ops`, `write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`, and `window_secs` — per-engine op counts and latency percentiles over the rolling metrics window, alongside the existing KV-only `domains[]`.
 - Optional CORS support via the new `[cors]` config section — an opt-in `CorsLayer` (exact origin allow-list, or `"*"`) lets browser clients call the API directly without a proxy in front; off by default.
+- **BREAKING** API: added `GET /store-api/config`, returning the effective configuration of the running process (`config_path`, `config_file_loaded`, `config`) — admin-only; the admin API key is redacted from `config`, everything else is the same field names as the TOML file.
 
 ### Security
 

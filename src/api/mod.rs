@@ -16,6 +16,7 @@ pub mod rel_domains;
 
 use crate::auth::{handlers::AuthState, middleware::auth_layer, AuthCache};
 use crate::backup::BackupManager;
+use crate::config::LuraConfig;
 use crate::core::events::GlobalEventBus;
 use crate::engines::json::JsonEngine;
 use crate::engines::lsm::DomainRegistry;
@@ -59,7 +60,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.9";
+pub const API_VERSION: &str = "0.3.10";
 
 struct VersionInfo;
 
@@ -102,6 +103,14 @@ pub struct AppState {
     /// general/018) — always present; whether anything was ever attached to
     /// the KV/JSON/rel engines is a startup-wiring concern, not an `Option` here.
     pub event_bus: Arc<GlobalEventBus>,
+    /// Effective configuration of the running process, backing
+    /// `GET /store-api/config` (spec general/022) — always present.
+    pub config: Arc<LuraConfig>,
+    /// Resolved config path (`resolve_config_path`) — always set, even when
+    /// `config_file_loaded` is `false`.
+    pub config_path: String,
+    /// Whether a file actually existed at `config_path` at startup.
+    pub config_file_loaded: bool,
 }
 
 // ── Shared DTOs ───────────────────────────────────────────────────────────────
@@ -125,6 +134,9 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     };
 
     let mut store_router = Router::new()
+        // Effective configuration (spec general/022). No `{domain}` segment —
+        // admin-only via the same extract_domain None-branch as /metrics.
+        .route("/config", get(metrics::get_config))
         // Metrics (admin / domain user)
         .route("/metrics", get(metrics::get_metrics))
         .route("/metrics/domains/:name", get(metrics::get_domain_metrics))
@@ -287,6 +299,8 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         metrics::version,
         metrics::get_metrics,
         metrics::get_domain_metrics,
+        // Effective configuration
+        metrics::get_config,
         // Domain management
         domains::create_domain,
         domains::list_domains,

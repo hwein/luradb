@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LuraConfig {
     pub server: ServerConfig,
@@ -89,7 +89,7 @@ pub fn resolve_config_path(cli_arg: Option<PathBuf>, exists: impl Fn(&Path) -> b
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
     /// TCP bind address for the HTTP/HTTPS listeners. Defaults to loopback,
@@ -167,7 +167,7 @@ impl ServerConfig {
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
     pub db_path: String,
@@ -193,7 +193,7 @@ impl Default for StorageConfig {
 ///
 /// Scaffolding only — not yet wired into the WAL/VLog/SSTable hot paths
 /// (see spec perf/004). Disabled by default.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct IoEngineConfig {
     /// Enables the IoEngine (Default: false). Also gates the perf/005 storage thread.
@@ -232,7 +232,7 @@ impl Default for IoEngineConfig {
 
 // ── Buffer Pool ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BufferPoolConfig {
     pub pool_size: usize,
@@ -246,7 +246,7 @@ impl Default for BufferPoolConfig {
 
 // ── Block Cache (Spec 015) ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BlockCacheConfig {
     /// Maximum total size of the block cache in bytes (default: 64 MB).
@@ -269,7 +269,7 @@ impl Default for BlockCacheConfig {
 
 // ── LSM Engine ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LsmConfig {
     pub vlog_inline_threshold: usize,
@@ -306,7 +306,7 @@ impl Default for LsmConfig {
 
 // ── Compaction ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CompactionCfg {
     pub l0_threshold: usize,
@@ -328,7 +328,7 @@ impl Default for CompactionCfg {
 
 // ── Janitor ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JanitorCfg {
     pub check_interval_secs: u64,
@@ -348,7 +348,7 @@ impl Default for JanitorCfg {
 
 // ── Domains ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DomainsConfig {
     pub max_name_length: usize,
@@ -378,7 +378,7 @@ impl Default for DomainsConfig {
 
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RateLimitConfig {
     pub default_read_iops: u32,
@@ -399,7 +399,7 @@ impl Default for RateLimitConfig {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AuthConfig {
     /// Set to `false` to disable auth enforcement (dev/local mode).
@@ -441,15 +441,20 @@ impl AuthConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AdminEntry {
     pub name: String,
+    /// Secret, read on deserialize but never written back out. Convention:
+    /// any new secret field in this file gets `#[serde(skip_serializing)]`
+    /// the moment it's introduced — that's the only thing keeping it out of
+    /// `GET /store-api/config` (spec general/022).
+    #[serde(skip_serializing)]
     pub api_key: String,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MetricsCfg {
     pub window_secs: u64,
@@ -467,7 +472,7 @@ impl Default for MetricsCfg {
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Verbose,
@@ -476,7 +481,7 @@ pub enum LogLevel {
     Prod,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     #[default]
@@ -484,7 +489,7 @@ pub enum LogFormat {
     Json,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct LogConfig {
     pub level: LogLevel,
@@ -527,7 +532,7 @@ impl LogConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct LogModulesConfig {
     pub auth: Option<LogLevel>,
@@ -539,7 +544,7 @@ pub struct LogModulesConfig {
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     /// CIDR strings of trusted reverse-proxy IPs/ranges.
@@ -558,7 +563,7 @@ impl Default for ProxyConfig {
 // ── JSON Store (spec json/001) ────────────────────────────────────────────────
 
 /// Config for the JSON engine's dedicated LSM instance (own paths & tuning).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JsonStoreConfig {
     /// Set to `false` to skip starting the JSON engine entirely.
@@ -642,7 +647,7 @@ impl Default for JsonStoreConfig {
 /// Config for the relational engine's dedicated LSM instance (own paths &
 /// tuning). No `db_path` — like the JSON engine, this LSM instance has no
 /// buffer-pool/DiskManager stack, so there is no database file to point at.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RelStoreConfig {
     /// Set to `false` to skip starting the relational engine entirely.
@@ -769,7 +774,7 @@ impl Default for RelStoreConfig {
 /// POSIX shared-memory segments for the local IPC bypass. Wire protocols on
 /// top of these segments (state header, ringbuffer, RCU) follow in specs
 /// 007-009.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ShmConfig {
     /// Enables SHM segment setup at startup (Default: false).
@@ -859,7 +864,7 @@ impl ShmConfig {
 
 // ── Backup & Restore (spec general/006) ───────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BackupConfig {
     /// Master switch. `false` = no scheduler task, backup endpoints answer 503.
@@ -889,7 +894,7 @@ impl Default for BackupConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BackupScheduleConfig {
     /// Unique across all schedules; `[a-zA-Z0-9_-]{1,50}`.
     pub name: String,
@@ -978,7 +983,7 @@ impl BackupConfig {
 /// Config for the `GlobalEventBus` behind `GET /store-api/events`: lifecycle/
 /// DDL events across the KV, JSON and relational engines. A section of its
 /// own rather than an `[lsm]` extension, since the bus belongs to no engine.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EventsConfig {
     /// Live broadcast channel capacity. A consumer that falls this far behind
@@ -1000,7 +1005,7 @@ impl Default for EventsConfig {
 
 // ── CORS (spec general/020) ───────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CorsConfig {
     /// Enables the `CorsLayer`. `false` (default) = no layer in the stack,

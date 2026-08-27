@@ -643,7 +643,8 @@ fn main() -> anyhow::Result<()> {
 
     tokio_uring::start(async move {
         tracing::info!("Starting LuraDB...");
-        if config_path.exists() {
+        let config_file_loaded = config_path.exists();
+        if config_file_loaded {
             tracing::info!("Config loaded from {}", config_path.display());
         } else {
             tracing::info!("No config file found at {}, using defaults", config_path.display());
@@ -790,6 +791,9 @@ fn main() -> anyhow::Result<()> {
             backup_manager,
             log_access,
             event_bus,
+            config: Arc::clone(&config),
+            config_path: config_path.display().to_string(),
+            config_file_loaded,
         };
         let app = build_router(&config, state, trusted_cidrs);
 
@@ -878,6 +882,9 @@ mod tests {
             backup_manager: None,
             log_access: None,
             event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
         };
         (state, dir)
     }

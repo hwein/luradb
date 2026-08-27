@@ -63,6 +63,32 @@ pub async fn version() -> Json<VersionResponse> {
     })
 }
 
+/// `GET /config` — effective configuration of the running process. Admin only.
+///
+/// The path carries no `{domain}` segment, so `extract_domain` returns `None`
+/// and the auth layer's None-branch requires an admin role (spec
+/// general/022). The admin API key never appears in the body — redaction
+/// happens at the field level (`AdminEntry.api_key`'s `#[serde(skip_serializing)]`
+/// in config.rs), not in this handler.
+#[utoipa::path(
+    get,
+    path = "/store-api/config",
+    responses(
+        (status = 200, description = "config_path (resolved path, always set), config_file_loaded (whether a file existed there), and config (the effective LuraConfig — see config.rs for field docs)", body = Object),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — Admin only"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Metrics"
+)]
+pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "config_path": state.config_path,
+        "config_file_loaded": state.config_file_loaded,
+        "config": &*state.config,
+    }))
+}
+
 /// `GET /metrics` — system + all domain metrics. Admin only.
 ///
 /// `engines` (spec general/019) is an additive block, one entry per storage
@@ -184,6 +210,16 @@ mod tests {
     // exercise get_metrics's engines block, which is always present
     // regardless of which engines are actually wired up.
     async fn make_state() -> (AppState, tempfile::TempDir) {
+        make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await
+    }
+
+    // Parameterized variant for the config-endpoint tests below (spec
+    // general/022), which need to control the config/path/loaded-flag triple.
+    async fn make_state_with_config(
+        config: crate::config::LuraConfig,
+        config_path: String,
+        config_file_loaded: bool,
+    ) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -217,6 +253,9 @@ mod tests {
             backup_manager: None,
             log_access: None,
             event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(config),
+            config_path,
+            config_file_loaded,
         };
         (state, dir)
     }
@@ -303,5 +342,120 @@ mod tests {
             before,
             "engine aggregate must survive domain deletion"
         );
+    }
+
+    // ── GET /store-api/config (spec general/022) ─────────────────────────────
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    async fn body_string(resp: axum::http::Response<Body>) -> String {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn config_response(state: AppState) -> axum::http::Response<Body> {
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+        app.oneshot(Request::builder().uri("/store-api/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    // Tests 1+2: the admin api_key is redacted by construction
+    // (`#[serde(skip_serializing)]` on `AdminEntry::api_key`), verified as a
+    // plain string search over the whole wire body -- stays valid even if the
+    // key moves to a nested location later. Redaction is field-exact: the
+    // admin name next to it must survive.
+    #[tokio::test]
+    async fn config_endpoint_redacts_admin_api_key_but_keeps_name() {
+        let mut config = crate::config::LuraConfig::default();
+        config.auth.admins = vec![crate::config::AdminEntry {
+            name: "root".to_string(),
+            api_key: "MARKER_SECRET".to_string(),
+        }];
+        let (state, _dir) = make_state_with_config(config, "test.toml".to_string(), false).await;
+        let resp = config_response(state).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(!body.contains("MARKER_SECRET"), "admin api_key leaked into the response body");
+        assert!(body.contains("root"), "admin name must stay visible");
+    }
+
+    // Test 3 (admin-only enforcement) lives in auth/middleware.rs, next to
+    // the other auth-layer HTTP tests -- see config_endpoint_is_admin_only.
+
+    // Test 4: LuraConfig::default() with config_file_loaded: false -> 200,
+    // flag false, config_path still set, config fully populated.
+    #[tokio::test]
+    async fn config_endpoint_defaults_operation() {
+        let (state, _dir) = make_state_with_config(
+            crate::config::LuraConfig::default(),
+            "/etc/luradb/luradb.toml".to_string(),
+            false,
+        )
+        .await;
+        let resp = config_response(state).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["config_file_loaded"], false);
+        assert_eq!(body["config_path"], "/etc/luradb/luradb.toml");
+        assert!(body["config"]["server"].is_object());
+        assert!(body["config"]["storage"].is_object());
+    }
+
+    // Test 5: config_path passes through unchanged; config_file_loaded: true
+    // distinguishes the "file was loaded" case from test 4's defaults case.
+    #[tokio::test]
+    async fn config_endpoint_path_passthrough_when_loaded() {
+        let (state, _dir) = make_state_with_config(
+            crate::config::LuraConfig::default(),
+            "/etc/luradb/luradb.toml".to_string(),
+            true,
+        )
+        .await;
+        let resp = config_response(state).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["config_path"], "/etc/luradb/luradb.toml");
+        assert_eq!(body["config_file_loaded"], true);
+    }
+
+    // Test 6: the `config` key-set matches LuraConfig's field names exactly --
+    // no fixed count/list here on purpose, so this stays valid as sections
+    // are added (the endpoint's own promise: "effective configuration").
+    #[tokio::test]
+    async fn config_endpoint_config_keys_match_luraconfig_fields() {
+        let (state, _dir) =
+            make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await;
+        let resp = config_response(state).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        let mut got: Vec<String> = body["config"].as_object().unwrap().keys().cloned().collect();
+        got.sort();
+        let expected_value = serde_json::to_value(crate::config::LuraConfig::default()).unwrap();
+        let mut expected: Vec<String> = expected_value.as_object().unwrap().keys().cloned().collect();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    // Test 7: a TOML-loaded config with a non-default value (server.port)
+    // comes back with that exact value -- proof the *loaded* instance is
+    // serialized, not a fresh default one.
+    #[tokio::test]
+    async fn config_endpoint_reflects_loaded_values_not_defaults() {
+        let toml_str = r#"
+            [server]
+            port = 4242
+        "#;
+        let config: crate::config::LuraConfig = toml::from_str(toml_str).unwrap();
+        assert_ne!(config.server.port, crate::config::ServerConfig::default().port);
+        let (state, _dir) = make_state_with_config(config, "test.toml".to_string(), true).await;
+        let resp = config_response(state).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["config"]["server"]["port"], 4242);
     }
 }

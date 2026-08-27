@@ -271,6 +271,9 @@ mod tests {
             backup_manager: None,
             log_access: None,
             event_bus: bus,
+            config: Arc::new(crate::config::LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
         };
         let app = crate::api::create_router(state, Arc::new(vec![]));
         (TestApp { app, admin_key }, dir)

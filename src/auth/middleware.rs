@@ -416,6 +416,9 @@ mod tests {
             backup_manager: None,
             log_access: None,
             event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(crate::config::LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
         };
         (state, dir)
     }
@@ -490,6 +493,74 @@ mod tests {
         // Regression: /health stays reachable without a token.
         let resp = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── /store-api/config admin-only (spec general/022) ──────────────────────
+
+    // Regression-critical: /store-api/config carries no `{domain}` segment, so
+    // its admin-only protection is entirely implicit -- it falls out of
+    // extract_domain's None branch above, same as /metrics, /events,
+    // /backups*. A future path refactor that accidentally gave it a domain
+    // segment would silently open it to any user holding some permission.
+    #[tokio::test]
+    async fn config_endpoint_is_admin_only() {
+        let (app, auth_cache, _dir) = make_app_with_auth().await;
+
+        // Non-admin key, even with a domain permission -> 403 (no {domain}
+        // segment in this path for that permission to apply to).
+        let key = "lura_test_config_key";
+        auth_cache
+            .upsert_user(crate::auth::UserRecord {
+                name: "worker".to_string(),
+                api_key_hash: crate::auth::hash_api_key(key),
+                role: crate::auth::UserRole::User,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        auth_cache
+            .set_permission(crate::auth::DomainPermission {
+                username: "worker".to_string(),
+                domain: "shop".to_string(),
+                access: AccessLevel::Ddl,
+            })
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/config")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Admin key -> 200.
+        let admin_key = "lura_test_config_admin_key";
+        auth_cache
+            .upsert_user(crate::auth::UserRecord {
+                name: "admin".to_string(),
+                api_key_hash: crate::auth::hash_api_key(admin_key),
+                role: crate::auth::UserRole::Admin,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/config")
+                    .header("authorization", format!("Bearer {admin_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

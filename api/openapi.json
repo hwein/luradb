@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.9",
+    "version": "0.3.10",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -544,6 +544,39 @@
             "description": "Backup is disabled"
           }
         }
+      }
+    },
+    "/store-api/config": {
+      "get": {
+        "tags": [
+          "Metrics"
+        ],
+        "summary": "`GET /config` — effective configuration of the running process. Admin only.",
+        "description": "The path carries no `{domain}` segment, so `extract_domain` returns `None`\nand the auth layer's None-branch requires an admin role (spec\ngeneral/022). The admin API key never appears in the body — redaction\nhappens at the field level (`AdminEntry.api_key`'s `#[serde(skip_serializing)]`\nin config.rs), not in this handler.",
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "config_path (resolved path, always set), config_file_loaded (whether a file existed there), and config (the effective LuraConfig — see config.rs for field docs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden — Admin only"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/store-api/domains": {

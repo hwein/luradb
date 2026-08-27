@@ -1,4 +1,5 @@
 use crate::engines::lsm::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
+use crate::engines::lsm::key::Timestamp;
 use crate::storage::format::{
     ArchivedDataBlockValue, BlockHandle, BloomFilter, CachedValue, DataBlock, DataBlockValue,
     IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer,
@@ -319,6 +320,18 @@ impl SSTableReader {
         key: &[u8],
         cache: &mut BlockCache,
     ) -> Result<Option<CachedValue>> {
+        Ok(self.get_with_cache_and_ts(key, cache)?.map(|(v, _)| v))
+    }
+
+    /// Like [`Self::get_with_cache`], but also returns the matched entry's
+    /// write timestamp, un-inverted back to HLC form (spec kv/022
+    /// `last_modified_at`) — the encoded key stores it inverted
+    /// (`Timestamp::inverted`) for newest-first sort order.
+    pub fn get_with_cache_and_ts(
+        &self,
+        key: &[u8],
+        cache: &mut BlockCache,
+    ) -> Result<Option<(CachedValue, Timestamp)>> {
         let bloom_key = mvcc_user_key(key);
         if !self.bloom_filter.contains(bloom_key) {
             return Ok(None);
@@ -337,7 +350,8 @@ impl SSTableReader {
 
             for entry in data_block.entries.iter() {
                 if entry.0.as_slice() == key {
-                    return Ok(Some(cached_value_from_archived(&raw, &entry.1)));
+                    let ts = Timestamp::from_inverted(mvcc_inv_ts(entry.0.as_slice()));
+                    return Ok(Some((cached_value_from_archived(&raw, &entry.1), ts)));
                 }
             }
         }
@@ -350,12 +364,14 @@ impl SSTableReader {
         Ok(None)
     }
 
-    /// MVCC prefix scan with block cache integration.
+    /// MVCC prefix scan with block cache integration; also returns the
+    /// matched entry's un-inverted write timestamp (see
+    /// [`Self::get_with_cache_and_ts`]).
     fn get_mvcc_prefix_cached(
         &self,
         key: &[u8],
         cache: &mut BlockCache,
-    ) -> Result<Option<CachedValue>> {
+    ) -> Result<Option<(CachedValue, Timestamp)>> {
         let search_user_key = mvcc_user_key(key);
         let search_inv_ts = mvcc_inv_ts(key);
 
@@ -387,7 +403,8 @@ impl SSTableReader {
                 let stored_inv_ts = mvcc_inv_ts(bk);
 
                 if stored_inv_ts >= search_inv_ts {
-                    return Ok(Some(cached_value_from_archived(&raw, &entry.1)));
+                    let ts = Timestamp::from_inverted(stored_inv_ts);
+                    return Ok(Some((cached_value_from_archived(&raw, &entry.1), ts)));
                 }
             }
 
@@ -815,6 +832,40 @@ mod tests {
         }
 
         assert!(reader.get_with_cache(b"missing-key", &mut cache)?.is_none());
+        Ok(())
+    }
+
+    // kv/022 regression: get_with_cache_and_ts must return the un-inverted
+    // write timestamp. The encoded key stores it inverted (newest-first sort
+    // order); a naive read of the raw bytes would report a NEWER write as a
+    // SMALLER timestamp, decreasing `last_modified_at` on every overwrite.
+    #[test]
+    fn test_get_with_cache_and_ts_uninverts_timestamp() -> anyhow::Result<()> {
+        use crate::engines::lsm::key::InternalKey;
+
+        let mut builder = SSTableBuilder::new();
+        // Same user key, two versions. Encoded order is newest-first (the
+        // inverted timestamp of the larger raw value sorts smaller), so the
+        // ts=2000 entry must be added before the ts=1000 one.
+        let newer = InternalKey::new(b"k".to_vec(), Timestamp::new(2000)).encode();
+        let older = InternalKey::new(b"k".to_vec(), Timestamp::new(1000)).encode();
+        builder.add_inline(newer, b"v2".to_vec(), 0);
+        builder.add_inline(older, b"v1".to_vec(), 0);
+        let bytes = builder.finish()?;
+        let reader = SSTableReader::open(bytes)?;
+        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
+
+        // Exact-match path: the search key equals the stored newer key.
+        let search_key = InternalKey::new(b"k".to_vec(), Timestamp::new(2000)).encode();
+        let (_, ts) = reader.get_with_cache_and_ts(&search_key, &mut cache)?.expect("must find entry");
+        assert_eq!(ts, Timestamp::new(2000), "must report the write timestamp, not its inverted on-disk form");
+
+        // MVCC-fallback path: a snapshot newer than both writes must resolve
+        // to the newest version (2000) and report its un-inverted timestamp.
+        let snapshot_key = InternalKey::new(b"k".to_vec(), Timestamp::new(9999)).encode();
+        let (_, ts) = reader.get_with_cache_and_ts(&snapshot_key, &mut cache)?.expect("must find entry");
+        assert_eq!(ts, Timestamp::new(2000));
+
         Ok(())
     }
 

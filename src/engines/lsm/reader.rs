@@ -4,6 +4,7 @@
 //! It searches through multiple levels: MemTable → Immutable MemTables → SSTables.
 
 use crate::engines::lsm::block_cache::BlockCache;
+use crate::engines::lsm::hlc::HLCTimestamp;
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::memtable::{MemTable, Value};
 use crate::storage::format::CachedValue;
@@ -24,6 +25,12 @@ fn now_secs() -> u64 {
 
 fn is_expired(expire_at: Option<u64>) -> bool {
     expire_at.map(|exp| exp <= now_secs()).unwrap_or(false)
+}
+
+/// Physical (millisecond) component of an MVCC write timestamp — the HLC
+/// packs it into the high 48 bits (spec kv/022 `last_modified_at`).
+fn hlc_physical_ms(ts: Timestamp) -> u64 {
+    HLCTimestamp::new(ts.as_u64()).physical()
 }
 
 /// A snapshot for MVCC reads.
@@ -112,6 +119,9 @@ pub struct ValueWithMetadata {
     pub from_vlog: bool,
     /// Key is explicitly NULL (kv/018): `data` is empty, `from_vlog` is false.
     pub is_null: bool,
+    /// Unix milliseconds of this version's write (spec kv/022
+    /// `last_modified_at`) — the HLC physical component of its MVCC timestamp.
+    pub last_modified_ms: u64,
 }
 
 impl LsmReader {
@@ -288,19 +298,19 @@ impl LsmReader {
         user_key: &[u8],
         snapshot: &Snapshot,
     ) -> Result<Option<Option<ValueWithMetadata>>> {
-        match memtable.get(user_key, snapshot.timestamp()) {
-            Some(Value::Inline(v, expire_at)) => {
+        match memtable.get_with_ts(user_key, snapshot.timestamp()) {
+            Some((Value::Inline(v, expire_at), ts)) => {
                 if is_expired(expire_at) { return Ok(Some(None)); }
-                Ok(Some(Some(ValueWithMetadata { data: v, expire_at: expire_at.unwrap_or(0), from_vlog: false, is_null: false })))
+                Ok(Some(Some(ValueWithMetadata { data: v, expire_at: expire_at.unwrap_or(0), from_vlog: false, is_null: false, last_modified_ms: hlc_physical_ms(ts) })))
             }
-            Some(Value::Pointer { expire_at, .. }) => {
+            Some((Value::Pointer { expire_at, .. }, ts)) => {
                 if is_expired(expire_at) { return Ok(Some(None)); }
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: expire_at.unwrap_or(0), from_vlog: true, is_null: false })))
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: expire_at.unwrap_or(0), from_vlog: true, is_null: false, last_modified_ms: hlc_physical_ms(ts) })))
             }
-            Some(Value::Null) => {
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true })))
+            Some((Value::Null, ts)) => {
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true, last_modified_ms: hlc_physical_ms(ts) })))
             }
-            Some(Value::Tombstone) => Ok(Some(None)),
+            Some((Value::Tombstone, _)) => Ok(Some(None)),
             None => Ok(None),
         }
     }
@@ -318,27 +328,27 @@ impl LsmReader {
 
         let maybe_value = {
             let mut cache = self.cache.lock();
-            sstable.get_with_cache(&encoded_key, &mut *cache)?
+            sstable.get_with_cache_and_ts(&encoded_key, &mut *cache)?
         };
 
         match maybe_value {
             None => Ok(None),
-            Some(CachedValue::Tombstone) => Ok(Some(None)),
-            Some(CachedValue::Null) => {
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true })))
+            Some((CachedValue::Tombstone, _)) => Ok(Some(None)),
+            Some((CachedValue::Null, ts)) => {
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true, last_modified_ms: hlc_physical_ms(ts) })))
             }
-            Some(CachedValue::VLogPointer { expire_at, .. }) => {
+            Some((CachedValue::VLogPointer { expire_at, .. }, ts)) => {
                 if expire_at != 0 && expire_at <= now_secs() {
                     return Ok(Some(None));
                 }
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at, from_vlog: true, is_null: false })))
+                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at, from_vlog: true, is_null: false, last_modified_ms: hlc_physical_ms(ts) })))
             }
-            Some(value) => {
+            Some((value, ts)) => {
                 let expire_at = value.expire_at();
                 if expire_at != 0 && expire_at <= now_secs() {
                     return Ok(Some(None));
                 }
-                Ok(Some(Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false, is_null: false })))
+                Ok(Some(Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false, is_null: false, last_modified_ms: hlc_physical_ms(ts) })))
             }
         }
     }

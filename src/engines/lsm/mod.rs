@@ -24,5 +24,5 @@ pub use levels::LevelManager;
 pub use compaction::{CompactionConfig, CompactionJob};
 pub use janitor::{Janitor, JanitorConfig};
 pub use watcher::{OpType, WalEvent};
-pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore};
+pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta};
 pub use rate_limiter::{DomainQuota, RateLimiter, TokenBucket};

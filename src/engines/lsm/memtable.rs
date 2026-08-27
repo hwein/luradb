@@ -57,15 +57,22 @@ impl MemTable {
     }
 
     /// Retrieves the latest version of a key visible to the given snapshot.
+    pub fn get(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<Value> {
+        self.get_with_ts(user_key, snapshot_ts).map(|(v, _)| v)
+    }
+
+    /// Like [`Self::get`], but also returns the version's write timestamp
+    /// (spec kv/022 `last_modified_at`) — decoded straight from the encoded
+    /// key, so already un-inverted.
     ///
     /// # Arguments
     /// * `user_key` - The user-facing key to look up
     /// * `snapshot_ts` - The snapshot timestamp (only return versions <= this)
     ///
     /// # Returns
-    /// * `Some(Value)` if a visible version is found
+    /// * `Some((Value, Timestamp))` if a visible version is found
     /// * `None` if no visible version exists
-    pub fn get(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<Value> {
+    pub fn get_with_ts(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<(Value, Timestamp)> {
         // Build the search key: UserKey + SnapshotTimestamp
         let search_key = InternalKey::new(user_key.to_vec(), snapshot_ts);
         let encoded_search_key = search_key.encode();
@@ -82,7 +89,8 @@ impl MemTable {
 
             if let Some(entry_user_key) = InternalKey::extract_user_key(key_bytes.as_slice()) {
                 if entry_user_key == user_key {
-                    return Some(value.clone());
+                    let ts = InternalKey::extract_timestamp(key_bytes.as_slice()).unwrap_or(snapshot_ts);
+                    return Some((value.clone(), ts));
                 } else {
                     // As soon as the UserKey no longer matches, we can stop,
                     // since the map is sorted by UserKey.

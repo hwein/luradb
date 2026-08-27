@@ -394,6 +394,17 @@ pub struct DomainStore {
     metrics: Arc<MetricsStore>,
 }
 
+/// Key metadata without the value bytes (spec kv/022): TTL expiry and the
+/// write time of the newest visible version. Backs `GET …/{key}/meta`;
+/// never dereferences a VLog pointer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyMeta {
+    /// Absolute Unix seconds; 0 = no TTL set.
+    pub expire_at: u64,
+    /// Unix milliseconds of the newest visible version's write.
+    pub last_modified_ms: u64,
+}
+
 impl DomainStore {
     fn prefixed_key(&self, user_key: &[u8]) -> Vec<u8> {
         let mut k = self.domain.system_prefix.clone();
@@ -451,6 +462,15 @@ impl DomainStore {
     /// `Null` (key exists in the NULL state), or `Absent`. Records latency
     /// and hit/miss in MetricsStore (a `Null` read counts as a hit).
     pub async fn get(&self, key: &[u8]) -> Result<GetResult> {
+        Ok(self.get_with_expiry(key).await?.0)
+    }
+
+    /// Like [`Self::get`], but also returns `expire_at` (absolute Unix
+    /// seconds, 0 = no TTL) — spec kv/022, backs the `X-Expires-At` response
+    /// header. Same validation, rate-limiting and hit/miss accounting as
+    /// `get`; unlike [`Self::get_with_snapshot`] this acquires its own
+    /// snapshot and goes through the read rate limiter.
+    pub async fn get_with_expiry(&self, key: &[u8]) -> Result<(GetResult, u64)> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
@@ -460,11 +480,33 @@ impl DomainStore {
         let snap = self.engine.snapshot();
         let result = self
             .engine
-            .get_with_snapshot(&self.prefixed_key(key), snap.snapshot())
+            .get_with_expiry(&self.prefixed_key(key), snap.snapshot())
             .await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.metrics.record_read(&self.domain.name, elapsed_us, !matches!(result, GetResult::Absent));
+        self.metrics.record_read(&self.domain.name, elapsed_us, !matches!(result.0, GetResult::Absent));
         Ok(result)
+    }
+
+    /// Reads a key's TTL expiry and last-modified time without its value
+    /// bytes (spec kv/022) — backs `GET …/{key}/meta`; never dereferences a
+    /// VLog pointer. Same validation and rate-limiting as `get`, including
+    /// the same hit/miss rule (a `Null` key is a hit, only an absent key is
+    /// a miss) — the read still spends a rate-limit token on the domain path.
+    pub async fn get_meta(&self, key: &[u8]) -> Result<Option<KeyMeta>> {
+        self.validate_user_key(key)?;
+        if !self.runtime.rate_limiter.check_read() {
+            self.metrics.record_rate_limit_rejection(&self.domain.name);
+            return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
+        }
+        let start = std::time::Instant::now();
+        let snap = self.engine.snapshot();
+        let result = self
+            .engine
+            .get_with_metadata(&self.prefixed_key(key), snap.snapshot())
+            .await?;
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        self.metrics.record_read(&self.domain.name, elapsed_us, result.is_some());
+        Ok(result.map(|m| KeyMeta { expire_at: m.expire_at, last_modified_ms: m.last_modified_ms }))
     }
 
     /// Tombstones a key (hard delete).

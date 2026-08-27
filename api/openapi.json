@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.1",
+    "version": "0.3.2",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -1511,7 +1511,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.",
+        "summary": "Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.\nWhen the key has a TTL, the response carries an `X-Expires-At` header with the absolute Unix-seconds expiry.",
         "operationId": "get_key",
         "parameters": [
           {
@@ -1535,7 +1535,16 @@
         ],
         "responses": {
           "200": {
-            "description": "Value (raw bytes; an empty value yields an empty body)",
+            "description": "Value (raw bytes; an empty value yields an empty body). The `X-Expires-At` header (absolute Unix seconds) is present only when the key has a TTL.",
+            "headers": {
+              "X-Expires-At": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            },
             "content": {
               "application/octet-stream": {}
             }
@@ -1672,6 +1681,68 @@
           },
           "400": {
             "description": "Invalid key"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/store-api/kv/{domain}/keys/{key}/meta": {
+      "get": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Returns a key's TTL expiry and last-modified time without reading its value (no VLog dereference).\n`last_modified_at` is the write time of the newest visible version (PUT, or PATCH …/null) — not a\ncreation timestamp; every overwrite advances it.",
+        "operationId": "get_key_meta",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Key (valid UTF-8, max 256 bytes)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Key metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyMetaResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid key"
+          },
+          "404": {
+            "description": "Key or domain not found"
           },
           "410": {
             "description": "Domain is being deleted"
@@ -3234,6 +3305,29 @@
           "state": {
             "type": "string",
             "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running)."
+          }
+        }
+      },
+      "KeyMetaResponse": {
+        "type": "object",
+        "required": [
+          "last_modified_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Absolute Unix-seconds TTL expiry; `null` when the key has no TTL. Equal to the `X-Expires-At` header when present.",
+            "minimum": 0
+          },
+          "last_modified_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-milliseconds write time of the newest visible version (PUT, or PATCH …/null) — not a creation timestamp; every overwrite advances it.",
+            "minimum": 0
           }
         }
       },

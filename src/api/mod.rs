@@ -59,7 +59,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.7";
+pub const API_VERSION: &str = "0.3.8";
 
 struct VersionInfo;
 
@@ -379,6 +379,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             json::SearchRequest,
             json::SearchResponse,
             json::ListParams,
+            json::DocumentResponse,
             json::DocumentListResponse,
             json::BulkErrorEntry,
             json::BulkLoadResponse,
@@ -501,6 +502,46 @@ mod contract_tests {
                 .any(|req| req.as_object().is_some_and(|o| o.contains_key("bearer_auth"))),
             "/version must carry bearer_auth security, was: {security}"
         );
+    }
+
+    // DocumentResponse schema shape (spec json/015 §1): _key/_version are
+    // fixed required properties, everything else is an open additionalProperties map.
+    #[test]
+    fn document_response_schema_is_well_formed() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schema = &json["components"]["schemas"]["DocumentResponse"];
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["_key", "_version"]),
+            "schema: {schema}"
+        );
+        assert_eq!(schema["properties"]["_key"]["type"], serde_json::json!("string"), "{schema}");
+        assert_eq!(schema["properties"]["_version"]["type"], serde_json::json!("integer"), "{schema}");
+        let additional = &schema["additionalProperties"];
+        assert!(!additional.is_null(), "additionalProperties must be present: {schema}");
+        assert_ne!(additional, &serde_json::json!(false), "additionalProperties must not be false: {schema}");
+    }
+
+    // DocumentResponse wiring (spec json/015 §3): the four document-CRUD
+    // responses that carry a body reference the new schema.
+    #[test]
+    fn document_response_wired_to_all_four_responses() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let checks = [
+            ("/store-api/json/{domain}/documents", "post", "201"),
+            ("/store-api/json/{domain}/documents/{key}", "put", "200"),
+            ("/store-api/json/{domain}/documents/{key}", "put", "201"),
+            ("/store-api/json/{domain}/documents/{key}", "get", "200"),
+        ];
+        for (path, method, status) in checks {
+            let response = &json["paths"][path][method]["responses"][status];
+            let schema_ref = &response["content"]["application/json"]["schema"]["$ref"];
+            assert_eq!(
+                schema_ref,
+                &serde_json::json!("#/components/schemas/DocumentResponse"),
+                "{method} {path} -> {status}: {response}"
+            );
+        }
     }
 }
 

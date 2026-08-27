@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.7",
+    "version": "0.3.8",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -994,7 +994,14 @@
         },
         "responses": {
           "201": {
-            "description": "Document created with generated UUIDv4 key"
+            "description": "Document created with generated UUIDv4 key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "Domain not found"
@@ -1075,7 +1082,14 @@
         ],
         "responses": {
           "200": {
-            "description": "Document content with _key/_version metadata"
+            "description": "Document content with _key/_version metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "Document or domain not found"
@@ -1135,10 +1149,24 @@
         },
         "responses": {
           "200": {
-            "description": "Document updated"
+            "description": "Document updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentResponse"
+                }
+              }
+            }
           },
           "201": {
-            "description": "Document created"
+            "description": "Document created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentResponse"
+                }
+              }
+            }
           },
           "400": {
             "description": "Invalid key, invalid If-Match or If-None-Match header, or both headers set together"
@@ -3496,6 +3524,29 @@
             "format": "int64",
             "minimum": 0
           }
+        }
+      },
+      "DocumentResponse": {
+        "type": "object",
+        "description": "A document as returned by the store: `_key`/`_version` metadata merged\ninto the user's fields.",
+        "required": [
+          "_key",
+          "_version"
+        ],
+        "properties": {
+          "_key": {
+            "type": "string",
+            "description": "Document key."
+          },
+          "_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Write counter: 1 on create, incremented on every write.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": {
+          "description": "The document's own fields. A document whose content is not a JSON\nobject appears as a single `_content` field holding that value."
         }
       },
       "DomainResponse": {

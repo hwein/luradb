@@ -61,6 +61,23 @@ pub(crate) fn json_engine(state: &AppState) -> Result<&Arc<JsonEngine>, ApiError
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
 
+/// A document as returned by the store: `_key`/`_version` metadata merged
+/// into the user's fields.
+#[derive(Serialize, ToSchema)]
+pub struct DocumentResponse {
+    /// Document key.
+    #[serde(rename = "_key")]
+    pub key: String,
+    /// Write counter: 1 on create, incremented on every write.
+    #[serde(rename = "_version")]
+    pub version: u64,
+    /// The document's own fields. A document whose content is not a JSON
+    /// object appears as a single `_content` field holding that value.
+    #[serde(flatten)]
+    #[schema(additional_properties)]
+    pub fields: HashMap<String, Value>,
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct CreateIndexRequest {
     /// JSON field path, dot notation for nested fields (e.g. "address.city").
@@ -219,7 +236,7 @@ fn parse_precondition(headers: &HeaderMap) -> Result<Option<Precondition>, ApiEr
     params(("domain" = String, Path, description = "JSON domain")),
     request_body = Object,
     responses(
-        (status = 201, description = "Document created with generated UUIDv4 key"),
+        (status = 201, description = "Document created with generated UUIDv4 key", body = DocumentResponse),
         (status = 404, description = "Domain not found"),
         (status = 413, description = "Payload too large"),
         (status = 503, description = "JSON engine disabled"),
@@ -247,8 +264,8 @@ pub async fn create_document(
     ),
     request_body = Object,
     responses(
-        (status = 200, description = "Document updated"),
-        (status = 201, description = "Document created"),
+        (status = 200, description = "Document updated", body = DocumentResponse),
+        (status = 201, description = "Document created", body = DocumentResponse),
         (status = 400, description = "Invalid key, invalid If-Match or If-None-Match header, or both headers set together"),
         (status = 404, description = "Domain not found, or If-Match on missing document"),
         (status = 409, description = "Version conflict (If-Match mismatch)"),
@@ -286,7 +303,7 @@ pub async fn put_document(
         ("key" = String, Path, description = "Document key"),
     ),
     responses(
-        (status = 200, description = "Document content with _key/_version metadata"),
+        (status = 200, description = "Document content with _key/_version metadata", body = DocumentResponse),
         (status = 404, description = "Document or domain not found"),
         (status = 503, description = "JSON engine disabled"),
     ),
@@ -1549,5 +1566,37 @@ mod tests {
         assert_eq!(status, StatusCode::GONE, "{body}");
         let (status, _) = request(&app, Method::PUT, "/store-api/json/api-dom/documents/x", Some("{}")).await;
         assert_eq!(status, StatusCode::GONE);
+    }
+
+    // 23. DocumentResponse schema sample (spec json/015): a written document's
+    //     _key/_version/user-field shape matches what the contract now declares.
+    #[tokio::test]
+    async fn test_document_response_matches_schema_shape() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/shape";
+        let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"city": "Lyon", "pop": 42}"#)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert!(doc["_key"].is_string(), "{body}");
+        assert!(doc["_version"].is_u64(), "{body}");
+        assert_eq!(doc["city"], json!("Lyon"), "{body}");
+        assert_eq!(doc["pop"], json!(42), "{body}");
+    }
+
+    // 24. _content regression (spec json/015 §2): a non-object document still
+    //     wraps under `_content`, unchanged by the new DocumentResponse schema.
+    #[tokio::test]
+    async fn test_non_object_document_wraps_in_content_field() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/scalar";
+        let (status, body) = request(&app, Method::PUT, uri, Some("42")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["_content"], json!(42), "{body}");
+        assert!(doc["_key"].is_string(), "{body}");
+        assert!(doc["_version"].is_u64(), "{body}");
     }
 }

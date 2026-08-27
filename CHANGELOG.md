@@ -14,6 +14,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: added `GET /store-api/events`, an SSE stream of lifecycle/DDL events across the KV, JSON and relational engines (domain created/deleted/purged; rel table/view/index DDL; JSON index DDL) — admin-only, no per-key data events. Same `id:`/`Last-Event-ID`/`reset` resume mechanism as the KV watch, with its own tag and sequence. New `[events]` config section (`channel_capacity`, `replay_buffer_size`).
 - **BREAKING** API: `PUT /store-api/json/{domain}/documents/{key}` now supports create-only writes via `If-None-Match: *`, answering `412 Precondition Failed` if the document already exists; only the literal `*` is supported, and combining it with `If-Match` answers `400`.
 - **BREAKING** API: added `DELETE /store-api/kv/{domain}/keys?prefix={p}&contains={s}`, deleting every matching key in one atomic write batch and returning `{"deleted": N}`; `prefix` is required and non-empty (a domain-emptying request still needs the admin-only domain delete), and a selection over the new `[domains].max_bulk_delete_keys` limit (default 10,000) answers `413` with nothing deleted.
+- **BREAKING** API: `POST /store-api/json/{domain}/documents`, `PUT /store-api/json/{domain}/documents/{key}`, and `GET /store-api/json/{domain}/documents/{key}` now document their response body as `DocumentResponse` (`_key`, `_version`, plus the document's own fields) in the OpenAPI contract — the JSON returned on the wire is unchanged.
 
 ### Security
 

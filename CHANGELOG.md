@@ -7,6 +7,7 @@ All notable changes to LuraDB are documented in this file.
 ### Added
 
 - **BREAKING** API: `GET /store-api/auth/users` responses now include a `permissions` array per user (`{domain, store_type, access}`), mirroring the write-endpoint vocabulary.
+- **BREAKING** API: added `GET /store-api/auth/whoami`, returning the caller's identity (`{name, role}`) for any authenticated caller — not admin-only. `role` is `"Admin"`, `"User"`, or a pseudo-role (`"TrustedPeer"`, `"Disabled"`).
 
 ### Security
 

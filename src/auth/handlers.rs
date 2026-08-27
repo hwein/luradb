@@ -1,7 +1,9 @@
 //! REST handlers for user management and domain permissions.
 //!
-//! All endpoints require Admin role (enforced by AuthMiddleware before these handlers run).
+//! All endpoints require Admin role (enforced by AuthMiddleware before these handlers run),
+//! except `whoami` — reachable by any authenticated caller (whitelisted in `middleware.rs`).
 //!
+//! GET    /store-api/auth/whoami                          → whoami        (200 | 401)
 //! POST   /store-api/auth/users                           → create_user   (201 | 409)
 //! GET    /store-api/auth/users                           → list_users    (200, incl. permissions)
 //! DELETE /store-api/auth/users/:name                     → delete_user   (204 | 404)
@@ -9,11 +11,11 @@
 //! DELETE /store-api/auth/users/:name/permissions/:domain → remove_permission (204 | 404)
 //! POST   /store-api/auth/users/:name/rotate-key          → rotate_key    (200 | 404)
 
-use crate::auth::middleware::{split_permission_domain, StoreType};
+use crate::auth::middleware::{extract_bearer, split_permission_domain, StoreType, TrustedPeer};
 use crate::auth::{generate_api_key, hash_api_key, AccessLevel, AuthCache, DomainPermission, UserRecord, UserRole};
 use crate::engines::lsm::DomainRegistry;
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -28,9 +30,25 @@ use utoipa::ToSchema;
 pub struct AuthState {
     pub cache: Arc<AuthCache>,
     pub registry: Arc<DomainRegistry>,
+    /// Mirrors `AppState::auth_enabled` (`api/mod.rs`) — needed by `whoami`
+    /// to report the `Disabled` pseudo-role when the `auth_layer` middleware
+    /// isn't in the router at all.
+    pub auth_enabled: bool,
 }
 
 // ── Request / response types ──────────────────────────────────────────────────
+
+/// Caller identity. `role` is the only discriminator between the four cases —
+/// see `whoami` for the full mapping; `name` is `null` whenever no
+/// `UserRecord` backs the caller (`TrustedPeer`, `Disabled`).
+#[derive(Serialize, ToSchema)]
+pub struct WhoamiResponse {
+    pub name: Option<String>,
+    /// `"Admin"`, `"User"`, or a pseudo-role: `"TrustedPeer"` (UDS peer
+    /// authenticated by the kernel, spec perf/001) or `"Disabled"`
+    /// (`auth.enabled = false`).
+    pub role: String,
+}
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateUserRequest {
@@ -127,6 +145,55 @@ fn now_secs() -> u64 {
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/store-api/auth/whoami",
+    responses(
+        (status = 200, description = "Caller identity — name (if any) and role", body = WhoamiResponse),
+        (status = 401, description = "Missing or invalid API key"),
+    ),
+    tag = "Auth"
+)]
+/// Returns the caller's own identity. Unlike every other endpoint under this
+/// tag, reachable by any authenticated caller — not admin-only (the
+/// `auth_layer` middleware whitelists this path, see `middleware.rs`).
+///
+/// Checked in order: `auth.enabled = false` → `Disabled`; a `TrustedPeer`
+/// (UDS peer authenticated by the kernel, spec perf/001) → `TrustedPeer`;
+/// otherwise the Bearer key is resolved to its `UserRecord` → `Admin`/`User`.
+/// A `401` past the `auth_layer` middleware (which already validates the key)
+/// can only mean a middleware bug — fail-closed, analogous to `enforce_sql_level`.
+pub async fn whoami(
+    State(state): State<AuthState>,
+    trusted: Option<Extension<TrustedPeer>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !state.auth_enabled {
+        return Json(WhoamiResponse {
+            name: None,
+            role: "Disabled".to_string(),
+        })
+        .into_response();
+    }
+    if trusted.is_some() {
+        return Json(WhoamiResponse {
+            name: None,
+            role: "TrustedPeer".to_string(),
+        })
+        .into_response();
+    }
+    if let Some(hash) = extract_bearer(&headers) {
+        if let Some(user) = state.cache.get_user_by_key_hash(&hash).await {
+            return Json(WhoamiResponse {
+                name: Some(user.name),
+                role: format!("{:?}", user.role),
+            })
+            .into_response();
+        }
+    }
+    err(StatusCode::UNAUTHORIZED, "Unauthorized")
+}
 
 #[utoipa::path(
     post,
@@ -684,4 +751,141 @@ mod tests {
             serde_json::json!([{"domain": "gonesoon", "store_type": "kv", "access": "write"}])
         );
     }
+
+    // ── whoami (spec general/016) ────────────────────────────────────────────
+
+    // Test 1: admin key -> 200 with its own name and role "Admin".
+    #[tokio::test]
+    async fn whoami_admin_key_returns_name_and_role() {
+        let (app, auth_cache, _dir) = make_app(true).await;
+        let key = "lura_whoami_admin";
+        add_user(&auth_cache, "root", key, UserRole::Admin).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/auth/whoami")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({"name": "root", "role": "Admin"}));
+    }
+
+    // Test 2: scoped user without any domain permission -> 200 with its name
+    // and role "User" -- not 403 (the fallback extract_domain would give
+    // without the whitelist entry; this is the point of the endpoint).
+    #[tokio::test]
+    async fn whoami_scoped_user_without_permissions_returns_user_role_not_403() {
+        let (app, auth_cache, _dir) = make_app(true).await;
+        let key = "lura_whoami_user";
+        add_user(&auth_cache, "alice", key, UserRole::User).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/auth/whoami")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({"name": "alice", "role": "User"}));
+    }
+
+    // Test 3: no header -> 401; invalid key -> 401 (the auth_layer middleware
+    // rejects both before the whitelist branch is ever reached).
+    #[tokio::test]
+    async fn whoami_requires_valid_key() {
+        let (app, _auth_cache, _dir) = make_app(true).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/auth/whoami")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/auth/whoami")
+                    .header("authorization", "Bearer lura_does_not_exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Test 4: TrustedPeer extension set (as the UDS accept loop would) -> 200,
+    // name null, role "TrustedPeer" -- no UserRecord involved at all.
+    #[tokio::test]
+    async fn whoami_trusted_peer_returns_pseudo_role() {
+        let (app, _auth_cache, _dir) = make_app(true).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/auth/whoami")
+                    .extension(TrustedPeer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({"name": null, "role": "TrustedPeer"}));
+    }
+
+    // Test 5: auth.enabled = false -> 200, name null, role "Disabled", no key
+    // needed (the auth_layer middleware isn't even in the router).
+    #[tokio::test]
+    async fn whoami_disabled_when_auth_off() {
+        let (app, _auth_cache, _dir) = make_app(false).await;
+
+        let resp = send(&app, Method::GET, "/store-api/auth/whoami", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({"name": null, "role": "Disabled"}));
+    }
+
+    // Test 6: auth.enabled = false AND TrustedPeer set -> still "Disabled" --
+    // the global switch takes precedence (checked first in the handler).
+    #[tokio::test]
+    async fn whoami_disabled_takes_precedence_over_trusted_peer() {
+        let (app, _auth_cache, _dir) = make_app(false).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/store-api/auth/whoami")
+                    .extension(TrustedPeer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({"name": null, "role": "Disabled"}));
+    }
+
+    // Test 7 (/version still reachable, whitelist not broken) is covered by
+    // `version_requires_valid_key_any_role` in middleware.rs, which exercises
+    // the exact same whitelist branch this spec extends.
 }

@@ -170,11 +170,12 @@ pub async fn auth_layer(
         None => return unauthorized(),
     };
 
-    // Version handshake (spec 004 §7): any valid key passes, no domain
-    // permission or admin role required. Must come after user resolution
-    // (so an invalid key still 401s) but before the admin/domain logic below
-    // — extract_domain("/version") is None, which would otherwise 403 it.
-    if path == "/version" {
+    // Whitelist (spec 004 §7 for /version, general/016 for whoami): any valid
+    // key passes for these paths, no domain permission or admin role
+    // required. Must come after user resolution (so an invalid key still
+    // 401s) but before the admin/domain logic below — extract_domain(…) is
+    // None for both paths, which would otherwise 403 them.
+    if path == "/version" || path == "/store-api/auth/whoami" {
         return next.run(request).await;
     }
 

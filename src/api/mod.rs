@@ -104,6 +104,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     let auth_state = AuthState {
         cache: Arc::clone(&state.auth_cache),
         registry: Arc::clone(&state.registry),
+        auth_enabled: state.auth_enabled,
     };
 
     let mut store_router = Router::new()
@@ -208,6 +209,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     }
 
     let auth_router = Router::new()
+        .route("/auth/whoami", get(crate::auth::handlers::whoami))
         .route(
             "/auth/users",
             post(crate::auth::handlers::create_user).get(crate::auth::handlers::list_users),
@@ -308,6 +310,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         rel_browse::update_row,
         rel_browse::delete_row,
         // Auth / User management
+        crate::auth::handlers::whoami,
         crate::auth::handlers::create_user,
         crate::auth::handlers::list_users,
         crate::auth::handlers::delete_user,
@@ -356,6 +359,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             rel_browse::IndexInfo,
             rel_browse::ViewSummary,
             rel_browse::RowsResponse,
+            crate::auth::handlers::WhoamiResponse,
             crate::auth::handlers::CreateUserRequest,
             crate::auth::handlers::CreateUserResponse,
             crate::auth::handlers::UserListItem,
@@ -389,7 +393,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         (name = "Relational Store", description = "Domain-scoped LuraSQL execution"),
         (name = "Relational Browse", description = "Catalog and row browsing for relational domains"),
         (name = "Relational Rows", description = "Row-level writes on relational tables"),
-        (name = "Auth", description = "User management and domain permissions — admins only"),
+        (name = "Auth", description = "User management and domain permissions — admins only, except GET /auth/whoami (any authenticated caller)"),
         (name = "Backup", description = "Logical backup & restore — admins only"),
         (name = "Logs", description = "Read-only log tail and file listing — admins only, opt-in via log.http_access"),
     ),

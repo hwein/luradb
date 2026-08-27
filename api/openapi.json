@@ -242,6 +242,31 @@
         }
       }
     },
+    "/store-api/auth/whoami": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Returns the caller's own identity. Unlike every other endpoint under this\ntag, reachable by any authenticated caller — not admin-only (the\n`auth_layer` middleware whitelists this path, see `middleware.rs`).",
+        "description": "Checked in order: `auth.enabled = false` → `Disabled`; a `TrustedPeer`\n(UDS peer authenticated by the kernel, spec perf/001) → `TrustedPeer`;\notherwise the Bearer key is resolved to its `UserRecord` → `Admin`/`User`.\nA `401` past the `auth_layer` middleware (which already validates the key)\ncan only mean a middleware bug — fail-closed, analogous to `enforce_sql_level`.",
+        "operationId": "whoami",
+        "responses": {
+          "200": {
+            "description": "Caller identity — name (if any) and role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoamiResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          }
+        }
+      }
+    },
     "/store-api/backups": {
       "get": {
         "tags": [
@@ -3824,6 +3849,25 @@
             "type": "string"
           }
         }
+      },
+      "WhoamiResponse": {
+        "type": "object",
+        "description": "Caller identity. `role` is the only discriminator between the four cases —\nsee `whoami` for the full mapping; `name` is `null` whenever no\n`UserRecord` backs the caller (`TrustedPeer`, `Disabled`).",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": "string",
+            "description": "`\"Admin\"`, `\"User\"`, or a pseudo-role: `\"TrustedPeer\"` (UDS peer\nauthenticated by the kernel, spec perf/001) or `\"Disabled\"`\n(`auth.enabled = false`)."
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -3878,7 +3922,7 @@
     },
     {
       "name": "Auth",
-      "description": "User management and domain permissions — admins only"
+      "description": "User management and domain permissions — admins only, except GET /auth/whoami (any authenticated caller)"
     },
     {
       "name": "Backup",

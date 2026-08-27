@@ -12,6 +12,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: added `GET /store-api/kv/{domain}/count` (optional `?prefix=`) and `GET /store-api/rel/{domain}/tables/{table}/count`, each returning `{"count": N}` — a full key/row scan, same cost as listing.
 - **BREAKING** API: `GET /store-api/kv/{domain}/watch` SSE events now carry an `id:` field, and the endpoint accepts `Last-Event-ID` (header, takes precedence) or `?last_event_id=` (query) to resume gaplessly from an in-memory replay ring; a new `reset` event type is emitted whenever gapless resume can't be guaranteed (window exceeded, server restart, or a lagged consumer). New `[lsm].watch_replay_buffer_size` config key controls the ring size (`0` disables resume).
 - **BREAKING** API: added `GET /store-api/events`, an SSE stream of lifecycle/DDL events across the KV, JSON and relational engines (domain created/deleted/purged; rel table/view/index DDL; JSON index DDL) — admin-only, no per-key data events. Same `id:`/`Last-Event-ID`/`reset` resume mechanism as the KV watch, with its own tag and sequence. New `[events]` config section (`channel_capacity`, `replay_buffer_size`).
+- **BREAKING** API: `PUT /store-api/json/{domain}/documents/{key}` now supports create-only writes via `If-None-Match: *`, answering `412 Precondition Failed` if the document already exists; only the literal `*` is supported, and combining it with `If-Match` answers `400`.
 
 ### Security
 

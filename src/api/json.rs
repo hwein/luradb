@@ -6,7 +6,7 @@ use crate::engines::json::bulk::{document_to_ndjson_line, document_to_value};
 use crate::engines::json::query::DEFAULT_LIMIT;
 use crate::engines::json::{
     etag_value, ExpectedVersion, FilterCondition, IndexDefinition, IndexFieldType, JsonEngine,
-    JsonStoreError, ListOptions, SearchQuery,
+    JsonStoreError, ListOptions, Precondition, SearchQuery,
 };
 use axum::{
     body::{Body, Bytes},
@@ -27,6 +27,7 @@ impl From<JsonStoreError> for ApiError {
     fn from(e: JsonStoreError) -> Self {
         let status = match &e {
             JsonStoreError::DocumentNotFound { .. } => StatusCode::NOT_FOUND,
+            JsonStoreError::DocumentAlreadyExists { .. } => StatusCode::PRECONDITION_FAILED,
             JsonStoreError::DomainNotFound(_) => StatusCode::NOT_FOUND,
             JsonStoreError::DomainDeleting(_) => StatusCode::GONE,
             JsonStoreError::DomainAlreadyExists(_) => StatusCode::CONFLICT,
@@ -179,6 +180,37 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<ExpectedVersion>, ApiErr
         })
 }
 
+/// Reads `If-Match`/`If-None-Match` into a write precondition (json/014
+/// §1/§4). The two headers are mutually exclusive; only the literal `*` is
+/// supported for `If-None-Match` (ETag lists are a deliberate non-goal).
+fn parse_precondition(headers: &HeaderMap) -> Result<Option<Precondition>, ApiError> {
+    let has_if_none_match = headers.contains_key(header::IF_NONE_MATCH);
+    if has_if_none_match && headers.contains_key(header::IF_MATCH) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "400 Bad Request: If-Match and If-None-Match are mutually exclusive",
+        ));
+    }
+    if !has_if_none_match {
+        return Ok(parse_if_match(headers)?.map(Precondition::IfMatch));
+    }
+    let raw = headers
+        .get(header::IF_NONE_MATCH)
+        .unwrap()
+        .to_str()
+        .map_err(|_| {
+            ApiError::new(StatusCode::BAD_REQUEST, "400 Bad Request: invalid If-None-Match header")
+        })?;
+    if raw.trim() == "*" {
+        Ok(Some(Precondition::MustNotExist))
+    } else {
+        Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("400 Bad Request: If-None-Match supports only the literal '*', got '{raw}'"),
+        ))
+    }
+}
+
 // ── Document CRUD ─────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -211,20 +243,26 @@ pub async fn create_document(
     params(
         ("domain" = String, Path, description = "JSON domain"),
         ("key" = String, Path, description = "Document key"),
+        ("If-None-Match" = Option<String>, Header, description = "Only `*` is supported: create-only write, 412 if the document exists"),
     ),
     request_body = Object,
     responses(
         (status = 200, description = "Document updated"),
         (status = 201, description = "Document created"),
-        (status = 400, description = "Invalid key or If-Match header"),
+        (status = 400, description = "Invalid key, invalid If-Match or If-None-Match header, or both headers set together"),
         (status = 404, description = "Domain not found, or If-Match on missing document"),
         (status = 409, description = "Version conflict (If-Match mismatch)"),
+        (status = 410, description = "Domain is being deleted"),
+        (status = 412, description = "Document already exists (If-None-Match: *)"),
         (status = 503, description = "JSON engine disabled"),
     ),
     tag = "JSON Document Store"
 )]
 /// Upserts a document. With an `If-Match: "<etag>"` header the write is a
-/// conditional update that fails with 409 on a version mismatch.
+/// conditional update that fails with 409 on a version mismatch. With
+/// `If-None-Match: *` the write is create-only and fails with 412 if the
+/// document already exists (json/014); the two headers are mutually
+/// exclusive (400).
 pub async fn put_document(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
@@ -232,9 +270,9 @@ pub async fn put_document(
     Json(content): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let engine = json_engine(&state)?;
-    let expected_version = parse_if_match(&headers)?;
+    let precondition = parse_precondition(&headers)?;
     let doc = engine
-        .put_document_with_version(&domain, &key, content, expected_version)
+        .put_document_with_version(&domain, &key, content, precondition)
         .await?;
     let status = if doc.version == 1 { StatusCode::CREATED } else { StatusCode::OK };
     Ok((status, Json(document_to_value(&doc))))
@@ -1120,6 +1158,120 @@ mod tests {
         let (status, body) = request(&app, Method::GET, uri, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#""n":2"#), "lost update must not happen: {body}");
+    }
+
+    // ── Create-only precondition (spec json/014) ─────────────────────────────
+
+    // 18. If-None-Match: * on a free key succeeds (201, fresh document).
+    #[tokio::test]
+    async fn test_create_only_put_free_key_returns_201() {
+        let (app, _dir) = make_app(true).await;
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store-api/json/default/documents/fresh")
+            .header("content-type", "application/json")
+            .header("if-none-match", "*")
+            .body(Body::from(r#"{"n": 1}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
+        assert_eq!(body["_version"], json!(1));
+    }
+
+    // 19. If-None-Match: * on an occupied key → 412, document unchanged.
+    #[tokio::test]
+    async fn test_create_only_put_occupied_key_returns_412() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/taken";
+        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("if-none-match", "*")
+            .body(Body::from(r#"{"n": 2}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+
+        let (status, body) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""n":1"#), "document must stay unchanged: {body}");
+    }
+
+    // 20. If-None-Match values other than the literal '*' are rejected — no
+    //     ETag-list support (§1), including the weak-validator form.
+    #[tokio::test]
+    async fn test_if_none_match_non_wildcard_rejected() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/x";
+        for value in ["\"abc-1\"", "W/\"*\""] {
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-none-match", value)
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "value: {value}");
+        }
+        let (status, _) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a rejected precondition must not write");
+    }
+
+    // 21. If-Match and If-None-Match together are mutually exclusive (§1).
+    #[tokio::test]
+    async fn test_if_match_and_if_none_match_together_rejected() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/both";
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("if-match", "\"0-1\"")
+            .header("if-none-match", "*")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let (status, _) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "conflicting preconditions must not write");
+    }
+
+    // 22. Recreate after delete is a legitimate create-only write (§5): the
+    //     new ETag carries a different generation than before the delete.
+    #[tokio::test]
+    async fn test_create_only_put_after_delete_recreate() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/reborn";
+        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+        let old_etag = fetch_etag(&app, uri).await;
+        let old_generation = old_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
+
+        let (status, _) = request(&app, Method::DELETE, uri, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("if-none-match", "*")
+            .body(Body::from(r#"{"n": 2}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
+        assert_eq!(body["_version"], json!(1));
+
+        let new_etag = fetch_etag(&app, uri).await;
+        let new_generation = new_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
+        assert_ne!(new_generation, old_generation, "recreate must roll a fresh generation");
     }
 
     // 13. Auth scoping: KV permissions do not grant JSON access (spec json/012).

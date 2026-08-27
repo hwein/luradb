@@ -45,6 +45,15 @@ pub struct ExpectedVersion {
     pub version: u64,
 }
 
+/// Write precondition for `put_document_with_version` (json/011, json/014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precondition {
+    /// `If-Match`: document must exist with exactly this incarnation+version.
+    IfMatch(ExpectedVersion),
+    /// `If-None-Match: *`: document must not exist.
+    MustNotExist,
+}
+
 /// Canonical ETag value (without quotes): `{generation:x}-{version}`.
 /// Opaque to clients; unique per document incarnation.
 pub fn etag_value(generation: u64, version: u64) -> String {

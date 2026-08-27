@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.5",
+    "version": "0.3.6",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -1089,7 +1089,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a\nconditional update that fails with 409 on a version mismatch.",
+        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a\nconditional update that fails with 409 on a version mismatch. With\n`If-None-Match: *` the write is create-only and fails with 412 if the\ndocument already exists (json/014); the two headers are mutually\nexclusive (400).",
         "operationId": "put_document",
         "parameters": [
           {
@@ -1108,6 +1108,18 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*` is supported: create-only write, 412 if the document exists",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -1129,13 +1141,19 @@
             "description": "Document created"
           },
           "400": {
-            "description": "Invalid key or If-Match header"
+            "description": "Invalid key, invalid If-Match or If-None-Match header, or both headers set together"
           },
           "404": {
             "description": "Domain not found, or If-Match on missing document"
           },
           "409": {
             "description": "Version conflict (If-Match mismatch)"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "412": {
+            "description": "Document already exists (If-None-Match: *)"
           },
           "503": {
             "description": "JSON engine disabled"

@@ -11,7 +11,7 @@ pub mod query;
 pub mod reindex;
 
 pub use bulk::BulkLoadResult;
-pub use document::{etag_value, Document, ExpectedVersion};
+pub use document::{etag_value, Document, ExpectedVersion, Precondition};
 pub use domain::{JsonDomain, JsonDomainState};
 pub use error::JsonStoreError;
 pub use index::{IndexDefinition, IndexFieldType};
@@ -293,38 +293,51 @@ impl JsonEngine {
         self.put_document_with_version(domain, key, content, None).await
     }
 
-    /// Upsert with optional optimistic concurrency check (spec json/011):
-    /// with `expected_version`, the write fails with `DocumentNotFound` if the
-    /// document is missing or `VersionConflict` if generation or version
-    /// differ (a stale ETag of a deleted incarnation never matches).
+    /// Upsert with an optional write precondition: `Precondition::IfMatch`
+    /// is the optimistic concurrency check of spec json/011 (fails with
+    /// `DocumentNotFound` if the document is missing or `VersionConflict` if
+    /// generation or version differ — a stale ETag of a deleted incarnation
+    /// never matches); `Precondition::MustNotExist` is the create-only write
+    /// of spec json/014 (fails with `DocumentAlreadyExists` if it is present).
     pub async fn put_document_with_version(
         &self,
         domain: &str,
         key: &str,
         content: Value,
-        expected_version: Option<ExpectedVersion>,
+        precondition: Option<Precondition>,
     ) -> Result<Document, JsonStoreError> {
         validate_document_key(key, self.max_document_key_length)?;
         let _guard = self.doc_write_lock.lock().await;
         let dom = self.domains.require_active(domain)?;
         let old = self.read_stored(&dom, key).await?;
-        if let Some(expected) = expected_version {
-            match &old {
-                None => {
-                    return Err(JsonStoreError::DocumentNotFound {
-                        domain: dom.name.clone(),
-                        key: key.to_string(),
-                    })
+        if let Some(precondition) = precondition {
+            match precondition {
+                Precondition::IfMatch(expected) => match &old {
+                    None => {
+                        return Err(JsonStoreError::DocumentNotFound {
+                            domain: dom.name.clone(),
+                            key: key.to_string(),
+                        })
+                    }
+                    Some(o)
+                        if o.generation != expected.generation
+                            || o.version != expected.version =>
+                    {
+                        return Err(JsonStoreError::VersionConflict {
+                            expected: etag_value(expected.generation, expected.version),
+                            actual: etag_value(o.generation, o.version),
+                        })
+                    }
+                    Some(_) => {}
+                },
+                Precondition::MustNotExist => {
+                    if old.is_some() {
+                        return Err(JsonStoreError::DocumentAlreadyExists {
+                            domain: dom.name.clone(),
+                            key: key.to_string(),
+                        });
+                    }
                 }
-                Some(o)
-                    if o.generation != expected.generation || o.version != expected.version =>
-                {
-                    return Err(JsonStoreError::VersionConflict {
-                        expected: etag_value(expected.generation, expected.version),
-                        actual: etag_value(o.generation, o.version),
-                    })
-                }
-                Some(_) => {}
             }
         }
         // No predecessor → new incarnation with a fresh random generation.
@@ -830,7 +843,7 @@ mod tests {
                 "default",
                 "k",
                 json!({"n": 2}),
-                Some(ExpectedVersion { generation: created.generation, version: 1 }),
+                Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
             )
             .await
             .unwrap();
@@ -849,7 +862,7 @@ mod tests {
                 "default",
                 "k",
                 json!({"n": 3}),
-                Some(ExpectedVersion { generation: created.generation, version: 1 }),
+                Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
             )
             .await
             .unwrap_err();
@@ -873,7 +886,7 @@ mod tests {
                 "default",
                 "nope",
                 json!({}),
-                Some(ExpectedVersion { generation: 0, version: 1 }),
+                Some(Precondition::IfMatch(ExpectedVersion { generation: 0, version: 1 })),
             )
             .await
             .unwrap_err();
@@ -895,7 +908,7 @@ mod tests {
                             "default",
                             "k",
                             json!({"winner": i}),
-                            Some(expected),
+                            Some(Precondition::IfMatch(expected)),
                         )
                         .await
                 })
@@ -959,7 +972,7 @@ mod tests {
         );
 
         let err = json
-            .put_document_with_version("default", "k", json!({"n": 3}), Some(stale))
+            .put_document_with_version("default", "k", json!({"n": 3}), Some(Precondition::IfMatch(stale)))
             .await
             .unwrap_err();
         assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
@@ -970,6 +983,45 @@ mod tests {
         assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
         let unchanged = json.get_document("default", "k").await.unwrap().unwrap();
         assert_eq!(unchanged.content, json!({"n": 2}), "lost update must not happen");
+    }
+
+    // ── Create-only precondition (spec json/014) ─────────────────────────────
+
+    // 39. Two parallel create-only-PUTs on the same free key → exactly one
+    //     creates, the other sees DocumentAlreadyExists; the doc_write_lock
+    //     serializes the race (pattern: test 33 for json/011).
+    #[tokio::test]
+    async fn test_create_only_parallel_puts_single_winner() {
+        let (json, _dir) = make_engine().await;
+        let tasks: Vec<_> = (0..2)
+            .map(|i| {
+                let engine = Arc::clone(&json);
+                tokio::spawn(async move {
+                    engine
+                        .put_document_with_version(
+                            "default",
+                            "k",
+                            json!({"winner": i}),
+                            Some(Precondition::MustNotExist),
+                        )
+                        .await
+                })
+            })
+            .collect();
+        let mut created = 0;
+        let mut exists = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(doc) => {
+                    assert_eq!(doc.version, 1);
+                    created += 1;
+                }
+                Err(JsonStoreError::DocumentAlreadyExists { .. }) => exists += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(created, 1);
+        assert_eq!(exists, 1);
     }
 
     // ── Synchronous indexing (spec json/005) ─────────────────────────────────

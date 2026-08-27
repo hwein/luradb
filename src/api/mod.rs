@@ -27,8 +27,9 @@ use axum::{
     Router,
 };
 use middleware::{proxy_fn, ParsedCidr};
+use serde::Serialize;
 use std::sync::Arc;
-use utoipa::{openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme}, Modify, OpenApi};
+use utoipa::{openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme}, Modify, OpenApi, ToSchema};
 
 // ── Security scheme (Modify hook) ─────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.2";
+pub const API_VERSION: &str = "0.3.3";
 
 struct VersionInfo;
 
@@ -97,6 +98,16 @@ pub struct AppState {
     pub log_access: Option<logs::LogAccessState>,
 }
 
+// ── Shared DTOs ───────────────────────────────────────────────────────────────
+
+/// Generic `{"count": N}` response, shared by JSON's `count_documents`, KV's
+/// `count_keys`, and rel's `count_rows` (spec general/017) — one schema
+/// instead of three identical ones.
+#[derive(Serialize, ToSchema)]
+pub struct CountResponse {
+    pub count: u64,
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 /// Builds the full domain + KV + auth router with the given app state.
@@ -122,6 +133,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         .route("/kv/:domain/keys/:key/null", patch(kv::set_null))
         .route("/kv/:domain/keys/:key/meta", get(kv::get_key_meta))
         .route("/kv/:domain/keys", get(kv::scan_keys))
+        .route("/kv/:domain/count", get(kv::count_keys))
         .route("/kv/:domain/watch", get(kv::watch))
         // JSON document store (handlers answer 503 when the engine is disabled)
         .route(
@@ -205,6 +217,10 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
                 "/rel/:domain/tables/:table/rows/:pk",
                 get(rel_browse::get_row).put(rel_browse::update_row).delete(rel_browse::delete_row),
             )
+            // Object counter (spec general/017): a level above the `rows`
+            // collection, not a static child of it — `/tables/count` still
+            // matches `:table`, so a table literally named `count` stays reachable.
+            .route("/rel/:domain/tables/:table/count", get(rel_browse::count_rows))
             .with_state(state.clone());
         store_router = store_router.merge(rel_routes);
     }
@@ -273,6 +289,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         kv::set_null,
         kv::get_key_meta,
         kv::scan_keys,
+        kv::count_keys,
         kv::watch,
         // JSON domains
         json_domains::create_domain,
@@ -307,6 +324,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         rel_browse::list_views,
         rel_browse::browse_rows,
         rel_browse::get_row,
+        rel_browse::count_rows,
         // Relational Rows (writes)
         rel_browse::insert_row,
         rel_browse::update_row,
@@ -339,6 +357,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             domains::CreateDomainRequest,
             domains::DomainResponse,
             kv::KeyMetaResponse,
+            CountResponse,
             json_domains::CreateJsonDomainRequest,
             json_domains::JsonDomainResponse,
             json::CreateIndexRequest,
@@ -347,7 +366,6 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             json::SearchResponse,
             json::ListParams,
             json::DocumentListResponse,
-            json::CountResponse,
             json::BulkErrorEntry,
             json::BulkLoadResponse,
             json::ReindexRequest,

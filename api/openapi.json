@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.2",
+    "version": "0.3.3",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -1447,6 +1447,62 @@
         }
       }
     },
+    "/store-api/kv/{domain}/count": {
+      "get": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Counts live keys in the domain, optionally filtered by a prefix — the same\nsemantics as `GET …/keys?prefix=`, without transferring the keys themselves.",
+        "operationId": "count_keys",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "description": "Key prefix filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Number of live keys matching the prefix. A full key scan under the hood (same cost as the equivalent `keys?prefix=` call) — cost grows linearly with domain size, so this is meant for on-demand use, not high-frequency polling.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CountResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/store-api/kv/{domain}/keys": {
       "get": {
         "tags": [
@@ -2312,6 +2368,59 @@
         }
       }
     },
+    "/store-api/rel/{domain}/tables/{table}/count": {
+      "get": {
+        "tags": [
+          "Relational Browse"
+        ],
+        "summary": "Counts the rows of `table` — the same residual-free access path `SELECT\nCOUNT(*) FROM table` would use via `/sql`, without a SQL round trip. A\nview answers 404 here, same as `GET …/rows` (no row-level resource in v1).",
+        "operationId": "count_rows",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Row count. A full key scan under the hood — cost grows linearly with table size; meant for on-demand use, not high-frequency polling.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CountResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain or table not found (a view has no count resource, same as `rows`)"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded"
+          },
+          "503": {
+            "description": "Relational engine disabled"
+          }
+        }
+      }
+    },
     "/store-api/rel/{domain}/tables/{table}/rows": {
       "get": {
         "tags": [
@@ -3064,6 +3173,7 @@
       },
       "CountResponse": {
         "type": "object",
+        "description": "Generic `{\"count\": N}` response, shared by JSON's `count_documents`, KV's\n`count_keys`, and rel's `count_rows` (spec general/017) — one schema\ninstead of three identical ones.",
         "required": [
           "count"
         ],

@@ -7,9 +7,10 @@
 //! PATCH  /store-api/kv/{domain}/keys/{key}/null     → set_null  (200 | 429)
 //! GET    /store-api/kv/{domain}/keys/{key}/meta     → get_key_meta (200 | 400 | 404 | 410 | 429)
 //! GET    /store-api/kv/{domain}/keys?prefix={p}     → scan_keys (200 | 429)
+//! GET    /store-api/kv/{domain}/count?prefix={p}    → count_keys (200 | 429)
 //! GET    /store-api/kv/{domain}/watch?prefix={p}    → watch     (SSE stream)
 
-use crate::api::{middleware::ApiError, AppState};
+use crate::api::{middleware::ApiError, AppState, CountResponse};
 use crate::engines::lsm::{GetResult, OpType};
 use axum::{
     body::Bytes,
@@ -255,6 +256,33 @@ pub async fn scan_keys(
 
 #[utoipa::path(
     get,
+    path = "/store-api/kv/{domain}/count",
+    params(
+        ("domain" = String, Path, description = "Domain name"),
+        ("prefix" = Option<String>, Query, description = "Key prefix filter"),
+    ),
+    responses(
+        (status = 200, description = "Number of live keys matching the prefix. A full key scan under the hood (same cost as the equivalent `keys?prefix=` call) — cost grows linearly with domain size, so this is meant for on-demand use, not high-frequency polling.", body = CountResponse),
+        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
+        (status = 410, description = "Domain is being deleted"),
+    ),
+    tag = "Key-Value Store"
+)]
+/// Counts live keys in the domain, optionally filtered by a prefix — the same
+/// semantics as `GET …/keys?prefix=`, without transferring the keys themselves.
+pub async fn count_keys(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+    Query(params): Query<ScanParams>,
+) -> Result<Json<CountResponse>, ApiError> {
+    let store = resolve(&state, &domain).await?;
+    let prefix = params.prefix.unwrap_or_default();
+    let count = store.count_keys(prefix.as_bytes()).await.map_err(ApiError::from)?;
+    Ok(Json(CountResponse { count }))
+}
+
+#[utoipa::path(
+    get,
     path = "/store-api/kv/{domain}/watch",
     params(
         ("domain" = String, Path, description = "Domain name"),
@@ -326,10 +354,22 @@ mod tests {
         make_app_with_config(crate::engines::lsm::domain::DomainConfig::default()).await
     }
 
-    // Spec kv/022 test 10 needs a domain with a near-zero read quota to
-    // force a 429 without hundreds of requests; every other test keeps
-    // using the default-quota `make_app` above.
+    // For tests that need a non-default quota (the large-volume count test
+    // raises the write quota); every other test keeps using the
+    // default-quota `make_app` above.
     async fn make_app_with_config(config: crate::engines::lsm::domain::DomainConfig) -> (axum::Router, tempfile::TempDir) {
+        let (state, dir) = make_state(config, false).await;
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+        (app, dir)
+    }
+
+    // Spec general/017 test 10 (auth scoping) needs `auth_enabled: true` and
+    // a live handle to `auth_cache` before the state is consumed by
+    // `create_router` — factored out of `make_app_with_config` for that.
+    async fn make_state(
+        config: crate::engines::lsm::domain::DomainConfig,
+        auth_enabled: bool,
+    ) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -352,7 +392,7 @@ mod tests {
         let state = AppState {
             registry,
             auth_cache,
-            auth_enabled: false,
+            auth_enabled,
             metrics,
             json_engine: None,
             rel_engine: None,
@@ -360,8 +400,7 @@ mod tests {
             backup_manager: None,
             log_access: None,
         };
-        let app = crate::api::create_router(state, Arc::new(vec![]));
-        (app, dir)
+        (state, dir)
     }
 
     // Test 5: PUT + GET roundtrip over HTTP.
@@ -595,9 +634,10 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    // Test 1: PUT ?ttl=60 -> GET carries X-Expires-At, value within
-    // [now+60, now+63] (second granularity + the +1 from expire_at_from_ttl,
-    // plus a little slack for scheduling jitter between the two timestamps).
+    // Test 1: PUT ?ttl=60 -> GET carries X-Expires-At. The stamp is
+    // put-time + 60 + 1 (second granularity + the +1 from
+    // expire_at_from_ttl); bracketing the PUT between `before`/`after`
+    // bounds it exactly (±1 truncation margin) however slowly the test runs.
     #[tokio::test]
     async fn test_get_with_ttl_returns_expires_at_header() {
         let (app, _dir) = make_app().await;
@@ -606,16 +646,17 @@ mod tests {
 
         let resp = send(&app, Method::PUT, &format!("{uri}?ttl=60"), Body::from("v")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        let after = crate::engines::lsm::domain::now_secs();
 
         let resp = send(&app, Method::GET, uri, Body::empty()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let header = resp.headers().get("x-expires-at").expect("X-Expires-At must be present");
         let expires_at: u64 = header.to_str().unwrap().parse().unwrap();
         assert!(
-            (before + 60..=before + 63).contains(&expires_at),
+            (before + 60..=after + 62).contains(&expires_at),
             "expected expires_at in [{}, {}], got {}",
             before + 60,
-            before + 63,
+            after + 62,
             expires_at
         );
     }
@@ -754,23 +795,196 @@ mod tests {
 
     // Test 10: …/meta runs into the read rate limit (429 + Retry-After) —
     // proof the admin backup bypass (get_with_snapshot, which skips the
-    // limiter) is not what backs this endpoint.
+    // limiter) is not what backs this endpoint. The bucket is drained and
+    // locked (no refill race) instead of racing a 1-IOPS refill window.
     #[tokio::test]
     async fn test_meta_rate_limit_429_with_retry_after() {
-        let mut config = crate::engines::lsm::domain::DomainConfig::default();
-        config.default_read_iops = 1;
-        let (app, _dir) = make_app_with_config(config).await;
+        let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), false).await;
+        let store = state.registry.store("testdom").await.unwrap();
+        let app = crate::api::create_router(state, Arc::new(vec![]));
         let uri = "/store-api/kv/testdom/keys/ratekey";
         send(&app, Method::PUT, uri, Body::from("v")).await;
 
         let resp = send(&app, Method::GET, &format!("{uri}/meta"), Body::empty()).await;
-        assert_eq!(resp.status(), StatusCode::OK, "first read must consume the single token");
+        assert_eq!(resp.status(), StatusCode::OK, "read must succeed before the budget is drained");
 
+        store.drain_read_budget_for_test();
         let resp = send(&app, Method::GET, &format!("{uri}/meta"), Body::empty()).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
             resp.headers().contains_key(axum::http::header::RETRY_AFTER),
             "429 must include Retry-After header"
         );
+    }
+
+    // ── Spec general/017: KV object-count endpoint ───────────────────────────
+
+    // Tests 1-3: empty domain -> 0; a mix of prefixed/unprefixed keys counts
+    // exactly, with and without a `prefix` filter, cross-checked against the
+    // exact key list `scan_keys` returns for the same prefix (spec §1: same
+    // codepath, so count == keys.len()); a deleted key stops counting, a
+    // NULL-state key keeps counting (it's still visible to a scan, kv/018).
+    #[tokio::test]
+    async fn test_count_keys_basic_prefix_and_liveness() {
+        let (app, _dir) = make_app().await;
+        let uri = "/store-api/kv/testdom/count";
+
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 0);
+
+        for i in 0..7 {
+            send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/b:{i}"), Body::from("v")).await;
+        }
+        for i in 0..3 {
+            send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/a:{i}"), Body::from("v")).await;
+        }
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 10);
+
+        let resp = send(&app, Method::GET, &format!("{uri}?prefix=a:"), Body::empty()).await;
+        assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 3);
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys?prefix=a:", Body::empty()).await;
+        let keys: Vec<String> =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(keys.len(), 3, "count?prefix=a: must match keys?prefix=a:'s length exactly");
+
+        // A deleted key stops counting; a NULL-state key keeps counting —
+        // net effect here is unchanged (10 - 1 deleted + 1 null-state = 10).
+        send(&app, Method::DELETE, "/store-api/kv/testdom/keys/b:0", Body::empty()).await;
+        send(&app, Method::PATCH, "/store-api/kv/testdom/keys/nullkey/null", Body::empty()).await;
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 10);
+    }
+
+    // Test 4: unknown domain -> 404; domain in deletion -> 410.
+    #[tokio::test]
+    async fn test_count_keys_domain_not_found_and_deleting() {
+        let (app, _dir) = make_app().await;
+
+        let resp = send(&app, Method::GET, "/store-api/kv/ghost/count", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/store-api/domains")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"gone"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = send(&app, Method::DELETE, "/store-api/domains/gone", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp = send(&app, Method::GET, "/store-api/kv/gone/count", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    // Test 4 (rate limit): exhausted read budget -> 429 + Retry-After, same
+    // drained-and-locked bucket mechanism as the …/meta rate-limit test.
+    #[tokio::test]
+    async fn test_count_keys_rate_limit_429_with_retry_after() {
+        let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), false).await;
+        let store = state.registry.store("testdom").await.unwrap();
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let uri = "/store-api/kv/testdom/count";
+
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "count must succeed before the budget is drained");
+
+        store.drain_read_budget_for_test();
+        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "429 must include Retry-After header"
+        );
+    }
+
+    // Test 5 (shadow counter-proof, spec §2): a key literally named "count"
+    // stays reachable via GET …/keys/count — proof that the count endpoint
+    // lives a level above `keys`, not as a `keys/count` sibling of `{key}`.
+    #[tokio::test]
+    async fn test_count_route_does_not_shadow_key_named_count() {
+        let (app, _dir) = make_app().await;
+        let resp = send(&app, Method::PUT, "/store-api/kv/testdom/keys/count", Body::from("42")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/count", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "a key named 'count' must stay readable via GET .../keys/{{key}}");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"42");
+    }
+
+    // Test 10: a Read grant on the domain allows the count; no grant -> 403
+    // (the generic domain-scoped auth path, spec general/007 — exercised here
+    // for the new route specifically).
+    #[tokio::test]
+    async fn test_count_keys_auth_scoping() {
+        use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
+
+        let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), true).await;
+        let cache = Arc::clone(&state.auth_cache);
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+
+        cache
+            .upsert_user(UserRecord {
+                name: "worker".to_string(),
+                api_key_hash: hash_api_key("lura_test_worker_key"),
+                role: UserRole::User,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let req = || {
+            Request::builder()
+                .method(Method::GET)
+                .uri("/store-api/kv/testdom/count")
+                .header("authorization", "Bearer lura_test_worker_key")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(req()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "no permission on testdom yet");
+
+        cache
+            .set_permission(DomainPermission {
+                username: "worker".to_string(),
+                domain: "testdom".to_string(),
+                access: AccessLevel::Read,
+            })
+            .await
+            .unwrap();
+        let resp = app.clone().oneshot(req()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "Read grant must allow the count");
+    }
+
+    // Test 11: 10,000 keys -> count = 10,000; only the number crosses the
+    // wire. Seeded concurrently (not one PUT at a time) so the WAL's
+    // group-commit (core::wal::run_committer) batches the writes into a
+    // handful of fsyncs instead of one per key; needs a raised write quota
+    // since the concurrent burst would otherwise trip the default 500/s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_count_keys_large_volume() {
+        let mut config = crate::engines::lsm::domain::DomainConfig::default();
+        config.default_write_iops = 20_000;
+        let (app, _dir) = make_app_with_config(config).await;
+
+        let app_ref = &app;
+        let puts = (0..10_000u32).map(|i| async move {
+            let uri = format!("/store-api/kv/testdom/keys/k{i:05}");
+            send(app_ref, Method::PUT, &uri, Body::from("v")).await
+        });
+        futures::future::join_all(puts).await;
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/count", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 10_000);
     }
 }

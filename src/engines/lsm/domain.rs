@@ -548,6 +548,25 @@ impl DomainStore {
         Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
     }
 
+    /// Counts live user-keys whose raw form starts with `prefix` — same scan
+    /// as `scan_keys` (spec general/017), without materializing the stripped
+    /// key strings.
+    pub async fn count_keys(&self, prefix: &[u8]) -> Result<u64> {
+        if !self.runtime.rate_limiter.check_read() {
+            return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
+        }
+        let full_prefix = self.prefixed_key(prefix);
+        Ok(self.engine.scan_keys(&full_prefix).await?.len() as u64)
+    }
+
+    /// Test-only: drains and locks this domain's read bucket so the next
+    /// read deterministically answers 429 — no refill race no matter how
+    /// slow the test runs (flaky-test fix, spec general/008 pattern).
+    #[cfg(test)]
+    pub fn drain_read_budget_for_test(&self) {
+        self.runtime.rate_limiter.read_bucket.drain_for_test();
+    }
+
     /// Restore-path upsert (spec general/006): same key validation as
     /// [`Self::put`]/[`Self::put_with_ttl`] but takes the absolute
     /// `expire_at` directly (no now-relative round trip) and bypasses the

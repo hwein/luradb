@@ -8,7 +8,9 @@ use super::catalog::{CatalogEntry, TableSchema};
 use super::cross_engine::LinkAuth;
 use super::dml::SelectResult;
 use super::error::RelStoreError;
+use super::plan;
 use super::rest_exec::ExpandedBlock;
+use super::select::resolve_candidate_keys;
 use super::types::ColumnType;
 use super::{ExecOutcome, RelEngine};
 use serde_json::Value;
@@ -157,6 +159,26 @@ impl RelEngine {
             (!resolved.is_empty()).then_some(resolved)
         };
         Ok(Some((result, expanded)))
+    }
+
+    /// Row count for `table` (spec general/017 §3): the residual-free branch
+    /// of `exec_count` (`select.rs`) — no WHERE clause, so the planner always
+    /// picks `AccessPath::FullScan` with no residual, making this a pure key
+    /// count with no row decode. A view resolves via `browse_table` like the
+    /// other Browse reads, so it 404s here instead of the write path's 400.
+    pub(crate) async fn count_rows(
+        &self,
+        domain: &str,
+        table: &str,
+        auth: LinkAuth,
+    ) -> Result<u64, RelStoreError> {
+        let schema = self.browse_table(domain, table)?;
+        let dom = self.domains.require_active(domain)?;
+        let mask = self.compute_link_mask(domain, &[&schema], auth).await?;
+        let plan = plan::plan_access(&schema, &None, &[], &[], &[], mask)?;
+        let (row_keys, _scanned) =
+            resolve_candidate_keys(&self.engine, &schema, &dom.system_prefix, &plan.access, None).await?;
+        Ok(row_keys.len() as u64)
     }
 }
 

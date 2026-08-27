@@ -1,7 +1,7 @@
 //! JSON-store REST handlers (spec json/009): documents, indexes, search,
 //! bulk load/export, re-indexing.
 
-use crate::api::{middleware::ApiError, AppState};
+use crate::api::{middleware::ApiError, AppState, CountResponse};
 use crate::engines::json::bulk::{document_to_ndjson_line, document_to_value};
 use crate::engines::json::query::DEFAULT_LIMIT;
 use crate::engines::json::{
@@ -139,11 +139,6 @@ pub struct DocumentListResponse {
     pub total: u64,
     pub offset: u32,
     pub limit: u32,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct CountResponse {
-    pub count: u64,
 }
 
 #[derive(Deserialize, ToSchema, Default)]

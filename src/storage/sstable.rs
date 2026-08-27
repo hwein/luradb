@@ -2,7 +2,7 @@ use crate::engines::lsm::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
 use crate::engines::lsm::key::Timestamp;
 use crate::storage::format::{
     ArchivedDataBlockValue, BlockHandle, BloomFilter, CachedValue, DataBlock, DataBlockValue,
-    IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer,
+    IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer, VersionState,
 };
 use crate::storage::bloom::BloomFilter as BloomFilterImpl;
 use rkyv::util::AlignedVec;
@@ -28,19 +28,6 @@ fn mvcc_inv_ts(key: &[u8]) -> u64 {
         u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap_or([0u8; 8]))
     } else {
         0
-    }
-}
-
-/// Liveness for [`SSTableReader::prefix_entries`]: not a tombstone, not
-/// TTL-expired at `now`. NULL entries count as live (kv/018).
-#[inline]
-fn is_entry_live(dbv: &DataBlockValue, now: u64) -> bool {
-    match dbv {
-        DataBlockValue::Pointer(vp) => {
-            !(vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET)
-                && !(vp.expire_at != 0 && vp.expire_at <= now)
-        }
-        DataBlockValue::Inline { expire_at, .. } => !(*expire_at != 0 && *expire_at <= now),
     }
 }
 
@@ -617,6 +604,7 @@ impl SSTableReader {
         prefix: &'a [u8],
     ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
         self.prefix_entries(prefix, None)
+            .map(|entry| entry.map(|(user_key, _ts, state)| (user_key, state == VersionState::Live)))
     }
 
     /// Like [`Self::keys_with_prefix`], but only considers versions visible
@@ -631,16 +619,19 @@ impl SSTableReader {
         max_inv_ts: u64,
     ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
         self.prefix_entries(prefix, Some(max_inv_ts))
+            .map(|entry| entry.map(|(user_key, _ts, state)| (user_key, state == VersionState::Live)))
     }
 
     /// Shared implementation for [`Self::keys_with_prefix`]/
     /// [`Self::keys_with_prefix_at`]: `max_inv_ts` of `None` matches every
-    /// version (today's `keys_with_prefix` behavior).
+    /// version (today's `keys_with_prefix` behavior). Returns each version's
+    /// write timestamp and liveness classification (spec kv/025 §2) — the
+    /// callers above collapse it to today's `(user_key, bool)`.
     fn prefix_entries<'a>(
         &'a self,
         prefix: &'a [u8],
         max_inv_ts: Option<u64>,
-    ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Timestamp, VersionState)>> + 'a {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -658,12 +649,14 @@ impl SSTableReader {
             if !user_key.starts_with(prefix) {
                 return None;
             }
+            let inv_ts = mvcc_inv_ts(encoded_key);
             if let Some(ceiling) = max_inv_ts {
-                if mvcc_inv_ts(encoded_key) < ceiling {
+                if inv_ts < ceiling {
                     return None; // newer than the snapshot -- not decisive
                 }
             }
-            Some(Ok((user_key.to_vec(), is_entry_live(&dbv, now))))
+            let state = dbv.version_state(now);
+            Some(Ok((user_key.to_vec(), Timestamp::from_inverted(inv_ts), state)))
         })
     }
 

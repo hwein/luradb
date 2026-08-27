@@ -23,6 +23,7 @@ use crate::core::storage_thread::StorageHandle;
 use crate::core::wal::WriteAheadLog;
 use crate::storage::vlog::{discover_generations, generation_path, VLog, VLogError, VLogRegistry};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
+use crate::storage::format::VersionState;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
 use anyhow::Result;
@@ -185,12 +186,7 @@ async fn append_to_active(vlog: &VLogRegistry, value: &[u8]) -> Result<(u32, u64
 
 /// True if `value` is neither TTL-expired at `now` nor a tombstone.
 fn is_live_version(value: &Value, now: u64) -> bool {
-    let expired = match value {
-        Value::Inline(_, Some(exp)) => *exp <= now,
-        Value::Pointer { expire_at: Some(exp), .. } => *exp <= now,
-        _ => false,
-    };
-    !expired && !matches!(value, Value::Tombstone)
+    value.version_state(now) == VersionState::Live
 }
 
 /// Sweeps one SSTable for keys with `prefix` (see [`scan_memtable_for_prefix`]
@@ -1958,6 +1954,45 @@ mod tests {
         engine.put_with_ttl(b"ttl_key", b"value", 2).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(engine.get(b"ttl_key").await.unwrap(), Some(b"value".to_vec()), "a 2s TTL must survive 1.1s");
+    }
+
+    // spec kv/025 §2/§9.11: format::is_expired treats `Some(0)` as "no TTL",
+    // not "expired" -- this only stays correct because no write path ever
+    // produces it. Covers all three paths named in the spec: `put` (None),
+    // `put_with_ttl` (including ttl_secs == 0), and WAL replay.
+    #[tokio::test]
+    async fn test_ttl_paths_never_produce_some_zero_expire_at() {
+        let (engine, dir) = make_engine().await;
+        engine.put(b"no_ttl", b"v").await.unwrap();
+        engine.put_with_ttl(b"expired_now", b"v", 0).await.unwrap();
+        engine.put_with_ttl(b"future", b"v", 60).await.unwrap();
+
+        fn assert_no_some_zero(value: &Value) {
+            let expire_at = match value {
+                Value::Inline(_, expire_at) => *expire_at,
+                Value::Pointer { expire_at, .. } => *expire_at,
+                Value::Null | Value::Tombstone => None,
+            };
+            assert_ne!(expire_at, Some(0), "no write path may produce Some(0)");
+        }
+
+        for (_, value) in engine.memtable.read().iter() {
+            assert_no_some_zero(&value);
+        }
+
+        // WAL replay: the live engine hasn't truncated its WAL yet, so
+        // recovering it independently reflects exactly what a restart would see.
+        let wal_path = dir.path().join("wal.log");
+        let recovered = LsmStorageEngine::recover_from_wal(
+            &wal_path,
+            &engine.vlog,
+            engine.engine_config.vlog_inline_threshold,
+        )
+        .await
+        .unwrap();
+        for (_, value) in recovered.iter() {
+            assert_no_some_zero(&value);
+        }
     }
 
     // ── scan_keys tests ──────────────────────────────────────────────────────

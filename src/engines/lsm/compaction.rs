@@ -23,7 +23,7 @@
 
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
-use crate::storage::format::{DataBlockValue, ValuePointer, TOMBSTONE_OFFSET};
+use crate::storage::format::{is_expired, DataBlockValue, ValuePointer, TOMBSTONE_OFFSET};
 use crate::storage::manifest::{Manifest, SSTableMetadata};
 use anyhow::Result;
 use std::sync::Arc;
@@ -217,7 +217,7 @@ impl CompactionJob {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if expire_at <= now {
+            if is_expired(expire_at, now) {
                 return None;
             }
         }

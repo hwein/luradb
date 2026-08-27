@@ -7,7 +7,7 @@ use crate::engines::lsm::block_cache::BlockCache;
 use crate::engines::lsm::hlc::HLCTimestamp;
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::memtable::{MemTable, Value};
-use crate::storage::format::CachedValue;
+use crate::storage::format::{self, CachedValue};
 use crate::storage::sstable::SSTableReader;
 use crate::storage::vlog::VLogRegistry;
 use anyhow::Result;
@@ -24,7 +24,9 @@ fn now_secs() -> u64 {
 }
 
 fn is_expired(expire_at: Option<u64>) -> bool {
-    expire_at.map(|exp| exp <= now_secs()).unwrap_or(false)
+    // invariant: no write path ever produces Some(0) (put/put_with_ttl/WAL
+    // replay) -- unwrap_or(0) safely means "no TTL" for format::is_expired.
+    format::is_expired(expire_at.unwrap_or(0), now_secs())
 }
 
 /// Physical (millisecond) component of an MVCC write timestamp — the HLC
@@ -251,7 +253,7 @@ impl LsmReader {
             Some(CachedValue::Tombstone) => Ok(Some((GetResult::Absent, 0))),
             Some(CachedValue::Null) => Ok(Some((GetResult::Null, 0))),
             Some(CachedValue::VLogPointer { file_id, value_offset, value_len, expire_at }) => {
-                if expire_at != 0 && expire_at <= now_secs() {
+                if format::is_expired(expire_at, now_secs()) {
                     return Ok(Some((GetResult::Absent, 0)));
                 }
                 let value = self.vlog.read(file_id, value_offset, value_len as usize).await?;
@@ -259,7 +261,7 @@ impl LsmReader {
             }
             Some(value) => {
                 let expire_at = value.expire_at();
-                if expire_at != 0 && expire_at <= now_secs() {
+                if format::is_expired(expire_at, now_secs()) {
                     return Ok(Some((GetResult::Absent, 0)));
                 }
                 Ok(Some((GetResult::Present(value.to_owned_bytes()), expire_at)))
@@ -338,14 +340,14 @@ impl LsmReader {
                 Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true, last_modified_ms: hlc_physical_ms(ts) })))
             }
             Some((CachedValue::VLogPointer { expire_at, .. }, ts)) => {
-                if expire_at != 0 && expire_at <= now_secs() {
+                if format::is_expired(expire_at, now_secs()) {
                     return Ok(Some(None));
                 }
                 Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at, from_vlog: true, is_null: false, last_modified_ms: hlc_physical_ms(ts) })))
             }
             Some((value, ts)) => {
                 let expire_at = value.expire_at();
-                if expire_at != 0 && expire_at <= now_secs() {
+                if format::is_expired(expire_at, now_secs()) {
                     return Ok(Some(None));
                 }
                 Ok(Some(Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false, is_null: false, last_modified_ms: hlc_physical_ms(ts) })))

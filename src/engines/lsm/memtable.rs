@@ -4,6 +4,7 @@
 //! recent writes in a sorted, lock-free data structure with MVCC support.
 
 use crate::engines::lsm::key::{InternalKey, Timestamp};
+use crate::storage::format::{is_expired, VersionState};
 use crossbeam_skiplist::SkipMap;
 use std::sync::Arc;
 
@@ -23,6 +24,26 @@ pub enum Value {
     /// update, not a delete.
     Null,
     Tombstone,
+}
+
+impl Value {
+    /// Classifies this version's liveness at `now` (spec kv/025 §2): mirrors
+    /// `DataBlockValue`/`CachedValue` in `storage::format` for the
+    /// MemTable's own value representation.
+    pub fn version_state(&self, now: u64) -> VersionState {
+        match self {
+            Value::Tombstone => VersionState::Tombstone,
+            Value::Null => VersionState::Live,
+            // invariant: no write path ever produces Some(0) (put/put_with_ttl/
+            // WAL replay) -- unwrap_or(0) safely means "no TTL" here.
+            Value::Inline(_, expire_at) => {
+                if is_expired(expire_at.unwrap_or(0), now) { VersionState::Expired } else { VersionState::Live }
+            }
+            Value::Pointer { expire_at, .. } => {
+                if is_expired(expire_at.unwrap_or(0), now) { VersionState::Expired } else { VersionState::Live }
+            }
+        }
+    }
 }
 
 /// The MemTable is a sorted, in-memory data structure that holds recent

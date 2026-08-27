@@ -80,6 +80,20 @@ pub(crate) fn permission_domain(store_type: StoreType, domain: &str) -> String {
     }
 }
 
+/// Reverses `permission_domain`. Domain names never contain `:` (enforced by
+/// each engine's domain-name validation at creation time), and
+/// `permission_domain` is the only writer of these keys — so the prefix
+/// match below is unambiguous and total, with no fallback branch needed.
+pub(crate) fn split_permission_domain(stored: &str) -> (StoreType, &str) {
+    if let Some(domain) = stored.strip_prefix("json:") {
+        (StoreType::Json, domain)
+    } else if let Some(domain) = stored.strip_prefix("rel:") {
+        (StoreType::Rel, domain)
+    } else {
+        (StoreType::Kv, stored)
+    }
+}
+
 fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
 }
@@ -311,6 +325,20 @@ mod tests {
         assert_eq!(permission_domain(StoreType::Kv, "users"), "users");
         assert_eq!(permission_domain(StoreType::Json, "users"), "json:users");
         assert_eq!(permission_domain(StoreType::Rel, "sales"), "rel:sales");
+    }
+
+    #[test]
+    fn split_permission_domain_roundtrip() {
+        for (store_type, domain) in [
+            (StoreType::Kv, "analytics"),
+            (StoreType::Json, "users"),
+            (StoreType::Rel, "sales"),
+        ] {
+            let stored = permission_domain(store_type, domain);
+            assert_eq!(split_permission_domain(&stored), (store_type, domain));
+        }
+        // No prefix (pre-existing plain KV keys) -> Kv.
+        assert_eq!(split_permission_domain("plain"), (StoreType::Kv, "plain"));
     }
 
     #[test]

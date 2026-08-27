@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **BREAKING** API: `GET /store-api/auth/users` responses now include a `permissions` array per user (`{domain, store_type, access}`), mirroring the write-endpoint vocabulary.
+
 ### Security
 
 - Rel: LIKE matching no longer allocates a table sized by pattern × text length.

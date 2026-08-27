@@ -56,7 +56,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.0";
+pub const API_VERSION: &str = "0.3.1";
 
 struct VersionInfo;
 
@@ -359,6 +359,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             crate::auth::handlers::CreateUserRequest,
             crate::auth::handlers::CreateUserResponse,
             crate::auth::handlers::UserListItem,
+            crate::auth::handlers::PermissionItem,
             crate::auth::handlers::SetPermissionRequest,
             crate::auth::handlers::RotateKeyResponse,
             backup::CreateBackupRequest,

@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.0",
+    "version": "0.3.1",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -37,11 +37,12 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Returns all created users (admins and regular users).\nAPI keys are not included — only name, role, and creation timestamp.",
+        "summary": "Returns all created users (admins and regular users) with their domain\npermission matrix. API keys are not included.",
+        "description": "For `role == \"Admin\"`, `permissions` is meaningless for access control:\nadmins have unconditional access regardless of its contents (kv/012). It\nis usually empty for an admin but not guaranteed to be — e.g. a user\npromoted to admin via `luradb.toml` keeps any permissions set before the\npromotion. Never read an empty array as \"no access\" or a non-empty one as\na restriction on an Admin row.\n\nThe list reflects the permission table as stored — it is not cross-checked\nagainst existing domains, so an entry for a since-deleted (or not-yet-created)\ndomain is shown unchanged.",
         "operationId": "list_users",
         "responses": {
           "200": {
-            "description": "List of all users (without API keys)",
+            "description": "List of all users (without API keys), including their domain permissions",
             "content": {
               "application/json": {
                 "schema": {
@@ -3332,6 +3333,28 @@
           }
         }
       },
+      "PermissionItem": {
+        "type": "object",
+        "description": "One entry of a user's domain permission matrix. `store_type`/`access` are\nlowercase and match the write-endpoint vocabulary exactly (`parse_store_type`,\n`access` parsing in `set_permission`) — usable as-is in a follow-up request.",
+        "required": [
+          "domain",
+          "store_type",
+          "access"
+        ],
+        "properties": {
+          "access": {
+            "type": "string",
+            "description": "`\"read\"`, `\"write\"`, or `\"ddl\"`."
+          },
+          "domain": {
+            "type": "string"
+          },
+          "store_type": {
+            "type": "string",
+            "description": "`\"kv\"`, `\"json\"`, or `\"rel\"`."
+          }
+        }
+      },
       "ReindexAcceptedResponse": {
         "type": "object",
         "required": [
@@ -3740,7 +3763,8 @@
         "required": [
           "name",
           "role",
-          "created_at"
+          "created_at",
+          "permissions"
         ],
         "properties": {
           "created_at": {
@@ -3750,6 +3774,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PermissionItem"
+            },
+            "description": "Domain permission matrix — see `list_users` doc for `role == \"Admin\"` semantics."
           },
           "role": {
             "type": "string"

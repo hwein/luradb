@@ -35,6 +35,7 @@ pub mod auth;
 pub mod backup;
 pub mod config;
 pub mod core;
+pub mod cors;
 pub mod engines;
 pub mod ipc;
 pub mod logging;
@@ -498,6 +499,19 @@ fn build_router(cfg: &LuraConfig, state: AppState, trusted_cidrs: Arc<Vec<crate:
     }
 
     app = app.merge(api::create_router(state, trusted_cidrs));
+
+    // Outermost layer (spec general/020 §Platzierung): runs before auth on
+    // every request, including Swagger/hello above, which live outside
+    // create_router and would otherwise miss it.
+    if let Some(cors) = cors::build_layer(&cfg.cors) {
+        if cfg.cors.allowed_origins.iter().any(|o| o == "*") {
+            tracing::warn!(
+                "cors.allowed_origins is \"*\" — Access-Control-Allow-Origin is sent on every response, including requests without an Origin header. A valid API key is still required for access."
+            );
+        }
+        app = app.layer(cors);
+    }
+
     app
 }
 
@@ -624,6 +638,7 @@ fn main() -> anyhow::Result<()> {
     config.log.validate()?;
     config.backup.validate(&config.storage, &config.json, &config.rel)?;
     config.auth.validate(&config.server)?;
+    config.cors.validate()?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {
@@ -816,4 +831,111 @@ fn main() -> anyhow::Result<()> {
 
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::util::ServiceExt;
+
+    async fn make_test_state(auth_enabled: bool) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
+        let fm = Arc::new(crate::storage::file_manager::FileManager::new(dir.path()).await.unwrap());
+        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(dir.path()));
+        let engine = Arc::new(
+            crate::engines::lsm::engine::LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, fm, mm,
+                crate::engines::lsm::engine::LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let registry = Arc::new(
+            crate::engines::lsm::DomainRegistry::recover(
+                engine,
+                crate::engines::lsm::domain::DomainConfig::default(),
+                Arc::clone(&metrics),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = AppState {
+            registry,
+            auth_cache,
+            auth_enabled,
+            metrics,
+            json_engine: None,
+            rel_engine: None,
+            shm_manager: None,
+            backup_manager: None,
+            log_access: None,
+            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+        };
+        (state, dir)
+    }
+
+    // Test 10 (spec general/020 §Tests): the CorsLayer must sit outside both
+    // create_router's auth_layer AND the Swagger sub-router's
+    // docs_auth_layer. Regression-critical: if the layer moved inward (e.g.
+    // into create_router), a request to the Swagger docs route would never
+    // reach it — docs_auth_layer would 401 first, with no CORS header.
+    #[tokio::test]
+    async fn cors_layer_wraps_swagger_and_survives_401() {
+        let mut cfg = LuraConfig::default();
+        cfg.server.swagger_enabled = true;
+        cfg.auth.enabled = true;
+        cfg.cors.enabled = true;
+        cfg.cors.allowed_origins = vec!["https://example.com".to_string()];
+
+        let (state, _dir) = make_test_state(true).await;
+        let app = build_router(&cfg, state, Arc::new(vec![]));
+
+        // (a) Preflight without Authorization -> 200 with the CORS header,
+        // even though this path sits behind docs_auth_layer.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api-docs/openapi.json")
+                    .header("origin", "https://example.com")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://example.com"
+        );
+
+        // (b) GET with an allowed Origin but no Authorization -> 401 from
+        // docs_auth_layer, but still carrying the CORS header — proof the
+        // layer sits outside that auth check, not inside it.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api-docs/openapi.json")
+                    .header("origin", "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://example.com"
+        );
+    }
 }

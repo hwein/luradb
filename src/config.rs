@@ -24,6 +24,7 @@ pub struct LuraConfig {
     pub shm: ShmConfig,
     pub backup: BackupConfig,
     pub events: EventsConfig,
+    pub cors: CorsConfig,
 }
 
 impl Default for LuraConfig {
@@ -48,6 +49,7 @@ impl Default for LuraConfig {
             shm: ShmConfig::default(),
             backup: BackupConfig::default(),
             events: EventsConfig::default(),
+            cors: CorsConfig::default(),
         }
     }
 }
@@ -996,6 +998,99 @@ impl Default for EventsConfig {
     }
 }
 
+// ── CORS (spec general/020) ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct CorsConfig {
+    /// Enables the `CorsLayer`. `false` (default) = no layer in the stack,
+    /// behavior unchanged.
+    pub enabled: bool,
+    /// Exact origins (`scheme://host[:port]`), byte-compared. `"*"` is
+    /// allowed only as the sole entry — see `validate`.
+    pub allowed_origins: Vec<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_origins: Vec::new(),
+        }
+    }
+}
+
+impl CorsConfig {
+    /// Fail-fast startup check (spec general/020 §Start-Validierung). A
+    /// no-op when `enabled = false` — `allowed_origins` is never read then.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.allowed_origins.is_empty(),
+            "invalid config: cors.enabled = true but cors.allowed_origins is empty — no origin would ever be allowed"
+        );
+
+        let has_wildcard = self.allowed_origins.iter().any(|o| o == "*");
+        if has_wildcard {
+            anyhow::ensure!(
+                self.allowed_origins.iter().all(|o| o == "*"),
+                "invalid config: cors.allowed_origins mixes the wildcard \"*\" with concrete origins — \"*\" must be the only entry"
+            );
+            return Ok(());
+        }
+
+        for origin in &self.allowed_origins {
+            anyhow::ensure!(
+                is_valid_origin_form(origin),
+                "invalid config: cors.allowed_origins entry '{origin}' is not a valid origin — expected exactly scheme://host[:port] (lowercase, no userinfo/path/query/fragment)"
+            );
+            // Belt-and-suspenders: guarantees `cors::build_layer` can never
+            // panic converting this entry to a `HeaderValue`. In practice
+            // `is_valid_origin_form`'s charset is already ASCII-only, so this
+            // never trips once the check above passed — it stays as the
+            // documented, literal implementation of this rule.
+            axum::http::HeaderValue::from_str(origin).map_err(|e| {
+                anyhow::anyhow!("invalid config: cors.allowed_origins entry '{origin}' is not a valid header value: {e}")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Strict `scheme://host[:port]` shape (spec general/020 §Start-Validierung,
+/// rules 3+5): scheme `[a-z][a-z0-9+.-]*`, non-empty lowercase host of
+/// `[a-z0-9.-]`, optional numeric port, nothing else — no userinfo, path,
+/// query, or fragment. The browser's `Origin` header always has exactly this
+/// shape, and `AllowOrigin::list` compares byte-for-byte, so anything looser
+/// here would silently never match.
+fn is_valid_origin_form(origin: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let mut scheme_chars = scheme.chars();
+    let valid_scheme = match scheme_chars.next() {
+        Some(first) if first.is_ascii_lowercase() => scheme_chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-')),
+        _ => false,
+    };
+    if !valid_scheme || rest.is_empty() || rest.contains(['@', '/', '?', '#']) {
+        return false;
+    }
+
+    let (host, port) = rest.rsplit_once(':').map_or((rest, None), |(h, p)| (h, Some(p)));
+    if host.is_empty()
+        || !host.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-'))
+    {
+        return false;
+    }
+    match port {
+        None => true,
+        Some(p) => !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1674,5 +1769,160 @@ mod tests {
         let config: LuraConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.auth.enabled);
         assert!(config.auth.validate(&config.server).is_ok());
+    }
+
+    // ── CORS (spec general/020) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_cors_disabled_by_default() {
+        let config = LuraConfig::default();
+        assert!(!config.cors.enabled);
+        assert!(config.cors.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn test_cors_toml_overrides() {
+        let toml_str = r#"
+            [cors]
+            enabled = true
+            allowed_origins = ["https://console.example.com", "http://localhost:5173"]
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.cors.enabled);
+        assert_eq!(
+            config.cors.allowed_origins,
+            vec!["https://console.example.com".to_string(), "http://localhost:5173".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_cors_validate_disabled_skips_all_checks() {
+        let mut cors = CorsConfig::default();
+        // Would fail every check below if looked at — enabled=false must
+        // short-circuit before any of it.
+        cors.allowed_origins = vec!["not a valid origin at all".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_enabled_with_empty_origins() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_wildcard_mixed_with_concrete_origin() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["*".to_string(), "https://example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_wildcard_alone() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["*".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_wildcard_duplicated() {
+        // Duplicate "*" entries are still "only the wildcard", not "mixed
+        // with concrete origins".
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["*".to_string(), "*".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_origin_with_port() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["http://localhost:5173".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_origin_without_port() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_duplicate_origin() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins =
+            vec!["https://console.example.com".to_string(), "https://console.example.com".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_trailing_slash() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com/".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_missing_scheme() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["console.example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_userinfo() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://user:pw@console.example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_query() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com?x=1".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_fragment() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com#f".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_empty_host() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_uppercase_host() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://Console.example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_unparseable_header_value() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://exa\nmple.com".to_string()];
+        assert!(cors.validate().is_err());
     }
 }

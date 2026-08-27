@@ -81,3 +81,9 @@ format = "text"
 
 [proxy]
 trusted_proxies = ["127.0.0.1", "::1"]
+
+[cors]
+# Cross-origin access for browser clients. Off by default.
+enabled = false
+# Exact origins, e.g. ["https://console.example.com", "http://localhost:5173"].
+allowed_origins = []

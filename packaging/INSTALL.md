@@ -91,6 +91,23 @@ LuraDB can terminate TLS itself, on its own port (`tls_port`, default `3443`), i
 
 5. Certificate rotation has no hot-reload — replace the files under `/etc/luradb/tls/` and run `sudo systemctl restart luradb`. For a CA-issued certificate, keep it renewed there (e.g. via `certbot`), or continue terminating TLS at a reverse proxy instead.
 
+## Enabling CORS for browser clients
+
+Off by default — a plain config change, no restart quirks. A browser-based client running on a different origin (e.g. a web console) needs `Access-Control-*` response headers, or the browser blocks every response regardless of whether the request succeeded server-side.
+
+```toml
+[cors]
+enabled = true
+allowed_origins = ["https://console.example.com", "http://localhost:5173"]
+```
+
+`allowed_origins` takes exact origins (`scheme://host[:port]`, lowercase, no path/query) — or the single entry `"*"` to allow any origin. `"*"` does not weaken authentication: `Authorization: Bearer` is still required as usual, it only means the origin allow-list stops being an extra line of defense. Methods, headers and cache lifetime are fixed by the server, not configurable. Apply with:
+
+```sh
+sudoedit /etc/luradb/luradb.toml   # [cors] enabled = true
+sudo systemctl restart luradb
+```
+
 ## UDS access
 
 Local clients can also reach LuraDB via the Unix domain socket `/run/luradb/luradb.sock` (mode `0660`, group `luradb`; the directory `/run/luradb` is created by systemd via `RuntimeDirectory=`). To grant another system user access:

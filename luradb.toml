@@ -84,3 +84,9 @@ retention_days = 30
 # IPs and CIDR ranges of trusted reverse proxies.
 # Leave empty when LuraDB is accessed directly (no proxy in front).
 trusted_proxies = ["127.0.0.1", "::1"]
+
+[cors]
+# Cross-origin access for browser clients. Off by default.
+enabled = false
+# Exact origins, e.g. ["https://console.example.com", "http://localhost:5173"].
+allowed_origins = []

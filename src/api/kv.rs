@@ -11,18 +11,21 @@
 //! GET    /store-api/kv/{domain}/watch?prefix={p}    → watch     (SSE stream)
 
 use crate::api::{middleware::ApiError, AppState, CountResponse};
-use crate::engines::lsm::{GetResult, OpType};
+use crate::core::events::{format_event_id, stream_epoch, ResetReason, Resume};
+use crate::engines::lsm::{GetResult, OpType, WalEvent, WatchMessage, WatchStart, WATCH_TAG};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
 };
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
 // ── Query param types ─────────────────────────────────────────────────────────
@@ -40,6 +43,10 @@ pub struct ScanParams {
 #[derive(Deserialize)]
 pub struct WatchParams {
     pub prefix: Option<String>,
+    /// Fallback resume id for callers that cannot set headers (e.g. `curl`,
+    /// or a `fetch`-based reader); the `Last-Event-ID` header wins when both
+    /// are present (spec kv/024 §4.1).
+    pub last_event_id: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -49,6 +56,89 @@ async fn resolve(
     domain: &str,
 ) -> Result<crate::engines::lsm::DomainStore, ApiError> {
     state.registry.store(domain).await.map_err(ApiError::from)
+}
+
+/// Resolves the effective `Last-Event-ID` (spec kv/024 §4.1): the header —
+/// what a native `EventSource`'s auto-reconnect sets — wins when both the
+/// header and `?last_event_id=` are present.
+fn resolve_last_event_id(headers: &HeaderMap, params: &WatchParams) -> Option<String> {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| params.last_event_id.clone())
+}
+
+/// A decided SSE item, before axum-specific rendering — kept as plain data
+/// (rather than `axum::response::sse::Event` directly) so the decision logic
+/// below is unit-testable by inspecting fields, without depending on
+/// `Event`'s internal representation (it exposes no accessors of its own).
+struct SseItem {
+    id: String,
+    event: &'static str,
+    data: String,
+}
+
+fn render_sse_item(item: SseItem) -> Event {
+    Event::default().id(item.id).event(item.event).data(item.data)
+}
+
+fn watch_event_item(event: &WalEvent, epoch: u64) -> SseItem {
+    let op_str = match event.op {
+        OpType::Set => "set",
+        OpType::Delete => "delete",
+    };
+    let key_str = String::from_utf8_lossy(&event.key).into_owned();
+    SseItem { id: format_event_id(WATCH_TAG, epoch, event.seq), event: op_str, data: key_str }
+}
+
+/// Builds `event: reset` (spec kv/024 §5): `id:` carries the current
+/// sequence head, so a reconnect right after a reset resumes gaplessly from
+/// there; `data:` is JSON (not plain text) so the reason vocabulary can grow
+/// without breaking the wire format. Serialized manually (`serde_json`
+/// rather than `Event::json_data`) since the latter needs axum's `json`
+/// cargo feature, which this project does not enable.
+fn reset_item(reason: ResetReason, epoch: u64, head: u64) -> SseItem {
+    let data = serde_json::to_string(&serde_json::json!({ "reason": reason }))
+        .expect("ResetReason serializes infallibly");
+    SseItem { id: format_event_id(WATCH_TAG, epoch, head), event: "reset", data }
+}
+
+enum WatchStep {
+    Emit(SseItem),
+    Skip,
+    Stop,
+}
+
+/// Maps one raw relay receive to a live-stream outcome (spec kv/024 §4.3,
+/// §6): suppresses `seq <= suppress_upto` (the overlap between an initial
+/// replay's snapshot and the live relay picking up), and turns a `Gap` or
+/// the receiver's own `Lagged` into `reset(lagged)` — never a silent
+/// `continue`, which is exactly the defect this spec fixes. Pure (no I/O),
+/// so every branch is unit-testable without real timing.
+fn watch_item(
+    msg: Result<WatchMessage, broadcast::error::RecvError>,
+    prefix: &[u8],
+    epoch: u64,
+    suppress_upto: Option<u64>,
+    head: u64,
+) -> WatchStep {
+    match msg {
+        Ok(WatchMessage::Event(event)) => {
+            if !event.key.starts_with(prefix) {
+                return WatchStep::Skip;
+            }
+            if suppress_upto.is_some_and(|upto| event.seq <= upto) {
+                return WatchStep::Skip;
+            }
+            WatchStep::Emit(watch_event_item(&event, epoch))
+        }
+        Ok(WatchMessage::Gap) => WatchStep::Emit(reset_item(ResetReason::Lagged, epoch, head)),
+        Err(broadcast::error::RecvError::Lagged(_)) => {
+            WatchStep::Emit(reset_item(ResetReason::Lagged, epoch, head))
+        }
+        Err(broadcast::error::RecvError::Closed) => WatchStep::Stop,
+    }
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -287,50 +377,77 @@ pub async fn count_keys(
     params(
         ("domain" = String, Path, description = "Domain name"),
         ("prefix" = Option<String>, Query, description = "Key prefix filter"),
+        ("last_event_id" = Option<String>, Query, description = "Resume id from a previous `id:` (or `event: reset`) — for callers that cannot set headers. Ignored when the `Last-Event-ID` header is present."),
+        ("Last-Event-ID" = Option<String>, Header, description = "Resume id from a previous `id:` (or `event: reset`); set automatically by a native `EventSource`'s auto-reconnect. Takes precedence over `?last_event_id=`."),
     ),
     responses(
-        (status = 200, description = "SSE stream of key change events", content_type = "text/event-stream"),
+        (status = 200, description = "SSE stream of key change events. Every event carries an `id:`. Event types: `set` / `delete` (data: the key) and `reset` (data: `{\"reason\": ...}`, emitted whenever gapless resume cannot be guaranteed — the client should re-read the domain, then keep applying events normally).", content_type = "text/event-stream"),
         (status = 410, description = "Domain is being deleted"),
     ),
     tag = "Key-Value Store"
 )]
 /// Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.
 /// The connection stays open until the client disconnects; a keep-alive ping is sent automatically.
+///
+/// A `Last-Event-ID` (header or `?last_event_id=`, spec kv/024) resumes gaplessly from an in-memory
+/// replay ring when possible; otherwise the server emits `event: reset` before continuing live. A
+/// client that ignores `id:`/`reset` behaves exactly as before this was added.
 pub async fn watch(
     State(state): State<AppState>,
     Path(domain): Path<String>,
     Query(params): Query<WatchParams>,
+    headers: HeaderMap,
 ) -> Result<
     Sse<impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static>,
     ApiError,
 > {
     let store = resolve(&state, &domain).await?;
+    let last_event_id = resolve_last_event_id(&headers, &params);
     let prefix_bytes: Vec<u8> = params.prefix.unwrap_or_default().into_bytes();
-    let rx = store.watch();
 
-    let stream = futures::stream::unfold(
-        (rx, prefix_bytes),
-        |(mut rx, prefix)| async move {
+    let WatchStart { resume, rx } = store.watch_from(last_event_id.as_deref());
+    let epoch = stream_epoch();
+
+    // Leading items served up front (never through the relay channel, see
+    // spec kv/024 §4.3): 0 or 1 `reset`, or a domain-/prefix-filtered replay.
+    // `suppress_upto` carries the replay's `head` so the live loop below can
+    // discard the live re-deliveries of what was just replayed (the
+    // subscribe-before-snapshot ordering guarantees overlap, never a gap).
+    let (leading, suppress_upto): (Vec<Event>, Option<u64>) = match resume {
+        Resume::Live => (Vec::new(), None),
+        Resume::Reset { reason, head } => (vec![render_sse_item(reset_item(reason, epoch, head))], None),
+        Resume::Replay { events, head } => {
+            let items = events
+                .iter()
+                .filter(|e| e.key.starts_with(&prefix_bytes))
+                .map(|e| render_sse_item(watch_event_item(e, epoch)))
+                .collect();
+            (items, Some(head))
+        }
+    };
+    let leading_stream = futures::stream::iter(leading.into_iter().map(Ok::<Event, Infallible>));
+
+    let live_stream = futures::stream::unfold(
+        (rx, prefix_bytes, suppress_upto, store),
+        move |(mut rx, prefix, suppress_upto, store)| async move {
             loop {
-                match rx.recv().await {
-                    Ok(event) if event.key.starts_with(&prefix) => {
-                        let op_str = match event.op {
-                            OpType::Set => "set",
-                            OpType::Delete => "delete",
-                        };
-                        let key_str = String::from_utf8_lossy(&event.key).into_owned();
-                        let sse = Event::default().event(op_str).data(key_str);
-                        return Some((Ok::<Event, Infallible>(sse), (rx, prefix)));
+                let msg = rx.recv().await;
+                // A `parking_lot::Mutex` lock, cheap enough to pay on every
+                // message rather than special-case the two branches that
+                // actually need it (Gap/Lagged) — keeps `watch_item` pure.
+                let head = store.watch_head();
+                match watch_item(msg, &prefix, epoch, suppress_upto, head) {
+                    WatchStep::Emit(item) => {
+                        return Some((Ok::<Event, Infallible>(render_sse_item(item)), (rx, prefix, suppress_upto, store)))
                     }
-                    Ok(_) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    WatchStep::Skip => continue,
+                    WatchStep::Stop => return None,
                 }
             }
         },
     );
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(leading_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -986,5 +1103,215 @@ mod tests {
         let resp = send(&app, Method::GET, "/store-api/kv/testdom/count", Body::empty()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 10_000);
+    }
+
+    // ── Spec kv/024: watch event ids, resume & gap signal ───────────────────
+
+    // Test 2: the Last-Event-ID header wins over `?last_event_id=` when both
+    // are present; either one alone is used as-is.
+    #[test]
+    fn test_resolve_last_event_id_header_wins_over_query() {
+        let params = |q: Option<&str>| WatchParams { prefix: None, last_event_id: q.map(str::to_string) };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "w-1-1".parse().unwrap());
+        assert_eq!(
+            resolve_last_event_id(&headers, &params(Some("w-2-2"))),
+            Some("w-1-1".to_string()),
+            "header must win when both are set"
+        );
+
+        let empty_headers = HeaderMap::new();
+        assert_eq!(resolve_last_event_id(&empty_headers, &params(Some("w-2-2"))), Some("w-2-2".to_string()));
+        assert_eq!(resolve_last_event_id(&headers, &params(None)), Some("w-1-1".to_string()));
+        assert_eq!(resolve_last_event_id(&empty_headers, &params(None)), None);
+    }
+
+    // watch_item: the pure per-message mapping the live loop uses (spec
+    // kv/024 §4.3/§6) — every branch, without any real timing. Asserts on
+    // `SseItem`'s plain fields rather than the rendered `axum::sse::Event`
+    // (which exposes no accessors of its own).
+    mod watch_item_tests {
+        use super::*;
+
+        fn set_event(seq: u64, key: &[u8]) -> WalEvent {
+            WalEvent { seq, key: key.to_vec(), op: OpType::Set }
+        }
+
+        #[test]
+        fn test_matching_prefix_emits_a_data_event() {
+            let step = watch_item(Ok(WatchMessage::Event(set_event(5, b"user:1"))), b"user:", 42, None, 0);
+            match step {
+                WatchStep::Emit(item) => {
+                    assert_eq!(item.id, format_event_id(WATCH_TAG, 42, 5));
+                    assert_eq!(item.event, "set");
+                    assert_eq!(item.data, "user:1");
+                }
+                _ => panic!("expected Emit"),
+            }
+        }
+
+        #[test]
+        fn test_delete_op_maps_to_delete_event_name() {
+            let event = WalEvent { seq: 1, key: b"k".to_vec(), op: OpType::Delete };
+            let step = watch_item(Ok(WatchMessage::Event(event)), b"", 1, None, 0);
+            match step {
+                WatchStep::Emit(item) => assert_eq!(item.event, "delete"),
+                _ => panic!("expected Emit"),
+            }
+        }
+
+        #[test]
+        fn test_non_matching_prefix_is_skipped() {
+            let step = watch_item(Ok(WatchMessage::Event(set_event(1, b"other:1"))), b"user:", 42, None, 0);
+            assert!(matches!(step, WatchStep::Skip));
+        }
+
+        // seq <= suppress_upto is a re-delivery of the initial replay; seq >
+        // suppress_upto is new and must be emitted (spec kv/024 §4.3).
+        #[test]
+        fn test_suppress_upto_boundary() {
+            let msg = || Ok(WatchMessage::Event(set_event(10, b"k")));
+            assert!(matches!(watch_item(msg(), b"", 1, Some(10), 0), WatchStep::Skip));
+            assert!(matches!(watch_item(msg(), b"", 1, Some(9), 0), WatchStep::Emit(_)));
+            assert!(matches!(watch_item(msg(), b"", 1, None, 0), WatchStep::Emit(_)));
+        }
+
+        #[test]
+        fn test_gap_emits_reset_lagged_with_head_as_id() {
+            let step = watch_item(Ok(WatchMessage::Gap), b"", 7, None, 99);
+            match step {
+                WatchStep::Emit(item) => {
+                    assert_eq!(item.event, "reset");
+                    assert_eq!(item.data, r#"{"reason":"lagged"}"#);
+                    assert_eq!(item.id, format_event_id(WATCH_TAG, 7, 99));
+                }
+                _ => panic!("expected Emit"),
+            }
+        }
+
+        #[test]
+        fn test_receiver_lagged_also_emits_reset_lagged() {
+            let step = watch_item(Err(broadcast::error::RecvError::Lagged(3)), b"", 7, None, 99);
+            match step {
+                WatchStep::Emit(item) => assert_eq!(item.data, r#"{"reason":"lagged"}"#),
+                _ => panic!("expected Emit"),
+            }
+        }
+
+        #[test]
+        fn test_closed_stops() {
+            let step = watch_item(Err(broadcast::error::RecvError::Closed), b"", 1, None, 0);
+            assert!(matches!(step, WatchStep::Stop));
+        }
+    }
+
+    /// Splits one SSE line into (field, value), tolerating an optional space
+    /// after the colon — axum's exact spacing isn't part of the contract, so
+    /// tests must not hardcode it. `split_once` only touches the *first*
+    /// colon, so a `data:` value that itself contains a colon (e.g. a key
+    /// like `user:1`) is preserved intact.
+    fn parse_sse_field(line: &str) -> Option<(&str, &str)> {
+        let (field, rest) = line.split_once(':')?;
+        Some((field, rest.strip_prefix(' ').unwrap_or(rest)))
+    }
+
+    /// Reads SSE lines (as parsed (field, value) pairs) from a streaming
+    /// response body, waiting up to `timeout` per chunk -- avoids hanging on
+    /// a stream that (by design) never completes on its own. Blank
+    /// (keep-alive comment) lines are dropped.
+    async fn read_sse_fields(
+        body: Body,
+        min_fields: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<(String, String)> {
+        let mut stream = body.into_data_stream();
+        let mut buf = String::new();
+        let mut fields = Vec::new();
+        while fields.len() < min_fields {
+            let chunk = tokio::time::timeout(timeout, stream.next())
+                .await
+                .expect("timed out waiting for an SSE chunk")
+                .expect("stream ended before min_fields was reached")
+                .expect("chunk read error");
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim_end_matches('\r').to_string();
+                buf = buf[pos + 1..].to_string();
+                if let Some((field, value)) = parse_sse_field(&line) {
+                    fields.push((field.to_string(), value.to_string()));
+                }
+            }
+        }
+        fields
+    }
+
+    // Test 6 (additive) + wire format: a fresh connect (no Last-Event-ID)
+    // gets no reset, and the `set` event it does see carries a real `id:`.
+    #[tokio::test]
+    async fn test_watch_sse_wire_format_has_id_and_no_reset_when_fresh() {
+        let (app, _dir) = make_app().await;
+        let watch_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/store-api/kv/testdom/watch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(watch_resp.status(), StatusCode::OK);
+
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/watched", Body::from("v")).await;
+
+        let fields = read_sse_fields(watch_resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
+        assert!(
+            fields.iter().any(|(f, v)| f == "id" && v.starts_with("w-")),
+            "expected an id: w-... field, got {fields:?}"
+        );
+        assert!(fields.contains(&("event".to_string(), "set".to_string())), "got {fields:?}");
+        assert!(fields.contains(&("data".to_string(), "watched".to_string())), "got {fields:?}");
+        assert!(
+            !fields.iter().any(|(f, v)| f == "event" && v == "reset"),
+            "a fresh connect must never reset, got {fields:?}"
+        );
+    }
+
+    // Test 10: `?prefix=` applies identically to the replay list and the
+    // live stream -- a non-matching key is invisible on both sides of the
+    // same connection.
+    #[tokio::test]
+    async fn test_watch_prefix_filter_applies_to_replay_and_live_identically() {
+        let (app, _dir) = make_app().await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/user:1", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/item:1", Body::from("v")).await;
+
+        // Resume from seq 0 ("from the beginning") so both pre-existing
+        // writes are replayed, exercising the replay-side filter.
+        let id0 = format_event_id(WATCH_TAG, stream_epoch(), 0);
+        let watch_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/store-api/kv/testdom/watch?prefix=user:&last_event_id={id0}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(watch_resp.status(), StatusCode::OK);
+
+        // A live write outside the prefix must also stay invisible.
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/item:2", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/user:2", Body::from("v")).await;
+
+        // 2 full events (user:1 replayed, user:2 live) x 3 fields each
+        // (id/event/data) -- read enough to capture both completely.
+        let fields = read_sse_fields(watch_resp.into_body(), 6, std::time::Duration::from_secs(5)).await;
+        let data_values: Vec<&str> = fields.iter().filter(|(f, _)| f == "data").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(data_values, vec!["user:1", "user:2"], "item:* must never appear, got {fields:?}");
     }
 }

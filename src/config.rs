@@ -277,6 +277,11 @@ pub struct LsmConfig {
     pub wal_event_channel_capacity: usize,
     /// Access SSTables via mmap (perf/003). `false` = load files fully (escape hatch).
     pub use_mmap: bool,
+    /// KV watch replay-ring capacity (spec kv/024). `0` disables resume —
+    /// every reconnect with a `Last-Event-ID` gets `reset`, but `id:` fields
+    /// are still assigned. Only the KV engine uses this; json/rel force it
+    /// to `0` (no watch endpoint there).
+    pub watch_replay_buffer_size: usize,
 }
 
 impl Default for LsmConfig {
@@ -290,6 +295,7 @@ impl Default for LsmConfig {
             compaction_check_interval_ms: 1000,
             wal_event_channel_capacity: 256,
             use_mmap: true,
+            watch_replay_buffer_size: 1024,
         }
     }
 }

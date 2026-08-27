@@ -15,8 +15,9 @@ use crate::engines::lsm::compaction::{
 };
 use crate::engines::lsm::janitor::{FlushBarrier, Janitor, JanitorConfig};
 use crate::engines::lsm::hlc::HybridLogicalClock;
-use crate::engines::lsm::watcher::{OpType, WalEvent};
+use crate::engines::lsm::watcher::{OpType, WalEvent, WATCH_TAG};
 use crate::engines::StorageEngine;
+use crate::core::events::{stream_epoch, Resume, SeqRing};
 use crate::core::io_engine::IoEngine;
 use crate::core::storage_thread::StorageHandle;
 use crate::core::wal::WriteAheadLog;
@@ -57,6 +58,11 @@ pub struct LsmEngineConfig {
     pub wal_event_channel_capacity: usize,
     /// Access SSTables via mmap instead of loading them fully (perf/003).
     pub use_mmap: bool,
+    /// Capacity of the KV watch replay ring (spec kv/024 §3). `0` disables
+    /// resume (every reconnect with a `Last-Event-ID` gets `reset`), but
+    /// `id:` fields are still assigned. json/rel set this to `0` — they have
+    /// no watch endpoint.
+    pub watch_replay_buffer_size: usize,
 }
 
 impl Default for LsmEngineConfig {
@@ -70,6 +76,7 @@ impl Default for LsmEngineConfig {
             compaction_check_interval_ms: 1_000,
             wal_event_channel_capacity: 256,
             use_mmap: true,
+            watch_replay_buffer_size: 1024,
         }
     }
 }
@@ -253,6 +260,10 @@ pub struct LsmStorageEngine {
     /// Broadcast channel for WAL-confirmed write events (Watch feature).
     change_tx: broadcast::Sender<WalEvent>,
 
+    /// Sequences every `change_tx` event and keeps a bounded replay ring for
+    /// the KV watch resume protocol (spec kv/024 §2).
+    watch_log: SeqRing<WalEvent>,
+
     /// Signals background tasks to stop.
     shutdown: Arc<AtomicBool>,
 
@@ -309,6 +320,7 @@ impl LsmStorageEngine {
             .await?;
 
         let (change_tx, _) = broadcast::channel(engine_config.wal_event_channel_capacity);
+        let watch_log = SeqRing::new(engine_config.watch_replay_buffer_size);
 
         let block_cache = Arc::new(Mutex::new(BlockCache::new(
             block_cache_config.capacity_bytes,
@@ -332,6 +344,7 @@ impl LsmStorageEngine {
             hlc: Arc::new(HybridLogicalClock::new()),
             snapshot_registry: Arc::new(SnapshotRegistry::new()),
             change_tx,
+            watch_log,
             shutdown: Arc::new(AtomicBool::new(false)),
             block_cache,
             storage_handle: None,
@@ -700,6 +713,13 @@ impl LsmStorageEngine {
 
     // ── Core write helpers ───────────────────────────────────────────────────
 
+    /// Assigns the next watch-stream sequence, rings it, and broadcasts it
+    /// (spec kv/024 §2) — the single choke point every non-batch write path
+    /// goes through.
+    fn publish_change(&self, key: &[u8], op: OpType) {
+        self.watch_log.publish(&self.change_tx, |seq| WalEvent { seq, key: key.to_vec(), op });
+    }
+
     /// Appends a SET entry to the WAL and inserts the value into the MemTable.
     ///
     /// Large values (>= `MAX_VALUE_LENGTH`) are offloaded to the vLog; smaller
@@ -721,7 +741,7 @@ impl LsmStorageEngine {
         self.wal.append(&log_entry).await?;
 
         // Broadcast after WAL is durable (sync_all already called inside wal.append).
-        let _ = self.change_tx.send(WalEvent { key: key.to_vec(), op: OpType::Set });
+        self.publish_change(key, OpType::Set);
 
         self.maybe_freeze_memtable()?;
 
@@ -758,7 +778,7 @@ impl LsmStorageEngine {
         self.wal.append(&log_entry).await?;
 
         // Broadcast after WAL is durable.
-        let _ = self.change_tx.send(WalEvent { key: key.to_vec(), op: OpType::Delete });
+        self.publish_change(key, OpType::Delete);
 
         self.maybe_freeze_memtable()?;
 
@@ -784,7 +804,7 @@ impl LsmStorageEngine {
         self.wal.append(&log_entry).await?;
 
         // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
-        let _ = self.change_tx.send(WalEvent { key: key.to_vec(), op: OpType::Set });
+        self.publish_change(key, OpType::Set);
 
         self.maybe_freeze_memtable()?;
 
@@ -832,14 +852,20 @@ impl LsmStorageEngine {
         log_entry
     }
 
+    /// Assigns `ops.len()` consecutive sequences in one lock section
+    /// (`publish_many`), so a concurrent single-op write can never
+    /// interleave into the middle of this batch's stream slice (spec
+    /// kv/024 §2).
     fn broadcast_batch_events(&self, ops: &[BatchOp]) {
-        for op in ops {
+        let mut ops = ops.iter();
+        self.watch_log.publish_many(&self.change_tx, ops.len(), |seq| {
+            let op = ops.next().expect("publish_many calls `make` exactly `n` times");
             let (key, op_type) = match op {
                 BatchOp::Put { key, .. } => (key, OpType::Set),
                 BatchOp::Delete { key } => (key, OpType::Delete),
             };
-            let _ = self.change_tx.send(WalEvent { key: key.clone(), op: op_type });
-        }
+            WalEvent { seq, key: key.clone(), op: op_type }
+        });
     }
 
     /// Phase 1 of [`Self::write_batch`]: offloads large values to the vLog,
@@ -1020,11 +1046,32 @@ impl LsmStorageEngine {
 
     /// Returns a receiver that is notified for every WAL-confirmed write.
     ///
-    /// Each event carries the key and operation type (`Set` / `Delete`).
-    /// The caller is responsible for filtering by prefix if needed.
-    /// Events may be dropped if the receiver is too slow (lagged).
+    /// Each event carries the key, operation type (`Set` / `Delete`), and its
+    /// watch-stream sequence (spec kv/024 §1-2). The caller is responsible
+    /// for filtering by prefix if needed. Events may be dropped if the
+    /// receiver is too slow (lagged) — use [`Self::watch_decide_resume`] to
+    /// recover from that via the replay ring.
     pub fn watch_subscribe(&self) -> broadcast::Receiver<WalEvent> {
         self.change_tx.subscribe()
+    }
+
+    /// Capacity of the live WAL-event broadcast (and, per spec kv/024 §3,
+    /// every per-domain relay channel too).
+    pub fn wal_event_channel_capacity(&self) -> usize {
+        self.engine_config.wal_event_channel_capacity
+    }
+
+    /// Current head of the watch-stream sequence — the `id:` a `reset`
+    /// event carries (spec kv/024 §5).
+    pub fn watch_head(&self) -> u64 {
+        self.watch_log.head()
+    }
+
+    /// Full resume decision for the KV watch (spec kv/024 §4.2) from a raw
+    /// `Last-Event-ID`/`?last_event_id=` value, using this process's real
+    /// [`stream_epoch`].
+    pub fn watch_decide_resume(&self, raw_id: Option<&str>) -> Resume<WalEvent> {
+        self.watch_log.decide_resume(raw_id, WATCH_TAG, stream_epoch())
     }
 
     // ── Flush ───────────────────────────────────────────────────────────────
@@ -2685,5 +2732,77 @@ mod tests {
             engine2.register_sstables_with_io_engine(&mut io_engine).await.unwrap();
             assert!(io_engine.get_file(file_id).is_some());
         });
+    }
+
+    // ── Spec kv/024 tests 7/8: watch-stream sequence assignment ──────────────
+
+    // Test 7: put, delete, set_null (-> Set, kv/018) and write_batch all
+    // publish through the same choke point (`publish_change`/`publish_many`)
+    // -> sequences are gapless and non-decreasing across every write path.
+    #[tokio::test]
+    async fn test_watch_seq_monotonic_across_all_write_paths() {
+        let (engine, _dir) = make_engine().await;
+        let mut rx = engine.watch_subscribe();
+
+        engine.put(b"a", b"1").await.unwrap(); // Set
+        engine.delete(b"a").await.unwrap(); // Delete
+        engine.set_null(b"b").await.unwrap(); // Set (kv/018: an update, not a delete)
+        engine
+            .write_batch(vec![
+                BatchOp::Put { key: b"c".to_vec(), value: b"1".to_vec() },
+                BatchOp::Put { key: b"d".to_vec(), value: b"2".to_vec() },
+            ])
+            .await
+            .unwrap();
+
+        let mut seqs = Vec::new();
+        for _ in 0..5 {
+            seqs.push(rx.recv().await.unwrap().seq);
+        }
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "sequences must be gapless and in write order: {seqs:?}");
+    }
+
+    // Test 8: a batch's N ops get N consecutive sequences (`publish_many`),
+    // and a concurrent single-op write lands fully before or after the
+    // batch's slice, never interleaved into it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_watch_batch_is_contiguous_against_concurrent_single_write() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let mut rx = engine.watch_subscribe();
+
+        let batch_ops: Vec<BatchOp> = (0..20)
+            .map(|i| BatchOp::Put { key: format!("batch{i}").into_bytes(), value: b"v".to_vec() })
+            .collect();
+
+        let e1 = Arc::clone(&engine);
+        let batch_handle = tokio::spawn(async move { e1.write_batch(batch_ops).await.unwrap() });
+        let e2 = Arc::clone(&engine);
+        let single_handle = tokio::spawn(async move { e2.put(b"single", b"v").await.unwrap() });
+        batch_handle.await.unwrap();
+        single_handle.await.unwrap();
+
+        let mut batch_seqs = Vec::new();
+        let mut single_seq = None;
+        for _ in 0..21 {
+            let event = rx.recv().await.unwrap();
+            if event.key == b"single" {
+                single_seq = Some(event.seq);
+            } else {
+                batch_seqs.push(event.seq);
+            }
+        }
+        batch_seqs.sort_unstable();
+        let (min, max) = (*batch_seqs.first().unwrap(), *batch_seqs.last().unwrap());
+        assert_eq!(
+            max - min + 1,
+            batch_seqs.len() as u64,
+            "batch sequences must be contiguous: {batch_seqs:?}"
+        );
+        let single_seq = single_seq.expect("the concurrent single write must have published an event");
+        assert!(
+            single_seq < min || single_seq > max,
+            "the concurrent single write must land fully before or after the batch: {single_seq} vs [{min},{max}]"
+        );
     }
 }

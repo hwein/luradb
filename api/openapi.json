@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.3",
+    "version": "0.3.4",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -1876,6 +1876,7 @@
           "Key-Value Store"
         ],
         "summary": "Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.\nThe connection stays open until the client disconnects; a keep-alive ping is sent automatically.",
+        "description": "A `Last-Event-ID` (header or `?last_event_id=`, spec kv/024) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. A\nclient that ignores `id:`/`reset` behaves exactly as before this was added.",
         "operationId": "watch",
         "parameters": [
           {
@@ -1895,11 +1896,32 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "last_event_id",
+            "in": "query",
+            "description": "Resume id from a previous `id:` (or `event: reset`) — for callers that cannot set headers. Ignored when the `Last-Event-ID` header is present.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Resume id from a previous `id:` (or `event: reset`); set automatically by a native `EventSource`'s auto-reconnect. Takes precedence over `?last_event_id=`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "SSE stream of key change events",
+            "description": "SSE stream of key change events. Every event carries an `id:`. Event types: `set` / `delete` (data: the key) and `reset` (data: `{\"reason\": ...}`, emitted whenever gapless resume cannot be guaranteed — the client should re-read the domain, then keep applying events normally).",
             "content": {
               "text/event-stream": {}
             }

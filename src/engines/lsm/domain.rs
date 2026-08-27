@@ -11,10 +11,11 @@
 //!
 //! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
 
+use crate::core::events::Resume;
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
-use crate::engines::lsm::watcher::WalEvent;
+use crate::engines::lsm::watcher::{WalEvent, WatchMessage};
 use crate::metrics::MetricsStore;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -405,6 +406,13 @@ pub struct KeyMeta {
     pub last_modified_ms: u64,
 }
 
+/// Result of starting (or resuming) a KV watch (spec kv/024 §4.3):
+/// `resume` is already domain-filtered/stripped, `rx` is the live stream.
+pub struct WatchStart {
+    pub resume: Resume<WalEvent>,
+    pub rx: broadcast::Receiver<WatchMessage>,
+}
+
 impl DomainStore {
     fn prefixed_key(&self, user_key: &[u8]) -> Vec<u8> {
         let mut k = self.domain.system_prefix.clone();
@@ -613,29 +621,80 @@ impl DomainStore {
         Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
     }
 
-    /// Subscribes to write events for this domain (domain prefix already stripped).
-    pub fn watch(&self) -> broadcast::Receiver<WalEvent> {
+    /// Subscribes to write events for this domain (domain prefix already
+    /// stripped), optionally resuming from `last_event_id` (spec kv/024 §4).
+    ///
+    /// Step order is binding (spec kv/024 §4.3): subscribing to the raw
+    /// engine broadcast happens *before* the ring snapshot, so nothing can
+    /// be lost between the snapshot and the relay task picking up live
+    /// traffic — only overlap, which the caller suppresses using the
+    /// returned `Resume`'s `head` (a live event with `seq <= head` is a
+    /// re-delivery of what was just replayed).
+    pub fn watch_from(&self, last_event_id: Option<&str>) -> WatchStart {
+        let mut raw_rx = self.engine.watch_subscribe(); // step 1: subscribe first
+        let resume = self.strip_domain_prefix(self.engine.watch_decide_resume(last_event_id)); // step 2
+
         let prefix = self.domain.system_prefix.clone();
         let prefix_len = prefix.len();
-        let mut raw_rx = self.engine.watch_subscribe();
-        let (tx, rx) = broadcast::channel(64);
+        let (tx, rx) = broadcast::channel(self.engine.wal_event_channel_capacity());
         tokio::spawn(async move {
+            // step 3: relay task
             loop {
                 match raw_rx.recv().await {
                     Ok(event) => {
                         if event.key.starts_with(&prefix) {
-                            let stripped = event.key[prefix_len..].to_vec();
-                            if tx.send(WalEvent { key: stripped, op: event.op }).is_err() {
+                            let stripped = WalEvent {
+                                seq: event.seq,
+                                key: event.key[prefix_len..].to_vec(),
+                                op: event.op,
+                            };
+                            if tx.send(WatchMessage::Event(stripped)).is_err() {
                                 break;
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A silent `continue` would hide the gap forever — the
+                    // domain-filtered stream isn't sequence-contiguous by
+                    // construction, so the client can't infer it either
+                    // (spec kv/024 §6).
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if tx.send(WatchMessage::Gap).is_err() {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
-        rx
+
+        WatchStart { resume, rx } // step 4
+    }
+
+    /// Current head of the engine's watch-stream sequence (spec kv/024 §5)
+    /// — stamps a `reset` triggered by a live lag, as opposed to one from
+    /// the initial resume decision, which already carries its own `head`.
+    pub fn watch_head(&self) -> u64 {
+        self.engine.watch_head()
+    }
+
+    /// Filters a resume's replay list to this domain's keys and strips the
+    /// domain prefix — the ring holds raw (prefixed) keys across every
+    /// domain (spec kv/024 §2.1); `head` and non-`Replay` variants pass
+    /// through unchanged.
+    fn strip_domain_prefix(&self, resume: Resume<WalEvent>) -> Resume<WalEvent> {
+        match resume {
+            Resume::Replay { events, head } => {
+                let prefix = &self.domain.system_prefix;
+                let prefix_len = prefix.len();
+                let events = events
+                    .into_iter()
+                    .filter(|e| e.key.starts_with(prefix))
+                    .map(|e| WalEvent { seq: e.seq, key: e.key[prefix_len..].to_vec(), op: e.op })
+                    .collect();
+                Resume::Replay { events, head }
+            }
+            other => other,
+        }
     }
 }
 
@@ -702,13 +761,25 @@ impl DomainPurger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::events::{format_event_id, stream_epoch, ResetReason};
     use crate::core::wal::WriteAheadLog;
+    use crate::engines::lsm::engine::LsmEngineConfig;
+    use crate::engines::lsm::watcher::WATCH_TAG;
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::vlog::VLog;
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
 
     async fn make_setup() -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
+        make_setup_with_engine_config(LsmEngineConfig::default()).await
+    }
+
+    // Spec kv/024 tests 3/5/11 need a non-default `watch_replay_buffer_size`
+    // or `wal_event_channel_capacity` — every other test keeps using the
+    // default-config `make_setup` above.
+    async fn make_setup_with_engine_config(
+        engine_config: LsmEngineConfig,
+    ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -719,7 +790,10 @@ mod tests {
         let engine = Arc::new(
             LsmStorageEngine::new(
                 wal, wal_path, vlog, vlog_path, fm, mm,
-                crate::engines::lsm::engine::LsmEngineOptions::default(),
+                crate::engines::lsm::engine::LsmEngineOptions {
+                    engine: engine_config,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap(),
@@ -1042,5 +1116,225 @@ mod tests {
         assert_eq!(keys, vec![b"k1".to_vec()]);
 
         assert_eq!(store.get(b"k1").await.unwrap(), GetResult::Present(b"new".to_vec()));
+    }
+
+    // ── Spec kv/024: watch event ids, resume & gap signal ───────────────────
+
+    // Test 1: 10 writes, disconnect after event 3, reconnect with its id ->
+    // exactly events 4..=10, in order, as a gapless Replay (no reset).
+    #[tokio::test]
+    async fn test_watch_resume_gapless_after_reconnect() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w1").await.unwrap();
+        let store = registry.store("w1").await.unwrap();
+
+        let started = store.watch_from(None);
+        assert!(matches!(started.resume, Resume::Live));
+        let mut rx = started.rx;
+
+        for i in 0..10 {
+            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+
+        let mut last_id = String::new();
+        for _ in 0..3 {
+            match rx.recv().await.unwrap() {
+                WatchMessage::Event(e) => last_id = format_event_id(WATCH_TAG, stream_epoch(), e.seq),
+                WatchMessage::Gap => panic!("unexpected gap"),
+            }
+        }
+
+        let resumed = store.watch_from(Some(&last_id));
+        match resumed.resume {
+            Resume::Replay { events, .. } => {
+                assert_eq!(events.len(), 7, "expected events 4..=10, got {events:?}");
+                for (i, e) in events.iter().enumerate() {
+                    assert_eq!(e.key, format!("k{}", i + 3).into_bytes());
+                }
+            }
+            _ => panic!("expected a gapless replay"),
+        }
+    }
+
+    // Test 3: watch_replay_buffer_size = 4, 10 writes, resume from event 1 ->
+    // reset(window_exceeded); the stream still continues live afterward.
+    #[tokio::test]
+    async fn test_watch_window_exceeded_resets_then_live_continues() {
+        let engine_config = LsmEngineConfig { watch_replay_buffer_size: 4, ..LsmEngineConfig::default() };
+        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+        registry.create_domain("w3").await.unwrap();
+        let store = registry.store("w3").await.unwrap();
+
+        for i in 0..10 {
+            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+        let id = format_event_id(WATCH_TAG, stream_epoch(), 1);
+        let mut resumed = store.watch_from(Some(&id));
+        match resumed.resume {
+            Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
+            _ => panic!("expected window_exceeded"),
+        }
+
+        store.put(b"after", b"v").await.unwrap();
+        match resumed.rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => assert_eq!(e.key, b"after"),
+            WatchMessage::Gap => panic!("unexpected gap"),
+        }
+    }
+
+    // Test 4: a resume id from a different epoch -> reset(restart). The
+    // fabricated epoch stands in for "a different process" — see
+    // core::events::tests for the fully parameterized version of this row.
+    #[tokio::test]
+    async fn test_watch_resume_wrong_epoch_is_restart() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w4").await.unwrap();
+        let store = registry.store("w4").await.unwrap();
+        store.put(b"k", b"v").await.unwrap();
+
+        let fake_epoch = stream_epoch().wrapping_add(1);
+        let id = format_event_id(WATCH_TAG, fake_epoch, 1);
+        let started = store.watch_from(Some(&id));
+        match started.resume {
+            Resume::Reset { reason: ResetReason::Restart, .. } => {}
+            _ => panic!("expected restart on epoch mismatch"),
+        }
+    }
+
+    // Test 5: a tiny wal_event_channel_capacity plus a non-draining
+    // receiver must eventually lag (tokio::broadcast's own detection) --
+    // proves watch_from actually wires the configured capacity through
+    // rather than a hardcoded value. The Lagged-to-reset(lagged) mapping
+    // itself is unit-tested at the kv.rs handler level (pure function, no
+    // timing dependency).
+    #[tokio::test]
+    async fn test_watch_slow_client_channel_lags_when_capacity_exceeded() {
+        let engine_config = LsmEngineConfig { wal_event_channel_capacity: 2, ..LsmEngineConfig::default() };
+        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+        registry.create_domain("w5").await.unwrap();
+        let store = registry.store("w5").await.unwrap();
+
+        let started = store.watch_from(None);
+        let mut rx = started.rx;
+
+        for i in 0..10 {
+            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+
+        let mut saw_lag = false;
+        for _ in 0..10 {
+            match rx.recv().await {
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    saw_lag = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        assert!(saw_lag, "a burst past channel capacity must eventually lag a non-draining receiver");
+    }
+
+    // Test 6: no Last-Event-ID -> Live (no replay, no reset), plus every
+    // live event still carries a real seq (id: is additive).
+    #[tokio::test]
+    async fn test_watch_no_last_event_id_is_additive_live_only() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w6").await.unwrap();
+        let store = registry.store("w6").await.unwrap();
+
+        let started = store.watch_from(None);
+        assert!(matches!(started.resume, Resume::Live));
+        let mut rx = started.rx;
+
+        store.put(b"only", b"v").await.unwrap();
+        match rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => {
+                assert_eq!(e.key, b"only");
+                assert!(e.seq > 0, "seq must be assigned even without a resume attempt");
+            }
+            WatchMessage::Gap => panic!("unexpected gap"),
+        }
+    }
+
+    // Test 11: watch_replay_buffer_size = 0 -> id: still assigned, and even
+    // an immediate reconnect with the just-received id resets (spec §4.2:
+    // the cap == 0 row is checked before the window-arithmetic rows).
+    #[tokio::test]
+    async fn test_watch_cap_zero_ids_present_but_every_resume_is_window_exceeded() {
+        let engine_config = LsmEngineConfig { watch_replay_buffer_size: 0, ..LsmEngineConfig::default() };
+        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+        registry.create_domain("w11").await.unwrap();
+        let store = registry.store("w11").await.unwrap();
+
+        let started = store.watch_from(None);
+        let mut rx = started.rx;
+        store.put(b"k", b"v").await.unwrap();
+        let last_id = match rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => {
+                assert!(e.seq > 0, "id must be assigned even with the ring disabled");
+                format_event_id(WATCH_TAG, stream_epoch(), e.seq)
+            }
+            WatchMessage::Gap => panic!("unexpected gap"),
+        };
+
+        let resumed = store.watch_from(Some(&last_id));
+        match resumed.resume {
+            Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
+            _ => panic!("cap == 0 must always reset, even for the just-received id"),
+        }
+    }
+
+    // Test 12: an id tagged for a different stream (general/018's "g") must
+    // reset as unknown_id, never silently succeed.
+    #[tokio::test]
+    async fn test_watch_foreign_tag_is_unknown_id() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w12").await.unwrap();
+        let store = registry.store("w12").await.unwrap();
+        store.put(b"k", b"v").await.unwrap();
+
+        let id = format_event_id("g", stream_epoch(), 1);
+        let started = store.watch_from(Some(&id));
+        match started.resume {
+            Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
+            _ => panic!("a foreign tag must reset as unknown_id, not silently succeed"),
+        }
+    }
+
+    // Replay is filtered to this domain's keys and prefix-stripped, exactly
+    // like the live relay (spec kv/024 §2.1/§4.3) -- a foreign domain's
+    // events in the same engine-wide ring must never surface here.
+    #[tokio::test]
+    async fn test_watch_replay_is_isolated_and_stripped_per_domain() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("wa").await.unwrap();
+        registry.create_domain("wb").await.unwrap();
+        let store_a = registry.store("wa").await.unwrap();
+        let store_b = registry.store("wb").await.unwrap();
+
+        let started = store_a.watch_from(None);
+        let mut rx = started.rx;
+
+        store_b.put(b"other-domain-key", b"v").await.unwrap();
+        store_a.put(b"mine", b"v").await.unwrap();
+        match rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => {
+                assert_eq!(e.key, b"mine", "domain B's key must never reach domain A's live stream");
+            }
+            WatchMessage::Gap => panic!("unexpected gap"),
+        }
+
+        // Resuming from before either write: replay must contain only A's
+        // key, raw-prefix-stripped, even though the ring holds both.
+        let before_id = format_event_id(WATCH_TAG, stream_epoch(), 0);
+        let resumed = store_a.watch_from(Some(&before_id));
+        match resumed.resume {
+            Resume::Replay { events, .. } => {
+                assert_eq!(events.len(), 1, "expected exactly A's own write, got {events:?}");
+                assert_eq!(events[0].key, b"mine");
+            }
+            _ => panic!("expected a gapless replay"),
+        }
     }
 }

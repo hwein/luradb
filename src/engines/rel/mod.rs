@@ -136,6 +136,7 @@ impl RelEngine {
             compaction_check_interval_ms: config.lsm.compaction_check_interval_ms,
             wal_event_channel_capacity: config.lsm.wal_event_channel_capacity,
             use_mmap: config.lsm.use_mmap,
+            watch_replay_buffer_size: 0, // no watch endpoint on the relational engine (spec kv/024 §3)
         };
         let compaction_config = CompactionConfig {
             l0_compaction_threshold: config.compaction.l0_threshold,

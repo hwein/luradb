@@ -10,6 +10,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: added `GET /store-api/auth/whoami`, returning the caller's identity (`{name, role}`) for any authenticated caller — not admin-only. `role` is `"Admin"`, `"User"`, or a pseudo-role (`"TrustedPeer"`, `"Disabled"`).
 - **BREAKING** API: added `GET /store-api/kv/{domain}/keys/{key}/meta`, returning a key's TTL expiry and last-modified time (`{expires_at, last_modified_at}`) without reading its value. `GET /store-api/kv/{domain}/keys/{key}` now also carries an `X-Expires-At` response header when the key has a TTL.
 - **BREAKING** API: added `GET /store-api/kv/{domain}/count` (optional `?prefix=`) and `GET /store-api/rel/{domain}/tables/{table}/count`, each returning `{"count": N}` — a full key/row scan, same cost as listing.
+- **BREAKING** API: `GET /store-api/kv/{domain}/watch` SSE events now carry an `id:` field, and the endpoint accepts `Last-Event-ID` (header, takes precedence) or `?last_event_id=` (query) to resume gaplessly from an in-memory replay ring; a new `reset` event type is emitted whenever gapless resume can't be guaranteed (window exceeded, server restart, or a lagged consumer). New `[lsm].watch_replay_buffer_size` config key controls the ring size (`0` disables resume).
 
 ### Security
 

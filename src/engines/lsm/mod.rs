@@ -23,6 +23,6 @@ pub use reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegis
 pub use levels::LevelManager;
 pub use compaction::{CompactionConfig, CompactionJob};
 pub use janitor::{Janitor, JanitorConfig};
-pub use watcher::{OpType, WalEvent};
-pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta};
+pub use watcher::{OpType, WalEvent, WatchMessage, WATCH_TAG};
+pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta, WatchStart};
 pub use rate_limiter::{DomainQuota, RateLimiter, TokenBucket};

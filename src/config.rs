@@ -354,6 +354,11 @@ pub struct DomainsConfig {
     pub default_domain: String,
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
+    /// Cap on the number of keys a single `DELETE …/keys?prefix=` bulk
+    /// delete (spec kv/023) may remove; a larger selection is rejected with
+    /// 413 and nothing is deleted. `0` rejects every non-empty selection —
+    /// not treated as "unlimited".
+    pub max_bulk_delete_keys: usize,
 }
 
 impl Default for DomainsConfig {
@@ -364,6 +369,7 @@ impl Default for DomainsConfig {
             default_domain: "default".to_string(),
             purger_batch_size: 100,
             purger_interval_secs: 5,
+            max_bulk_delete_keys: 10_000,
         }
     }
 }

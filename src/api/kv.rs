@@ -7,6 +7,7 @@
 //! PATCH  /store-api/kv/{domain}/keys/{key}/null     → set_null  (200 | 429)
 //! GET    /store-api/kv/{domain}/keys/{key}/meta     → get_key_meta (200 | 400 | 404 | 410 | 429)
 //! GET    /store-api/kv/{domain}/keys?prefix={p}     → scan_keys (200 | 429)
+//! DELETE /store-api/kv/{domain}/keys?prefix={p}&contains={s} → delete_keys_by_prefix (200 | 400 | 413 | 429 | 404 | 410)
 //! GET    /store-api/kv/{domain}/count?prefix={p}    → count_keys (200 | 429)
 //! GET    /store-api/kv/{domain}/watch?prefix={p}    → watch     (SSE stream)
 
@@ -38,6 +39,15 @@ pub struct TtlParams {
 #[derive(Deserialize)]
 pub struct ScanParams {
     pub prefix: Option<String>,
+}
+
+/// `prefix` is required and rejected empty-string (spec kv/023 §2) — plain
+/// `String`, not `Option`, so a missing `?prefix=` is an axum `Query`
+/// rejection (400) before the handler ever runs.
+#[derive(Deserialize)]
+pub struct BulkDeleteParams {
+    pub prefix: String,
+    pub contains: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -342,6 +352,47 @@ pub async fn scan_keys(
     let keys: Vec<String> =
         raw.into_iter().map(|k| String::from_utf8_lossy(&k).into_owned()).collect();
     Ok(Json(keys))
+}
+
+// ── BulkDeleteResponse DTO ───────────────────────────────────────────────────
+
+#[derive(Serialize, ToSchema)]
+pub struct BulkDeleteResponse {
+    pub deleted: usize,
+}
+
+#[utoipa::path(
+    delete,
+    path = "/store-api/kv/{domain}/keys",
+    params(
+        ("domain" = String, Path, description = "Domain name"),
+        ("prefix" = String, Query, description = "Key prefix — required, must not be empty. A domain-emptying request needs the admin-only DELETE /store-api/domains/{name} instead."),
+        ("contains" = Option<String>, Query, description = "Case-sensitive substring filter on the user key, applied to the prefix scan's results before the cap check"),
+    ),
+    responses(
+        (status = 200, description = "Matched keys deleted atomically (one write batch); an empty selection is a no-op", body = BulkDeleteResponse),
+        (status = 400, description = "Missing or empty prefix"),
+        (status = 413, description = "The selection exceeds max_bulk_delete_keys; no key was deleted"),
+        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
+        (status = 404, description = "Domain not found"),
+        (status = 410, description = "Domain is being deleted"),
+    ),
+    tag = "Key-Value Store"
+)]
+/// Deletes every live key whose raw form starts with `prefix`, optionally narrowed by a case-sensitive
+/// `contains` substring filter on the key — the same selection `GET …/keys?prefix=&contains=` would show.
+/// Atomic: either every matched key is gone, or (a 413) none is. Returns the number of keys deleted.
+pub async fn delete_keys_by_prefix(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+    Query(params): Query<BulkDeleteParams>,
+) -> Result<Json<BulkDeleteResponse>, ApiError> {
+    let store = resolve(&state, &domain).await?;
+    let deleted = store
+        .delete_by_prefix(params.prefix.as_bytes(), params.contains.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(BulkDeleteResponse { deleted }))
 }
 
 #[utoipa::path(
@@ -1104,6 +1155,294 @@ mod tests {
         let resp = send(&app, Method::GET, "/store-api/kv/testdom/count", Body::empty()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 10_000);
+    }
+
+    // ── Spec kv/023: prefix bulk-delete ──────────────────────────────────────
+
+    // Test 1: 5 keys sharing a prefix + 2 foreign keys -> deleting the prefix
+    // removes exactly the 5, the 2 foreign keys stay reachable via GET.
+    #[tokio::test]
+    async fn test_bulk_delete_by_prefix_deletes_matching_keeps_foreign() {
+        let (app, _dir) = make_app().await;
+        for i in 0..5 {
+            send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/del:{i}"), Body::from("v")).await;
+        }
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/keep:1", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/keep:2", Body::from("v")).await;
+
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=del:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 5);
+
+        for i in 0..5 {
+            let resp = send(&app, Method::GET, &format!("/store-api/kv/testdom/keys/del:{i}"), Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+        for k in ["keep:1", "keep:2"] {
+            let resp = send(&app, Method::GET, &format!("/store-api/kv/testdom/keys/{k}"), Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{k} must survive the prefix delete");
+        }
+    }
+
+    // Test 2: `contains` is case-sensitive — `contains=Log` matches
+    // `app:Log:1`, not `app:log:2`.
+    #[tokio::test]
+    async fn test_bulk_delete_contains_filter_is_case_sensitive() {
+        let (app, _dir) = make_app().await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/app:Log:1", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/app:log:2", Body::from("v")).await;
+
+        let resp =
+            send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=app:&contains=Log", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 1);
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/app:Log:1", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/app:log:2", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "lowercase key must survive a case-sensitive contains=Log");
+    }
+
+    // Test 3: an empty prefix is rejected (400) and the domain is unchanged —
+    // proof the endpoint can never be used to empty a whole domain.
+    #[tokio::test]
+    async fn test_bulk_delete_empty_prefix_400_domain_unchanged() {
+        let (app, _dir) = make_app().await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/k1", Body::from("v")).await;
+
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys", Body::empty()).await;
+        let keys: Vec<String> =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(keys, vec!["k1".to_string()], "domain must be unchanged after a rejected empty-prefix delete");
+    }
+
+    // Test 4: a missing `prefix` query param is an axum `Query` rejection (400).
+    #[tokio::test]
+    async fn test_bulk_delete_missing_prefix_400() {
+        let (app, _dir) = make_app().await;
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // Test 5: no matches -> 200 with deleted: 0 (no WAL record, idempotent).
+    #[tokio::test]
+    async fn test_bulk_delete_no_matches_returns_zero() {
+        let (app, _dir) = make_app().await;
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=ghost:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 0);
+    }
+
+    // Test 6: a selection over the configured cap -> 413 with both the match
+    // count and the limit in the error text, and nothing gets deleted.
+    #[tokio::test]
+    async fn test_bulk_delete_over_cap_413_nothing_deleted() {
+        let mut config = crate::engines::lsm::domain::DomainConfig::default();
+        config.max_bulk_delete_keys = 3;
+        let (app, _dir) = make_app_with_config(config).await;
+        for i in 0..5 {
+            send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/cap:{i}"), Body::from("v")).await;
+        }
+
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=cap:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains('5') && text.contains('3'), "expected both counts in the error, got {text}");
+
+        for i in 0..5 {
+            let resp = send(&app, Method::GET, &format!("/store-api/kv/testdom/keys/cap:{i}"), Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "cap:{i} must survive a rejected over-cap delete");
+        }
+    }
+
+    // Test 7: exactly `cap` matches -> success, not 413.
+    #[tokio::test]
+    async fn test_bulk_delete_exactly_at_cap_succeeds() {
+        let mut config = crate::engines::lsm::domain::DomainConfig::default();
+        config.max_bulk_delete_keys = 3;
+        let (app, _dir) = make_app_with_config(config).await;
+        for i in 0..3 {
+            send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/edge:{i}"), Body::from("v")).await;
+        }
+
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=edge:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 3);
+    }
+
+    // Test 8: the cap is checked AFTER the `contains` filter — more raw
+    // prefix hits than the cap, but the filtered set fits -> success, not a
+    // false 413.
+    #[tokio::test]
+    async fn test_bulk_delete_cap_checked_after_contains_filter() {
+        let mut config = crate::engines::lsm::domain::DomainConfig::default();
+        config.max_bulk_delete_keys = 2;
+        let (app, _dir) = make_app_with_config(config).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/f:x1", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/f:x2", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/f:y1", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/f:y2", Body::from("v")).await;
+
+        let resp =
+            send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=f:&contains=x", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "raw prefix hits exceed the cap, but the filtered set does not");
+        assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 2);
+    }
+
+    // Test 9 (spec §3.2 order): the write token is checked before the scan
+    // runs. `read_iops = 1` makes this provable — draining only the write
+    // bucket must 429 the bulk-delete without ever touching the sole read
+    // token, so a GET right after must still succeed.
+    #[tokio::test]
+    async fn test_bulk_delete_checks_write_token_before_scanning() {
+        let mut config = crate::engines::lsm::domain::DomainConfig::default();
+        config.default_read_iops = 1;
+        let (state, _dir) = make_state(config, false).await;
+        let store = state.registry.store("testdom").await.unwrap();
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/ord:1", Body::from("v")).await;
+
+        store.drain_write_budget_for_test();
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=ord:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "write check must run before the scan");
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/ord:1", Body::empty()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the sole read token must be untouched -- a scan-first bug would have consumed it"
+        );
+    }
+
+    // Test 10: a watch subscriber gets one `delete` event per deleted key —
+    // the same stream N individual DELETEs would have produced.
+    #[tokio::test]
+    async fn test_bulk_delete_fires_one_delete_event_per_key() {
+        let (app, _dir) = make_app().await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/w:1", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/w:2", Body::from("v")).await;
+
+        let watch_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/store-api/kv/testdom/watch?prefix=w:")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(watch_resp.status(), StatusCode::OK);
+
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=w:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 2);
+
+        // 2 delete events x 3 SSE fields each (id/event/data).
+        let fields = read_sse_fields(watch_resp.into_body(), 6, std::time::Duration::from_secs(5)).await;
+        let delete_count = fields.iter().filter(|(f, v)| f == "event" && v == "delete").count();
+        assert_eq!(delete_count, 2, "expected exactly 2 delete events, got {fields:?}");
+        let data_values: Vec<&str> = fields.iter().filter(|(f, _)| f == "data").map(|(_, v)| v.as_str()).collect();
+        assert!(data_values.contains(&"w:1") && data_values.contains(&"w:2"), "got {fields:?}");
+    }
+
+    // Test 12: a key in the NULL state (kv/018) is a live key -- it appears
+    // in the scan and gets deleted like any other; afterward it reads 404
+    // (deleted), never 204 (NULL-but-present).
+    #[tokio::test]
+    async fn test_bulk_delete_includes_null_state_keys() {
+        let (app, _dir) = make_app().await;
+        send(&app, Method::PATCH, "/store-api/kv/testdom/keys/n:1/null", Body::empty()).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/n:2", Body::from("v")).await;
+
+        let resp = send(&app, Method::DELETE, "/store-api/kv/testdom/keys?prefix=n:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 2);
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/n:1", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a deleted NULL-state key must read as 404, not 204");
+    }
+
+    // Test 13: auth scoping -- a Read-only grant is not enough (403), a
+    // Write grant is (200), and an admin passes regardless (200). DELETE is
+    // unconditionally a write per `is_write_request` (spec §5).
+    #[tokio::test]
+    async fn test_bulk_delete_auth_scoping() {
+        use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
+
+        let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), true).await;
+        let cache = Arc::clone(&state.auth_cache);
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+
+        cache
+            .upsert_user(UserRecord {
+                name: "reader".to_string(),
+                api_key_hash: hash_api_key("lura_test_bulk_reader"),
+                role: UserRole::User,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        cache
+            .set_permission(DomainPermission {
+                username: "reader".to_string(),
+                domain: "testdom".to_string(),
+                access: AccessLevel::Read,
+            })
+            .await
+            .unwrap();
+
+        cache
+            .upsert_user(UserRecord {
+                name: "writer".to_string(),
+                api_key_hash: hash_api_key("lura_test_bulk_writer"),
+                role: UserRole::User,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        cache
+            .set_permission(DomainPermission {
+                username: "writer".to_string(),
+                domain: "testdom".to_string(),
+                access: AccessLevel::Write,
+            })
+            .await
+            .unwrap();
+
+        cache
+            .upsert_user(UserRecord {
+                name: "admin".to_string(),
+                api_key_hash: hash_api_key("lura_test_bulk_admin"),
+                role: UserRole::Admin,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let req = |key: &str| {
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/store-api/kv/testdom/keys?prefix=a")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(req("lura_test_bulk_reader")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a read-only grant must not allow bulk delete");
+
+        let resp = app.clone().oneshot(req("lura_test_bulk_writer")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a write grant must allow bulk delete");
+
+        let resp = app.clone().oneshot(req("lura_test_bulk_admin")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "admin must always be allowed");
     }
 
     // ── Spec kv/024: watch event ids, resume & gap signal ───────────────────

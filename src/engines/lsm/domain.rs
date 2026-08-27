@@ -12,7 +12,7 @@
 //! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
 
 use crate::core::events::{GlobalEventBus, Resume};
-use crate::engines::lsm::engine::LsmStorageEngine;
+use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::engines::lsm::watcher::{WalEvent, WatchMessage};
@@ -44,6 +44,7 @@ pub struct DomainConfig {
     pub default_max_storage_bytes: u64,
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
+    pub max_bulk_delete_keys: usize,
 }
 
 impl Default for DomainConfig {
@@ -57,6 +58,7 @@ impl Default for DomainConfig {
             default_max_storage_bytes: 0,
             purger_batch_size: 100,
             purger_interval_secs: 5,
+            max_bulk_delete_keys: 10_000,
         }
     }
 }
@@ -395,6 +397,7 @@ impl DomainRegistry {
             engine: Arc::clone(&self.engine),
             runtime,
             max_user_key_len: self.config.max_user_key_length,
+            max_bulk_delete_keys: self.config.max_bulk_delete_keys,
             metrics: Arc::clone(&self.metrics),
         })
     }
@@ -416,6 +419,7 @@ pub struct DomainStore {
     engine: Arc<LsmStorageEngine>,
     runtime: Arc<DomainRuntime>,
     max_user_key_len: usize,
+    max_bulk_delete_keys: usize,
     metrics: Arc<MetricsStore>,
 }
 
@@ -591,12 +595,64 @@ impl DomainStore {
         Ok(self.engine.scan_keys(&full_prefix).await?.len() as u64)
     }
 
+    /// Deletes every live user-key matching `prefix`, optionally narrowed by
+    /// a case-sensitive `contains` substring filter on the user key (spec
+    /// kv/023). Order is binding (spec §3): the write token is checked
+    /// before the scan runs, so a request that will fail the write limit
+    /// never pays for scan work; the scan itself pulls its own read token
+    /// (`scan_keys`). Atomic — one `write_batch` call for the whole
+    /// selection, so either every matched key is gone or (on a cap
+    /// violation) none is.
+    pub async fn delete_by_prefix(&self, prefix: &[u8], contains: Option<&str>) -> Result<usize> {
+        anyhow::ensure!(!prefix.is_empty(), "400 Bad Request: prefix must not be empty");
+        if !self.runtime.rate_limiter.check_write() {
+            self.metrics.record_rate_limit_rejection(&self.domain.name);
+            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
+        }
+
+        let matched = self.scan_keys(prefix).await?;
+        let matched: Vec<Vec<u8>> = match contains {
+            // A non-UTF-8 key would be an invariant break (general/007
+            // guarantees UTF-8 keys) — skip it from the filtered match set
+            // rather than fail the whole request.
+            Some(needle) => matched
+                .into_iter()
+                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
+                .collect(),
+            None => matched,
+        };
+
+        anyhow::ensure!(
+            matched.len() <= self.max_bulk_delete_keys,
+            "413 Payload Too Large: {} keys match the selection, limit is {}",
+            matched.len(),
+            self.max_bulk_delete_keys
+        );
+
+        let ops: Vec<BatchOp> =
+            matched.iter().map(|k| BatchOp::Delete { key: self.prefixed_key(k) }).collect();
+        let start = std::time::Instant::now();
+        self.engine.write_batch(ops).await?;
+        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        Ok(matched.len())
+    }
+
     /// Test-only: drains and locks this domain's read bucket so the next
     /// read deterministically answers 429 — no refill race no matter how
     /// slow the test runs (flaky-test fix, spec general/008 pattern).
     #[cfg(test)]
     pub fn drain_read_budget_for_test(&self) {
         self.runtime.rate_limiter.read_bucket.drain_for_test();
+    }
+
+    /// Test-only: write-bucket counterpart of
+    /// [`Self::drain_read_budget_for_test`] — used to prove the write-token
+    /// check in [`Self::delete_by_prefix`] runs before the scan (spec kv/023
+    /// §3.2): draining only the write bucket leaves the read bucket
+    /// untouched, so a following read still succeeds.
+    #[cfg(test)]
+    pub fn drain_write_budget_for_test(&self) {
+        self.runtime.rate_limiter.write_bucket.drain_for_test();
     }
 
     /// Restore-path upsert (spec general/006): same key validation as
@@ -1458,5 +1514,61 @@ mod tests {
         assert_eq!(purged.kind, "domain_purged");
         assert_eq!(purged.domain, "late-purge");
         shutdown.store(true, Ordering::Relaxed);
+    }
+
+    // ── Spec kv/023: prefix bulk-delete ──────────────────────────────────────
+
+    /// Reopens an `LsmStorageEngine` on `dir`'s existing WAL/VLog/SSTable
+    /// files (same file names as `make_setup`) — mirrors `engine.rs`'s own
+    /// `engine_on` test helper; needed here to prove `delete_by_prefix`'s
+    /// batch survives a real restart (spec kv/023 §8 test 11).
+    async fn reopen_engine(dir: &tempfile::TempDir) -> Arc<LsmStorageEngine> {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let fm = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let mm = Arc::new(ManifestManager::new(dir.path()));
+        Arc::new(
+            LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, fm, mm,
+                crate::engines::lsm::engine::LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    // Test 11: delete_by_prefix's write_batch is atomic across a restart —
+    // every key of the deleted selection stays gone after WAL recovery, the
+    // same property the existing engine-level write_batch tests prove
+    // (json/005), exercised here through the domain-scoped bulk-delete path.
+    #[tokio::test]
+    async fn test_delete_by_prefix_atomic_and_recovered() {
+        let (engine, registry, dir) = make_setup().await;
+        registry.create_domain("bulk-recover").await.unwrap();
+        let store = registry.store("bulk-recover").await.unwrap();
+        store.put(b"p:1", b"v1").await.unwrap();
+        store.put(b"p:2", b"v2").await.unwrap();
+        store.put(b"p:3", b"v3").await.unwrap();
+        store.put(b"other", b"vx").await.unwrap();
+
+        let deleted = store.delete_by_prefix(b"p:", None).await.unwrap();
+        assert_eq!(deleted, 3);
+
+        drop(store);
+        drop(registry);
+        drop(engine);
+
+        let engine2 = reopen_engine(&dir).await;
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let registry2 = DomainRegistry::recover(Arc::clone(&engine2), DomainConfig::default(), metrics)
+            .await
+            .unwrap();
+        let store2 = registry2.store("bulk-recover").await.unwrap();
+        assert_eq!(store2.get(b"p:1").await.unwrap(), GetResult::Absent);
+        assert_eq!(store2.get(b"p:2").await.unwrap(), GetResult::Absent);
+        assert_eq!(store2.get(b"p:3").await.unwrap(), GetResult::Absent);
+        assert_eq!(store2.get(b"other").await.unwrap(), GetResult::Present(b"vx".to_vec()));
     }
 }

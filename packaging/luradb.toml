@@ -61,6 +61,8 @@ max_user_key_length = 256
 default_domain = "default"
 purger_batch_size = 100
 purger_interval_secs = 5
+# Cap on keys removed by one DELETE …/keys?prefix= bulk delete (spec kv/023).
+max_bulk_delete_keys = 10000
 
 [rate_limit]
 default_read_iops = 1000

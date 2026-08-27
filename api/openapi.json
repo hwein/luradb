@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.6",
+    "version": "0.3.7",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -1625,6 +1625,78 @@
             }
           }
         }
+      },
+      "delete": {
+        "tags": [
+          "Key-Value Store"
+        ],
+        "summary": "Deletes every live key whose raw form starts with `prefix`, optionally narrowed by a case-sensitive\n`contains` substring filter on the key — the same selection `GET …/keys?prefix=&contains=` would show.\nAtomic: either every matched key is gone, or (a 413) none is. Returns the number of keys deleted.",
+        "operationId": "delete_keys_by_prefix",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Domain name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "description": "Key prefix — required, must not be empty. A domain-emptying request needs the admin-only DELETE /store-api/domains/{name} instead.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "contains",
+            "in": "query",
+            "description": "Case-sensitive substring filter on the user key, applied to the prefix scan's results before the cap check",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matched keys deleted atomically (one write batch); an empty selection is a no-op",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkDeleteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or empty prefix"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "410": {
+            "description": "Domain is being deleted"
+          },
+          "413": {
+            "description": "The selection exceeds max_bulk_delete_keys; no key was deleted"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/store-api/kv/{domain}/keys/{key}": {
@@ -3173,6 +3245,18 @@
           },
           "state": {
             "type": "string"
+          }
+        }
+      },
+      "BulkDeleteResponse": {
+        "type": "object",
+        "required": [
+          "deleted"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },

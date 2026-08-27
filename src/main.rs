@@ -122,6 +122,7 @@ fn build_engine_configs(
         default_max_storage_bytes: cfg.rate_limit.default_max_storage_bytes,
         purger_batch_size: cfg.domains.purger_batch_size,
         purger_interval_secs: cfg.domains.purger_interval_secs,
+        max_bulk_delete_keys: cfg.domains.max_bulk_delete_keys,
     };
     let metrics_config = MetricsConfig {
         window_secs: cfg.metrics.window_secs,

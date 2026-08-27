@@ -59,7 +59,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.6";
+pub const API_VERSION: &str = "0.3.7";
 
 struct VersionInfo;
 
@@ -138,7 +138,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         )
         .route("/kv/:domain/keys/:key/null", patch(kv::set_null))
         .route("/kv/:domain/keys/:key/meta", get(kv::get_key_meta))
-        .route("/kv/:domain/keys", get(kv::scan_keys))
+        .route("/kv/:domain/keys", get(kv::scan_keys).delete(kv::delete_keys_by_prefix))
         .route("/kv/:domain/count", get(kv::count_keys))
         .route("/kv/:domain/watch", get(kv::watch))
         // JSON document store (handlers answer 503 when the engine is disabled)
@@ -299,6 +299,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         kv::set_null,
         kv::get_key_meta,
         kv::scan_keys,
+        kv::delete_keys_by_prefix,
         kv::count_keys,
         kv::watch,
         // JSON domains
@@ -369,6 +370,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             domains::CreateDomainRequest,
             domains::DomainResponse,
             kv::KeyMetaResponse,
+            kv::BulkDeleteResponse,
             CountResponse,
             json_domains::CreateJsonDomainRequest,
             json_domains::JsonDomainResponse,

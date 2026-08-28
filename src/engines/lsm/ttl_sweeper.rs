@@ -59,7 +59,7 @@ impl TtlSweeper {
         // 1./2. One freeze check, then pin — after this the tick never causes
         // a freeze itself, so no tombstone can land in a newer source than a
         // concurrent write to the same key (§4.2).
-        self.engine.maybe_freeze_memtable()?;
+        self.engine.maybe_freeze_memtable().await?;
         let memtable = self.engine.pin_memtable();
 
         // 3. Candidate scan above the cursor (superset, no vLog access).

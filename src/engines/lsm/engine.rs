@@ -308,14 +308,19 @@ pub struct LsmStorageEngine {
     /// (spec perf/009 §4) rebuilds on this event in addition to its interval.
     flush_notify: Arc<Notify>,
 
-    /// In-flight guard for the vLog-pointer-creating write sequence (spec
-    /// kv/020). Writers hold the `read()` side from the active-generation
-    /// fetch through `memtable.set`; the Janitor's flush barrier drains by
-    /// taking `write()` once and dropping it immediately. `tokio::sync::RwLock`
-    /// is task-fair (write-preferring), so the drain waits only for guards
-    /// already in flight, never for ones started after it — no starvation
-    /// under sustained write load, and no deadlock: the drain holds no other
-    /// lock a writer needs while it waits.
+    /// In-flight guard for the client write sequence (spec kv/020, widened by
+    /// kv/029). Every client write path holds the `read()` side from before its
+    /// timestamp through `memtable.set`; every production MemTable rotation
+    /// drains by taking `write()` and holding it across the swap. Two
+    /// guarantees follow: no vLog pointer into a generation the Janitor just
+    /// sealed is still on its way into a MemTable (kv/020), and no rotation
+    /// falls between a writer's stamp and its apply, which would strand an
+    /// older stamp in the newer MemTable (kv/029). `tokio::sync::RwLock` is
+    /// task-fair (write-preferring), so a drain waits only for guards already
+    /// in flight, never for ones started after it — no starvation under
+    /// sustained write load, and no deadlock: the drain holds no other lock a
+    /// writer needs while it waits, and no write path drains while holding its
+    /// own read guard.
     in_flight_writes: tokio::sync::RwLock<()>,
 }
 
@@ -640,21 +645,27 @@ impl LsmStorageEngine {
     /// vLog pointer MemTable-resident. Used by the Janitor's flush barrier.
     pub async fn flush_all_memtables(&self) -> Result<()> {
         // Drain (spec kv/020). Order anchor: Seal (Janitor, before it calls this
-        // barrier) -> Drain (here) -> Freeze/Flush (below). Taking and instantly
-        // dropping the write side waits out every pointer-write that acquired
-        // its read guard before this point -- each has, by the time it releases
-        // the guard, already applied its `memtable.set`. Combined with the
-        // preceding seal (no *new* pointer into the sealed generations can
-        // appear), every live pointer into a sealed generation is now
-        // MemTable-resident and gets picked up by the freeze/flush below.
-        drop(self.in_flight_writes.write().await);
-
-        let frozen = {
-            let mut mt = self.memtable.write();
-            std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
-        };
-        if !frozen.is_empty() {
-            self.immutable_memtables.write().push(frozen);
+        // barrier) -> Drain (here) -> Freeze/Flush (below). The write side waits
+        // out every write that acquired its read guard before this point -- each
+        // has, by the time it releases the guard, already applied its
+        // `memtable.set`. Combined with the preceding seal (no *new* pointer
+        // into the sealed generations can appear), every live pointer into a
+        // sealed generation is now MemTable-resident and gets picked up by the
+        // freeze/flush below.
+        //
+        // Held across the rotation instead of dropped right after the wait
+        // (spec kv/029): a writer admitted in between could draw its stamp
+        // before the swap and apply it after, stranding an older stamp in the
+        // new MemTable. Everything below the guard is synchronous -- no await.
+        {
+            let _drain = self.in_flight_writes.write().await;
+            let frozen = {
+                let mut mt = self.memtable.write();
+                std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
+            };
+            if !frozen.is_empty() {
+                self.immutable_memtables.write().push(frozen);
+            }
         }
         while !self.immutable_memtables.read().is_empty() {
             self.flush_memtable().await?;
@@ -850,10 +861,21 @@ impl LsmStorageEngine {
 
     // ── Write path helpers ──────────────────────────────────────────────────
 
-    pub(super) fn maybe_freeze_memtable(&self) -> Result<()> {
+    /// Rotates the active MemTable once it reached the size threshold.
+    ///
+    /// Drains in-flight writes first and holds the drain across the swap (spec
+    /// kv/029): every writer that already drew its stamp has applied it before
+    /// the rotation, every later one stamps after it. Otherwise a slow writer
+    /// could apply its older stamp into the fresh MemTable — a newer source
+    /// holding an older version, which the source-ordered read path resolves
+    /// the wrong way round. Must never run under this engine's own
+    /// `in_flight_writes` read guard (self-deadlock); the write paths therefore
+    /// call it before acquiring theirs.
+    pub(super) async fn maybe_freeze_memtable(&self) -> Result<()> {
         let threshold = self.engine_config.memtable_size_threshold;
         let size = { self.memtable.read().approximate_size() };
         if size >= threshold {
+            let _drain = self.in_flight_writes.write().await;
             let mut mt = self.memtable.write();
             let mut imm = self.immutable_memtables.write();
             if mt.approximate_size() >= threshold {
@@ -879,6 +901,18 @@ impl LsmStorageEngine {
     /// ones are stored inline. `expire_at` is an absolute Unix timestamp (seconds)
     /// for TTL; `None` or `0` means no expiry.
     pub(super) async fn write_kv_pair(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
+        // Freeze check first (spec kv/029): its drain takes the write side of
+        // `in_flight_writes`, which would deadlock under the guard below.
+        self.maybe_freeze_memtable().await?;
+
+        // In-flight guard (spec kv/020, widened by kv/029): held from before
+        // the stamp through `memtable.set`, so no rotation can fall into that
+        // window and no pointer into a generation the Janitor just sealed is
+        // still on its way into a MemTable. Inline values carry no generation
+        // but need the guard all the same — the stamp ordering applies to
+        // every write.
+        let _guard = self.in_flight_writes.read().await;
+
         let timestamp = self.next_timestamp();
         let expire_at_val = expire_at.unwrap_or(0);
 
@@ -896,23 +930,11 @@ impl LsmStorageEngine {
         // Broadcast after WAL is durable (sync_all already called inside wal.append).
         self.publish_change(key, OpType::Set);
 
-        self.maybe_freeze_memtable()?;
-
-        // Resolve the value before touching the MemTable (like `write_batch`):
-        // a MemTable captured *before* the vLog append could be frozen and
-        // flushed meanwhile, which would drop the entry.
-        //
-        // In-flight guard (spec kv/020): held from the active-generation fetch
-        // through `memtable.set` below, so the Janitor's flush-barrier drain
-        // cannot complete while a pointer into a generation it just sealed is
-        // still on its way into a MemTable. Inline values carry no generation,
-        // so they need no guard.
-        let (resolved, _guard) = if value.len() >= self.engine_config.vlog_inline_threshold {
-            let guard = self.in_flight_writes.read().await;
+        let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
             let (file_id, offset) = append_to_active(&self.vlog, value).await?;
-            (Value::Pointer { file_id, offset, len: value.len(), expire_at }, Some(guard))
+            Value::Pointer { file_id, offset, len: value.len(), expire_at }
         } else {
-            (Value::Inline(value.to_vec(), expire_at), None)
+            Value::Inline(value.to_vec(), expire_at)
         };
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, resolved);
@@ -933,6 +955,11 @@ impl LsmStorageEngine {
 
     /// Appends a DELETE entry to the WAL and inserts a tombstone into the MemTable.
     pub(super) async fn write_tombstone(&self, key: &[u8]) -> Result<()> {
+        // Freeze check before the guard, then guard before the stamp — see
+        // `write_kv_pair` (spec kv/029).
+        self.maybe_freeze_memtable().await?;
+        let _guard = self.in_flight_writes.read().await;
+
         let timestamp = self.next_timestamp();
 
         self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
@@ -940,10 +967,8 @@ impl LsmStorageEngine {
         // Broadcast after WAL is durable.
         self.publish_change(key, OpType::Delete);
 
-        self.maybe_freeze_memtable()?;
-
-        // Pinned only here, after the WAL append: pulling it forward would
-        // stretch this path's inversion window to a whole fsync (spec kv/025 §3.2).
+        // Still pinned after the WAL append; the guard above now closes the
+        // inversion window this placement only narrowed (spec kv/025 §3.2).
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
         Ok(())
@@ -981,6 +1006,11 @@ impl LsmStorageEngine {
     /// visible and overwrites older versions like a Put. Writes without
     /// expiry (`set_null` never carries a TTL).
     pub(super) async fn write_null(&self, key: &[u8]) -> Result<()> {
+        // Freeze check before the guard, then guard before the stamp — see
+        // `write_kv_pair` (spec kv/029).
+        self.maybe_freeze_memtable().await?;
+        let _guard = self.in_flight_writes.read().await;
+
         let timestamp = self.next_timestamp();
 
         // WAL entry: [type=4][ts:u64][key_len:u32][key] — type 3 is already
@@ -994,8 +1024,6 @@ impl LsmStorageEngine {
 
         // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
         self.publish_change(key, OpType::Set);
-
-        self.maybe_freeze_memtable()?;
 
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Null);
@@ -1086,21 +1114,23 @@ impl LsmStorageEngine {
             return Ok(());
         }
         self.validate_batch_ops(&ops)?;
+
+        // Freeze check before the guard (spec kv/029) — see `write_kv_pair`.
+        self.maybe_freeze_memtable().await?;
+
+        // In-flight guard (spec kv/020, widened by kv/029), held across the
+        // whole batch: batches are bounded, so one guard per batch is simpler
+        // than tracking which individual ops end up pointer-creating. Acquired
+        // before the shared stamp and held through every `memtable.set` in
+        // Phase 2 below.
+        let _guard = self.in_flight_writes.read().await;
+
         let timestamp = self.next_timestamp();
 
         let log_entry = Self::encode_batch_wal_record(timestamp, &ops);
         self.wal.append(&log_entry).await?;
 
         self.broadcast_batch_events(&ops);
-
-        self.maybe_freeze_memtable()?;
-
-        // In-flight guard (spec kv/020), held across the whole batch: batches
-        // are bounded, so one guard per batch is simpler than tracking which
-        // individual ops end up pointer-creating. Acquired before Phase 1's
-        // first `vlog.active()` fetch and held through every `memtable.set`
-        // in Phase 2 below.
-        let _guard = self.in_flight_writes.read().await;
 
         // Phase 1 (fallible): offload large values to the vLog BEFORE any
         // MemTable mutation — a vLog error must not leave the batch
@@ -1284,6 +1314,9 @@ impl LsmStorageEngine {
     // ── Flush ───────────────────────────────────────────────────────────────
 
     /// Test-only: freezes the active MemTable so `flush_memtable` persists it.
+    /// Deliberately without the in-flight drain every production rotation runs
+    /// (spec kv/029 §Verifikationspflicht 2) — it is the lever tests use to
+    /// build the stranded-stamp state the drain now prevents.
     #[cfg(test)]
     pub fn freeze_active_memtable(&self) {
         let mut mt = self.memtable.write();
@@ -1774,6 +1807,27 @@ mod tests {
         LsmStorageEngine::new(
             wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
             LsmEngineOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Like `engine_on`, but with a custom MemTable freeze threshold (spec
+    /// kv/029 tests). `approximate_size` counts 256 bytes per entry, so a
+    /// threshold of 256 rotates on every write after the first.
+    async fn engine_with_threshold(dir: &tempfile::TempDir, threshold: usize) -> LsmStorageEngine {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        LsmStorageEngine::new(
+            wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+            LsmEngineOptions {
+                engine: LsmEngineConfig { memtable_size_threshold: threshold, ..Default::default() },
+                ..Default::default()
+            },
         )
         .await
         .unwrap()
@@ -3220,6 +3274,123 @@ mod tests {
             .await
             .expect("drain must complete promptly once the guard is released")
             .unwrap();
+    }
+
+    /// Highest-stamped version of `user_key` across the active and all
+    /// immutable MemTables -- the stamp-ordered oracle the source-ordered read
+    /// path has to agree with (spec kv/029). Inline values only; its callers
+    /// write no pointers.
+    fn newest_memtable_version(engine: &LsmStorageEngine, user_key: &[u8]) -> Option<(u64, Vec<u8>)> {
+        let mut sources = vec![Arc::clone(&*engine.memtable.read())];
+        sources.extend(engine.immutable_memtables.read().iter().cloned());
+
+        let mut newest: Option<(u64, Vec<u8>)> = None;
+        for memtable in &sources {
+            for (encoded_key, value) in memtable.iter() {
+                if InternalKey::extract_user_key(&encoded_key) != Some(user_key) {
+                    continue;
+                }
+                let Some(stamp) = InternalKey::extract_timestamp(&encoded_key) else { continue };
+                let stamp = stamp.as_u64();
+                let beats = match &newest {
+                    Some((best, _)) => stamp > *best,
+                    None => true,
+                };
+                if beats {
+                    if let Value::Inline(bytes, _) = value {
+                        newest = Some((stamp, bytes));
+                    }
+                }
+            }
+        }
+        newest
+    }
+
+    // Spec kv/029 test 1, before-state: the point read resolves by source, not
+    // by stamp, so an older stamp in the newer MemTable wins over the newer
+    // version below it. Built with the test-only rotation lever (the one
+    // rotation without a drain) because no production path can produce this
+    // state any more -- it pins down exactly what the write barrier prevents.
+    #[tokio::test]
+    async fn test_older_stamp_in_newer_memtable_wins_by_source_order() {
+        let (engine, _dir) = make_engine().await;
+
+        // Writer B: newer stamp, applied into the MemTable that is frozen next.
+        let newer = engine.next_timestamp();
+        engine.memtable.read().set(b"k".to_vec(), newer, Value::Inline(b"newer".to_vec(), None));
+
+        engine.freeze_active_memtable();
+
+        // Writer A: stamp drawn before the rotation, applied after it.
+        let older = Timestamp::new(newer.as_u64() - 1);
+        engine.memtable.read().set(b"k".to_vec(), older, Value::Inline(b"older".to_vec(), None));
+
+        assert_eq!(
+            engine.get(b"k").await.unwrap(),
+            Some(b"older".to_vec()),
+            "first hit decides: the newer source wins even with the older stamp"
+        );
+    }
+
+    // Spec kv/029 test 1, after-state: concurrent writers on one key with a
+    // threshold that rotates on nearly every write. The read must always
+    // resolve to the newest stamp the engine holds -- what the source-ordered
+    // read path can only deliver while the freeze barrier holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_writes_across_freezes_never_strand_an_older_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(engine_with_threshold(&dir, 256).await);
+
+        for round in 0..20u32 {
+            let key = format!("k{round}");
+            let writers: Vec<_> = (0..4u32)
+                .map(|w| {
+                    let engine = Arc::clone(&engine);
+                    let key = key.clone();
+                    tokio::spawn(async move {
+                        engine.put(key.as_bytes(), format!("v{w}").as_bytes()).await.unwrap();
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.await.unwrap();
+            }
+
+            let (stamp, newest) = newest_memtable_version(&engine, key.as_bytes())
+                .expect("every round writes its key into a MemTable");
+            assert_eq!(
+                engine.get(key.as_bytes()).await.unwrap(),
+                Some(newest),
+                "round {round}: the read must return the version stamped {stamp}"
+            );
+        }
+    }
+
+    // Spec kv/029 test 2: a held writer guard blocks the freeze until the
+    // in-flight apply is through; afterwards the rotation goes ahead. Same
+    // shape as the kv/020 drain test, now for the regular freeze path.
+    #[tokio::test]
+    async fn test_freeze_waits_for_held_writer_guard_then_rotates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_with_threshold(&dir, 256).await;
+        engine.put(b"k", b"v").await.unwrap();
+        assert!(engine.immutable_memtables.read().is_empty(), "the first write does not rotate");
+
+        // Simulates a write that has drawn its stamp and not applied it yet.
+        let guard = engine.in_flight_writes.read().await;
+
+        let blocked = tokio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable()).await;
+        assert!(blocked.is_err(), "the freeze must wait while a writer guard is held");
+        assert!(engine.immutable_memtables.read().is_empty(), "nothing rotated under the held guard");
+
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable())
+            .await
+            .expect("the freeze must proceed once the guard is released")
+            .unwrap();
+        assert_eq!(engine.immutable_memtables.read().len(), 1, "the rotation happened after the drain");
+        assert!(engine.memtable.read().is_empty(), "the active MemTable is fresh");
     }
 
     // Spec kv/020 tests 2+3: sharpens test_gc_keeps_values_written_concurrently

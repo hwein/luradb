@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.12",
+    "version": "0.4.0",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -1413,6 +1413,16 @@
               }
             }
           },
+          "400": {
+            "description": "Reserved top-level field (_key, _version, _content)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Domain not found",
             "content": {
@@ -1678,7 +1688,7 @@
             }
           },
           "400": {
-            "description": "Invalid key, invalid If-Match or If-None-Match header, or both headers set together",
+            "description": "Invalid key, reserved top-level field (_key, _version, _content), invalid If-Match or If-None-Match header, or both headers set together",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1829,7 +1839,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Streams all documents of a domain as NDJSON without full buffering.",
+        "summary": "Streams all documents of a domain as NDJSON without full buffering. A\ndocument written before json/017 that still carries a top-level\n`_key`/`_version`/`_content` field exports lossy, same as before — no\nmigration reshapes existing data.",
         "operationId": "export_documents",
         "parameters": [
           {

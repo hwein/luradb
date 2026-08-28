@@ -33,8 +33,8 @@ use crate::storage::manifest::ManifestManager;
 use crate::storage::vlog::VLog;
 use anyhow::Result;
 use document::{
-    doc_key, generate_uuid_v4, new_generation, validate_document_key, StoredDocument,
-    DOC_KEY_OVERHEAD,
+    doc_key, generate_uuid_v4, new_generation, reject_reserved_fields, validate_document_key,
+    StoredDocument, DOC_KEY_OVERHEAD,
 };
 use domain::JsonDomainRegistry;
 use index::IndexRegistry;
@@ -308,6 +308,7 @@ impl JsonEngine {
         domain: &str,
         content: Value,
     ) -> Result<Document, JsonStoreError> {
+        reject_reserved_fields(&content)?;
         let key = generate_uuid_v4();
         let _guard = self.doc_write_locks[Self::shard(domain, &key)].lock().await;
         let dom = self.domains.require_active(domain)?;
@@ -346,6 +347,7 @@ impl JsonEngine {
         precondition: Option<Precondition>,
     ) -> Result<Document, JsonStoreError> {
         validate_document_key(key, self.max_document_key_length)?;
+        reject_reserved_fields(&content)?;
         let _guard = self.doc_write_locks[Self::shard(domain, key)].lock().await;
         let dom = self.domains.require_active(domain)?;
         let old = self.read_stored(&dom, key).await?;
@@ -718,6 +720,30 @@ mod tests {
         let (json, _dir) = make_engine().await;
         let err = json.put_document("default", "a:b", json!({})).await.unwrap_err();
         assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+    }
+
+    // 10b. A document with a reserved top-level field smuggled in before
+    //      this check existed (direct write_batch, bypassing
+    //      create_document/put_document_with_version) stays readable via
+    //      get_document -- overshadowed, no new read error (spec json/017
+    //      §3 test 6; no migration/scan step for existing data).
+    #[tokio::test]
+    async fn test_legacy_document_with_reserved_field_stays_readable() {
+        let (json, _dir) = make_engine().await;
+        let dom = json.get_domain("default").unwrap();
+        let stored = StoredDocument {
+            version: 1,
+            generation: new_generation(),
+            content: json!({"_key": "smuggled", "x": 1}),
+        };
+        let payload = serde_json::to_vec(&stored).unwrap();
+        json.engine()
+            .write_batch(vec![BatchOp::Put { key: doc_key(&dom.system_prefix, "legacy"), value: payload }])
+            .await
+            .unwrap();
+
+        let fetched = json.get_document("default", "legacy").await.unwrap().unwrap();
+        assert_eq!(fetched.content, json!({"_key": "smuggled", "x": 1}));
     }
 
     // 11. Domain create → get_domain returns it.

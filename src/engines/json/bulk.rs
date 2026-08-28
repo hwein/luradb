@@ -3,7 +3,7 @@
 
 use super::document::{
     doc_key, doc_scan_prefix, generate_uuid_v4, new_generation, parse_doc_key,
-    validate_document_key, Document, StoredDocument,
+    reject_reserved_fields, validate_document_key, Document, StoredDocument,
 };
 use super::error::JsonStoreError;
 use super::JsonEngine;
@@ -82,6 +82,11 @@ impl JsonEngine {
         let dom = self.domains.require_active(domain)?;
         let mut ops: Vec<BatchOp> = Vec::new();
         for (key, content) in batch {
+            if let Err(e) = reject_reserved_fields(&content) {
+                result.failed += 1;
+                result.errors.push((key, e.to_string()));
+                continue;
+            }
             let old = self.read_stored(&dom, &key).await?;
             let (generation, version) = match &old {
                 Some(o) => (o.generation, o.version + 1),
@@ -459,25 +464,59 @@ mod tests {
         assert_eq!(docs[0].key.len(), 36, "generated key must be a UUID");
     }
 
-    // 8. Roundtrip: NDJSON load → export → identical content.
+    // 8. Roundtrip: NDJSON load → export → identical content, including an
+    //    underscore-prefixed user field that is not a reserved name (_foo)
+    //    and a non-object document (spec json/017 test 5: every acceptable
+    //    document survives export → re-import unchanged).
     #[tokio::test]
     async fn test_ndjson_roundtrip() {
         let (json, _dir) = make_engine_with_batch(100).await;
         let ndjson = concat!(
             "{\"_key\": \"r1\", \"city\": \"Essen\", \"n\": 1}\n",
             "{\"_key\": \"r2\", \"city\": \"Berlin\", \"n\": 2}\n",
+            "{\"_key\": \"r3\", \"_foo\": \"bar\"}\n",
+            "{\"_key\": \"r4\", \"_content\": 99}\n",
         );
         let result = json.bulk_load_ndjson("default", ndjson).await.unwrap();
-        assert_eq!(result.imported, 2);
+        assert_eq!(result.imported, 4);
         assert_eq!(result.failed, 0);
 
         let stream = json.bulk_export("default").await.unwrap();
         let lines: Vec<String> = stream.map(|d| document_to_ndjson_line(&d)).collect().await;
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 4);
         let reparsed: Vec<(Option<String>, Value)> =
             lines.iter().map(|l| parse_ndjson_line(l).unwrap()).collect();
         assert!(reparsed.contains(&(Some("r1".to_string()), json!({"city": "Essen", "n": 1}))));
         assert!(reparsed.contains(&(Some("r2".to_string()), json!({"city": "Berlin", "n": 2}))));
+        assert!(reparsed.contains(&(Some("r3".to_string()), json!({"_foo": "bar"}))));
+        assert!(reparsed.contains(&(Some("r4".to_string()), json!(99))));
+    }
+
+    // 8b. A leftover reserved field after meta-extraction is rejected as a
+    //     per-line import error; other lines still import (spec json/017 §1
+    //     test 4). Line 1: after `_key` extraction the map is
+    //     {"_content":1,"x":2} -- length 2, so the `_content`-unwrap rule
+    //     (map.len() == 1) does not fire and `_content` survives as a
+    //     leftover user field.
+    #[tokio::test]
+    async fn test_bulk_load_rejects_leftover_reserved_field() {
+        let (json, _dir) = make_engine_with_batch(100).await;
+        let ndjson = concat!(
+            "{\"_key\":\"a\",\"_content\":1,\"x\":2}\n",
+            "{\"_key\":\"b\",\"city\":\"Essen\"}\n",
+        );
+        let result = json.bulk_load_ndjson("default", ndjson).await.unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].0, "a", "error must name the key");
+        assert!(
+            result.errors[0].1.contains("field '_content'"),
+            "error must name the field: {}",
+            result.errors[0].1
+        );
+        assert!(json.get_document("default", "b").await.unwrap().is_some());
+        assert!(json.get_document("default", "a").await.unwrap().is_none());
     }
 
     // 9. A key within max_document_key_length but too long for the composite

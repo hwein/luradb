@@ -33,6 +33,7 @@ impl From<JsonStoreError> for ApiError {
             JsonStoreError::DomainAlreadyExists(_) => StatusCode::CONFLICT,
             JsonStoreError::InvalidDomainName(_) => StatusCode::BAD_REQUEST,
             JsonStoreError::InvalidKey(_) => StatusCode::BAD_REQUEST,
+            JsonStoreError::ReservedField { .. } => StatusCode::BAD_REQUEST,
             JsonStoreError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             JsonStoreError::IndexAlreadyExists { .. } => StatusCode::CONFLICT,
             // Deleting a missing index is a 404; the search handler
@@ -237,6 +238,7 @@ fn parse_precondition(headers: &HeaderMap) -> Result<Option<Precondition>, ApiEr
     request_body = Object,
     responses(
         (status = 201, description = "Document created with generated UUIDv4 key", body = DocumentResponse),
+        (status = 400, description = "Reserved top-level field (_key, _version, _content)", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
         (status = 413, description = "Payload too large", body = String, content_type = "text/plain"),
@@ -268,7 +270,7 @@ pub async fn create_document(
     responses(
         (status = 200, description = "Document updated", body = DocumentResponse),
         (status = 201, description = "Document created", body = DocumentResponse),
-        (status = 400, description = "Invalid key, invalid If-Match or If-None-Match header, or both headers set together", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid key, reserved top-level field (_key, _version, _content), invalid If-Match or If-None-Match header, or both headers set together", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found, or If-Match on missing document", body = String, content_type = "text/plain"),
         (status = 409, description = "Version conflict (If-Match mismatch)", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
@@ -633,7 +635,10 @@ pub async fn bulk_load(
     ),
     tag = "JSON Document Store"
 )]
-/// Streams all documents of a domain as NDJSON without full buffering.
+/// Streams all documents of a domain as NDJSON without full buffering. A
+/// document written before json/017 that still carries a top-level
+/// `_key`/`_version`/`_content` field exports lossy, same as before — no
+/// migration reshapes existing data.
 pub async fn export_documents(
     State(state): State<AppState>,
     Path(domain): Path<String>,
@@ -1638,5 +1643,64 @@ mod tests {
         let body = String::from_utf8_lossy(&bytes);
         assert!(!body.is_empty(), "404 body must not be empty");
         assert!(serde_json::from_str::<Value>(&body).is_err(), "body must be plain text, not JSON: {body}");
+    }
+
+    // 26. Reserved top-level fields (_key/_version/_content) are rejected
+    //     with 400 naming the field, for both POST and PUT; nothing ends up
+    //     stored (spec json/017 test 1).
+    #[tokio::test]
+    async fn test_reserved_top_level_field_rejected_on_write() {
+        let (app, _dir) = make_app(true).await;
+        for field in ["_key", "_version", "_content"] {
+            let body = format!(r#"{{"{field}": 1, "x": 2}}"#);
+
+            let (status, resp) =
+                request(&app, Method::POST, "/store-api/json/default/documents", Some(&body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
+            assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
+
+            let uri = format!("/store-api/json/default/documents/reserved{field}");
+            let (status, resp) = request(&app, Method::PUT, &uri, Some(&body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
+            assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
+            let (status, _) = request(&app, Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{field}: rejected PUT must not store anything");
+        }
+
+        let (status, body) = request(&app, Method::GET, "/store-api/json/default/documents/count", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["count"],
+            json!(0),
+            "no rejected POST must have stored anything either"
+        );
+    }
+
+    // 27. A reserved name nested under a user field collides with nothing
+    //     and stays allowed (spec json/017 §Entscheid: top-level only).
+    #[tokio::test]
+    async fn test_nested_reserved_field_name_allowed() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/nested";
+        let (status, body) = request(&app, Method::PUT, uri, Some(r#"{"a": {"_key": 1}}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["a"], json!({"_key": 1}), "{body}");
+    }
+
+    // 28. Non-object documents stay accepted unchanged -- the new
+    //     reserved-field check only looks at top-level object keys (spec
+    //     json/017 test 3; the `42` case is already covered by test 24's
+    //     json/015 _content-wrap regression).
+    #[tokio::test]
+    async fn test_non_object_documents_still_accepted() {
+        let (app, _dir) = make_app(true).await;
+        for (i, body) in [r#""text""#, "[1,2]"].into_iter().enumerate() {
+            let uri = format!("/store-api/json/default/documents/scalar{i}");
+            let (status, resp) = request(&app, Method::PUT, &uri, Some(body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}: {resp}");
+        }
     }
 }

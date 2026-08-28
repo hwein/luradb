@@ -867,6 +867,67 @@ mod tests {
         assert_eq!(found.total, 1, "search over the restored index must find the restored document");
     }
 
+    // 2b. Restore: an archive line for a legacy document that still carries
+    //     a reserved top-level field (the kind of pre-json/017 data a live
+    //     write can no longer produce) counts as a per-line restore failure;
+    //     the rest of the domain restores normally (spec json/017 §3 test 8).
+    #[tokio::test]
+    async fn test_restore_rejects_legacy_document_with_reserved_field() {
+        let (_engine, kv, _d1) = make_kv_registry().await;
+        let (json_src, _d2) = make_json_engine().await;
+        json_src.create_domain("legacy").await.unwrap();
+        json_src.put_document("legacy", "ok", json!({"n": 1})).await.unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let json_src_opt = Some(Arc::clone(&json_src));
+        let path = make_backup(
+            out_dir.path(),
+            "bk_legacy",
+            BackupScope::JsonDomain("legacy".to_string()),
+            false,
+            &kv,
+            &json_src_opt,
+        )
+        .await;
+
+        // Inject a second "doc" line with a reserved top-level field
+        // directly into the archive and reseal the checksum -- exactly the
+        // kind of document a live write can no longer produce.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut body: Vec<String> = content
+            .lines()
+            .take_while(|l| !l.contains("\"t\":\"checksum\""))
+            .map(String::from)
+            .collect();
+        let bad_doc = json!({
+            "t": "doc", "domain": "legacy", "key": "bad", "version": 1,
+            "content": {"_key": "smuggled", "n": 2},
+        });
+        body.push(bad_doc.to_string());
+        reseal(&path, &body);
+
+        let (json_dst, _d3) = make_json_engine().await;
+        let json_dst_opt = Some(Arc::clone(&json_dst));
+        let outcome = run_restore(RestoreParams {
+            dir: out_dir.path(),
+            backup_id: "bk_legacy",
+            mode: RestoreMode::FailIfExists,
+            into_domain: None,
+            include_auth: false,
+            kv_registry: &kv,
+            json_engine: &json_dst_opt,
+            scan_batch_size: 500,
+            scan_pause_ms: 0,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.imported, 1, "the clean document still restores");
+        assert_eq!(outcome.failed, 1, "the reserved-field document is a restore failure, not a crash");
+        assert!(json_dst.get_document("legacy", "ok").await.unwrap().is_some());
+        assert!(json_dst.get_document("legacy", "bad").await.unwrap().is_none());
+    }
+
     // 3. Roundtrip: domain:<name> touches both engines.
     #[tokio::test]
     async fn test_roundtrip_domain_scope_both_engines() {

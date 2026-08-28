@@ -31,6 +31,8 @@ pub enum JsonStoreError {
     VersionConflict { expected: String, actual: String },
     #[error("invalid document key: {0}")]
     InvalidKey(String),
+    #[error("field '{field}' is reserved (_key, _version, _content are store metadata)")]
+    ReservedField { field: String },
     #[error("payload of {size} bytes exceeds maximum of {max} bytes")]
     PayloadTooLarge { size: usize, max: usize },
     #[error("serialization error: {0}")]

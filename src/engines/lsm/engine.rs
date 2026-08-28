@@ -2483,7 +2483,17 @@ mod tests {
         engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
         engine.put(b"user:2", b"bob").await.unwrap();
         wait_past_ttl(1).await;
-        let keys = engine.scan_keys(b"user:").await.unwrap();
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and the scan's own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut keys = engine.scan_keys(b"user:").await.unwrap();
+        for _ in 0..100 {
+            if !keys.contains(&b"user:1".to_vec()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            keys = engine.scan_keys(b"user:").await.unwrap();
+        }
         assert!(!keys.contains(&b"user:1".to_vec()));
         assert!(keys.contains(&b"user:2".to_vec()));
     }

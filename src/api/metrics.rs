@@ -100,6 +100,12 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 /// second is excluded). A disabled engine still gets its block, all zero —
 /// `0` for a latency percentile means no op landed in the window, not an
 /// unmeasurably fast one.
+//
+// The `system` block is KV-only: `compaction_runs`, `janitor_runs` and
+// `memtable_size_bytes` come from the KV engine's LSM instance — json/rel
+// run their own instances, not reflected here (spec general/024). Plain
+// `//` on purpose: a `///` line would enter the OpenAPI description and
+// change the pinned contract file.
 #[utoipa::path(
     get,
     path = "/store-api/metrics",
@@ -113,12 +119,13 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 )]
 pub async fn get_metrics(State(state): State<AppState>) -> Json<Value> {
     let sys = &state.metrics.system;
+    let engine = state.registry.engine();
     let system = json!({
         "total_reads":       sys.total_reads.load(Ordering::Relaxed),
         "total_writes":      sys.total_writes.load(Ordering::Relaxed),
-        "compaction_runs":   sys.compaction_runs.load(Ordering::Relaxed),
-        "janitor_runs":      sys.janitor_runs.load(Ordering::Relaxed),
-        "memtable_size_bytes": sys.memtable_size_bytes.load(Ordering::Relaxed),
+        "compaction_runs":   engine.compaction_runs(),
+        "janitor_runs":      engine.janitor_runs(),
+        "memtable_size_bytes": engine.stats().memtable_size as u64,
     });
     let domains = state.metrics.get_all_domain_metrics();
     let [kv_metrics, json_metrics, rel_metrics] = state.metrics.engine_metrics();
@@ -342,6 +349,50 @@ mod tests {
             before,
             "engine aggregate must survive domain deletion"
         );
+    }
+
+    // ── Spec general/024: compaction_runs/janitor_runs/memtable_size_bytes ───
+
+    // Test 3: memtable_size_bytes is a live gauge read from the engine's
+    // active MemTable, not a maintained counter -- grows after a write, and
+    // shrinks back once flush_all_memtables drains it (approximate, so no
+    // exact post-flush value is asserted).
+    #[tokio::test]
+    async fn test_memtable_size_bytes_reflects_live_memtable() {
+        let (state, _dir) = make_state().await;
+        state.registry.create_domain("shop").await.unwrap();
+        state.registry.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
+
+        let Json(body) = get_metrics(State(state.clone())).await;
+        let before = body["system"]["memtable_size_bytes"].as_u64().unwrap();
+        assert!(before > 0, "memtable_size_bytes must be > 0 after a PUT");
+
+        state.registry.engine().flush_all_memtables().await.unwrap();
+
+        let Json(body) = get_metrics(State(state)).await;
+        let after = body["system"]["memtable_size_bytes"].as_u64().unwrap();
+        assert!(after < before, "memtable_size_bytes must shrink after a full flush");
+    }
+
+    // Test 4 (regression): the system block keeps exactly its five known
+    // fields, all numeric -- rewiring three of them to the engine must not
+    // drop or rename a field.
+    #[tokio::test]
+    async fn test_system_block_keeps_exactly_five_numeric_fields() {
+        let (state, _dir) = make_state().await;
+        let Json(body) = get_metrics(State(state)).await;
+        let system = body["system"].as_object().unwrap();
+
+        let mut fields: Vec<&str> = system.keys().map(|s| s.as_str()).collect();
+        fields.sort();
+        let mut expected =
+            vec!["total_reads", "total_writes", "compaction_runs", "janitor_runs", "memtable_size_bytes"];
+        expected.sort();
+        assert_eq!(fields, expected, "system block must keep exactly its five known fields");
+
+        for field in expected {
+            assert!(system[field].is_number(), "system.{field} must be numeric");
+        }
     }
 
     // ── GET /store-api/config (spec general/022) ─────────────────────────────

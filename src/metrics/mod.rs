@@ -61,9 +61,6 @@ pub struct HeartbeatMetrics {
 pub struct SystemMetrics {
     pub total_reads: AtomicU64,
     pub total_writes: AtomicU64,
-    pub compaction_runs: AtomicU64,
-    pub janitor_runs: AtomicU64,
-    pub memtable_size_bytes: AtomicU64,
     /// Relational DDL counters (spec rel/003).
     pub rel_ddl_create_total: AtomicU64,
     pub rel_ddl_drop_total: AtomicU64,
@@ -113,9 +110,6 @@ impl Default for SystemMetrics {
         Self {
             total_reads: AtomicU64::new(0),
             total_writes: AtomicU64::new(0),
-            compaction_runs: AtomicU64::new(0),
-            janitor_runs: AtomicU64::new(0),
-            memtable_size_bytes: AtomicU64::new(0),
             rel_ddl_create_total: AtomicU64::new(0),
             rel_ddl_drop_total: AtomicU64::new(0),
             rel_frontend_statements_read_total: AtomicU64::new(0),

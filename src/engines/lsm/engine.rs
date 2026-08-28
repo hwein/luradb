@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::time::{sleep, Duration};
 
@@ -300,6 +300,16 @@ pub struct LsmStorageEngine {
     /// S3-FIFO block cache shared across all read operations.
     block_cache: Arc<Mutex<BlockCache>>,
 
+    /// Number of successfully completed `compact_next_level` calls since
+    /// process start (spec general/024) -- `/metrics` system block.
+    compaction_runs: AtomicU64,
+
+    /// Number of Janitor GC cycles that actually ran (`GcStats::ran == true`)
+    /// since process start (spec general/024) -- `/metrics` system block.
+    /// `Arc` because the Janitor is built as its own object and carries this
+    /// counter into its background task.
+    janitor_runs: Arc<AtomicU64>,
+
     /// Storage thread handle (perf/005). When set, `flush_memtable` writes
     /// SSTables through it and the Janitor reopens the VLog through it after GC.
     storage_handle: Option<StorageHandle>,
@@ -395,6 +405,8 @@ impl LsmStorageEngine {
             shutdown_tx,
             background_tasks: Mutex::new(Vec::new()),
             block_cache,
+            compaction_runs: AtomicU64::new(0),
+            janitor_runs: Arc::new(AtomicU64::new(0)),
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
             in_flight_writes: tokio::sync::RwLock::new(()),
@@ -599,6 +611,7 @@ impl LsmStorageEngine {
             self.engine_config.use_mmap,
             Arc::clone(&self.shutdown),
             self.storage_handle.clone(),
+            Arc::clone(&self.janitor_runs),
             Some(flush_barrier),
         )
     }
@@ -1505,6 +1518,10 @@ impl LsmStorageEngine {
         };
 
         self.compact_level(source_level).await?;
+        // Only a level that actually got compacted counts -- mirrors the
+        // Janitor's `GcStats::ran` distinction so this stays an activity
+        // signal instead of a poll-interval counter (spec general/024).
+        self.compaction_runs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1694,7 +1711,18 @@ impl LsmStorageEngine {
 
     // ── Stats ────────────────────────────────────────────────────────────────
 
-    #[allow(dead_code)]
+    /// Number of successfully completed `compact_next_level` calls since
+    /// process start (spec general/024).
+    pub fn compaction_runs(&self) -> u64 {
+        self.compaction_runs.load(Ordering::Relaxed)
+    }
+
+    /// Number of Janitor GC cycles that actually ran since process start
+    /// (spec general/024).
+    pub fn janitor_runs(&self) -> u64 {
+        self.janitor_runs.load(Ordering::Relaxed)
+    }
+
     pub fn stats(&self) -> EngineStats {
         let memtable = self.memtable.read();
         let imm = self.immutable_memtables.read();
@@ -1714,7 +1742,6 @@ pub struct EngineHeartbeatData {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct EngineStats {
     pub memtable_size: usize,
     pub num_immutable_memtables: usize,
@@ -3088,6 +3115,29 @@ mod tests {
         assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
         assert_eq!(engine.get(b"m").await.unwrap(), Some(b"13".to_vec()));
         assert_eq!(engine.get(b"z").await.unwrap(), Some(b"26".to_vec()));
+    }
+
+    // Test 1 (spec general/024): compaction_runs counts successfully
+    // completed compact_next_level calls -- 0 before any compaction runs,
+    // >= 1 once should_compact's own trigger condition (L0 at the default
+    // threshold of 4) has actually been acted on.
+    #[tokio::test]
+    async fn test_compaction_runs_counter_increments_on_real_compaction() {
+        let (engine, _dir) = make_engine().await;
+        assert_eq!(engine.compaction_runs(), 0);
+
+        engine.put(b"a", b"1").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"b", b"2").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"c", b"3").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"d", b"4").await.unwrap();
+        freeze_and_flush(&engine).await;
+        assert!(should_compact(&engine.manifest.read(), &engine.compaction_config));
+
+        engine.compact_next_level().await.unwrap();
+        assert_eq!(engine.compaction_runs(), 1, "a real compaction must increment compaction_runs");
     }
 
     /// GC config that fires on any non-empty vLog.

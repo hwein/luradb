@@ -47,6 +47,7 @@ All notable changes to LuraDB are documented in this file.
 - Rel: reads resolve their candidate rows against the statement snapshot on every access path, so concurrently deleted rows no longer vanish mid-query and the unindexed-join budget counts only visible rows.
 - LSM: a MemTable rotation can no longer strand an in-flight write's older version above a newer one, which made reads return stale data.
 - KV: watch events are now emitted after the write is applied, narrowing the window in which a delete racing a concurrent set broadcasts a state that never becomes visible.
+- LSM: the `/metrics` fields `compaction_runs`, `janitor_runs` and `memtable_size_bytes` report real values instead of constant zero.
 
 ## [0.3.1] - 2026-08-13
 

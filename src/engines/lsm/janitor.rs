@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
@@ -143,6 +143,11 @@ pub struct Janitor {
     /// the thread after GC so remote I/O survives the swap.
     storage_handle: Option<StorageHandle>,
 
+    /// Incremented once per GC cycle that actually ran (`GcStats::ran ==
+    /// true`) -- shared with `LsmStorageEngine::janitor_runs` for the
+    /// `/metrics` system block (spec general/024).
+    janitor_runs: Arc<AtomicU64>,
+
     /// Drains all MemTables before the live scan. `None` only for fixtures
     /// that have no MemTables at all.
     flush_barrier: Option<FlushBarrier>,
@@ -164,6 +169,7 @@ impl Janitor {
         use_mmap: bool,
         shutdown: Arc<AtomicBool>,
         storage_handle: Option<StorageHandle>,
+        janitor_runs: Arc<AtomicU64>,
         flush_barrier: Option<FlushBarrier>,
     ) -> Self {
         Self {
@@ -179,6 +185,7 @@ impl Janitor {
             use_mmap,
             shutdown,
             storage_handle,
+            janitor_runs,
             flush_barrier,
         }
     }
@@ -344,6 +351,13 @@ impl Janitor {
              {live_bytes_by_generation:?}, reclaimed={reclaimed_bytes} bytes, \
              rebuilt={sstables_rebuilt} SSTables"
         );
+
+        // Counts actually-run cycles only (mirrors `GcStats::ran`), not
+        // threshold checks that skipped -- otherwise this would be an uptime
+        // counter instead of an activity signal (spec general/024). Placed
+        // here rather than only in the background loop so direct `run_gc`
+        // callers (tests, future triggers) count too.
+        self.janitor_runs.fetch_add(1, Ordering::Relaxed);
 
         Ok(GcStats {
             ran: true,
@@ -677,6 +691,7 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             Some(handle.clone()),
+            Arc::new(AtomicU64::new(0)),
             None,
         );
 
@@ -777,6 +792,8 @@ mod tests {
 
     /// Builds a tokio-fs-path Janitor (no storage thread) over the given
     /// fixtures. No flush barrier: these fixtures have no MemTables.
+    /// `janitor_runs` is passed straight through, so a caller that wants to
+    /// inspect it keeps its own clone.
     fn build_janitor(
         dir: &std::path::Path,
         vlog_shared: Arc<VLogRegistry>,
@@ -785,6 +802,7 @@ mod tests {
         manifest: Arc<RwLock<Manifest>>,
         file_manager: Arc<FileManager>,
         config: JanitorConfig,
+        janitor_runs: Arc<AtomicU64>,
     ) -> Janitor {
         let bc = BlockCacheConfig::default();
         Janitor::new(
@@ -804,6 +822,7 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             None,
+            janitor_runs,
             None,
         )
     }
@@ -859,6 +878,7 @@ mod tests {
         );
         let vlog_shared = Arc::new(VLogRegistry::new(vlog));
         let before = vlog_shared.active();
+        let janitor_runs = Arc::new(AtomicU64::new(0));
 
         // (a) vLog smaller than min_vlog_size_bytes.
         let janitor = build_janitor(
@@ -869,6 +889,7 @@ mod tests {
             Arc::clone(&manifest),
             Arc::clone(&file_manager),
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
+            Arc::clone(&janitor_runs),
         );
         let stats = janitor.run_gc().await.unwrap();
         assert!(!stats.ran, "vlog below min size must skip");
@@ -882,10 +903,12 @@ mod tests {
             Arc::clone(&manifest),
             Arc::clone(&file_manager),
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.95, min_vlog_size_bytes: 1 },
+            Arc::clone(&janitor_runs),
         );
         let stats = janitor.run_gc().await.unwrap();
         assert!(!stats.ran, "dead ratio below threshold must skip");
         assert_eq!(stats.sstables_rebuilt, 0);
+        assert_eq!(janitor_runs.load(Ordering::Relaxed), 0, "skip cycles (ran == false) must not increment janitor_runs");
 
         // Nothing was touched: same vLog Arc, no new generation, SSTable intact.
         let after = vlog_shared.active();
@@ -922,6 +945,7 @@ mod tests {
             Arc::new(RwLock::new(manifest)),
             file_manager,
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
+            Arc::new(AtomicU64::new(0)),
         );
 
         // With `?` instead of `continue` in the collect phase this would be Err.
@@ -964,6 +988,7 @@ mod tests {
             );
         }
         let vlog_shared = Arc::new(VLogRegistry::new(vlog));
+        let janitor_runs = Arc::new(AtomicU64::new(0));
 
         let janitor = build_janitor(
             dir.path(),
@@ -973,12 +998,14 @@ mod tests {
             Arc::clone(&manifest),
             Arc::clone(&file_manager),
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 1 },
+            Arc::clone(&janitor_runs),
         );
 
         let stats = janitor.run_gc().await.unwrap();
         assert!(stats.ran);
         assert_eq!(stats.sstables_rebuilt, 2);
         assert_eq!(stats.live_bytes_by_generation, vec![(1, 200)]);
+        assert_eq!(janitor_runs.load(Ordering::Relaxed), 1, "a ran == true cycle must increment janitor_runs");
 
         // Deduped copy: A at 0, B at 100, nothing else.
         let swapped = vlog_shared.active();

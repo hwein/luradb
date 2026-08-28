@@ -41,6 +41,7 @@ All notable changes to LuraDB are documented in this file.
 - LSM: a restarted engine now seeds its clock from the recovered WAL and manifest — after a backwards system-clock step it no longer hides existing data or buries a rewritten key under its older version.
 - LSM: a concurrent flush/compaction/GC save can no longer persist a stale manifest.
 - LSM: a corrupt WAL length field fails recovery instead of allocating up to 4 GiB.
+- Rel: a `SELECT … LIMIT` without ORDER BY no longer returns a short page when concurrent inserts land in the capped scan window.
 
 ## [0.3.1] - 2026-08-13
 

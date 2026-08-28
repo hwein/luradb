@@ -1190,6 +1190,24 @@ impl LsmStorageEngine {
         self.scan_keys_inner(prefix, usize::MAX, Some(snapshot)).await
     }
 
+    /// Combines [`Self::scan_keys_limited`] and [`Self::scan_keys_with_snapshot`]:
+    /// stops once `limit` keys visible under `snapshot` were found (spec
+    /// rel/014 SELECT fast-limit path). A key that only starts existing
+    /// after `snapshot` never counts toward the cap, so it can never
+    /// displace a snapshot-visible key the way it could under the
+    /// unsnapshotted [`Self::scan_keys_limited`]. Like that method, the
+    /// result is a sorted subset of the visible keys (not necessarily the
+    /// lexicographically smallest ones) — LIMIT without ORDER BY accepts
+    /// any subset, matching today's fast-path semantics.
+    pub async fn scan_keys_limited_with_snapshot(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.scan_keys_inner(prefix, limit, Some(snapshot)).await
+    }
+
     /// Shared implementation for [`Self::scan_keys_limited`]/
     /// [`Self::scan_keys_with_snapshot`]: `snapshot` of `None` matches every
     /// version currently live (today's `scan_keys` behavior).
@@ -2584,6 +2602,120 @@ mod tests {
             keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
         }
         assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
+    }
+
+    // ── scan_keys_limited_with_snapshot tests (spec rel/014 SELECT fast-limit
+    // snapshot consistency) ──────────────────────────────────────────────────
+
+    // Test 1 (the core case): a key that only starts existing after the
+    // snapshot must never occupy one of the capped slots, even when it sorts
+    // ahead of the pre-snapshot keys. Counterproof alongside: today's
+    // unsnapshotted scan_keys_limited IS displaced by such a ghost -- the
+    // difference this method fixes.
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_excludes_ghosts_from_cap() {
+        let (engine, _dir) = make_engine().await;
+        for i in 0..10 {
+            engine.put(format!("z:m{i}").as_bytes(), b"v").await.unwrap();
+        }
+        let snap = engine.snapshot();
+        // Ghosts: written after the snapshot, and sort ahead of "z:m*".
+        for i in 0..5 {
+            engine.put(format!("z:a{i}").as_bytes(), b"v").await.unwrap();
+        }
+
+        let keys = engine.scan_keys_limited_with_snapshot(b"z:", 5, snap.snapshot()).await.unwrap();
+        assert_eq!(keys.len(), 5, "cap must be filled entirely by pre-snapshot keys");
+        assert!(keys.iter().all(|k| k.starts_with(b"z:m")), "no ghost key may occupy a cap slot");
+
+        let unsnapshotted = engine.scan_keys_limited(b"z:", 5).await.unwrap();
+        assert!(
+            unsnapshotted.iter().any(|k| k.starts_with(b"z:a")),
+            "today's unsnapshotted cap must be displaced by ghosts, or this is no longer a counterproof"
+        );
+    }
+
+    // Test 2: a key deleted after the snapshot was taken still counts toward
+    // the cap and appears in the result (point-in-time consistency).
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_keeps_deleted_after_snapshot() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"user:1", b"v").await.unwrap();
+        let snap = engine.snapshot();
+        engine.delete(b"user:1").await.unwrap();
+
+        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
+        assert_eq!(keys, vec![b"user:1".to_vec()]);
+    }
+
+    // Test 3: once the cap is filled while scanning a newer source, an older
+    // source's further snapshot-visible keys are never reached -- still a
+    // correct (if not minimal) subset, exactly `limit` entries (same
+    // "subset, not necessarily smallest" semantics as the unsnapshotted
+    // test_scan_keys_limited_stops_in_sstable_sweep above).
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_stops_at_cap_across_sources() {
+        let (engine, _dir) = make_engine().await;
+        for i in 0..5 {
+            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        freeze_and_flush(&engine).await; // SSTable: user:0..4
+        for i in 5..10 {
+            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        let snap = engine.snapshot(); // all 10 visible: 5 in the SSTable, 5 in the active MemTable
+
+        let full = engine.scan_keys_limited_with_snapshot(b"user:", 100, snap.snapshot()).await.unwrap();
+        assert_eq!(full.len(), 10, "sanity: all 10 must be snapshot-visible when uncapped");
+
+        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 4, snap.snapshot()).await.unwrap();
+        assert_eq!(
+            keys.len(),
+            4,
+            "must stop exactly at the cap even though 6 more visible keys remain in the older SSTable"
+        );
+    }
+
+    // Test 4a: a TTL-expired key must not occupy a cap slot even though it
+    // was written -- and became snapshot-visible -- before the snapshot;
+    // wall-clock expiry still applies under a capped snapshot scan, same as
+    // the uncapped scan_keys_with_snapshot. A cap of 1 makes the assertion
+    // discriminating: if the expired key ("user:1", sorting first) wrongly
+    // held the one slot, the live "user:2" would never appear.
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_excludes_expired_from_cap() {
+        let (engine, _dir) = make_engine().await;
+        engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+        engine.put(b"user:2", b"bob").await.unwrap();
+        let snap = engine.snapshot();
+        wait_past_ttl(1).await;
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and the scan's own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
+        for _ in 0..100 {
+            if keys == vec![b"user:2".to_vec()] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
+        }
+        assert_eq!(
+            keys,
+            vec![b"user:2".to_vec()],
+            "an expired key must not occupy the cap slot ahead of a live one"
+        );
+    }
+
+    // Test 4b: a NULL key (kv/018 -- present, not deleted) counts as live and
+    // does occupy a cap slot.
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_includes_null() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"user:1").await.unwrap();
+        let snap = engine.snapshot();
+        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
+        assert_eq!(keys, vec![b"user:1".to_vec()]);
     }
 
     // ── Point-read MVCC ordering tests (overlapping L0 / frozen MemTables) ───

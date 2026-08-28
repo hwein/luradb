@@ -302,17 +302,19 @@ impl RowPipeline {
 /// ascending key order (byte order == value order, spec §3/§5), plus the
 /// number of underlying LSM keys visited (I/O-budget metric, §9).
 ///
-/// `fast_limit_cap`: only consulted for `AccessPath::FullScan` — the
-/// `scan_keys_limited` shortcut is sound *only* for "full scan, no residual,
-/// no ORDER BY, LIMIT set" (spec §6); its caller enforces that. Every other
-/// path (and every other case of FullScan) must see the full, correctly
-/// ordered key set, so it always uses plain `scan_keys`.
+/// `fast_limit`: only consulted for `AccessPath::FullScan` — the
+/// `scan_keys_limited_with_snapshot` shortcut is sound *only* for "full
+/// scan, no residual, no ORDER BY, LIMIT set" (spec §6); its caller enforces
+/// that. The snapshot pairs with the cap (spec rel/014) so a key that only
+/// starts existing after the snapshot can never occupy one of the capped
+/// slots. Every other path (and every other case of FullScan) must see the
+/// full, correctly ordered key set, so it always uses plain `scan_keys`.
 pub(super) async fn resolve_candidate_keys(
     engine: &Arc<LsmStorageEngine>,
     schema: &TableSchema,
     prefix: &[u8],
     access: &AccessPath,
-    fast_limit_cap: Option<usize>,
+    fast_limit: Option<(usize, &Snapshot)>,
 ) -> Result<(Vec<Vec<u8>>, u64), RelStoreError> {
     match access {
         AccessPath::PkPoint(value) => {
@@ -385,8 +387,8 @@ pub(super) async fn resolve_candidate_keys(
         }
         AccessPath::FullScan => {
             let row_prefix = keys::row_table_prefix(prefix, schema.table_id);
-            let all = match fast_limit_cap {
-                Some(cap) => engine.scan_keys_limited(&row_prefix, cap).await?,
+            let all = match fast_limit {
+                Some((cap, snap)) => engine.scan_keys_limited_with_snapshot(&row_prefix, cap, snap).await?,
                 None => engine.scan_keys(&row_prefix).await?,
             };
             let n = all.len() as u64;
@@ -636,8 +638,9 @@ impl RelEngine {
         let snapshot_guard = self.engine.snapshot();
         let snap = snapshot_guard.snapshot().clone();
 
+        let fast_limit = fast_cap.map(|cap| (cap, &snap));
         let (mut row_keys, scanned) =
-            resolve_candidate_keys(&self.engine, &schema, &prefix, &plan.access, fast_cap).await?;
+            resolve_candidate_keys(&self.engine, &schema, &prefix, &plan.access, fast_limit).await?;
         if !order_by.is_empty() && plan.order_free && plan.order_desc {
             row_keys.reverse();
         }
@@ -1259,5 +1262,71 @@ mod tests {
         let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE 3 >= id").await.rows, 0);
         got.sort();
         assert_eq!(got, vec![1, 2, 3], "flip_op(GtEq)=LtEq: '3 >= id' means id <= 3");
+    }
+
+    // 25. Spec rel/014 §5 (wiring regression): a table with generous headroom
+    // over LIMIT (comfortably >= limit + 1 committed rows) must keep
+    // returning a full page under concurrent inserts of early-sorting rows.
+    // The deterministic proof that ghosts never occupy a cap slot is engine
+    // test 1 (engine.rs); this only proves the rel-level wiring doesn't
+    // regress under real interleaving. Bounded, no tight timing window as
+    // the test condition (general/008-line): any short page or `false` here
+    // is a genuine bug, not a flake.
+    #[tokio::test]
+    async fn test_fast_limit_snapshot_consistent_under_concurrent_inserts() {
+        let (rel, _d) = make().await;
+        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+        // Baseline PKs (1000..1020) sort after every concurrently-inserted
+        // row below, and comfortably exceed limit(10) + 1.
+        for i in 1000..1020 {
+            ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
+        }
+
+        let writer = Arc::clone(&rel);
+        let inserter = tokio::spawn(async move {
+            // Early-sorting PKs: a ghost landing in the capped scan window
+            // must never displace a real row.
+            for i in 0..50 {
+                writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
+            assert_eq!(s.rows.len(), 10, "a concurrent insert must never shrink a full LIMIT page");
+            assert!(s.limit_applied, "more rows exist past LIMIT -- must stay true under concurrent inserts");
+        }
+        inserter.await.unwrap();
+    }
+
+    // 26. Spec rel/014 §6 (limit_applied discriminator): exactly `limit + 1`
+    // committed rows -- the minimal count for which `limit_applied = true`
+    // is correct -- racing concurrent early-sorting inserts. This is the
+    // exact configuration that used to separate old from new: the old
+    // unsnapshotted cap would either lose the "+1 probe" to a ghost slot
+    // (limit_applied wrongly false) or lose a real row to one (a short
+    // page); the snapshot-capped scan must get both fields right every time.
+    #[tokio::test]
+    async fn test_fast_limit_snapshot_correct_at_minimal_visible_plus_ghosts() {
+        let (rel, _d) = make().await;
+        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+        // Exactly limit(10) + 1 committed rows -- zero headroom in the cap.
+        for i in 1000..1011 {
+            ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
+        }
+
+        let writer = Arc::clone(&rel);
+        let inserter = tokio::spawn(async move {
+            for i in 0..50 {
+                writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
+            assert_eq!(s.rows.len(), 10, "the minimal +1 row must never be displaced by a ghost slot");
+            assert!(s.limit_applied, "the +1 probe must never be lost to a ghost slot");
+        }
+        inserter.await.unwrap();
     }
 }

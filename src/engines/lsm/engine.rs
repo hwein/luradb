@@ -890,7 +890,9 @@ impl LsmStorageEngine {
 
     /// Assigns the next watch-stream sequence, rings it, and broadcasts it
     /// (spec kv/024 §2) — the single choke point every non-batch write path
-    /// goes through.
+    /// goes through. Every caller invokes this only after its own
+    /// `memtable.set` (spec kv/030): a crash between the two now drops the
+    /// event instead of describing a write a replay might still undo.
     fn publish_change(&self, key: &[u8], op: OpType) {
         self.watch_log.publish(&self.change_tx, |seq| WalEvent { seq, key: key.to_vec(), op });
     }
@@ -927,9 +929,6 @@ impl LsmStorageEngine {
         log_entry.extend_from_slice(&expire_at_val.to_be_bytes());
         self.wal.append(&log_entry).await?;
 
-        // Broadcast after WAL is durable (sync_all already called inside wal.append).
-        self.publish_change(key, OpType::Set);
-
         let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
             let (file_id, offset) = append_to_active(&self.vlog, value).await?;
             Value::Pointer { file_id, offset, len: value.len(), expire_at }
@@ -938,6 +937,11 @@ impl LsmStorageEngine {
         };
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, resolved);
+
+        // Broadcast after the apply is visible, not just WAL-durable (spec
+        // kv/030): closes the window where a racing delete's event could
+        // describe a state that never becomes visible.
+        self.publish_change(key, OpType::Set);
         Ok(())
     }
 
@@ -964,13 +968,13 @@ impl LsmStorageEngine {
 
         self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
-        // Broadcast after WAL is durable.
-        self.publish_change(key, OpType::Delete);
-
         // Still pinned after the WAL append; the guard above now closes the
         // inversion window this placement only narrowed (spec kv/025 §3.2).
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.publish_change(key, OpType::Delete);
         Ok(())
     }
 
@@ -994,10 +998,10 @@ impl LsmStorageEngine {
     ) -> Result<()> {
         self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
-        // Broadcast after WAL is durable.
-        self.publish_change(key, OpType::Delete);
-
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.publish_change(key, OpType::Delete);
         Ok(())
     }
 
@@ -1022,11 +1026,12 @@ impl LsmStorageEngine {
         log_entry.extend_from_slice(key);
         self.wal.append(&log_entry).await?;
 
-        // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
-        self.publish_change(key, OpType::Set);
-
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Null);
+
+        // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.publish_change(key, OpType::Set);
         Ok(())
     }
 
@@ -1072,16 +1077,14 @@ impl LsmStorageEngine {
     /// Assigns `ops.len()` consecutive sequences in one lock section
     /// (`publish_many`), so a concurrent single-op write can never
     /// interleave into the middle of this batch's stream slice (spec
-    /// kv/024 §2).
-    fn broadcast_batch_events(&self, ops: &[BatchOp]) {
-        let mut ops = ops.iter();
-        self.watch_log.publish_many(&self.change_tx, ops.len(), |seq| {
-            let op = ops.next().expect("publish_many calls `make` exactly `n` times");
-            let (key, op_type) = match op {
-                BatchOp::Put { key, .. } => (key, OpType::Set),
-                BatchOp::Delete { key } => (key, OpType::Delete),
-            };
-            WalEvent { seq, key: key.clone(), op: op_type }
+    /// kv/024 §2). Called only after the batch's MemTable apply (spec
+    /// kv/030), on `events` pre-extracted from the ops before
+    /// `resolve_batch_values` consumes them — see `write_batch`.
+    fn broadcast_batch_events(&self, events: &[(Vec<u8>, OpType)]) {
+        let mut events = events.iter();
+        self.watch_log.publish_many(&self.change_tx, events.len(), |seq| {
+            let (key, op) = events.next().expect("publish_many calls `make` exactly `n` times");
+            WalEvent { seq, key: key.clone(), op: op.clone() }
         });
     }
 
@@ -1130,7 +1133,15 @@ impl LsmStorageEngine {
         let log_entry = Self::encode_batch_wal_record(timestamp, &ops);
         self.wal.append(&log_entry).await?;
 
-        self.broadcast_batch_events(&ops);
+        // Captured before `resolve_batch_values` below consumes `ops` — the
+        // broadcast itself waits until after the Phase 2 apply (spec kv/030).
+        let batch_events: Vec<(Vec<u8>, OpType)> = ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { key, .. } => (key.clone(), OpType::Set),
+                BatchOp::Delete { key } => (key.clone(), OpType::Delete),
+            })
+            .collect();
 
         // Phase 1 (fallible): offload large values to the vLog BEFORE any
         // MemTable mutation — a vLog error must not leave the batch
@@ -1142,6 +1153,9 @@ impl LsmStorageEngine {
         for (key, value) in resolved {
             memtable.set(key, timestamp, value);
         }
+
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.broadcast_batch_events(&batch_events);
         Ok(())
     }
 
@@ -3701,5 +3715,53 @@ mod tests {
             single_seq < min || single_seq > max,
             "the concurrent single write must land fully before or after the batch: {single_seq} vs [{min},{max}]"
         );
+    }
+
+    // ── Spec kv/030 test 1: watch events after MemTable apply ────────────────
+
+    // A Set/Delete race on one key. Before the fix, `publish_change` ran right
+    // after the WAL fsync, before `memtable.set` -- a subscriber could receive
+    // an event for a write that was not yet applied (and, on a crash, might
+    // never be, kv/025 §5 Restfenster A). After the fix, every write path
+    // calls `memtable.set` before `publish_change` with no `.await` between
+    // them, and the broadcast channel's send/recv synchronizes with that
+    // apply -- so a read taken right after receiving any event from this
+    // round must already see a state newer than the pre-race baseline.
+    // Deterministic on purpose, not a hit-rate sample: this ordering is
+    // unconditional, unlike the residual stream-vs-timestamp ordering gap
+    // between two different writers that stays open (spec kv/030 §2) and is
+    // not exercised here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_watch_event_is_never_seen_before_its_own_apply() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+
+        for round in 0..50u32 {
+            let key = format!("race{round}");
+            engine.put(key.as_bytes(), b"baseline").await.unwrap();
+            let (baseline_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
+            let mut rx = engine.watch_subscribe();
+
+            let e1 = Arc::clone(&engine);
+            let k1 = key.clone();
+            let set_handle = tokio::spawn(async move { e1.put(k1.as_bytes(), b"updated").await.unwrap() });
+            let e2 = Arc::clone(&engine);
+            let k2 = key.clone();
+            let del_handle = tokio::spawn(async move { e2.delete(k2.as_bytes()).await.unwrap() });
+
+            for _ in 0..2 {
+                let event = rx.recv().await.unwrap();
+                assert_eq!(event.key, key.as_bytes());
+                let (seen_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
+                assert!(
+                    seen_ts.as_u64() > baseline_ts.as_u64(),
+                    "round {round}: {:?} event observed before its own apply became visible",
+                    event.op
+                );
+            }
+
+            set_handle.await.unwrap();
+            del_handle.await.unwrap();
+        }
     }
 }

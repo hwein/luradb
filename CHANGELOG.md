@@ -43,6 +43,7 @@ All notable changes to LuraDB are documented in this file.
 - LSM: a corrupt WAL length field fails recovery instead of allocating up to 4 GiB.
 - Rel: a `SELECT … LIMIT` without ORDER BY no longer returns a short page when concurrent inserts land in the capped scan window.
 - LSM: a MemTable rotation can no longer strand an in-flight write's older version above a newer one, which made reads return stale data.
+- KV: watch events are now emitted after the write is applied, narrowing the window in which a delete racing a concurrent set broadcasts a state that never becomes visible.
 
 ## [0.3.1] - 2026-08-13
 

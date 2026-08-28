@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, Context};
 use tokio::fs::{File, OpenOptions, rename};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::sync::Mutex;
 
 /// Metadata for a single SSTable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,40 +122,63 @@ impl Manifest {
 pub struct ManifestManager {
     /// Path to the manifest file
     manifest_path: PathBuf,
+    /// Highest `Manifest.version` durably saved so far (spec kv/027 §A).
+    /// `version` only grows under the caller's manifest write lock, so a
+    /// save at or below this is a stale snapshot losing a race against a
+    /// newer save already on disk -- guards against a lost update between
+    /// concurrent flush/compaction/GC saves.
+    last_saved_version: Mutex<u64>,
 }
 
 impl ManifestManager {
     /// Creates a new manifest manager.
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
         let manifest_path = base_dir.as_ref().join("MANIFEST");
-        Self { manifest_path }
+        Self { manifest_path, last_saved_version: Mutex::new(0) }
     }
 
     /// Loads the manifest from disk.
     ///
-    /// Returns a new empty manifest if the file doesn't exist.
+    /// Returns a new empty manifest if the file doesn't exist. Seeds the
+    /// stale-save guard from the loaded version either way.
     pub async fn load(&self) -> Result<Manifest> {
-        if !self.manifest_path.exists() {
-            return Ok(Manifest::new());
-        }
+        let manifest = if !self.manifest_path.exists() {
+            Manifest::new()
+        } else {
+            let mut file = File::open(&self.manifest_path)
+                .await
+                .context("Failed to open manifest file")?;
 
-        let mut file = File::open(&self.manifest_path)
-            .await
-            .context("Failed to open manifest file")?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)
+                .await
+                .context("Failed to read manifest")?;
 
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .await
-            .context("Failed to read manifest")?;
+            serde_json::from_slice(&data)
+                .context("Failed to deserialize manifest")?
+        };
 
-        let manifest: Manifest = serde_json::from_slice(&data)
-            .context("Failed to deserialize manifest")?;
+        *self.last_saved_version.lock().await = manifest.version;
 
         Ok(manifest)
     }
 
     /// Saves the manifest to disk atomically.
+    ///
+    /// A no-op if `manifest.version` is at or below the last version saved
+    /// here: the newer state is already persisted, so overwriting it with
+    /// this stale snapshot would be the bug, not skipping it (spec kv/027 §A).
     pub async fn save(&self, manifest: &Manifest) -> Result<()> {
+        let mut last_saved = self.last_saved_version.lock().await;
+        if manifest.version <= *last_saved {
+            tracing::debug!(
+                version = manifest.version,
+                last_saved_version = *last_saved,
+                "skipping stale manifest save"
+            );
+            return Ok(());
+        }
+
         let temp_path = self.manifest_path.with_extension("tmp");
 
         // Serialize to JSON
@@ -177,6 +201,8 @@ impl ManifestManager {
         rename(&temp_path, &self.manifest_path)
             .await
             .context("Failed to rename manifest")?;
+
+        *last_saved = manifest.version;
 
         Ok(())
     }
@@ -301,6 +327,93 @@ mod tests {
 
         assert_eq!(loaded.total_sstables(), 1);
         assert_eq!(loaded.get_level(1)[0].file_id, 42);
+
+        Ok(())
+    }
+
+    fn meta(file_id: u64) -> SSTableMetadata {
+        SSTableMetadata {
+            file_id,
+            level: 0,
+            smallest_key: b"a".to_vec(),
+            largest_key: b"z".to_vec(),
+            file_size: 1,
+            max_timestamp: 0,
+        }
+    }
+
+    // Interleaving: an older snapshot (v_n) saved after a newer one (v_{n+1})
+    // must not overwrite it -- v_{n+1} is a superset of v_n's mutations
+    // (spec kv/027 §A).
+    #[tokio::test]
+    async fn test_save_rejects_stale_version_after_interleaving() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = ManifestManager::new(temp_dir.path());
+
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(meta(1)); // version 1
+        let stale = manifest.clone();
+
+        manifest.add_sstable(meta(2)); // version 2
+        let newer = manifest.clone();
+
+        // The newer snapshot lands first, then the stale one races in.
+        manager.save(&newer).await?;
+        manager.save(&stale).await?;
+
+        let on_disk = ManifestManager::new(temp_dir.path()).load().await?;
+        assert_eq!(on_disk.version, newer.version);
+        assert_eq!(on_disk.total_sstables(), 2, "the stale save must not have overwritten file 2");
+
+        Ok(())
+    }
+
+    // load() must seed the guard from the version on disk -- a fresh
+    // ManifestManager (as after a restart) rejects a stale save just as the
+    // instance that wrote that version would.
+    #[tokio::test]
+    async fn test_load_seeds_guard_against_stale_save_after_reopen() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = ManifestManager::new(temp_dir.path());
+
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(meta(1)); // version 1
+        manager.save(&manifest).await?;
+
+        let reopened = ManifestManager::new(temp_dir.path());
+        let loaded = reopened.load().await?;
+        assert_eq!(loaded.version, 1);
+
+        // Same version as what's already on disk, but different content --
+        // constructed directly (not via add_sstable) so staleness comes from
+        // the version alone, not a mutation this manager never saw.
+        let stale = Manifest { levels: vec![vec![meta(99)]], version: 1 };
+        reopened.save(&stale).await?;
+
+        let on_disk = ManifestManager::new(temp_dir.path()).load().await?;
+        assert_eq!(on_disk.total_sstables(), 1, "the stale post-reopen save must be a no-op");
+        assert_eq!(on_disk.get_level(0)[0].file_id, 1);
+
+        Ok(())
+    }
+
+    // Normal path: sequential, non-racing saves each carry a higher version
+    // than the last and must both actually write.
+    #[tokio::test]
+    async fn test_sequential_saves_both_persist() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = ManifestManager::new(temp_dir.path());
+
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(meta(1)); // version 1
+        manager.save(&manifest).await?;
+
+        manifest.add_sstable(meta(2)); // version 2
+        manager.save(&manifest).await?;
+
+        let on_disk = manager.load().await?;
+        assert_eq!(on_disk.version, 2);
+        assert_eq!(on_disk.total_sstables(), 2);
 
         Ok(())
     }

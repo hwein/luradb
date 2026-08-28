@@ -5,6 +5,22 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
+/// Hard ceiling on any single length-prefixed WAL field (a key or a value)
+/// read during recovery. Without it, a corrupt tail turns garbage bytes into
+/// a u32 length up to 4 GiB and `read_len_prefixed` allocates that much
+/// before `read_exact` ever reaches EOF (spec kv/026 Spec-Review F7).
+///
+/// Derived, not guessed, from the largest a legitimate write path can hand
+/// to one field: axum's default per-request body cap is 2 MiB (see
+/// `api/mod.rs`), the JSON bulk import's explicit override
+/// (`json.bulk_body_limit_bytes`) defaults to 64 MiB, and the IPC/SHM
+/// command ring (`shm.command_buffer_size`) defaults to 4 MiB -- all well
+/// above `LsmConfig::max_value_size`'s own 512 KiB default, which every
+/// engine (kv/json/rel) validates a value against before it ever reaches
+/// the WAL. 64 MiB (the JSON bulk body cap) is the largest of these; 96 MiB
+/// gives it headroom no legitimate write can reach.
+const WAL_MAX_FIELD_LEN: usize = 96 * 1024 * 1024;
+
 #[derive(Error, Debug)]
 pub enum WalError {
     #[error("I/O error: {0}")]
@@ -104,6 +120,9 @@ pub async fn recover(path: impl AsRef<Path>) -> Result<Vec<WalEntry>, WalError> 
 
 async fn read_len_prefixed(file: &mut File) -> Result<Vec<u8>, WalError> {
     let len = file.read_u32().await? as usize;
+    if len > WAL_MAX_FIELD_LEN {
+        return Err(field_too_long_error(len));
+    }
     let mut buf = vec![0; len];
     file.read_exact(&mut buf).await?;
     Ok(buf)
@@ -113,6 +132,13 @@ fn invalid_entry_error() -> WalError {
     WalError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         "Invalid WAL entry type found during recovery",
+    ))
+}
+
+fn field_too_long_error(len: usize) -> WalError {
+    WalError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("WAL field length {len} exceeds maximum of {WAL_MAX_FIELD_LEN} bytes"),
     ))
 }
 
@@ -405,5 +431,51 @@ mod tests {
         assert_eq!(wal.append(b"XY").await.unwrap(), 0);
         drop(wal);
         assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+    }
+
+    // Builds a raw DELETE record: [type=2][ts:u64][key_len:u32][key]. Used
+    // directly (bypassing WriteAheadLog::append) to hand `recover()` a
+    // length-prefixed field with a chosen, possibly corrupt, length.
+    fn raw_delete_record(key_len_field: u32, key: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.push(2u8);
+        raw.extend_from_slice(&1u64.to_be_bytes());
+        raw.extend_from_slice(&key_len_field.to_be_bytes());
+        raw.extend_from_slice(key);
+        raw
+    }
+
+    // A length field beyond WAL_MAX_FIELD_LEN must fail recovery immediately
+    // -- not attempt an allocation up to 4 GiB (spec kv/026 Spec-Review F7,
+    // kv/027 §B). No key bytes follow; the cap check must reject this before
+    // read_exact ever runs.
+    #[tokio::test]
+    async fn test_recover_rejects_wal_field_length_exceeding_cap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal");
+        std::fs::write(&path, raw_delete_record((WAL_MAX_FIELD_LEN + 1) as u32, &[])).unwrap();
+
+        let err = recover(&path).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "expected a field-too-long error, got: {err}"
+        );
+    }
+
+    // A field of exactly WAL_MAX_FIELD_LEN must still parse -- the cap
+    // rejects lengths *above* it, never at it.
+    #[tokio::test]
+    async fn test_recover_accepts_wal_field_length_exactly_at_cap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal");
+        let key = vec![b'k'; WAL_MAX_FIELD_LEN];
+        std::fs::write(&path, raw_delete_record(WAL_MAX_FIELD_LEN as u32, &key)).unwrap();
+
+        let entries = recover(&path).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::Delete { key: k, .. } => assert_eq!(k.len(), WAL_MAX_FIELD_LEN),
+            other => panic!("expected WalEntry::Delete, got {other:?}"),
+        }
     }
 }

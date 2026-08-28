@@ -39,6 +39,8 @@ All notable changes to LuraDB are documented in this file.
 - LSM: shutdown with a failed flush no longer truncates the WAL.
 - LSM: startup fails loudly instead of silently skipping an unopenable SSTable.
 - LSM: a restarted engine now seeds its clock from the recovered WAL and manifest — after a backwards system-clock step it no longer hides existing data or buries a rewritten key under its older version.
+- LSM: a concurrent flush/compaction/GC save can no longer persist a stale manifest.
+- LSM: a corrupt WAL length field fails recovery instead of allocating up to 4 GiB.
 
 ## [0.3.1] - 2026-08-13
 

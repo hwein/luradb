@@ -2319,8 +2319,18 @@ mod tests {
         // Immediate readability is covered by test_ttl_key_readable_before_expiry.
         engine.put_with_ttl(b"ttl_key", b"value", 1).await.unwrap();
         wait_past_ttl(1).await;
-        // Must be None after expiry
-        assert!(engine.get(b"ttl_key").await.unwrap().is_none());
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and get()'s own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut value = engine.get(b"ttl_key").await.unwrap();
+        for _ in 0..100 {
+            if value.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            value = engine.get(b"ttl_key").await.unwrap();
+        }
+        assert!(value.is_none());
     }
 
     fn subsec_ms() -> u32 {
@@ -2562,7 +2572,17 @@ mod tests {
         engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
         let snap = engine.snapshot();
         wait_past_ttl(1).await;
-        let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and the scan's own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        for _ in 0..100 {
+            if keys.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        }
         assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
     }
 

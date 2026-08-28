@@ -156,7 +156,7 @@ impl JoinProbe {
 
     async fn probe_index(&self, index_id: u32, val_enc: &[u8]) -> Result<Vec<SourceBinding>, RelStoreError> {
         let scan_prefix = keys::index_value_prefix(&self.right_prefix, index_id, val_enc);
-        let hits = self.engine.scan_keys(&scan_prefix).await?;
+        let hits = self.engine.scan_keys_with_snapshot(&scan_prefix, &self.snapshot).await?;
         self.metrics.record_rel_select_scanned_keys(hits.len() as u64);
         let mut out = Vec::with_capacity(hits.len());
         for h in &hits {
@@ -177,7 +177,10 @@ impl JoinProbe {
         // materialized before the cap check below ever runs.
         let consumed = self.fallback_budget.load(Ordering::Relaxed);
         let remaining = (self.max_fallback_scan as u64).saturating_sub(consumed);
-        let scan_keys = self.engine.scan_keys_limited(&row_prefix, remaining as usize + 1).await?;
+        let scan_keys = self
+            .engine
+            .scan_keys_limited_with_snapshot(&row_prefix, remaining as usize + 1, &self.snapshot)
+            .await?;
         let n = scan_keys.len() as u64;
         self.metrics.record_rel_select_scanned_keys(n);
         let total = self.fallback_budget.fetch_add(n, Ordering::Relaxed) + n;
@@ -931,9 +934,15 @@ impl RelEngine {
         let base_plan =
             plan::plan_access(&bindings[0].schema, &base_where, &base_quals, params, &base_order_local, mask)?;
 
-        let (mut row_keys, scanned) =
-            select::resolve_candidate_keys(&self.engine, &bindings[0].schema, &prefix, &base_plan.access, None)
-                .await?;
+        let (mut row_keys, scanned) = select::resolve_candidate_keys(
+            &self.engine,
+            &bindings[0].schema,
+            &prefix,
+            &base_plan.access,
+            &snap,
+            None,
+        )
+        .await?;
         let order_free = !base_order_local.is_empty() && base_plan.order_free;
         if order_free && base_plan.order_desc {
             row_keys.reverse();
@@ -1674,5 +1683,53 @@ mod tests {
         // A genuine type error is still rejected.
         let e = err(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.a_id > 'x'").await;
         assert!(matches!(e, RelStoreError::TypeMismatch { .. }), "got: {e}");
+    }
+
+    // 28. Spec rel/018 §Test 3 (join fallback cap, exact): a right table
+    // with exactly `max_fallback_scan` snapshot-visible rows plus ghosts
+    // inserted after the snapshot must not trip `UnindexedJoinScanExceeded`
+    // -- pre-fix, the live (unsnapshotted) fallback scan counted the ghosts
+    // too and threw one row too early (the Insert-side mirror of test 26's
+    // cap-exactness check, now snapshot-scoped). White-box on `JoinProbe`
+    // directly (pattern: tests 23/27) so the snapshot boundary is exact,
+    // not timing-dependent.
+    #[tokio::test]
+    async fn test_scan_fallback_cap_excludes_ghosts_from_budget() {
+        let (rel, _d) = make().await;
+        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+        for i in 0..5 {
+            ok(&rel, &format!("INSERT INTO b VALUES ({i}, 42)")).await;
+        }
+
+        let snapshot_guard = rel.engine().snapshot();
+        let snap = snapshot_guard.snapshot().clone();
+        // Ghosts: live at probe time, but after the snapshot -- must not
+        // count toward the fallback budget nor appear in the result.
+        for i in 5..8 {
+            ok(&rel, &format!("INSERT INTO b VALUES ({i}, 42)")).await;
+        }
+
+        let prefix = rel.get_domain("default").unwrap().system_prefix;
+        let b_schema = match rel.get_object("default", "b").unwrap() {
+            CatalogEntry::Table(t) => Arc::new(t),
+            _ => unreachable!(),
+        };
+        let probe = JoinProbe {
+            engine: Arc::clone(rel.engine()),
+            snapshot: snap,
+            metrics: Arc::clone(&rel.metrics),
+            right_prefix: prefix,
+            right_table: Arc::clone(&b_schema),
+            right_alias: "b".to_string(),
+            right_col_pos: 1,
+            value_source: (0, 1),
+            strategy: ProbeStrategy::ScanFallback,
+            widen_int_to_real: false,
+            fallback_budget: Arc::new(AtomicU64::new(0)),
+            max_fallback_scan: 5,
+            mask: LinkMask::default(),
+        };
+        let hits = probe.probe(&ScalarValue::Integer(42)).await.unwrap();
+        assert_eq!(hits.len(), 5, "all 5 snapshot-visible rows must match; ghosts excluded from the scan itself");
     }
 }

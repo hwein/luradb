@@ -181,8 +181,19 @@ impl RelEngine {
         let dom = self.domains.require_active(domain)?;
         let mask = self.compute_link_mask(domain, &[&schema], auth).await?;
         let plan = plan::plan_access(&schema, &None, &[], &[], &[], mask)?;
-        let (row_keys, _scanned) =
-            resolve_candidate_keys(&self.engine, &schema, &dom.system_prefix, &plan.access, None).await?;
+        // Registered before the key scan (spec rel/018 §2, `exec_count`
+        // pattern): a point-in-time count, not a live key count.
+        let snapshot_guard = self.engine.snapshot();
+        let snap = snapshot_guard.snapshot().clone();
+        let (row_keys, _scanned) = resolve_candidate_keys(
+            &self.engine,
+            &schema,
+            &dom.system_prefix,
+            &plan.access,
+            &snap,
+            None,
+        )
+        .await?;
         Ok(row_keys.len() as u64)
     }
 }

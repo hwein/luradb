@@ -122,7 +122,7 @@ impl<S: RowSource + Send> RowSource for Filter<S> {
                 match self.input.next().await? {
                     None => return Ok(None),
                     Some(row) => {
-                        let keep = matches!(eval(&self.pred, &flatten(&row.bindings)), Bool3::True);
+                        let keep = matches!(eval(&self.pred, &flatten(&row.bindings))?, Bool3::True);
                         if keep {
                             return Ok(Some(row));
                         }
@@ -755,7 +755,7 @@ impl RelEngine {
                 };
                 let mut count = 0i64;
                 while let Some(row) = scan.next().await? {
-                    if matches!(eval(&pred, &row.bindings[0].values), Bool3::True) {
+                    if matches!(eval(&pred, &row.bindings[0].values)?, Bool3::True) {
                         count += 1;
                     }
                 }

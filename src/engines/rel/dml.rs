@@ -447,7 +447,7 @@ impl RelEngine {
             scanned += 1;
             let values = decode_row(&bytes, schema);
             let keep = match &pred {
-                Some(p) => matches!(eval(p, &values), Bool3::True),
+                Some(p) => matches!(eval(p, &values)?, Bool3::True),
                 None => true,
             };
             if keep {

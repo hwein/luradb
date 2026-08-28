@@ -22,6 +22,7 @@ All notable changes to LuraDB are documented in this file.
 ### Security
 
 - Rel: LIKE matching no longer allocates a table sized by pattern × text length.
+- Rel: pathologically self-similar LIKE patterns now abort with an error instead of monopolizing a CPU core per row.
 - Auth: rotating an API key now immediately invalidates the previous one — it used to stay valid in the cache until a second restart.
 - **BREAKING** Rel: cross-engine KVREF/JSONREF links now require read access to the target KV/JSON domain. `/sql` expand of a column the caller can't read now returns `null` instead of the resolved value; INSERT/UPDATE (via `/sql` or row writes) with such a link now answers 403 instead of succeeding or 409.
 - The server refuses to start with authentication disabled on a non-loopback bind — a config without `[auth]`, or a bind to `0.0.0.0`/`::` with `auth.enabled = false`, previously started silently with unauthenticated, network-wide access.

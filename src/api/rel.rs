@@ -43,6 +43,7 @@ impl From<RelStoreError> for ApiError {
             | RelStoreError::RowTooLarge { .. }
             | RelStoreError::KeyTooLong { .. }
             | RelStoreError::SortBufferExceeded { .. }
+            | RelStoreError::LikeBudgetExceeded { .. }
             | RelStoreError::JoinDepthExceeded { .. }
             | RelStoreError::UnindexedJoin { .. }
             | RelStoreError::UnindexedJoinScanExceeded { .. }
@@ -1251,5 +1252,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT, "admin keeps the ordinary CrossEngineLinkMissing 409");
+    }
+
+    // rel/017 §Tests 5: a pathologically self-similar LIKE pattern over /sql
+    // aborts with 400 LikeBudgetExceeded instead of pinning a CPU core. A
+    // short inline pattern is enough once the matched cell is large (same
+    // large-cell-via-param construction as the rel/015 E2E test in
+    // eval.rs), keeping the SQL statement itself well under
+    // max_statement_len.
+    #[tokio::test]
+    async fn test_like_budget_exceeded_400() {
+        let (app, _dir) = make_default_app().await;
+        sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)"}"#).await;
+        let big = "a".repeat(60_000);
+        let insert = format!(r#"{{"sql": "INSERT INTO t VALUES (1, ?)", "params": ["{big}"]}}"#);
+        let (status, body) = sql(&app, "default", &insert).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // '%' + 200 'a's + 'b' (202 bytes) against the 60,000-'a' cell never
+        // matches (no 'b' in the text), so the matcher retries the 200-char
+        // literal at every position in the cell — well past the step budget
+        // for a pattern this size.
+        let pattern = format!("%{}b", "a".repeat(200));
+        let select = format!(r#"{{"sql": "SELECT id FROM t WHERE txt LIKE '{pattern}'"}}"#);
+        let (status, body) = sql(&app, "default", &select).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let msg = body["_raw"].as_str().unwrap_or_default();
+        assert!(msg.contains("pathologically self-similar"), "{msg}");
+
+        // The process stays responsive: a follow-up request still goes through.
+        let (status, _) = sql(&app, "default", r#"{"sql": "SELECT COUNT(*) FROM t"}"#).await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

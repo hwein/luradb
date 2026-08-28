@@ -119,6 +119,13 @@ pub enum RelStoreError {
     #[error("sort buffer of {rows} rows exceeds maximum of {max}; narrow the result with WHERE/LIMIT or add a matching index")]
     SortBufferExceeded { rows: usize, max: usize },
 
+    // ── LIKE matcher (spec rel/017) ───────────────────────────────────────────
+    /// `like_match`'s per-row step counter exceeded its budget — pattern and
+    /// value are pathologically self-similar (rel/015 backtracking) (→ 400,
+    /// propagates before negation: `NOT LIKE` over budget is the same error).
+    #[error("LIKE match aborted after {steps} steps (budget {max}): pattern and value are pathologically self-similar")]
+    LikeBudgetExceeded { steps: usize, max: usize },
+
     // ── LEFT JOIN (spec rel/007) ─────────────────────────────────────────────
     /// `select.joins.len()` (plus any already-consumed expand stages, rel/009
     /// interface prep) exceeds `max_join_depth` (→ 400).

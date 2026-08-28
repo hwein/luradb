@@ -199,7 +199,7 @@ impl JoinProbe {
         for k in &scan_keys {
             if let Some(bytes) = self.engine.get_with_snapshot(k, &self.snapshot).await?.into_option() {
                 let values = decode_row(&bytes, &self.right_table);
-                if matches!(eval(&pred, &values), Bool3::True) {
+                if matches!(eval(&pred, &values)?, Bool3::True) {
                     out.push(self.row_binding(values));
                 }
             } // ghost: skip

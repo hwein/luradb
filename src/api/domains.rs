@@ -44,8 +44,8 @@ impl From<crate::engines::lsm::Domain> for DomainResponse {
     request_body = CreateDomainRequest,
     responses(
         (status = 201, description = "Domain created", body = DomainResponse),
-        (status = 409, description = "Domain already exists"),
-        (status = 400, description = "Invalid domain name"),
+        (status = 409, description = "Domain already exists", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid domain name", body = String, content_type = "text/plain"),
     ),
     tag = "Domains"
 )]
@@ -81,7 +81,7 @@ pub async fn list_domains(
     params(("name" = String, Path, description = "Domain name")),
     responses(
         (status = 200, description = "Domain found", body = DomainResponse),
-        (status = 404, description = "Domain not found"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
     ),
     tag = "Domains"
 )]
@@ -105,7 +105,7 @@ pub async fn get_domain(
     params(("name" = String, Path, description = "Domain name")),
     responses(
         (status = 202, description = "Deletion accepted — background purge started"),
-        (status = 404, description = "Domain not found"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
     ),
     tag = "Domains"
 )]

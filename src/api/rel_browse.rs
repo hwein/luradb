@@ -125,10 +125,10 @@ fn default_to_json(d: &DefaultValue) -> Option<Value> {
     params(("domain" = String, Path, description = "Relational domain")),
     responses(
         (status = 200, description = "Tables of the domain", body = Vec<TableSummary>),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -159,10 +159,10 @@ pub async fn list_tables(
     ),
     responses(
         (status = 200, description = "Table schema detail", body = TableDetail),
-        (status = 404, description = "Domain or table not found (a view is not a table)"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain or table not found (a view is not a table)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -217,10 +217,10 @@ pub async fn get_table(
     params(("domain" = String, Path, description = "Relational domain")),
     responses(
         (status = 200, description = "Views of the domain, incl. raw SQL text", body = Vec<ViewSummary>),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -328,12 +328,12 @@ fn enforce_response_size(engine: &RelEngine, value: &Value) -> Result<(), ApiErr
     ),
     responses(
         (status = 200, description = "Matching rows as objects, with row_count/limit/offset/limit_applied", body = RowsResponse),
-        (status = 400, description = "Unknown filter column, or a filter/limit/offset parse/type error"),
-        (status = 404, description = "Domain or table not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 413, description = "Response exceeds max_response_bytes"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "Unknown filter column, or a filter/limit/offset parse/type error", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain or table not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 413, description = "Response exceeds max_response_bytes", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -396,12 +396,12 @@ pub async fn browse_rows(
     ),
     responses(
         (status = 200, description = "The row as an object, with an optional _expanded block", body = Object),
-        (status = 400, description = "PK parse/type error"),
-        (status = 404, description = "Domain, table, or row not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 413, description = "Response exceeds max_response_bytes"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "PK parse/type error", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, or row not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 413, description = "Response exceeds max_response_bytes", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -443,10 +443,10 @@ pub async fn get_row(
     ),
     responses(
         (status = 200, description = "Row count. A full key scan under the hood — cost grows linearly with table size; meant for on-demand use, not high-frequency polling.", body = CountResponse),
-        (status = 404, description = "Domain or table not found (a view has no count resource, same as `rows`)"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain or table not found (a view has no count resource, same as `rows`)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -508,13 +508,13 @@ fn percent_encode_path_segment(s: &str) -> String {
     request_body = Object,
     responses(
         (status = 201, description = "Row inserted", body = Object),
-        (status = 400, description = "NOT NULL/type/schema violation"),
-        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)"),
-        (status = 404, description = "Domain, table, or referenced body column not found"),
-        (status = 409, description = "PK collision, unique violation, or missing REFERENCES target"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "NOT NULL/type/schema violation", body = String, content_type = "text/plain"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, or referenced body column not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "PK collision, unique violation, or missing REFERENCES target", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Rows"
 )]
@@ -556,13 +556,13 @@ pub async fn insert_row(
     request_body = Object,
     responses(
         (status = 200, description = "Row updated", body = Object),
-        (status = 400, description = "NOT NULL/type/schema violation, or body primary key != path primary key"),
-        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)"),
-        (status = 404, description = "Domain, table, column, or row not found"),
-        (status = 409, description = "Unique violation, or missing REFERENCES target"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "NOT NULL/type/schema violation, or body primary key != path primary key", body = String, content_type = "text/plain"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, column, or row not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "Unique violation, or missing REFERENCES target", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Rows"
 )]
@@ -604,11 +604,11 @@ pub async fn update_row(
     ),
     responses(
         (status = 200, description = "Row deleted", body = Object),
-        (status = 400, description = "PK parse/type error"),
-        (status = 404, description = "Domain, table, or row not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "PK parse/type error", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, or row not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Rows"
 )]

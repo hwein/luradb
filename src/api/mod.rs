@@ -60,7 +60,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.11";
+pub const API_VERSION: &str = "0.3.12";
 
 struct VersionInfo;
 
@@ -644,6 +644,55 @@ mod contract_tests {
         let schema = &json["paths"]["/store-api/json/{domain}/documents/{key}"]["get"]["responses"]
             ["404"]["content"]["text/plain"]["schema"];
         assert_eq!(schema["type"], serde_json::json!("string"), "{schema}");
+    }
+
+    // ── Error-body typing gate (spec general/026) ────────────────────────────
+
+    /// Every documented response with status >= 400, anywhere in the API,
+    /// must declare a `text/plain` string body — otherwise a codegen client
+    /// sees `content?: never` on that error, the contract lie general/004 set
+    /// out to end. No exception list as a starting state (spec §Gate); the
+    /// one exception below is justified, not a loophole, and covers json.rs
+    /// too (json/016 §D2's narrower guarantee, now subsumed).
+    #[test]
+    fn every_4xx_5xx_response_declares_text_plain_string_body() {
+        const HTTP_METHODS: [&str; 8] =
+            ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
+        // metrics::get_domain_metrics returns a bare `Result<_, StatusCode>`
+        // (see the handler in metrics.rs), not `ApiError` — its 404 is a
+        // real empty body, not a plaintext one. Reality over schema (spec
+        // general/026): documented without a body instead of faking one. The
+        // only entry here; a new one needs the same proof (a handler path
+        // that provably never carries a body).
+        const NO_BODY_EXCEPTIONS: &[(&str, &str, &str)] =
+            &[("/store-api/metrics/domains/{name}", "get", "404")];
+
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = json["paths"].as_object().expect("contract without paths");
+        for (path, item) in paths {
+            let methods = item.as_object().expect("path item is not an object");
+            for (method, op) in methods {
+                if !HTTP_METHODS.contains(&method.as_str()) {
+                    continue;
+                }
+                let Some(responses) = op["responses"].as_object() else { continue };
+                for (status, response) in responses {
+                    let Ok(code) = status.parse::<u16>() else { continue };
+                    if code < 400 {
+                        continue;
+                    }
+                    if NO_BODY_EXCEPTIONS.contains(&(path.as_str(), method.as_str(), status.as_str())) {
+                        continue;
+                    }
+                    let schema_type = &response["content"]["text/plain"]["schema"]["type"];
+                    assert_eq!(
+                        schema_type,
+                        &serde_json::json!("string"),
+                        "{method} {path} -> {status}: missing text/plain string body: {response}"
+                    );
+                }
+            }
+        }
     }
 }
 

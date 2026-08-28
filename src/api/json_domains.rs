@@ -59,9 +59,9 @@ impl From<JsonDomain> for JsonDomainResponse {
     request_body = CreateJsonDomainRequest,
     responses(
         (status = 201, description = "JSON domain created", body = JsonDomainResponse),
-        (status = 409, description = "Domain already exists"),
-        (status = 400, description = "Invalid domain name"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 409, description = "Domain already exists", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid domain name", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -80,7 +80,7 @@ pub async fn create_domain(
     path = "/store-api/json/domains",
     responses(
         (status = 200, description = "List of active JSON domains", body = Vec<JsonDomainResponse>),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -98,9 +98,9 @@ pub async fn list_domains(
     params(("name" = String, Path, description = "JSON domain name")),
     responses(
         (status = 200, description = "Domain found", body = JsonDomainResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted (background purge running)"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted (background purge running)", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -131,8 +131,8 @@ pub async fn get_domain(
     params(("name" = String, Path, description = "JSON domain name")),
     responses(
         (status = 202, description = "Deletion accepted — background purge follows"),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]

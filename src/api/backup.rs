@@ -335,10 +335,10 @@ fn parse_restore_mode(s: &str) -> Result<restore::RestoreMode, ApiError> {
     request_body = CreateBackupRequest,
     responses(
         (status = 202, description = "Backup job started", body = BackupAcceptedResponse),
-        (status = 400, description = "Invalid scope"),
-        (status = 404, description = "Scope targets a missing domain"),
-        (status = 409, description = "A backup or restore job is already running"),
-        (status = 503, description = "Backup is disabled, or scope requires the JSON engine, which is disabled"),
+        (status = 400, description = "Invalid scope", body = String, content_type = "text/plain"),
+        (status = 404, description = "Scope targets a missing domain", body = String, content_type = "text/plain"),
+        (status = 409, description = "A backup or restore job is already running", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled, or scope requires the JSON engine, which is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -362,7 +362,7 @@ pub async fn create_backup(
     path = "/store-api/backups",
     responses(
         (status = 200, description = "Backup list", body = BackupListResponse),
-        (status = 503, description = "Backup is disabled"),
+        (status = 503, description = "Backup is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -381,9 +381,9 @@ pub async fn list_backups(State(state): State<AppState>) -> Result<Json<BackupLi
     params(("id" = String, Path, description = "Backup id")),
     responses(
         (status = 200, description = "Backup details", body = BackupDetailResponse),
-        (status = 400, description = "Invalid backup id"),
-        (status = 404, description = "Backup not found"),
-        (status = 503, description = "Backup is disabled"),
+        (status = 400, description = "Invalid backup id", body = String, content_type = "text/plain"),
+        (status = 404, description = "Backup not found", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -409,10 +409,10 @@ pub async fn get_backup(
     responses(
         (status = 200, description = "Full NDJSON archive", content_type = "application/x-ndjson"),
         (status = 206, description = "Partial content (Range request)", content_type = "application/x-ndjson"),
-        (status = 400, description = "Invalid backup id"),
-        (status = 404, description = "Backup not found"),
-        (status = 409, description = "The backup job for this id is still running"),
-        (status = 503, description = "Backup is disabled"),
+        (status = 400, description = "Invalid backup id", body = String, content_type = "text/plain"),
+        (status = 404, description = "Backup not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "The backup job for this id is still running", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -447,10 +447,10 @@ pub async fn download_backup(
     params(("id" = String, Path, description = "Backup id")),
     responses(
         (status = 204, description = "Backup deleted"),
-        (status = 400, description = "Invalid backup id"),
-        (status = 404, description = "Backup not found"),
-        (status = 409, description = "The backup job for this id is still running"),
-        (status = 503, description = "Backup is disabled"),
+        (status = 400, description = "Invalid backup id", body = String, content_type = "text/plain"),
+        (status = 404, description = "Backup not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "The backup job for this id is still running", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -473,8 +473,8 @@ pub async fn delete_backup(
     request_body(content = String, description = "NDJSON backup archive, raw bytes streamed to disk (no multipart)"),
     responses(
         (status = 201, description = "Archive accepted", body = BackupDetailResponse),
-        (status = 400, description = "Invalid backup file — checksum/manifest verification failed"),
-        (status = 503, description = "Backup is disabled"),
+        (status = 400, description = "Invalid backup file — checksum/manifest verification failed", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -555,10 +555,10 @@ async fn stream_body_to_file(path: &std::path::Path, body: Body) -> Result<(), A
     request_body = RestoreRequest,
     responses(
         (status = 202, description = "Restore job started", body = RestoreAcceptedResponse),
-        (status = 400, description = "Invalid id/mode, remap requires a single domain, unsupported format version, or invalid backup file"),
-        (status = 404, description = "Backup not found, or scope targets a missing domain"),
-        (status = 409, description = "A backup or restore job is already running"),
-        (status = 503, description = "Backup is disabled"),
+        (status = 400, description = "Invalid id/mode, remap requires a single domain, unsupported format version, or invalid backup file", body = String, content_type = "text/plain"),
+        (status = 404, description = "Backup not found, or scope targets a missing domain", body = String, content_type = "text/plain"),
+        (status = 409, description = "A backup or restore job is already running", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -630,8 +630,8 @@ pub async fn restore_backup(
     params(("id" = String, Path, description = "Restore id")),
     responses(
         (status = 200, description = "Restore status", body = RestoreStatusResponse),
-        (status = 404, description = "Restore not found"),
-        (status = 503, description = "Backup is disabled"),
+        (status = 404, description = "Restore not found", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]

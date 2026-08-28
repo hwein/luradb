@@ -51,7 +51,7 @@ pub struct VersionResponse {
     path = "/version",
     responses(
         (status = 200, description = "Server and API contract version", body = VersionResponse),
-        (status = 401, description = "Unauthorized — a valid API key is required"),
+        (status = 401, description = "Unauthorized — a valid API key is required", body = String, content_type = "text/plain"),
     ),
     security(("bearer_auth" = [])),
     tag = "Metrics"
@@ -75,8 +75,8 @@ pub async fn version() -> Json<VersionResponse> {
     path = "/store-api/config",
     responses(
         (status = 200, description = "config_path (resolved path, always set), config_file_loaded (whether a file existed there), and config (the effective LuraConfig — see config.rs for field docs)", body = Object),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden — Admin only"),
+        (status = 401, description = "Unauthorized", body = String, content_type = "text/plain"),
+        (status = 403, description = "Forbidden — Admin only", body = String, content_type = "text/plain"),
     ),
     security(("bearer_auth" = [])),
     tag = "Metrics"
@@ -111,8 +111,8 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
     path = "/store-api/metrics",
     responses(
         (status = 200, description = "Metrics snapshot"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden — Admin only"),
+        (status = 401, description = "Unauthorized", body = String, content_type = "text/plain"),
+        (status = 403, description = "Forbidden — Admin only", body = String, content_type = "text/plain"),
     ),
     security(("bearer_auth" = [])),
     tag = "Metrics"
@@ -175,8 +175,13 @@ pub async fn get_metrics(State(state): State<AppState>) -> Json<Value> {
     params(("name" = String, Path, description = "Domain name")),
     responses(
         (status = 200, description = "Domain metrics snapshot"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 401, description = "Unauthorized", body = String, content_type = "text/plain"),
+        (status = 403, description = "Forbidden", body = String, content_type = "text/plain"),
+        // 404: get_domain_metrics returns bare `StatusCode::NOT_FOUND` (see
+        // handler below), not `ApiError` — a real empty body, not a plaintext
+        // one. Left undocumented as a body per general/026 (reality over
+        // schema); the contract_tests gate below carries the matching,
+        // justified exception.
         (status = 404, description = "Domain not found or no metrics yet"),
     ),
     security(("bearer_auth" = [])),

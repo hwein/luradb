@@ -53,9 +53,9 @@ impl From<RelDomain> for RelDomainResponse {
     request_body = CreateRelDomainRequest,
     responses(
         (status = 201, description = "Relational domain created", body = RelDomainResponse),
-        (status = 409, description = "Domain already exists"),
-        (status = 400, description = "Invalid domain name"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 409, description = "Domain already exists", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid domain name", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]
@@ -75,7 +75,7 @@ pub async fn create_domain(
     path = "/store-api/rel/domains",
     responses(
         (status = 200, description = "List of active relational domains", body = Vec<RelDomainResponse>),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]
@@ -91,9 +91,9 @@ pub async fn list_domains(State(state): State<AppState>) -> Result<Json<Vec<RelD
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
         (status = 200, description = "Domain found", body = RelDomainResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted (background purge running)"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted (background purge running)", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]
@@ -122,9 +122,9 @@ pub async fn get_domain(
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
         (status = 202, description = "Deletion accepted — background purge follows (rel/013)"),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is already being deleted"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is already being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]

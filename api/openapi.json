@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.11",
+    "version": "0.3.12",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -84,10 +84,24 @@
             }
           },
           "400": {
-            "description": "Invalid name"
+            "description": "Invalid name",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "User already exists"
+            "description": "User already exists",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -115,7 +129,14 @@
             "description": "User and all permissions deleted"
           },
           "404": {
-            "description": "User not found"
+            "description": "User not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -153,10 +174,24 @@
             "description": "Permission set"
           },
           "400": {
-            "description": "Invalid access or domain value"
+            "description": "Invalid access or domain value",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "User or domain not found"
+            "description": "User or domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -202,7 +237,14 @@
             "description": "Permission revoked"
           },
           "404": {
-            "description": "Permission not found"
+            "description": "Permission not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -237,7 +279,14 @@
             }
           },
           "404": {
-            "description": "User not found"
+            "description": "User not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -262,7 +311,14 @@
             }
           },
           "401": {
-            "description": "Missing or invalid API key"
+            "description": "Missing or invalid API key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -286,7 +342,14 @@
             }
           },
           "503": {
-            "description": "Backup is disabled"
+            "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -318,16 +381,44 @@
             }
           },
           "400": {
-            "description": "Invalid scope"
+            "description": "Invalid scope",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Scope targets a missing domain"
+            "description": "Scope targets a missing domain",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "A backup or restore job is already running"
+            "description": "A backup or restore job is already running",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Backup is disabled, or scope requires the JSON engine, which is disabled"
+            "description": "Backup is disabled, or scope requires the JSON engine, which is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -362,10 +453,24 @@
             }
           },
           "400": {
-            "description": "Invalid backup file — checksum/manifest verification failed"
+            "description": "Invalid backup file — checksum/manifest verification failed",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Backup is disabled"
+            "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -400,13 +505,34 @@
             }
           },
           "400": {
-            "description": "Invalid backup id"
+            "description": "Invalid backup id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Backup not found"
+            "description": "Backup not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Backup is disabled"
+            "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -432,16 +558,44 @@
             "description": "Backup deleted"
           },
           "400": {
-            "description": "Invalid backup id"
+            "description": "Invalid backup id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Backup not found"
+            "description": "Backup not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "The backup job for this id is still running"
+            "description": "The backup job for this id is still running",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Backup is disabled"
+            "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -478,16 +632,44 @@
             }
           },
           "400": {
-            "description": "Invalid backup id"
+            "description": "Invalid backup id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Backup not found"
+            "description": "Backup not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "The backup job for this id is still running"
+            "description": "The backup job for this id is still running",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Backup is disabled"
+            "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -532,16 +714,44 @@
             }
           },
           "400": {
-            "description": "Invalid id/mode, remap requires a single domain, unsupported format version, or invalid backup file"
+            "description": "Invalid id/mode, remap requires a single domain, unsupported format version, or invalid backup file",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Backup not found, or scope targets a missing domain"
+            "description": "Backup not found, or scope targets a missing domain",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "A backup or restore job is already running"
+            "description": "A backup or restore job is already running",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Backup is disabled"
+            "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -566,10 +776,24 @@
             }
           },
           "401": {
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
-            "description": "Forbidden — Admin only"
+            "description": "Forbidden — Admin only",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -630,10 +854,24 @@
             }
           },
           "400": {
-            "description": "Invalid domain name"
+            "description": "Invalid domain name",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Domain already exists"
+            "description": "Domain already exists",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -668,7 +906,14 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -694,7 +939,14 @@
             "description": "Deletion accepted — background purge started"
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -738,10 +990,24 @@
             }
           },
           "401": {
-            "description": "Missing or invalid API key"
+            "description": "Missing or invalid API key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
-            "description": "Non-admin caller — this endpoint has no `{domain}` segment, so it is admin-only"
+            "description": "Non-admin caller — this endpoint has no `{domain}` segment, so it is admin-only",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -768,7 +1034,14 @@
             }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -800,13 +1073,34 @@
             }
           },
           "400": {
-            "description": "Invalid domain name"
+            "description": "Invalid domain name",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Domain already exists"
+            "description": "Domain already exists",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -841,13 +1135,34 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted (background purge running)"
+            "description": "Domain is being deleted (background purge running)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -873,10 +1188,24 @@
             "description": "Deletion accepted — background purge follows"
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2030,7 +2359,14 @@
             }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2040,6 +2376,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2089,7 +2432,14 @@
             }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2099,6 +2449,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2152,16 +2509,44 @@
             }
           },
           "400": {
-            "description": "Missing or empty prefix"
+            "description": "Missing or empty prefix",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "413": {
-            "description": "The selection exceeds max_bulk_delete_keys; no key was deleted"
+            "description": "The selection exceeds max_bulk_delete_keys; no key was deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2171,6 +2556,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2225,13 +2617,34 @@
             "description": "Key exists in the explicit null state (set via PATCH …/null)"
           },
           "400": {
-            "description": "Invalid key"
+            "description": "Invalid key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Key or domain not found"
+            "description": "Key or domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2241,6 +2654,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2299,13 +2719,34 @@
             "description": "Key upserted"
           },
           "400": {
-            "description": "Invalid key"
+            "description": "Invalid key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2315,6 +2756,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2352,10 +2800,24 @@
             "description": "Key deleted"
           },
           "400": {
-            "description": "Invalid key"
+            "description": "Invalid key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2365,6 +2827,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2411,13 +2880,34 @@
             }
           },
           "400": {
-            "description": "Invalid key"
+            "description": "Invalid key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Key or domain not found"
+            "description": "Key or domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2427,6 +2917,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2466,10 +2963,24 @@
             "description": "Key set to the null value state"
           },
           "400": {
-            "description": "Invalid key"
+            "description": "Invalid key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "description": "Rate limit exceeded",
@@ -2479,6 +2990,13 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2543,7 +3061,14 @@
             }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2597,16 +3122,44 @@
             }
           },
           "400": {
-            "description": "lines = 0, or invalid file name"
+            "description": "lines = 0, or invalid file name",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "file does not exist"
+            "description": "file does not exist",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "log directory unreadable, no luradb.log* file found, or read failed"
+            "description": "log directory unreadable, no luradb.log* file found, or read failed",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Log HTTP access is disabled"
+            "description": "Log HTTP access is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2630,10 +3183,24 @@
             }
           },
           "500": {
-            "description": "log directory unreadable"
+            "description": "log directory unreadable",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Log HTTP access is disabled"
+            "description": "Log HTTP access is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2651,10 +3218,24 @@
             "description": "Metrics snapshot"
           },
           "401": {
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
-            "description": "Forbidden — Admin only"
+            "description": "Forbidden — Admin only",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2687,10 +3268,24 @@
             "description": "Domain metrics snapshot"
           },
           "401": {
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "Domain not found or no metrics yet"
@@ -2725,7 +3320,14 @@
             }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -2757,13 +3359,34 @@
             }
           },
           "400": {
-            "description": "Invalid domain name"
+            "description": "Invalid domain name",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Domain already exists"
+            "description": "Domain already exists",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2798,13 +3421,34 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted (background purge running)"
+            "description": "Domain is being deleted (background purge running)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -2830,13 +3474,34 @@
             "description": "Deletion accepted — background purge follows (rel/013)"
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is already being deleted"
+            "description": "Domain is already being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2881,28 +3546,84 @@
             }
           },
           "400": {
-            "description": "Syntax, type, parameter-count, or expand error"
+            "description": "Syntax, type, parameter-count, or expand error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
-            "description": "Access level too low for this statement (rel/011)"
+            "description": "Access level too low for this statement (rel/011)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain, table, column, or index not found"
+            "description": "Domain, table, column, or index not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Conflict — duplicate key, unique violation, name collision, …"
+            "description": "Conflict — duplicate key, unique violation, name collision, …",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "413": {
-            "description": "Response exceeds max_response_bytes"
+            "description": "Response exceeds max_response_bytes",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2940,16 +3661,44 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2993,16 +3742,44 @@
             }
           },
           "404": {
-            "description": "Domain or table not found (a view is not a table)"
+            "description": "Domain or table not found (a view is not a table)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3046,16 +3823,44 @@
             }
           },
           "404": {
-            "description": "Domain or table not found (a view has no count resource, same as `rows`)"
+            "description": "Domain or table not found (a view has no count resource, same as `rows`)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3128,22 +3933,64 @@
             }
           },
           "400": {
-            "description": "Unknown filter column, or a filter/limit/offset parse/type error"
+            "description": "Unknown filter column, or a filter/limit/offset parse/type error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain or table not found"
+            "description": "Domain or table not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "413": {
-            "description": "Response exceeds max_response_bytes"
+            "description": "Response exceeds max_response_bytes",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -3195,25 +4042,74 @@
             }
           },
           "400": {
-            "description": "NOT NULL/type/schema violation"
+            "description": "NOT NULL/type/schema violation",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
-            "description": "Missing read access to a linked KV/JSON domain (rel/016)"
+            "description": "Missing read access to a linked KV/JSON domain (rel/016)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain, table, or referenced body column not found"
+            "description": "Domain, table, or referenced body column not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "PK collision, unique violation, or missing REFERENCES target"
+            "description": "PK collision, unique violation, or missing REFERENCES target",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3275,22 +4171,64 @@
             }
           },
           "400": {
-            "description": "PK parse/type error"
+            "description": "PK parse/type error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain, table, or row not found"
+            "description": "Domain, table, or row not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "413": {
-            "description": "Response exceeds max_response_bytes"
+            "description": "Response exceeds max_response_bytes",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -3351,25 +4289,74 @@
             }
           },
           "400": {
-            "description": "NOT NULL/type/schema violation, or body primary key != path primary key"
+            "description": "NOT NULL/type/schema violation, or body primary key != path primary key",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
-            "description": "Missing read access to a linked KV/JSON domain (rel/016)"
+            "description": "Missing read access to a linked KV/JSON domain (rel/016)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain, table, column, or row not found"
+            "description": "Domain, table, column, or row not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Unique violation, or missing REFERENCES target"
+            "description": "Unique violation, or missing REFERENCES target",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -3420,19 +4407,54 @@
             }
           },
           "400": {
-            "description": "PK parse/type error"
+            "description": "PK parse/type error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain, table, or row not found"
+            "description": "Domain, table, or row not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3470,16 +4492,44 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Per-domain request budget exceeded"
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Relational engine disabled"
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3514,10 +4564,24 @@
             }
           },
           "404": {
-            "description": "Restore not found"
+            "description": "Restore not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Backup is disabled"
+            "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3541,7 +4605,14 @@
             }
           },
           "401": {
-            "description": "Unauthorized — a valid API key is required"
+            "description": "Unauthorized — a valid API key is required",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [

@@ -20,6 +20,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: added `GET /store-api/config`, returning the effective configuration of the running process (`config_path`, `config_file_loaded`, `config`) — admin-only; the admin API key is redacted from `config`, everything else is the same field names as the TOML file.
 - Startup now fails fast when `max_value_size` or `max_key_length` of any engine's `[lsm]` block exceed the WAL recovery field cap — previously such a config wrote WAL records that only failed the *next* restart's recovery.
 - **BREAKING** API: JSON document-store OpenAPI contract now documents `410 Gone` on all document/index/search/bulk/reindex routes, `If-Match` as a header parameter on `PUT`/`DELETE …/documents/{key}`, the `ETag` response header on `GET …/documents/{key}`, `DocumentListResponse`/`SearchResponse` document lists typed as `DocumentResponse[]`, and `text/plain` string bodies on every 4xx/5xx response in the JSON API.
+- **BREAKING** API: every documented 4xx/5xx error response across the rest of the REST API (KV, domains, relational store/browse/rows, auth, backup/restore, logs, metrics, global events) now documents its body as a `text/plain` string in the OpenAPI contract, same as the JSON API above — wire format unchanged, previously undocumented; a new contract test enforces this on every current and future route.
 
 ### Security
 

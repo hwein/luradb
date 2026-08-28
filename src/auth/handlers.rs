@@ -151,7 +151,7 @@ fn now_secs() -> u64 {
     path = "/store-api/auth/whoami",
     responses(
         (status = 200, description = "Caller identity — name (if any) and role", body = WhoamiResponse),
-        (status = 401, description = "Missing or invalid API key"),
+        (status = 401, description = "Missing or invalid API key", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
@@ -201,8 +201,8 @@ pub async fn whoami(
     request_body = CreateUserRequest,
     responses(
         (status = 201, description = "User created. API key is shown once in the response.", body = CreateUserResponse),
-        (status = 409, description = "User already exists"),
-        (status = 400, description = "Invalid name"),
+        (status = 409, description = "User already exists", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid name", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
@@ -322,7 +322,7 @@ pub async fn list_users(State(state): State<AuthState>) -> Json<Vec<UserListItem
     params(("name" = String, Path, description = "Username")),
     responses(
         (status = 204, description = "User and all permissions deleted"),
-        (status = 404, description = "User not found"),
+        (status = 404, description = "User not found", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
@@ -348,8 +348,8 @@ pub async fn delete_user(
     request_body = SetPermissionRequest,
     responses(
         (status = 200, description = "Permission set"),
-        (status = 404, description = "User or domain not found"),
-        (status = 400, description = "Invalid access or domain value"),
+        (status = 404, description = "User or domain not found", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid access or domain value", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
@@ -411,7 +411,7 @@ pub async fn set_permission(
     ),
     responses(
         (status = 204, description = "Permission revoked"),
-        (status = 404, description = "Permission not found"),
+        (status = 404, description = "Permission not found", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
@@ -443,7 +443,7 @@ pub async fn remove_permission(
     params(("name" = String, Path, description = "Username")),
     responses(
         (status = 200, description = "New API key generated (visible once)", body = RotateKeyResponse),
-        (status = 404, description = "User not found"),
+        (status = 404, description = "User not found", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
@@ -563,6 +563,25 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    // Spec general/026 test 2 (auth sample): a real 404 (unknown user)
+    // carries a non-empty plaintext body — schema and reality agree.
+    #[tokio::test]
+    async fn test_delete_missing_user_404_has_nonempty_plaintext_body() {
+        let (app, _auth_cache, _dir) = make_app(false).await;
+        let resp = send(&app, Method::DELETE, "/store-api/auth/users/ghost", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let content_type =
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.is_empty(), "404 body must not be empty");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body).is_err(),
+            "body must be plain text, not JSON: {body}"
+        );
     }
 
     // Test 2: user without any grant -> permissions: [].

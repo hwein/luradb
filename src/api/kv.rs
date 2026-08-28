@@ -164,10 +164,10 @@ fn watch_item(
     request_body(content = String, content_type = "text/plain"),
     responses(
         (status = 200, description = "Key upserted"),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
-        (status = 400, description = "Invalid key"),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
+        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -199,10 +199,10 @@ pub async fn put_key(
     responses(
         (status = 200, description = "Value (raw bytes; an empty value yields an empty body). The `X-Expires-At` header (absolute Unix seconds) is present only when the key has a TTL.", content_type = "application/octet-stream", headers(("X-Expires-At" = u64))),
         (status = 204, description = "Key exists in the explicit null state (set via PATCH …/null)"),
-        (status = 404, description = "Key or domain not found"),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
-        (status = 400, description = "Invalid key"),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 404, description = "Key or domain not found", body = String, content_type = "text/plain"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
+        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -249,10 +249,10 @@ pub struct KeyMetaResponse {
     ),
     responses(
         (status = 200, description = "Key metadata", body = KeyMetaResponse),
-        (status = 400, description = "Invalid key"),
-        (status = 404, description = "Key or domain not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
+        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 404, description = "Key or domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
     ),
     tag = "Key-Value Store"
 )]
@@ -284,9 +284,9 @@ pub async fn get_key_meta(
     ),
     responses(
         (status = 204, description = "Key deleted"),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
-        (status = 400, description = "Invalid key"),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
+        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -309,9 +309,9 @@ pub async fn delete_key(
     ),
     responses(
         (status = 200, description = "Key set to the null value state"),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
-        (status = 400, description = "Invalid key"),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
+        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -335,8 +335,8 @@ pub async fn set_null(
     ),
     responses(
         (status = 200, description = "List of matching keys", body = Vec<String>),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -371,11 +371,11 @@ pub struct BulkDeleteResponse {
     ),
     responses(
         (status = 200, description = "Matched keys deleted atomically (one write batch); an empty selection is a no-op", body = BulkDeleteResponse),
-        (status = 400, description = "Missing or empty prefix"),
-        (status = 413, description = "The selection exceeds max_bulk_delete_keys; no key was deleted"),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 400, description = "Missing or empty prefix", body = String, content_type = "text/plain"),
+        (status = 413, description = "The selection exceeds max_bulk_delete_keys; no key was deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -404,8 +404,8 @@ pub async fn delete_keys_by_prefix(
     ),
     responses(
         (status = 200, description = "Number of live keys matching the prefix. A full key scan under the hood (same cost as the equivalent `keys?prefix=` call) — cost grows linearly with domain size, so this is meant for on-demand use, not high-frequency polling.", body = CountResponse),
-        (status = 429, description = "Rate limit exceeded", headers(("Retry-After" = u64))),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -433,7 +433,7 @@ pub async fn count_keys(
     ),
     responses(
         (status = 200, description = "SSE stream of key change events. Every event carries an `id:`. Event types: `set` / `delete` (data: the key) and `reset` (data: `{\"reason\": ...}`, emitted whenever gapless resume cannot be guaranteed — the client should re-read the domain, then keep applying events normally).", content_type = "text/event-stream"),
-        (status = 410, description = "Domain is being deleted"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
@@ -615,6 +615,25 @@ mod tests {
             .oneshot(Request::builder().method(method).uri(uri).body(body).unwrap())
             .await
             .unwrap()
+    }
+
+    // Spec general/026 test 2 (kv sample): a real 404 carries a non-empty
+    // plaintext body — schema (text/plain string) and reality agree.
+    #[tokio::test]
+    async fn test_get_missing_key_404_has_nonempty_plaintext_body() {
+        let (app, _dir) = make_app().await;
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/ghost", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let content_type =
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.is_empty(), "404 body must not be empty");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body).is_err(),
+            "body must be plain text, not JSON: {body}"
+        );
     }
 
     // PATCH …/null → 200; GET → 204 (empty body); key appears in the scan;

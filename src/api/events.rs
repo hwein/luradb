@@ -108,8 +108,8 @@ fn global_live_item(
     ),
     responses(
         (status = 200, description = "SSE stream of lifecycle/DDL events across the KV, JSON and relational engines: domains created/deleted/purged, and (rel) table/view/index DDL, (json) index DDL. No per-key data events — use a domain's `watch` for those. Every event carries an `id:`; `event:` matches its `type` field (e.g. `domain_created`, `table_altered`). `data:` is JSON `{engine, type, domain, object?, ts}` — `object` is the table/view/index/field name, absent for domain events. `event: reset` (`data: {\"reason\": ...}`) is emitted whenever gapless resume cannot be guaranteed.", content_type = "text/event-stream"),
-        (status = 401, description = "Missing or invalid API key"),
-        (status = 403, description = "Non-admin caller — this endpoint has no `{domain}` segment, so it is admin-only"),
+        (status = 401, description = "Missing or invalid API key", body = String, content_type = "text/plain"),
+        (status = 403, description = "Non-admin caller — this endpoint has no `{domain}` segment, so it is admin-only", body = String, content_type = "text/plain"),
     ),
     tag = "Events"
 )]

@@ -233,14 +233,14 @@ pub(super) fn dml_result_json(r: &DmlResult) -> Value {
             {\"columns\":[{\"name\",\"type\"}],\"rows\":[[...]],\"row_count\",\"limit_applied\",\
             \"expanded\"?}. `rows` are arrays (not objects) so same-named JOIN columns don't collide.",
             body = Object),
-        (status = 400, description = "Syntax, type, parameter-count, or expand error"),
-        (status = 403, description = "Access level too low for this statement (rel/011)"),
-        (status = 404, description = "Domain, table, column, or index not found"),
-        (status = 409, description = "Conflict — duplicate key, unique violation, name collision, …"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 413, description = "Response exceeds max_response_bytes"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "Syntax, type, parameter-count, or expand error", body = String, content_type = "text/plain"),
+        (status = 403, description = "Access level too low for this statement (rel/011)", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, column, or index not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "Conflict — duplicate key, unique violation, name collision, …", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 413, description = "Response exceeds max_response_bytes", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Store"
 )]
@@ -400,6 +400,28 @@ mod tests {
         let (status, text) = request(app, Method::POST, &format!("/store-api/rel/{domain}/sql"), Some(body)).await;
         let value: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"_raw": text}));
         (status, value)
+    }
+
+    // Spec general/026 test 2 (rel sample): a real 404 (unknown domain)
+    // carries a non-empty plaintext body — schema and reality agree.
+    #[tokio::test]
+    async fn test_missing_domain_404_has_nonempty_plaintext_body() {
+        let (app, _dir) = make_default_app().await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/store-api/rel/ghost/sql")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let content_type =
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.is_empty(), "404 body must not be empty");
+        assert!(serde_json::from_str::<Value>(&body).is_err(), "body must be plain text, not JSON: {body}");
     }
 
     // 1. Domain roundtrip: create → 201; list contains it with state=active;

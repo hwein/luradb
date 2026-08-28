@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 /// engine (kv/json/rel) validates a value against before it ever reaches
 /// the WAL. 64 MiB (the JSON bulk body cap) is the largest of these; 96 MiB
 /// gives it headroom no legitimate write can reach.
-const WAL_MAX_FIELD_LEN: usize = 96 * 1024 * 1024;
+pub const WAL_MAX_FIELD_LEN: usize = 96 * 1024 * 1024;
 
 #[derive(Error, Debug)]
 pub enum WalError {

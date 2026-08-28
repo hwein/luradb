@@ -652,6 +652,9 @@ fn main() -> anyhow::Result<()> {
     config.backup.validate(&config.storage, &config.json, &config.rel)?;
     config.auth.validate(&config.server)?;
     config.cors.validate()?;
+    config.lsm.validate("lsm")?;
+    config.json.lsm.validate("json.lsm")?;
+    config.rel.lsm.validate("rel.lsm")?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {

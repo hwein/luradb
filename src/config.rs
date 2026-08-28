@@ -1,3 +1,4 @@
+use crate::core::wal::WAL_MAX_FIELD_LEN;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -303,6 +304,28 @@ impl Default for LsmConfig {
             use_mmap: true,
             watch_replay_buffer_size: 1024,
         }
+    }
+}
+
+impl LsmConfig {
+    /// Startup validation (spec general/025): `max_value_size` and
+    /// `max_key_length` are the two WAL length-prefixed fields this engine
+    /// writes. A value above `WAL_MAX_FIELD_LEN` would still write today and
+    /// only fail recovery on the *next* restart -- reject it at startup
+    /// instead. `prefix` names the TOML block (`"lsm"`, `"json.lsm"`,
+    /// `"rel.lsm"`) in the error message.
+    pub fn validate(&self, prefix: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_value_size <= WAL_MAX_FIELD_LEN,
+            "invalid config: {prefix}.max_value_size ({}) exceeds the WAL recovery field cap ({WAL_MAX_FIELD_LEN} bytes) — writes this large could never be recovered",
+            self.max_value_size
+        );
+        anyhow::ensure!(
+            self.max_key_length <= WAL_MAX_FIELD_LEN,
+            "invalid config: {prefix}.max_key_length ({}) exceeds the WAL recovery field cap ({WAL_MAX_FIELD_LEN} bytes) — writes this large could never be recovered",
+            self.max_key_length
+        );
+        Ok(())
     }
 }
 
@@ -1955,5 +1978,54 @@ mod tests {
         cors.enabled = true;
         cors.allowed_origins = vec!["https://exa\nmple.com".to_string()];
         assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_lsm_validate_default_ok() {
+        let config = LuraConfig::default();
+        assert!(config.lsm.validate("lsm").is_ok());
+        assert!(config.json.lsm.validate("json.lsm").is_ok());
+        assert!(config.rel.lsm.validate("rel.lsm").is_ok());
+    }
+
+    #[test]
+    fn test_lsm_validate_max_value_size_at_cap_ok() {
+        let mut lsm = LsmConfig::default();
+        lsm.max_value_size = WAL_MAX_FIELD_LEN;
+        assert!(lsm.validate("lsm").is_ok());
+    }
+
+    #[test]
+    fn test_lsm_validate_max_value_size_over_cap_rejected() {
+        let mut lsm = LsmConfig::default();
+        lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
+        let err = lsm.validate("lsm").unwrap_err().to_string();
+        assert!(err.contains("lsm.max_value_size"), "{err}");
+        assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
+        assert!(err.contains(&WAL_MAX_FIELD_LEN.to_string()), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_max_key_length_over_cap_rejected() {
+        let mut lsm = LsmConfig::default();
+        lsm.max_key_length = WAL_MAX_FIELD_LEN + 1;
+        let err = lsm.validate("lsm").unwrap_err().to_string();
+        assert!(err.contains("lsm.max_key_length"), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_json_lsm_over_cap_rejected() {
+        let mut config = LuraConfig::default();
+        config.json.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
+        let err = config.json.lsm.validate("json.lsm").unwrap_err().to_string();
+        assert!(err.contains("json.lsm.max_value_size"), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_rel_lsm_over_cap_rejected() {
+        let mut config = LuraConfig::default();
+        config.rel.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
+        let err = config.rel.lsm.validate("rel.lsm").unwrap_err().to_string();
+        assert!(err.contains("rel.lsm.max_value_size"), "{err}");
     }
 }

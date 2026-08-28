@@ -18,6 +18,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: `GET /store-api/metrics` now includes an `engines` block (`kv`/`json`/`rel`), each with `read_ops`, `write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`, and `window_secs` — per-engine op counts and latency percentiles over the rolling metrics window, alongside the existing KV-only `domains[]`.
 - Optional CORS support via the new `[cors]` config section — an opt-in `CorsLayer` (exact origin allow-list, or `"*"`) lets browser clients call the API directly without a proxy in front; off by default.
 - **BREAKING** API: added `GET /store-api/config`, returning the effective configuration of the running process (`config_path`, `config_file_loaded`, `config`) — admin-only; the admin API key is redacted from `config`, everything else is the same field names as the TOML file.
+- Startup now fails fast when `max_value_size` or `max_key_length` of any engine's `[lsm]` block exceed the WAL recovery field cap — previously such a config wrote WAL records that only failed the *next* restart's recovery.
 
 ### Security
 

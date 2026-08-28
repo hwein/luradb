@@ -37,6 +37,7 @@ All notable changes to LuraDB are documented in this file.
 
 - **BREAKING** API: `POST /store-api/auth/users/{name}/permissions` now checks domain existence for `json`/`rel` store types when their engine is active — a missing domain now answers `404` (previously `200`), matching the existing `kv` behavior. New opt-in query parameter `?allow_missing=true` skips the existence check for all three store types (pre-provisioning), now including `kv` for the first time; domain name validation (`400`) applies to `json`/`rel` unconditionally and to `kv` only when `allow_missing=true`.
 - **BREAKING** `server.bind_address` now defaults to `127.0.0.1` (previously `0.0.0.0`). Only affects a start without a config file, or one that omits `bind_address`; both shipped configs (`luradb.toml`, `packaging/luradb.toml`) already bind loopback explicitly.
+- **BREAKING** API: `GET /store-api/kv/{domain}/keys` now returns a paginated envelope (`{keys, total, offset, limit}`) instead of a bare array, and accepts new `contains`, `limit` (default 1000, max 10000), and `offset` query parameters.
 - JSON document writes on different keys no longer serialize behind one engine-global lock.
 - KV: expired keys are now removed proactively and emit a `delete` event — a background TTL sweeper tombstones them instead of leaving them to the next compaction, so watch subscribers see the expiry and the space comes back earlier. New `[ttl_sweeper]` config section (`enabled`, `interval_secs`, `batch_size`); `enabled = false` restores the previous purely lazy behavior.
 

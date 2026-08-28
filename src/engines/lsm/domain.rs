@@ -584,6 +584,43 @@ impl DomainStore {
         Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
     }
 
+    /// Returns one page of live user-keys whose raw form starts with
+    /// `prefix`, optionally narrowed by a case-sensitive `contains`
+    /// substring filter on the user key — same filter semantics as
+    /// `delete_by_prefix` (a non-UTF-8 key is skipped, not an error). One
+    /// read token per call (spec kv/028): the scan itself stays unbounded,
+    /// same server cost as `scan_keys`/`count_keys` — only the wire response
+    /// is capped. `total` counts the filtered set before `offset`/`limit`
+    /// are applied; returns `(page, total)`.
+    pub async fn scan_keys_page(
+        &self,
+        prefix: &[u8],
+        contains: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        if !self.runtime.rate_limiter.check_read() {
+            return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
+        }
+        let full_prefix = self.prefixed_key(prefix);
+        let raw_keys = self.engine.scan_keys(&full_prefix).await?;
+        let prefix_len = self.domain.system_prefix.len();
+        let matched: Vec<Vec<u8>> = raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect();
+        let matched: Vec<Vec<u8>> = match contains {
+            // A non-UTF-8 key would be an invariant break (general/007
+            // guarantees UTF-8 keys) — skip it rather than fail the request
+            // (same rule as delete_by_prefix).
+            Some(needle) => matched
+                .into_iter()
+                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
+                .collect(),
+            None => matched,
+        };
+        let total = matched.len() as u64;
+        let page: Vec<Vec<u8>> = matched.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
     /// Counts live user-keys whose raw form starts with `prefix` — same scan
     /// as `scan_keys` (spec general/017), without materializing the stripped
     /// key strings.

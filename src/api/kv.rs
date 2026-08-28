@@ -6,7 +6,7 @@
 //! DELETE /store-api/kv/{domain}/keys/{key}          → delete_key (204 | 429)
 //! PATCH  /store-api/kv/{domain}/keys/{key}/null     → set_null  (200 | 429)
 //! GET    /store-api/kv/{domain}/keys/{key}/meta     → get_key_meta (200 | 400 | 404 | 410 | 429)
-//! GET    /store-api/kv/{domain}/keys?prefix={p}     → scan_keys (200 | 429)
+//! GET    /store-api/kv/{domain}/keys?prefix={p}&contains={s}&limit={n}&offset={o} → scan_keys (200 | 429)
 //! DELETE /store-api/kv/{domain}/keys?prefix={p}&contains={s} → delete_keys_by_prefix (200 | 400 | 413 | 429 | 404 | 410)
 //! GET    /store-api/kv/{domain}/count?prefix={p}    → count_keys (200 | 429)
 //! GET    /store-api/kv/{domain}/watch?prefix={p}    → watch     (SSE stream)
@@ -29,6 +29,12 @@ use std::convert::Infallible;
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
+// Caps the wire response of a keys scan (spec kv/028); the underlying scan
+// itself stays unbounded — same server cost as today, documented at
+// `count_keys`. `count_keys` keeps using `ScanParams` unchanged.
+const DEFAULT_SCAN_LIMIT: usize = 1000;
+const MAX_SCAN_LIMIT: usize = 10_000;
+
 // ── Query param types ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -39,6 +45,15 @@ pub struct TtlParams {
 #[derive(Deserialize)]
 pub struct ScanParams {
     pub prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct KeyScanParams {
+    pub prefix: Option<String>,
+    /// Case-sensitive substring filter on the user key, applied before `total`/offset/limit (kv/023 §2 semantics).
+    pub contains: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 /// `prefix` is required and rejected empty-string (spec kv/023 §2) — plain
@@ -326,32 +341,55 @@ pub async fn set_null(
     Ok(StatusCode::OK)
 }
 
+// ── KeyScanResponse DTO ──────────────────────────────────────────────────────
+
+#[derive(Serialize, ToSchema)]
+pub struct KeyScanResponse {
+    /// The page, in scan order (sorted).
+    pub keys: Vec<String>,
+    /// Matches after `prefix`/`contains` filtering, before `offset`/`limit`.
+    pub total: u64,
+    /// Effective offset applied.
+    pub offset: usize,
+    /// Effective limit applied (after capping to the maximum).
+    pub limit: usize,
+}
+
 #[utoipa::path(
     get,
     path = "/store-api/kv/{domain}/keys",
     params(
         ("domain" = String, Path, description = "Domain name"),
         ("prefix" = Option<String>, Query, description = "Key prefix filter"),
+        ("contains" = Option<String>, Query, description = "Case-sensitive substring filter on the user key, applied before total/offset/limit"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 1000, max 10000; over-max is silently capped)"),
+        ("offset" = Option<usize>, Query, description = "Keys to skip"),
     ),
     responses(
-        (status = 200, description = "List of matching keys", body = Vec<String>),
+        (status = 200, description = "One page of matching keys", body = KeyScanResponse),
         (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
     ),
     tag = "Key-Value Store"
 )]
-/// Lists all keys in the domain, optionally filtered by a prefix. Returns an empty array if no keys match.
+/// Lists one page of keys in the domain, optionally filtered by a prefix and/or a case-sensitive `contains` substring.
+/// `total` counts matches after filtering, before `offset`/`limit` are applied; an out-of-range `offset` yields an empty `keys` array with `total` unchanged.
 pub async fn scan_keys(
     State(state): State<AppState>,
     Path(domain): Path<String>,
-    Query(params): Query<ScanParams>,
-) -> Result<Json<Vec<String>>, ApiError> {
+    Query(params): Query<KeyScanParams>,
+) -> Result<Json<KeyScanResponse>, ApiError> {
     let store = resolve(&state, &domain).await?;
     let prefix = params.prefix.unwrap_or_default();
-    let raw = store.scan_keys(prefix.as_bytes()).await.map_err(ApiError::from)?;
+    let limit = params.limit.unwrap_or(DEFAULT_SCAN_LIMIT).min(MAX_SCAN_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+    let (raw, total) = store
+        .scan_keys_page(prefix.as_bytes(), params.contains.as_deref(), offset, limit)
+        .await
+        .map_err(ApiError::from)?;
     let keys: Vec<String> =
         raw.into_iter().map(|k| String::from_utf8_lossy(&k).into_owned()).collect();
-    Ok(Json(keys))
+    Ok(Json(KeyScanResponse { keys, total, offset, limit }))
 }
 
 // ── BulkDeleteResponse DTO ───────────────────────────────────────────────────
@@ -652,8 +690,8 @@ mod tests {
         assert!(body.is_empty());
 
         let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys", Body::empty()).await;
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let keys: Vec<String> = serde_json::from_slice(&body).unwrap();
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
         assert!(keys.iter().any(|k| k == "nkey"), "null key must appear in scans, got {keys:?}");
 
         let resp = send(&app, Method::DELETE, uri, Body::empty()).await;
@@ -806,8 +844,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scan_resp.status(), StatusCode::OK);
-        let body = to_bytes(scan_resp.into_body(), usize::MAX).await.unwrap();
-        let keys: Vec<String> = serde_json::from_slice(&body).unwrap();
+        let body = body_json(scan_resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
         assert!(
             keys.iter().any(|k| k == key),
             "scan must return the exact stored string {key:?}, got {keys:?}"
@@ -1037,8 +1075,8 @@ mod tests {
         assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 3);
 
         let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys?prefix=a:", Body::empty()).await;
-        let keys: Vec<String> =
-            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
         assert_eq!(keys.len(), 3, "count?prefix=a: must match keys?prefix=a:'s length exactly");
 
         // A deleted key stops counting; a NULL-state key keeps counting —
@@ -1236,8 +1274,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys", Body::empty()).await;
-        let keys: Vec<String> =
-            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
         assert_eq!(keys, vec!["k1".to_string()], "domain must be unchanged after a rejected empty-prefix delete");
     }
 
@@ -1675,5 +1713,134 @@ mod tests {
         let fields = read_sse_fields(watch_resp.into_body(), 6, std::time::Duration::from_secs(5)).await;
         let data_values: Vec<&str> = fields.iter().filter(|(f, _)| f == "data").map(|(_, v)| v.as_str()).collect();
         assert_eq!(data_values, vec!["user:1", "user:2"], "item:* must never appear, got {fields:?}");
+    }
+
+    // ── Spec kv/028: GET …/keys pagination & contains filter ────────────────
+
+    // Test 1: 25 keys, limit=10 -> page 1 (offset=0) and page 2 (offset=10)
+    // are disjoint, each in sorted scan order, `total=25` on every page;
+    // page 3 (offset=20) holds the remaining 5; offset=30 is past the end
+    // -> empty `keys`, `total` unchanged, still 200.
+    #[tokio::test]
+    async fn test_scan_keys_pagination_pages_are_disjoint_and_sorted() {
+        let (app, _dir) = make_app().await;
+        for i in 0..25 {
+            send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/p:{i:02}"), Body::from("v")).await;
+        }
+        let expected: Vec<String> = (0..25).map(|i| format!("p:{i:02}")).collect();
+        let page = |offset: usize| format!("/store-api/kv/testdom/keys?prefix=p:&limit=10&offset={offset}");
+
+        for (offset, start, end) in [(0usize, 0usize, 10usize), (10, 10, 20), (20, 20, 25)] {
+            let resp = send(&app, Method::GET, &page(offset), Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp.into_body()).await;
+            let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
+            assert_eq!(keys, expected[start..end].to_vec(), "offset={offset}");
+            assert_eq!(body["total"].as_u64().unwrap(), 25);
+        }
+
+        let resp = send(&app, Method::GET, &page(30), Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
+        assert!(keys.is_empty(), "offset past the end must yield an empty page");
+        assert_eq!(body["total"].as_u64().unwrap(), 25);
+    }
+
+    // Test 2: no `limit` -> default 1000; with > 1000 matches, exactly 1000
+    // keys come back, the envelope's `limit` reads 1000, and `total` is the
+    // full match count. Seeded concurrently (see test_count_keys_large_volume)
+    // with a raised write quota so the burst doesn't trip the default 500/s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_scan_keys_default_limit_is_1000() {
+        let mut config = crate::engines::lsm::domain::DomainConfig::default();
+        config.default_write_iops = 5_000;
+        let (app, _dir) = make_app_with_config(config).await;
+
+        let app_ref = &app;
+        let puts = (0..1_100u32).map(|i| async move {
+            let uri = format!("/store-api/kv/testdom/keys/d:{i:05}");
+            send(app_ref, Method::PUT, &uri, Body::from("v")).await
+        });
+        futures::future::join_all(puts).await;
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys?prefix=d:", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
+        assert_eq!(keys.len(), 1000, "default page size must be 1000");
+        assert_eq!(body["limit"].as_u64().unwrap(), 1000);
+        assert_eq!(body["total"].as_u64().unwrap(), 1_100);
+    }
+
+    // Test 3: `limit` above the maximum is silently capped -- the envelope
+    // reports the effective value (10000), no 400. A real 10001-key page
+    // isn't needed to prove this: the take() logic itself is already
+    // covered by test 1's pagination.
+    #[tokio::test]
+    async fn test_scan_keys_limit_above_max_is_capped_in_envelope() {
+        let (app, _dir) = make_app().await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/only", Body::from("v")).await;
+
+        let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys?limit=999999", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["limit"].as_u64().unwrap(), 10_000, "limit must be capped to the maximum in the envelope");
+    }
+
+    // Test 4: `contains` is case-sensitive and counts toward `total` -- same
+    // scenario as the bulk-delete contains filter (kv/023 test 2):
+    // `contains=Log` matches `app:Log:1`, not `app:log:2`.
+    #[tokio::test]
+    async fn test_scan_keys_contains_filter_is_case_sensitive_and_counts_in_total() {
+        let (app, _dir) = make_app().await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/app:Log:1", Body::from("v")).await;
+        send(&app, Method::PUT, "/store-api/kv/testdom/keys/app:log:2", Body::from("v")).await;
+
+        let resp =
+            send(&app, Method::GET, "/store-api/kv/testdom/keys?prefix=app:&contains=Log", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
+        assert_eq!(keys, vec!["app:Log:1".to_string()]);
+        assert_eq!(body["total"].as_u64().unwrap(), 1, "total must reflect the filtered count");
+    }
+
+    // Test 5: prefix + contains + offset/limit combined -- filtering happens
+    // before pagination (more raw prefix hits than the filtered count, which
+    // itself fits under `limit`): the page holds every filtered match,
+    // `total` is the filtered count, and a follow-up offset slices that same
+    // filtered set rather than the raw prefix hits.
+    #[tokio::test]
+    async fn test_scan_keys_prefix_contains_offset_limit_combined() {
+        let (app, _dir) = make_app().await;
+        for k in ["f:x1", "f:x2", "f:x3", "f:y1", "f:y2"] {
+            send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/{k}"), Body::from("v")).await;
+        }
+
+        let resp = send(
+            &app,
+            Method::GET,
+            "/store-api/kv/testdom/keys?prefix=f:&contains=x&limit=4",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
+        assert_eq!(keys, vec!["f:x1".to_string(), "f:x2".to_string(), "f:x3".to_string()]);
+        assert_eq!(body["total"].as_u64().unwrap(), 3, "total must be the filtered count, not the 5 raw prefix hits");
+
+        let resp = send(
+            &app,
+            Method::GET,
+            "/store-api/kv/testdom/keys?prefix=f:&contains=x&limit=4&offset=1",
+            Body::empty(),
+        )
+        .await;
+        let body = body_json(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
+        assert_eq!(keys, vec!["f:x2".to_string(), "f:x3".to_string()], "offset must slice the filtered set");
+        assert_eq!(body["total"].as_u64().unwrap(), 3);
     }
 }

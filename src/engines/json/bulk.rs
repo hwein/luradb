@@ -67,16 +67,18 @@ pub fn document_to_ndjson_line(doc: &Document) -> String {
 }
 
 impl JsonEngine {
-    /// Reads, versions and writes one import batch entirely under the doc
-    /// write lock, so the read→write cycle cannot race put/delete (json/011)
-    /// and no batch lands after the purger finalized the domain (json/013).
+    /// Reads, versions and writes one import batch entirely under the write
+    /// shards of its own keys, so the read→write cycle cannot race put/delete
+    /// (json/011) and no batch lands after the purger finalized the domain
+    /// (json/013) — the purger holds every shard.
     async fn load_batch(
         &self,
         domain: &str,
         batch: Vec<(String, Value)>,
         result: &mut BulkLoadResult,
     ) -> Result<(), JsonStoreError> {
-        let _guard = self.doc_write_lock.lock().await;
+        let shards = batch.iter().map(|(key, _)| Self::shard(domain, key)).collect();
+        let _guards = self.lock_shards(shards).await;
         let dom = self.domains.require_active(domain)?;
         let mut ops: Vec<BatchOp> = Vec::new();
         for (key, content) in batch {
@@ -131,7 +133,7 @@ impl JsonEngine {
 
     /// Imports documents in atomic batches of `bulk_batch_size`. Per-document
     /// errors are recorded and skipped; engine/storage errors abort the call
-    /// (already flushed batches stay imported). The lock is held per batch,
+    /// (already flushed batches stay imported). The shards are held per batch,
     /// not across the whole import, so single-document writers are not
     /// starved by large imports.
     pub async fn bulk_load(
@@ -533,6 +535,35 @@ mod tests {
             vec![super::super::index::index_key(&prefix, "city", city.as_bytes(), "k")],
             "exactly one index entry, matching the final content"
         );
+    }
+
+    // 11. Deadlock probe (spec json/018): two concurrent batches over the same
+    //     keys in opposite order finish — the ascending shard acquisition is
+    //     the proof object; a naive per-key order would deadlock here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_bulk_loads_with_opposite_key_order() {
+        let (json, _dir) = make_engine_with_batch(100).await;
+        let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+        let forward: Vec<_> = keys.iter().map(|k| (Some(k.clone()), json!({"v": "f"}))).collect();
+        let backward: Vec<_> =
+            keys.iter().rev().map(|k| (Some(k.clone()), json!({"v": "b"}))).collect();
+
+        let a = tokio::spawn({
+            let json = Arc::clone(&json);
+            async move { json.bulk_load("default", forward).await }
+        });
+        let b = tokio::spawn({
+            let json = Arc::clone(&json);
+            async move { json.bulk_load("default", backward).await }
+        });
+        let bound = std::time::Duration::from_secs(10);
+        tokio::time::timeout(bound, a).await.expect("bulk A deadlocked").unwrap().unwrap();
+        tokio::time::timeout(bound, b).await.expect("bulk B deadlocked").unwrap().unwrap();
+
+        for key in &keys {
+            let doc = json.get_document("default", key).await.unwrap().unwrap();
+            assert_eq!(doc.version, 2, "both imports must see each other's version");
+        }
     }
 
     // ── Spec general/019: per-engine metrics ─────────────────────────────────

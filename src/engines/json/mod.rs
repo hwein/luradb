@@ -41,8 +41,13 @@ use index::IndexRegistry;
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+
+/// Number of document-write lock shards (spec json/018). Not configurable —
+/// the number only caps the collision probability.
+const DOC_WRITE_SHARDS: usize = 64;
 
 /// Central entry point for all JSON-store operations.
 pub struct JsonEngine {
@@ -63,8 +68,10 @@ pub struct JsonEngine {
     reindex_running: SyncMutex<HashMap<String, String>>,
     /// Serializes read→write in document writes so version checks (OCC,
     /// json/011) cannot race, and fences writers against the purger's
-    /// finalize: domain state is checked under this lock (json/013).
-    doc_write_lock: tokio::sync::Mutex<()>,
+    /// finalize: domain state is checked under the shard guard (json/013).
+    /// Sharded per document reference (json/018) — writes on keys of
+    /// different shards no longer wait for each other.
+    doc_write_locks: [tokio::sync::Mutex<()>; DOC_WRITE_SHARDS],
     /// Global lifecycle/DDL event bus (spec general/018 §1) — backs
     /// `create_index`/`delete_index`'s `index_created`/`index_dropped`;
     /// domain lifecycle events are published by `domains` itself. Unset in
@@ -152,7 +159,7 @@ impl JsonEngine {
             reindex_pause_ms: config.reindex_pause_ms,
             reindex_tasks: RwLock::new(HashMap::new()),
             reindex_running: SyncMutex::new(HashMap::new()),
-            doc_write_lock: tokio::sync::Mutex::new(()),
+            doc_write_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
             event_bus: OnceLock::new(),
             metrics,
         }))
@@ -266,6 +273,33 @@ impl JsonEngine {
         Ok(())
     }
 
+    // ── Document write locks (spec json/018) ──────────────────────────────────
+
+    /// Lock shard of a document reference. Domain and key both feed the hash,
+    /// so equal keys of different domains need not share a shard.
+    fn shard(domain: &str, key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        domain.hash(&mut hasher);
+        key.hash(&mut hasher);
+        (hasher.finish() % DOC_WRITE_SHARDS as u64) as usize
+    }
+
+    /// Acquires several shards at once. Sole owner of the acquisition order
+    /// (ascending shard index, deduplicated), which is what makes concurrent
+    /// multi-key writers deadlock-free.
+    async fn lock_shards(
+        &self,
+        mut shards: Vec<usize>,
+    ) -> Vec<tokio::sync::MutexGuard<'_, ()>> {
+        shards.sort_unstable();
+        shards.dedup();
+        let mut guards = Vec::with_capacity(shards.len());
+        for shard in shards {
+            guards.push(self.doc_write_locks[shard].lock().await);
+        }
+        guards
+    }
+
     // ── Core CRUD (spec json/002, domain-aware since json/003) ────────────────
 
     /// Stores `content` under a system-generated UUIDv4 key.
@@ -274,9 +308,9 @@ impl JsonEngine {
         domain: &str,
         content: Value,
     ) -> Result<Document, JsonStoreError> {
-        let _guard = self.doc_write_lock.lock().await;
-        let dom = self.domains.require_active(domain)?;
         let key = generate_uuid_v4();
+        let _guard = self.doc_write_locks[Self::shard(domain, &key)].lock().await;
+        let dom = self.domains.require_active(domain)?;
         if key.len() > self.max_document_key_length {
             return Err(JsonStoreError::InvalidKey(format!(
                 "generated UUID key needs {} chars but the effective key limit is {} — raise json.max_document_key_length or json.lsm.max_key_length",
@@ -312,7 +346,7 @@ impl JsonEngine {
         precondition: Option<Precondition>,
     ) -> Result<Document, JsonStoreError> {
         validate_document_key(key, self.max_document_key_length)?;
-        let _guard = self.doc_write_lock.lock().await;
+        let _guard = self.doc_write_locks[Self::shard(domain, key)].lock().await;
         let dom = self.domains.require_active(domain)?;
         let old = self.read_stored(&dom, key).await?;
         if let Some(precondition) = precondition {
@@ -414,7 +448,7 @@ impl JsonEngine {
     ) -> Result<bool, JsonStoreError> {
         let start = std::time::Instant::now();
         validate_document_key(key, self.max_document_key_length)?;
-        let _guard = self.doc_write_lock.lock().await;
+        let _guard = self.doc_write_locks[Self::shard(domain, key)].lock().await;
         let dom = self.domains.require_active(domain)?;
         let old = match self.read_stored(&dom, key).await? {
             Some(old) => old,
@@ -1007,8 +1041,8 @@ mod tests {
     // ── Create-only precondition (spec json/014) ─────────────────────────────
 
     // 39. Two parallel create-only-PUTs on the same free key → exactly one
-    //     creates, the other sees DocumentAlreadyExists; the doc_write_lock
-    //     serializes the race (pattern: test 33 for json/011).
+    //     creates, the other sees DocumentAlreadyExists; the key's write
+    //     shard serializes the race (pattern: test 33 for json/011).
     #[tokio::test]
     async fn test_create_only_parallel_puts_single_winner() {
         let (json, _dir) = make_engine().await;
@@ -1041,6 +1075,60 @@ mod tests {
         }
         assert_eq!(created, 1);
         assert_eq!(exists, 1);
+    }
+
+    // ── Sharded document-write locks (spec json/018) ─────────────────────────
+
+    // 40. A held write shard blocks only keys of that shard: a put on a key
+    //     of another shard runs through, one on the same shard waits.
+    #[tokio::test]
+    async fn test_writes_serialize_per_shard_only() {
+        let (json, _dir) = make_engine().await;
+        let held = JsonEngine::shard("default", "anchor");
+        let other_shard_key = (0..)
+            .map(|i| format!("o{i}"))
+            .find(|k| JsonEngine::shard("default", k) != held)
+            .unwrap();
+        let same_shard_key = (0..)
+            .map(|i| format!("s{i}"))
+            .find(|k| JsonEngine::shard("default", k) == held)
+            .unwrap();
+
+        let guard = json.doc_write_locks[held].lock().await;
+
+        let free = tokio::spawn({
+            let json = Arc::clone(&json);
+            async move { json.put_document("default", &other_shard_key, json!({"n": 1})).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), free)
+            .await
+            .expect("a key of another shard must not wait")
+            .unwrap()
+            .unwrap();
+
+        let parked = tokio::spawn({
+            let json = Arc::clone(&json);
+            async move { json.put_document("default", &same_shard_key, json!({"n": 2})).await }
+        });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!parked.is_finished(), "a key of the held shard must wait");
+        drop(guard);
+        parked.await.unwrap().unwrap();
+    }
+
+    // 41. The same document reference always maps to the same shard, and the
+    //     domain is part of the hash (no forced collision across domains).
+    #[tokio::test]
+    async fn test_shard_is_stable_and_domain_aware() {
+        assert_eq!(JsonEngine::shard("a", "k"), JsonEngine::shard("a", "k"));
+        assert!((0..DOC_WRITE_SHARDS).contains(&JsonEngine::shard("a", "k")));
+        let differs = (0..64).any(|i| {
+            let key = format!("k{i}");
+            JsonEngine::shard("a", &key) != JsonEngine::shard("b", &key)
+        });
+        assert!(differs, "domain must feed the hash");
     }
 
     // ── Synchronous indexing (spec json/005) ─────────────────────────────────

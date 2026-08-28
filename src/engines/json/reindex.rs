@@ -2,7 +2,7 @@
 //!
 //! Runs as a background task: scans all documents of a domain and writes
 //! missing index entries in throttled batches. Idempotent — existing entries
-//! are left untouched. Each chunk runs under the engine's `doc_write_lock`
+//! are left untouched. Each chunk runs under all document-write shards
 //! (concurrent updates cannot be clobbered with stale entries) and re-checks
 //! the domain state (a domain deleted mid-run ends the task as `Failed`).
 
@@ -10,7 +10,7 @@ use super::document::{doc_scan_prefix, generate_uuid_v4, parse_doc_key};
 use super::domain::JsonDomain;
 use super::error::JsonStoreError;
 use super::index::{encode_index_value, extract_field, index_key, IndexDefinition};
-use super::JsonEngine;
+use super::{JsonEngine, DOC_WRITE_SHARDS};
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::StorageEngine;
 use serde::Serialize;
@@ -153,12 +153,12 @@ impl JsonEngine {
         chunk: &[Vec<u8>],
         processed: &mut u64,
     ) -> Result<(), JsonStoreError> {
-        // read → existence check → write of a chunk runs under the doc
-        // write lock so concurrent updates/deletes cannot be overwritten
-        // with stale index entries.
-        let _guard = self.doc_write_lock.lock().await;
+        // read → existence check → write of a chunk runs under every write
+        // shard so concurrent updates/deletes cannot be overwritten with
+        // stale index entries — the chunk's keys are not known upfront.
+        let _guards = self.lock_shards((0..DOC_WRITE_SHARDS).collect()).await;
         // Domain deleted mid-run? Stop instead of racing the purger
-        // (checked under the lock, which the purger holds to finalize).
+        // (checked under the shards, which the purger holds to finalize).
         self.domains.require_active(&dom.name)?;
         let mut ops = Vec::new();
         for lsm_key in chunk {
@@ -372,8 +372,9 @@ mod tests {
         json.put_document("doomed", "a", json!({"city": "X"})).await.unwrap();
         json.put_document("doomed", "b", json!({"city": "Y"})).await.unwrap();
         json.create_index("doomed", "city", IndexFieldType::String).await.unwrap();
-        // Block the first chunk on the doc write lock; delete the domain meanwhile.
-        let guard = json.doc_write_lock.lock().await;
+        // Block the first chunk on one write shard (a chunk takes all of
+        // them); delete the domain meanwhile.
+        let guard = json.doc_write_locks[0].lock().await;
         let result = json.reindex_domain("doomed").unwrap();
         json.delete_domain("doomed").await.unwrap();
         drop(guard);

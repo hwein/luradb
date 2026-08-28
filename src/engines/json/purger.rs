@@ -6,7 +6,7 @@
 
 use super::document::doc_scan_prefix;
 use super::index::index_domain_prefix;
-use super::JsonEngine;
+use super::{JsonEngine, DOC_WRITE_SHARDS};
 use crate::engines::lsm::engine::BatchOp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,11 +46,11 @@ impl JsonDomainPurger {
 
     /// One purge cycle: tombstones up to `batch_size` keys per deleting
     /// domain; finalizes the domain once no data keys remain. Scans through
-    /// tombstone/finalize run under the engine's doc write lock so no
+    /// tombstone/finalize run under every document-write shard so no
     /// in-flight writer can land keys after the final empty scan (json/013).
     pub async fn purge_tick(&self) -> anyhow::Result<()> {
         for domain in self.engine.domains.list_deleting_domains() {
-            let _guard = self.engine.doc_write_lock.lock().await;
+            let _guards = self.engine.lock_shards((0..DOC_WRITE_SHARDS).collect()).await;
             let doc_keys = self
                 .engine
                 .engine()
@@ -275,8 +275,8 @@ mod tests {
         json.create_domain("doomed").await.unwrap();
         let prefix = json.get_domain("doomed").unwrap().system_prefix;
 
-        // In-flight writer: parked on the doc write lock held by the test.
-        let guard = json.doc_write_lock.lock().await;
+        // In-flight writer: parked on its key's write shard, held by the test.
+        let guard = json.doc_write_locks[JsonEngine::shard("doomed", "zombie")].lock().await;
         let writer = tokio::spawn({
             let json = Arc::clone(&json);
             async move { json.put_document("doomed", "zombie", json!({"n": 1})).await }
@@ -285,7 +285,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         json.delete_domain("doomed").await.unwrap();
-        // The purger must block on the same lock instead of finalizing.
+        // The purger takes all shards, so it must block instead of finalizing.
         let tick = tokio::spawn({
             let p = purger(&json, 100);
             async move { p.purge_tick().await }
@@ -326,8 +326,8 @@ mod tests {
         json.create_domain("doomed").await.unwrap();
         let prefix = json.get_domain("doomed").unwrap().system_prefix;
 
-        // Park the import's first batch flush on the doc write lock.
-        let guard = json.doc_write_lock.lock().await;
+        // Park the import's first batch flush on the write shard of its key.
+        let guard = json.doc_write_locks[JsonEngine::shard("doomed", "a")].lock().await;
         let loader = tokio::spawn({
             let json = Arc::clone(&json);
             async move {

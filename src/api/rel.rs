@@ -1022,9 +1022,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // rel/011 §8 item 9: set_permission accepts access="ddl" and
-    // store_type="rel" without requiring the domain to exist yet; an invalid
-    // access value -> 400; remove_permission with ?store_type=rel removes it.
+    // general/021: set_permission accepts access="ddl" and store_type="rel"
+    // for a domain that doesn't exist yet via the explicit ?allow_missing=true
+    // opt-in (replaces rel/011 §8 item 9's implicit no-check behavior); an
+    // invalid access value still -> 400; remove_permission with
+    // ?store_type=rel removes it.
     #[tokio::test]
     async fn test_auth_handlers_rel_ddl_permission() {
         use crate::auth::{hash_api_key, AccessLevel, UserRecord, UserRole};
@@ -1067,10 +1069,11 @@ mod tests {
             app.clone().oneshot(req)
         };
 
-        // Invalid access value -> 400.
+        // Invalid access value -> 400 (domain check skipped via allow_missing,
+        // so this exercises access-value validation specifically).
         let resp = send(
             Method::POST,
-            "/store-api/auth/users/worker/permissions",
+            "/store-api/auth/users/worker/permissions?allow_missing=true",
             Some(r#"{"domain": "shop", "access": "xxx", "store_type": "rel"}"#),
             admin_key,
         )
@@ -1078,10 +1081,11 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // "ddl" + "rel", domain doesn't exist yet -> still 200 (no existence check).
+        // "ddl" + "rel", domain doesn't exist yet -> 200 via allow_missing=true
+        // (spec general/021 pre-provisioning; without it this would now 404).
         let resp = send(
             Method::POST,
-            "/store-api/auth/users/worker/permissions",
+            "/store-api/auth/users/worker/permissions?allow_missing=true",
             Some(r#"{"domain": "shop", "access": "ddl", "store_type": "rel"}"#),
             admin_key,
         )

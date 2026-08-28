@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.4.0",
+    "version": "0.5.0",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -146,7 +146,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Sets or overwrites a user's access permission on a domain.\n`access` must be `\"read\"`, `\"write\"`, or `\"ddl\"` — each level includes the\nlower ones. For `kv` the domain must exist; `json`/`rel` only check the name.",
+        "summary": "Sets or overwrites a user's access permission on a domain.\n`access` must be `\"read\"`, `\"write\"`, or `\"ddl\"` — each level includes the\nlower ones. Domain existence is checked when the target engine is active;\n`?allow_missing=true` skips the check for all store types.",
         "operationId": "set_permission",
         "parameters": [
           {
@@ -156,6 +156,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "allow_missing",
+            "in": "query",
+            "description": "Skip the domain existence check (pre-provisioning). Default false.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],

@@ -60,7 +60,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.4.0";
+pub const API_VERSION: &str = "0.5.0";
 
 struct VersionInfo;
 
@@ -131,6 +131,8 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         cache: Arc::clone(&state.auth_cache),
         registry: Arc::clone(&state.registry),
         auth_enabled: state.auth_enabled,
+        json_engine: state.json_engine.clone(),
+        rel_engine: state.rel_engine.clone(),
     };
 
     let mut store_router = Router::new()

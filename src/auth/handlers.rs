@@ -13,7 +13,9 @@
 
 use crate::auth::middleware::{extract_bearer, split_permission_domain, StoreType, TrustedPeer};
 use crate::auth::{generate_api_key, hash_api_key, AccessLevel, AuthCache, DomainPermission, UserRecord, UserRole};
+use crate::engines::json::JsonEngine;
 use crate::engines::lsm::DomainRegistry;
+use crate::engines::rel::RelEngine;
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
@@ -34,6 +36,12 @@ pub struct AuthState {
     /// to report the `Disabled` pseudo-role when the `auth_layer` middleware
     /// isn't in the router at all.
     pub auth_enabled: bool,
+    /// Mirrors `AppState::json_engine` — `None` when the JSON engine is
+    /// disabled. Backs `set_permission`'s domain existence check (spec general/021).
+    pub json_engine: Option<Arc<JsonEngine>>,
+    /// Mirrors `AppState::rel_engine` — `None` when the relational engine is
+    /// disabled. Backs `set_permission`'s domain existence check (spec general/021).
+    pub rel_engine: Option<Arc<RelEngine>>,
 }
 
 // ── Request / response types ──────────────────────────────────────────────────
@@ -99,6 +107,12 @@ pub struct SetPermissionRequest {
 pub struct RemovePermissionParams {
     /// Store type of the domain: `"kv"` (default), `"json"` or `"rel"`.
     pub store_type: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SetPermissionParams {
+    /// Skip the domain existence check (pre-provisioning).
+    pub allow_missing: Option<bool>,
 }
 
 /// Resolves the optional store_type field to the permission namespace.
@@ -344,7 +358,10 @@ pub async fn delete_user(
 #[utoipa::path(
     post,
     path = "/store-api/auth/users/{name}/permissions",
-    params(("name" = String, Path, description = "Username")),
+    params(
+        ("name" = String, Path, description = "Username"),
+        ("allow_missing" = Option<bool>, Query, description = "Skip the domain existence check (pre-provisioning). Default false."),
+    ),
     request_body = SetPermissionRequest,
     responses(
         (status = 200, description = "Permission set"),
@@ -355,10 +372,12 @@ pub async fn delete_user(
 )]
 /// Sets or overwrites a user's access permission on a domain.
 /// `access` must be `"read"`, `"write"`, or `"ddl"` — each level includes the
-/// lower ones. For `kv` the domain must exist; `json`/`rel` only check the name.
+/// lower ones. Domain existence is checked when the target engine is active;
+/// `?allow_missing=true` skips the check for all store types.
 pub async fn set_permission(
     State(state): State<AuthState>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<SetPermissionParams>,
     Json(body): Json<SetPermissionRequest>,
 ) -> Response {
     if state.cache.get_user_by_name(&name).await.is_none() {
@@ -368,19 +387,45 @@ pub async fn set_permission(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    // JSON/rel domains skip the existence check: permissions must be settable
-    // even while the engine is disabled or the domain doesn't exist yet (spec
-    // json/012 §6, rel/011 §8). The name must still be a possible domain
-    // name, or the permission could never match.
+    let allow_missing = params.allow_missing.unwrap_or(false);
+    // Domain existence check (spec general/021): kv unchanged; json/rel check
+    // via the engine when active. `allow_missing` skips the check for all
+    // three (pre-provisioning). json/rel always validate the name first;
+    // kv only in the allow_missing branch, where no lookup exists to catch
+    // an impossible name (§4 — kv's real length limit is config-driven, so
+    // `valid_name`'s fixed 50 must not apply to kv's normal lookup branch).
     match store_type {
         StoreType::Kv => {
-            if state.registry.get_domain(&body.domain).await.unwrap_or(None).is_none() {
+            if allow_missing {
+                if !valid_name(&body.domain) {
+                    return err(StatusCode::BAD_REQUEST, "domain must be 1-50 chars of [a-zA-Z0-9_-]");
+                }
+            } else if state.registry.get_domain(&body.domain).await.unwrap_or(None).is_none() {
                 return err(StatusCode::NOT_FOUND, "404 Not Found: domain not found");
             }
         }
-        StoreType::Json | StoreType::Rel => {
+        StoreType::Json => {
             if !valid_name(&body.domain) {
                 return err(StatusCode::BAD_REQUEST, "domain must be 1-50 chars of [a-zA-Z0-9_-]");
+            }
+            if !allow_missing {
+                if let Some(engine) = &state.json_engine {
+                    if engine.get_domain(&body.domain).is_none() {
+                        return err(StatusCode::NOT_FOUND, "404 Not Found: domain not found");
+                    }
+                }
+            }
+        }
+        StoreType::Rel => {
+            if !valid_name(&body.domain) {
+                return err(StatusCode::BAD_REQUEST, "domain must be 1-50 chars of [a-zA-Z0-9_-]");
+            }
+            if !allow_missing {
+                if let Some(engine) = &state.rel_engine {
+                    if engine.get_domain(&body.domain).is_none() {
+                        return err(StatusCode::NOT_FOUND, "404 Not Found: domain not found");
+                    }
+                }
             }
         }
     }
@@ -489,13 +534,33 @@ mod tests {
     use tower::util::ServiceExt;
 
     async fn make_app(auth_enabled: bool) -> (axum::Router, Arc<AuthCache>, tempfile::TempDir) {
+        let (app, auth_cache, _json, _rel, dir) = make_app_with_engines(auth_enabled, false, false).await;
+        (app, auth_cache, dir)
+    }
+
+    /// Like `make_app`, but also boots the JSON/rel engines when requested
+    /// (spec general/021) and returns their handles so a test can create/
+    /// delete domains directly instead of only through the router.
+    async fn make_app_with_engines(
+        auth_enabled: bool,
+        json_enabled: bool,
+        rel_enabled: bool,
+    ) -> (
+        axum::Router,
+        Arc<AuthCache>,
+        Option<Arc<JsonEngine>>,
+        Option<Arc<RelEngine>>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::TempDir::new().unwrap();
-        let wal_path = dir.path().join("wal.log");
+        let kv_dir = dir.path().join("kv");
+        std::fs::create_dir_all(&kv_dir).unwrap();
+        let wal_path = kv_dir.join("wal.log");
         let wal = Arc::new(crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap());
-        let vlog_path = dir.path().join("vlog.log");
+        let vlog_path = kv_dir.join("vlog.log");
         let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
-        let fm = Arc::new(crate::storage::file_manager::FileManager::new(dir.path()).await.unwrap());
-        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(dir.path()));
+        let fm = Arc::new(crate::storage::file_manager::FileManager::new(&kv_dir).await.unwrap());
+        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&kv_dir));
         let engine = Arc::new(
             crate::engines::lsm::engine::LsmStorageEngine::new(
                 wal, wal_path, vlog, vlog_path, fm, mm,
@@ -508,20 +573,48 @@ mod tests {
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             crate::engines::lsm::DomainRegistry::recover(
-                engine,
+                Arc::clone(&engine),
                 crate::engines::lsm::domain::DomainConfig::default(),
                 Arc::clone(&metrics),
             )
             .await
             .unwrap(),
         );
+        let json_engine = if json_enabled {
+            let config = crate::config::JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("json_sst").to_string_lossy().into_owned(),
+                reindex_pause_ms: 0,
+                ..crate::config::JsonStoreConfig::default()
+            };
+            Some(JsonEngine::bootstrap(&config, Arc::clone(&metrics)).await.unwrap())
+        } else {
+            None
+        };
+        let rel_engine = if rel_enabled {
+            let cfg = crate::config::RelStoreConfig {
+                wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("rel_sst").to_string_lossy().into_owned(),
+                ..crate::config::RelStoreConfig::default()
+            };
+            let resolver = crate::engines::rel::CrossEngineResolver::new(
+                Some(Arc::clone(&registry)),
+                None,
+                Arc::clone(&metrics),
+            );
+            Some(RelEngine::bootstrap(&cfg, Arc::clone(&metrics), resolver).await.unwrap())
+        } else {
+            None
+        };
         let state = crate::api::AppState {
             registry,
             auth_cache: Arc::clone(&auth_cache),
             auth_enabled,
             metrics,
-            json_engine: None,
-            rel_engine: None,
+            json_engine: json_engine.clone(),
+            rel_engine: rel_engine.clone(),
             shm_manager: None,
             backup_manager: None,
             log_access: None,
@@ -531,7 +624,7 @@ mod tests {
             config_file_loaded: false,
         };
         let app = crate::api::create_router(state, Arc::new(vec![]));
-        (app, auth_cache, dir)
+        (app, auth_cache, json_engine, rel_engine, dir)
     }
 
     async fn send(app: &axum::Router, method: Method, uri: &str, body: Body) -> axum::http::Response<Body> {
@@ -911,4 +1004,209 @@ mod tests {
     // Test 7 (/version still reachable, whitelist not broken) is covered by
     // `version_requires_valid_key_any_role` in middleware.rs, which exercises
     // the exact same whitelist branch this spec extends.
+
+    // ── set_permission domain validation (spec general/021) ─────────────────
+
+    /// POSTs a permission grant; returns only the status (body is irrelevant
+    /// to every test below). `allow_missing` becomes `?allow_missing=` when `Some`.
+    async fn set_perm(
+        app: &axum::Router,
+        user: &str,
+        domain: &str,
+        store_type: &str,
+        allow_missing: Option<bool>,
+    ) -> StatusCode {
+        let uri = match allow_missing {
+            Some(v) => format!("/store-api/auth/users/{user}/permissions?allow_missing={v}"),
+            None => format!("/store-api/auth/users/{user}/permissions"),
+        };
+        let body = serde_json::json!({"domain": domain, "access": "read", "store_type": store_type});
+        send(app, Method::POST, &uri, Body::from(body.to_string())).await.status()
+    }
+
+    /// Like `send`, but with a Bearer key -- needed once `auth_enabled = true`.
+    async fn authed(
+        app: &axum::Router,
+        key: &str,
+        method: Method,
+        uri: &str,
+        body: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let mut builder = Request::builder().method(method).uri(uri).header("authorization", format!("Bearer {key}"));
+        let req = if let Some(b) = body {
+            builder = builder.header("content-type", "application/json");
+            builder.body(Body::from(b.to_string())).unwrap()
+        } else {
+            builder.body(Body::empty()).unwrap()
+        };
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    // Test 1: json, engine active -- domain exists -> 200; missing -> 404
+    // (new); missing + allow_missing=true -> 200.
+    #[tokio::test]
+    async fn set_permission_json_engine_active_checks_domain_existence() {
+        let (app, auth_cache, json, _rel, _dir) = make_app_with_engines(false, true, false).await;
+        add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
+        json.unwrap().create_domain("jsondom").await.unwrap();
+
+        assert_eq!(set_perm(&app, "alice", "jsondom", "json", None).await, StatusCode::OK);
+        assert_eq!(set_perm(&app, "alice", "ghost", "json", None).await, StatusCode::NOT_FOUND);
+        assert_eq!(set_perm(&app, "alice", "ghost", "json", Some(true)).await, StatusCode::OK);
+    }
+
+    // Test 2: rel, engine active -- same three cases as Test 1.
+    #[tokio::test]
+    async fn set_permission_rel_engine_active_checks_domain_existence() {
+        let (app, auth_cache, _json, rel, _dir) = make_app_with_engines(false, false, true).await;
+        add_user(&auth_cache, "bob", "lura_bob", UserRole::User).await;
+        rel.unwrap().create_domain("reldom").await.unwrap();
+
+        assert_eq!(set_perm(&app, "bob", "reldom", "rel", None).await, StatusCode::OK);
+        assert_eq!(set_perm(&app, "bob", "ghost", "rel", None).await, StatusCode::NOT_FOUND);
+        assert_eq!(set_perm(&app, "bob", "ghost", "rel", Some(true)).await, StatusCode::OK);
+    }
+
+    // Test 3: json/rel engine disabled (None) -- the check is impossible, not
+    // skipped: always 200, with or without allow_missing.
+    #[tokio::test]
+    async fn set_permission_engine_disabled_skips_existence_check() {
+        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+        add_user(&auth_cache, "carol", "lura_carol", UserRole::User).await;
+
+        for store_type in ["json", "rel"] {
+            assert_eq!(set_perm(&app, "carol", "ghost", store_type, None).await, StatusCode::OK, "{store_type} without allow_missing");
+            assert_eq!(set_perm(&app, "carol", "ghost", store_type, Some(true)).await, StatusCode::OK, "{store_type} with allow_missing");
+        }
+    }
+
+    // Test 4: kv -- domain exists -> 200 (unchanged); missing -> 404
+    // (unchanged); missing + allow_missing=true -> 200 (new: first store type
+    // to get pre-provisioning).
+    #[tokio::test]
+    async fn set_permission_kv_allow_missing_enables_pre_provisioning() {
+        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+        add_user(&auth_cache, "dana", "lura_dana", UserRole::User).await;
+        let resp = send(
+            &app,
+            Method::POST,
+            "/store-api/domains",
+            Body::from(serde_json::json!({"name": "kvdom"}).to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        assert_eq!(set_perm(&app, "dana", "kvdom", "kv", None).await, StatusCode::OK);
+        assert_eq!(set_perm(&app, "dana", "ghost", "kv", None).await, StatusCode::NOT_FOUND);
+        assert_eq!(set_perm(&app, "dana", "ghost", "kv", Some(true)).await, StatusCode::OK);
+    }
+
+    // Test 5: invalid domain name -> 400 for json/rel always; for kv only
+    // with allow_missing=true (no lookup there to catch it otherwise); kv
+    // without allow_missing keeps answering 404 -- the name is never
+    // validated on that branch (spec general/021 §4).
+    #[tokio::test]
+    async fn set_permission_invalid_name_rules_per_store_type() {
+        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+        add_user(&auth_cache, "erin", "lura_erin", UserRole::User).await;
+        let long_name = "a".repeat(51);
+
+        for bad in ["a:b", "", long_name.as_str()] {
+            assert_eq!(set_perm(&app, "erin", bad, "json", None).await, StatusCode::BAD_REQUEST, "json {bad:?}");
+            assert_eq!(set_perm(&app, "erin", bad, "rel", None).await, StatusCode::BAD_REQUEST, "rel {bad:?}");
+            assert_eq!(set_perm(&app, "erin", bad, "kv", Some(true)).await, StatusCode::BAD_REQUEST, "kv allow_missing {bad:?}");
+            assert_eq!(set_perm(&app, "erin", bad, "kv", None).await, StatusCode::NOT_FOUND, "kv no allow_missing {bad:?}");
+        }
+    }
+
+    // Test 6: unknown user -> 404 before any domain check, even with
+    // allow_missing=true (order unchanged, handlers.rs user check runs first).
+    #[tokio::test]
+    async fn set_permission_unknown_user_404_even_with_allow_missing() {
+        let (app, _auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+
+        assert_eq!(set_perm(&app, "ghost_user", "dom", "kv", None).await, StatusCode::NOT_FOUND);
+        assert_eq!(set_perm(&app, "ghost_user", "dom", "json", Some(true)).await, StatusCode::NOT_FOUND);
+    }
+
+    // Test 7: allow_missing=true pre-provisions a permission that becomes
+    // effective once the domain is created -- json/012 §6's workflow keeps
+    // working, now as an explicit opt-in instead of a side effect of missing
+    // validation.
+    #[tokio::test]
+    async fn set_permission_allow_missing_roundtrip_activates_on_domain_creation() {
+        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(true, true, false).await;
+        add_user(&auth_cache, "root", "lura_root", UserRole::Admin).await;
+        add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
+
+        let resp = authed(
+            &app,
+            "lura_root",
+            Method::POST,
+            "/store-api/auth/users/alice/permissions?allow_missing=true",
+            Some(&serde_json::json!({"domain": "predom", "access": "write", "store_type": "json"}).to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Domain doesn't exist yet: the auth layer already lets alice through
+        // on her pre-provisioned grant -- the handler alone answers 404.
+        let resp = authed(
+            &app,
+            "lura_alice",
+            Method::POST,
+            "/store-api/json/predom/documents",
+            Some(&serde_json::json!({"x": 1}).to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = authed(
+            &app,
+            "lura_root",
+            Method::POST,
+            "/store-api/json/domains",
+            Some(&serde_json::json!({"name": "predom"}).to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = authed(
+            &app,
+            "lura_alice",
+            Method::POST,
+            "/store-api/json/predom/documents",
+            Some(&serde_json::json!({"x": 1}).to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Test 8: a domain in Deleting state answers 404 without allow_missing,
+    // for both json and rel. Deleted directly through the engine handle --
+    // this harness never spawns a purger, so the state can't race the
+    // assertion below (spec general/021 Test 8 herstellungsweg).
+    #[tokio::test]
+    async fn set_permission_deleting_domain_answers_404() {
+        let (app, auth_cache, json, rel, _dir) = make_app_with_engines(false, true, true).await;
+        add_user(&auth_cache, "frank", "lura_frank", UserRole::User).await;
+        let json = json.unwrap();
+        let rel = rel.unwrap();
+
+        json.create_domain("doomed").await.unwrap();
+        json.delete_domain("doomed").await.unwrap();
+        assert_eq!(
+            json.get_domain_any("doomed").map(|d| d.state),
+            Some(crate::engines::json::JsonDomainState::Deleting)
+        );
+        assert_eq!(set_perm(&app, "frank", "doomed", "json", None).await, StatusCode::NOT_FOUND);
+
+        rel.create_domain("doomed2").await.unwrap();
+        rel.delete_domain("doomed2").await.unwrap();
+        assert_eq!(
+            rel.get_domain_any("doomed2").map(|d| d.state),
+            Some(crate::engines::rel::RelDomainState::Deleting)
+        );
+        assert_eq!(set_perm(&app, "frank", "doomed2", "rel", None).await, StatusCode::NOT_FOUND);
+    }
 }

@@ -119,7 +119,7 @@ pub struct SearchRequest {
 #[derive(Serialize, ToSchema)]
 pub struct SearchResponse {
     /// Matching documents incl. `_key`/`_version` metadata.
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<DocumentResponse>)]
     pub documents: Vec<Value>,
     pub total: u64,
     pub offset: u32,
@@ -150,7 +150,7 @@ pub struct ListParams {
 #[derive(Serialize, ToSchema)]
 pub struct DocumentListResponse {
     /// Loaded documents incl. `_key`/`_version` (empty when keys_only).
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<DocumentResponse>)]
     pub documents: Vec<Value>,
     /// Document keys of the page.
     pub keys: Vec<String>,
@@ -237,9 +237,10 @@ fn parse_precondition(headers: &HeaderMap) -> Result<Option<Precondition>, ApiEr
     request_body = Object,
     responses(
         (status = 201, description = "Document created with generated UUIDv4 key", body = DocumentResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 413, description = "Payload too large"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 413, description = "Payload too large", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -260,18 +261,19 @@ pub async fn create_document(
     params(
         ("domain" = String, Path, description = "JSON domain"),
         ("key" = String, Path, description = "Document key"),
+        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: conditional write, 409 on version mismatch"),
         ("If-None-Match" = Option<String>, Header, description = "Only `*` is supported: create-only write, 412 if the document exists"),
     ),
     request_body = Object,
     responses(
         (status = 200, description = "Document updated", body = DocumentResponse),
         (status = 201, description = "Document created", body = DocumentResponse),
-        (status = 400, description = "Invalid key, invalid If-Match or If-None-Match header, or both headers set together"),
-        (status = 404, description = "Domain not found, or If-Match on missing document"),
-        (status = 409, description = "Version conflict (If-Match mismatch)"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 412, description = "Document already exists (If-None-Match: *)"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 400, description = "Invalid key, invalid If-Match or If-None-Match header, or both headers set together", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found, or If-Match on missing document", body = String, content_type = "text/plain"),
+        (status = 409, description = "Version conflict (If-Match mismatch)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 412, description = "Document already exists (If-None-Match: *)", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -303,9 +305,11 @@ pub async fn put_document(
         ("key" = String, Path, description = "Document key"),
     ),
     responses(
-        (status = 200, description = "Document content with _key/_version metadata", body = DocumentResponse),
-        (status = 404, description = "Document or domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 200, description = "Document content with _key/_version metadata", body = DocumentResponse,
+         headers(("ETag" = String, description = "Opaque version tag for If-Match / If-None-Match"))),
+        (status = 404, description = "Document or domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -329,12 +333,14 @@ pub async fn get_document(
     params(
         ("domain" = String, Path, description = "JSON domain"),
         ("key" = String, Path, description = "Document key"),
+        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: conditional write, 409 on version mismatch"),
     ),
     responses(
         (status = 204, description = "Document deleted"),
-        (status = 404, description = "Document or domain not found"),
-        (status = 409, description = "Version conflict (If-Match mismatch)"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Document or domain not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "Version conflict (If-Match mismatch)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -368,8 +374,9 @@ pub async fn delete_document(
     ),
     responses(
         (status = 200, description = "Paginated document list", body = DocumentListResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -401,8 +408,9 @@ pub async fn list_documents(
     params(("domain" = String, Path, description = "JSON domain")),
     responses(
         (status = 200, description = "Document count", body = CountResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -425,9 +433,10 @@ pub async fn count_documents(
     request_body = CreateIndexRequest,
     responses(
         (status = 201, description = "Index definition created", body = IndexResponse),
-        (status = 400, description = "Invalid field or type"),
-        (status = 409, description = "Index already exists"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 400, description = "Invalid field or type", body = String, content_type = "text/plain"),
+        (status = 409, description = "Index already exists", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -460,8 +469,9 @@ pub async fn create_index(
     params(("domain" = String, Path, description = "JSON domain")),
     responses(
         (status = 200, description = "Index definitions of the domain", body = Vec<IndexResponse>),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -484,8 +494,9 @@ pub async fn list_indexes(
     ),
     responses(
         (status = 204, description = "Index definition removed"),
-        (status = 404, description = "Index or domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Index or domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -508,9 +519,10 @@ pub async fn delete_index(
     request_body = SearchRequest,
     responses(
         (status = 200, description = "Matching documents", body = SearchResponse),
-        (status = 400, description = "Invalid filter or unindexed field"),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 400, description = "Invalid filter or unindexed field", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -584,8 +596,9 @@ fn build_search_query(req: SearchRequest) -> Result<SearchQuery, ApiError> {
     request_body(content = String, description = "NDJSON — one document per line, optional _key field"),
     responses(
         (status = 200, description = "Import summary", body = BulkLoadResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -614,8 +627,9 @@ pub async fn bulk_load(
     params(("domain" = String, Path, description = "JSON domain")),
     responses(
         (status = 200, description = "NDJSON stream of all documents", content_type = "application/x-ndjson"),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -648,10 +662,11 @@ pub async fn export_documents(
     request_body(content = ReindexRequest, description = "Optional field restriction"),
     responses(
         (status = 202, description = "Re-index started", body = ReindexAcceptedResponse),
-        (status = 400, description = "Malformed request body"),
-        (status = 404, description = "Domain not found"),
-        (status = 409, description = "Re-index already running for this domain"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 400, description = "Malformed request body", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "Re-index already running for this domain", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -694,8 +709,8 @@ pub async fn trigger_reindex(
     ),
     responses(
         (status = 200, description = "Current re-index status"),
-        (status = 404, description = "Unknown task id for this domain"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Unknown task id for this domain", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -1601,5 +1616,27 @@ mod tests {
         assert_eq!(doc["_content"], json!(42), "{body}");
         assert!(doc["_key"].is_string(), "{body}");
         assert!(doc["_version"].is_u64(), "{body}");
+    }
+
+    // 25. Error-body reality check (spec json/016 §D2 test 5): the contract's
+    //     text/plain schema on 404 matches what the server actually sends — a
+    //     real GET on a missing document returns a non-empty plaintext body
+    //     with a text/plain content type, not JSON.
+    #[tokio::test]
+    async fn test_missing_document_404_has_nonempty_plaintext_body() {
+        let (app, _dir) = make_app(true).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/store-api/json/default/documents/does-not-exist")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let content_type = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.is_empty(), "404 body must not be empty");
+        assert!(serde_json::from_str::<Value>(&body).is_err(), "body must be plain text, not JSON: {body}");
     }
 }

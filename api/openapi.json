@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.3.10",
+    "version": "0.3.11",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -922,10 +922,34 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -991,10 +1015,34 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -1037,13 +1085,44 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "413": {
-            "description": "Payload too large"
+            "description": "Payload too large",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1078,10 +1157,34 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1116,6 +1219,14 @@
         "responses": {
           "200": {
             "description": "Document content with _key/_version metadata",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Opaque version tag for If-Match / If-None-Match"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1125,10 +1236,34 @@
             }
           },
           "404": {
-            "description": "Document or domain not found"
+            "description": "Document or domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -1155,6 +1290,18 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Opaque ETag from a prior read: conditional write, 409 on version mismatch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -1202,22 +1349,64 @@
             }
           },
           "400": {
-            "description": "Invalid key, invalid If-Match or If-None-Match header, or both headers set together"
+            "description": "Invalid key, invalid If-Match or If-None-Match header, or both headers set together",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain not found, or If-Match on missing document"
+            "description": "Domain not found, or If-Match on missing document",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Version conflict (If-Match mismatch)"
+            "description": "Version conflict (If-Match mismatch)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "410": {
-            "description": "Domain is being deleted"
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "412": {
-            "description": "Document already exists (If-None-Match: *)"
+            "description": "Document already exists (If-None-Match: *)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -1245,6 +1434,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "Opaque ETag from a prior read: conditional write, 409 on version mismatch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -1252,13 +1453,44 @@
             "description": "Document deleted"
           },
           "404": {
-            "description": "Document or domain not found"
+            "description": "Document or domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Version conflict (If-Match mismatch)"
+            "description": "Version conflict (If-Match mismatch)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1289,10 +1521,34 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1330,10 +1586,34 @@
             }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -1376,13 +1656,44 @@
             }
           },
           "400": {
-            "description": "Invalid field or type"
+            "description": "Invalid field or type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Index already exists"
+            "description": "Index already exists",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1419,10 +1730,34 @@
             "description": "Index definition removed"
           },
           "404": {
-            "description": "Index or domain not found"
+            "description": "Index or domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1468,16 +1803,54 @@
             }
           },
           "400": {
-            "description": "Malformed request body"
+            "description": "Malformed request body",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Re-index already running for this domain"
+            "description": "Re-index already running for this domain",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1514,10 +1887,24 @@
             "description": "Current re-index status"
           },
           "404": {
-            "description": "Unknown task id for this domain"
+            "description": "Unknown task id for this domain",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1562,13 +1949,44 @@
             }
           },
           "400": {
-            "description": "Invalid filter or unindexed field"
+            "description": "Invalid filter or unindexed field",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
-            "description": "Domain not found"
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "503": {
-            "description": "JSON engine disabled"
+            "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3532,7 +3950,7 @@
           "documents": {
             "type": "array",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/DocumentResponse"
             },
             "description": "Loaded documents incl. `_key`/`_version` (empty when keys_only)."
           },
@@ -4107,7 +4525,7 @@
           "documents": {
             "type": "array",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/DocumentResponse"
             },
             "description": "Matching documents incl. `_key`/`_version` metadata."
           },

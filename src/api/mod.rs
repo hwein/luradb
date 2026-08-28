@@ -60,7 +60,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.3.10";
+pub const API_VERSION: &str = "0.3.11";
 
 struct VersionInfo;
 
@@ -556,6 +556,94 @@ mod contract_tests {
                 "{method} {path} -> {status}: {response}"
             );
         }
+    }
+
+    // 410 coverage (spec json/016 §A, test 1): every document-side JSON
+    // endpoint whose engine call reaches `require_active` documents a 410
+    // response. Domain-management routes in json_domains.rs document their
+    // own 410 separately (json/013) and reindex_status (task-map lookup
+    // only, no domain-state check) is deliberately excluded.
+    #[test]
+    fn json_document_endpoints_document_410_gone() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let checks = [
+            ("/store-api/json/{domain}/documents", "post"),
+            ("/store-api/json/{domain}/documents/{key}", "put"),
+            ("/store-api/json/{domain}/documents/{key}", "get"),
+            ("/store-api/json/{domain}/documents/{key}", "delete"),
+            ("/store-api/json/{domain}/documents", "get"),
+            ("/store-api/json/{domain}/documents/count", "get"),
+            ("/store-api/json/{domain}/search", "post"),
+            ("/store-api/json/{domain}/indexes", "post"),
+            ("/store-api/json/{domain}/indexes", "get"),
+            ("/store-api/json/{domain}/indexes/{field}", "delete"),
+            ("/store-api/json/{domain}/bulk", "post"),
+            ("/store-api/json/{domain}/export", "get"),
+            ("/store-api/json/{domain}/reindex", "post"),
+        ];
+        for (path, method) in checks {
+            let response = &json["paths"][path][method]["responses"]["410"];
+            assert!(!response.is_null(), "{method} {path}: missing 410 response");
+        }
+        let status_responses =
+            &json["paths"]["/store-api/json/{domain}/reindex/{task_id}"]["get"]["responses"];
+        assert!(status_responses["410"].is_null(), "reindex_status must not document 410");
+    }
+
+    // Header parameters (spec json/016 §B, test 2): PUT and DELETE of the
+    // document route carry If-Match; PUT additionally keeps the
+    // If-None-Match parameter from json/014.
+    #[test]
+    fn document_route_carries_if_match_header_parameter() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let has_header = |path: &str, method: &str, name: &str| {
+            json["paths"][path][method]["parameters"]
+                .as_array()
+                .expect("parameters array")
+                .iter()
+                .any(|p| p["name"] == serde_json::json!(name) && p["in"] == serde_json::json!("header"))
+        };
+        let doc_path = "/store-api/json/{domain}/documents/{key}";
+        assert!(has_header(doc_path, "put", "If-Match"), "PUT must carry If-Match");
+        assert!(has_header(doc_path, "put", "If-None-Match"), "PUT must still carry If-None-Match");
+        assert!(has_header(doc_path, "delete", "If-Match"), "DELETE must carry If-Match");
+    }
+
+    // List/search typing (spec json/016 §C, test 3): both `documents` fields
+    // reference DocumentResponse instead of the former Vec<Object> placeholder.
+    #[test]
+    fn document_list_and_search_responses_reference_document_response_items() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for schema in ["DocumentListResponse", "SearchResponse"] {
+            let items_ref =
+                &json["components"]["schemas"][schema]["properties"]["documents"]["items"]["$ref"];
+            assert_eq!(
+                items_ref,
+                &serde_json::json!("#/components/schemas/DocumentResponse"),
+                "{schema}.documents.items: {items_ref}"
+            );
+        }
+    }
+
+    // ETag response header (spec json/016 §D1, test 4): GET …/documents/{key}'s
+    // 200 declares the header used for a subsequent If-Match / If-None-Match.
+    #[test]
+    fn get_document_200_declares_etag_header() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let header = &json["paths"]["/store-api/json/{domain}/documents/{key}"]["get"]["responses"]
+            ["200"]["headers"]["ETag"];
+        assert!(!header.is_null(), "GET …/documents/{{key}} 200 must declare an ETag header: {header}");
+    }
+
+    // Error-body typing sample (spec json/016 §D2, test 5 schema half): a 4xx
+    // response of json.rs declares its body as a plain string. The matching
+    // reality check (an actual roundtrip) lives in json::tests.
+    #[test]
+    fn json_error_response_sample_declares_text_plain_string_body() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schema = &json["paths"]["/store-api/json/{domain}/documents/{key}"]["get"]["responses"]
+            ["404"]["content"]["text/plain"]["schema"];
+        assert_eq!(schema["type"], serde_json::json!("string"), "{schema}");
     }
 }
 

@@ -19,6 +19,7 @@ All notable changes to LuraDB are documented in this file.
 - Optional CORS support via the new `[cors]` config section — an opt-in `CorsLayer` (exact origin allow-list, or `"*"`) lets browser clients call the API directly without a proxy in front; off by default.
 - **BREAKING** API: added `GET /store-api/config`, returning the effective configuration of the running process (`config_path`, `config_file_loaded`, `config`) — admin-only; the admin API key is redacted from `config`, everything else is the same field names as the TOML file.
 - Startup now fails fast when `max_value_size` or `max_key_length` of any engine's `[lsm]` block exceed the WAL recovery field cap — previously such a config wrote WAL records that only failed the *next* restart's recovery.
+- **BREAKING** API: JSON document-store OpenAPI contract now documents `410 Gone` on all document/index/search/bulk/reindex routes, `If-Match` as a header parameter on `PUT`/`DELETE …/documents/{key}`, the `ETag` response header on `GET …/documents/{key}`, `DocumentListResponse`/`SearchResponse` document lists typed as `DocumentResponse[]`, and `text/plain` string bodies on every 4xx/5xx response in the JSON API.
 
 ### Security
 

@@ -249,8 +249,19 @@ jobs:
         with:
           name: sbom
 
+      - name: changelog.json asset
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.gate.outputs.prerelease }}" = "true" ]; then
+            # changelog-json.sh unreleased has no version of its own (same
+            # argument convention as changelog-extract.sh) - patch in the tag version.
+            scripts/changelog-json.sh unreleased | jq --arg v "$VERSION" '.version = $v' > changelog.json
+          else
+            scripts/changelog-json.sh "${VERSION}" > changelog.json
+          fi
+
       - name: Checksums
-        run: sha256sum luradb_*.deb "luradb-${VERSION}.cdx.json" > SHA256SUMS
+        run: sha256sum luradb_*.deb "luradb-${VERSION}.cdx.json" changelog.json > SHA256SUMS
 
       # Attestations are unavailable on user-owned private repos - skipped
       # until the repository goes public.
@@ -277,4 +288,4 @@ jobs:
             --title "LuraDB ${{ github.ref_name }}" \
             --notes-file notes.md \
             "${FLAGS[@]}" \
-            luradb_*.deb "luradb-${VERSION}.cdx.json" SHA256SUMS
+            luradb_*.deb "luradb-${VERSION}.cdx.json" changelog.json SHA256SUMS

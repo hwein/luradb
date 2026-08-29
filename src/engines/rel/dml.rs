@@ -6,7 +6,7 @@
 
 use super::ast::{Assignment, CompareOp, Delete, Expr, Insert, Literal, Operand, Select, Statement, Update};
 use super::catalog::{CatalogEntry, ColumnDef, DefaultValue, TableSchema};
-use super::cross_engine::{JsonResolution, KvResolution};
+use super::cross_engine::{JsonResolution, KvResolution, LinkAuth};
 use super::domain::RelDomain;
 use super::error::RelStoreError;
 use super::eval::{eval, Bool3, Pred, PredOperand};
@@ -16,6 +16,7 @@ use super::types::{encode_sortable, ColumnType, ScalarValue};
 use super::{ExecOutcome, RelEngine};
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::lsm::reader::Snapshot;
+use crate::metrics::EngineKind;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -86,9 +87,17 @@ struct Candidate {
 
 /// An INSERT row's resolved values plus whether the AUTOINCREMENT PK still
 /// needs a sequence value (filled under the write lock).
-struct RowPlan {
+pub(super) struct RowPlan {
     values: HashMap<u16, ScalarValue>,
     needs_auto: bool,
+}
+
+impl RowPlan {
+    /// Builds an already-resolved row (no AUTOINCREMENT fill-in needed) — the
+    /// shape `rel/019`'s from-file import stages via [`RelEngine::stage_insert_row`].
+    pub(super) fn new(values: HashMap<u16, ScalarValue>) -> Self {
+        Self { values, needs_auto: false }
+    }
 }
 
 impl RelEngine {
@@ -101,17 +110,31 @@ impl RelEngine {
         domain: &str,
         stmt: Statement,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
-        match stmt {
-            Statement::Insert(i) => self.exec_insert(domain, i, params).await.map(ExecOutcome::Dml),
-            Statement::Update(u) => self.exec_update(domain, u, params).await.map(ExecOutcome::Dml),
+        // Spec general/019: one op with one latency sample per call, read for
+        // Select and write for Insert/Update/Delete -- DDL never reaches here.
+        let is_read = matches!(stmt, Statement::Select(_));
+        let start = std::time::Instant::now();
+        let outcome = match stmt {
+            Statement::Insert(i) => self.exec_insert(domain, i, params, auth).await.map(ExecOutcome::Dml),
+            Statement::Update(u) => self.exec_update(domain, u, params, auth).await.map(ExecOutcome::Dml),
             Statement::Delete(d) => self.exec_delete(domain, d, params).await.map(ExecOutcome::Dml),
-            Statement::Select(s) => self.exec_select(domain, s, params).await,
+            Statement::Select(s) => self.exec_select(domain, s, params, auth).await,
             Statement::CreateView(_) | Statement::DropView(_) => {
                 unreachable!("CREATE/DROP VIEW are dispatched in RelEngine::execute (rel/008 view.rs)")
             }
             _ => unreachable!("DDL is dispatched before execute_dml"),
+        };
+        if outcome.is_ok() {
+            let latency_us = start.elapsed().as_micros() as u64;
+            if is_read {
+                self.metrics.record_engine_read(EngineKind::Rel, latency_us);
+            } else {
+                self.metrics.record_engine_write(EngineKind::Rel, latency_us);
+            }
         }
+        outcome
     }
 
     /// Resolves a DML target to a table: view → `NotWritable`, missing →
@@ -142,6 +165,7 @@ impl RelEngine {
         domain: &str,
         ins: Insert,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<DmlResult, RelStoreError> {
         let (dom, schema) = self.require_table(domain, &ins.table)?;
         let prefix = &dom.system_prefix;
@@ -169,7 +193,7 @@ impl RelEngine {
 
         for row in &rows {
             let pk_v = self
-                .stage_insert_row(domain, &schema, prefix, row, snap, &mut seen_pk, &mut seen_unique, &mut ops)
+                .stage_insert_row(domain, &schema, prefix, row, snap, &mut seen_pk, &mut seen_unique, &mut ops, auth)
                 .await?;
             if single {
                 last_pk = Some(pk_v);
@@ -192,7 +216,7 @@ impl RelEngine {
     /// → PK dup → row size → UNIQUE → REFERENCES → cross-engine links → index
     /// entries → row `Put`. Returns the row's PK, for `exec_insert`'s
     /// single-row `last_pk`.
-    async fn stage_insert_row(
+    pub(super) async fn stage_insert_row(
         &self,
         domain: &str,
         schema: &TableSchema,
@@ -202,6 +226,7 @@ impl RelEngine {
         seen_pk: &mut HashSet<Vec<u8>>,
         seen_unique: &mut HashSet<(u32, Vec<u8>)>,
         ops: &mut Vec<BatchOp>,
+        auth: LinkAuth,
     ) -> Result<ScalarValue, RelStoreError> {
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
         self.validate_not_null_and_text(schema, &row.values)?;
@@ -229,7 +254,7 @@ impl RelEngine {
 
         self.check_row_unique(schema, &row.values, prefix, &pk_enc, seen_unique).await?;
         self.check_row_references(domain, schema, &row.values, prefix, snap).await?;
-        self.check_row_cross_engine_links(domain, schema, &row.values).await?;
+        self.check_row_cross_engine_links(domain, schema, &row.values, auth).await?;
 
         for k in row_index_keys(schema, &row.values, prefix, &pk_enc) {
             self.guard_key_len(&k)?;
@@ -246,6 +271,7 @@ impl RelEngine {
         domain: &str,
         upd: Update,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<DmlResult, RelStoreError> {
         let (dom, schema) = self.require_table(domain, &upd.table)?;
         let prefix = &dom.system_prefix;
@@ -283,7 +309,7 @@ impl RelEngine {
             let row_key = keys::row_key(prefix, schema.table_id, &pk_enc);
             self.guard_key_len(&row_key)?;
 
-            self.check_updated_references(domain, prefix, &sets, snap).await?;
+            self.check_updated_references(domain, prefix, &sets, snap, auth).await?;
             self.diff_update_indexes(&schema, prefix, &old, &new, &set_ids, &pk_enc, &mut seen_unique, &mut ops)
                 .await?;
             ops.push(BatchOp::Put { key: row_key, value: row_bytes });
@@ -302,6 +328,7 @@ impl RelEngine {
         prefix: &[u8],
         sets: &[(ColumnDef, ScalarValue)],
         snap: &Snapshot,
+        auth: LinkAuth,
     ) -> Result<(), RelStoreError> {
         for (c, v) in sets {
             if c.references.is_some() && !matches!(c.col_type, ColumnType::KvRef | ColumnType::JsonRef) {
@@ -309,7 +336,7 @@ impl RelEngine {
             }
             if matches!(c.col_type, ColumnType::KvRef | ColumnType::JsonRef) {
                 if let ScalarValue::Text(key) = v {
-                    self.validate_cross_engine_link(domain, c, key).await?;
+                    self.validate_cross_engine_link(domain, c, key, auth).await?;
                 }
             }
         }
@@ -428,7 +455,7 @@ impl RelEngine {
             scanned += 1;
             let values = decode_row(&bytes, schema);
             let keep = match &pred {
-                Some(p) => matches!(eval(p, &values), Bool3::True),
+                Some(p) => matches!(eval(p, &values)?, Bool3::True),
                 None => true,
             };
             if keep {
@@ -564,20 +591,25 @@ impl RelEngine {
         domain: &str,
         schema: &TableSchema,
         values: &HashMap<u16, ScalarValue>,
+        auth: LinkAuth,
     ) -> Result<(), RelStoreError> {
         for c in &schema.columns {
             if !matches!(c.col_type, ColumnType::KvRef | ColumnType::JsonRef) {
                 continue;
             }
             if let Some(ScalarValue::Text(key)) = values.get(&c.col_id) {
-                self.validate_cross_engine_link(domain, c, key).await?;
+                self.validate_cross_engine_link(domain, c, key, auth).await?;
             }
         }
         Ok(())
     }
 
     /// Validates one non-NULL link value against its same-named target domain
-    /// (existence suffices — a null-value key *exists*). `DomainUnavailable`
+    /// (existence suffices — a null-value key *exists*). Missing read access
+    /// (`auth`, spec rel/016) is rejected first, before any existence lookup
+    /// and without charging the write-validation metric — otherwise an
+    /// unauthorized caller could distinguish an existing from a missing key,
+    /// exactly the oracle this spec closes. `DomainUnavailable`
     /// (disabled/gone/`Deleting`) and `Absent` (active but missing) map to the
     /// two 409 variants (spec §2/§7).
     async fn validate_cross_engine_link(
@@ -585,9 +617,13 @@ impl RelEngine {
         domain: &str,
         col: &ColumnDef,
         key: &str,
+        auth: LinkAuth,
     ) -> Result<(), RelStoreError> {
         match col.col_type {
             ColumnType::KvRef => {
+                if !auth.kv_read {
+                    return Err(RelStoreError::CrossEngineForbidden { engine: "kv".to_string() });
+                }
                 self.cross_engine.record_write_validation("kv");
                 match self.cross_engine.kv_lookup(domain, key).await? {
                     KvResolution::DomainUnavailable => Err(RelStoreError::CrossEngineTargetUnavailable {
@@ -603,6 +639,9 @@ impl RelEngine {
                 }
             }
             ColumnType::JsonRef => {
+                if !auth.json_read {
+                    return Err(RelStoreError::CrossEngineForbidden { engine: "json".to_string() });
+                }
                 self.cross_engine.record_write_validation("json");
                 match self.cross_engine.json_lookup(domain, key).await? {
                     JsonResolution::DomainUnavailable => Err(RelStoreError::CrossEngineTargetUnavailable {
@@ -648,7 +687,7 @@ impl RelEngine {
     /// domain — otherwise an orphan `ROW:` key could resurrect under a recreated
     /// same-name domain. The guard is the same one the purger holds around its
     /// emptiness check + finalization.
-    async fn commit_guarded(&self, domain: &str, ops: Vec<BatchOp>) -> Result<(), RelStoreError> {
+    pub(super) async fn commit_guarded(&self, domain: &str, ops: Vec<BatchOp>) -> Result<(), RelStoreError> {
         let _wg = self.write_guard.lock().await;
         self.domains.require_active(domain)?;
         self.engine.write_batch(ops).await?;

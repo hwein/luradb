@@ -1,12 +1,12 @@
 //! JSON-store REST handlers (spec json/009): documents, indexes, search,
 //! bulk load/export, re-indexing.
 
-use crate::api::{middleware::ApiError, AppState};
+use crate::api::{middleware::ApiError, AppState, CountResponse};
 use crate::engines::json::bulk::{document_to_ndjson_line, document_to_value};
 use crate::engines::json::query::DEFAULT_LIMIT;
 use crate::engines::json::{
     etag_value, ExpectedVersion, FilterCondition, IndexDefinition, IndexFieldType, JsonEngine,
-    JsonStoreError, ListOptions, SearchQuery,
+    JsonStoreError, ListOptions, Precondition, SearchQuery,
 };
 use axum::{
     body::{Body, Bytes},
@@ -27,11 +27,13 @@ impl From<JsonStoreError> for ApiError {
     fn from(e: JsonStoreError) -> Self {
         let status = match &e {
             JsonStoreError::DocumentNotFound { .. } => StatusCode::NOT_FOUND,
+            JsonStoreError::DocumentAlreadyExists { .. } => StatusCode::PRECONDITION_FAILED,
             JsonStoreError::DomainNotFound(_) => StatusCode::NOT_FOUND,
             JsonStoreError::DomainDeleting(_) => StatusCode::GONE,
             JsonStoreError::DomainAlreadyExists(_) => StatusCode::CONFLICT,
             JsonStoreError::InvalidDomainName(_) => StatusCode::BAD_REQUEST,
             JsonStoreError::InvalidKey(_) => StatusCode::BAD_REQUEST,
+            JsonStoreError::ReservedField { .. } => StatusCode::BAD_REQUEST,
             JsonStoreError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             JsonStoreError::IndexAlreadyExists { .. } => StatusCode::CONFLICT,
             // Deleting a missing index is a 404; the search handler
@@ -59,6 +61,23 @@ pub(crate) fn json_engine(state: &AppState) -> Result<&Arc<JsonEngine>, ApiError
 }
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
+
+/// A document as returned by the store: `_key`/`_version` metadata merged
+/// into the user's fields.
+#[derive(Serialize, ToSchema)]
+pub struct DocumentResponse {
+    /// Document key.
+    #[serde(rename = "_key")]
+    pub key: String,
+    /// Write counter: 1 on create, incremented on every write.
+    #[serde(rename = "_version")]
+    pub version: u64,
+    /// The document's own fields. A document whose content is not a JSON
+    /// object appears as a single `_content` field holding that value.
+    #[serde(flatten)]
+    #[schema(additional_properties)]
+    pub fields: HashMap<String, Value>,
+}
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateIndexRequest {
@@ -101,7 +120,7 @@ pub struct SearchRequest {
 #[derive(Serialize, ToSchema)]
 pub struct SearchResponse {
     /// Matching documents incl. `_key`/`_version` metadata.
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<DocumentResponse>)]
     pub documents: Vec<Value>,
     pub total: u64,
     pub offset: u32,
@@ -132,18 +151,13 @@ pub struct ListParams {
 #[derive(Serialize, ToSchema)]
 pub struct DocumentListResponse {
     /// Loaded documents incl. `_key`/`_version` (empty when keys_only).
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<DocumentResponse>)]
     pub documents: Vec<Value>,
     /// Document keys of the page.
     pub keys: Vec<String>,
     pub total: u64,
     pub offset: u32,
     pub limit: u32,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct CountResponse {
-    pub count: u64,
 }
 
 #[derive(Deserialize, ToSchema, Default)]
@@ -184,6 +198,37 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<ExpectedVersion>, ApiErr
         })
 }
 
+/// Reads `If-Match`/`If-None-Match` into a write precondition (json/014
+/// §1/§4). The two headers are mutually exclusive; only the literal `*` is
+/// supported for `If-None-Match` (ETag lists are a deliberate non-goal).
+fn parse_precondition(headers: &HeaderMap) -> Result<Option<Precondition>, ApiError> {
+    let has_if_none_match = headers.contains_key(header::IF_NONE_MATCH);
+    if has_if_none_match && headers.contains_key(header::IF_MATCH) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "400 Bad Request: If-Match and If-None-Match are mutually exclusive",
+        ));
+    }
+    if !has_if_none_match {
+        return Ok(parse_if_match(headers)?.map(Precondition::IfMatch));
+    }
+    let raw = headers
+        .get(header::IF_NONE_MATCH)
+        .unwrap()
+        .to_str()
+        .map_err(|_| {
+            ApiError::new(StatusCode::BAD_REQUEST, "400 Bad Request: invalid If-None-Match header")
+        })?;
+    if raw.trim() == "*" {
+        Ok(Some(Precondition::MustNotExist))
+    } else {
+        Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("400 Bad Request: If-None-Match supports only the literal '*', got '{raw}'"),
+        ))
+    }
+}
+
 // ── Document CRUD ─────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -192,10 +237,12 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<ExpectedVersion>, ApiErr
     params(("domain" = String, Path, description = "JSON domain")),
     request_body = Object,
     responses(
-        (status = 201, description = "Document created with generated UUIDv4 key"),
-        (status = 404, description = "Domain not found"),
-        (status = 413, description = "Payload too large"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 201, description = "Document created with generated UUIDv4 key", body = DocumentResponse),
+        (status = 400, description = "Reserved top-level field (_key, _version, _content)", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 413, description = "Payload too large", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -216,20 +263,27 @@ pub async fn create_document(
     params(
         ("domain" = String, Path, description = "JSON domain"),
         ("key" = String, Path, description = "Document key"),
+        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: conditional write, 409 on version mismatch"),
+        ("If-None-Match" = Option<String>, Header, description = "Only `*` is supported: create-only write, 412 if the document exists"),
     ),
     request_body = Object,
     responses(
-        (status = 200, description = "Document updated"),
-        (status = 201, description = "Document created"),
-        (status = 400, description = "Invalid key or If-Match header"),
-        (status = 404, description = "Domain not found, or If-Match on missing document"),
-        (status = 409, description = "Version conflict (If-Match mismatch)"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 200, description = "Document updated", body = DocumentResponse),
+        (status = 201, description = "Document created", body = DocumentResponse),
+        (status = 400, description = "Invalid key, reserved top-level field (_key, _version, _content), invalid If-Match or If-None-Match header, or both headers set together", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found, or If-Match on missing document", body = String, content_type = "text/plain"),
+        (status = 409, description = "Version conflict (If-Match mismatch)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 412, description = "Document already exists (If-None-Match: *)", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
 /// Upserts a document. With an `If-Match: "<etag>"` header the write is a
-/// conditional update that fails with 409 on a version mismatch.
+/// conditional update that fails with 409 on a version mismatch. With
+/// `If-None-Match: *` the write is create-only and fails with 412 if the
+/// document already exists (json/014); the two headers are mutually
+/// exclusive (400).
 pub async fn put_document(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
@@ -237,9 +291,9 @@ pub async fn put_document(
     Json(content): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let engine = json_engine(&state)?;
-    let expected_version = parse_if_match(&headers)?;
+    let precondition = parse_precondition(&headers)?;
     let doc = engine
-        .put_document_with_version(&domain, &key, content, expected_version)
+        .put_document_with_version(&domain, &key, content, precondition)
         .await?;
     let status = if doc.version == 1 { StatusCode::CREATED } else { StatusCode::OK };
     Ok((status, Json(document_to_value(&doc))))
@@ -253,9 +307,11 @@ pub async fn put_document(
         ("key" = String, Path, description = "Document key"),
     ),
     responses(
-        (status = 200, description = "Document content with _key/_version metadata"),
-        (status = 404, description = "Document or domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 200, description = "Document content with _key/_version metadata", body = DocumentResponse,
+         headers(("ETag" = String, description = "Opaque version tag for If-Match / If-None-Match"))),
+        (status = 404, description = "Document or domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -279,12 +335,14 @@ pub async fn get_document(
     params(
         ("domain" = String, Path, description = "JSON domain"),
         ("key" = String, Path, description = "Document key"),
+        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: conditional write, 409 on version mismatch"),
     ),
     responses(
         (status = 204, description = "Document deleted"),
-        (status = 404, description = "Document or domain not found"),
-        (status = 409, description = "Version conflict (If-Match mismatch)"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Document or domain not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "Version conflict (If-Match mismatch)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -318,8 +376,9 @@ pub async fn delete_document(
     ),
     responses(
         (status = 200, description = "Paginated document list", body = DocumentListResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -351,8 +410,9 @@ pub async fn list_documents(
     params(("domain" = String, Path, description = "JSON domain")),
     responses(
         (status = 200, description = "Document count", body = CountResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -375,9 +435,10 @@ pub async fn count_documents(
     request_body = CreateIndexRequest,
     responses(
         (status = 201, description = "Index definition created", body = IndexResponse),
-        (status = 400, description = "Invalid field or type"),
-        (status = 409, description = "Index already exists"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 400, description = "Invalid field or type", body = String, content_type = "text/plain"),
+        (status = 409, description = "Index already exists", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -410,8 +471,9 @@ pub async fn create_index(
     params(("domain" = String, Path, description = "JSON domain")),
     responses(
         (status = 200, description = "Index definitions of the domain", body = Vec<IndexResponse>),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -434,8 +496,9 @@ pub async fn list_indexes(
     ),
     responses(
         (status = 204, description = "Index definition removed"),
-        (status = 404, description = "Index or domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Index or domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -458,9 +521,10 @@ pub async fn delete_index(
     request_body = SearchRequest,
     responses(
         (status = 200, description = "Matching documents", body = SearchResponse),
-        (status = 400, description = "Invalid filter or unindexed field"),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 400, description = "Invalid filter or unindexed field", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -534,8 +598,9 @@ fn build_search_query(req: SearchRequest) -> Result<SearchQuery, ApiError> {
     request_body(content = String, description = "NDJSON — one document per line, optional _key field"),
     responses(
         (status = 200, description = "Import summary", body = BulkLoadResponse),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
@@ -564,12 +629,16 @@ pub async fn bulk_load(
     params(("domain" = String, Path, description = "JSON domain")),
     responses(
         (status = 200, description = "NDJSON stream of all documents", content_type = "application/x-ndjson"),
-        (status = 404, description = "Domain not found"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
-/// Streams all documents of a domain as NDJSON without full buffering.
+/// Streams all documents of a domain as NDJSON without full buffering. A
+/// document written before json/017 that still carries a top-level
+/// `_key`/`_version`/`_content` field exports lossy, same as before — no
+/// migration reshapes existing data.
 pub async fn export_documents(
     State(state): State<AppState>,
     Path(domain): Path<String>,
@@ -598,10 +667,11 @@ pub async fn export_documents(
     request_body(content = ReindexRequest, description = "Optional field restriction"),
     responses(
         (status = 202, description = "Re-index started", body = ReindexAcceptedResponse),
-        (status = 400, description = "Malformed request body"),
-        (status = 404, description = "Domain not found"),
-        (status = 409, description = "Re-index already running for this domain"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 400, description = "Malformed request body", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "Re-index already running for this domain", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -644,8 +714,8 @@ pub async fn trigger_reindex(
     ),
     responses(
         (status = 200, description = "Current re-index status"),
-        (status = 404, description = "Unknown task id for this domain"),
-        (status = 503, description = "JSON engine disabled"),
+        (status = 404, description = "Unknown task id for this domain", body = String, content_type = "text/plain"),
+        (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Indexes"
 )]
@@ -698,6 +768,7 @@ mod tests {
             .await
             .unwrap(),
         );
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let json_engine = if json_enabled {
             let config = JsonStoreConfig {
                 wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
@@ -706,12 +777,11 @@ mod tests {
                 reindex_pause_ms: 0,
                 ..JsonStoreConfig::default()
             };
-            Some(JsonEngine::bootstrap(&config).await.unwrap())
+            Some(JsonEngine::bootstrap(&config, Arc::clone(&metrics)).await.unwrap())
         } else {
             None
         };
         let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
-        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             DomainRegistry::recover(engine, DomainConfig::default(), Arc::clone(&metrics))
                 .await
@@ -727,6 +797,10 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
+            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(crate::config::LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
         };
         (state, dir)
     }
@@ -1126,6 +1200,120 @@ mod tests {
         assert!(body.contains(r#""n":2"#), "lost update must not happen: {body}");
     }
 
+    // ── Create-only precondition (spec json/014) ─────────────────────────────
+
+    // 18. If-None-Match: * on a free key succeeds (201, fresh document).
+    #[tokio::test]
+    async fn test_create_only_put_free_key_returns_201() {
+        let (app, _dir) = make_app(true).await;
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store-api/json/default/documents/fresh")
+            .header("content-type", "application/json")
+            .header("if-none-match", "*")
+            .body(Body::from(r#"{"n": 1}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
+        assert_eq!(body["_version"], json!(1));
+    }
+
+    // 19. If-None-Match: * on an occupied key → 412, document unchanged.
+    #[tokio::test]
+    async fn test_create_only_put_occupied_key_returns_412() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/taken";
+        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("if-none-match", "*")
+            .body(Body::from(r#"{"n": 2}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+
+        let (status, body) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""n":1"#), "document must stay unchanged: {body}");
+    }
+
+    // 20. If-None-Match values other than the literal '*' are rejected — no
+    //     ETag-list support (§1), including the weak-validator form.
+    #[tokio::test]
+    async fn test_if_none_match_non_wildcard_rejected() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/x";
+        for value in ["\"abc-1\"", "W/\"*\""] {
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-none-match", value)
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "value: {value}");
+        }
+        let (status, _) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a rejected precondition must not write");
+    }
+
+    // 21. If-Match and If-None-Match together are mutually exclusive (§1).
+    #[tokio::test]
+    async fn test_if_match_and_if_none_match_together_rejected() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/both";
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("if-match", "\"0-1\"")
+            .header("if-none-match", "*")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let (status, _) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "conflicting preconditions must not write");
+    }
+
+    // 22. Recreate after delete is a legitimate create-only write (§5): the
+    //     new ETag carries a different generation than before the delete.
+    #[tokio::test]
+    async fn test_create_only_put_after_delete_recreate() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/reborn";
+        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+        let old_etag = fetch_etag(&app, uri).await;
+        let old_generation = old_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
+
+        let (status, _) = request(&app, Method::DELETE, uri, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("if-none-match", "*")
+            .body(Body::from(r#"{"n": 2}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
+        assert_eq!(body["_version"], json!(1));
+
+        let new_etag = fetch_etag(&app, uri).await;
+        let new_generation = new_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
+        assert_ne!(new_generation, old_generation, "recreate must roll a fresh generation");
+    }
+
     // 13. Auth scoping: KV permissions do not grant JSON access (spec json/012).
     #[tokio::test]
     async fn test_auth_scoping_kv_vs_json() {
@@ -1401,5 +1589,118 @@ mod tests {
         assert_eq!(status, StatusCode::GONE, "{body}");
         let (status, _) = request(&app, Method::PUT, "/store-api/json/api-dom/documents/x", Some("{}")).await;
         assert_eq!(status, StatusCode::GONE);
+    }
+
+    // 23. DocumentResponse schema sample (spec json/015): a written document's
+    //     _key/_version/user-field shape matches what the contract now declares.
+    #[tokio::test]
+    async fn test_document_response_matches_schema_shape() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/shape";
+        let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"city": "Lyon", "pop": 42}"#)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert!(doc["_key"].is_string(), "{body}");
+        assert!(doc["_version"].is_u64(), "{body}");
+        assert_eq!(doc["city"], json!("Lyon"), "{body}");
+        assert_eq!(doc["pop"], json!(42), "{body}");
+    }
+
+    // 24. _content regression (spec json/015 §2): a non-object document still
+    //     wraps under `_content`, unchanged by the new DocumentResponse schema.
+    #[tokio::test]
+    async fn test_non_object_document_wraps_in_content_field() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/scalar";
+        let (status, body) = request(&app, Method::PUT, uri, Some("42")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["_content"], json!(42), "{body}");
+        assert!(doc["_key"].is_string(), "{body}");
+        assert!(doc["_version"].is_u64(), "{body}");
+    }
+
+    // 25. Error-body reality check (spec json/016 §D2 test 5): the contract's
+    //     text/plain schema on 404 matches what the server actually sends — a
+    //     real GET on a missing document returns a non-empty plaintext body
+    //     with a text/plain content type, not JSON.
+    #[tokio::test]
+    async fn test_missing_document_404_has_nonempty_plaintext_body() {
+        let (app, _dir) = make_app(true).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/store-api/json/default/documents/does-not-exist")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let content_type = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.is_empty(), "404 body must not be empty");
+        assert!(serde_json::from_str::<Value>(&body).is_err(), "body must be plain text, not JSON: {body}");
+    }
+
+    // 26. Reserved top-level fields (_key/_version/_content) are rejected
+    //     with 400 naming the field, for both POST and PUT; nothing ends up
+    //     stored (spec json/017 test 1).
+    #[tokio::test]
+    async fn test_reserved_top_level_field_rejected_on_write() {
+        let (app, _dir) = make_app(true).await;
+        for field in ["_key", "_version", "_content"] {
+            let body = format!(r#"{{"{field}": 1, "x": 2}}"#);
+
+            let (status, resp) =
+                request(&app, Method::POST, "/store-api/json/default/documents", Some(&body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
+            assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
+
+            let uri = format!("/store-api/json/default/documents/reserved{field}");
+            let (status, resp) = request(&app, Method::PUT, &uri, Some(&body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
+            assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
+            let (status, _) = request(&app, Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{field}: rejected PUT must not store anything");
+        }
+
+        let (status, body) = request(&app, Method::GET, "/store-api/json/default/documents/count", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["count"],
+            json!(0),
+            "no rejected POST must have stored anything either"
+        );
+    }
+
+    // 27. A reserved name nested under a user field collides with nothing
+    //     and stays allowed (spec json/017 §Entscheid: top-level only).
+    #[tokio::test]
+    async fn test_nested_reserved_field_name_allowed() {
+        let (app, _dir) = make_app(true).await;
+        let uri = "/store-api/json/default/documents/nested";
+        let (status, body) = request(&app, Method::PUT, uri, Some(r#"{"a": {"_key": 1}}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = request(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["a"], json!({"_key": 1}), "{body}");
+    }
+
+    // 28. Non-object documents stay accepted unchanged -- the new
+    //     reserved-field check only looks at top-level object keys (spec
+    //     json/017 test 3; the `42` case is already covered by test 24's
+    //     json/015 _content-wrap regression).
+    #[tokio::test]
+    async fn test_non_object_documents_still_accepted() {
+        let (app, _dir) = make_app(true).await;
+        for (i, body) in [r#""text""#, "[1,2]"].into_iter().enumerate() {
+            let uri = format!("/store-api/json/default/documents/scalar{i}");
+            let (status, resp) = request(&app, Method::PUT, &uri, Some(body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}: {resp}");
+        }
     }
 }

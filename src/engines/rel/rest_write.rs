@@ -5,6 +5,7 @@
 //! exact same write path, constraints, and error codes as `/sql`.
 
 use super::ast::{Assignment, ColumnRef, CompareOp, Delete, Expr, Insert, Operand, Statement, Update};
+use super::cross_engine::LinkAuth;
 use super::dml::{coerce_json, DmlResult};
 use super::error::RelStoreError;
 use super::rest_browse::parse_raw_value;
@@ -23,11 +24,12 @@ impl RelEngine {
         domain: &str,
         table: &str,
         body: &serde_json::Map<String, Value>,
+        auth: LinkAuth,
     ) -> Result<DmlResult, RelStoreError> {
         let (columns, params): (Vec<String>, Vec<Value>) = normalize_body_keys(body)?.into_iter().unzip();
         let row: Vec<Operand> = (0..params.len()).map(Operand::Param).collect();
         let stmt = Statement::Insert(Insert { table: table.to_string(), columns: Some(columns), rows: vec![row] });
-        match self.execute_dml(domain, stmt, &params).await? {
+        match self.execute_dml(domain, stmt, &params, auth).await? {
             ExecOutcome::Dml(r) => Ok(r),
             _ => unreachable!("Insert always yields ExecOutcome::Dml"),
         }
@@ -46,6 +48,7 @@ impl RelEngine {
         table: &str,
         pk_raw: &str,
         body: &serde_json::Map<String, Value>,
+        auth: LinkAuth,
     ) -> Result<DmlResult, RelStoreError> {
         let (_, schema) = self.require_table(domain, table)?;
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
@@ -79,7 +82,7 @@ impl RelEngine {
                 rhs: Operand::Param(pk_param),
             }),
         });
-        match self.execute_dml(domain, stmt, &params).await? {
+        match self.execute_dml(domain, stmt, &params, auth).await? {
             ExecOutcome::Dml(r) => Ok(r),
             _ => unreachable!("Update always yields ExecOutcome::Dml"),
         }
@@ -105,7 +108,9 @@ impl RelEngine {
                 rhs: Operand::Param(0),
             }),
         });
-        match self.execute_dml(domain, stmt, &[pk_value]).await? {
+        // DELETE never validates cross-engine links (rel/005 §11) — no
+        // caller-supplied `LinkAuth` to thread through (spec rel/016).
+        match self.execute_dml(domain, stmt, &[pk_value], LinkAuth::full()).await? {
             ExecOutcome::Dml(r) => Ok(r),
             _ => unreachable!("Delete always yields ExecOutcome::Dml"),
         }
@@ -176,12 +181,12 @@ mod tests {
         make_orders_table(&rel).await;
 
         let result = rel
-            .insert_row("default", "orders", &mk_body(json!({"id": 1, "Amount": 42})))
+            .insert_row("default", "orders", &mk_body(json!({"id": 1, "Amount": 42})), LinkAuth::full())
             .await
             .unwrap();
         assert_eq!(result.affected, 1);
 
-        let (row, _) = rel.get_row("default", "orders", "1", &[]).await.unwrap().unwrap();
+        let (row, _) = rel.get_row("default", "orders", "1", &[], LinkAuth::full()).await.unwrap().unwrap();
         let idx = row.columns.iter().position(|(n, _)| n.as_str() == "amount").unwrap();
         assert_eq!(row.rows[0][idx], ScalarValue::Integer(42));
     }
@@ -194,7 +199,7 @@ mod tests {
         make_orders_table(&rel).await;
 
         let body = mk_body(json!({"id": 1, "Amount": 1, "amount": 2}));
-        let err = rel.insert_row("default", "orders", &body).await.unwrap_err();
+        let err = rel.insert_row("default", "orders", &body, LinkAuth::full()).await.unwrap_err();
         assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
     }
 
@@ -205,15 +210,15 @@ mod tests {
     async fn test_update_row_recognizes_mixed_case_body_pk_match() {
         let (rel, _dir) = make_engine().await;
         make_orders_table(&rel).await;
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5}))).await.unwrap();
+        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
 
         let result = rel
-            .update_row("default", "orders", "1", &mk_body(json!({"Id": 1, "amount": 9})))
+            .update_row("default", "orders", "1", &mk_body(json!({"Id": 1, "amount": 9})), LinkAuth::full())
             .await
             .unwrap();
         assert_eq!(result.affected, 1);
 
-        let (row, _) = rel.get_row("default", "orders", "1", &[]).await.unwrap().unwrap();
+        let (row, _) = rel.get_row("default", "orders", "1", &[], LinkAuth::full()).await.unwrap().unwrap();
         let idx = row.columns.iter().position(|(n, _)| n.as_str() == "amount").unwrap();
         assert_eq!(row.rows[0][idx], ScalarValue::Integer(9));
     }
@@ -224,10 +229,10 @@ mod tests {
     async fn test_update_row_rejects_mismatched_mixed_case_body_pk() {
         let (rel, _dir) = make_engine().await;
         make_orders_table(&rel).await;
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5}))).await.unwrap();
+        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
 
         let err = rel
-            .update_row("default", "orders", "1", &mk_body(json!({"Id": 2})))
+            .update_row("default", "orders", "1", &mk_body(json!({"Id": 2})), LinkAuth::full())
             .await
             .unwrap_err();
         match err {
@@ -246,10 +251,10 @@ mod tests {
     async fn test_update_row_rejects_colliding_keys() {
         let (rel, _dir) = make_engine().await;
         make_orders_table(&rel).await;
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5}))).await.unwrap();
+        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
 
         let body = mk_body(json!({"Amount": 1, "amount": 2}));
-        let err = rel.update_row("default", "orders", "1", &body).await.unwrap_err();
+        let err = rel.update_row("default", "orders", "1", &body, LinkAuth::full()).await.unwrap_err();
         assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
     }
 }

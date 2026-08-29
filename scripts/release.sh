@@ -9,6 +9,7 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 CHANGELOG="$REPO_ROOT/CHANGELOG.md"
 CARGO_TOML="$REPO_ROOT/Cargo.toml"
 EXTRACT="$SCRIPT_DIR/changelog-extract.sh"
+CHANGELOG_JSON="$SCRIPT_DIR/changelog-json.sh"
 
 DRY_RUN=0
 MODE="final"
@@ -135,6 +136,12 @@ check_tests() {
 
 check_unreleased_nonempty() {
     "$EXTRACT" unreleased >/dev/null || die "[Unreleased] is missing or empty"
+}
+
+# Runs unconditionally, even under --dry-run: changelog-json.sh only reads
+# CHANGELOG.md, it mutates nothing (spec dist/010 §Umsetzung).
+check_changelog_json() {
+    "$CHANGELOG_JSON" unreleased | jq empty || die "changelog-json.sh unreleased did not produce valid JSON"
 }
 
 check_tag_free() {
@@ -365,6 +372,7 @@ run_final() {
     check_clean_and_synced
     check_tests
     check_unreleased_nonempty
+    check_changelog_json
 
     local last proposed version tag next_dev
     last=$("$EXTRACT" --latest-version 2>/dev/null || true)
@@ -429,6 +437,7 @@ run_rc() {
     check_clean_and_synced
     check_tests
     check_unreleased_nonempty
+    check_changelog_json
 
     local last proposed version n tag
     last=$("$EXTRACT" --latest-version 2>/dev/null || true)
@@ -487,6 +496,7 @@ run_hotfix() {
     check_clean_and_synced
     check_tests
     check_unreleased_nonempty
+    check_changelog_json
 
     tag="v$version"
     check_tag_free "$tag"

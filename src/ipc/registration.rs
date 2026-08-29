@@ -22,6 +22,7 @@
 //! open, matching REST without auth.
 
 use super::dispatcher::{ClientConnection, ClientEvent};
+use super::readers::ReaderRegistry;
 use crate::uds;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -45,6 +46,9 @@ pub struct RegistrationConfig {
     pub auth_enabled: bool,
     /// UIDs allowed to register while `auth_enabled` (from `auth.trusted_uids`).
     pub trusted_uids: Arc<Vec<u32>>,
+    /// Reader slots the snapshot publisher scans; one lease per live client
+    /// (spec perf/012 §7).
+    pub readers: Arc<ReaderRegistry>,
 }
 
 /// Creates the socket's parent directory if missing, then binds it (reusing the
@@ -134,7 +138,7 @@ async fn handle_connection(
     }
 
     // 3. Mint the segment quartet + the server ring ends.
-    let (conn, names) =
+    let (conn, names, slot_handle) =
         match ClientConnection::create(&config.instance_id, client_id, config.ring_size, config.segment_mode) {
             Ok(v) => v,
             Err(e) => {
@@ -149,15 +153,23 @@ async fn handle_connection(
         return; // dispatcher gone (shutdown); the channel dropped `conn`, unlinking
     }
 
-    // 5. Reply with the segment names.
+    // 5. Register the reader slot — strictly before the reply (spec perf/012
+    // §7): the client may pin as soon as it has read the `OK`, and a pin the
+    // publisher cannot see would let it flip a buffer that is being read. The
+    // event channel above is asynchronous and therefore no substitute. `lease`
+    // frees the slot on every exit below, cancellation at an `.await` included.
+    let lease = config.readers.register(slot_handle);
+
+    // 6. Reply with the segment names.
     let reply = format!("OK {} {} {} {} {}\n", client_id, names[0], names[1], names[2], names[3]);
     if let Err(e) = write_half.write_all(reply.as_bytes()).await {
         tracing::warn!("[shm-reg] reply to client {client_id} failed: {e}");
+        drop(lease);
         let _ = events.send(ClientEvent::Disconnect(client_id));
         return;
     }
 
-    // 6. Keep the socket open; EOF/error = disconnect. Also stop on shutdown.
+    // 7. Keep the socket open; EOF/error = disconnect. Also stop on shutdown.
     let mut buf = [0u8; 32];
     loop {
         tokio::select! {
@@ -168,6 +180,9 @@ async fn handle_connection(
             }
         }
     }
+    // Slot first, then the segments: the publisher must stop seeing this client
+    // before the dispatcher tears the connection down.
+    drop(lease);
     let _ = events.send(ClientEvent::Disconnect(client_id));
 }
 
@@ -181,6 +196,10 @@ fn peer_is_trusted(stream: &tokio::net::UnixStream, trusted_uids: &[u32]) -> boo
 #[cfg(test)]
 mod tests {
     use super::super::dispatcher::ShmDispatcher;
+    use super::super::protocol::{
+        PublishOutcome, ReaderSlot, SnapshotWriter, StateHeader, PUBLISH_WAIT_TIMEOUT_US,
+        READER_SLOT_OFFSET,
+    };
     use super::super::ringbuffer::{DoubleMmapRegion, RingConsumer, RingProducer, RingbufferHeader};
     use super::super::shm::ShmSegment;
     use super::*;
@@ -236,6 +255,7 @@ mod tests {
     struct Server {
         sock: std::path::PathBuf,
         instance_id: String,
+        readers: Arc<ReaderRegistry>,
         shutdown: watch::Sender<bool>,
         reg: tokio::task::JoinHandle<()>,
         disp: tokio::task::JoinHandle<()>,
@@ -258,6 +278,7 @@ mod tests {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (sd_tx, sd_rx) = watch::channel(false);
         let instance_id = unique_instance();
+        let readers = Arc::new(ReaderRegistry::new());
         let disp = tokio::spawn(ShmDispatcher::new(registry).run(events_rx, sd_rx.clone()));
         let reg = tokio::spawn(serve_registration(
             listener,
@@ -267,11 +288,12 @@ mod tests {
                 segment_mode: 0o600,
                 auth_enabled,
                 trusted_uids: Arc::new(trusted_uids),
+                readers: Arc::clone(&readers),
             },
             events_tx,
             sd_rx,
         ));
-        Server { sock, instance_id, shutdown: sd_tx, reg, disp, _sockdir: sockdir }
+        Server { sock, instance_id, readers, shutdown: sd_tx, reg, disp, _sockdir: sockdir }
     }
 
     impl Server {
@@ -302,6 +324,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         false
+    }
+
+    /// Bounded wait for the registry to shrink to `n` entries: a lease is
+    /// released inside the listener task, i.e. asynchronously to this test.
+    async fn poll_registry_len(readers: &ReaderRegistry, n: usize) -> bool {
+        for _ in 0..2000 {
+            if readers.snapshot().len() == n {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// The client's view of its reader slot, mapped read/write from `cmd_hdr`.
+    ///
+    /// # Safety
+    /// `cmd_hdr` must stay mapped for as long as the returned reference is used.
+    unsafe fn client_slot(cmd_hdr: &ShmSegment) -> &ReaderSlot {
+        ReaderSlot::from_ptr(cmd_hdr.as_ptr().add(READER_SLOT_OFFSET), cmd_hdr.len() - READER_SLOT_OFFSET)
+    }
+
+    /// Stand-in for the snapshot publisher: an in-process header plus two
+    /// buffers, wired to the listener's reader registry.
+    struct WriterArena {
+        header: Box<StateHeader>,
+        a: Vec<u8>,
+        b: Vec<u8>,
+        readers: Arc<ReaderRegistry>,
+    }
+
+    impl WriterArena {
+        fn new(readers: Arc<ReaderRegistry>) -> Self {
+            let header = Box::new(StateHeader::zeroed());
+            header.init();
+            Self { header, a: vec![0u8; 256], b: vec![0u8; 256], readers }
+        }
+
+        fn publish(&mut self, data: &[u8]) -> PublishOutcome {
+            let len = self.a.len();
+            // Safe: single writer, two distinct buffers of `len` bytes, header valid.
+            let writer = unsafe {
+                SnapshotWriter::new(
+                    &*self.header,
+                    self.a.as_mut_ptr(),
+                    self.b.as_mut_ptr(),
+                    len,
+                    PUBLISH_WAIT_TIMEOUT_US,
+                    Arc::clone(&self.readers),
+                )
+            };
+            writer.publish(data).unwrap()
+        }
     }
 
     async fn recv_response(rx: &mut RingConsumer) -> ShmResponse {
@@ -392,6 +467,82 @@ mod tests {
 
         drop(stream);
         server.stop().await;
+    }
+
+    // Spec perf/012 §7: the slot is in the registry before the client can read
+    // the `OK` (and therefore before it can pin), and EOF on the registration
+    // socket reclaims it — the next publish onto the pinned buffer goes through
+    // without the server ever writing into the client's page.
+    #[tokio::test]
+    async fn test_reader_slot_registered_before_reply_and_freed_on_eof() {
+        let (registry, _dir) = make_registry().await;
+        let server = start_server(Arc::clone(&registry), 4096).await;
+
+        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+        let reply = register(&mut stream).await;
+        let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
+
+        let slots = server.readers.snapshot();
+        assert_eq!(slots.len(), 1, "slot registered before the OK reply");
+        assert_eq!(slots[0].client_id, 1);
+
+        // The client pins buffer B through its own cmd_hdr mapping and dies
+        // without releasing it.
+        let cmd_hdr = ShmSegment::open(&names[1]).unwrap();
+        let slot = unsafe { client_slot(&cmd_hdr) };
+        slot.counter(1).fetch_add(1, Ordering::AcqRel);
+
+        let mut arena = WriterArena::new(Arc::clone(&server.readers));
+        assert_eq!(arena.publish(b"blocked"), PublishOutcome::SkippedBusy { buffer: 1 });
+        assert_eq!(server.readers.blockers(1), vec![(1, 1)]);
+
+        drop(stream);
+        assert!(poll_registry_len(&server.readers, 0).await, "EOF must release the lease");
+        assert_eq!(arena.publish(b"reclaimed"), PublishOutcome::Published);
+        assert_eq!(slot.counter(1).load(Ordering::SeqCst), 1, "the server never clears the slot");
+
+        server.stop().await;
+    }
+
+    // Spec perf/012 test 7: a connection task cancelled at an `.await` (what the
+    // shutdown path does when it drops the listener's JoinSet) never reaches the
+    // code behind its EOF loop — only the lease's Drop frees the slot.
+    #[tokio::test]
+    async fn test_aborted_connection_task_releases_reader_slot() {
+        let (client, server_side) = UnixStream::pair().unwrap();
+        let readers = Arc::new(ReaderRegistry::new());
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let config = Arc::new(RegistrationConfig {
+            instance_id: unique_instance(),
+            ring_size: 4096,
+            segment_mode: 0o600,
+            auth_enabled: false,
+            trusted_uids: Arc::new(Vec::new()),
+            readers: Arc::clone(&readers),
+        });
+        let task = tokio::spawn(handle_connection(server_side, 5, config, events_tx, sd_rx));
+
+        let mut client = client;
+        let reply = register(&mut client).await;
+        let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
+        // Hold the connection: dropping it would unlink the segments early.
+        let _conn = events_rx.recv().await.expect("connect event");
+
+        let cmd_hdr = ShmSegment::open(&names[1]).unwrap();
+        let slot = unsafe { client_slot(&cmd_hdr) };
+        slot.counter(1).fetch_add(1, Ordering::AcqRel);
+
+        let mut arena = WriterArena::new(Arc::clone(&readers));
+        assert_eq!(arena.publish(b"blocked"), PublishOutcome::SkippedBusy { buffer: 1 });
+
+        // The client socket stays open, so nothing but the cancellation can free
+        // the slot. Awaiting the aborted handle resolves once the task's future
+        // — and with it the lease — has been dropped.
+        task.abort();
+        let _ = task.await;
+        assert!(readers.snapshot().is_empty(), "cancelled task must release its lease");
+        assert_eq!(arena.publish(b"reclaimed"), PublishOutcome::Published);
     }
 
     // Full loop: register, open the segments, drive Put+Get over the rings, then

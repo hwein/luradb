@@ -52,6 +52,8 @@ sudo systemctl restart luradb
 
 `luradb.toml` is a dpkg conffile: local changes survive updates (dpkg prompts on conflicts between a local change and the new package version).
 
+Disabling authentication (`auth.enabled = false`) only starts if `server.bind_address` is loopback (`127.0.0.1` / `::1`) — binding wider than loopback with auth off is refused at startup, so an unauthenticated listener can never end up reachable from the network. Enable auth, or keep the bind on loopback.
+
 ## Enabling HTTPS (quickstart)
 
 LuraDB can terminate TLS itself, on its own port (`tls_port`, default `3443`), in parallel to the plain HTTP listener. This is a quick start with a self-signed certificate; for a certificate from a public or internal CA (e.g. via `certbot`), just point `tls_cert_path`/`tls_key_path` at those files instead — or keep operating behind a reverse proxy.
@@ -88,6 +90,23 @@ LuraDB can terminate TLS itself, on its own port (`tls_port`, default `3443`), i
    ```
 
 5. Certificate rotation has no hot-reload — replace the files under `/etc/luradb/tls/` and run `sudo systemctl restart luradb`. For a CA-issued certificate, keep it renewed there (e.g. via `certbot`), or continue terminating TLS at a reverse proxy instead.
+
+## Enabling CORS for browser clients
+
+Off by default — a plain config change, no restart quirks. A browser-based client running on a different origin (e.g. a web console) needs `Access-Control-*` response headers, or the browser blocks every response regardless of whether the request succeeded server-side.
+
+```toml
+[cors]
+enabled = true
+allowed_origins = ["https://console.example.com", "http://localhost:5173"]
+```
+
+`allowed_origins` takes exact origins (`scheme://host[:port]`, lowercase, no path/query) — or the single entry `"*"` to allow any origin. `"*"` does not weaken authentication: `Authorization: Bearer` is still required as usual, it only means the origin allow-list stops being an extra line of defense. Methods, headers and cache lifetime are fixed by the server, not configurable. Apply with:
+
+```sh
+sudoedit /etc/luradb/luradb.toml   # [cors] enabled = true
+sudo systemctl restart luradb
+```
 
 ## UDS access
 

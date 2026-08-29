@@ -5,11 +5,15 @@
 
 use super::ast::{ColumnRef, CompareOp, Expr, Limit, Operand, Select, SelectItem, TableRef};
 use super::catalog::{CatalogEntry, TableSchema};
+use super::cross_engine::LinkAuth;
 use super::dml::SelectResult;
 use super::error::RelStoreError;
+use super::plan;
 use super::rest_exec::ExpandedBlock;
+use super::select::resolve_candidate_keys;
 use super::types::ColumnType;
 use super::{ExecOutcome, RelEngine};
+use crate::metrics::EngineKind;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -45,7 +49,9 @@ impl RelEngine {
         expand: &[String],
         limit: Option<i64>,
         offset: Option<i64>,
+        auth: LinkAuth,
     ) -> Result<(SelectResult, Option<ExpandedBlock>, u64, u64), RelStoreError> {
+        let start = std::time::Instant::now();
         let schema = self.browse_table(domain, table)?;
 
         let mut params: Vec<Value> = Vec::with_capacity(filters.len());
@@ -94,9 +100,10 @@ impl RelEngine {
             limit: limit_clause,
         };
 
-        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &params).await? else {
+        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &params, auth).await? else {
             unreachable!("a Select statement always yields ExecOutcome::Select")
         };
+        self.metrics.record_engine_read(EngineKind::Rel, start.elapsed().as_micros() as u64);
 
         let expanded = if expand.is_empty() {
             None
@@ -122,7 +129,9 @@ impl RelEngine {
         table: &str,
         pk_raw: &str,
         expand: &[String],
+        auth: LinkAuth,
     ) -> Result<Option<(SelectResult, Option<ExpandedBlock>)>, RelStoreError> {
+        let start = std::time::Instant::now();
         let schema = self.browse_table(domain, table)?;
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
         let pk_value = parse_raw_value(pk_col.col_type, pk_raw)?;
@@ -140,9 +149,10 @@ impl RelEngine {
             limit: None,
         };
 
-        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &[pk_value]).await? else {
+        let ExecOutcome::Select(result) = self.exec_select(domain, sel, &[pk_value], auth).await? else {
             unreachable!("a Select statement always yields ExecOutcome::Select")
         };
+        self.metrics.record_engine_read(EngineKind::Rel, start.elapsed().as_micros() as u64);
         if result.rows.is_empty() {
             return Ok(None);
         }
@@ -154,6 +164,37 @@ impl RelEngine {
             (!resolved.is_empty()).then_some(resolved)
         };
         Ok(Some((result, expanded)))
+    }
+
+    /// Row count for `table` (spec general/017 §3): the residual-free branch
+    /// of `exec_count` (`select.rs`) — no WHERE clause, so the planner always
+    /// picks `AccessPath::FullScan` with no residual, making this a pure key
+    /// count with no row decode. A view resolves via `browse_table` like the
+    /// other Browse reads, so it 404s here instead of the write path's 400.
+    pub(crate) async fn count_rows(
+        &self,
+        domain: &str,
+        table: &str,
+        auth: LinkAuth,
+    ) -> Result<u64, RelStoreError> {
+        let schema = self.browse_table(domain, table)?;
+        let dom = self.domains.require_active(domain)?;
+        let mask = self.compute_link_mask(domain, &[&schema], auth).await?;
+        let plan = plan::plan_access(&schema, &None, &[], &[], &[], mask)?;
+        // Registered before the key scan (spec rel/018 §2, `exec_count`
+        // pattern): a point-in-time count, not a live key count.
+        let snapshot_guard = self.engine.snapshot();
+        let snap = snapshot_guard.snapshot().clone();
+        let (row_keys, _scanned) = resolve_candidate_keys(
+            &self.engine,
+            &schema,
+            &dom.system_prefix,
+            &plan.access,
+            &snap,
+            None,
+        )
+        .await?;
+        Ok(row_keys.len() as u64)
     }
 }
 
@@ -222,8 +263,8 @@ mod tests {
         rel.create_table("default", TableInput { name: "orders".to_string(), columns: vec![id_col, amount_col] })
             .await
             .unwrap();
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 50}))).await.unwrap();
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 2, "amount": 99}))).await.unwrap();
+        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 50})), LinkAuth::full()).await.unwrap();
+        rel.insert_row("default", "orders", &mk_body(json!({"id": 2, "amount": 99})), LinkAuth::full()).await.unwrap();
     }
 
     // 010-F1(c): a mixed-case `?col=` filter name must resolve against the
@@ -236,7 +277,8 @@ mod tests {
 
         let mut filters = HashMap::new();
         filters.insert("Amount".to_string(), "50".to_string());
-        let (result, _, _, _) = rel.browse_rows("default", "orders", &filters, &[], None, None).await.unwrap();
+        let (result, _, _, _) =
+            rel.browse_rows("default", "orders", &filters, &[], None, None, LinkAuth::full()).await.unwrap();
 
         assert_eq!(result.rows.len(), 1, "exactly the row with amount=50 must match");
         let idx = result.columns.iter().position(|(n, _)| n.as_str() == "id").unwrap();

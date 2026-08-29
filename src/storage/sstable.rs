@@ -1,7 +1,8 @@
 use crate::engines::lsm::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
+use crate::engines::lsm::key::Timestamp;
 use crate::storage::format::{
     ArchivedDataBlockValue, BlockHandle, BloomFilter, CachedValue, DataBlock, DataBlockValue,
-    IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer,
+    IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer, VersionState,
 };
 use crate::storage::bloom::BloomFilter as BloomFilterImpl;
 use rkyv::util::AlignedVec;
@@ -27,19 +28,6 @@ fn mvcc_inv_ts(key: &[u8]) -> u64 {
         u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap_or([0u8; 8]))
     } else {
         0
-    }
-}
-
-/// Liveness for [`SSTableReader::prefix_entries`]: not a tombstone, not
-/// TTL-expired at `now`. NULL entries count as live (kv/018).
-#[inline]
-fn is_entry_live(dbv: &DataBlockValue, now: u64) -> bool {
-    match dbv {
-        DataBlockValue::Pointer(vp) => {
-            !(vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET)
-                && !(vp.expire_at != 0 && vp.expire_at <= now)
-        }
-        DataBlockValue::Inline { expire_at, .. } => !(*expire_at != 0 && *expire_at <= now),
     }
 }
 
@@ -282,6 +270,14 @@ impl SSTableReader {
         let bloom_archived = rkyv::access::<Archived<BloomFilter>, rancor::Error>(bloom_slice)
             .map_err(|e| anyhow::anyhow!("Bloom filter validation failed: {}", e))?;
 
+        // kv/021: an empty bit array paired with num_hashes >= 1 would divide
+        // by zero on every lookup (BloomFilter::hash). A legitimate writer
+        // never produces this combination (see SSTableBuilder::new), so it
+        // only occurs on corrupted/torn/crafted bytes -- reject it here.
+        if bloom_archived.data.is_empty() && u32::from(bloom_archived.num_hashes) >= 1 {
+            bail!("Invalid bloom filter: empty bit array with non-zero hash count");
+        }
+
         let bloom_filter = BloomFilterImpl::from_bytes(
             bloom_archived.data.to_vec(),
             u32::from(bloom_archived.num_hashes),
@@ -311,6 +307,18 @@ impl SSTableReader {
         key: &[u8],
         cache: &mut BlockCache,
     ) -> Result<Option<CachedValue>> {
+        Ok(self.get_with_cache_and_ts(key, cache)?.map(|(v, _)| v))
+    }
+
+    /// Like [`Self::get_with_cache`], but also returns the matched entry's
+    /// write timestamp, un-inverted back to HLC form (spec kv/022
+    /// `last_modified_at`) — the encoded key stores it inverted
+    /// (`Timestamp::inverted`) for newest-first sort order.
+    pub fn get_with_cache_and_ts(
+        &self,
+        key: &[u8],
+        cache: &mut BlockCache,
+    ) -> Result<Option<(CachedValue, Timestamp)>> {
         let bloom_key = mvcc_user_key(key);
         if !self.bloom_filter.contains(bloom_key) {
             return Ok(None);
@@ -329,7 +337,8 @@ impl SSTableReader {
 
             for entry in data_block.entries.iter() {
                 if entry.0.as_slice() == key {
-                    return Ok(Some(cached_value_from_archived(&raw, &entry.1)));
+                    let ts = Timestamp::from_inverted(mvcc_inv_ts(entry.0.as_slice()));
+                    return Ok(Some((cached_value_from_archived(&raw, &entry.1), ts)));
                 }
             }
         }
@@ -342,12 +351,14 @@ impl SSTableReader {
         Ok(None)
     }
 
-    /// MVCC prefix scan with block cache integration.
+    /// MVCC prefix scan with block cache integration; also returns the
+    /// matched entry's un-inverted write timestamp (see
+    /// [`Self::get_with_cache_and_ts`]).
     fn get_mvcc_prefix_cached(
         &self,
         key: &[u8],
         cache: &mut BlockCache,
-    ) -> Result<Option<CachedValue>> {
+    ) -> Result<Option<(CachedValue, Timestamp)>> {
         let search_user_key = mvcc_user_key(key);
         let search_inv_ts = mvcc_inv_ts(key);
 
@@ -379,7 +390,8 @@ impl SSTableReader {
                 let stored_inv_ts = mvcc_inv_ts(bk);
 
                 if stored_inv_ts >= search_inv_ts {
-                    return Ok(Some(cached_value_from_archived(&raw, &entry.1)));
+                    let ts = Timestamp::from_inverted(stored_inv_ts);
+                    return Ok(Some((cached_value_from_archived(&raw, &entry.1), ts)));
                 }
             }
 
@@ -592,6 +604,7 @@ impl SSTableReader {
         prefix: &'a [u8],
     ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
         self.prefix_entries(prefix, None)
+            .map(|entry| entry.map(|(user_key, _ts, state)| (user_key, state == VersionState::Live)))
     }
 
     /// Like [`Self::keys_with_prefix`], but only considers versions visible
@@ -606,16 +619,20 @@ impl SSTableReader {
         max_inv_ts: u64,
     ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
         self.prefix_entries(prefix, Some(max_inv_ts))
+            .map(|entry| entry.map(|(user_key, _ts, state)| (user_key, state == VersionState::Live)))
     }
 
     /// Shared implementation for [`Self::keys_with_prefix`]/
     /// [`Self::keys_with_prefix_at`]: `max_inv_ts` of `None` matches every
-    /// version (today's `keys_with_prefix` behavior).
-    fn prefix_entries<'a>(
+    /// version (today's `keys_with_prefix` behavior). Returns each version's
+    /// write timestamp and liveness classification (spec kv/025 §2) — the
+    /// callers above collapse it to today's `(user_key, bool)`, the TTL
+    /// sweeper's expiry scan uses it directly.
+    pub(crate) fn prefix_entries<'a>(
         &'a self,
         prefix: &'a [u8],
         max_inv_ts: Option<u64>,
-    ) -> impl Iterator<Item = Result<(Vec<u8>, bool)>> + 'a {
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Timestamp, VersionState)>> + 'a {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -633,12 +650,14 @@ impl SSTableReader {
             if !user_key.starts_with(prefix) {
                 return None;
             }
+            let inv_ts = mvcc_inv_ts(encoded_key);
             if let Some(ceiling) = max_inv_ts {
-                if mvcc_inv_ts(encoded_key) < ceiling {
+                if inv_ts < ceiling {
                     return None; // newer than the snapshot -- not decisive
                 }
             }
-            Some(Ok((user_key.to_vec(), is_entry_live(&dbv, now))))
+            let state = dbv.version_state(now);
+            Some(Ok((user_key.to_vec(), Timestamp::from_inverted(inv_ts), state)))
         })
     }
 
@@ -807,6 +826,40 @@ mod tests {
         }
 
         assert!(reader.get_with_cache(b"missing-key", &mut cache)?.is_none());
+        Ok(())
+    }
+
+    // kv/022 regression: get_with_cache_and_ts must return the un-inverted
+    // write timestamp. The encoded key stores it inverted (newest-first sort
+    // order); a naive read of the raw bytes would report a NEWER write as a
+    // SMALLER timestamp, decreasing `last_modified_at` on every overwrite.
+    #[test]
+    fn test_get_with_cache_and_ts_uninverts_timestamp() -> anyhow::Result<()> {
+        use crate::engines::lsm::key::InternalKey;
+
+        let mut builder = SSTableBuilder::new();
+        // Same user key, two versions. Encoded order is newest-first (the
+        // inverted timestamp of the larger raw value sorts smaller), so the
+        // ts=2000 entry must be added before the ts=1000 one.
+        let newer = InternalKey::new(b"k".to_vec(), Timestamp::new(2000)).encode();
+        let older = InternalKey::new(b"k".to_vec(), Timestamp::new(1000)).encode();
+        builder.add_inline(newer, b"v2".to_vec(), 0);
+        builder.add_inline(older, b"v1".to_vec(), 0);
+        let bytes = builder.finish()?;
+        let reader = SSTableReader::open(bytes)?;
+        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
+
+        // Exact-match path: the search key equals the stored newer key.
+        let search_key = InternalKey::new(b"k".to_vec(), Timestamp::new(2000)).encode();
+        let (_, ts) = reader.get_with_cache_and_ts(&search_key, &mut cache)?.expect("must find entry");
+        assert_eq!(ts, Timestamp::new(2000), "must report the write timestamp, not its inverted on-disk form");
+
+        // MVCC-fallback path: a snapshot newer than both writes must resolve
+        // to the newest version (2000) and report its un-inverted timestamp.
+        let snapshot_key = InternalKey::new(b"k".to_vec(), Timestamp::new(9999)).encode();
+        let (_, ts) = reader.get_with_cache_and_ts(&snapshot_key, &mut cache)?.expect("must find entry");
+        assert_eq!(ts, Timestamp::new(2000));
+
         Ok(())
     }
 
@@ -1114,6 +1167,86 @@ mod tests {
         let reader = SSTableReader::open(buf)?;
         let result = reader.get(b"key1");
         assert!(result.is_err(), "overflowing block handle must be rejected, not panic");
+        Ok(())
+    }
+
+    // kv/021: builds a valid SSTable whose bloom filter block is structurally
+    // valid (rkyv::access succeeds) but carries an empty bit array combined
+    // with `num_hashes`, to exercise the from_data fail-fast check on a
+    // corrupted/crafted bloom block (as opposed to bloom.rs's own unit test
+    // for the from_bytes/hash defense-in-depth layer).
+    fn build_sstable_with_empty_bloom_block(num_hashes: u32) -> anyhow::Result<Vec<u8>> {
+        let mut builder = SSTableBuilder::new();
+        builder.add(
+            b"key1".to_vec(),
+            ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
+        );
+        let valid_bytes = builder.finish()?;
+
+        let footer_offset_bytes: [u8; 8] = valid_bytes[valid_bytes.len() - 8..].try_into()?;
+        let footer_offset = u64::from_le_bytes(footer_offset_bytes) as usize;
+        let footer_end = valid_bytes.len() - 8;
+        let footer = rkyv::access::<Archived<SSTableFooter>, rancor::Error>(
+            &valid_bytes[footer_offset..footer_end],
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let bloom_offset = u64::from(footer.bloom_filter_handle.offset) as usize;
+        let index_handle = BlockHandle {
+            offset: u64::from(footer.index_handle.offset),
+            size: u64::from(footer.index_handle.size),
+        };
+
+        // Keep the data-block and index-block bytes (and their alignment
+        // padding) verbatim; rebuild only the bloom block and footer.
+        let mut buf = AlignedVec::new();
+        buf.extend_from_slice(&valid_bytes[..bloom_offset]);
+
+        fn pad_to_align8(buf: &mut AlignedVec) {
+            let misalign = buf.len() % 8;
+            if misalign != 0 {
+                buf.extend_from_slice(&[0u8; 8][..8 - misalign]);
+            }
+        }
+
+        let bloom_filter_fmt = BloomFilter { data: Vec::new(), num_hashes };
+        let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter_fmt)?;
+        let bloom_filter_handle = BlockHandle { offset: buf.len() as u64, size: bloom_bytes.len() as u64 };
+        buf.extend_from_slice(&bloom_bytes);
+        pad_to_align8(&mut buf);
+
+        let footer = SSTableFooter { index_handle, bloom_filter_handle, checksum: 0 };
+        let footer_bytes = rkyv::to_bytes::<rancor::Error>(&footer)?;
+        let footer_offset = buf.len() as u64;
+        buf.extend_from_slice(&footer_bytes);
+        buf.extend_from_slice(&footer_offset.to_le_bytes());
+
+        Ok(buf.into_vec())
+    }
+
+    // kv/021: an empty bloom bit array combined with num_hashes >= 1 can only
+    // come from corrupted/torn/crafted bytes (a real writer never produces
+    // it, see SSTableBuilder::new) -- from_data must reject it, not panic.
+    #[test]
+    fn test_from_data_rejects_empty_bloom_block_with_nonzero_hashes() -> anyhow::Result<()> {
+        let buf = build_sstable_with_empty_bloom_block(3)?;
+        let result = SSTableReader::open(buf);
+        assert!(
+            result.is_err(),
+            "empty bloom bit array with num_hashes >= 1 must be rejected, not panic"
+        );
+        Ok(())
+    }
+
+    // kv/021: num_hashes == 0 is what BloomFilter::new(0, p) legitimately
+    // produces (NaN-cast); the fail-fast must not reject this combination.
+    #[test]
+    fn test_from_data_accepts_empty_bloom_block_with_zero_hashes() -> anyhow::Result<()> {
+        let buf = build_sstable_with_empty_bloom_block(0)?;
+        let result = SSTableReader::open(buf);
+        assert!(
+            result.is_ok(),
+            "empty bloom bit array with num_hashes == 0 must still be accepted"
+        );
         Ok(())
     }
 }

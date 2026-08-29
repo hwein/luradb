@@ -1,7 +1,9 @@
-use serde::Deserialize;
+use crate::core::wal::WAL_MAX_FIELD_LEN;
+use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LuraConfig {
     pub server: ServerConfig,
@@ -12,6 +14,7 @@ pub struct LuraConfig {
     pub lsm: LsmConfig,
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
+    pub ttl_sweeper: TtlSweeperCfg,
     pub domains: DomainsConfig,
     pub rate_limit: RateLimitConfig,
     pub log: LogConfig,
@@ -22,6 +25,8 @@ pub struct LuraConfig {
     pub rel: RelStoreConfig,
     pub shm: ShmConfig,
     pub backup: BackupConfig,
+    pub events: EventsConfig,
+    pub cors: CorsConfig,
 }
 
 impl Default for LuraConfig {
@@ -35,6 +40,7 @@ impl Default for LuraConfig {
             lsm: LsmConfig::default(),
             compaction: CompactionCfg::default(),
             janitor: JanitorCfg::default(),
+            ttl_sweeper: TtlSweeperCfg::default(),
             domains: DomainsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             log: LogConfig::default(),
@@ -45,6 +51,8 @@ impl Default for LuraConfig {
             rel: RelStoreConfig::default(),
             shm: ShmConfig::default(),
             backup: BackupConfig::default(),
+            events: EventsConfig::default(),
+            cors: CorsConfig::default(),
         }
     }
 }
@@ -84,16 +92,19 @@ pub fn resolve_config_path(cli_arg: Option<PathBuf>, exists: impl Fn(&Path) -> b
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// TCP bind address for the HTTP/HTTPS listeners. Defaults to loopback,
+    /// not `0.0.0.0` (spec general/013: fail-closed with auth disabled).
     pub bind_address: String,
     pub port: u16,
-    /// Set to `false` to disable the Swagger UI entirely (e.g. in production).
-    /// While `true`, `/api-docs/openapi.json` (incl. `x-luradb-server-version`)
-    /// is served without auth — exposed/production deployments should set
-    /// `false`, otherwise the `GET /version` auth hardening (spec 004 §7) is
-    /// undermined by the same version info being open via Swagger.
+    /// Set to `true` to enable the Swagger UI + `/api-docs/openapi.json`
+    /// (default: `false`, safe for production). When `auth.enabled = true`,
+    /// these docs routes require the same "any valid key, no domain
+    /// permission" check as `GET /version` (spec 004 §7; enforced by
+    /// `auth::middleware::docs_auth_layer`, spec general/014) — when auth is
+    /// disabled, they're served openly like everything else.
     pub swagger_enabled: bool,
     /// URL path at which Swagger UI is served (default: `/test-ui`).
     pub swagger_url: String,
@@ -120,9 +131,9 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "127.0.0.1".to_string(),
             port: 3000,
-            swagger_enabled: true,
+            swagger_enabled: false,
             swagger_url: "/test-ui".to_string(),
             hello_enabled: true,
             hello_message: "Hello from LuraDB".to_string(),
@@ -159,7 +170,7 @@ impl ServerConfig {
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
     pub db_path: String,
@@ -185,7 +196,7 @@ impl Default for StorageConfig {
 ///
 /// Scaffolding only — not yet wired into the WAL/VLog/SSTable hot paths
 /// (see spec perf/004). Disabled by default.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct IoEngineConfig {
     /// Enables the IoEngine (Default: false). Also gates the perf/005 storage thread.
@@ -224,7 +235,7 @@ impl Default for IoEngineConfig {
 
 // ── Buffer Pool ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BufferPoolConfig {
     pub pool_size: usize,
@@ -238,7 +249,7 @@ impl Default for BufferPoolConfig {
 
 // ── Block Cache (Spec 015) ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BlockCacheConfig {
     /// Maximum total size of the block cache in bytes (default: 64 MB).
@@ -261,7 +272,7 @@ impl Default for BlockCacheConfig {
 
 // ── LSM Engine ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LsmConfig {
     pub vlog_inline_threshold: usize,
@@ -273,6 +284,11 @@ pub struct LsmConfig {
     pub wal_event_channel_capacity: usize,
     /// Access SSTables via mmap (perf/003). `false` = load files fully (escape hatch).
     pub use_mmap: bool,
+    /// KV watch replay-ring capacity (spec kv/024). `0` disables resume —
+    /// every reconnect with a `Last-Event-ID` gets `reset`, but `id:` fields
+    /// are still assigned. Only the KV engine uses this; json/rel force it
+    /// to `0` (no watch endpoint there).
+    pub watch_replay_buffer_size: usize,
 }
 
 impl Default for LsmConfig {
@@ -286,13 +302,36 @@ impl Default for LsmConfig {
             compaction_check_interval_ms: 1000,
             wal_event_channel_capacity: 256,
             use_mmap: true,
+            watch_replay_buffer_size: 1024,
         }
+    }
+}
+
+impl LsmConfig {
+    /// Startup validation (spec general/025): `max_value_size` and
+    /// `max_key_length` are the two WAL length-prefixed fields this engine
+    /// writes. A value above `WAL_MAX_FIELD_LEN` would still write today and
+    /// only fail recovery on the *next* restart -- reject it at startup
+    /// instead. `prefix` names the TOML block (`"lsm"`, `"json.lsm"`,
+    /// `"rel.lsm"`) in the error message.
+    pub fn validate(&self, prefix: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_value_size <= WAL_MAX_FIELD_LEN,
+            "invalid config: {prefix}.max_value_size ({}) exceeds the WAL recovery field cap ({WAL_MAX_FIELD_LEN} bytes) — writes this large could never be recovered",
+            self.max_value_size
+        );
+        anyhow::ensure!(
+            self.max_key_length <= WAL_MAX_FIELD_LEN,
+            "invalid config: {prefix}.max_key_length ({}) exceeds the WAL recovery field cap ({WAL_MAX_FIELD_LEN} bytes) — writes this large could never be recovered",
+            self.max_key_length
+        );
+        Ok(())
     }
 }
 
 // ── Compaction ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CompactionCfg {
     pub l0_threshold: usize,
@@ -314,7 +353,7 @@ impl Default for CompactionCfg {
 
 // ── Janitor ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JanitorCfg {
     pub check_interval_secs: u64,
@@ -332,9 +371,33 @@ impl Default for JanitorCfg {
     }
 }
 
+// ── TTL sweeper ───────────────────────────────────────────────────────────────
+
+/// Background task that tombstones TTL-expired keys and emits their delete
+/// events (spec kv/025). Only the KV instance runs one.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TtlSweeperCfg {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    /// Candidates *checked* per tick — discarded ones count too, so a tick may
+    /// write fewer tombstones than this.
+    pub batch_size: usize,
+}
+
+impl Default for TtlSweeperCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+            batch_size: 500,
+        }
+    }
+}
+
 // ── Domains ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DomainsConfig {
     pub max_name_length: usize,
@@ -342,6 +405,11 @@ pub struct DomainsConfig {
     pub default_domain: String,
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
+    /// Cap on the number of keys a single `DELETE …/keys?prefix=` bulk
+    /// delete (spec kv/023) may remove; a larger selection is rejected with
+    /// 413 and nothing is deleted. `0` rejects every non-empty selection —
+    /// not treated as "unlimited".
+    pub max_bulk_delete_keys: usize,
 }
 
 impl Default for DomainsConfig {
@@ -352,13 +420,14 @@ impl Default for DomainsConfig {
             default_domain: "default".to_string(),
             purger_batch_size: 100,
             purger_interval_secs: 5,
+            max_bulk_delete_keys: 10_000,
         }
     }
 }
 
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RateLimitConfig {
     pub default_read_iops: u32,
@@ -379,7 +448,7 @@ impl Default for RateLimitConfig {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AuthConfig {
     /// Set to `false` to disable auth enforcement (dev/local mode).
@@ -400,15 +469,41 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+impl AuthConfig {
+    /// Fail-closed startup check (spec general/013): with auth disabled, the
+    /// server may only serve loopback — otherwise anyone who reaches the
+    /// listener gets unauthenticated full access. `#[serde(default)]` means
+    /// a config without an `[auth]` section still reaches this check.
+    pub fn validate(&self, server: &ServerConfig) -> anyhow::Result<()> {
+        let bind: IpAddr = server.bind_address.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid config: server.bind_address '{}' is not a valid IP address: {e}",
+                server.bind_address
+            )
+        })?;
+        anyhow::ensure!(
+            self.enabled || bind.is_loopback(),
+            "invalid config: auth.enabled = false and server.bind_address = '{}' is not loopback — enable auth (auth.enabled = true) or bind to loopback (127.0.0.1 / ::1)",
+            server.bind_address
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AdminEntry {
     pub name: String,
+    /// Secret, read on deserialize but never written back out. Convention:
+    /// any new secret field in this file gets `#[serde(skip_serializing)]`
+    /// the moment it's introduced — that's the only thing keeping it out of
+    /// `GET /store-api/config` (spec general/022).
+    #[serde(skip_serializing)]
     pub api_key: String,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MetricsCfg {
     pub window_secs: u64,
@@ -426,7 +521,7 @@ impl Default for MetricsCfg {
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Verbose,
@@ -435,7 +530,7 @@ pub enum LogLevel {
     Prod,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     #[default]
@@ -443,7 +538,7 @@ pub enum LogFormat {
     Json,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct LogConfig {
     pub level: LogLevel,
@@ -486,7 +581,7 @@ impl LogConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct LogModulesConfig {
     pub auth: Option<LogLevel>,
@@ -498,7 +593,7 @@ pub struct LogModulesConfig {
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     /// CIDR strings of trusted reverse-proxy IPs/ranges.
@@ -517,7 +612,7 @@ impl Default for ProxyConfig {
 // ── JSON Store (spec json/001) ────────────────────────────────────────────────
 
 /// Config for the JSON engine's dedicated LSM instance (own paths & tuning).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JsonStoreConfig {
     /// Set to `false` to skip starting the JSON engine entirely.
@@ -601,7 +696,7 @@ impl Default for JsonStoreConfig {
 /// Config for the relational engine's dedicated LSM instance (own paths &
 /// tuning). No `db_path` — like the JSON engine, this LSM instance has no
 /// buffer-pool/DiskManager stack, so there is no database file to point at.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RelStoreConfig {
     /// Set to `false` to skip starting the relational engine entirely.
@@ -645,6 +740,9 @@ pub struct RelStoreConfig {
     /// per batch, and seconds between ticks. Mirrors `[json]`.
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
+    /// Body-size cap for `POST .../tables/from-file` (spec rel/019), analogous
+    /// to `json.bulk_body_limit_bytes`.
+    pub import_body_limit_bytes: usize,
     pub lsm: LsmConfig,
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
@@ -715,6 +813,7 @@ impl Default for RelStoreConfig {
             cross_engine_sweep_batch_size: 100,
             purger_batch_size: 100,
             purger_interval_secs: 5,
+            import_body_limit_bytes: 64 * 1024 * 1024,
             lsm: LsmConfig::default(),
             compaction: CompactionCfg::default(),
             janitor: JanitorCfg::default(),
@@ -728,7 +827,7 @@ impl Default for RelStoreConfig {
 /// POSIX shared-memory segments for the local IPC bypass. Wire protocols on
 /// top of these segments (state header, ringbuffer, RCU) follow in specs
 /// 007-009.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ShmConfig {
     /// Enables SHM segment setup at startup (Default: false).
@@ -788,9 +887,12 @@ impl ShmConfig {
             "shm.command_buffer_size must be at least 4096 bytes, got {}",
             self.command_buffer_size
         );
+        // Same bound the startup path checks, taken from the type itself so the
+        // two can't drift apart (spec perf/012 §8).
         anyhow::ensure!(
-            self.state_size >= 64,
-            "shm.state_size must be at least 64 bytes, got {}",
+            self.state_size >= crate::ipc::StateHeader::SIZE,
+            "shm.state_size must be at least {} bytes, got {}",
+            crate::ipc::StateHeader::SIZE,
             self.state_size
         );
         anyhow::ensure!(
@@ -818,7 +920,7 @@ impl ShmConfig {
 
 // ── Backup & Restore (spec general/006) ───────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BackupConfig {
     /// Master switch. `false` = no scheduler task, backup endpoints answer 503.
@@ -848,7 +950,7 @@ impl Default for BackupConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BackupScheduleConfig {
     /// Unique across all schedules; `[a-zA-Z0-9_-]{1,50}`.
     pub name: String,
@@ -929,6 +1031,124 @@ impl BackupConfig {
             );
         }
         Ok(())
+    }
+}
+
+// ── Global event stream (spec general/018) ────────────────────────────────────
+
+/// Config for the `GlobalEventBus` behind `GET /store-api/events`: lifecycle/
+/// DDL events across the KV, JSON and relational engines. A section of its
+/// own rather than an `[lsm]` extension, since the bus belongs to no engine.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// Live broadcast channel capacity. A consumer that falls this far behind
+    /// gets `event: reset` (`reason: "lagged"`) instead of a silent gap.
+    pub channel_capacity: usize,
+    /// Replay-ring size backing `Last-Event-ID` resume. `0` disables resume
+    /// (every reconnect gets `reset`); `id:` fields are assigned regardless.
+    pub replay_buffer_size: usize,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            channel_capacity: 256,
+            replay_buffer_size: 1024,
+        }
+    }
+}
+
+// ── CORS (spec general/020) ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CorsConfig {
+    /// Enables the `CorsLayer`. `false` (default) = no layer in the stack,
+    /// behavior unchanged.
+    pub enabled: bool,
+    /// Exact origins (`scheme://host[:port]`), byte-compared. `"*"` is
+    /// allowed only as the sole entry — see `validate`.
+    pub allowed_origins: Vec<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_origins: Vec::new(),
+        }
+    }
+}
+
+impl CorsConfig {
+    /// Fail-fast startup check (spec general/020 §Start-Validierung). A
+    /// no-op when `enabled = false` — `allowed_origins` is never read then.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.allowed_origins.is_empty(),
+            "invalid config: cors.enabled = true but cors.allowed_origins is empty — no origin would ever be allowed"
+        );
+
+        let has_wildcard = self.allowed_origins.iter().any(|o| o == "*");
+        if has_wildcard {
+            anyhow::ensure!(
+                self.allowed_origins.iter().all(|o| o == "*"),
+                "invalid config: cors.allowed_origins mixes the wildcard \"*\" with concrete origins — \"*\" must be the only entry"
+            );
+            return Ok(());
+        }
+
+        for origin in &self.allowed_origins {
+            anyhow::ensure!(
+                is_valid_origin_form(origin),
+                "invalid config: cors.allowed_origins entry '{origin}' is not a valid origin — expected exactly scheme://host[:port] (lowercase, no userinfo/path/query/fragment)"
+            );
+            // Belt-and-suspenders: guarantees `cors::build_layer` can never
+            // panic converting this entry to a `HeaderValue`. In practice
+            // `is_valid_origin_form`'s charset is already ASCII-only, so this
+            // never trips once the check above passed — it stays as the
+            // documented, literal implementation of this rule.
+            axum::http::HeaderValue::from_str(origin).map_err(|e| {
+                anyhow::anyhow!("invalid config: cors.allowed_origins entry '{origin}' is not a valid header value: {e}")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Strict `scheme://host[:port]` shape (spec general/020 §Start-Validierung,
+/// rules 3+5): scheme `[a-z][a-z0-9+.-]*`, non-empty lowercase host of
+/// `[a-z0-9.-]`, optional numeric port, nothing else — no userinfo, path,
+/// query, or fragment. The browser's `Origin` header always has exactly this
+/// shape, and `AllowOrigin::list` compares byte-for-byte, so anything looser
+/// here would silently never match.
+fn is_valid_origin_form(origin: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let mut scheme_chars = scheme.chars();
+    let valid_scheme = match scheme_chars.next() {
+        Some(first) if first.is_ascii_lowercase() => scheme_chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-')),
+        _ => false,
+    };
+    if !valid_scheme || rest.is_empty() || rest.contains(['@', '/', '?', '#']) {
+        return false;
+    }
+
+    let (host, port) = rest.rsplit_once(':').map_or((rest, None), |(h, p)| (h, Some(p)));
+    if host.is_empty()
+        || !host.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-'))
+    {
+        return false;
+    }
+    match port {
+        None => true,
+        Some(p) => !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
     }
 }
 
@@ -1115,6 +1335,13 @@ mod tests {
         assert!(ServerConfig::default().validate().is_ok());
     }
 
+    // Spec general/014 test 5: prod-safe default — docs routes stay off
+    // unless explicitly enabled.
+    #[test]
+    fn test_swagger_disabled_by_default() {
+        assert!(!ServerConfig::default().swagger_enabled);
+    }
+
     #[test]
     fn test_server_validate_rejects_both_listeners_disabled() {
         let mut server = ServerConfig::default();
@@ -1230,8 +1457,11 @@ mod tests {
     #[test]
     fn test_shm_state_and_data_size_minimums() {
         let mut config = ShmConfig::default();
-        config.state_size = 32;
+        // The bound is the header size itself (spec perf/012 §8).
+        config.state_size = crate::ipc::StateHeader::SIZE - 1;
         assert!(config.validate().is_err());
+        config.state_size = crate::ipc::StateHeader::SIZE;
+        assert!(config.validate().is_ok());
 
         config.state_size = 4096;
         config.data_buffer_size = 100;
@@ -1497,5 +1727,315 @@ mod tests {
     fn test_log_validate_disabled_ignores_empty_path() {
         let log = LogConfig::default();
         assert!(log.validate().is_ok());
+    }
+
+    // ── Auth fail-closed (spec general/013) ─────────────────────────────────
+
+    #[test]
+    fn test_server_default_bind_address_is_loopback() {
+        assert_eq!(ServerConfig::default().bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_auth_validate_rejects_disabled_auth_on_all_interfaces_ipv4() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "0.0.0.0".to_string();
+        assert!(AuthConfig::default().validate(&server).is_err());
+    }
+
+    #[test]
+    fn test_auth_validate_rejects_disabled_auth_on_all_interfaces_ipv6() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "::".to_string();
+        assert!(AuthConfig::default().validate(&server).is_err());
+    }
+
+    #[test]
+    fn test_auth_validate_accepts_disabled_auth_on_loopback_ipv4() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "127.0.0.1".to_string();
+        assert!(AuthConfig::default().validate(&server).is_ok());
+    }
+
+    #[test]
+    fn test_auth_validate_accepts_disabled_auth_on_loopback_ipv6() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "::1".to_string();
+        assert!(AuthConfig::default().validate(&server).is_ok());
+    }
+
+    #[test]
+    fn test_auth_validate_accepts_enabled_auth_on_all_interfaces() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "0.0.0.0".to_string();
+        let auth = AuthConfig { enabled: true, ..AuthConfig::default() };
+        assert!(auth.validate(&server).is_ok());
+    }
+
+    #[test]
+    fn test_auth_validate_rejects_unparseable_bind_address() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "not-an-ip".to_string();
+        assert!(AuthConfig::default().validate(&server).is_err());
+    }
+
+    // The address is parsed unconditionally, independent of whether the
+    // loopback rule itself would apply — an unparseable address never binds.
+    #[test]
+    fn test_auth_validate_rejects_unparseable_bind_address_even_when_enabled() {
+        let mut server = ServerConfig::default();
+        server.bind_address = "not-an-ip".to_string();
+        let auth = AuthConfig { enabled: true, ..AuthConfig::default() };
+        assert!(auth.validate(&server).is_err());
+    }
+
+    // A config file without an [auth] section must not bypass the check:
+    // serde fills in AuthConfig::default() (enabled = false), and validate()
+    // still fails once bound beyond loopback.
+    #[test]
+    fn test_auth_validate_missing_auth_section_still_fails_closed() {
+        let toml_str = r#"
+            [server]
+            bind_address = "0.0.0.0"
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.auth.enabled);
+        assert!(config.auth.validate(&config.server).is_err());
+    }
+
+    // ── Global event stream (spec general/018) ──────────────────────────────
+
+    #[test]
+    fn test_events_defaults() {
+        let config = LuraConfig::default();
+        assert_eq!(config.events.channel_capacity, 256);
+        assert_eq!(config.events.replay_buffer_size, 1024);
+    }
+
+    #[test]
+    fn test_events_toml_overrides() {
+        let toml_str = r#"
+            [events]
+            channel_capacity = 8
+            replay_buffer_size = 0
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.events.channel_capacity, 8);
+        assert_eq!(config.events.replay_buffer_size, 0);
+    }
+
+    #[test]
+    fn test_auth_validate_missing_auth_section_loopback_ok() {
+        let toml_str = r#"
+            [server]
+            bind_address = "127.0.0.1"
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.auth.enabled);
+        assert!(config.auth.validate(&config.server).is_ok());
+    }
+
+    // ── CORS (spec general/020) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_cors_disabled_by_default() {
+        let config = LuraConfig::default();
+        assert!(!config.cors.enabled);
+        assert!(config.cors.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn test_cors_toml_overrides() {
+        let toml_str = r#"
+            [cors]
+            enabled = true
+            allowed_origins = ["https://console.example.com", "http://localhost:5173"]
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.cors.enabled);
+        assert_eq!(
+            config.cors.allowed_origins,
+            vec!["https://console.example.com".to_string(), "http://localhost:5173".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_cors_validate_disabled_skips_all_checks() {
+        let mut cors = CorsConfig::default();
+        // Would fail every check below if looked at — enabled=false must
+        // short-circuit before any of it.
+        cors.allowed_origins = vec!["not a valid origin at all".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_enabled_with_empty_origins() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_wildcard_mixed_with_concrete_origin() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["*".to_string(), "https://example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_wildcard_alone() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["*".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_wildcard_duplicated() {
+        // Duplicate "*" entries are still "only the wildcard", not "mixed
+        // with concrete origins".
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["*".to_string(), "*".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_origin_with_port() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["http://localhost:5173".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_origin_without_port() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_accepts_duplicate_origin() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins =
+            vec!["https://console.example.com".to_string(), "https://console.example.com".to_string()];
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_trailing_slash() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com/".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_missing_scheme() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["console.example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_userinfo() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://user:pw@console.example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_query() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com?x=1".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_fragment() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://console.example.com#f".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_empty_host() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_uppercase_host() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://Console.example.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_cors_validate_rejects_unparseable_header_value() {
+        let mut cors = CorsConfig::default();
+        cors.enabled = true;
+        cors.allowed_origins = vec!["https://exa\nmple.com".to_string()];
+        assert!(cors.validate().is_err());
+    }
+
+    #[test]
+    fn test_lsm_validate_default_ok() {
+        let config = LuraConfig::default();
+        assert!(config.lsm.validate("lsm").is_ok());
+        assert!(config.json.lsm.validate("json.lsm").is_ok());
+        assert!(config.rel.lsm.validate("rel.lsm").is_ok());
+    }
+
+    #[test]
+    fn test_lsm_validate_max_value_size_at_cap_ok() {
+        let mut lsm = LsmConfig::default();
+        lsm.max_value_size = WAL_MAX_FIELD_LEN;
+        assert!(lsm.validate("lsm").is_ok());
+    }
+
+    #[test]
+    fn test_lsm_validate_max_value_size_over_cap_rejected() {
+        let mut lsm = LsmConfig::default();
+        lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
+        let err = lsm.validate("lsm").unwrap_err().to_string();
+        assert!(err.contains("lsm.max_value_size"), "{err}");
+        assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
+        assert!(err.contains(&WAL_MAX_FIELD_LEN.to_string()), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_max_key_length_over_cap_rejected() {
+        let mut lsm = LsmConfig::default();
+        lsm.max_key_length = WAL_MAX_FIELD_LEN + 1;
+        let err = lsm.validate("lsm").unwrap_err().to_string();
+        assert!(err.contains("lsm.max_key_length"), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_json_lsm_over_cap_rejected() {
+        let mut config = LuraConfig::default();
+        config.json.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
+        let err = config.json.lsm.validate("json.lsm").unwrap_err().to_string();
+        assert!(err.contains("json.lsm.max_value_size"), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_rel_lsm_over_cap_rejected() {
+        let mut config = LuraConfig::default();
+        config.rel.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
+        let err = config.rel.lsm.validate("rel.lsm").unwrap_err().to_string();
+        assert!(err.contains("rel.lsm.max_value_size"), "{err}");
     }
 }

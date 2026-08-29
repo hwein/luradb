@@ -4,6 +4,7 @@
 //! recent writes in a sorted, lock-free data structure with MVCC support.
 
 use crate::engines::lsm::key::{InternalKey, Timestamp};
+use crate::storage::format::{is_expired, VersionState};
 use crossbeam_skiplist::SkipMap;
 use std::sync::Arc;
 
@@ -23,6 +24,26 @@ pub enum Value {
     /// update, not a delete.
     Null,
     Tombstone,
+}
+
+impl Value {
+    /// Classifies this version's liveness at `now` (spec kv/025 §2): mirrors
+    /// `DataBlockValue`/`CachedValue` in `storage::format` for the
+    /// MemTable's own value representation.
+    pub fn version_state(&self, now: u64) -> VersionState {
+        match self {
+            Value::Tombstone => VersionState::Tombstone,
+            Value::Null => VersionState::Live,
+            // invariant: no write path ever produces Some(0) (put/put_with_ttl/
+            // WAL replay) -- unwrap_or(0) safely means "no TTL" here.
+            Value::Inline(_, expire_at) => {
+                if is_expired(expire_at.unwrap_or(0), now) { VersionState::Expired } else { VersionState::Live }
+            }
+            Value::Pointer { expire_at, .. } => {
+                if is_expired(expire_at.unwrap_or(0), now) { VersionState::Expired } else { VersionState::Live }
+            }
+        }
+    }
 }
 
 /// The MemTable is a sorted, in-memory data structure that holds recent
@@ -57,15 +78,22 @@ impl MemTable {
     }
 
     /// Retrieves the latest version of a key visible to the given snapshot.
+    pub fn get(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<Value> {
+        self.get_with_ts(user_key, snapshot_ts).map(|(v, _)| v)
+    }
+
+    /// Like [`Self::get`], but also returns the version's write timestamp
+    /// (spec kv/022 `last_modified_at`) — decoded straight from the encoded
+    /// key, so already un-inverted.
     ///
     /// # Arguments
     /// * `user_key` - The user-facing key to look up
     /// * `snapshot_ts` - The snapshot timestamp (only return versions <= this)
     ///
     /// # Returns
-    /// * `Some(Value)` if a visible version is found
+    /// * `Some((Value, Timestamp))` if a visible version is found
     /// * `None` if no visible version exists
-    pub fn get(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<Value> {
+    pub fn get_with_ts(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<(Value, Timestamp)> {
         // Build the search key: UserKey + SnapshotTimestamp
         let search_key = InternalKey::new(user_key.to_vec(), snapshot_ts);
         let encoded_search_key = search_key.encode();
@@ -82,7 +110,8 @@ impl MemTable {
 
             if let Some(entry_user_key) = InternalKey::extract_user_key(key_bytes.as_slice()) {
                 if entry_user_key == user_key {
-                    return Some(value.clone());
+                    let ts = InternalKey::extract_timestamp(key_bytes.as_slice()).unwrap_or(snapshot_ts);
+                    return Some((value.clone(), ts));
                 } else {
                     // As soon as the UserKey no longer matches, we can stop,
                     // since the map is sorted by UserKey.

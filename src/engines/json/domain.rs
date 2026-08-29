@@ -6,13 +6,14 @@
 //! in spec json/013.
 
 use super::error::JsonStoreError;
+use crate::core::events::GlobalEventBus;
 use crate::engines::lsm::domain::{fnv64, now_secs};
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::StorageEngine;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
 const SYS_JSON_DOMAIN_PREFIX: &[u8] = b"__sys:json_domain:";
@@ -97,6 +98,9 @@ pub struct JsonDomainRegistry {
     /// Serializes `create_domain` end-to-end (check-then-act spans an await,
     /// see spec general/003).
     create_lock: Mutex<()>,
+    /// Global lifecycle/DDL event bus (spec general/018 §1) — unset in unit
+    /// tests and a standalone-built registry, which then publishes nothing.
+    event_bus: OnceLock<Arc<GlobalEventBus>>,
 }
 
 impl JsonDomainRegistry {
@@ -122,6 +126,7 @@ impl JsonDomainRegistry {
             domains: RwLock::new(loaded),
             engine,
             create_lock: Mutex::new(()),
+            event_bus: OnceLock::new(),
         };
         // Any state counts: creating over a Deleting default would fail with
         // DomainAlreadyExists and abort every boot. The purger finalizes it;
@@ -139,6 +144,19 @@ impl JsonDomainRegistry {
         Ok(registry)
     }
 
+    /// Wires the global event bus (spec general/018 §1); a no-op call site
+    /// (`event_bus.get()` returning `None`) means it was never attached.
+    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
+        let _ = self.event_bus.set(bus);
+    }
+
+    /// `domain_created` / `domain_deleted` / `domain_purged` (spec §2).
+    fn publish_lifecycle_event(&self, kind: &'static str, domain: &str) {
+        if let Some(bus) = self.event_bus.get() {
+            bus.publish("json", kind, domain, None);
+        }
+    }
+
     /// Creates a new domain. Fails if the name already exists (incl. deleting).
     pub async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
         validate_domain_name(name)?;
@@ -150,6 +168,7 @@ impl JsonDomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain.clone());
+        self.publish_lifecycle_event("domain_created", name);
         Ok(domain)
     }
 
@@ -197,6 +216,7 @@ impl JsonDomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain);
+        self.publish_lifecycle_event("domain_deleted", name);
         Ok(())
     }
 
@@ -205,6 +225,7 @@ impl JsonDomainRegistry {
     pub(crate) async fn finalize_deletion(&self, name: &str) -> Result<(), JsonStoreError> {
         self.engine.delete(&sys_key(name)).await?;
         self.domains.write().remove(name);
+        self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
 

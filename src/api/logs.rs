@@ -101,10 +101,10 @@ fn log_access_state(state: &AppState) -> Result<&LogAccessState, ApiError> {
     ),
     responses(
         (status = 200, description = "Tail of the selected log file", body = LogResponse),
-        (status = 400, description = "lines = 0, or invalid file name"),
-        (status = 404, description = "file does not exist"),
-        (status = 500, description = "log directory unreadable, no luradb.log* file found, or read failed"),
-        (status = 503, description = "Log HTTP access is disabled"),
+        (status = 400, description = "lines = 0, or invalid file name", body = String, content_type = "text/plain"),
+        (status = 404, description = "file does not exist", body = String, content_type = "text/plain"),
+        (status = 500, description = "log directory unreadable, no luradb.log* file found, or read failed", body = String, content_type = "text/plain"),
+        (status = 503, description = "Log HTTP access is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Logs"
 )]
@@ -169,8 +169,8 @@ pub async fn get_logs(
     path = "/store-api/logs/files",
     responses(
         (status = 200, description = "All luradb.log* files, newest first", body = LogFilesResponse),
-        (status = 500, description = "log directory unreadable"),
-        (status = 503, description = "Log HTTP access is disabled"),
+        (status = 500, description = "log directory unreadable", body = String, content_type = "text/plain"),
+        (status = 503, description = "Log HTTP access is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Logs"
 )]
@@ -385,6 +385,10 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access,
+            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(crate::config::LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
         };
         (state, dir)
     }

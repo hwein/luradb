@@ -6,6 +6,7 @@ pub mod auth;
 pub mod backup;
 pub mod config;
 pub mod core;
+pub mod cors;
 pub mod engines;
 pub mod ipc;
 pub mod logging;

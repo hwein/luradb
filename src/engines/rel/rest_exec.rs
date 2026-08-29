@@ -5,6 +5,7 @@
 //! same MVCC snapshot the SELECT itself read at.
 
 use super::ast::StatementClass;
+use super::cross_engine::LinkAuth;
 use super::dml::{DmlResult, SelectResult};
 use super::error::RelStoreError;
 use super::{ExecOutcome, RelEngine};
@@ -94,13 +95,15 @@ impl RelEngine {
     /// one parse), and — for a SELECT with a non-empty `expand` — resolves
     /// REFERENCES columns (`expand.rs`) in the same snapshot the SELECT read
     /// at (`SelectResult::snapshot`, §5). Non-empty `expand` on DML/DDL is
-    /// rejected (§5).
+    /// rejected (§5). `auth` gates cross-engine link masking/validation for
+    /// this call (spec rel/016).
     pub async fn execute_sql(
         &self,
         domain: &str,
         sql: &str,
         params: &[serde_json::Value],
         expand: &[String],
+        auth: LinkAuth,
     ) -> Result<SqlOutcome, RelStoreError> {
         let domain = domain.to_string();
         // Both checks run inside `mid` — i.e. before `execute_checked` ever
@@ -110,7 +113,7 @@ impl RelEngine {
         // `expand` validation fails) — same reasoning as the rate limit
         // needing to sit before any execution I/O.
         let outcome = self
-            .execute_checked(&domain, sql, params, |class| {
+            .execute_checked(&domain, sql, params, auth, |class| {
                 if !expand.is_empty() && class != StatementClass::Read {
                     return Err(RelStoreError::InvalidExpand(
                         "expand is only valid for SELECT".to_string(),

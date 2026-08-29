@@ -36,6 +36,8 @@ impl From<anyhow::Error> for ApiError {
             StatusCode::CONFLICT
         } else if msg.starts_with("404") {
             StatusCode::NOT_FOUND
+        } else if msg.starts_with("413") {
+            StatusCode::PAYLOAD_TOO_LARGE
         } else if msg.starts_with("400") {
             StatusCode::BAD_REQUEST
         } else {

@@ -28,7 +28,12 @@ use std::collections::HashSet;
 #[derive(Debug)]
 pub enum DdlOutcome {
     TableCreated(TableSchema),
-    TableAltered(TableSchema),
+    /// `renamed_from` is `Some(old_name)` only for `RENAME TABLE` (filled
+    /// solely in the `DdlPlan::RenameTable` arm below) — the global event
+    /// stream needs it to publish the vanished old name as its own
+    /// `table_dropped` event (spec general/018 §2.1); the three column-DDL
+    /// arms (`ADD`/`DROP`/`RENAME COLUMN`) leave it `None`.
+    TableAltered { schema: TableSchema, renamed_from: Option<String> },
     TableDropped { name: String },
     IndexCreated(IndexMeta),
     IndexDropped { name: String },
@@ -53,7 +58,7 @@ pub async fn execute(
         DdlPlan::AddColumn { table, column } => {
             let schema = catalog.add_column(domains, domain, &table, column).await?;
             metrics.record_rel_ddl_op("alter_table");
-            Ok(DdlOutcome::TableAltered(schema))
+            Ok(DdlOutcome::TableAltered { schema, renamed_from: None })
         }
         DdlPlan::DropColumn { table, column } => {
             let object = format!("{table}.{column}");
@@ -63,7 +68,7 @@ pub async fn execute(
                 })
                 .await?;
             metrics.record_rel_ddl_op("alter_table");
-            Ok(DdlOutcome::TableAltered(schema))
+            Ok(DdlOutcome::TableAltered { schema, renamed_from: None })
         }
         DdlPlan::RenameColumn { table, from, to } => {
             let object = format!("{table}.{from}");
@@ -73,7 +78,7 @@ pub async fn execute(
                 })
                 .await?;
             metrics.record_rel_ddl_op("alter_table");
-            Ok(DdlOutcome::TableAltered(schema))
+            Ok(DdlOutcome::TableAltered { schema, renamed_from: None })
         }
         DdlPlan::RenameTable { table, to } => {
             let schema = catalog
@@ -82,7 +87,7 @@ pub async fn execute(
                 })
                 .await?;
             metrics.record_rel_ddl_op("alter_table");
-            Ok(DdlOutcome::TableAltered(schema))
+            Ok(DdlOutcome::TableAltered { schema, renamed_from: Some(table) })
         }
         DdlPlan::DropTable { table } => {
             catalog
@@ -290,7 +295,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, DdlOutcome::TableAltered(_)));
+        assert!(matches!(outcome, DdlOutcome::TableAltered { .. }));
 
         // CREATE/DROP INDEX go through RelEngine::execute_create_index (backfill
         // path) and RelEngine::execute; see mod.rs test 18 and dml.rs test 23.
@@ -337,5 +342,55 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+    }
+
+    // Spec general/018 §2.1: RENAME TABLE fills `renamed_from` with the old
+    // name (needed to publish it as a `table_dropped` event); every other
+    // ALTER TABLE variant leaves it `None`.
+    #[tokio::test]
+    async fn test_table_altered_renamed_from_only_set_by_rename_table() {
+        let (domains, catalog, metrics, _dir) = make_ctx().await;
+        let mut pk = ColumnInput::new("id", ColumnType::Integer);
+        pk.primary_key = true;
+        execute(
+            &catalog,
+            &domains,
+            &metrics,
+            "default",
+            DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
+        )
+        .await
+        .unwrap();
+
+        let outcome = execute(
+            &catalog,
+            &domains,
+            &metrics,
+            "default",
+            DdlPlan::AddColumn { table: "t".to_string(), column: ColumnInput::new("age", ColumnType::Integer) },
+        )
+        .await
+        .unwrap();
+        match outcome {
+            DdlOutcome::TableAltered { renamed_from, .. } => assert_eq!(renamed_from, None, "ADD COLUMN must not set renamed_from"),
+            other => panic!("expected TableAltered, got {other:?}"),
+        }
+
+        let outcome = execute(
+            &catalog,
+            &domains,
+            &metrics,
+            "default",
+            DdlPlan::RenameTable { table: "t".to_string(), to: "t2".to_string() },
+        )
+        .await
+        .unwrap();
+        match outcome {
+            DdlOutcome::TableAltered { schema, renamed_from } => {
+                assert_eq!(renamed_from, Some("t".to_string()));
+                assert_eq!(schema.name, "t2");
+            }
+            other => panic!("expected TableAltered, got {other:?}"),
+        }
     }
 }

@@ -6,7 +6,7 @@
 
 use super::document::doc_scan_prefix;
 use super::index::index_domain_prefix;
-use super::JsonEngine;
+use super::{JsonEngine, DOC_WRITE_SHARDS};
 use crate::engines::lsm::engine::BatchOp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,11 +46,11 @@ impl JsonDomainPurger {
 
     /// One purge cycle: tombstones up to `batch_size` keys per deleting
     /// domain; finalizes the domain once no data keys remain. Scans through
-    /// tombstone/finalize run under the engine's doc write lock so no
+    /// tombstone/finalize run under every document-write shard so no
     /// in-flight writer can land keys after the final empty scan (json/013).
     pub async fn purge_tick(&self) -> anyhow::Result<()> {
         for domain in self.engine.domains.list_deleting_domains() {
-            let _guard = self.engine.doc_write_lock.lock().await;
+            let _guards = self.engine.lock_shards((0..DOC_WRITE_SHARDS).collect()).await;
             let doc_keys = self
                 .engine
                 .engine()
@@ -84,6 +84,7 @@ mod tests {
     use super::super::{IndexFieldType, JsonEngine, JsonStoreError};
     use super::*;
     use crate::config::JsonStoreConfig;
+    use crate::metrics::{MetricsConfig, MetricsStore};
     use serde_json::json;
 
     fn config_for(dir: &tempfile::TempDir) -> JsonStoreConfig {
@@ -96,7 +97,8 @@ mod tests {
     }
 
     async fn seeded_engine(dir: &tempfile::TempDir) -> Arc<JsonEngine> {
-        let json = JsonEngine::bootstrap(&config_for(dir)).await.unwrap();
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config_for(dir), metrics).await.unwrap();
         json.create_domain("doomed").await.unwrap();
         json.create_index("doomed", "city", IndexFieldType::String).await.unwrap();
         for i in 0..5 {
@@ -198,7 +200,7 @@ mod tests {
             json.delete_domain("doomed").await.unwrap();
             json.shutdown().await;
         }
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         let deleting = json.domains.list_deleting_domains();
         assert_eq!(deleting.len(), 1, "deleting domain must survive restart");
 
@@ -226,13 +228,13 @@ mod tests {
     async fn test_bootstrap_survives_deleting_default_domain() {
         let dir = tempfile::TempDir::new().unwrap();
         {
-            let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
             json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
             json.delete_domain("default").await.unwrap();
             json.shutdown().await;
         }
         // Restart before the purge finished: boot must succeed, default stays Deleting.
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         assert!(json.get_domain("default").is_none(), "deleting default must not be active");
 
         let purger = purger(&json, 100);
@@ -248,7 +250,7 @@ mod tests {
     async fn test_default_domain_recreated_after_purge() {
         let dir = tempfile::TempDir::new().unwrap();
         {
-            let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
             json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
             json.delete_domain("default").await.unwrap();
             let purger = purger(&json, 100);
@@ -257,7 +259,7 @@ mod tests {
             assert!(json.domains.get_domain_any("default").is_none());
             json.shutdown().await;
         }
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         let default = json.domains.get_domain_any("default").expect("default must be recreated");
         assert_eq!(default.state, super::super::JsonDomainState::Active);
         json.shutdown().await;
@@ -269,12 +271,12 @@ mod tests {
     #[tokio::test]
     async fn test_inflight_write_cannot_land_after_finalize() {
         let dir = tempfile::TempDir::new().unwrap();
-        let json = JsonEngine::bootstrap(&config_for(&dir)).await.unwrap();
+        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
         json.create_domain("doomed").await.unwrap();
         let prefix = json.get_domain("doomed").unwrap().system_prefix;
 
-        // In-flight writer: parked on the doc write lock held by the test.
-        let guard = json.doc_write_lock.lock().await;
+        // In-flight writer: parked on its key's write shard, held by the test.
+        let guard = json.doc_write_locks[JsonEngine::shard("doomed", "zombie")].lock().await;
         let writer = tokio::spawn({
             let json = Arc::clone(&json);
             async move { json.put_document("doomed", "zombie", json!({"n": 1})).await }
@@ -283,7 +285,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         json.delete_domain("doomed").await.unwrap();
-        // The purger must block on the same lock instead of finalizing.
+        // The purger takes all shards, so it must block instead of finalizing.
         let tick = tokio::spawn({
             let p = purger(&json, 100);
             async move { p.purge_tick().await }
@@ -319,12 +321,13 @@ mod tests {
     async fn test_bulk_flush_aborts_when_domain_deleted_mid_import() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = JsonStoreConfig { bulk_batch_size: 1, ..config_for(&dir) };
-        let json = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         json.create_domain("doomed").await.unwrap();
         let prefix = json.get_domain("doomed").unwrap().system_prefix;
 
-        // Park the import's first batch flush on the doc write lock.
-        let guard = json.doc_write_lock.lock().await;
+        // Park the import's first batch flush on the write shard of its key.
+        let guard = json.doc_write_locks[JsonEngine::shard("doomed", "a")].lock().await;
         let loader = tokio::spawn({
             let json = Arc::clone(&json);
             async move {

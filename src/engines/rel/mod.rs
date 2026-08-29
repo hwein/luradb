@@ -11,6 +11,7 @@ pub mod domain;
 pub mod error;
 pub mod eval;
 pub mod expand;
+pub mod from_file;
 pub mod join;
 pub mod keys;
 pub mod lexer;
@@ -31,11 +32,12 @@ pub use catalog::{
     CatalogEntry, CatalogLimits, ColumnDef, ColumnInput, DefaultValue, IndexMeta, RelCatalog,
     TableInput, TableSchema, ViewSchema,
 };
-pub use cross_engine::{CrossEngineResolver, RelCrossEngineSweeper};
+pub use cross_engine::{CrossEngineResolver, LinkAuth, RelCrossEngineSweeper};
 pub use ddl::DdlOutcome;
 pub use dml::{DmlResult, SelectResult};
 pub use domain::{RelDomain, RelDomainState};
 pub use error::RelStoreError;
+pub use from_file::{CreateFromFileResult, FileFormat, ImportColumn, ImportRowError};
 pub use purger::RelDomainPurger;
 pub use rest_exec::{ExpandedBlock, SqlOutcome};
 pub use types::{encode_sortable, scalar_to_json, ColumnType, ScalarValue};
@@ -49,6 +51,7 @@ pub enum ExecOutcome {
 }
 
 use crate::config::RelStoreConfig;
+use crate::core::events::GlobalEventBus;
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
@@ -63,7 +66,7 @@ use domain::RelDomainRegistry;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Central entry point for all relational-store operations. For now it
 /// wraps the dedicated LSM instance plus domain management (rel/002) —
@@ -103,12 +106,20 @@ pub struct RelEngine {
     /// REST response cap (spec rel/009 §6): checked handler-side, after
     /// serialization, so it stays a plain getter here.
     max_response_bytes: usize,
+    /// Body-size cap for `POST .../tables/from-file` (spec rel/019 §1),
+    /// applied by the handler as a route-level `DefaultBodyLimit`.
+    import_body_limit_bytes: usize,
     /// Lazily-filled per-domain rate limiters (spec rel/009 §7) — mirrors the
     /// KV `DomainRegistry`'s `runtimes` map: a separate, name-keyed structure,
     /// not a field of the serialized `RelDomain` (rel/002's invariant stays
     /// intact). `parking_lot::RwLock`: sync-only critical sections, never
     /// held across an `.await`.
     rate_limiters: RwLock<HashMap<String, Arc<RateLimiter>>>,
+    /// Global lifecycle/DDL event bus (spec general/018 §1) — backs the
+    /// central DDL dispatch in `execute_checked`; domain lifecycle events are
+    /// published by `domains` itself. Unset in unit tests and a standalone-
+    /// built engine, which then publish nothing.
+    event_bus: OnceLock<Arc<GlobalEventBus>>,
 }
 
 impl RelEngine {
@@ -136,6 +147,7 @@ impl RelEngine {
             compaction_check_interval_ms: config.lsm.compaction_check_interval_ms,
             wal_event_channel_capacity: config.lsm.wal_event_channel_capacity,
             use_mmap: config.lsm.use_mmap,
+            watch_replay_buffer_size: 0, // no watch endpoint on the relational engine (spec kv/024 §3)
         };
         let compaction_config = CompactionConfig {
             l0_compaction_threshold: config.compaction.l0_threshold,
@@ -198,13 +210,23 @@ impl RelEngine {
             max_join_depth: config.max_join_depth,
             allow_unindexed_joins: config.allow_unindexed_joins,
             max_response_bytes: config.max_response_bytes,
+            import_body_limit_bytes: config.import_body_limit_bytes,
             rate_limiters: RwLock::new(HashMap::new()),
+            event_bus: OnceLock::new(),
         }))
     }
 
     /// The dedicated relational LSM instance.
     pub fn engine(&self) -> &Arc<LsmStorageEngine> {
         &self.engine
+    }
+
+    /// Wires the global event bus (spec general/018 §1): its own `OnceLock`
+    /// backs the central DDL dispatch, and it forwards to `domains` for the
+    /// domain lifecycle events.
+    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
+        self.domains.attach_event_bus(Arc::clone(&bus));
+        let _ = self.event_bus.set(bus);
     }
 
     /// Gracefully shuts down the underlying LSM instance.
@@ -291,6 +313,13 @@ impl RelEngine {
         self.max_response_bytes
     }
 
+    /// `import_body_limit_bytes` getter (spec rel/019 §1): the from-file
+    /// route applies this as a `DefaultBodyLimit` layer, mirroring
+    /// `JsonEngine::bulk_body_limit_bytes`.
+    pub fn import_body_limit_bytes(&self) -> usize {
+        self.import_body_limit_bytes
+    }
+
     /// Drops a domain's lazily-created rate limiter (spec rel/009 §7). The
     /// rel/013 purger calls this once a domain is finalized, mirroring the KV
     /// registry's `runtimes` cleanup: a recreated same-name domain then starts
@@ -350,7 +379,7 @@ impl RelEngine {
         sql: &str,
         params: &[serde_json::Value],
     ) -> Result<ExecOutcome, RelStoreError> {
-        self.execute_checked(domain, sql, params, |_class| Ok(())).await
+        self.execute_checked(domain, sql, params, LinkAuth::full(), |_class| Ok(())).await
     }
 
     /// Shared core of [`Self::execute`] and the REST-edge
@@ -358,13 +387,16 @@ impl RelEngine {
     /// bind/dispatch, with one seam — `mid` runs right after classification,
     /// before binding/dispatch ever touches the engine, so a caller can gate
     /// the statement (rate limit here; rel/011 adds statement-level auth at
-    /// the same seam) without a second parse. `execute` passes a no-op `mid`,
-    /// so its behavior/signature are unchanged.
+    /// the same seam) without a second parse. `execute` passes a no-op `mid`
+    /// and `LinkAuth::full()`, so its behavior/signature are unchanged.
+    /// `auth` flows into `execute_dml` for cross-engine link masking/
+    /// validation (spec rel/016).
     pub(crate) async fn execute_checked(
         &self,
         domain: &str,
         sql: &str,
         params: &[serde_json::Value],
+        auth: LinkAuth,
         mid: impl FnOnce(StatementClass) -> Result<(), RelStoreError> + Send,
     ) -> Result<ExecOutcome, RelStoreError> {
         let tokens = lexer::tokenize(sql, self.max_statement_len).map_err(|e| {
@@ -386,7 +418,12 @@ impl RelEngine {
 
         mid(class)?;
 
-        match binder::bind(stmt, param_count, params)? {
+        // The whole dispatch is captured before returning (spec general/018
+        // §4 point 10): `ExecOutcome::Ddl` arises at three separate arms
+        // below, so binding the match's value here — rather than a `?` on
+        // each arm feeding straight into an early return — is the only way a
+        // later fourth arm can't slip past the event publish.
+        let outcome = match binder::bind(stmt, param_count, params)? {
             // CREATE INDEX runs the backfill-aware path (spec rel/005 §13).
             binder::BoundStatement::Ddl(DdlPlan::CreateIndex { table, name, column, unique }) => ddl::execute_create_index(
                 &self.engine,
@@ -402,12 +439,12 @@ impl RelEngine {
                 unique,
             )
             .await
-            .map(ExecOutcome::Ddl),
+            .map(ExecOutcome::Ddl)?,
             binder::BoundStatement::Ddl(plan) => {
                 self.check_ddl_link_engines(&plan)?;
                 ddl::execute(&self.catalog, &self.domains, &self.metrics, domain, plan)
                     .await
-                    .map(ExecOutcome::Ddl)
+                    .map(ExecOutcome::Ddl)?
             }
             // CREATE/DROP VIEW need the raw `sql` text (rel/008 §3: the stored
             // view body is the *raw* SELECT substring, not a re-serialized
@@ -415,13 +452,43 @@ impl RelEngine {
             // sees the bound `Statement`, not the original source string.
             binder::BoundStatement::Pending { stmt, .. } => match stmt {
                 ast::Statement::CreateView(cv) => {
-                    view::execute_create_view(self, domain, cv, sql).await.map(ExecOutcome::Ddl)
+                    view::execute_create_view(self, domain, cv, sql).await.map(ExecOutcome::Ddl)?
                 }
                 ast::Statement::DropView(dv) => {
-                    view::execute_drop_view(self, domain, dv).await.map(ExecOutcome::Ddl)
+                    view::execute_drop_view(self, domain, dv).await.map(ExecOutcome::Ddl)?
                 }
-                other => self.execute_dml(domain, other, params).await,
+                other => self.execute_dml(domain, other, params, auth).await?,
             },
+        };
+        if let ExecOutcome::Ddl(ddl_outcome) = &outcome {
+            self.publish_ddl_event(domain, ddl_outcome);
+        }
+        Ok(outcome)
+    }
+
+    /// Maps a successfully executed `DdlOutcome` to its global-event-stream
+    /// `kind`/`object` and publishes it (spec general/018 §2/§4 point 10). A
+    /// `RENAME TABLE` (`TableAltered` with `renamed_from: Some(old)`)
+    /// publishes two adjacent events instead of one (§2.1): `table_dropped`
+    /// for the name that no longer exists, `table_created` for the one that
+    /// now does — correct for every client without new field knowledge.
+    fn publish_ddl_event(&self, domain: &str, outcome: &DdlOutcome) {
+        let Some(bus) = self.event_bus.get() else { return };
+        match outcome {
+            DdlOutcome::TableCreated(schema) => bus.publish("rel", "table_created", domain, Some(schema.name.clone())),
+            DdlOutcome::TableAltered { schema, renamed_from: Some(old) } => bus.publish_many(
+                "rel",
+                domain,
+                &[("table_dropped", Some(old.clone())), ("table_created", Some(schema.name.clone()))],
+            ),
+            DdlOutcome::TableAltered { schema, renamed_from: None } => {
+                bus.publish("rel", "table_altered", domain, Some(schema.name.clone()))
+            }
+            DdlOutcome::TableDropped { name } => bus.publish("rel", "table_dropped", domain, Some(name.clone())),
+            DdlOutcome::IndexCreated(meta) => bus.publish("rel", "index_created", domain, Some(meta.name.clone())),
+            DdlOutcome::IndexDropped { name } => bus.publish("rel", "index_dropped", domain, Some(name.clone())),
+            DdlOutcome::ViewCreated(view) => bus.publish("rel", "view_created", domain, Some(view.name.clone())),
+            DdlOutcome::ViewDropped { name } => bus.publish("rel", "view_dropped", domain, Some(name.clone())),
         }
     }
 }
@@ -812,5 +879,128 @@ mod tests {
         rel.execute("default", "DROP VIEW v", &[]).await.unwrap();
         assert!(rel.get_object("default", "v").is_err());
         rel.shutdown().await;
+    }
+
+    // ── Spec general/018: global lifecycle event bus ────────────────────────
+
+    async fn make_engine_with_bus() -> (Arc<RelEngine>, Arc<crate::core::events::GlobalEventBus>, tempfile::TempDir) {
+        let (rel, dir) = make_engine().await;
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
+        rel.attach_event_bus(Arc::clone(&bus));
+        (rel, bus, dir)
+    }
+
+    // Test 3: CREATE TABLE, ALTER TABLE (add/rename column), CREATE INDEX,
+    // DROP INDEX, CREATE VIEW, DROP VIEW, DROP TABLE -> one event each with
+    // the right kind/object.
+    #[tokio::test]
+    async fn test_rel_ddl_publishes_one_event_per_statement_with_matching_kind_and_object() {
+        let (rel, bus, _dir) = make_engine_with_bus().await;
+        let mut rx = bus.subscribe();
+
+        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", &[]).await.unwrap();
+        rel.execute("default", "ALTER TABLE t ADD COLUMN b INTEGER", &[]).await.unwrap();
+        rel.execute("default", "ALTER TABLE t RENAME COLUMN b TO c", &[]).await.unwrap();
+        rel.execute("default", "CREATE INDEX t_a_idx ON t (a)", &[]).await.unwrap();
+        rel.execute("default", "DROP INDEX t_a_idx", &[]).await.unwrap();
+        rel.execute("default", "CREATE VIEW v AS SELECT * FROM t", &[]).await.unwrap();
+        rel.execute("default", "DROP VIEW v", &[]).await.unwrap();
+        rel.execute("default", "DROP TABLE t", &[]).await.unwrap();
+
+        let expected = [
+            ("table_created", Some("t")),
+            ("table_altered", Some("t")),
+            ("table_altered", Some("t")),
+            ("index_created", Some("t_a_idx")),
+            ("index_dropped", Some("t_a_idx")),
+            ("view_created", Some("v")),
+            ("view_dropped", Some("v")),
+            ("table_dropped", Some("t")),
+        ];
+        for (kind, object) in expected {
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event.engine, "rel");
+            assert_eq!(event.kind, kind);
+            assert_eq!(event.object.as_deref(), object, "kind {kind}");
+            assert_eq!(event.domain, "default");
+        }
+        assert!(rx.try_recv().is_err(), "no extra events expected");
+    }
+
+    // Test 3a: RENAME TABLE publishes exactly two events -- table_dropped
+    // (old name) immediately followed by table_created (new name), with
+    // consecutive sequences (spec §2.1).
+    #[tokio::test]
+    async fn test_rename_table_publishes_two_consecutive_events() {
+        let (rel, bus, _dir) = make_engine_with_bus().await;
+        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+        let mut rx = bus.subscribe();
+
+        rel.execute("default", "ALTER TABLE t RENAME TO t2", &[]).await.unwrap();
+
+        let dropped = rx.try_recv().unwrap();
+        let created = rx.try_recv().unwrap();
+        assert_eq!(dropped.kind, "table_dropped");
+        assert_eq!(dropped.object.as_deref(), Some("t"));
+        assert_eq!(created.kind, "table_created");
+        assert_eq!(created.object.as_deref(), Some("t2"));
+        assert_eq!(created.seq, dropped.seq + 1, "must be consecutive sequences");
+        assert!(rx.try_recv().is_err(), "exactly two events, nothing else");
+    }
+
+    // Test 4: a failed DDL (table already exists, view with a dependency,
+    // duplicate domain name) publishes no event; a following successful
+    // statement still publishes normally.
+    #[tokio::test]
+    async fn test_failed_ddl_publishes_no_event() {
+        let (rel, bus, _dir) = make_engine_with_bus().await;
+        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", &[]).await.unwrap();
+        rel.execute("default", "CREATE VIEW v AS SELECT a FROM t", &[]).await.unwrap();
+        let mut rx = bus.subscribe();
+
+        // Table already exists.
+        assert!(rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.is_err());
+        // DROP COLUMN on a column `v` explicitly depends on.
+        assert!(rel.execute("default", "ALTER TABLE t DROP COLUMN a", &[]).await.is_err());
+        // Duplicate domain name.
+        assert!(rel.create_domain("default").await.is_err());
+
+        assert!(rx.try_recv().is_err(), "a failed DDL must publish nothing");
+
+        // A subsequent successful statement still works and publishes normally.
+        rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.kind, "table_created");
+        assert_eq!(event.object.as_deref(), Some("u"));
+    }
+
+    // Test 2 (rel slice): after a purge run, domain_purged appears, after
+    // domain_deleted.
+    #[tokio::test]
+    async fn test_domain_purge_event_published_after_domain_deleted() {
+        let (rel, bus, _dir) = make_engine_with_bus().await;
+        let mut rx = bus.subscribe();
+
+        rel.create_domain("purge-ev").await.unwrap();
+        rx.try_recv().unwrap(); // domain_created, not under test here
+        rel.delete_domain("purge-ev").await.unwrap();
+
+        let purger = RelDomainPurger::new(Arc::clone(&rel), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
+        purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
+
+        let deleted = rx.try_recv().unwrap();
+        assert_eq!(deleted.kind, "domain_deleted");
+        let purged = rx.try_recv().unwrap();
+        assert_eq!(purged.kind, "domain_purged");
+        assert_eq!(purged.domain, "purge-ev");
+    }
+
+    // Test 12 (rel slice): DDL without a bus attached succeeds unchanged, no panic.
+    #[tokio::test]
+    async fn test_rel_ddl_without_event_bus_attached_succeeds_without_panic() {
+        let (rel, _dir) = make_engine().await; // no attach_event_bus call
+        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+        rel.execute("default", "ALTER TABLE t ADD COLUMN a INTEGER", &[]).await.unwrap();
+        rel.execute("default", "DROP TABLE t", &[]).await.unwrap();
     }
 }

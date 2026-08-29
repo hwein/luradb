@@ -5,6 +5,8 @@
 //! - `MetricsTicker`: background task that calls `tick_all()` every second.
 //! - `HeartbeatMetrics`: data returned by `GET /health`.
 //! - `DomainWindowMetrics`: aggregated per-domain window returned by `/metrics`.
+//! - `EngineWindowMetrics`: aggregated per-engine (kv/json/rel) window returned
+//!   by `/metrics` (spec general/019).
 
 pub mod window;
 
@@ -59,9 +61,6 @@ pub struct HeartbeatMetrics {
 pub struct SystemMetrics {
     pub total_reads: AtomicU64,
     pub total_writes: AtomicU64,
-    pub compaction_runs: AtomicU64,
-    pub janitor_runs: AtomicU64,
-    pub memtable_size_bytes: AtomicU64,
     /// Relational DDL counters (spec rel/003).
     pub rel_ddl_create_total: AtomicU64,
     pub rel_ddl_drop_total: AtomicU64,
@@ -111,9 +110,6 @@ impl Default for SystemMetrics {
         Self {
             total_reads: AtomicU64::new(0),
             total_writes: AtomicU64::new(0),
-            compaction_runs: AtomicU64::new(0),
-            janitor_runs: AtomicU64::new(0),
-            memtable_size_bytes: AtomicU64::new(0),
             rel_ddl_create_total: AtomicU64::new(0),
             rel_ddl_drop_total: AtomicU64::new(0),
             rel_frontend_statements_read_total: AtomicU64::new(0),
@@ -162,11 +158,43 @@ pub struct DomainWindowMetrics {
     pub window_secs: u64,
 }
 
+// ── EngineWindowMetrics (spec general/019) ────────────────────────────────────
+
+/// Which storage engine an aggregate op/latency window belongs to; indexes
+/// `MetricsStore::engines`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    Kv = 0,
+    Json = 1,
+    Rel = 2,
+}
+
+/// Per-engine counterpart of `DomainWindowMetrics`: aggregate ops/s and
+/// latency percentiles across all domains of one engine (kv/json/rel), read
+/// and write side by side. No `cache_hit_rate` — engine windows don't track
+/// cache hit/miss.
+#[derive(Serialize)]
+pub struct EngineWindowMetrics {
+    pub read_ops: u64,
+    pub write_ops: u64,
+    pub read_latency_us_p50: u64,
+    pub read_latency_us_p95: u64,
+    pub read_latency_us_p99: u64,
+    pub write_latency_us_p50: u64,
+    pub write_latency_us_p95: u64,
+    pub write_latency_us_p99: u64,
+    pub window_secs: u64,
+}
+
 // ── MetricsStore ──────────────────────────────────────────────────────────────
 
 pub struct MetricsStore {
     pub system: SystemMetrics,
     domains: RwLock<HashMap<String, MetricsWindow>>,
+    /// Per-engine aggregate windows (spec general/019), indexed by
+    /// `EngineKind`. Fixed at construction — no lazy insert, no removal on
+    /// domain deletion — so engine windows outlive individual domains.
+    engines: [MetricsWindow; 3],
     /// Per-rel-domain catalog-object count gauge (spec rel/003).
     rel_catalog_objects: RwLock<HashMap<String, u64>>,
     started_at: u64,
@@ -175,9 +203,11 @@ pub struct MetricsStore {
 
 impl MetricsStore {
     pub fn new(config: MetricsConfig) -> Arc<Self> {
+        let window_secs = config.window_secs as usize;
         Arc::new(Self {
             system: SystemMetrics::default(),
             domains: RwLock::new(HashMap::new()),
+            engines: std::array::from_fn(|_| MetricsWindow::new(window_secs)),
             rel_catalog_objects: RwLock::new(HashMap::new()),
             started_at: now_secs(),
             config,
@@ -355,6 +385,9 @@ impl MetricsStore {
             .or_insert_with(|| MetricsWindow::new(self.config.window_secs as usize));
     }
 
+    /// KV-only (every current call site is `DomainStore`'s read path) —
+    /// also mirrors into the KV engine-aggregate window (spec general/019).
+    /// JSON and rel use `record_engine_read` instead.
     pub fn record_read(&self, domain: &str, latency_us: u64, is_hit: bool) {
         self.system.total_reads.fetch_add(1, Ordering::Relaxed);
         self.ensure_domain(domain);
@@ -362,8 +395,11 @@ impl MetricsStore {
         if let Some(w) = domains.get(domain) {
             w.record_read(latency_us, is_hit);
         }
+        self.engines[EngineKind::Kv as usize].record_read(latency_us, is_hit);
     }
 
+    /// KV-only — see [`Self::record_read`]. JSON and rel use
+    /// `record_engine_write` instead.
     pub fn record_write(&self, domain: &str, latency_us: u64) {
         self.system.total_writes.fetch_add(1, Ordering::Relaxed);
         self.ensure_domain(domain);
@@ -371,6 +407,26 @@ impl MetricsStore {
         if let Some(w) = domains.get(domain) {
             w.record_write(latency_us);
         }
+        self.engines[EngineKind::Kv as usize].record_write(latency_us);
+    }
+
+    /// Records one read op on `kind`'s engine-aggregate window (spec
+    /// general/019) — the JSON/rel counterpart of KV's `record_read`
+    /// mirroring. Engine windows don't track cache hit/miss.
+    pub fn record_engine_read(&self, kind: EngineKind, latency_us: u64) {
+        self.engines[kind as usize].record_read(latency_us, false);
+    }
+
+    /// Records one write op on `kind`'s engine-aggregate window (spec
+    /// general/019).
+    pub fn record_engine_write(&self, kind: EngineKind, latency_us: u64) {
+        self.engines[kind as usize].record_write(latency_us);
+    }
+
+    /// Aggregates the three engine windows, indexed by `EngineKind`
+    /// (`[kv, json, rel]`).
+    pub fn engine_metrics(&self) -> [EngineWindowMetrics; 3] {
+        std::array::from_fn(|i| self.engines[i].aggregate_engine(self.config.window_secs))
     }
 
     pub fn record_rate_limit_rejection(&self, domain: &str) {
@@ -403,6 +459,9 @@ impl MetricsStore {
     pub fn tick_all(&self) {
         let domains = self.domains.read();
         for w in domains.values() {
+            w.tick();
+        }
+        for w in &self.engines {
             w.tick();
         }
     }

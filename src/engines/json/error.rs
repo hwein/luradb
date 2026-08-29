@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum JsonStoreError {
     #[error("document '{key}' not found in domain '{domain}'")]
     DocumentNotFound { domain: String, key: String },
+    #[error("document '{key}' already exists in domain '{domain}'")]
+    DocumentAlreadyExists { domain: String, key: String },
     #[error("domain '{0}' not found")]
     DomainNotFound(String),
     #[error("domain '{0}' is being deleted")]
@@ -29,6 +31,8 @@ pub enum JsonStoreError {
     VersionConflict { expected: String, actual: String },
     #[error("invalid document key: {0}")]
     InvalidKey(String),
+    #[error("field '{field}' is reserved (_key, _version, _content are store metadata)")]
+    ReservedField { field: String },
     #[error("payload of {size} bytes exceeds maximum of {max} bytes")]
     PayloadTooLarge { size: usize, max: usize },
     #[error("serialization error: {0}")]

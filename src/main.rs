@@ -1,8 +1,8 @@
-use axum::{response::Json, routing::get, Router};
+use axum::{middleware::from_fn_with_state, response::Json, routing::get, Router};
 use clap::Parser;
 use crate::{
     api::{ApiDoc, AppState},
-    auth::{reconcile_admins, AuthCache},
+    auth::{middleware::docs_auth_layer, reconcile_admins, AuthCache},
     config::{resolve_config_path, LuraConfig},
     core::{
         buffer_pool::BufferPoolManager,
@@ -16,6 +16,7 @@ use crate::{
         domain::{DomainConfig, DomainPurger, DomainRegistry},
         engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine},
         janitor::JanitorConfig,
+        ttl_sweeper::TtlSweeper,
     },
     engines::rel::RelEngine,
     ipc::ShmManager,
@@ -35,6 +36,7 @@ pub mod auth;
 pub mod backup;
 pub mod config;
 pub mod core;
+pub mod cors;
 pub mod engines;
 pub mod ipc;
 pub mod logging;
@@ -99,6 +101,7 @@ fn build_engine_configs(
         compaction_check_interval_ms: cfg.lsm.compaction_check_interval_ms,
         wal_event_channel_capacity: cfg.lsm.wal_event_channel_capacity,
         use_mmap: cfg.lsm.use_mmap,
+        watch_replay_buffer_size: cfg.lsm.watch_replay_buffer_size,
     };
     let compaction_config = CompactionConfig {
         l0_compaction_threshold: cfg.compaction.l0_threshold,
@@ -121,6 +124,7 @@ fn build_engine_configs(
         default_max_storage_bytes: cfg.rate_limit.default_max_storage_bytes,
         purger_batch_size: cfg.domains.purger_batch_size,
         purger_interval_secs: cfg.domains.purger_interval_secs,
+        max_bulk_delete_keys: cfg.domains.max_bulk_delete_keys,
     };
     let metrics_config = MetricsConfig {
         window_secs: cfg.metrics.window_secs,
@@ -203,10 +207,10 @@ async fn init_io_engine(
 }
 
 // --- JSON engine (dedicated second LSM instance) ---
-async fn init_json_engine(cfg: &LuraConfig) -> anyhow::Result<Option<Arc<JsonEngine>>> {
+async fn init_json_engine(cfg: &LuraConfig, metrics: &Arc<MetricsStore>) -> anyhow::Result<Option<Arc<JsonEngine>>> {
     if cfg.json.enabled {
         cfg.json.validate_paths(&cfg.storage)?;
-        let engine = JsonEngine::bootstrap(&cfg.json).await?;
+        let engine = JsonEngine::bootstrap(&cfg.json, Arc::clone(metrics)).await?;
         tracing::info!("JSON engine ready.");
         Ok(Some(engine))
     } else {
@@ -329,6 +333,18 @@ fn spawn_background_tasks(
     ));
     tokio::spawn(async move { purger.run().await });
 
+    // --- TTL sweeper (background, spec kv/025 §6) ---
+    // KV only: JSON and rel never write an `expire_at`.
+    if cfg.ttl_sweeper.enabled {
+        let sweeper = Arc::new(TtlSweeper::new(
+            Arc::clone(lsm_store),
+            Arc::clone(&shutdown_flag),
+            cfg.ttl_sweeper.batch_size,
+            cfg.ttl_sweeper.interval_secs,
+        ));
+        tokio::spawn(async move { sweeper.run().await });
+    }
+
     // --- JSON domain purger (background) ---
     if let Some(engine) = json_engine {
         let json_purger = Arc::new(crate::engines::json::JsonDomainPurger::new(
@@ -416,6 +432,10 @@ async fn start_shm(
         let dispatcher = ipc::ShmDispatcher::new(Arc::clone(registry));
         let dispatcher_task = tokio::spawn(dispatcher.run(events_rx, shutdown_rx.clone()));
 
+        // Reader slots of the registered clients (spec perf/012): the
+        // registration listener leases them, the publisher scans them.
+        let readers = Arc::new(ipc::ReaderRegistry::new());
+
         // RCU read-snapshot publisher (spec perf/009): rebuilds the SHM
         // double-buffer snapshot on an interval and after every flush.
         // Spawned on the tokio-uring executor since SnapshotWriter is !Send.
@@ -428,6 +448,7 @@ async fn start_shm(
             Arc::clone(shm_manager.as_ref().expect("shm_manager present when shm.enabled")),
             std::time::Duration::from_millis(cfg.shm.snapshot_interval_ms),
             ipc::PUBLISH_WAIT_TIMEOUT_US,
+            Arc::clone(&readers),
             lsm_store.flush_notify(),
             shutdown_rx.clone(),
         );
@@ -443,6 +464,7 @@ async fn start_shm(
             segment_mode: cfg.shm.segment_mode,
             auth_enabled: cfg.auth.enabled,
             trusted_uids: Arc::new(cfg.auth.trusted_uids.clone()),
+            readers,
         };
         let reg_task = tokio::spawn(ipc::serve_registration(listener, reg_config, events_tx, shutdown_rx));
         tracing::info!("SHM registration listener active on {reg_path}");
@@ -474,10 +496,20 @@ fn build_router(cfg: &LuraConfig, state: AppState, trusted_cidrs: Arc<Vec<crate:
     let mut app = Router::new();
 
     if cfg.server.swagger_enabled {
-        app = app.merge(
+        // Swagger UI is registered here, not inside api::create_router, so it
+        // needs its own auth layer (spec general/014) — the general/009
+        // router-contract gate would otherwise trip on docs routes with no
+        // contract entry. `docs_auth_layer` wraps this whole sub-router, so
+        // every path SwaggerUi registers under `swagger_url` (index, redirect,
+        // static assets) is covered without listing them individually.
+        let mut docs_router = Router::new().merge(
             SwaggerUi::new(cfg.server.swagger_url.clone())
                 .url("/api-docs/openapi.json", ApiDoc::openapi()),
         );
+        if cfg.auth.enabled {
+            docs_router = docs_router.layer(from_fn_with_state(Arc::clone(&state.auth_cache), docs_auth_layer));
+        }
+        app = app.merge(docs_router);
     }
 
     if cfg.server.hello_enabled {
@@ -486,6 +518,19 @@ fn build_router(cfg: &LuraConfig, state: AppState, trusted_cidrs: Arc<Vec<crate:
     }
 
     app = app.merge(api::create_router(state, trusted_cidrs));
+
+    // Outermost layer (spec general/020 §Platzierung): runs before auth on
+    // every request, including Swagger/hello above, which live outside
+    // create_router and would otherwise miss it.
+    if let Some(cors) = cors::build_layer(&cfg.cors) {
+        if cfg.cors.allowed_origins.iter().any(|o| o == "*") {
+            tracing::warn!(
+                "cors.allowed_origins is \"*\" — Access-Control-Allow-Origin is sent on every response, including requests without an Origin header. A valid API key is still required for access."
+            );
+        }
+        app = app.layer(cors);
+    }
+
     app
 }
 
@@ -611,14 +656,29 @@ fn main() -> anyhow::Result<()> {
     config.server.validate()?;
     config.log.validate()?;
     config.backup.validate(&config.storage, &config.json, &config.rel)?;
+    config.auth.validate(&config.server)?;
+    config.cors.validate()?;
+    config.lsm.validate("lsm")?;
+    config.json.lsm.validate("json.lsm")?;
+    config.rel.lsm.validate("rel.lsm")?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {
         tracing::info!("Starting LuraDB...");
-        if config_path.exists() {
+        let config_file_loaded = config_path.exists();
+        if config_file_loaded {
             tracing::info!("Config loaded from {}", config_path.display());
         } else {
             tracing::info!("No config file found at {}, using defaults", config_path.display());
+        }
+        // `config.auth.validate` already rejected a non-loopback bind above,
+        // so reaching here with auth disabled means the dev-mode loopback
+        // case (spec general/013) — allowed, but not silent.
+        if !config.auth.enabled {
+            tracing::warn!(
+                "auth.enabled is false — the server is unauthenticated. Allowed only because server.bind_address ({}) is loopback-only.",
+                config.server.bind_address
+            );
         }
 
         let (engine_config, compaction_config, janitor_config, domain_config, metrics) =
@@ -694,8 +754,24 @@ fn main() -> anyhow::Result<()> {
         );
         tracing::info!("Domain registry recovered.");
 
-        let json_engine = init_json_engine(&config).await?;
+        let json_engine = init_json_engine(&config, &metrics).await?;
         let rel_engine = init_rel_engine(&config, &registry, &json_engine, &metrics).await?;
+
+        // --- Global event bus (spec general/018 §1) --- attached before the
+        // purgers are spawned and before the listener accepts requests: a
+        // finalize_* running against an unattached bus would silently drop
+        // its domain_purged event, which is exactly what this ordering avoids.
+        let event_bus = Arc::new(crate::core::events::GlobalEventBus::new(
+            config.events.channel_capacity,
+            config.events.replay_buffer_size,
+        ));
+        registry.attach_event_bus(Arc::clone(&event_bus));
+        if let Some(engine) = &json_engine {
+            engine.attach_event_bus(Arc::clone(&event_bus));
+        }
+        if let Some(engine) = &rel_engine {
+            engine.attach_event_bus(Arc::clone(&event_bus));
+        }
 
         let shutdown_flag = spawn_background_tasks(
             &config,
@@ -736,6 +812,10 @@ fn main() -> anyhow::Result<()> {
             shm_manager: shm_manager.clone(),
             backup_manager,
             log_access,
+            event_bus,
+            config: Arc::clone(&config),
+            config_path: config_path.display().to_string(),
+            config_file_loaded,
         };
         let app = build_router(&config, state, trusted_cidrs);
 
@@ -777,4 +857,114 @@ fn main() -> anyhow::Result<()> {
 
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::util::ServiceExt;
+
+    async fn make_test_state(auth_enabled: bool) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
+        let fm = Arc::new(crate::storage::file_manager::FileManager::new(dir.path()).await.unwrap());
+        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(dir.path()));
+        let engine = Arc::new(
+            crate::engines::lsm::engine::LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, fm, mm,
+                crate::engines::lsm::engine::LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let registry = Arc::new(
+            crate::engines::lsm::DomainRegistry::recover(
+                engine,
+                crate::engines::lsm::domain::DomainConfig::default(),
+                Arc::clone(&metrics),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = AppState {
+            registry,
+            auth_cache,
+            auth_enabled,
+            metrics,
+            json_engine: None,
+            rel_engine: None,
+            shm_manager: None,
+            backup_manager: None,
+            log_access: None,
+            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
+        };
+        (state, dir)
+    }
+
+    // Test 10 (spec general/020 §Tests): the CorsLayer must sit outside both
+    // create_router's auth_layer AND the Swagger sub-router's
+    // docs_auth_layer. Regression-critical: if the layer moved inward (e.g.
+    // into create_router), a request to the Swagger docs route would never
+    // reach it — docs_auth_layer would 401 first, with no CORS header.
+    #[tokio::test]
+    async fn cors_layer_wraps_swagger_and_survives_401() {
+        let mut cfg = LuraConfig::default();
+        cfg.server.swagger_enabled = true;
+        cfg.auth.enabled = true;
+        cfg.cors.enabled = true;
+        cfg.cors.allowed_origins = vec!["https://example.com".to_string()];
+
+        let (state, _dir) = make_test_state(true).await;
+        let app = build_router(&cfg, state, Arc::new(vec![]));
+
+        // (a) Preflight without Authorization -> 200 with the CORS header,
+        // even though this path sits behind docs_auth_layer.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api-docs/openapi.json")
+                    .header("origin", "https://example.com")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://example.com"
+        );
+
+        // (b) GET with an allowed Origin but no Authorization -> 401 from
+        // docs_auth_layer, but still carrying the CORS header — proof the
+        // layer sits outside that auth check, not inside it.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api-docs/openapi.json")
+                    .header("origin", "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://example.com"
+        );
+    }
 }

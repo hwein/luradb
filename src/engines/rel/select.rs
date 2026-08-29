@@ -9,7 +9,7 @@
 
 use super::ast::{Limit, OrderItem, Select, SelectItem};
 use super::catalog::{CatalogEntry, TableSchema};
-use super::cross_engine::LinkMask;
+use super::cross_engine::{LinkAuth, LinkMask};
 use super::dml::{accepted_quals, resolve_column};
 use super::error::RelStoreError;
 use super::eval::{eval, Bool3, Pred};
@@ -122,7 +122,7 @@ impl<S: RowSource + Send> RowSource for Filter<S> {
                 match self.input.next().await? {
                     None => return Ok(None),
                     Some(row) => {
-                        let keep = matches!(eval(&self.pred, &flatten(&row.bindings)), Bool3::True);
+                        let keep = matches!(eval(&self.pred, &flatten(&row.bindings))?, Bool3::True);
                         if keep {
                             return Ok(Some(row));
                         }
@@ -302,17 +302,26 @@ impl RowPipeline {
 /// ascending key order (byte order == value order, spec §3/§5), plus the
 /// number of underlying LSM keys visited (I/O-budget metric, §9).
 ///
-/// `fast_limit_cap`: only consulted for `AccessPath::FullScan` — the
-/// `scan_keys_limited` shortcut is sound *only* for "full scan, no residual,
-/// no ORDER BY, LIMIT set" (spec §6); its caller enforces that. Every other
-/// path (and every other case of FullScan) must see the full, correctly
-/// ordered key set, so it always uses plain `scan_keys`.
+/// Every branch reads *at* `snapshot` (spec rel/018): a row deleted after
+/// the snapshot was taken still yields its key here, just like a point read
+/// via `get_with_snapshot` would still find it — candidate acquisition and
+/// row fetch now agree on the same point in time on every access path.
+///
+/// `fast_limit`: only consulted for `AccessPath::FullScan` — the
+/// `scan_keys_limited_with_snapshot` shortcut is sound *only* for "full
+/// scan, no residual, no ORDER BY, LIMIT set" (spec §6); its caller enforces
+/// that. The cap counts only snapshot-visible keys (spec rel/014), so a key
+/// that only starts existing after the snapshot can never occupy one of the
+/// capped slots. Every other case of FullScan (and every other path) sees
+/// the full, correctly ordered, snapshot-visible key set via
+/// `scan_keys_with_snapshot`.
 pub(super) async fn resolve_candidate_keys(
     engine: &Arc<LsmStorageEngine>,
     schema: &TableSchema,
     prefix: &[u8],
     access: &AccessPath,
-    fast_limit_cap: Option<usize>,
+    snapshot: &Snapshot,
+    fast_limit: Option<usize>,
 ) -> Result<(Vec<Vec<u8>>, u64), RelStoreError> {
     match access {
         AccessPath::PkPoint(value) => {
@@ -324,7 +333,7 @@ pub(super) async fn resolve_candidate_keys(
         }
         AccessPath::PkRange(bounds) => {
             let row_prefix = keys::row_table_prefix(prefix, schema.table_id);
-            let all = engine.scan_keys(&row_prefix).await?;
+            let all = engine.scan_keys_with_snapshot(&row_prefix, snapshot).await?;
             let n = all.len() as u64;
             let out = all
                 .into_iter()
@@ -335,7 +344,7 @@ pub(super) async fn resolve_candidate_keys(
         AccessPath::PkPrefix(literal) => {
             let mut scan_prefix = keys::row_table_prefix(prefix, schema.table_id);
             scan_prefix.extend_from_slice(&encode_text_prefix(literal));
-            let hits = engine.scan_keys(&scan_prefix).await?;
+            let hits = engine.scan_keys_with_snapshot(&scan_prefix, snapshot).await?;
             let n = hits.len() as u64;
             Ok((hits, n))
         }
@@ -344,7 +353,7 @@ pub(super) async fn resolve_candidate_keys(
                 return Ok((Vec::new(), 0));
             };
             let scan_prefix = keys::index_value_prefix(prefix, index.index_id, &val_enc);
-            let hits = engine.scan_keys(&scan_prefix).await?;
+            let hits = engine.scan_keys_with_snapshot(&scan_prefix, snapshot).await?;
             let n = hits.len() as u64;
             let row_keys = hits
                 .iter()
@@ -355,7 +364,7 @@ pub(super) async fn resolve_candidate_keys(
         AccessPath::IndexRange { index, bounds } => {
             let phys = index_column_physical_type(schema, index);
             let scan_prefix = keys::index_value_prefix(prefix, index.index_id, &[]);
-            let all = engine.scan_keys(&scan_prefix).await?;
+            let all = engine.scan_keys_with_snapshot(&scan_prefix, snapshot).await?;
             let n = all.len() as u64;
             let mut out = Vec::new();
             for k in &all {
@@ -371,7 +380,7 @@ pub(super) async fn resolve_candidate_keys(
             let value_prefix = keys::index_value_prefix(prefix, index.index_id, &[]);
             let mut scan_prefix = value_prefix.clone();
             scan_prefix.extend_from_slice(&encode_text_prefix(literal));
-            let hits = engine.scan_keys(&scan_prefix).await?;
+            let hits = engine.scan_keys_with_snapshot(&scan_prefix, snapshot).await?;
             let n = hits.len() as u64;
             let row_keys = hits
                 .iter()
@@ -385,9 +394,9 @@ pub(super) async fn resolve_candidate_keys(
         }
         AccessPath::FullScan => {
             let row_prefix = keys::row_table_prefix(prefix, schema.table_id);
-            let all = match fast_limit_cap {
-                Some(cap) => engine.scan_keys_limited(&row_prefix, cap).await?,
-                None => engine.scan_keys(&row_prefix).await?,
+            let all = match fast_limit {
+                Some(cap) => engine.scan_keys_limited_with_snapshot(&row_prefix, cap, snapshot).await?,
+                None => engine.scan_keys_with_snapshot(&row_prefix, snapshot).await?,
             };
             let n = all.len() as u64;
             Ok((all, n))
@@ -575,6 +584,7 @@ impl RelEngine {
         domain: &str,
         sel: Select,
         params: &[Value],
+        auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
         // View-inlining pre-stage (spec rel/008 §1/§4): replaces every FROM/JOIN
         // view reference with its definition, recursively, *before* the rest of
@@ -582,7 +592,7 @@ impl RelEngine {
         // select touching no view pays nothing (returns `sel` unchanged).
         let sel = super::view::inline_views(self, domain, sel)?;
         if !sel.joins.is_empty() {
-            return self.exec_select_joined(domain, sel, params).await;
+            return self.exec_select_joined(domain, sel, params, auth).await;
         }
         let dom = self.domains.require_active(domain)?;
         let schema = match self.catalog.get(&self.domains, domain, &sel.from.name) {
@@ -608,7 +618,7 @@ impl RelEngine {
 
         // One registry lookup per query (spec rel/012 §3), reused for the
         // planner guard and the RowScan materialization.
-        let mask = self.compute_link_mask(domain, &[&schema]).await?;
+        let mask = self.compute_link_mask(domain, &[&schema], auth).await?;
 
         if sel.items.len() == 1 && matches!(sel.items[0], SelectItem::CountStar) {
             return self.exec_count(&schema, &prefix, &sel, &quals, params, mask).await;
@@ -627,16 +637,16 @@ impl RelEngine {
         let fast_cap = use_fast_limit.then(|| (offset + limit + 1) as usize);
 
         // Register the snapshot *before* scanning for candidate keys (spec
-        // §2): `scan_keys` is unsnapshotted (live-at-call-time), so a row
-        // that only starts existing after the snapshot but before the scan
-        // would otherwise never be reachable as a "ghost" — registering
-        // first guarantees the snapshot can only be *older than or equal to*
-        // what the scan sees, matching `acquire_candidates` (dml.rs).
+        // rel/018 §4): every branch below reads *at* this snapshot
+        // (`scan_keys_with_snapshot`), so what registering first buys is a
+        // stable read horizon — the guard must stay alive across the whole
+        // scan+fetch episode so compaction/GC cannot advance past a version
+        // this snapshot still needs, matching `acquire_candidates` (dml.rs).
         let snapshot_guard = self.engine.snapshot();
         let snap = snapshot_guard.snapshot().clone();
 
         let (mut row_keys, scanned) =
-            resolve_candidate_keys(&self.engine, &schema, &prefix, &plan.access, fast_cap).await?;
+            resolve_candidate_keys(&self.engine, &schema, &prefix, &plan.access, &snap, fast_cap).await?;
         if !order_by.is_empty() && plan.order_free && plan.order_desc {
             row_keys.reverse();
         }
@@ -710,12 +720,13 @@ impl RelEngine {
         mask: LinkMask,
     ) -> Result<ExecOutcome, RelStoreError> {
         let plan = plan::plan_access(schema, &sel.where_clause, quals, params, &[], mask)?;
-        // Registered before the key scan even though the no-residual path
-        // below never uses it — see the identical note in `exec_select`.
+        // Registered before the key scan (spec rel/018 §2): every branch
+        // below, including the no-residual key-count path, now reads at
+        // this snapshot — see the identical note in `exec_select`.
         let snapshot_guard = self.engine.snapshot();
         let snap = snapshot_guard.snapshot().clone();
         let (row_keys, scanned) =
-            resolve_candidate_keys(&self.engine, schema, prefix, &plan.access, None).await?;
+            resolve_candidate_keys(&self.engine, schema, prefix, &plan.access, &snap, None).await?;
         self.metrics.record_rel_select_scanned_keys(scanned);
 
         let n: i64 = match plan.residual {
@@ -744,7 +755,7 @@ impl RelEngine {
                 };
                 let mut count = 0i64;
                 while let Some(row) = scan.next().await? {
-                    if matches!(eval(&pred, &row.bindings[0].values), Bool3::True) {
+                    if matches!(eval(&pred, &row.bindings[0].values)?, Bool3::True) {
                         count += 1;
                     }
                 }
@@ -768,6 +779,7 @@ impl RelEngine {
 mod tests {
     use super::*;
     use crate::config::RelStoreConfig;
+    use crate::engines::lsm::engine::BatchOp;
     use crate::metrics::{MetricsConfig, MetricsStore};
     use std::sync::atomic::Ordering;
 
@@ -1258,5 +1270,206 @@ mod tests {
         let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE 3 >= id").await.rows, 0);
         got.sort();
         assert_eq!(got, vec![1, 2, 3], "flip_op(GtEq)=LtEq: '3 >= id' means id <= 3");
+    }
+
+    // 25. Spec rel/014 §5 (wiring regression): a table with generous headroom
+    // over LIMIT (comfortably >= limit + 1 committed rows) must keep
+    // returning a full page under concurrent inserts of early-sorting rows.
+    // The deterministic proof that ghosts never occupy a cap slot is engine
+    // test 1 (engine.rs); this only proves the rel-level wiring doesn't
+    // regress under real interleaving. Bounded, no tight timing window as
+    // the test condition (general/008-line): any short page or `false` here
+    // is a genuine bug, not a flake.
+    #[tokio::test]
+    async fn test_fast_limit_snapshot_consistent_under_concurrent_inserts() {
+        let (rel, _d) = make().await;
+        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+        // Baseline PKs (1000..1020) sort after every concurrently-inserted
+        // row below, and comfortably exceed limit(10) + 1.
+        for i in 1000..1020 {
+            ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
+        }
+
+        let writer = Arc::clone(&rel);
+        let inserter = tokio::spawn(async move {
+            // Early-sorting PKs: a ghost landing in the capped scan window
+            // must never displace a real row.
+            for i in 0..50 {
+                writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
+            assert_eq!(s.rows.len(), 10, "a concurrent insert must never shrink a full LIMIT page");
+            assert!(s.limit_applied, "more rows exist past LIMIT -- must stay true under concurrent inserts");
+        }
+        inserter.await.unwrap();
+    }
+
+    // 26. Spec rel/014 §6 (limit_applied discriminator): exactly `limit + 1`
+    // committed rows -- the minimal count for which `limit_applied = true`
+    // is correct -- racing concurrent early-sorting inserts. This is the
+    // exact configuration that used to separate old from new: the old
+    // unsnapshotted cap would either lose the "+1 probe" to a ghost slot
+    // (limit_applied wrongly false) or lose a real row to one (a short
+    // page); the snapshot-capped scan must get both fields right every time.
+    #[tokio::test]
+    async fn test_fast_limit_snapshot_correct_at_minimal_visible_plus_ghosts() {
+        let (rel, _d) = make().await;
+        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+        // Exactly limit(10) + 1 committed rows -- zero headroom in the cap.
+        for i in 1000..1011 {
+            ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
+        }
+
+        let writer = Arc::clone(&rel);
+        let inserter = tokio::spawn(async move {
+            for i in 0..50 {
+                writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+            }
+        });
+
+        for _ in 0..50 {
+            let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
+            assert_eq!(s.rows.len(), 10, "the minimal +1 row must never be displaced by a ghost slot");
+            assert!(s.limit_applied, "the +1 probe must never be lost to a ghost slot");
+        }
+        inserter.await.unwrap();
+    }
+
+    // 27. Spec rel/018 §Test 1 (delete side, Full Scan): a key deleted
+    // *after* the snapshot was taken must still be a candidate -- the
+    // engine-level delete mirrors a concurrent DELETE racing the SELECT's
+    // snapshot registration. Direct unit test against the function, no HTTP
+    // (the deterministic engine-level proof is rel/014 engine test 2; this
+    // only proves the rel-level wiring passes the snapshot through).
+    #[tokio::test]
+    async fn test_resolve_candidate_keys_full_scan_sees_snapshot_deleted_row() {
+        let (rel, _d) = make().await;
+        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+        ok(&rel, "INSERT INTO t VALUES (1), (2)").await;
+
+        let snapshot_guard = rel.engine().snapshot();
+        let snap = snapshot_guard.snapshot().clone();
+
+        let prefix = rel.get_domain("default").unwrap().system_prefix;
+        let schema = match rel.get_object("default", "t").unwrap() {
+            CatalogEntry::Table(t) => t,
+            _ => unreachable!(),
+        };
+        let key1 = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
+        // Engine-level delete (tombstone), bypassing the DML write path --
+        // the same effect a concurrent `DELETE FROM t WHERE id = 1` has on
+        // the live key set.
+        rel.engine().write_batch(vec![BatchOp::Delete { key: key1.clone() }]).await.unwrap();
+
+        let (row_keys, _scanned) =
+            resolve_candidate_keys(rel.engine(), &schema, &prefix, &AccessPath::FullScan, &snap, None)
+                .await
+                .unwrap();
+        assert!(row_keys.contains(&key1), "a key deleted after the snapshot must remain a candidate");
+    }
+
+    // 28. Spec rel/018 §Test 2 (delete side, index branches): a concurrent
+    // UPDATE of an indexed column tombstones the *old* IDX entry, not the
+    // ROW key -- a live index scan loses the row even though its snapshot
+    // version (the old value) still satisfies the predicate.
+    // IndexPoint/IndexRange/IndexPrefix must still return it when resolved
+    // at the snapshot; a fresh (post-tombstone) snapshot must not (Gegenprobe:
+    // proves the difference is the snapshot, not a scan bug).
+    #[tokio::test]
+    async fn test_resolve_candidate_keys_index_paths_see_snapshot_deleted_index_entry() {
+        let (rel, _d) = make().await;
+        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER, name TEXT)").await;
+        ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
+        ok(&rel, "CREATE INDEX idx_name ON t (name)").await;
+        ok(&rel, "INSERT INTO t VALUES (1, 5, 'alice')").await;
+
+        let prefix = rel.get_domain("default").unwrap().system_prefix;
+        let schema = match rel.get_object("default", "t").unwrap() {
+            CatalogEntry::Table(t) => t,
+            _ => unreachable!(),
+        };
+        let idx_tag = schema.indexes.iter().find(|ix| ix.column == "tag").unwrap().clone();
+        let idx_name = schema.indexes.iter().find(|ix| ix.column == "name").unwrap().clone();
+        let row_key = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
+
+        // Read back the real on-disk IDX-entry bytes (rather than
+        // re-deriving them) so the tombstone below hits exactly what
+        // INSERT wrote.
+        let tag_scan_prefix = keys::index_value_prefix(&prefix, idx_tag.index_id, &[]);
+        let tag_idx_key = rel.engine().scan_keys(&tag_scan_prefix).await.unwrap().into_iter().next().unwrap();
+        let name_scan_prefix = keys::index_value_prefix(&prefix, idx_name.index_id, &[]);
+        let name_idx_key = rel.engine().scan_keys(&name_scan_prefix).await.unwrap().into_iter().next().unwrap();
+
+        let snapshot_guard = rel.engine().snapshot();
+        let snap = snapshot_guard.snapshot().clone();
+
+        // Simulates a concurrent UPDATE moving `tag`/`name` off their
+        // indexed values: only the IDX entries vanish, the ROW key doesn't.
+        rel.engine()
+            .write_batch(vec![
+                BatchOp::Delete { key: tag_idx_key },
+                BatchOp::Delete { key: name_idx_key },
+            ])
+            .await
+            .unwrap();
+
+        let (point, _) = resolve_candidate_keys(
+            rel.engine(),
+            &schema,
+            &prefix,
+            &AccessPath::IndexPoint { index: idx_tag.clone(), value: ScalarValue::Integer(5) },
+            &snap,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(point, vec![row_key.clone()], "IndexPoint must still see the snapshot-visible entry");
+
+        let (range, _) = resolve_candidate_keys(
+            rel.engine(),
+            &schema,
+            &prefix,
+            &AccessPath::IndexRange {
+                index: idx_tag.clone(),
+                bounds: RangeBounds { lower: Some((ScalarValue::Integer(0), true)), upper: None },
+            },
+            &snap,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(range, vec![row_key.clone()], "IndexRange must still see the snapshot-visible entry");
+
+        let (prefix_hits, _) = resolve_candidate_keys(
+            rel.engine(),
+            &schema,
+            &prefix,
+            &AccessPath::IndexPrefix { index: idx_name, prefix: "ali".to_string() },
+            &snap,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prefix_hits, vec![row_key], "IndexPrefix must still see the snapshot-visible entry");
+
+        // Gegenprobe: a fresh snapshot taken after the tombstone must NOT
+        // see the vanished index entry -- proves the assertions above
+        // exercise the snapshot, not a scan that ignores deletes outright.
+        let now_guard = rel.engine().snapshot();
+        let now_snap = now_guard.snapshot().clone();
+        let (point_now, _) = resolve_candidate_keys(
+            rel.engine(),
+            &schema,
+            &prefix,
+            &AccessPath::IndexPoint { index: idx_tag, value: ScalarValue::Integer(5) },
+            &now_snap,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(point_now.is_empty(), "a current snapshot must not see the tombstoned index entry");
     }
 }

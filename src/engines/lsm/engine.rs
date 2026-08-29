@@ -15,21 +15,23 @@ use crate::engines::lsm::compaction::{
 };
 use crate::engines::lsm::janitor::{FlushBarrier, Janitor, JanitorConfig};
 use crate::engines::lsm::hlc::HybridLogicalClock;
-use crate::engines::lsm::watcher::{OpType, WalEvent};
+use crate::engines::lsm::watcher::{OpType, WalEvent, WATCH_TAG};
 use crate::engines::StorageEngine;
+use crate::core::events::{stream_epoch, Resume, SeqRing};
 use crate::core::io_engine::IoEngine;
 use crate::core::storage_thread::StorageHandle;
 use crate::core::wal::WriteAheadLog;
 use crate::storage::vlog::{discover_generations, generation_path, VLog, VLogError, VLogRegistry};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
+use crate::storage::format::VersionState;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use tokio::sync::{broadcast, Notify};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use tokio::sync::{broadcast, watch, Notify};
 use tokio::time::{sleep, Duration};
 
 // Default limits — kept as constants so tests can reference them directly.
@@ -57,6 +59,11 @@ pub struct LsmEngineConfig {
     pub wal_event_channel_capacity: usize,
     /// Access SSTables via mmap instead of loading them fully (perf/003).
     pub use_mmap: bool,
+    /// Capacity of the KV watch replay ring (spec kv/024 §3). `0` disables
+    /// resume (every reconnect with a `Last-Event-ID` gets `reset`), but
+    /// `id:` fields are still assigned. json/rel set this to `0` — they have
+    /// no watch endpoint.
+    pub watch_replay_buffer_size: usize,
 }
 
 impl Default for LsmEngineConfig {
@@ -70,6 +77,7 @@ impl Default for LsmEngineConfig {
             compaction_check_interval_ms: 1_000,
             wal_event_channel_capacity: 256,
             use_mmap: true,
+            watch_replay_buffer_size: 1024,
         }
     }
 }
@@ -178,12 +186,31 @@ async fn append_to_active(vlog: &VLogRegistry, value: &[u8]) -> Result<(u32, u64
 
 /// True if `value` is neither TTL-expired at `now` nor a tombstone.
 fn is_live_version(value: &Value, now: u64) -> bool {
-    let expired = match value {
-        Value::Inline(_, Some(exp)) => *exp <= now,
-        Value::Pointer { expire_at: Some(exp), .. } => *exp <= now,
-        _ => false,
-    };
-    !expired && !matches!(value, Value::Tombstone)
+    value.version_state(now) == VersionState::Live
+}
+
+/// Entries the expiry scan checks between two yield points (spec kv/025 §7).
+const SCAN_EXPIRED_YIELD_INTERVAL: usize = 1024;
+
+/// Counts one checked entry and hands the worker back every
+/// [`SCAN_EXPIRED_YIELD_INTERVAL`] entries (spec kv/025 §7) — the SSTable
+/// phase is synchronous and would otherwise block a worker for a whole file.
+async fn scan_expired_yield(checked: &mut usize) {
+    *checked += 1;
+    if *checked % SCAN_EXPIRED_YIELD_INTERVAL == 0 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Adds `key` and drops the largest entry once the set exceeds `limit`, so it
+/// always holds the `limit` smallest candidates seen — independent of the
+/// order the sources deliver them in (spec kv/025 §3). Memory is
+/// O(`batch_size`), never O(keys of the instance).
+fn push_expired_candidate(candidates: &mut BTreeSet<Vec<u8>>, limit: usize, key: Vec<u8>) {
+    candidates.insert(key);
+    if candidates.len() > limit {
+        candidates.pop_last();
+    }
 }
 
 /// Sweeps one SSTable for keys with `prefix` (see [`scan_memtable_for_prefix`]
@@ -253,11 +280,35 @@ pub struct LsmStorageEngine {
     /// Broadcast channel for WAL-confirmed write events (Watch feature).
     change_tx: broadcast::Sender<WalEvent>,
 
+    /// Sequences every `change_tx` event and keeps a bounded replay ring for
+    /// the KV watch resume protocol (spec kv/024 §2).
+    watch_log: SeqRing<WalEvent>,
+
     /// Signals background tasks to stop.
     shutdown: Arc<AtomicBool>,
 
+    /// Wakes background loops immediately on shutdown instead of leaving them
+    /// to sleep out their poll interval (M2) — `watch::Receiver::changed` has
+    /// no lost-wakeup between a loop's flag check and going to sleep, unlike
+    /// `Notify::notify_waiters`.
+    shutdown_tx: watch::Sender<bool>,
+
+    /// Handles of the three background loops; joined by [`Self::shutdown`]
+    /// before it touches MemTables/WAL (M1).
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+
     /// S3-FIFO block cache shared across all read operations.
     block_cache: Arc<Mutex<BlockCache>>,
+
+    /// Number of successfully completed `compact_next_level` calls since
+    /// process start (spec general/024) -- `/metrics` system block.
+    compaction_runs: AtomicU64,
+
+    /// Number of Janitor GC cycles that actually ran (`GcStats::ran == true`)
+    /// since process start (spec general/024) -- `/metrics` system block.
+    /// `Arc` because the Janitor is built as its own object and carries this
+    /// counter into its background task.
+    janitor_runs: Arc<AtomicU64>,
 
     /// Storage thread handle (perf/005). When set, `flush_memtable` writes
     /// SSTables through it and the Janitor reopens the VLog through it after GC.
@@ -267,14 +318,19 @@ pub struct LsmStorageEngine {
     /// (spec perf/009 §4) rebuilds on this event in addition to its interval.
     flush_notify: Arc<Notify>,
 
-    /// In-flight guard for the vLog-pointer-creating write sequence (spec
-    /// kv/020). Writers hold the `read()` side from the active-generation
-    /// fetch through `memtable.set`; the Janitor's flush barrier drains by
-    /// taking `write()` once and dropping it immediately. `tokio::sync::RwLock`
-    /// is task-fair (write-preferring), so the drain waits only for guards
-    /// already in flight, never for ones started after it — no starvation
-    /// under sustained write load, and no deadlock: the drain holds no other
-    /// lock a writer needs while it waits.
+    /// In-flight guard for the client write sequence (spec kv/020, widened by
+    /// kv/029). Every client write path holds the `read()` side from before its
+    /// timestamp through `memtable.set`; every production MemTable rotation
+    /// drains by taking `write()` and holding it across the swap. Two
+    /// guarantees follow: no vLog pointer into a generation the Janitor just
+    /// sealed is still on its way into a MemTable (kv/020), and no rotation
+    /// falls between a writer's stamp and its apply, which would strand an
+    /// older stamp in the newer MemTable (kv/029). `tokio::sync::RwLock` is
+    /// task-fair (write-preferring), so a drain waits only for guards already
+    /// in flight, never for ones started after it — no starvation under
+    /// sustained write load, and no deadlock: the drain holds no other lock a
+    /// writer needs while it waits, and no write path drains while holding its
+    /// own read guard.
     in_flight_writes: tokio::sync::RwLock<()>,
 }
 
@@ -299,16 +355,27 @@ impl LsmStorageEngine {
         let vlog = Self::build_vlog_registry(vlog, &vlog_path).await?;
 
         // Recover the MemTable from the WAL first.
-        let recovered = Self::recover_from_wal(&wal_path, &vlog, engine_config.vlog_inline_threshold).await?;
+        let (recovered, wal_max_ts) =
+            Self::recover_from_wal(&wal_path, &vlog, engine_config.vlog_inline_threshold).await?;
 
         let level_manager = Arc::new(LevelManager::new());
         let manifest = manifest_manager.load().await?;
+
+        // High-water mark of everything already persisted (spec kv/026 M3).
+        let manifest_max_ts = manifest
+            .levels
+            .iter()
+            .flatten()
+            .map(|meta| meta.max_timestamp)
+            .max()
+            .unwrap_or(0);
 
         // Then, recover SSTable levels from the manifest.
         Self::recover_sstables(&manifest, &file_manager, &level_manager, engine_config.use_mmap)
             .await?;
 
         let (change_tx, _) = broadcast::channel(engine_config.wal_event_channel_capacity);
+        let watch_log = SeqRing::new(engine_config.watch_replay_buffer_size);
 
         let block_cache = Arc::new(Mutex::new(BlockCache::new(
             block_cache_config.capacity_bytes,
@@ -316,6 +383,7 @@ impl LsmStorageEngine {
             block_cache_config.ghost_capacity,
         )));
 
+        let (shutdown_tx, _) = watch::channel(false);
         let engine = Self {
             memtable: Arc::new(RwLock::new(Arc::new(MemTable::new()))),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
@@ -332,12 +400,24 @@ impl LsmStorageEngine {
             hlc: Arc::new(HybridLogicalClock::new()),
             snapshot_registry: Arc::new(SnapshotRegistry::new()),
             change_tx,
+            watch_log,
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
+            background_tasks: Mutex::new(Vec::new()),
             block_cache,
+            compaction_runs: AtomicU64::new(0),
+            janitor_runs: Arc::new(AtomicU64::new(0)),
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
             in_flight_writes: tokio::sync::RwLock::new(()),
         };
+
+        // Spec kv/026 M3: a fresh HLC only reads the wall clock, so after a
+        // backwards clock step every snapshot would be older than the data on
+        // disk and hide it. Seeding from recovered state fixes the read side
+        // and keeps new writes above existing versions. Must happen before the
+        // recovery flush below, i.e. before any timestamp can be issued.
+        engine.hlc.seed(wal_max_ts.max(manifest_max_ts));
 
         // Recovered WAL data is RAM-only: flush it to an SSTable BEFORE
         // truncating the WAL, so no later startup failure can lose it.
@@ -404,7 +484,9 @@ impl LsmStorageEngine {
         Ok(Arc::new(registry))
     }
 
-    /// Recovers the MemTable state from the WAL.
+    /// Recovers the MemTable state from the WAL, together with the highest
+    /// raw MVCC timestamp it replayed (0 for an empty WAL) — [`Self::new`]
+    /// seeds the HLC with it (spec kv/026 M3).
     ///
     /// Does NOT truncate the WAL — [`Self::new`] first flushes the recovered
     /// data to an SSTable, so an interrupted startup never loses it.
@@ -412,7 +494,7 @@ impl LsmStorageEngine {
         wal_path: &PathBuf,
         vlog: &VLogRegistry,
         vlog_inline_threshold: usize,
-    ) -> Result<MemTable> {
+    ) -> Result<(MemTable, u64)> {
         let memtable = MemTable::new();
         let entries = crate::core::wal::recover(wal_path).await?;
         let mut max_ts = 0;
@@ -443,7 +525,7 @@ impl LsmStorageEngine {
             }
         }
 
-        Ok(memtable)
+        Ok((memtable, max_ts))
     }
 
     /// Opens an SSTable reader for `file_id` — memory-mapped when `use_mmap`
@@ -463,6 +545,9 @@ impl LsmStorageEngine {
         Ok(reader)
     }
 
+    /// An unopenable SSTable that the manifest still lists is a startup
+    /// error (spec kv/026 M2), not a warning: silently installing a partial
+    /// level would start the database without a part of its data.
     async fn recover_sstables(
         manifest: &Manifest,
         file_manager: &Arc<FileManager>,
@@ -472,13 +557,10 @@ impl LsmStorageEngine {
         for (level_idx, level_metas) in manifest.levels.iter().enumerate() {
             let mut sstables = Vec::new();
             for meta in level_metas {
-                match Self::open_sstable_reader(file_manager, meta.file_id, use_mmap).await {
-                    Ok(reader) => sstables.push(Arc::new(reader)),
-                    Err(e) => eprintln!(
-                        "Warning: cannot open SSTable {} at L{level_idx}: {e}",
-                        meta.file_id
-                    ),
-                }
+                let reader = Self::open_sstable_reader(file_manager, meta.file_id, use_mmap)
+                    .await
+                    .with_context(|| format!("cannot open SSTable {} at L{level_idx}", meta.file_id))?;
+                sstables.push(Arc::new(reader));
             }
             if !sstables.is_empty() {
                 level_manager.replace_level(level_idx, sstables);
@@ -489,19 +571,23 @@ impl LsmStorageEngine {
 
     // ── Background tasks ────────────────────────────────────────────────────
 
-    /// Starts the flush loop, compaction loop, and Janitor GC loop.
+    /// Starts the flush loop, compaction loop, and Janitor GC loop, keeping
+    /// their `JoinHandle`s so [`Self::shutdown`] can join them (M1).
     pub fn start_background_tasks(self: &Arc<Self>) {
+        let mut tasks = self.background_tasks.lock();
+
         // Flush loop
         let engine = Arc::clone(self);
-        tokio::spawn(async move { engine.background_flush_loop().await });
+        tasks.push(tokio::spawn(async move { engine.background_flush_loop().await }));
 
         // Compaction loop
         let engine = Arc::clone(self);
-        tokio::spawn(async move { engine.background_compaction_loop().await });
+        tasks.push(tokio::spawn(async move { engine.background_compaction_loop().await }));
 
         // Janitor (vLog GC) loop
         let janitor = Arc::new(self.build_janitor(self.janitor_config.clone()));
-        tokio::spawn(async move { janitor.run_background().await });
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        tasks.push(tokio::spawn(async move { janitor.run_background(shutdown_rx).await }));
     }
 
     /// Builds a Janitor over this engine's state, wired with the flush barrier
@@ -525,11 +611,13 @@ impl LsmStorageEngine {
             self.engine_config.use_mmap,
             Arc::clone(&self.shutdown),
             self.storage_handle.clone(),
+            Arc::clone(&self.janitor_runs),
             Some(flush_barrier),
         )
     }
 
     async fn background_flush_loop(&self) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         while !self.shutdown.load(Ordering::Relaxed) {
             let has_immutable = !self.immutable_memtables.read().is_empty();
             if has_immutable {
@@ -537,11 +625,18 @@ impl LsmStorageEngine {
                     eprintln!("[Engine] Flush error: {e}");
                 }
             }
-            sleep(Duration::from_millis(self.engine_config.flush_check_interval_ms)).await;
+            // M2: woken immediately on shutdown instead of sleeping out the
+            // full interval; `changed()` cannot miss a signal sent while this
+            // loop was doing the work above (no lost-wakeup, unlike Notify).
+            tokio::select! {
+                _ = sleep(Duration::from_millis(self.engine_config.flush_check_interval_ms)) => {}
+                _ = shutdown_rx.changed() => {}
+            }
         }
     }
 
     async fn background_compaction_loop(&self) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         while !self.shutdown.load(Ordering::Relaxed) {
             let needs = {
                 let manifest = self.manifest.read();
@@ -552,7 +647,10 @@ impl LsmStorageEngine {
                     eprintln!("[Engine] Compaction error: {e}");
                 }
             }
-            sleep(Duration::from_millis(self.engine_config.compaction_check_interval_ms)).await;
+            tokio::select! {
+                _ = sleep(Duration::from_millis(self.engine_config.compaction_check_interval_ms)) => {}
+                _ = shutdown_rx.changed() => {}
+            }
         }
     }
 
@@ -560,21 +658,27 @@ impl LsmStorageEngine {
     /// vLog pointer MemTable-resident. Used by the Janitor's flush barrier.
     pub async fn flush_all_memtables(&self) -> Result<()> {
         // Drain (spec kv/020). Order anchor: Seal (Janitor, before it calls this
-        // barrier) -> Drain (here) -> Freeze/Flush (below). Taking and instantly
-        // dropping the write side waits out every pointer-write that acquired
-        // its read guard before this point -- each has, by the time it releases
-        // the guard, already applied its `memtable.set`. Combined with the
-        // preceding seal (no *new* pointer into the sealed generations can
-        // appear), every live pointer into a sealed generation is now
-        // MemTable-resident and gets picked up by the freeze/flush below.
-        drop(self.in_flight_writes.write().await);
-
-        let frozen = {
-            let mut mt = self.memtable.write();
-            std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
-        };
-        if !frozen.is_empty() {
-            self.immutable_memtables.write().push(frozen);
+        // barrier) -> Drain (here) -> Freeze/Flush (below). The write side waits
+        // out every write that acquired its read guard before this point -- each
+        // has, by the time it releases the guard, already applied its
+        // `memtable.set`. Combined with the preceding seal (no *new* pointer
+        // into the sealed generations can appear), every live pointer into a
+        // sealed generation is now MemTable-resident and gets picked up by the
+        // freeze/flush below.
+        //
+        // Held across the rotation instead of dropped right after the wait
+        // (spec kv/029): a writer admitted in between could draw its stamp
+        // before the swap and apply it after, stranding an older stamp in the
+        // new MemTable. Everything below the guard is synchronous -- no await.
+        {
+            let _drain = self.in_flight_writes.write().await;
+            let frozen = {
+                let mut mt = self.memtable.write();
+                std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
+            };
+            if !frozen.is_empty() {
+                self.immutable_memtables.write().push(frozen);
+            }
         }
         while !self.immutable_memtables.read().is_empty() {
             self.flush_memtable().await?;
@@ -582,12 +686,44 @@ impl LsmStorageEngine {
         Ok(())
     }
 
-    /// Shuts down all background tasks and flushes remaining MemTables.
+    /// Signals background tasks to stop, joins them, then flushes remaining
+    /// MemTables and truncates the WAL. Idempotent: a second call finds no
+    /// handles left to join and flushes/truncates an already-clean state.
+    ///
+    /// A failed flush skips the truncate (spec kv/026 M1): `flush_memtable`
+    /// already removes a MemTable from `immutable_memtables` before its
+    /// fallible SSTable/manifest I/O, so once that I/O fails the WAL is the
+    /// only remaining copy of its data — truncating anyway would destroy it.
+    /// The next startup replays the WAL instead. The failure stays an
+    /// `eprintln!`, not just `tracing::error!`: no tracing subscriber runs
+    /// under `cargo test`, so this line is the only surviving evidence in a
+    /// captured test log (spec kv/026 §A3). Callers (`main.rs`, `json`/`rel`
+    /// bootstrap) take no `Result` from this method, so a log line like
+    /// "LSM engine shutdown complete." right after it only means the
+    /// shutdown sequence ran to completion, not that the flush succeeded.
     pub async fn shutdown(&self) {
+        // 1. Signal: flag for cheap sync checks + watch send to wake any
+        // loop that is sleeping (M2) instead of leaving it to poll.
         self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.shutdown_tx.send(true);
 
+        // 2. Join before touching MemTables/WAL below. The lock cannot be
+        // held across the awaits in the loop, so the handles are taken first.
+        let handles = {
+            let mut tasks = self.background_tasks.lock();
+            std::mem::take(&mut *tasks)
+        };
+        for handle in handles {
+            if let Err(e) = handle.await {
+                eprintln!("[Engine] Background task join error: {e}");
+            }
+        }
+
+        // 3. Only now is nothing left running concurrently (M1). A failed
+        // flush must not be followed by the truncate below — see doc comment.
         if let Err(e) = self.flush_all_memtables().await {
             eprintln!("[Engine] Shutdown flush error: {e}");
+            return;
         }
 
         // All data is now in SSTables — WAL entries are redundant.
@@ -677,6 +813,60 @@ impl LsmStorageEngine {
         self.build_reader().get_with_expiry(key, snapshot).await
     }
 
+    /// Newest version of `key` as (write stamp, liveness) — the TTL sweeper's
+    /// authoritative re-check (spec kv/025 §3.1). Takes no snapshot argument:
+    /// the sweeper always wants the current state, so it is pulled internally
+    /// and cannot accidentally be a stale one.
+    pub(super) async fn newest_version(&self, key: &[u8]) -> Result<Option<(Timestamp, VersionState)>> {
+        let snapshot = self.snapshot_unregistered();
+        self.build_reader().newest_version(key, &snapshot).await
+    }
+
+    /// Collects the `limit` smallest user-keys above `after` that carry *some*
+    /// expired version (spec kv/025 §3). Deliberately a superset: no
+    /// cross-source newest-first resolution happens here (no `decided` set
+    /// over all keys, §7) — [`Self::newest_version`] decides authoritatively.
+    /// Key-only, no vLog I/O.
+    pub(super) async fn scan_expired(&self, after: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        let mut candidates: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let now = now_secs();
+        let mut checked = 0usize;
+
+        let memtables = {
+            let mut tables = vec![Arc::clone(&*self.memtable.read())];
+            tables.extend(self.immutable_memtables.read().iter().cloned());
+            tables
+        };
+        for mt in &memtables {
+            for (encoded_key, value) in mt.iter() {
+                scan_expired_yield(&mut checked).await;
+                let Some(user_key) = InternalKey::extract_user_key(&encoded_key) else {
+                    continue;
+                };
+                if user_key <= after || value.version_state(now) != VersionState::Expired {
+                    continue;
+                }
+                push_expired_candidate(&mut candidates, limit, user_key.to_vec());
+            }
+        }
+
+        for level_sstables in self.level_manager.get_all_levels() {
+            for sstable in level_sstables {
+                for entry in sstable.prefix_entries(&[], None) {
+                    scan_expired_yield(&mut checked).await;
+                    let (user_key, _ts, state) = entry?;
+                    if state != VersionState::Expired || user_key.as_slice() <= after {
+                        continue;
+                    }
+                    push_expired_candidate(&mut candidates, limit, user_key);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        Ok(candidates.into_iter().collect())
+    }
+
     /// Returns a handle to the block cache metrics for the `/metrics` endpoint.
     pub fn block_cache_metrics(&self) -> Arc<crate::engines::lsm::block_cache::BlockCacheMetrics> {
         self.block_cache.lock().metrics()
@@ -684,10 +874,21 @@ impl LsmStorageEngine {
 
     // ── Write path helpers ──────────────────────────────────────────────────
 
-    fn maybe_freeze_memtable(&self) -> Result<()> {
+    /// Rotates the active MemTable once it reached the size threshold.
+    ///
+    /// Drains in-flight writes first and holds the drain across the swap (spec
+    /// kv/029): every writer that already drew its stamp has applied it before
+    /// the rotation, every later one stamps after it. Otherwise a slow writer
+    /// could apply its older stamp into the fresh MemTable — a newer source
+    /// holding an older version, which the source-ordered read path resolves
+    /// the wrong way round. Must never run under this engine's own
+    /// `in_flight_writes` read guard (self-deadlock); the write paths therefore
+    /// call it before acquiring theirs.
+    pub(super) async fn maybe_freeze_memtable(&self) -> Result<()> {
         let threshold = self.engine_config.memtable_size_threshold;
         let size = { self.memtable.read().approximate_size() };
         if size >= threshold {
+            let _drain = self.in_flight_writes.write().await;
             let mut mt = self.memtable.write();
             let mut imm = self.immutable_memtables.write();
             if mt.approximate_size() >= threshold {
@@ -700,12 +901,33 @@ impl LsmStorageEngine {
 
     // ── Core write helpers ───────────────────────────────────────────────────
 
+    /// Assigns the next watch-stream sequence, rings it, and broadcasts it
+    /// (spec kv/024 §2) — the single choke point every non-batch write path
+    /// goes through. Every caller invokes this only after its own
+    /// `memtable.set` (spec kv/030): a crash between the two now drops the
+    /// event instead of describing a write a replay might still undo.
+    fn publish_change(&self, key: &[u8], op: OpType) {
+        self.watch_log.publish(&self.change_tx, |seq| WalEvent { seq, key: key.to_vec(), op });
+    }
+
     /// Appends a SET entry to the WAL and inserts the value into the MemTable.
     ///
     /// Large values (>= `MAX_VALUE_LENGTH`) are offloaded to the vLog; smaller
     /// ones are stored inline. `expire_at` is an absolute Unix timestamp (seconds)
     /// for TTL; `None` or `0` means no expiry.
     pub(super) async fn write_kv_pair(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
+        // Freeze check first (spec kv/029): its drain takes the write side of
+        // `in_flight_writes`, which would deadlock under the guard below.
+        self.maybe_freeze_memtable().await?;
+
+        // In-flight guard (spec kv/020, widened by kv/029): held from before
+        // the stamp through `memtable.set`, so no rotation can fall into that
+        // window and no pointer into a generation the Janitor just sealed is
+        // still on its way into a MemTable. Inline values carry no generation
+        // but need the guard all the same — the stamp ordering applies to
+        // every write.
+        let _guard = self.in_flight_writes.read().await;
+
         let timestamp = self.next_timestamp();
         let expire_at_val = expire_at.unwrap_or(0);
 
@@ -720,50 +942,79 @@ impl LsmStorageEngine {
         log_entry.extend_from_slice(&expire_at_val.to_be_bytes());
         self.wal.append(&log_entry).await?;
 
-        // Broadcast after WAL is durable (sync_all already called inside wal.append).
-        let _ = self.change_tx.send(WalEvent { key: key.to_vec(), op: OpType::Set });
-
-        self.maybe_freeze_memtable()?;
-
-        // Resolve the value before touching the MemTable (like `write_batch`):
-        // a MemTable captured *before* the vLog append could be frozen and
-        // flushed meanwhile, which would drop the entry.
-        //
-        // In-flight guard (spec kv/020): held from the active-generation fetch
-        // through `memtable.set` below, so the Janitor's flush-barrier drain
-        // cannot complete while a pointer into a generation it just sealed is
-        // still on its way into a MemTable. Inline values carry no generation,
-        // so they need no guard.
-        let (resolved, _guard) = if value.len() >= self.engine_config.vlog_inline_threshold {
-            let guard = self.in_flight_writes.read().await;
+        let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
             let (file_id, offset) = append_to_active(&self.vlog, value).await?;
-            (Value::Pointer { file_id, offset, len: value.len(), expire_at }, Some(guard))
+            Value::Pointer { file_id, offset, len: value.len(), expire_at }
         } else {
-            (Value::Inline(value.to_vec(), expire_at), None)
+            Value::Inline(value.to_vec(), expire_at)
         };
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, resolved);
+
+        // Broadcast after the apply is visible, not just WAL-durable (spec
+        // kv/030): closes the window where a racing delete's event could
+        // describe a state that never becomes visible.
+        self.publish_change(key, OpType::Set);
         Ok(())
     }
 
-    /// Appends a DELETE entry to the WAL and inserts a tombstone into the MemTable.
-    pub(super) async fn write_tombstone(&self, key: &[u8]) -> Result<()> {
-        let timestamp = self.next_timestamp();
-
+    /// Serialises one DELETE record (WAL type 2): [type=2][ts:u64][key_len:u32][key].
+    /// Shared by the client delete path and the TTL sweeper (spec kv/025 §3.2);
+    /// the record format and its replay are unchanged.
+    fn encode_tombstone_wal_record(timestamp: Timestamp, key: &[u8]) -> Vec<u8> {
         let mut log_entry = Vec::new();
         log_entry.push(2u8);
         log_entry.extend_from_slice(&timestamp.as_u64().to_be_bytes());
         log_entry.extend_from_slice(&(key.len() as u32).to_be_bytes());
         log_entry.extend_from_slice(key);
-        self.wal.append(&log_entry).await?;
+        log_entry
+    }
 
-        // Broadcast after WAL is durable.
-        let _ = self.change_tx.send(WalEvent { key: key.to_vec(), op: OpType::Delete });
+    /// Appends a DELETE entry to the WAL and inserts a tombstone into the MemTable.
+    pub(super) async fn write_tombstone(&self, key: &[u8]) -> Result<()> {
+        // Freeze check before the guard, then guard before the stamp — see
+        // `write_kv_pair` (spec kv/029).
+        self.maybe_freeze_memtable().await?;
+        let _guard = self.in_flight_writes.read().await;
 
-        self.maybe_freeze_memtable()?;
+        let timestamp = self.next_timestamp();
 
+        self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
+
+        // Still pinned after the WAL append; the guard above now closes the
+        // inversion window this placement only narrowed (spec kv/025 §3.2).
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.publish_change(key, OpType::Delete);
+        Ok(())
+    }
+
+    /// Pins the active MemTable — every tombstone of one sweep tick goes into
+    /// exactly this one (spec kv/025 §3 step 2, §4.2).
+    pub(super) fn pin_memtable(&self) -> Arc<MemTable> {
+        Arc::clone(&*self.memtable.read())
+    }
+
+    /// Writes a tombstone dated `timestamp` into the *given* MemTable — the
+    /// TTL sweeper's pinned one (spec kv/025 §3.2). Deliberately without
+    /// `maybe_freeze_memtable` and without re-reading `self.memtable`: a
+    /// tombstone that ends up in a newer source than the value it dates
+    /// against would win despite its older stamp (§4.2). Sweeper-exclusive —
+    /// [`Self::write_tombstone`] does not delegate here.
+    pub(super) async fn write_tombstone_at(
+        &self,
+        memtable: &Arc<MemTable>,
+        key: &[u8],
+        timestamp: Timestamp,
+    ) -> Result<()> {
+        self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
+
+        memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.publish_change(key, OpType::Delete);
         Ok(())
     }
 
@@ -772,6 +1023,11 @@ impl LsmStorageEngine {
     /// visible and overwrites older versions like a Put. Writes without
     /// expiry (`set_null` never carries a TTL).
     pub(super) async fn write_null(&self, key: &[u8]) -> Result<()> {
+        // Freeze check before the guard, then guard before the stamp — see
+        // `write_kv_pair` (spec kv/029).
+        self.maybe_freeze_memtable().await?;
+        let _guard = self.in_flight_writes.read().await;
+
         let timestamp = self.next_timestamp();
 
         // WAL entry: [type=4][ts:u64][key_len:u32][key] — type 3 is already
@@ -783,13 +1039,12 @@ impl LsmStorageEngine {
         log_entry.extend_from_slice(key);
         self.wal.append(&log_entry).await?;
 
-        // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
-        let _ = self.change_tx.send(WalEvent { key: key.to_vec(), op: OpType::Set });
-
-        self.maybe_freeze_memtable()?;
-
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Null);
+
+        // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.publish_change(key, OpType::Set);
         Ok(())
     }
 
@@ -832,14 +1087,18 @@ impl LsmStorageEngine {
         log_entry
     }
 
-    fn broadcast_batch_events(&self, ops: &[BatchOp]) {
-        for op in ops {
-            let (key, op_type) = match op {
-                BatchOp::Put { key, .. } => (key, OpType::Set),
-                BatchOp::Delete { key } => (key, OpType::Delete),
-            };
-            let _ = self.change_tx.send(WalEvent { key: key.clone(), op: op_type });
-        }
+    /// Assigns `ops.len()` consecutive sequences in one lock section
+    /// (`publish_many`), so a concurrent single-op write can never
+    /// interleave into the middle of this batch's stream slice (spec
+    /// kv/024 §2). Called only after the batch's MemTable apply (spec
+    /// kv/030), on `events` pre-extracted from the ops before
+    /// `resolve_batch_values` consumes them — see `write_batch`.
+    fn broadcast_batch_events(&self, events: &[(Vec<u8>, OpType)]) {
+        let mut events = events.iter();
+        self.watch_log.publish_many(&self.change_tx, events.len(), |seq| {
+            let (key, op) = events.next().expect("publish_many calls `make` exactly `n` times");
+            WalEvent { seq, key: key.clone(), op: op.clone() }
+        });
     }
 
     /// Phase 1 of [`Self::write_batch`]: offloads large values to the vLog,
@@ -871,21 +1130,31 @@ impl LsmStorageEngine {
             return Ok(());
         }
         self.validate_batch_ops(&ops)?;
+
+        // Freeze check before the guard (spec kv/029) — see `write_kv_pair`.
+        self.maybe_freeze_memtable().await?;
+
+        // In-flight guard (spec kv/020, widened by kv/029), held across the
+        // whole batch: batches are bounded, so one guard per batch is simpler
+        // than tracking which individual ops end up pointer-creating. Acquired
+        // before the shared stamp and held through every `memtable.set` in
+        // Phase 2 below.
+        let _guard = self.in_flight_writes.read().await;
+
         let timestamp = self.next_timestamp();
 
         let log_entry = Self::encode_batch_wal_record(timestamp, &ops);
         self.wal.append(&log_entry).await?;
 
-        self.broadcast_batch_events(&ops);
-
-        self.maybe_freeze_memtable()?;
-
-        // In-flight guard (spec kv/020), held across the whole batch: batches
-        // are bounded, so one guard per batch is simpler than tracking which
-        // individual ops end up pointer-creating. Acquired before Phase 1's
-        // first `vlog.active()` fetch and held through every `memtable.set`
-        // in Phase 2 below.
-        let _guard = self.in_flight_writes.read().await;
+        // Captured before `resolve_batch_values` below consumes `ops` — the
+        // broadcast itself waits until after the Phase 2 apply (spec kv/030).
+        let batch_events: Vec<(Vec<u8>, OpType)> = ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { key, .. } => (key.clone(), OpType::Set),
+                BatchOp::Delete { key } => (key.clone(), OpType::Delete),
+            })
+            .collect();
 
         // Phase 1 (fallible): offload large values to the vLog BEFORE any
         // MemTable mutation — a vLog error must not leave the batch
@@ -897,6 +1166,9 @@ impl LsmStorageEngine {
         for (key, value) in resolved {
             memtable.set(key, timestamp, value);
         }
+
+        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        self.broadcast_batch_events(&batch_events);
         Ok(())
     }
 
@@ -975,6 +1247,24 @@ impl LsmStorageEngine {
         self.scan_keys_inner(prefix, usize::MAX, Some(snapshot)).await
     }
 
+    /// Combines [`Self::scan_keys_limited`] and [`Self::scan_keys_with_snapshot`]:
+    /// stops once `limit` keys visible under `snapshot` were found (spec
+    /// rel/014 SELECT fast-limit path). A key that only starts existing
+    /// after `snapshot` never counts toward the cap, so it can never
+    /// displace a snapshot-visible key the way it could under the
+    /// unsnapshotted [`Self::scan_keys_limited`]. Like that method, the
+    /// result is a sorted subset of the visible keys (not necessarily the
+    /// lexicographically smallest ones) — LIMIT without ORDER BY accepts
+    /// any subset, matching today's fast-path semantics.
+    pub async fn scan_keys_limited_with_snapshot(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.scan_keys_inner(prefix, limit, Some(snapshot)).await
+    }
+
     /// Shared implementation for [`Self::scan_keys_limited`]/
     /// [`Self::scan_keys_with_snapshot`]: `snapshot` of `None` matches every
     /// version currently live (today's `scan_keys` behavior).
@@ -1020,16 +1310,40 @@ impl LsmStorageEngine {
 
     /// Returns a receiver that is notified for every WAL-confirmed write.
     ///
-    /// Each event carries the key and operation type (`Set` / `Delete`).
-    /// The caller is responsible for filtering by prefix if needed.
-    /// Events may be dropped if the receiver is too slow (lagged).
+    /// Each event carries the key, operation type (`Set` / `Delete`), and its
+    /// watch-stream sequence (spec kv/024 §1-2). The caller is responsible
+    /// for filtering by prefix if needed. Events may be dropped if the
+    /// receiver is too slow (lagged) — use [`Self::watch_decide_resume`] to
+    /// recover from that via the replay ring.
     pub fn watch_subscribe(&self) -> broadcast::Receiver<WalEvent> {
         self.change_tx.subscribe()
+    }
+
+    /// Capacity of the live WAL-event broadcast (and, per spec kv/024 §3,
+    /// every per-domain relay channel too).
+    pub fn wal_event_channel_capacity(&self) -> usize {
+        self.engine_config.wal_event_channel_capacity
+    }
+
+    /// Current head of the watch-stream sequence — the `id:` a `reset`
+    /// event carries (spec kv/024 §5).
+    pub fn watch_head(&self) -> u64 {
+        self.watch_log.head()
+    }
+
+    /// Full resume decision for the KV watch (spec kv/024 §4.2) from a raw
+    /// `Last-Event-ID`/`?last_event_id=` value, using this process's real
+    /// [`stream_epoch`].
+    pub fn watch_decide_resume(&self, raw_id: Option<&str>) -> Resume<WalEvent> {
+        self.watch_log.decide_resume(raw_id, WATCH_TAG, stream_epoch())
     }
 
     // ── Flush ───────────────────────────────────────────────────────────────
 
     /// Test-only: freezes the active MemTable so `flush_memtable` persists it.
+    /// Deliberately without the in-flight drain every production rotation runs
+    /// (spec kv/029 §Verifikationspflicht 2) — it is the lever tests use to
+    /// build the stranded-stamp state the drain now prevents.
     #[cfg(test)]
     pub fn freeze_active_memtable(&self) {
         let mut mt = self.memtable.write();
@@ -1050,6 +1364,7 @@ impl LsmStorageEngine {
         let mut builder = SSTableBuilder::new();
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
+        let mut max_timestamp = 0u64;
 
         for (encoded_key, value) in memtable_to_flush.iter() {
             if smallest_key.is_none() || encoded_key < *smallest_key.as_ref().unwrap() {
@@ -1057,6 +1372,10 @@ impl LsmStorageEngine {
             }
             if largest_key.is_none() || encoded_key > *largest_key.as_ref().unwrap() {
                 largest_key = Some(encoded_key.clone());
+            }
+            // Raw value, not `Timestamp::cmp` — that one sorts newest first.
+            if let Some(ts) = InternalKey::extract_timestamp(&encoded_key) {
+                max_timestamp = max_timestamp.max(ts.as_u64());
             }
 
             match value {
@@ -1139,6 +1458,7 @@ impl LsmStorageEngine {
                 smallest_key: smallest_key.unwrap_or_default(),
                 largest_key: largest_key.unwrap_or_default(),
                 file_size,
+                max_timestamp,
             });
         }
 
@@ -1198,6 +1518,10 @@ impl LsmStorageEngine {
         };
 
         self.compact_level(source_level).await?;
+        // Only a level that actually got compacted counts -- mirrors the
+        // Janitor's `GcStats::ran` distinction so this stays an activity
+        // signal instead of a poll-interval counter (spec general/024).
+        self.compaction_runs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1285,7 +1609,7 @@ impl LsmStorageEngine {
             } else {
                 SSTableReader::open(sstable_data)?
             };
-            let (smallest_key, largest_key) = Self::sstable_key_range(&sstable)?;
+            let (smallest_key, largest_key, max_timestamp) = Self::sstable_key_range(&sstable)?;
 
             new_metas.push(SSTableMetadata {
                 file_id,
@@ -1293,15 +1617,18 @@ impl LsmStorageEngine {
                 smallest_key,
                 largest_key,
                 file_size,
+                max_timestamp,
             });
         }
         Ok(new_metas)
     }
 
-    /// Smallest/largest encoded key in `sstable` (empty vecs when it has none).
-    fn sstable_key_range(sstable: &SSTableReader) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// Smallest/largest encoded key in `sstable` (empty vecs when it has none)
+    /// plus its highest raw MVCC timestamp (`SSTableMetadata::max_timestamp`).
+    fn sstable_key_range(sstable: &SSTableReader) -> Result<(Vec<u8>, Vec<u8>, u64)> {
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
+        let mut max_timestamp = 0u64;
         for entry in sstable.iter() {
             let (key, _) = entry?;
             if smallest_key.is_none() || key < smallest_key.as_ref().unwrap().as_slice() {
@@ -1310,8 +1637,12 @@ impl LsmStorageEngine {
             if largest_key.is_none() || key > largest_key.as_ref().unwrap().as_slice() {
                 largest_key = Some(key.to_vec());
             }
+            // Raw value, not `Timestamp::cmp` — that one sorts newest first.
+            if let Some(ts) = InternalKey::extract_timestamp(key) {
+                max_timestamp = max_timestamp.max(ts.as_u64());
+            }
         }
-        Ok((smallest_key.unwrap_or_default(), largest_key.unwrap_or_default()))
+        Ok((smallest_key.unwrap_or_default(), largest_key.unwrap_or_default(), max_timestamp))
     }
 
     /// Rebuilds `levels`' readers from the manifest (post manifest-swap).
@@ -1380,7 +1711,18 @@ impl LsmStorageEngine {
 
     // ── Stats ────────────────────────────────────────────────────────────────
 
-    #[allow(dead_code)]
+    /// Number of successfully completed `compact_next_level` calls since
+    /// process start (spec general/024).
+    pub fn compaction_runs(&self) -> u64 {
+        self.compaction_runs.load(Ordering::Relaxed)
+    }
+
+    /// Number of Janitor GC cycles that actually ran since process start
+    /// (spec general/024).
+    pub fn janitor_runs(&self) -> u64 {
+        self.janitor_runs.load(Ordering::Relaxed)
+    }
+
     pub fn stats(&self) -> EngineStats {
         let memtable = self.memtable.read();
         let imm = self.immutable_memtables.read();
@@ -1400,7 +1742,6 @@ pub struct EngineHeartbeatData {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct EngineStats {
     pub memtable_size: usize,
     pub num_immutable_memtables: usize,
@@ -1458,7 +1799,9 @@ mod tests {
     use crate::storage::manifest::ManifestManager;
     use crate::engines::StorageEngine;
     use crate::engines::lsm::block_cache::BlockCacheKey;
+    use crate::engines::lsm::hlc::HLCTimestamp;
     use crate::engines::lsm::watcher::OpType;
+    use std::os::unix::fs::PermissionsExt;
 
     async fn make_engine() -> (LsmStorageEngine, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1490,6 +1833,176 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Like `engine_on`, but with the SSTable directory split out from `dir`
+    /// so a test can make it unwritable (spec kv/026 M1 fault injection)
+    /// without touching the WAL/manifest paths too.
+    async fn engine_with_sstable_dir(dir: &tempfile::TempDir, sstable_dir: &Path) -> LsmStorageEngine {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(sstable_dir).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        LsmStorageEngine::new(
+            wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+            LsmEngineOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Like `engine_on`, but with a custom MemTable freeze threshold (spec
+    /// kv/029 tests). `approximate_size` counts 256 bytes per entry, so a
+    /// threshold of 256 rotates on every write after the first.
+    async fn engine_with_threshold(dir: &tempfile::TempDir, threshold: usize) -> LsmStorageEngine {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        LsmStorageEngine::new(
+            wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+            LsmEngineOptions {
+                engine: LsmEngineConfig { memtable_size_threshold: threshold, ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Builds an engine on `dir` with `options`, wraps it in `Arc`, and
+    /// starts its background tasks -- the shape every real bootstrap path
+    /// uses (`main.rs`, `JsonEngine::bootstrap`, `RelEngine::bootstrap`).
+    async fn boot_with_tasks(dir: &tempfile::TempDir, options: LsmEngineOptions) -> Arc<LsmStorageEngine> {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        let engine = Arc::new(
+            LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options)
+                .await
+                .unwrap(),
+        );
+        engine.start_background_tasks();
+        engine
+    }
+
+    // Spec general/023 test 1 (wake + join): without M2 the Janitor's
+    // default 60s sleep would blow this timeout; without M1 nothing here
+    // would prove the loops actually stopped. Bound chosen generously on
+    // purpose (lesson from general/008: no tight time windows).
+    #[tokio::test]
+    async fn test_shutdown_wakes_and_joins_background_tasks_promptly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+
+        tokio::time::timeout(Duration::from_secs(10), engine.shutdown())
+            .await
+            .expect("shutdown must be woken, not wait out the 60s Janitor interval");
+    }
+
+    // Spec general/023 test 2 (restart determinism): the test_disabled_smoke
+    // pattern at the LSM level, now overlap-free by construction -- a
+    // shutdown that returns before its tasks fully stop would let the old
+    // instance's flush/compaction/GC race the new instance's recovery on the
+    // same directory (spec general/023 §A2).
+    #[tokio::test]
+    async fn test_restart_determinism_with_background_tasks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Short poll intervals raise the odds that a loop is doing real work
+        // (not just sleeping) at the moment shutdown() fires each iteration.
+        let opts = || LsmEngineOptions {
+            engine: LsmEngineConfig {
+                flush_check_interval_ms: 5,
+                compaction_check_interval_ms: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut engine = boot_with_tasks(&dir, opts()).await;
+        for i in 0..10u32 {
+            let key = format!("k{i}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            engine.put(&key, &value).await.unwrap();
+            engine.shutdown().await;
+
+            engine = boot_with_tasks(&dir, opts()).await;
+            assert_eq!(engine.get(&key).await.unwrap(), Some(value), "iteration {i}");
+        }
+        engine.shutdown().await;
+    }
+
+    // Spec general/023 test 3 (idempotency): a second shutdown() finds an
+    // empty handle list and an already-flushed, already-truncated WAL --
+    // must not panic or return an error.
+    #[tokio::test]
+    async fn test_shutdown_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+        engine.put(b"k", b"v").await.unwrap();
+
+        engine.shutdown().await;
+        engine.shutdown().await; // must not panic
+    }
+
+    // Spec general/023 test 5 (no task leak): shutdown's mem::take leaves no
+    // dangling JoinHandles behind -- checkable directly since the field is
+    // private to this module.
+    #[tokio::test]
+    async fn test_shutdown_leaves_no_task_handles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+
+        engine.shutdown().await;
+
+        assert!(engine.background_tasks.lock().is_empty());
+    }
+
+    // Spec kv/026 M1: flush_memtable removes the MemTable from
+    // `immutable_memtables` before its fallible SSTable write, so once that
+    // write fails the WAL is the only remaining copy -- shutdown() must not
+    // truncate it in that case. The SSTable directory is split out from the
+    // WAL/manifest one so making it read-only fails only the flush, not the
+    // truncate that would otherwise follow it.
+    #[tokio::test]
+    async fn test_shutdown_skips_wal_truncate_after_failed_flush() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sstable_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&sstable_dir).unwrap();
+        let wal_path = dir.path().join("wal.log");
+
+        let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        engine.put(b"crash-key", b"crash-value").await.unwrap();
+
+        // write_sstable creates a new tmp file in sstable_dir -- a read-only
+        // directory rejects that deterministically (verified non-root).
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        engine.shutdown().await;
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !std::fs::read(&wal_path).unwrap().is_empty(),
+            "a failed shutdown flush must leave the WAL in place"
+        );
+
+        // Re-open replays the WAL and recovers the data.
+        let engine2 = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        assert_eq!(engine2.get(b"crash-key").await.unwrap(), Some(b"crash-value".to_vec()));
+
+        // Success case unchanged: a normal shutdown flush still truncates.
+        engine2.put(b"post-recovery", b"v2").await.unwrap();
+        engine2.shutdown().await;
+        assert!(
+            std::fs::read(&wal_path).unwrap().is_empty(),
+            "a successful shutdown flush still truncates the WAL"
+        );
     }
 
     // Batch: all ops visible after write, and WAL replay (record type 3)
@@ -1569,6 +2082,178 @@ mod tests {
 
         let engine3 = engine_on(&dir).await;
         assert_eq!(engine3.get(b"crash-key").await.unwrap(), Some(b"v1".to_vec()));
+    }
+
+    // Spec kv/026 M2: an SSTable the manifest still lists but that can no
+    // longer be opened must fail `new()` instead of silently installing a
+    // partial level.
+    #[tokio::test]
+    async fn test_new_fails_when_manifest_sstable_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        engine.put(b"k", b"v").await.unwrap();
+        engine.flush_all_memtables().await.unwrap();
+        drop(engine);
+
+        async fn try_reopen(dir: &tempfile::TempDir) -> Result<LsmStorageEngine> {
+            let wal_path = dir.path().join("wal.log");
+            let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+            let vlog_path = dir.path().join("vlog.log");
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+            LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+                LsmEngineOptions::default(),
+            )
+            .await
+        }
+
+        // Success case unchanged: the SSTable is intact, re-open succeeds.
+        let engine2 = try_reopen(&dir).await.unwrap();
+        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+        drop(engine2);
+
+        let sst_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("sst"))
+            .expect("flush must have produced an SSTable file");
+        std::fs::remove_file(&sst_path).unwrap();
+
+        let result = try_reopen(&dir).await;
+        assert!(result.is_err(), "new() must fail when a manifested SSTable cannot be opened");
+    }
+
+    // ── Spec kv/026 M3: HLC seeding from recovered state ─────────────────────
+    //
+    // A backwards step of the system clock, reproduced deterministically: the
+    // HLC is pushed ahead of the wall clock before the writes, so a restarted
+    // engine seeding its clock from nothing would take snapshots older than
+    // every stored version and read back nothing. No wall clock is touched.
+
+    const HLC_SKEW_MS: u64 = 5_000;
+
+    fn advance_hlc(engine: &LsmStorageEngine) {
+        let ahead = engine.hlc().now().physical() + HLC_SKEW_MS;
+        engine.hlc().update(HLCTimestamp::from_components(ahead, 0));
+    }
+
+    async fn put_range(engine: &LsmStorageEngine, range: std::ops::Range<u32>) {
+        for i in range {
+            engine.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+    }
+
+    async fn assert_all_readable(engine: &LsmStorageEngine, range: std::ops::Range<u32>) {
+        for i in range {
+            assert_eq!(
+                engine.get(format!("k{i}").as_bytes()).await.unwrap(),
+                Some(b"v".to_vec()),
+                "k{i} must be visible after the restart"
+            );
+        }
+    }
+
+    // Test 1: crash variant — the WAL still holds the advanced stamps.
+    #[tokio::test]
+    async fn test_crash_restart_sees_data_written_ahead_of_the_wall_clock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        put_range(&engine, 0..20).await;
+        drop(engine); // crash: the data lives only in the WAL
+
+        let engine2 = engine_on(&dir).await;
+        assert_all_readable(&engine2, 0..20).await;
+    }
+
+    // Test 2: clean-shutdown variant — the WAL is empty afterwards, so only
+    // the manifest high-water mark can carry the clock across the restart.
+    #[tokio::test]
+    async fn test_clean_shutdown_restart_sees_data_written_ahead_of_the_wall_clock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        put_range(&engine, 0..20).await;
+        engine.shutdown().await;
+        drop(engine);
+
+        assert!(
+            std::fs::read(dir.path().join("wal.log")).unwrap().is_empty(),
+            "a clean shutdown leaves no WAL to seed from"
+        );
+
+        let engine2 = engine_on(&dir).await;
+        assert_all_readable(&engine2, 0..20).await;
+    }
+
+    // Test 3: a re-put after the restart must outrank the stored version.
+    // The compaction is the discriminator — it keeps only the highest-stamped
+    // version of a key, so a re-put stamped below the stored one is not
+    // merely invisible for a while, it is dropped for good.
+    #[tokio::test]
+    async fn test_reput_after_restart_outranks_the_stored_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        engine.put(b"k", b"old").await.unwrap();
+        engine.shutdown().await;
+        drop(engine);
+
+        let engine2 = engine_on(&dir).await;
+        engine2.put(b"k", b"new").await.unwrap();
+        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+
+        // Both versions now meet in one merged SSTable.
+        engine2.flush_all_memtables().await.unwrap();
+        engine2.compact_level(0).await.unwrap();
+        assert_eq!(
+            engine2.get(b"k").await.unwrap(),
+            Some(b"new".to_vec()),
+            "the compaction must keep the re-put value, not the older-stamped one"
+        );
+        engine2.shutdown().await;
+        drop(engine2);
+
+        let engine3 = engine_on(&dir).await;
+        assert_eq!(
+            engine3.get(b"k").await.unwrap(),
+            Some(b"new".to_vec()),
+            "the re-put value must survive a further restart"
+        );
+    }
+
+    // Test 4: a manifest written before M3 has no `max_timestamp` field; it
+    // must still load (serde default 0) with the WAL seed doing the work.
+    #[tokio::test]
+    async fn test_manifest_without_max_timestamp_loads_and_wal_seed_applies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        advance_hlc(&engine);
+        put_range(&engine, 0..5).await;
+        engine.flush_all_memtables().await.unwrap();
+        put_range(&engine, 5..10).await;
+        drop(engine); // crash: the WAL still holds every key
+
+        // Rewrite the manifest in the pre-M3 format.
+        let manifest_path = dir.path().join("MANIFEST");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        for level in json["levels"].as_array_mut().unwrap() {
+            for meta in level.as_array_mut().unwrap() {
+                assert!(meta.as_object_mut().unwrap().remove("max_timestamp").is_some());
+            }
+        }
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let loaded = ManifestManager::new(dir.path()).load().await.unwrap();
+        let meta = loaded.get_level(0).first().expect("the flush must have produced an SSTable");
+        assert_eq!(meta.max_timestamp, 0, "an old manifest reads as 0, without a migration run");
+
+        let engine2 = engine_on(&dir).await;
+        assert_all_readable(&engine2, 0..10).await;
     }
 
     // ── Lifecycle tests ──────────────────────────────────────────────────────
@@ -1747,8 +2432,18 @@ mod tests {
         // Immediate readability is covered by test_ttl_key_readable_before_expiry.
         engine.put_with_ttl(b"ttl_key", b"value", 1).await.unwrap();
         wait_past_ttl(1).await;
-        // Must be None after expiry
-        assert!(engine.get(b"ttl_key").await.unwrap().is_none());
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and get()'s own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut value = engine.get(b"ttl_key").await.unwrap();
+        for _ in 0..100 {
+            if value.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            value = engine.get(b"ttl_key").await.unwrap();
+        }
+        assert!(value.is_none());
     }
 
     fn subsec_ms() -> u32 {
@@ -1774,6 +2469,45 @@ mod tests {
         engine.put_with_ttl(b"ttl_key", b"value", 2).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(engine.get(b"ttl_key").await.unwrap(), Some(b"value".to_vec()), "a 2s TTL must survive 1.1s");
+    }
+
+    // spec kv/025 §2/§9.11: format::is_expired treats `Some(0)` as "no TTL",
+    // not "expired" -- this only stays correct because no write path ever
+    // produces it. Covers all three paths named in the spec: `put` (None),
+    // `put_with_ttl` (including ttl_secs == 0), and WAL replay.
+    #[tokio::test]
+    async fn test_ttl_paths_never_produce_some_zero_expire_at() {
+        let (engine, dir) = make_engine().await;
+        engine.put(b"no_ttl", b"v").await.unwrap();
+        engine.put_with_ttl(b"expired_now", b"v", 0).await.unwrap();
+        engine.put_with_ttl(b"future", b"v", 60).await.unwrap();
+
+        fn assert_no_some_zero(value: &Value) {
+            let expire_at = match value {
+                Value::Inline(_, expire_at) => *expire_at,
+                Value::Pointer { expire_at, .. } => *expire_at,
+                Value::Null | Value::Tombstone => None,
+            };
+            assert_ne!(expire_at, Some(0), "no write path may produce Some(0)");
+        }
+
+        for (_, value) in engine.memtable.read().iter() {
+            assert_no_some_zero(&value);
+        }
+
+        // WAL replay: the live engine hasn't truncated its WAL yet, so
+        // recovering it independently reflects exactly what a restart would see.
+        let wal_path = dir.path().join("wal.log");
+        let (recovered, _) = LsmStorageEngine::recover_from_wal(
+            &wal_path,
+            &engine.vlog,
+            engine.engine_config.vlog_inline_threshold,
+        )
+        .await
+        .unwrap();
+        for (_, value) in recovered.iter() {
+            assert_no_some_zero(&value);
+        }
     }
 
     // ── scan_keys tests ──────────────────────────────────────────────────────
@@ -1872,7 +2606,17 @@ mod tests {
         engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
         engine.put(b"user:2", b"bob").await.unwrap();
         wait_past_ttl(1).await;
-        let keys = engine.scan_keys(b"user:").await.unwrap();
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and the scan's own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut keys = engine.scan_keys(b"user:").await.unwrap();
+        for _ in 0..100 {
+            if !keys.contains(&b"user:1".to_vec()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            keys = engine.scan_keys(b"user:").await.unwrap();
+        }
         assert!(!keys.contains(&b"user:1".to_vec()));
         assert!(keys.contains(&b"user:2".to_vec()));
     }
@@ -1941,8 +2685,132 @@ mod tests {
         engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
         let snap = engine.snapshot();
         wait_past_ttl(1).await;
-        let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and the scan's own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        for _ in 0..100 {
+            if keys.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+        }
         assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
+    }
+
+    // ── scan_keys_limited_with_snapshot tests (spec rel/014 SELECT fast-limit
+    // snapshot consistency) ──────────────────────────────────────────────────
+
+    // Test 1 (the core case): a key that only starts existing after the
+    // snapshot must never occupy one of the capped slots, even when it sorts
+    // ahead of the pre-snapshot keys. Counterproof alongside: today's
+    // unsnapshotted scan_keys_limited IS displaced by such a ghost -- the
+    // difference this method fixes.
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_excludes_ghosts_from_cap() {
+        let (engine, _dir) = make_engine().await;
+        for i in 0..10 {
+            engine.put(format!("z:m{i}").as_bytes(), b"v").await.unwrap();
+        }
+        let snap = engine.snapshot();
+        // Ghosts: written after the snapshot, and sort ahead of "z:m*".
+        for i in 0..5 {
+            engine.put(format!("z:a{i}").as_bytes(), b"v").await.unwrap();
+        }
+
+        let keys = engine.scan_keys_limited_with_snapshot(b"z:", 5, snap.snapshot()).await.unwrap();
+        assert_eq!(keys.len(), 5, "cap must be filled entirely by pre-snapshot keys");
+        assert!(keys.iter().all(|k| k.starts_with(b"z:m")), "no ghost key may occupy a cap slot");
+
+        let unsnapshotted = engine.scan_keys_limited(b"z:", 5).await.unwrap();
+        assert!(
+            unsnapshotted.iter().any(|k| k.starts_with(b"z:a")),
+            "today's unsnapshotted cap must be displaced by ghosts, or this is no longer a counterproof"
+        );
+    }
+
+    // Test 2: a key deleted after the snapshot was taken still counts toward
+    // the cap and appears in the result (point-in-time consistency).
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_keeps_deleted_after_snapshot() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"user:1", b"v").await.unwrap();
+        let snap = engine.snapshot();
+        engine.delete(b"user:1").await.unwrap();
+
+        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
+        assert_eq!(keys, vec![b"user:1".to_vec()]);
+    }
+
+    // Test 3: once the cap is filled while scanning a newer source, an older
+    // source's further snapshot-visible keys are never reached -- still a
+    // correct (if not minimal) subset, exactly `limit` entries (same
+    // "subset, not necessarily smallest" semantics as the unsnapshotted
+    // test_scan_keys_limited_stops_in_sstable_sweep above).
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_stops_at_cap_across_sources() {
+        let (engine, _dir) = make_engine().await;
+        for i in 0..5 {
+            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        freeze_and_flush(&engine).await; // SSTable: user:0..4
+        for i in 5..10 {
+            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        let snap = engine.snapshot(); // all 10 visible: 5 in the SSTable, 5 in the active MemTable
+
+        let full = engine.scan_keys_limited_with_snapshot(b"user:", 100, snap.snapshot()).await.unwrap();
+        assert_eq!(full.len(), 10, "sanity: all 10 must be snapshot-visible when uncapped");
+
+        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 4, snap.snapshot()).await.unwrap();
+        assert_eq!(
+            keys.len(),
+            4,
+            "must stop exactly at the cap even though 6 more visible keys remain in the older SSTable"
+        );
+    }
+
+    // Test 4a: a TTL-expired key must not occupy a cap slot even though it
+    // was written -- and became snapshot-visible -- before the snapshot;
+    // wall-clock expiry still applies under a capped snapshot scan, same as
+    // the uncapped scan_keys_with_snapshot. A cap of 1 makes the assertion
+    // discriminating: if the expired key ("user:1", sorting first) wrongly
+    // held the one slot, the live "user:2" would never appear.
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_excludes_expired_from_cap() {
+        let (engine, _dir) = make_engine().await;
+        engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+        engine.put(b"user:2", b"bob").await.unwrap();
+        let snap = engine.snapshot();
+        wait_past_ttl(1).await;
+        // Bounded retry instead of a single probe: a backwards wall-clock
+        // step between the wait above and the scan's own now_secs() briefly
+        // un-expires the key (observed on WSL2, spec kv/026 analysis).
+        let mut keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
+        for _ in 0..100 {
+            if keys == vec![b"user:2".to_vec()] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
+        }
+        assert_eq!(
+            keys,
+            vec![b"user:2".to_vec()],
+            "an expired key must not occupy the cap slot ahead of a live one"
+        );
+    }
+
+    // Test 4b: a NULL key (kv/018 -- present, not deleted) counts as live and
+    // does occupy a cap slot.
+    #[tokio::test]
+    async fn test_scan_keys_limited_with_snapshot_includes_null() {
+        let (engine, _dir) = make_engine().await;
+        engine.set_null(b"user:1").await.unwrap();
+        let snap = engine.snapshot();
+        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
+        assert_eq!(keys, vec![b"user:1".to_vec()]);
     }
 
     // ── Point-read MVCC ordering tests (overlapping L0 / frozen MemTables) ───
@@ -2249,6 +3117,29 @@ mod tests {
         assert_eq!(engine.get(b"z").await.unwrap(), Some(b"26".to_vec()));
     }
 
+    // Test 1 (spec general/024): compaction_runs counts successfully
+    // completed compact_next_level calls -- 0 before any compaction runs,
+    // >= 1 once should_compact's own trigger condition (L0 at the default
+    // threshold of 4) has actually been acted on.
+    #[tokio::test]
+    async fn test_compaction_runs_counter_increments_on_real_compaction() {
+        let (engine, _dir) = make_engine().await;
+        assert_eq!(engine.compaction_runs(), 0);
+
+        engine.put(b"a", b"1").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"b", b"2").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"c", b"3").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"d", b"4").await.unwrap();
+        freeze_and_flush(&engine).await;
+        assert!(should_compact(&engine.manifest.read(), &engine.compaction_config));
+
+        engine.compact_next_level().await.unwrap();
+        assert_eq!(engine.compaction_runs(), 1, "a real compaction must increment compaction_runs");
+    }
+
     /// GC config that fires on any non-empty vLog.
     fn gc_always() -> JanitorConfig {
         JanitorConfig {
@@ -2447,6 +3338,123 @@ mod tests {
             .await
             .expect("drain must complete promptly once the guard is released")
             .unwrap();
+    }
+
+    /// Highest-stamped version of `user_key` across the active and all
+    /// immutable MemTables -- the stamp-ordered oracle the source-ordered read
+    /// path has to agree with (spec kv/029). Inline values only; its callers
+    /// write no pointers.
+    fn newest_memtable_version(engine: &LsmStorageEngine, user_key: &[u8]) -> Option<(u64, Vec<u8>)> {
+        let mut sources = vec![Arc::clone(&*engine.memtable.read())];
+        sources.extend(engine.immutable_memtables.read().iter().cloned());
+
+        let mut newest: Option<(u64, Vec<u8>)> = None;
+        for memtable in &sources {
+            for (encoded_key, value) in memtable.iter() {
+                if InternalKey::extract_user_key(&encoded_key) != Some(user_key) {
+                    continue;
+                }
+                let Some(stamp) = InternalKey::extract_timestamp(&encoded_key) else { continue };
+                let stamp = stamp.as_u64();
+                let beats = match &newest {
+                    Some((best, _)) => stamp > *best,
+                    None => true,
+                };
+                if beats {
+                    if let Value::Inline(bytes, _) = value {
+                        newest = Some((stamp, bytes));
+                    }
+                }
+            }
+        }
+        newest
+    }
+
+    // Spec kv/029 test 1, before-state: the point read resolves by source, not
+    // by stamp, so an older stamp in the newer MemTable wins over the newer
+    // version below it. Built with the test-only rotation lever (the one
+    // rotation without a drain) because no production path can produce this
+    // state any more -- it pins down exactly what the write barrier prevents.
+    #[tokio::test]
+    async fn test_older_stamp_in_newer_memtable_wins_by_source_order() {
+        let (engine, _dir) = make_engine().await;
+
+        // Writer B: newer stamp, applied into the MemTable that is frozen next.
+        let newer = engine.next_timestamp();
+        engine.memtable.read().set(b"k".to_vec(), newer, Value::Inline(b"newer".to_vec(), None));
+
+        engine.freeze_active_memtable();
+
+        // Writer A: stamp drawn before the rotation, applied after it.
+        let older = Timestamp::new(newer.as_u64() - 1);
+        engine.memtable.read().set(b"k".to_vec(), older, Value::Inline(b"older".to_vec(), None));
+
+        assert_eq!(
+            engine.get(b"k").await.unwrap(),
+            Some(b"older".to_vec()),
+            "first hit decides: the newer source wins even with the older stamp"
+        );
+    }
+
+    // Spec kv/029 test 1, after-state: concurrent writers on one key with a
+    // threshold that rotates on nearly every write. The read must always
+    // resolve to the newest stamp the engine holds -- what the source-ordered
+    // read path can only deliver while the freeze barrier holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_writes_across_freezes_never_strand_an_older_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(engine_with_threshold(&dir, 256).await);
+
+        for round in 0..20u32 {
+            let key = format!("k{round}");
+            let writers: Vec<_> = (0..4u32)
+                .map(|w| {
+                    let engine = Arc::clone(&engine);
+                    let key = key.clone();
+                    tokio::spawn(async move {
+                        engine.put(key.as_bytes(), format!("v{w}").as_bytes()).await.unwrap();
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.await.unwrap();
+            }
+
+            let (stamp, newest) = newest_memtable_version(&engine, key.as_bytes())
+                .expect("every round writes its key into a MemTable");
+            assert_eq!(
+                engine.get(key.as_bytes()).await.unwrap(),
+                Some(newest),
+                "round {round}: the read must return the version stamped {stamp}"
+            );
+        }
+    }
+
+    // Spec kv/029 test 2: a held writer guard blocks the freeze until the
+    // in-flight apply is through; afterwards the rotation goes ahead. Same
+    // shape as the kv/020 drain test, now for the regular freeze path.
+    #[tokio::test]
+    async fn test_freeze_waits_for_held_writer_guard_then_rotates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_with_threshold(&dir, 256).await;
+        engine.put(b"k", b"v").await.unwrap();
+        assert!(engine.immutable_memtables.read().is_empty(), "the first write does not rotate");
+
+        // Simulates a write that has drawn its stamp and not applied it yet.
+        let guard = engine.in_flight_writes.read().await;
+
+        let blocked = tokio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable()).await;
+        assert!(blocked.is_err(), "the freeze must wait while a writer guard is held");
+        assert!(engine.immutable_memtables.read().is_empty(), "nothing rotated under the held guard");
+
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable())
+            .await
+            .expect("the freeze must proceed once the guard is released")
+            .unwrap();
+        assert_eq!(engine.immutable_memtables.read().len(), 1, "the rotation happened after the drain");
+        assert!(engine.memtable.read().is_empty(), "the active MemTable is fresh");
     }
 
     // Spec kv/020 tests 2+3: sharpens test_gc_keeps_values_written_concurrently
@@ -2685,5 +3693,125 @@ mod tests {
             engine2.register_sstables_with_io_engine(&mut io_engine).await.unwrap();
             assert!(io_engine.get_file(file_id).is_some());
         });
+    }
+
+    // ── Spec kv/024 tests 7/8: watch-stream sequence assignment ──────────────
+
+    // Test 7: put, delete, set_null (-> Set, kv/018) and write_batch all
+    // publish through the same choke point (`publish_change`/`publish_many`)
+    // -> sequences are gapless and non-decreasing across every write path.
+    #[tokio::test]
+    async fn test_watch_seq_monotonic_across_all_write_paths() {
+        let (engine, _dir) = make_engine().await;
+        let mut rx = engine.watch_subscribe();
+
+        engine.put(b"a", b"1").await.unwrap(); // Set
+        engine.delete(b"a").await.unwrap(); // Delete
+        engine.set_null(b"b").await.unwrap(); // Set (kv/018: an update, not a delete)
+        engine
+            .write_batch(vec![
+                BatchOp::Put { key: b"c".to_vec(), value: b"1".to_vec() },
+                BatchOp::Put { key: b"d".to_vec(), value: b"2".to_vec() },
+            ])
+            .await
+            .unwrap();
+
+        let mut seqs = Vec::new();
+        for _ in 0..5 {
+            seqs.push(rx.recv().await.unwrap().seq);
+        }
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "sequences must be gapless and in write order: {seqs:?}");
+    }
+
+    // Test 8: a batch's N ops get N consecutive sequences (`publish_many`),
+    // and a concurrent single-op write lands fully before or after the
+    // batch's slice, never interleaved into it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_watch_batch_is_contiguous_against_concurrent_single_write() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let mut rx = engine.watch_subscribe();
+
+        let batch_ops: Vec<BatchOp> = (0..20)
+            .map(|i| BatchOp::Put { key: format!("batch{i}").into_bytes(), value: b"v".to_vec() })
+            .collect();
+
+        let e1 = Arc::clone(&engine);
+        let batch_handle = tokio::spawn(async move { e1.write_batch(batch_ops).await.unwrap() });
+        let e2 = Arc::clone(&engine);
+        let single_handle = tokio::spawn(async move { e2.put(b"single", b"v").await.unwrap() });
+        batch_handle.await.unwrap();
+        single_handle.await.unwrap();
+
+        let mut batch_seqs = Vec::new();
+        let mut single_seq = None;
+        for _ in 0..21 {
+            let event = rx.recv().await.unwrap();
+            if event.key == b"single" {
+                single_seq = Some(event.seq);
+            } else {
+                batch_seqs.push(event.seq);
+            }
+        }
+        batch_seqs.sort_unstable();
+        let (min, max) = (*batch_seqs.first().unwrap(), *batch_seqs.last().unwrap());
+        assert_eq!(
+            max - min + 1,
+            batch_seqs.len() as u64,
+            "batch sequences must be contiguous: {batch_seqs:?}"
+        );
+        let single_seq = single_seq.expect("the concurrent single write must have published an event");
+        assert!(
+            single_seq < min || single_seq > max,
+            "the concurrent single write must land fully before or after the batch: {single_seq} vs [{min},{max}]"
+        );
+    }
+
+    // ── Spec kv/030 test 1: watch events after MemTable apply ────────────────
+
+    // A Set/Delete race on one key. Before the fix, `publish_change` ran right
+    // after the WAL fsync, before `memtable.set` -- a subscriber could receive
+    // an event for a write that was not yet applied (and, on a crash, might
+    // never be, kv/025 §5 Restfenster A). After the fix, every write path
+    // calls `memtable.set` before `publish_change` with no `.await` between
+    // them, and the broadcast channel's send/recv synchronizes with that
+    // apply -- so a read taken right after receiving any event from this
+    // round must already see a state newer than the pre-race baseline.
+    // Deterministic on purpose, not a hit-rate sample: this ordering is
+    // unconditional, unlike the residual stream-vs-timestamp ordering gap
+    // between two different writers that stays open (spec kv/030 §2) and is
+    // not exercised here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_watch_event_is_never_seen_before_its_own_apply() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+
+        for round in 0..50u32 {
+            let key = format!("race{round}");
+            engine.put(key.as_bytes(), b"baseline").await.unwrap();
+            let (baseline_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
+            let mut rx = engine.watch_subscribe();
+
+            let e1 = Arc::clone(&engine);
+            let k1 = key.clone();
+            let set_handle = tokio::spawn(async move { e1.put(k1.as_bytes(), b"updated").await.unwrap() });
+            let e2 = Arc::clone(&engine);
+            let k2 = key.clone();
+            let del_handle = tokio::spawn(async move { e2.delete(k2.as_bytes()).await.unwrap() });
+
+            for _ in 0..2 {
+                let event = rx.recv().await.unwrap();
+                assert_eq!(event.key, key.as_bytes());
+                let (seen_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
+                assert!(
+                    seen_ts.as_u64() > baseline_ts.as_u64(),
+                    "round {round}: {:?} event observed before its own apply became visible",
+                    event.op
+                );
+            }
+
+            set_handle.await.unwrap();
+            del_handle.await.unwrap();
+        }
     }
 }

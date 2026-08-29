@@ -8,6 +8,7 @@
 //! POST /store-api/rel/{domain}/tables/{t}/rows     -> insert_row
 //! PUT  /store-api/rel/{domain}/tables/{t}/rows/{pk} -> update_row
 //! DELETE /store-api/rel/{domain}/tables/{t}/rows/{pk} -> delete_row
+//! GET  /store-api/rel/{domain}/tables/{t}/count    -> count_rows
 //!
 //! All eight compile onto the existing rel/005 (DML) / rel/006 (SELECT)
 //! bound plans (`RelEngine::{browse_rows,get_row,insert_row,update_row,
@@ -16,14 +17,14 @@
 //! built here); `rel_engine(&state)?` + a rate-limit charge guard every
 //! handler, matching rel/009's `/sql` handler.
 
-use crate::api::rel::{column_type_name, dml_result_json, rel_engine};
-use crate::api::{middleware::ApiError, AppState};
+use crate::api::rel::{column_type_name, compute_link_auth, dml_result_json, rel_engine};
+use crate::api::{middleware::ApiError, AppState, CountResponse};
+use crate::auth::middleware::{AuthOutcome, AuthUser};
 use crate::engines::rel::{
-    scalar_to_json, CatalogEntry, ColumnType, DefaultValue, ExpandedBlock, RelEngine, RelStoreError,
-    ScalarValue,
+    scalar_to_json, CatalogEntry, ColumnType, DefaultValue, ExpandedBlock, RelEngine, RelStoreError, ScalarValue,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
 };
@@ -124,10 +125,10 @@ fn default_to_json(d: &DefaultValue) -> Option<Value> {
     params(("domain" = String, Path, description = "Relational domain")),
     responses(
         (status = 200, description = "Tables of the domain", body = Vec<TableSummary>),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -158,10 +159,10 @@ pub async fn list_tables(
     ),
     responses(
         (status = 200, description = "Table schema detail", body = TableDetail),
-        (status = 404, description = "Domain or table not found (a view is not a table)"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain or table not found (a view is not a table)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -216,10 +217,10 @@ pub async fn get_table(
     params(("domain" = String, Path, description = "Relational domain")),
     responses(
         (status = 200, description = "Views of the domain, incl. raw SQL text", body = Vec<ViewSummary>),
-        (status = 404, description = "Domain not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -327,12 +328,12 @@ fn enforce_response_size(engine: &RelEngine, value: &Value) -> Result<(), ApiErr
     ),
     responses(
         (status = 200, description = "Matching rows as objects, with row_count/limit/offset/limit_applied", body = RowsResponse),
-        (status = 400, description = "Unknown filter column, or a filter/limit/offset parse/type error"),
-        (status = 404, description = "Domain or table not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 413, description = "Response exceeds max_response_bytes"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "Unknown filter column, or a filter/limit/offset parse/type error", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain or table not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 413, description = "Response exceeds max_response_bytes", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -344,6 +345,8 @@ pub async fn browse_rows(
     State(state): State<AppState>,
     Path((domain, table)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
 ) -> Result<Json<Value>, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, false)?;
@@ -354,8 +357,16 @@ pub async fn browse_rows(
     let filters: HashMap<String, String> =
         params.into_iter().filter(|(k, _)| !RESERVED_QUERY_PARAMS.contains(&k.as_str())).collect();
 
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
     let (result, expanded, applied_limit, applied_offset) =
-        engine.browse_rows(&domain, &table, &filters, &expand, limit, offset).await?;
+        engine.browse_rows(&domain, &table, &filters, &expand, limit, offset, link_auth).await?;
 
     let rows: Vec<Value> = result
         .rows
@@ -385,12 +396,12 @@ pub async fn browse_rows(
     ),
     responses(
         (status = 200, description = "The row as an object, with an optional _expanded block", body = Object),
-        (status = 400, description = "PK parse/type error"),
-        (status = 404, description = "Domain, table, or row not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 413, description = "Response exceeds max_response_bytes"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "PK parse/type error", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, or row not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 413, description = "Response exceeds max_response_bytes", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Browse"
 )]
@@ -400,17 +411,67 @@ pub async fn get_row(
     State(state): State<AppState>,
     Path((domain, table, pk)): Path<(String, String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
 ) -> Result<Json<Value>, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, false)?;
     let expand = parse_expand_param(&params);
 
-    let Some((result, expanded)) = engine.get_row(&domain, &table, &pk, &expand).await? else {
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
+    let Some((result, expanded)) = engine.get_row(&domain, &table, &pk, &expand, link_auth).await? else {
         return Err(ApiError::new(StatusCode::NOT_FOUND, format!("404 Not Found: row '{pk}' not found")));
     };
     let obj = row_to_object(&result.columns, &result.rows[0], expanded.as_ref(), 0);
     enforce_response_size(engine, &obj)?;
     Ok(Json(obj))
+}
+
+#[utoipa::path(
+    get,
+    path = "/store-api/rel/{domain}/tables/{table}/count",
+    params(
+        ("domain" = String, Path, description = "Relational domain"),
+        ("table" = String, Path, description = "Table name"),
+    ),
+    responses(
+        (status = 200, description = "Row count. A full key scan under the hood — cost grows linearly with table size; meant for on-demand use, not high-frequency polling.", body = CountResponse),
+        (status = 404, description = "Domain or table not found (a view has no count resource, same as `rows`)", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
+    ),
+    tag = "Relational Browse"
+)]
+/// Counts the rows of `table` — the same residual-free access path `SELECT
+/// COUNT(*) FROM table` would use via `/sql`, without a SQL round trip. A
+/// view answers 404 here, same as `GET …/rows` (no row-level resource in v1).
+pub async fn count_rows(
+    State(state): State<AppState>,
+    Path((domain, table)): Path<(String, String)>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
+) -> Result<Json<CountResponse>, ApiError> {
+    let engine = rel_engine(&state)?;
+    check_budget(engine, &state, &domain, false)?;
+
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
+    let count = engine.count_rows(&domain, &table, link_auth).await?;
+    Ok(Json(CountResponse { count }))
 }
 
 // ── Row-Writes (spec §5) ─────────────────────────────────────────────────────
@@ -447,12 +508,13 @@ fn percent_encode_path_segment(s: &str) -> String {
     request_body = Object,
     responses(
         (status = 201, description = "Row inserted", body = Object),
-        (status = 400, description = "NOT NULL/type/schema violation"),
-        (status = 404, description = "Domain, table, or referenced body column not found"),
-        (status = 409, description = "PK collision, unique violation, or missing REFERENCES target"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "NOT NULL/type/schema violation", body = String, content_type = "text/plain"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, or referenced body column not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "PK collision, unique violation, or missing REFERENCES target", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Rows"
 )]
@@ -462,12 +524,22 @@ fn percent_encode_path_segment(s: &str) -> String {
 pub async fn insert_row(
     State(state): State<AppState>,
     Path((domain, table)): Path<(String, String)>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
     Json(body): Json<Map<String, Value>>,
 ) -> Result<Response, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, true)?;
 
-    let result = engine.insert_row(&domain, &table, &body).await?;
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
+    let result = engine.insert_row(&domain, &table, &body, link_auth).await?;
     let pk = result.last_pk.as_ref().expect("single-row INSERT always yields last_pk (rel/005 §9)");
     let location = format!("/store-api/rel/{domain}/tables/{table}/rows/{}", pk_path_segment(pk));
     Ok((StatusCode::CREATED, [(header::LOCATION, location)], Json(dml_result_json(&result))).into_response())
@@ -484,12 +556,13 @@ pub async fn insert_row(
     request_body = Object,
     responses(
         (status = 200, description = "Row updated", body = Object),
-        (status = 400, description = "NOT NULL/type/schema violation, or body primary key != path primary key"),
-        (status = 404, description = "Domain, table, column, or row not found"),
-        (status = 409, description = "Unique violation, or missing REFERENCES target"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "NOT NULL/type/schema violation, or body primary key != path primary key", body = String, content_type = "text/plain"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, column, or row not found", body = String, content_type = "text/plain"),
+        (status = 409, description = "Unique violation, or missing REFERENCES target", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Rows"
 )]
@@ -499,12 +572,22 @@ pub async fn insert_row(
 pub async fn update_row(
     State(state): State<AppState>,
     Path((domain, table, pk)): Path<(String, String, String)>,
+    auth_outcome: Option<Extension<AuthOutcome>>,
+    auth_user: Option<Extension<AuthUser>>,
     Json(body): Json<Map<String, Value>>,
 ) -> Result<Json<Value>, ApiError> {
     let engine = rel_engine(&state)?;
     check_budget(engine, &state, &domain, true)?;
 
-    let result = engine.update_row(&domain, &table, &pk, &body).await?;
+    let link_auth = compute_link_auth(
+        &state,
+        auth_outcome.map(|Extension(o)| o),
+        auth_user.map(|Extension(u)| u).as_ref(),
+        &domain,
+    )
+    .await;
+
+    let result = engine.update_row(&domain, &table, &pk, &body, link_auth).await?;
     if result.affected == 0 {
         return Err(ApiError::new(StatusCode::NOT_FOUND, format!("404 Not Found: row '{pk}' not found")));
     }
@@ -521,11 +604,11 @@ pub async fn update_row(
     ),
     responses(
         (status = 200, description = "Row deleted", body = Object),
-        (status = 400, description = "PK parse/type error"),
-        (status = 404, description = "Domain, table, or row not found"),
-        (status = 410, description = "Domain is being deleted"),
-        (status = 429, description = "Per-domain request budget exceeded"),
-        (status = 503, description = "Relational engine disabled"),
+        (status = 400, description = "PK parse/type error", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain, table, or row not found", body = String, content_type = "text/plain"),
+        (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 429, description = "Per-domain request budget exceeded", body = String, content_type = "text/plain"),
+        (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Rows"
 )]
@@ -561,7 +644,7 @@ mod tests {
 
     // ── Harness (mirrors src/api/rel.rs's own test harness) ─────────────────
 
-    async fn make_state(rel_config: Option<RelStoreConfig>) -> (AppState, tempfile::TempDir) {
+    async fn make_state(rel_config: Option<RelStoreConfig>, auth_enabled: bool) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let kv_dir = dir.path().join("kv");
         std::fs::create_dir_all(&kv_dir).unwrap();
@@ -608,19 +691,23 @@ mod tests {
         let state = AppState {
             registry,
             auth_cache,
-            auth_enabled: false,
+            auth_enabled,
             metrics,
             json_engine: None,
             rel_engine,
             shm_manager: None,
             backup_manager: None,
             log_access: None,
+            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            config: Arc::new(crate::config::LuraConfig::default()),
+            config_path: "test.toml".to_string(),
+            config_file_loaded: false,
         };
         (state, dir)
     }
 
     async fn make_app(rel_config: Option<RelStoreConfig>) -> (axum::Router, tempfile::TempDir) {
-        let (state, dir) = make_state(rel_config).await;
+        let (state, dir) = make_state(rel_config, false).await;
         (crate::api::create_router(state, Arc::new(vec![])), dir)
     }
 
@@ -1148,7 +1235,7 @@ mod tests {
     //     bucket (separate); exhaustion -> 429 + Retry-After.
     #[tokio::test]
     async fn test_rate_limit_429() {
-        let (state, _dir) = make_state(Some(RelStoreConfig::default())).await;
+        let (state, _dir) = make_state(Some(RelStoreConfig::default()), false).await;
         let engine = state.rel_engine.clone().unwrap();
         let app = crate::api::create_router(state, Arc::new(vec![]));
         sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
@@ -1256,5 +1343,163 @@ mod tests {
         .await;
         assert_eq!(sql_status, StatusCode::CONFLICT);
         assert_eq!(rest_status, StatusCode::CONFLICT, "same error code as the equivalent /sql INSERT");
+    }
+
+    // ── Spec general/017: rel object-count endpoint ──────────────────────────
+
+    // Test 6: empty table -> 0; after 3 INSERT -> 3; after 1 DELETE -> 2.
+    #[tokio::test]
+    async fn test_count_rows_basic_lifecycle() {
+        let (app, _dir) = make_default_app().await;
+        sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
+        let uri = "/store-api/rel/default/tables/t/count";
+
+        let (status, body) = req_json(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], json!(0));
+
+        sql(&app, "default", r#"{"sql": "INSERT INTO t VALUES (1), (2), (3)"}"#).await;
+        let (status, body) = req_json(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], json!(3));
+
+        sql(&app, "default", r#"{"sql": "DELETE FROM t WHERE id = 1"}"#).await;
+        let (status, body) = req_json(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], json!(2));
+    }
+
+    // Test 7: unknown table -> 404; a view -> 404, not 400 (proof that
+    // count_rows resolves the schema via browse_table, the read-side
+    // resolver, not the write path's require_table); unknown/deleting domain
+    // -> 404/410; disabled engine -> the route doesn't exist at all.
+    #[tokio::test]
+    async fn test_count_rows_not_found_view_and_domain_errors() {
+        let (app, _dir) = make_default_app().await;
+        sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
+        sql(&app, "default", r#"{"sql": "CREATE VIEW v AS SELECT * FROM t"}"#).await;
+
+        let (status, _) = req_json(&app, Method::GET, "/store-api/rel/default/tables/ghost/count", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = req_json(&app, Method::GET, "/store-api/rel/default/tables/v/count", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a view has no count resource, not 400");
+
+        let (status, _) = req_json(&app, Method::GET, "/store-api/rel/ghost/tables/t/count", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown domain");
+
+        request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "gone"}"#)).await;
+        request(&app, Method::DELETE, "/store-api/rel/domains/gone", None).await;
+        let (status, _) = req_json(&app, Method::GET, "/store-api/rel/gone/tables/t/count", None).await;
+        assert_eq!(status, StatusCode::GONE, "deleting domain");
+
+        let (app_disabled, _dir2) = make_app(None).await;
+        let (status, _) =
+            request(&app_disabled, Method::GET, "/store-api/rel/default/tables/t/count", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "rel engine disabled -> route absent");
+    }
+
+    // Test 8: exhausted read budget -> 429 via the check_budget path (same
+    // mechanism as Row-Browse's own rate-limit test).
+    #[tokio::test]
+    async fn test_count_rows_rate_limit_429() {
+        let (state, _dir) = make_state(Some(RelStoreConfig::default()), false).await;
+        let engine = state.rel_engine.clone().unwrap();
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+        sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
+
+        engine.drain_domain_budget_for_test("default", false);
+        let (status, _) = req_json(&app, Method::GET, "/store-api/rel/default/tables/t/count", None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // Test 9: the REST count matches `SELECT COUNT(*) FROM t` via `/sql` —
+    // the residual-free branch of exec_count vs. count_rows, same numbers.
+    #[tokio::test]
+    async fn test_count_rows_matches_sql_count_star() {
+        let (app, _dir) = make_default_app().await;
+        sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
+        sql(&app, "default", r#"{"sql": "INSERT INTO t VALUES (1), (2), (3), (4)"}"#).await;
+
+        let (status, body) =
+            req_json(&app, Method::GET, "/store-api/rel/default/tables/t/count", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, sql_body) = sql(&app, "default", r#"{"sql": "SELECT COUNT(*) FROM t"}"#).await;
+        assert_eq!(body["count"], sql_body["rows"][0][0]);
+    }
+
+    // Test 10: a Read grant on the rel domain (`rel:{domain}` namespace)
+    // allows the count; no grant -> 403.
+    #[tokio::test]
+    async fn test_count_rows_auth_scoping() {
+        use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
+
+        let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
+        let cache = Arc::clone(&state.auth_cache);
+        let app = crate::api::create_router(state, Arc::new(vec![]));
+
+        let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {bearer}"));
+            let req = if let Some(b) = body {
+                builder = builder.header("content-type", "application/json");
+                builder.body(Body::from(b.to_string())).unwrap()
+            } else {
+                builder.body(Body::empty()).unwrap()
+            };
+            app.clone().oneshot(req)
+        };
+
+        let admin_key = "lura_test_admin_key";
+        cache
+            .upsert_user(UserRecord {
+                name: "boss".to_string(),
+                api_key_hash: hash_api_key(admin_key),
+                role: UserRole::Admin,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        let resp = send(Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#), admin_key)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = send(
+            Method::POST,
+            "/store-api/rel/shop/sql",
+            Some(r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#),
+            admin_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let user_key = "lura_test_worker_key";
+        cache
+            .upsert_user(UserRecord {
+                name: "worker".to_string(),
+                api_key_hash: hash_api_key(user_key),
+                role: UserRole::User,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let resp = send(Method::GET, "/store-api/rel/shop/tables/t/count", None, user_key).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "no permission on rel:shop yet");
+
+        cache
+            .set_permission(DomainPermission {
+                username: "worker".to_string(),
+                domain: "rel:shop".to_string(),
+                access: AccessLevel::Read,
+            })
+            .await
+            .unwrap();
+        let resp = send(Method::GET, "/store-api/rel/shop/tables/t/count", None, user_key).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "Read grant must allow the count");
     }
 }

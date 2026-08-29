@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 
 const CAT_PREFIX: &[u8] = b"CAT:";
 const SYS_CATALOG_SEQ_PREFIX: &[u8] = b"__sys:rel_catalog_seq:";
-const MAX_IDENTIFIER_LEN: usize = 50;
+pub(crate) const MAX_IDENTIFIER_LEN: usize = 50;
 
 // ── Identifier rules (concept 3.5) ─────────────────────────────────────────────
 
@@ -670,6 +670,12 @@ impl RelCatalog {
         let mut prospective = self.entries.read().get(prefix).cloned().unwrap_or_default();
         prospective.insert(schema.name.clone(), CatalogEntry::Table(schema.clone()));
         prospective
+    }
+
+    /// The `rel.max_columns` cap, so a caller can reject an oversized schema
+    /// before doing per-column work (`create_table` enforces it again).
+    pub(crate) fn max_columns(&self) -> usize {
+        self.limits.max_columns
     }
 
     /// Validates all columns and returns `(stored columns, unique column names)`.

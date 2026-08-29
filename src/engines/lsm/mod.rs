@@ -15,6 +15,7 @@ pub mod janitor;
 pub mod watcher;
 pub mod domain;
 pub mod rate_limiter;
+pub mod ttl_sweeper;
 
 pub use block_cache::{BlockCache, BlockCacheKey, BlockCacheMetrics};
 pub use engine::LsmStorageEngine;
@@ -23,6 +24,7 @@ pub use reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegis
 pub use levels::LevelManager;
 pub use compaction::{CompactionConfig, CompactionJob};
 pub use janitor::{Janitor, JanitorConfig};
-pub use watcher::{OpType, WalEvent};
-pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore};
+pub use watcher::{OpType, WalEvent, WatchMessage, WATCH_TAG};
+pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta, WatchStart};
 pub use rate_limiter::{DomainQuota, RateLimiter, TokenBucket};
+pub use ttl_sweeper::TtlSweeper;

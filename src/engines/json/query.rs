@@ -12,6 +12,7 @@ use super::index::{
     self, encode_index_value, index_field_prefix, index_scan_prefix, IndexDefinition,
 };
 use super::JsonEngine;
+use crate::metrics::EngineKind;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
@@ -90,6 +91,7 @@ impl JsonEngine {
         domain: &str,
         query: SearchQuery,
     ) -> Result<SearchResult, JsonStoreError> {
+        let start = std::time::Instant::now();
         let dom = self.domains.require_active(domain)?;
         if query.filters.is_empty() {
             return Err(JsonStoreError::InvalidFilter(
@@ -133,12 +135,14 @@ impl JsonEngine {
                 });
             }
         }
-        Ok(SearchResult {
+        let result = SearchResult {
             documents,
             total,
             offset: query.offset,
             limit,
-        })
+        };
+        self.metrics.record_engine_read(EngineKind::Json, start.elapsed().as_micros() as u64);
+        Ok(result)
     }
 
     /// Lists documents of a domain without filters or index requirements,
@@ -148,6 +152,7 @@ impl JsonEngine {
         domain: &str,
         options: ListOptions,
     ) -> Result<DocumentListResult, JsonStoreError> {
+        let start = std::time::Instant::now();
         let dom = self.domains.require_active(domain)?;
         let limit = options.limit.min(MAX_LIMIT);
         let lsm_keys = self
@@ -178,17 +183,22 @@ impl JsonEngine {
                 }
             }
         }
-        Ok(DocumentListResult { documents, keys, total, offset: options.offset, limit })
+        let result = DocumentListResult { documents, keys, total, offset: options.offset, limit };
+        self.metrics.record_engine_read(EngineKind::Json, start.elapsed().as_micros() as u64);
+        Ok(result)
     }
 
     /// Counts all documents of a domain (key scan only, no value loads).
     pub async fn count_documents(&self, domain: &str) -> Result<u64, JsonStoreError> {
+        let start = std::time::Instant::now();
         let dom = self.domains.require_active(domain)?;
         let keys = self
             .engine
             .scan_keys(&doc_scan_prefix(&dom.system_prefix))
             .await?;
-        Ok(keys.len() as u64)
+        let count = keys.len() as u64;
+        self.metrics.record_engine_read(EngineKind::Json, start.elapsed().as_micros() as u64);
+        Ok(count)
     }
 
     /// Evaluates one filter condition to the set of matching document keys.
@@ -289,7 +299,8 @@ mod tests {
             sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
         };
-        let engine = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         (engine, dir)
     }
 

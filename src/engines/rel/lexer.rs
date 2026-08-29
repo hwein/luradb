@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn test_numbers() {
         assert_eq!(toks("42"), vec![Token::Integer(42)]);
-        assert_eq!(toks("3.14"), vec![Token::Real(3.14)]);
+        assert_eq!(toks("3.25"), vec![Token::Real(3.25)]);
         assert_eq!(toks("1e3"), vec![Token::Real(1e3)]);
         assert_eq!(toks("1.5e-2"), vec![Token::Real(1.5e-2)]);
         assert_eq!(toks("-7"), vec![Token::Integer(-7)]);

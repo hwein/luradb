@@ -10,6 +10,13 @@ use serde_json::Value;
 
 pub(crate) const DOC_PREFIX: &[u8] = b"DOC:";
 
+/// Top-level field names reserved for store metadata: `_key`/`_version` are
+/// merged onto the document by `bulk::document_to_value`, `_content` wraps a
+/// non-object document. Colliding with them made a document unreadable or
+/// roundtrip-corruptible (spec json/017); nested occurrences collide with
+/// nothing and stay allowed.
+const RESERVED_FIELDS: [&str; 3] = ["_key", "_version", "_content"];
+
 /// Fixed composite-key overhead of [`doc_key`]: `DOC:` + 16-hex system
 /// prefix (json/003) + `:`.
 pub(crate) const DOC_KEY_OVERHEAD: usize = DOC_PREFIX.len() + 16 + 1;
@@ -43,6 +50,15 @@ pub(crate) struct StoredDocument {
 pub struct ExpectedVersion {
     pub generation: u64,
     pub version: u64,
+}
+
+/// Write precondition for `put_document_with_version` (json/011, json/014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precondition {
+    /// `If-Match`: document must exist with exactly this incarnation+version.
+    IfMatch(ExpectedVersion),
+    /// `If-None-Match: *`: document must not exist.
+    MustNotExist,
 }
 
 /// Canonical ETag value (without quotes): `{generation:x}-{version}`.
@@ -109,6 +125,19 @@ pub(crate) fn validate_document_key(key: &str, max_len: usize) -> Result<(), Jso
     Ok(())
 }
 
+/// Rejects a top-level reserved field name (`_key`, `_version`, `_content`)
+/// on an object document. Non-objects have no top-level fields, so they
+/// always pass — their `_content` wrapping happens server-side, on read.
+pub(crate) fn reject_reserved_fields(content: &Value) -> Result<(), JsonStoreError> {
+    let Value::Object(map) = content else { return Ok(()) };
+    for field in RESERVED_FIELDS {
+        if map.contains_key(field) {
+            return Err(JsonStoreError::ReservedField { field: field.to_string() });
+        }
+    }
+    Ok(())
+}
+
 /// Generates a random UUIDv4 string using the existing `rand` + `hex` crates.
 pub(crate) fn generate_uuid_v4() -> String {
     use rand::RngCore;
@@ -129,6 +158,7 @@ pub(crate) fn generate_uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // 1. doc_key/parse_doc_key roundtrip.
     #[test]
@@ -163,5 +193,24 @@ mod tests {
     fn test_etag_value_format() {
         assert_eq!(etag_value(0x00c0_ffee, 7), "c0ffee-7");
         assert_eq!(etag_value(0, 1), "0-1");
+    }
+
+    // 5. reject_reserved_fields: top-level _key/_version/_content are
+    //    rejected by name on an object; a nested occurrence and every
+    //    non-object always pass (spec json/017 §1).
+    #[test]
+    fn test_reject_reserved_fields() {
+        for field in RESERVED_FIELDS {
+            let content = json!({field: 1, "x": 2});
+            let err = reject_reserved_fields(&content).unwrap_err();
+            assert!(
+                matches!(&err, JsonStoreError::ReservedField { field: f } if f == field),
+                "got: {err}"
+            );
+        }
+        reject_reserved_fields(&json!({"a": {"_key": 1}})).unwrap();
+        for content in [json!(42), json!("text"), json!([1, 2])] {
+            reject_reserved_fields(&content).unwrap();
+        }
     }
 }

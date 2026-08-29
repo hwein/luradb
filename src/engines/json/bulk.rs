@@ -3,12 +3,13 @@
 
 use super::document::{
     doc_key, doc_scan_prefix, generate_uuid_v4, new_generation, parse_doc_key,
-    validate_document_key, Document, StoredDocument,
+    reject_reserved_fields, validate_document_key, Document, StoredDocument,
 };
 use super::error::JsonStoreError;
 use super::JsonEngine;
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::lsm::reader::Snapshot;
+use crate::metrics::EngineKind;
 use futures::Stream;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -66,19 +67,26 @@ pub fn document_to_ndjson_line(doc: &Document) -> String {
 }
 
 impl JsonEngine {
-    /// Reads, versions and writes one import batch entirely under the doc
-    /// write lock, so the read→write cycle cannot race put/delete (json/011)
-    /// and no batch lands after the purger finalized the domain (json/013).
+    /// Reads, versions and writes one import batch entirely under the write
+    /// shards of its own keys, so the read→write cycle cannot race put/delete
+    /// (json/011) and no batch lands after the purger finalized the domain
+    /// (json/013) — the purger holds every shard.
     async fn load_batch(
         &self,
         domain: &str,
         batch: Vec<(String, Value)>,
         result: &mut BulkLoadResult,
     ) -> Result<(), JsonStoreError> {
-        let _guard = self.doc_write_lock.lock().await;
+        let shards = batch.iter().map(|(key, _)| Self::shard(domain, key)).collect();
+        let _guards = self.lock_shards(shards).await;
         let dom = self.domains.require_active(domain)?;
         let mut ops: Vec<BatchOp> = Vec::new();
         for (key, content) in batch {
+            if let Err(e) = reject_reserved_fields(&content) {
+                result.failed += 1;
+                result.errors.push((key, e.to_string()));
+                continue;
+            }
             let old = self.read_stored(&dom, &key).await?;
             let (generation, version) = match &old {
                 Some(o) => (o.generation, o.version + 1),
@@ -130,7 +138,7 @@ impl JsonEngine {
 
     /// Imports documents in atomic batches of `bulk_batch_size`. Per-document
     /// errors are recorded and skipped; engine/storage errors abort the call
-    /// (already flushed batches stay imported). The lock is held per batch,
+    /// (already flushed batches stay imported). The shards are held per batch,
     /// not across the whole import, so single-document writers are not
     /// starved by large imports.
     pub async fn bulk_load(
@@ -138,6 +146,7 @@ impl JsonEngine {
         domain: &str,
         documents: Vec<(Option<String>, Value)>,
     ) -> Result<BulkLoadResult, JsonStoreError> {
+        let start = std::time::Instant::now();
         self.domains.require_active(domain)?;
         let mut result = BulkLoadResult::default();
 
@@ -168,6 +177,7 @@ impl JsonEngine {
         for batch in batches {
             self.load_batch(domain, batch, &mut result).await?;
         }
+        self.metrics.record_engine_write(EngineKind::Json, start.elapsed().as_micros() as u64);
         Ok(result)
     }
 
@@ -204,11 +214,13 @@ impl JsonEngine {
         self: &Arc<Self>,
         domain: &str,
     ) -> Result<impl Stream<Item = Document> + Send + 'static, JsonStoreError> {
+        let start = std::time::Instant::now();
         let dom = self.domains.require_active(domain)?;
         let keys = self
             .engine
             .scan_keys(&doc_scan_prefix(&dom.system_prefix))
             .await?;
+        self.metrics.record_engine_read(EngineKind::Json, start.elapsed().as_micros() as u64);
         let engine = Arc::clone(self);
         Ok(futures::stream::unfold(
             (engine, keys.into_iter(), dom),
@@ -283,7 +295,8 @@ mod tests {
             bulk_batch_size: batch,
             ..JsonStoreConfig::default()
         };
-        let engine = JsonEngine::bootstrap(&config).await.unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         (engine, dir)
     }
 
@@ -451,25 +464,59 @@ mod tests {
         assert_eq!(docs[0].key.len(), 36, "generated key must be a UUID");
     }
 
-    // 8. Roundtrip: NDJSON load → export → identical content.
+    // 8. Roundtrip: NDJSON load → export → identical content, including an
+    //    underscore-prefixed user field that is not a reserved name (_foo)
+    //    and a non-object document (spec json/017 test 5: every acceptable
+    //    document survives export → re-import unchanged).
     #[tokio::test]
     async fn test_ndjson_roundtrip() {
         let (json, _dir) = make_engine_with_batch(100).await;
         let ndjson = concat!(
             "{\"_key\": \"r1\", \"city\": \"Essen\", \"n\": 1}\n",
             "{\"_key\": \"r2\", \"city\": \"Berlin\", \"n\": 2}\n",
+            "{\"_key\": \"r3\", \"_foo\": \"bar\"}\n",
+            "{\"_key\": \"r4\", \"_content\": 99}\n",
         );
         let result = json.bulk_load_ndjson("default", ndjson).await.unwrap();
-        assert_eq!(result.imported, 2);
+        assert_eq!(result.imported, 4);
         assert_eq!(result.failed, 0);
 
         let stream = json.bulk_export("default").await.unwrap();
         let lines: Vec<String> = stream.map(|d| document_to_ndjson_line(&d)).collect().await;
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 4);
         let reparsed: Vec<(Option<String>, Value)> =
             lines.iter().map(|l| parse_ndjson_line(l).unwrap()).collect();
         assert!(reparsed.contains(&(Some("r1".to_string()), json!({"city": "Essen", "n": 1}))));
         assert!(reparsed.contains(&(Some("r2".to_string()), json!({"city": "Berlin", "n": 2}))));
+        assert!(reparsed.contains(&(Some("r3".to_string()), json!({"_foo": "bar"}))));
+        assert!(reparsed.contains(&(Some("r4".to_string()), json!(99))));
+    }
+
+    // 8b. A leftover reserved field after meta-extraction is rejected as a
+    //     per-line import error; other lines still import (spec json/017 §1
+    //     test 4). Line 1: after `_key` extraction the map is
+    //     {"_content":1,"x":2} -- length 2, so the `_content`-unwrap rule
+    //     (map.len() == 1) does not fire and `_content` survives as a
+    //     leftover user field.
+    #[tokio::test]
+    async fn test_bulk_load_rejects_leftover_reserved_field() {
+        let (json, _dir) = make_engine_with_batch(100).await;
+        let ndjson = concat!(
+            "{\"_key\":\"a\",\"_content\":1,\"x\":2}\n",
+            "{\"_key\":\"b\",\"city\":\"Essen\"}\n",
+        );
+        let result = json.bulk_load_ndjson("default", ndjson).await.unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].0, "a", "error must name the key");
+        assert!(
+            result.errors[0].1.contains("field '_content'"),
+            "error must name the field: {}",
+            result.errors[0].1
+        );
+        assert!(json.get_document("default", "b").await.unwrap().is_some());
+        assert!(json.get_document("default", "a").await.unwrap().is_none());
     }
 
     // 9. A key within max_document_key_length but too long for the composite
@@ -526,6 +573,59 @@ mod tests {
             entries,
             vec![super::super::index::index_key(&prefix, "city", city.as_bytes(), "k")],
             "exactly one index entry, matching the final content"
+        );
+    }
+
+    // 11. Deadlock probe (spec json/018): two concurrent batches over the same
+    //     keys in opposite order finish — the ascending shard acquisition is
+    //     the proof object; a naive per-key order would deadlock here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_bulk_loads_with_opposite_key_order() {
+        let (json, _dir) = make_engine_with_batch(100).await;
+        let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+        let forward: Vec<_> = keys.iter().map(|k| (Some(k.clone()), json!({"v": "f"}))).collect();
+        let backward: Vec<_> =
+            keys.iter().rev().map(|k| (Some(k.clone()), json!({"v": "b"}))).collect();
+
+        let a = tokio::spawn({
+            let json = Arc::clone(&json);
+            async move { json.bulk_load("default", forward).await }
+        });
+        let b = tokio::spawn({
+            let json = Arc::clone(&json);
+            async move { json.bulk_load("default", backward).await }
+        });
+        let bound = std::time::Duration::from_secs(10);
+        tokio::time::timeout(bound, a).await.expect("bulk A deadlocked").unwrap().unwrap();
+        tokio::time::timeout(bound, b).await.expect("bulk B deadlocked").unwrap().unwrap();
+
+        for key in &keys {
+            let doc = json.get_document("default", key).await.unwrap().unwrap();
+            assert_eq!(doc.version, 2, "both imports must see each other's version");
+        }
+    }
+
+    // ── Spec general/019: per-engine metrics ─────────────────────────────────
+
+    // Test 6: bulk_load with N documents increments json.write_ops by
+    // exactly 1, not N, with exactly one latency sample -- proof of the
+    // "one call = one op" rule, regardless of how many batches the import
+    // splits into internally.
+    #[tokio::test]
+    async fn test_bulk_load_counts_as_one_write_op() {
+        let (json, _dir) = make_engine_with_batch(2).await; // small batch: several internal flushes
+        let docs = (0..7)
+            .map(|i| (Some(format!("d{i}")), json!({"n": i})))
+            .collect();
+        let result = json.bulk_load("default", docs).await.unwrap();
+        assert_eq!(result.imported, 7);
+
+        // aggregate_engine only sums fully ticked buckets (spec general/019).
+        json.metrics.tick_all();
+        let m = json.metrics.engine_metrics();
+        assert_eq!(
+            m[EngineKind::Json as usize].write_ops, 1,
+            "one call, one op -- not one per document or batch"
         );
     }
 }

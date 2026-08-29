@@ -11,10 +11,11 @@
 //!
 //! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
 
-use crate::engines::lsm::engine::LsmStorageEngine;
+use crate::core::events::{GlobalEventBus, Resume};
+use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
-use crate::engines::lsm::watcher::WalEvent;
+use crate::engines::lsm::watcher::{WalEvent, WatchMessage};
 use crate::metrics::MetricsStore;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
@@ -43,6 +44,7 @@ pub struct DomainConfig {
     pub default_max_storage_bytes: u64,
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
+    pub max_bulk_delete_keys: usize,
 }
 
 impl Default for DomainConfig {
@@ -56,6 +58,7 @@ impl Default for DomainConfig {
             default_max_storage_bytes: 0,
             purger_batch_size: 100,
             purger_interval_secs: 5,
+            max_bulk_delete_keys: 10_000,
         }
     }
 }
@@ -173,6 +176,10 @@ pub struct DomainRegistry {
     engine: Arc<LsmStorageEngine>,
     config: DomainConfig,
     metrics: Arc<MetricsStore>,
+    /// Global lifecycle/DDL event bus (spec general/018 §1) — unset in unit
+    /// tests and standalone-built registries, which then simply publish
+    /// nothing (`publish_lifecycle_event`'s `if let Some(bus) = ...`).
+    event_bus: OnceLock<Arc<GlobalEventBus>>,
 }
 
 impl DomainRegistry {
@@ -191,6 +198,7 @@ impl DomainRegistry {
             engine,
             config,
             metrics,
+            event_bus: OnceLock::new(),
         };
         registry.load_from_engine().await?;
         // Check in any state: creating over a Deleting default would 409 and
@@ -213,6 +221,22 @@ impl DomainRegistry {
     /// Returns a reference to the underlying storage engine.
     pub fn engine(&self) -> &Arc<LsmStorageEngine> {
         &self.engine
+    }
+
+    /// Wires the global event bus (spec general/018 §1). Must run before the
+    /// purgers are spawned and before the listener accepts requests — set
+    /// only once, during startup; every read afterward goes through
+    /// `publish_lifecycle_event`'s `OnceLock::get`.
+    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
+        let _ = self.event_bus.set(bus);
+    }
+
+    /// `domain_created` / `domain_deleted` / `domain_purged` (spec §2) — a
+    /// no-op when no bus is attached.
+    fn publish_lifecycle_event(&self, kind: &'static str, domain: &str) {
+        if let Some(bus) = self.event_bus.get() {
+            bus.publish("kv", kind, domain, None);
+        }
     }
 
     fn make_runtime(&self) -> Arc<DomainRuntime> {
@@ -258,6 +282,7 @@ impl DomainRegistry {
         self.engine.put(&sys_key(name), &data).await?;
         self.runtimes.write().insert(name.to_string(), self.make_runtime());
         self.domains.write().insert(name.to_string(), domain.clone());
+        self.publish_lifecycle_event("domain_created", name);
         Ok(domain)
     }
 
@@ -318,6 +343,7 @@ impl DomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain);
+        self.publish_lifecycle_event("domain_deleted", name);
         Ok(())
     }
 
@@ -339,6 +365,7 @@ impl DomainRegistry {
         self.runtimes.write().remove(name);
         self.domains.write().remove(name);
         self.metrics.remove_domain(name);
+        self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
 
@@ -370,6 +397,7 @@ impl DomainRegistry {
             engine: Arc::clone(&self.engine),
             runtime,
             max_user_key_len: self.config.max_user_key_length,
+            max_bulk_delete_keys: self.config.max_bulk_delete_keys,
             metrics: Arc::clone(&self.metrics),
         })
     }
@@ -391,7 +419,26 @@ pub struct DomainStore {
     engine: Arc<LsmStorageEngine>,
     runtime: Arc<DomainRuntime>,
     max_user_key_len: usize,
+    max_bulk_delete_keys: usize,
     metrics: Arc<MetricsStore>,
+}
+
+/// Key metadata without the value bytes (spec kv/022): TTL expiry and the
+/// write time of the newest visible version. Backs `GET …/{key}/meta`;
+/// never dereferences a VLog pointer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyMeta {
+    /// Absolute Unix seconds; 0 = no TTL set.
+    pub expire_at: u64,
+    /// Unix milliseconds of the newest visible version's write.
+    pub last_modified_ms: u64,
+}
+
+/// Result of starting (or resuming) a KV watch (spec kv/024 §4.3):
+/// `resume` is already domain-filtered/stripped, `rx` is the live stream.
+pub struct WatchStart {
+    pub resume: Resume<WalEvent>,
+    pub rx: broadcast::Receiver<WatchMessage>,
 }
 
 impl DomainStore {
@@ -451,6 +498,15 @@ impl DomainStore {
     /// `Null` (key exists in the NULL state), or `Absent`. Records latency
     /// and hit/miss in MetricsStore (a `Null` read counts as a hit).
     pub async fn get(&self, key: &[u8]) -> Result<GetResult> {
+        Ok(self.get_with_expiry(key).await?.0)
+    }
+
+    /// Like [`Self::get`], but also returns `expire_at` (absolute Unix
+    /// seconds, 0 = no TTL) — spec kv/022, backs the `X-Expires-At` response
+    /// header. Same validation, rate-limiting and hit/miss accounting as
+    /// `get`; unlike [`Self::get_with_snapshot`] this acquires its own
+    /// snapshot and goes through the read rate limiter.
+    pub async fn get_with_expiry(&self, key: &[u8]) -> Result<(GetResult, u64)> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
@@ -460,11 +516,33 @@ impl DomainStore {
         let snap = self.engine.snapshot();
         let result = self
             .engine
-            .get_with_snapshot(&self.prefixed_key(key), snap.snapshot())
+            .get_with_expiry(&self.prefixed_key(key), snap.snapshot())
             .await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.metrics.record_read(&self.domain.name, elapsed_us, !matches!(result, GetResult::Absent));
+        self.metrics.record_read(&self.domain.name, elapsed_us, !matches!(result.0, GetResult::Absent));
         Ok(result)
+    }
+
+    /// Reads a key's TTL expiry and last-modified time without its value
+    /// bytes (spec kv/022) — backs `GET …/{key}/meta`; never dereferences a
+    /// VLog pointer. Same validation and rate-limiting as `get`, including
+    /// the same hit/miss rule (a `Null` key is a hit, only an absent key is
+    /// a miss) — the read still spends a rate-limit token on the domain path.
+    pub async fn get_meta(&self, key: &[u8]) -> Result<Option<KeyMeta>> {
+        self.validate_user_key(key)?;
+        if !self.runtime.rate_limiter.check_read() {
+            self.metrics.record_rate_limit_rejection(&self.domain.name);
+            return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
+        }
+        let start = std::time::Instant::now();
+        let snap = self.engine.snapshot();
+        let result = self
+            .engine
+            .get_with_metadata(&self.prefixed_key(key), snap.snapshot())
+            .await?;
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        self.metrics.record_read(&self.domain.name, elapsed_us, result.is_some());
+        Ok(result.map(|m| KeyMeta { expire_at: m.expire_at, last_modified_ms: m.last_modified_ms }))
     }
 
     /// Tombstones a key (hard delete).
@@ -504,6 +582,114 @@ impl DomainStore {
         let raw_keys = self.engine.scan_keys(&full_prefix).await?;
         let prefix_len = self.domain.system_prefix.len();
         Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
+    }
+
+    /// Returns one page of live user-keys whose raw form starts with
+    /// `prefix`, optionally narrowed by a case-sensitive `contains`
+    /// substring filter on the user key — same filter semantics as
+    /// `delete_by_prefix` (a non-UTF-8 key is skipped, not an error). One
+    /// read token per call (spec kv/028): the scan itself stays unbounded,
+    /// same server cost as `scan_keys`/`count_keys` — only the wire response
+    /// is capped. `total` counts the filtered set before `offset`/`limit`
+    /// are applied; returns `(page, total)`.
+    pub async fn scan_keys_page(
+        &self,
+        prefix: &[u8],
+        contains: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        if !self.runtime.rate_limiter.check_read() {
+            return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
+        }
+        let full_prefix = self.prefixed_key(prefix);
+        let raw_keys = self.engine.scan_keys(&full_prefix).await?;
+        let prefix_len = self.domain.system_prefix.len();
+        let matched: Vec<Vec<u8>> = raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect();
+        let matched: Vec<Vec<u8>> = match contains {
+            // A non-UTF-8 key would be an invariant break (general/007
+            // guarantees UTF-8 keys) — skip it rather than fail the request
+            // (same rule as delete_by_prefix).
+            Some(needle) => matched
+                .into_iter()
+                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
+                .collect(),
+            None => matched,
+        };
+        let total = matched.len() as u64;
+        let page: Vec<Vec<u8>> = matched.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    /// Counts live user-keys whose raw form starts with `prefix` — same scan
+    /// as `scan_keys` (spec general/017), without materializing the stripped
+    /// key strings.
+    pub async fn count_keys(&self, prefix: &[u8]) -> Result<u64> {
+        if !self.runtime.rate_limiter.check_read() {
+            return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
+        }
+        let full_prefix = self.prefixed_key(prefix);
+        Ok(self.engine.scan_keys(&full_prefix).await?.len() as u64)
+    }
+
+    /// Deletes every live user-key matching `prefix`, optionally narrowed by
+    /// a case-sensitive `contains` substring filter on the user key (spec
+    /// kv/023). Order is binding (spec §3): the write token is checked
+    /// before the scan runs, so a request that will fail the write limit
+    /// never pays for scan work; the scan itself pulls its own read token
+    /// (`scan_keys`). Atomic — one `write_batch` call for the whole
+    /// selection, so either every matched key is gone or (on a cap
+    /// violation) none is.
+    pub async fn delete_by_prefix(&self, prefix: &[u8], contains: Option<&str>) -> Result<usize> {
+        anyhow::ensure!(!prefix.is_empty(), "400 Bad Request: prefix must not be empty");
+        if !self.runtime.rate_limiter.check_write() {
+            self.metrics.record_rate_limit_rejection(&self.domain.name);
+            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
+        }
+
+        let matched = self.scan_keys(prefix).await?;
+        let matched: Vec<Vec<u8>> = match contains {
+            // A non-UTF-8 key would be an invariant break (general/007
+            // guarantees UTF-8 keys) — skip it from the filtered match set
+            // rather than fail the whole request.
+            Some(needle) => matched
+                .into_iter()
+                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
+                .collect(),
+            None => matched,
+        };
+
+        anyhow::ensure!(
+            matched.len() <= self.max_bulk_delete_keys,
+            "413 Payload Too Large: {} keys match the selection, limit is {}",
+            matched.len(),
+            self.max_bulk_delete_keys
+        );
+
+        let ops: Vec<BatchOp> =
+            matched.iter().map(|k| BatchOp::Delete { key: self.prefixed_key(k) }).collect();
+        let start = std::time::Instant::now();
+        self.engine.write_batch(ops).await?;
+        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        Ok(matched.len())
+    }
+
+    /// Test-only: drains and locks this domain's read bucket so the next
+    /// read deterministically answers 429 — no refill race no matter how
+    /// slow the test runs (flaky-test fix, spec general/008 pattern).
+    #[cfg(test)]
+    pub fn drain_read_budget_for_test(&self) {
+        self.runtime.rate_limiter.read_bucket.drain_for_test();
+    }
+
+    /// Test-only: write-bucket counterpart of
+    /// [`Self::drain_read_budget_for_test`] — used to prove the write-token
+    /// check in [`Self::delete_by_prefix`] runs before the scan (spec kv/023
+    /// §3.2): draining only the write bucket leaves the read bucket
+    /// untouched, so a following read still succeeds.
+    #[cfg(test)]
+    pub fn drain_write_budget_for_test(&self) {
+        self.runtime.rate_limiter.write_bucket.drain_for_test();
     }
 
     /// Restore-path upsert (spec general/006): same key validation as
@@ -552,29 +738,80 @@ impl DomainStore {
         Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
     }
 
-    /// Subscribes to write events for this domain (domain prefix already stripped).
-    pub fn watch(&self) -> broadcast::Receiver<WalEvent> {
+    /// Subscribes to write events for this domain (domain prefix already
+    /// stripped), optionally resuming from `last_event_id` (spec kv/024 §4).
+    ///
+    /// Step order is binding (spec kv/024 §4.3): subscribing to the raw
+    /// engine broadcast happens *before* the ring snapshot, so nothing can
+    /// be lost between the snapshot and the relay task picking up live
+    /// traffic — only overlap, which the caller suppresses using the
+    /// returned `Resume`'s `head` (a live event with `seq <= head` is a
+    /// re-delivery of what was just replayed).
+    pub fn watch_from(&self, last_event_id: Option<&str>) -> WatchStart {
+        let mut raw_rx = self.engine.watch_subscribe(); // step 1: subscribe first
+        let resume = self.strip_domain_prefix(self.engine.watch_decide_resume(last_event_id)); // step 2
+
         let prefix = self.domain.system_prefix.clone();
         let prefix_len = prefix.len();
-        let mut raw_rx = self.engine.watch_subscribe();
-        let (tx, rx) = broadcast::channel(64);
+        let (tx, rx) = broadcast::channel(self.engine.wal_event_channel_capacity());
         tokio::spawn(async move {
+            // step 3: relay task
             loop {
                 match raw_rx.recv().await {
                     Ok(event) => {
                         if event.key.starts_with(&prefix) {
-                            let stripped = event.key[prefix_len..].to_vec();
-                            if tx.send(WalEvent { key: stripped, op: event.op }).is_err() {
+                            let stripped = WalEvent {
+                                seq: event.seq,
+                                key: event.key[prefix_len..].to_vec(),
+                                op: event.op,
+                            };
+                            if tx.send(WatchMessage::Event(stripped)).is_err() {
                                 break;
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A silent `continue` would hide the gap forever — the
+                    // domain-filtered stream isn't sequence-contiguous by
+                    // construction, so the client can't infer it either
+                    // (spec kv/024 §6).
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if tx.send(WatchMessage::Gap).is_err() {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
-        rx
+
+        WatchStart { resume, rx } // step 4
+    }
+
+    /// Current head of the engine's watch-stream sequence (spec kv/024 §5)
+    /// — stamps a `reset` triggered by a live lag, as opposed to one from
+    /// the initial resume decision, which already carries its own `head`.
+    pub fn watch_head(&self) -> u64 {
+        self.engine.watch_head()
+    }
+
+    /// Filters a resume's replay list to this domain's keys and strips the
+    /// domain prefix — the ring holds raw (prefixed) keys across every
+    /// domain (spec kv/024 §2.1); `head` and non-`Replay` variants pass
+    /// through unchanged.
+    fn strip_domain_prefix(&self, resume: Resume<WalEvent>) -> Resume<WalEvent> {
+        match resume {
+            Resume::Replay { events, head } => {
+                let prefix = &self.domain.system_prefix;
+                let prefix_len = prefix.len();
+                let events = events
+                    .into_iter()
+                    .filter(|e| e.key.starts_with(prefix))
+                    .map(|e| WalEvent { seq: e.seq, key: e.key[prefix_len..].to_vec(), op: e.op })
+                    .collect();
+                Resume::Replay { events, head }
+            }
+            other => other,
+        }
     }
 }
 
@@ -641,13 +878,25 @@ impl DomainPurger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::events::{format_event_id, stream_epoch, ResetReason};
     use crate::core::wal::WriteAheadLog;
+    use crate::engines::lsm::engine::LsmEngineConfig;
+    use crate::engines::lsm::watcher::WATCH_TAG;
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::vlog::VLog;
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
 
     async fn make_setup() -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
+        make_setup_with_engine_config(LsmEngineConfig::default()).await
+    }
+
+    // Spec kv/024 tests 3/5/11 need a non-default `watch_replay_buffer_size`
+    // or `wal_event_channel_capacity` — every other test keeps using the
+    // default-config `make_setup` above.
+    async fn make_setup_with_engine_config(
+        engine_config: LsmEngineConfig,
+    ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -658,7 +907,10 @@ mod tests {
         let engine = Arc::new(
             LsmStorageEngine::new(
                 wal, wal_path, vlog, vlog_path, fm, mm,
-                crate::engines::lsm::engine::LsmEngineOptions::default(),
+                crate::engines::lsm::engine::LsmEngineOptions {
+                    engine: engine_config,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap(),
@@ -981,5 +1233,379 @@ mod tests {
         assert_eq!(keys, vec![b"k1".to_vec()]);
 
         assert_eq!(store.get(b"k1").await.unwrap(), GetResult::Present(b"new".to_vec()));
+    }
+
+    // ── Spec kv/024: watch event ids, resume & gap signal ───────────────────
+
+    // Test 1: 10 writes, disconnect after event 3, reconnect with its id ->
+    // exactly events 4..=10, in order, as a gapless Replay (no reset).
+    #[tokio::test]
+    async fn test_watch_resume_gapless_after_reconnect() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w1").await.unwrap();
+        let store = registry.store("w1").await.unwrap();
+
+        let started = store.watch_from(None);
+        assert!(matches!(started.resume, Resume::Live));
+        let mut rx = started.rx;
+
+        for i in 0..10 {
+            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+
+        let mut last_id = String::new();
+        for _ in 0..3 {
+            match rx.recv().await.unwrap() {
+                WatchMessage::Event(e) => last_id = format_event_id(WATCH_TAG, stream_epoch(), e.seq),
+                WatchMessage::Gap => panic!("unexpected gap"),
+            }
+        }
+
+        let resumed = store.watch_from(Some(&last_id));
+        match resumed.resume {
+            Resume::Replay { events, .. } => {
+                assert_eq!(events.len(), 7, "expected events 4..=10, got {events:?}");
+                for (i, e) in events.iter().enumerate() {
+                    assert_eq!(e.key, format!("k{}", i + 3).into_bytes());
+                }
+            }
+            _ => panic!("expected a gapless replay"),
+        }
+    }
+
+    // Test 3: watch_replay_buffer_size = 4, 10 writes, resume from event 1 ->
+    // reset(window_exceeded); the stream still continues live afterward.
+    #[tokio::test]
+    async fn test_watch_window_exceeded_resets_then_live_continues() {
+        let engine_config = LsmEngineConfig { watch_replay_buffer_size: 4, ..LsmEngineConfig::default() };
+        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+        registry.create_domain("w3").await.unwrap();
+        let store = registry.store("w3").await.unwrap();
+
+        for i in 0..10 {
+            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+        let id = format_event_id(WATCH_TAG, stream_epoch(), 1);
+        let mut resumed = store.watch_from(Some(&id));
+        match resumed.resume {
+            Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
+            _ => panic!("expected window_exceeded"),
+        }
+
+        store.put(b"after", b"v").await.unwrap();
+        match resumed.rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => assert_eq!(e.key, b"after"),
+            WatchMessage::Gap => panic!("unexpected gap"),
+        }
+    }
+
+    // Test 4: a resume id from a different epoch -> reset(restart). The
+    // fabricated epoch stands in for "a different process" — see
+    // core::events::tests for the fully parameterized version of this row.
+    #[tokio::test]
+    async fn test_watch_resume_wrong_epoch_is_restart() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w4").await.unwrap();
+        let store = registry.store("w4").await.unwrap();
+        store.put(b"k", b"v").await.unwrap();
+
+        let fake_epoch = stream_epoch().wrapping_add(1);
+        let id = format_event_id(WATCH_TAG, fake_epoch, 1);
+        let started = store.watch_from(Some(&id));
+        match started.resume {
+            Resume::Reset { reason: ResetReason::Restart, .. } => {}
+            _ => panic!("expected restart on epoch mismatch"),
+        }
+    }
+
+    // Test 5: a tiny wal_event_channel_capacity plus a non-draining
+    // receiver must eventually lag (tokio::broadcast's own detection) --
+    // proves watch_from actually wires the configured capacity through
+    // rather than a hardcoded value. The Lagged-to-reset(lagged) mapping
+    // itself is unit-tested at the kv.rs handler level (pure function, no
+    // timing dependency).
+    #[tokio::test]
+    async fn test_watch_slow_client_channel_lags_when_capacity_exceeded() {
+        let engine_config = LsmEngineConfig { wal_event_channel_capacity: 2, ..LsmEngineConfig::default() };
+        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+        registry.create_domain("w5").await.unwrap();
+        let store = registry.store("w5").await.unwrap();
+
+        let started = store.watch_from(None);
+        let mut rx = started.rx;
+
+        for i in 0..10 {
+            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        }
+
+        let mut saw_lag = false;
+        for _ in 0..10 {
+            match rx.recv().await {
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    saw_lag = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        assert!(saw_lag, "a burst past channel capacity must eventually lag a non-draining receiver");
+    }
+
+    // Test 6: no Last-Event-ID -> Live (no replay, no reset), plus every
+    // live event still carries a real seq (id: is additive).
+    #[tokio::test]
+    async fn test_watch_no_last_event_id_is_additive_live_only() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w6").await.unwrap();
+        let store = registry.store("w6").await.unwrap();
+
+        let started = store.watch_from(None);
+        assert!(matches!(started.resume, Resume::Live));
+        let mut rx = started.rx;
+
+        store.put(b"only", b"v").await.unwrap();
+        match rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => {
+                assert_eq!(e.key, b"only");
+                assert!(e.seq > 0, "seq must be assigned even without a resume attempt");
+            }
+            WatchMessage::Gap => panic!("unexpected gap"),
+        }
+    }
+
+    // Test 11: watch_replay_buffer_size = 0 -> id: still assigned, and even
+    // an immediate reconnect with the just-received id resets (spec §4.2:
+    // the cap == 0 row is checked before the window-arithmetic rows).
+    #[tokio::test]
+    async fn test_watch_cap_zero_ids_present_but_every_resume_is_window_exceeded() {
+        let engine_config = LsmEngineConfig { watch_replay_buffer_size: 0, ..LsmEngineConfig::default() };
+        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+        registry.create_domain("w11").await.unwrap();
+        let store = registry.store("w11").await.unwrap();
+
+        let started = store.watch_from(None);
+        let mut rx = started.rx;
+        store.put(b"k", b"v").await.unwrap();
+        let last_id = match rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => {
+                assert!(e.seq > 0, "id must be assigned even with the ring disabled");
+                format_event_id(WATCH_TAG, stream_epoch(), e.seq)
+            }
+            WatchMessage::Gap => panic!("unexpected gap"),
+        };
+
+        let resumed = store.watch_from(Some(&last_id));
+        match resumed.resume {
+            Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
+            _ => panic!("cap == 0 must always reset, even for the just-received id"),
+        }
+    }
+
+    // Test 12: an id tagged for a different stream (general/018's "g") must
+    // reset as unknown_id, never silently succeed.
+    #[tokio::test]
+    async fn test_watch_foreign_tag_is_unknown_id() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("w12").await.unwrap();
+        let store = registry.store("w12").await.unwrap();
+        store.put(b"k", b"v").await.unwrap();
+
+        let id = format_event_id("g", stream_epoch(), 1);
+        let started = store.watch_from(Some(&id));
+        match started.resume {
+            Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
+            _ => panic!("a foreign tag must reset as unknown_id, not silently succeed"),
+        }
+    }
+
+    // Replay is filtered to this domain's keys and prefix-stripped, exactly
+    // like the live relay (spec kv/024 §2.1/§4.3) -- a foreign domain's
+    // events in the same engine-wide ring must never surface here.
+    #[tokio::test]
+    async fn test_watch_replay_is_isolated_and_stripped_per_domain() {
+        let (_engine, registry, _dir) = make_setup().await;
+        registry.create_domain("wa").await.unwrap();
+        registry.create_domain("wb").await.unwrap();
+        let store_a = registry.store("wa").await.unwrap();
+        let store_b = registry.store("wb").await.unwrap();
+
+        let started = store_a.watch_from(None);
+        let mut rx = started.rx;
+
+        store_b.put(b"other-domain-key", b"v").await.unwrap();
+        store_a.put(b"mine", b"v").await.unwrap();
+        match rx.recv().await.unwrap() {
+            WatchMessage::Event(e) => {
+                assert_eq!(e.key, b"mine", "domain B's key must never reach domain A's live stream");
+            }
+            WatchMessage::Gap => panic!("unexpected gap"),
+        }
+
+        // Resuming from before either write: replay must contain only A's
+        // key, raw-prefix-stripped, even though the ring holds both.
+        let before_id = format_event_id(WATCH_TAG, stream_epoch(), 0);
+        let resumed = store_a.watch_from(Some(&before_id));
+        match resumed.resume {
+            Resume::Replay { events, .. } => {
+                assert_eq!(events.len(), 1, "expected exactly A's own write, got {events:?}");
+                assert_eq!(events[0].key, b"mine");
+            }
+            _ => panic!("expected a gapless replay"),
+        }
+    }
+
+    // ── Spec general/018: global lifecycle event bus ────────────────────────
+
+    // Test 1 (kv slice): create_domain/delete_domain publish domain_created/
+    // domain_deleted with the right engine, domain and a real ts.
+    #[tokio::test]
+    async fn test_domain_lifecycle_events_published_with_engine_domain_and_ts() {
+        let (_engine, registry, _dir) = make_setup().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        registry.attach_event_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("evdom").await.unwrap();
+        registry.delete_domain("evdom").await.unwrap();
+
+        let created = rx.try_recv().unwrap();
+        assert_eq!(created.engine, "kv");
+        assert_eq!(created.kind, "domain_created");
+        assert_eq!(created.domain, "evdom");
+        assert_eq!(created.object, None);
+        assert!(created.ts > 0);
+
+        let deleted = rx.try_recv().unwrap();
+        assert_eq!(deleted.kind, "domain_deleted");
+        assert_eq!(deleted.domain, "evdom");
+    }
+
+    // Test 2: after a purge run, domain_purged appears, and after domain_deleted.
+    #[tokio::test]
+    async fn test_domain_purge_event_published_after_domain_deleted() {
+        let (engine, registry, _dir) = make_setup().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        registry.attach_event_bus(Arc::clone(&bus));
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("purge-ev").await.unwrap();
+        rx.try_recv().unwrap(); // domain_created, not under test here
+
+        registry.delete_domain("purge-ev").await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cfg = DomainConfig::default();
+        let purger = DomainPurger::new(
+            Arc::clone(&engine),
+            Arc::clone(&registry),
+            Arc::clone(&shutdown),
+            cfg.purger_batch_size,
+            cfg.purger_interval_secs,
+        );
+        purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
+
+        let deleted = rx.try_recv().unwrap();
+        assert_eq!(deleted.kind, "domain_deleted");
+        let purged = rx.try_recv().unwrap();
+        assert_eq!(purged.kind, "domain_purged");
+        assert_eq!(purged.domain, "purge-ev");
+    }
+
+    // Test 12 (kv slice): no bus attached -> lifecycle ops succeed unchanged,
+    // no panic, and nothing is published anywhere.
+    #[tokio::test]
+    async fn test_lifecycle_ops_without_event_bus_attached_publish_nothing() {
+        let (_engine, registry, _dir) = make_setup().await;
+        let bus = GlobalEventBus::new(16, 16); // never attached
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("no-bus").await.unwrap();
+        registry.delete_domain("no-bus").await.unwrap();
+
+        assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
+    }
+
+    // Test 13: attach_event_bus, THEN spawn the purger (main.rs's startup
+    // order, spec §1) -- a purge run afterward still delivers domain_purged.
+    #[tokio::test]
+    async fn test_attach_before_purger_spawn_still_delivers_domain_purged() {
+        let (engine, registry, _dir) = make_setup().await;
+        let bus = Arc::new(GlobalEventBus::new(16, 16));
+        registry.attach_event_bus(Arc::clone(&bus)); // attach first
+        let mut rx = bus.subscribe();
+
+        registry.create_domain("late-purge").await.unwrap();
+        registry.delete_domain("late-purge").await.unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let purger = Arc::new(DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), Arc::clone(&shutdown), 1, 1));
+        tokio::spawn(purger.run()); // spawned after attach, mirroring main.rs's startup order
+
+        // Drain domain_created/domain_deleted, then wait for domain_purged.
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+        let purged = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for domain_purged")
+            .unwrap();
+        assert_eq!(purged.kind, "domain_purged");
+        assert_eq!(purged.domain, "late-purge");
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    // ── Spec kv/023: prefix bulk-delete ──────────────────────────────────────
+
+    /// Reopens an `LsmStorageEngine` on `dir`'s existing WAL/VLog/SSTable
+    /// files (same file names as `make_setup`) — mirrors `engine.rs`'s own
+    /// `engine_on` test helper; needed here to prove `delete_by_prefix`'s
+    /// batch survives a real restart (spec kv/023 §8 test 11).
+    async fn reopen_engine(dir: &tempfile::TempDir) -> Arc<LsmStorageEngine> {
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let fm = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let mm = Arc::new(ManifestManager::new(dir.path()));
+        Arc::new(
+            LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, fm, mm,
+                crate::engines::lsm::engine::LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    // Test 11: delete_by_prefix's write_batch is atomic across a restart —
+    // every key of the deleted selection stays gone after WAL recovery, the
+    // same property the existing engine-level write_batch tests prove
+    // (json/005), exercised here through the domain-scoped bulk-delete path.
+    #[tokio::test]
+    async fn test_delete_by_prefix_atomic_and_recovered() {
+        let (engine, registry, dir) = make_setup().await;
+        registry.create_domain("bulk-recover").await.unwrap();
+        let store = registry.store("bulk-recover").await.unwrap();
+        store.put(b"p:1", b"v1").await.unwrap();
+        store.put(b"p:2", b"v2").await.unwrap();
+        store.put(b"p:3", b"v3").await.unwrap();
+        store.put(b"other", b"vx").await.unwrap();
+
+        let deleted = store.delete_by_prefix(b"p:", None).await.unwrap();
+        assert_eq!(deleted, 3);
+
+        drop(store);
+        drop(registry);
+        drop(engine);
+
+        let engine2 = reopen_engine(&dir).await;
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let registry2 = DomainRegistry::recover(Arc::clone(&engine2), DomainConfig::default(), metrics)
+            .await
+            .unwrap();
+        let store2 = registry2.store("bulk-recover").await.unwrap();
+        assert_eq!(store2.get(b"p:1").await.unwrap(), GetResult::Absent);
+        assert_eq!(store2.get(b"p:2").await.unwrap(), GetResult::Absent);
+        assert_eq!(store2.get(b"p:3").await.unwrap(), GetResult::Absent);
+        assert_eq!(store2.get(b"other").await.unwrap(), GetResult::Present(b"vx".to_vec()));
     }
 }

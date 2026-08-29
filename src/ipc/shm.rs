@@ -2,7 +2,7 @@
 //! lifecycle manager (spec perf/006).
 
 use anyhow::{Context, Result};
-use memmap2::MmapMut;
+use memmap2::{Mmap, MmapMut};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
@@ -10,13 +10,13 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::config::ShmConfig;
 
-/// A single mmap'd POSIX shared-memory segment (`/dev/shm/<name>`).
-///
-/// Used read/write by the server today; a read-only client mapping is added
-/// by spec perf/010.
+/// A single mmap'd POSIX shared-memory segment (`/dev/shm/<name>`), mapped
+/// read/write. Clients map `state`/`data_a`/`data_b` through
+/// [`ShmSegment::open_readonly`] instead (spec perf/012 §10).
 pub struct ShmSegment {
     name: String,
     mmap: MmapMut,
@@ -60,10 +60,11 @@ impl ShmSegment {
         Ok(Self { name: name.to_string(), mmap, size, file })
     }
 
-    /// Opens an already-created segment read/write (crash-recovery
-    /// re-attachment, or a second handle within this spec's tests). The size
-    /// is read back via `fstat` rather than trusted from the caller.
-    /// Read-only client opens are spec perf/010's concern.
+    /// Opens an already-created segment read/write: crash-recovery
+    /// re-attachment, a second handle in tests, and the client side of the
+    /// per-client ring quartet (`cmd`/`cmd_hdr`/`resp`/`resp_hdr`, which carries
+    /// the client's `ReaderSlot`). The size is read back via `fstat` rather than
+    /// trusted from the caller.
     pub fn open(name: &str) -> Result<Self> {
         let cname = CString::new(name).with_context(|| format!("invalid shm name '{name}'"))?;
         let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0) };
@@ -78,6 +79,26 @@ impl ShmSegment {
             .with_context(|| format!("mmap '{name}' ({size} bytes) failed"))?;
 
         Ok(Self { name: name.to_string(), mmap, size, file })
+    }
+
+    /// Opens an existing segment `O_RDONLY` / `PROT_READ` — the mandatory client
+    /// mapping for `state`, `data_a` and `data_b` (spec perf/012 §10). A write
+    /// through the returned mapping faults, which is the point: reader counters
+    /// live in the client's own `cmd_hdr` page, not in `state`.
+    pub fn open_readonly(name: &str) -> Result<ReadOnlySegment> {
+        let cname = CString::new(name).with_context(|| format!("invalid shm name '{name}'"))?;
+        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        if fd < 0 {
+            return Err(errno_context(format!("shm_open '{name}' read-only failed")));
+        }
+        // Safe: sole owner of this fresh fd, same reasoning as in `create`.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let size = file.metadata().with_context(|| format!("fstat '{name}' failed"))?.len() as usize;
+
+        let mmap = unsafe { memmap2::MmapOptions::new().len(size).map(&file) }
+            .with_context(|| format!("mmap '{name}' ({size} bytes) read-only failed"))?;
+
+        Ok(ReadOnlySegment { mmap, size, _file: file })
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -100,6 +121,26 @@ impl ShmSegment {
     /// Raw fd — retained for spec perf/010's `SCM_RIGHTS` client hand-off.
     pub fn fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+/// A `PROT_READ` mapping of an existing segment (see
+/// [`ShmSegment::open_readonly`]). No `as_mut_ptr`, no fd hand-off: a client
+/// only ever reads through it.
+pub struct ReadOnlySegment {
+    mmap: Mmap,
+    size: usize,
+    /// Owns the fd (closed exactly once, on drop).
+    _file: File,
+}
+
+impl ReadOnlySegment {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+
+    pub fn len(&self) -> usize {
+        self.size
     }
 }
 
@@ -227,7 +268,8 @@ impl Drop for ShmManager {
 }
 
 /// Header segment size for a per-client ring — one page, minimal (spec §2).
-const CLIENT_HDR_SIZE: usize = 4096;
+/// `cmd_hdr` also carries the client's `ReaderSlot` (spec perf/012 §1).
+pub const CLIENT_HDR_SIZE: usize = 4096;
 
 /// The four per-client ring segments (spec perf/008 Multi-Client): a cmd ring
 /// (client→server) and a resp ring (server→client), each a data segment plus a
@@ -238,7 +280,10 @@ const CLIENT_HDR_SIZE: usize = 4096;
 /// for the prefix stale-scan (`cleanup_stale_segments`) to reap on restart.
 pub struct ClientShm {
     cmd: ShmSegment,
-    cmd_hdr: ShmSegment,
+    /// Behind an `Arc` because the publisher's `ReaderSlotHandle` holds a clone:
+    /// the slot page must stay mapped even if the dispatcher drops this
+    /// connection mid-scan (spec perf/012 §6).
+    cmd_hdr: Arc<ShmSegment>,
     resp: ShmSegment,
     resp_hdr: ShmSegment,
 }
@@ -252,7 +297,7 @@ impl ClientShm {
         let build = || -> Result<Self> {
             Ok(Self {
                 cmd: ShmSegment::create(&names[0], ring_size, mode)?,
-                cmd_hdr: ShmSegment::create(&names[1], CLIENT_HDR_SIZE, mode)?,
+                cmd_hdr: Arc::new(ShmSegment::create(&names[1], CLIENT_HDR_SIZE, mode)?),
                 resp: ShmSegment::create(&names[2], ring_size, mode)?,
                 resp_hdr: ShmSegment::create(&names[3], CLIENT_HDR_SIZE, mode)?,
             })
@@ -285,6 +330,12 @@ impl ClientShm {
     pub fn cmd_hdr(&self) -> &ShmSegment {
         &self.cmd_hdr
     }
+
+    /// Shared handle on the `cmd_hdr` mapping — what a `ReaderSlotHandle` keeps
+    /// alive while it points into that page.
+    pub fn cmd_hdr_arc(&self) -> Arc<ShmSegment> {
+        Arc::clone(&self.cmd_hdr)
+    }
     pub fn resp(&self) -> &ShmSegment {
         &self.resp
     }
@@ -295,7 +346,7 @@ impl ClientShm {
 
 impl Drop for ClientShm {
     fn drop(&mut self) {
-        for seg in [&self.cmd, &self.cmd_hdr, &self.resp, &self.resp_hdr] {
+        for seg in [&self.cmd, &*self.cmd_hdr, &self.resp, &self.resp_hdr] {
             let Ok(cname) = CString::new(seg.name()) else { continue };
             if unsafe { libc::shm_unlink(cname.as_ptr()) } < 0 {
                 let err = std::io::Error::last_os_error();
@@ -387,7 +438,13 @@ fn acquire_lock(instance_id: &str) -> Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::{
+        PublishOutcome, ReaderSlot, SnapshotGuard, SnapshotWriter, StateHeader, PUBLISH_WAIT_TIMEOUT_US,
+        READER_SLOT_OFFSET,
+    };
+    use super::super::readers::{ReaderRegistry, ReaderSlotHandle};
     use super::*;
+    use std::any::Any;
     use std::sync::atomic::AtomicU32;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -585,6 +642,84 @@ mod tests {
             let path = format!("/dev/shm/{}", &name[1..]);
             assert!(!std::path::Path::new(&path).exists(), "{name} should be unlinked after drop");
         }
+    }
+
+    // Spec perf/012 test 8: the mandatory client mapping modes (§10) —
+    // state/data_a/data_b `PROT_READ`, the ReaderSlot page read/write. Reading a
+    // published snapshot through the read-only mappings must work and must show
+    // the pin in the slot; a write to `state` would fault here exactly as it
+    // would in a foreign process.
+    #[test]
+    fn test_readonly_client_mapping_reads_published_snapshot() {
+        let base = unique_name("ro");
+        let names: Vec<String> =
+            ["state", "data_a", "data_b", "cmd_hdr"].iter().map(|p| format!("{base}_{p}")).collect();
+        let _cleanup: Vec<ShmCleanup> = names.iter().map(|n| ShmCleanup(n.clone())).collect();
+
+        // Server side: read/write mappings plus the client's slot page.
+        let state = ShmSegment::create(&names[0], 4096, 0o600).unwrap();
+        let mut data_a = ShmSegment::create(&names[1], 4096, 0o600).unwrap();
+        let mut data_b = ShmSegment::create(&names[2], 4096, 0o600).unwrap();
+        let cmd_hdr = Arc::new(ShmSegment::create(&names[3], CLIENT_HDR_SIZE, 0o600).unwrap());
+        // Safe: fresh mappings of the sizes asked for above, only ever read
+        // through the types they are cast to.
+        let header = unsafe { StateHeader::from_ptr(state.as_ptr(), state.len()) };
+        header.init();
+        let server_slot = unsafe {
+            ReaderSlot::from_ptr(cmd_hdr.as_ptr().add(READER_SLOT_OFFSET), cmd_hdr.len() - READER_SLOT_OFFSET)
+        };
+
+        let registry = Arc::new(ReaderRegistry::new());
+        // Safe: the slot lives inside the `cmd_hdr` mapping the handle keeps alive.
+        let handle = unsafe {
+            ReaderSlotHandle::new(
+                1,
+                server_slot as *const ReaderSlot,
+                Arc::clone(&cmd_hdr) as Arc<dyn Any + Send + Sync>,
+            )
+        };
+        let _lease = registry.register(handle);
+
+        let buf_len = data_a.len();
+        // Safe: single writer, two distinct mappings of `buf_len` bytes.
+        let writer = unsafe {
+            SnapshotWriter::new(
+                header,
+                data_a.as_mut_ptr(),
+                data_b.as_mut_ptr(),
+                buf_len,
+                PUBLISH_WAIT_TIMEOUT_US,
+                Arc::clone(&registry),
+            )
+        };
+        let payload = b"read-only client snapshot";
+        assert_eq!(writer.publish(payload).unwrap(), PublishOutcome::Published);
+
+        // Client side: state/data read-only, cmd_hdr (and thus the slot) RW.
+        let ro_state = ShmSegment::open_readonly(&names[0]).unwrap();
+        let ro_a = ShmSegment::open_readonly(&names[1]).unwrap();
+        let ro_b = ShmSegment::open_readonly(&names[2]).unwrap();
+        let client_hdr = ShmSegment::open(&names[3]).unwrap();
+        // Safe: all four are live mappings held for the rest of this test.
+        let (client_header, client_slot, a, b) = unsafe {
+            (
+                StateHeader::from_ptr(ro_state.as_ptr(), ro_state.len()),
+                ReaderSlot::from_ptr(
+                    client_hdr.as_ptr().add(READER_SLOT_OFFSET),
+                    client_hdr.len() - READER_SLOT_OFFSET,
+                ),
+                std::slice::from_raw_parts(ro_a.as_ptr(), ro_a.len()),
+                std::slice::from_raw_parts(ro_b.as_ptr(), ro_b.len()),
+            )
+        };
+        assert!(client_header.check_compatible().is_ok());
+
+        let guard = SnapshotGuard::acquire(client_header, client_slot, a, b)
+            .expect("snapshot readable through the read-only mappings");
+        assert_eq!(guard.data(), payload);
+        assert_eq!(server_slot.counter(1).load(Ordering::SeqCst), 1, "pin visible to the server");
+        drop(guard);
+        assert_eq!(server_slot.counter(1).load(Ordering::SeqCst), 0);
     }
 
     // 8. command_buffer_size not a power of two -> validation error (via ShmManager::new()).

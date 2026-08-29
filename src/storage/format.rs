@@ -10,6 +10,19 @@ use std::sync::Arc;
 pub const TOMBSTONE_OFFSET: u64 = u64::MAX;
 pub const NULL_OFFSET: u64 = u64::MAX - 1;
 
+/// The single expiry check (spec kv/025 §2): `expire_at` is 0 (no TTL) or a
+/// Unix timestamp (seconds); every read/compaction path delegates here
+/// instead of repeating `expire_at != 0 && expire_at <= now`.
+pub fn is_expired(expire_at: u64, now: u64) -> bool {
+    expire_at != 0 && expire_at <= now
+}
+
+/// Liveness classification of one stored version at a given `now` (spec
+/// kv/025 §2), built below for [`DataBlockValue`]/[`CachedValue`] and, where
+/// `Value` is defined, for the MemTable's own representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionState { Live, Expired, Tombstone } // NULL counts as Live (kv/018)
+
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[rkyv(attr(repr(C)))] // Force C layout on Archived type
 #[repr(C)]
@@ -51,6 +64,25 @@ pub struct IndexBlock {
 pub enum DataBlockValue {
     Pointer(ValuePointer),
     Inline { data: Vec<u8>, expire_at: u64 },
+}
+
+impl DataBlockValue {
+    /// Classifies this version's liveness at `now` (spec kv/025 §2): the
+    /// tombstone sentinel is `Tombstone`; everything else (including the
+    /// NULL sentinel, `expire_at == 0`) follows [`is_expired`].
+    pub fn version_state(&self, now: u64) -> VersionState {
+        match self {
+            DataBlockValue::Pointer(vp) if vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET => {
+                VersionState::Tombstone
+            }
+            DataBlockValue::Pointer(vp) => {
+                if is_expired(vp.expire_at, now) { VersionState::Expired } else { VersionState::Live }
+            }
+            DataBlockValue::Inline { expire_at, .. } => {
+                if is_expired(*expire_at, now) { VersionState::Expired } else { VersionState::Live }
+            }
+        }
+    }
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
@@ -163,11 +195,32 @@ impl CachedValue {
             .expect("to_owned_bytes on VLogPointer/Tombstone/Null — resolve first")
             .to_vec()
     }
+
+    /// Classifies this version's liveness at `now` (spec kv/025 §2): mirrors
+    /// [`DataBlockValue::version_state`] for the cached read-path
+    /// representation.
+    pub fn version_state(&self, now: u64) -> VersionState {
+        match self {
+            CachedValue::Tombstone => VersionState::Tombstone,
+            CachedValue::Null => VersionState::Live,
+            _ => {
+                if is_expired(self.expire_at(), now) { VersionState::Expired } else { VersionState::Live }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec kv/025 §9.11: expire_at == 0 (no TTL), == now (expired), > now (not yet).
+    #[test]
+    fn test_is_expired_boundaries() {
+        assert!(!is_expired(0, 100));
+        assert!(is_expired(100, 100));
+        assert!(!is_expired(101, 100));
+    }
 
     fn cached(bytes: &[u8], offset: usize, len: usize) -> CachedValue {
         let mut block = AlignedVec::with_capacity(bytes.len());

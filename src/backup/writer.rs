@@ -462,7 +462,8 @@ mod tests {
             sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
         };
-        (JsonEngine::bootstrap(&config).await.unwrap(), dir)
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        (JsonEngine::bootstrap(&config, metrics).await.unwrap(), dir)
     }
 
     // 1. resolve_scope: `all` picks up every active KV domain.

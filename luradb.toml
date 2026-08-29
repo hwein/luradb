@@ -33,6 +33,9 @@ max_value_size = 524288
 flush_check_interval_ms = 100
 compaction_check_interval_ms = 1000
 wal_event_channel_capacity = 256
+# KV watch replay-ring size (spec kv/024). 0 = resume off (every
+# reconnect with a Last-Event-ID gets `reset`); id: fields always exist.
+watch_replay_buffer_size = 1024
 
 [compaction]
 l0_threshold = 4
@@ -45,17 +48,36 @@ check_interval_secs = 60
 dead_bytes_threshold = 0.30
 min_vlog_size_bytes = 67108864
 
+# Background removal of TTL-expired keys (spec kv/025): each swept key gets a
+# tombstone and a delete event. Disabling it restores purely lazy expiry.
+[ttl_sweeper]
+enabled = true
+interval_secs = 60
+# Candidates checked per tick — discarded ones count too.
+batch_size = 500
+
 [domains]
 max_name_length = 50
 max_user_key_length = 256
 default_domain = "default"
 purger_batch_size = 100
 purger_interval_secs = 5
+# Cap on keys removed by one DELETE …/keys?prefix= bulk delete (spec kv/023).
+max_bulk_delete_keys = 10000
 
 [rate_limit]
 default_read_iops = 1000
 default_write_iops = 500
 default_max_storage_bytes = 0
+
+[rel]
+# Body-size cap for POST .../tables/from-file (spec rel/019).
+import_body_limit_bytes = 67108864
+
+[events]
+# Live broadcast for GET /store-api/events (spec general/018).
+channel_capacity = 256      # a consumer this far behind gets `reset` (reason: lagged)
+replay_buffer_size = 1024   # ring for Last-Event-ID resume; 0 = resume off
 
 [log]
 level = "verbose"
@@ -74,3 +96,9 @@ retention_days = 30
 # IPs and CIDR ranges of trusted reverse proxies.
 # Leave empty when LuraDB is accessed directly (no proxy in front).
 trusted_proxies = ["127.0.0.1", "::1"]
+
+[cors]
+# Cross-origin access for browser clients. Off by default.
+enabled = false
+# Exact origins, e.g. ["https://console.example.com", "http://localhost:5173"].
+allowed_origins = []

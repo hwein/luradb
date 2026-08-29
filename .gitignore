@@ -11,8 +11,8 @@
 /luradb_rel.vlog
 /luradb_rel_sstables
 
-# Benchmark reports (cargo bench)
-/benches/results/
+# Benchmarks: local development tooling, not part of the published product
+/benches/
 
 # CycloneDX SBOM output (cargo cyclonedx); a release asset, not tracked here
 /*.cdx.json

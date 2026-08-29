@@ -6,6 +6,8 @@ All notable changes to LuraDB are documented in this file.
 
 ### Added
 
+- API: added `POST /store-api/rel/{domain}/tables/from-file` — creates a relational table from an uploaded CSV/TSV file with inferred column types (`INTEGER`/`REAL`/`BOOLEAN`/`TIMESTAMP`/`TEXT`) and imports its rows, reporting `imported`/`failed`/per-row errors like the JSON bulk load; new `[rel].import_body_limit_bytes` config key (default 64 MiB).
+
 - **BREAKING** API: `GET /store-api/auth/users` responses now include a `permissions` array per user (`{domain, store_type, access}`), mirroring the write-endpoint vocabulary.
 - **BREAKING** API: added `GET /store-api/auth/whoami`, returning the caller's identity (`{name, role}`) for any authenticated caller — not admin-only. `role` is `"Admin"`, `"User"`, or a pseudo-role (`"TrustedPeer"`, `"Disabled"`).
 - **BREAKING** API: added `GET /store-api/kv/{domain}/keys/{key}/meta`, returning a key's TTL expiry and last-modified time (`{expires_at, last_modified_at}`) without reading its value. `GET /store-api/kv/{domain}/keys/{key}` now also carries an `X-Expires-At` response header when the key has a TTL.

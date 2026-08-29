@@ -11,6 +11,7 @@ pub mod domain;
 pub mod error;
 pub mod eval;
 pub mod expand;
+pub mod from_file;
 pub mod join;
 pub mod keys;
 pub mod lexer;
@@ -36,6 +37,7 @@ pub use ddl::DdlOutcome;
 pub use dml::{DmlResult, SelectResult};
 pub use domain::{RelDomain, RelDomainState};
 pub use error::RelStoreError;
+pub use from_file::{CreateFromFileResult, FileFormat, ImportColumn, ImportRowError};
 pub use purger::RelDomainPurger;
 pub use rest_exec::{ExpandedBlock, SqlOutcome};
 pub use types::{encode_sortable, scalar_to_json, ColumnType, ScalarValue};
@@ -104,6 +106,9 @@ pub struct RelEngine {
     /// REST response cap (spec rel/009 §6): checked handler-side, after
     /// serialization, so it stays a plain getter here.
     max_response_bytes: usize,
+    /// Body-size cap for `POST .../tables/from-file` (spec rel/019 §1),
+    /// applied by the handler as a route-level `DefaultBodyLimit`.
+    import_body_limit_bytes: usize,
     /// Lazily-filled per-domain rate limiters (spec rel/009 §7) — mirrors the
     /// KV `DomainRegistry`'s `runtimes` map: a separate, name-keyed structure,
     /// not a field of the serialized `RelDomain` (rel/002's invariant stays
@@ -205,6 +210,7 @@ impl RelEngine {
             max_join_depth: config.max_join_depth,
             allow_unindexed_joins: config.allow_unindexed_joins,
             max_response_bytes: config.max_response_bytes,
+            import_body_limit_bytes: config.import_body_limit_bytes,
             rate_limiters: RwLock::new(HashMap::new()),
             event_bus: OnceLock::new(),
         }))
@@ -305,6 +311,13 @@ impl RelEngine {
     /// serialized response length against this after building it.
     pub fn max_response_bytes(&self) -> usize {
         self.max_response_bytes
+    }
+
+    /// `import_body_limit_bytes` getter (spec rel/019 §1): the from-file
+    /// route applies this as a `DefaultBodyLimit` layer, mirroring
+    /// `JsonEngine::bulk_body_limit_bytes`.
+    pub fn import_body_limit_bytes(&self) -> usize {
+        self.import_body_limit_bytes
     }
 
     /// Drops a domain's lazily-created rate limiter (spec rel/009 §7). The

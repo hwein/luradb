@@ -87,9 +87,17 @@ struct Candidate {
 
 /// An INSERT row's resolved values plus whether the AUTOINCREMENT PK still
 /// needs a sequence value (filled under the write lock).
-struct RowPlan {
+pub(super) struct RowPlan {
     values: HashMap<u16, ScalarValue>,
     needs_auto: bool,
+}
+
+impl RowPlan {
+    /// Builds an already-resolved row (no AUTOINCREMENT fill-in needed) — the
+    /// shape `rel/019`'s from-file import stages via [`RelEngine::stage_insert_row`].
+    pub(super) fn new(values: HashMap<u16, ScalarValue>) -> Self {
+        Self { values, needs_auto: false }
+    }
 }
 
 impl RelEngine {
@@ -208,7 +216,7 @@ impl RelEngine {
     /// → PK dup → row size → UNIQUE → REFERENCES → cross-engine links → index
     /// entries → row `Put`. Returns the row's PK, for `exec_insert`'s
     /// single-row `last_pk`.
-    async fn stage_insert_row(
+    pub(super) async fn stage_insert_row(
         &self,
         domain: &str,
         schema: &TableSchema,
@@ -679,7 +687,7 @@ impl RelEngine {
     /// domain — otherwise an orphan `ROW:` key could resurrect under a recreated
     /// same-name domain. The guard is the same one the purger holds around its
     /// emptiness check + finalization.
-    async fn commit_guarded(&self, domain: &str, ops: Vec<BatchOp>) -> Result<(), RelStoreError> {
+    pub(super) async fn commit_guarded(&self, domain: &str, ops: Vec<BatchOp>) -> Result<(), RelStoreError> {
         let _wg = self.write_guard.lock().await;
         self.domains.require_active(domain)?;
         self.engine.write_batch(ops).await?;

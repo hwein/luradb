@@ -13,6 +13,7 @@ pub mod middleware;
 pub mod rel;
 pub mod rel_browse;
 pub mod rel_domains;
+pub mod rel_import;
 
 use crate::auth::{handlers::AuthState, middleware::auth_layer, AuthCache};
 use crate::backup::BackupManager;
@@ -60,7 +61,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.6.0";
+pub const API_VERSION: &str = "0.6.1";
 
 struct VersionInfo;
 
@@ -228,6 +229,14 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
                 get(rel_domains::get_domain).delete(rel_domains::delete_domain),
             )
             .route("/rel/:domain/sql", post(rel::execute_sql))
+            // CSV/TSV file import (spec rel/019): a body-size cap analogous
+            // to the JSON bulk route below, sized from the engine config.
+            .route(
+                "/rel/:domain/tables/from-file",
+                post(rel_import::create_table_from_file).layer(DefaultBodyLimit::max(
+                    state.rel_engine.as_ref().map_or(64 * 1024 * 1024, |e| e.import_body_limit_bytes()),
+                )),
+            )
             // Browse/Row REST surface (spec rel/010): registered in this
             // same conditional sub-router, not a second merge point.
             .route("/rel/:domain/tables", get(rel_browse::list_tables))
@@ -345,6 +354,8 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         rel_domains::delete_domain,
         // Relational SQL
         rel::execute_sql,
+        // Relational file import
+        rel_import::create_table_from_file,
         // Relational Browse (catalog + rows)
         rel_browse::list_tables,
         rel_browse::get_table,
@@ -405,6 +416,9 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             rel_domains::CreateRelDomainRequest,
             rel_domains::RelDomainResponse,
             rel::SqlRequest,
+            rel_import::CreateFromFileColumn,
+            rel_import::CreateFromFileErrorEntry,
+            rel_import::CreateFromFileResponse,
             rel_browse::TableSummary,
             rel_browse::TableLinks,
             rel_browse::TableDetail,
@@ -444,6 +458,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         (name = "JSON Indexes", description = "Index management for JSON domains"),
         (name = "Relational Domains", description = "Relational domain lifecycle"),
         (name = "Relational Store", description = "Domain-scoped LuraSQL execution"),
+        (name = "Relational Import", description = "CSV/TSV file upload -> new relational table with inferred schema"),
         (name = "Relational Browse", description = "Catalog and row browsing for relational domains"),
         (name = "Relational Rows", description = "Row-level writes on relational tables"),
         (name = "Auth", description = "User management and domain permissions — admins only, except GET /auth/whoami (any authenticated caller)"),

@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 
 const CAT_PREFIX: &[u8] = b"CAT:";
 const SYS_CATALOG_SEQ_PREFIX: &[u8] = b"__sys:rel_catalog_seq:";
-const MAX_IDENTIFIER_LEN: usize = 50;
+pub(crate) const MAX_IDENTIFIER_LEN: usize = 50;
 
 // ── Identifier rules (concept 3.5) ─────────────────────────────────────────────
 

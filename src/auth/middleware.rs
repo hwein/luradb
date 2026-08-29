@@ -290,6 +290,10 @@ mod tests {
             extract_domain("/store-api/rel/sales/tables/orders/rows"),
             Some((StoreType::Rel, "sales", false))
         );
+        assert_eq!(
+            extract_domain("/store-api/rel/sales/tables/from-file"),
+            Some((StoreType::Rel, "sales", false))
+        );
         assert_eq!(extract_domain("/store-api/rel/domains"), None);
         assert_eq!(extract_domain("/store-api/rel/domains/sales"), None);
         assert_eq!(

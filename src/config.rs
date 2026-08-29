@@ -740,6 +740,9 @@ pub struct RelStoreConfig {
     /// per batch, and seconds between ticks. Mirrors `[json]`.
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
+    /// Body-size cap for `POST .../tables/from-file` (spec rel/019), analogous
+    /// to `json.bulk_body_limit_bytes`.
+    pub import_body_limit_bytes: usize,
     pub lsm: LsmConfig,
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
@@ -810,6 +813,7 @@ impl Default for RelStoreConfig {
             cross_engine_sweep_batch_size: 100,
             purger_batch_size: 100,
             purger_interval_secs: 5,
+            import_body_limit_bytes: 64 * 1024 * 1024,
             lsm: LsmConfig::default(),
             compaction: CompactionCfg::default(),
             janitor: JanitorCfg::default(),

@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.6.0",
+    "version": "0.6.1",
     "x-luradb-server-version": "0.3.2-dev"
   },
   "paths": {
@@ -3748,6 +3748,165 @@
         }
       }
     },
+    "/store-api/rel/{domain}/tables/from-file": {
+      "post": {
+        "tags": [
+          "Relational Import"
+        ],
+        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column (spec §5.1), then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues (spec §5.2). Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement (rel/011 pattern).",
+        "operationId": "create_table_from_file",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "Relational domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Name of the table to create",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "description": "\"csv\" or \"tsv\" -- no format sniffing",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "header",
+            "in": "query",
+            "description": "Whether the first line is a header row (default true)",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "pk",
+            "in": "query",
+            "description": "Existing (normalized) column to use as primary key; omitted -> synthetic `_row` column",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Raw CSV/TSV file bytes -- Content-Type is not enforced, `format` decides",
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Table created and its rows imported (imported/failed counts, per-row error log)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateFromFileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing/invalid name or format, empty file, too many columns, invalid header UTF-8, or an unknown pk column",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing DDL access on the domain",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A table or view with that name already exists",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds rel.import_body_limit_bytes",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-domain request budget exceeded",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/store-api/rel/{domain}/tables/{table}": {
       "get": {
         "tags": [
@@ -4980,6 +5139,85 @@
           }
         }
       },
+      "CreateFromFileColumn": {
+        "type": "object",
+        "required": [
+          "name",
+          "type",
+          "primary_key"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "primary_key": {
+            "type": "boolean"
+          },
+          "source_header": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateFromFileErrorEntry": {
+        "type": "object",
+        "required": [
+          "row",
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "row": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CreateFromFileResponse": {
+        "type": "object",
+        "required": [
+          "table",
+          "columns",
+          "imported",
+          "failed",
+          "errors"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CreateFromFileColumn"
+            }
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CreateFromFileErrorEntry"
+            }
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "imported": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "table": {
+            "type": "string"
+          }
+        }
+      },
       "CreateIndexRequest": {
         "type": "object",
         "required": [
@@ -5939,6 +6177,10 @@
     {
       "name": "Relational Store",
       "description": "Domain-scoped LuraSQL execution"
+    },
+    {
+      "name": "Relational Import",
+      "description": "CSV/TSV file upload -> new relational table with inferred schema"
     },
     {
       "name": "Relational Browse",

@@ -70,6 +70,10 @@ default_read_iops = 1000
 default_write_iops = 500
 default_max_storage_bytes = 0
 
+[rel]
+# Body-size cap for POST .../tables/from-file (spec rel/019).
+import_body_limit_bytes = 67108864
+
 [events]
 # Live broadcast for GET /store-api/events (spec general/018).
 channel_capacity = 256      # a consumer this far behind gets `reset` (reason: lagged)

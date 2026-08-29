@@ -78,16 +78,6 @@ csv = "1"
 
 [dev-dependencies]
 tempfile = "3.10"
-# Benchmark harness (perf/011).
-# "async" (not "async_tokio") so criterion doesn't pull its own separate tokio
-# dependency — we supply our own AsyncExecutor wrapping the project's runtime.
-criterion = { version = "0.5", features = ["html_reports", "async"] }
-# Client-side features for the IPC benchmark's hyper HTTP client (TCP + UDS).
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
-
-[[bench]]
-name = "ipc_bench"
-harness = false
 
 [package.metadata.deb]
 maintainer = "Heiko Wein <heiko.wein.hw@gmail.com>"

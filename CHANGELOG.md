@@ -4,6 +4,8 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-29
+
 ### Added
 
 - API: added `POST /store-api/rel/{domain}/tables/from-file` — creates a relational table from an uploaded CSV/TSV file with inferred column types (`INTEGER`/`REAL`/`BOOLEAN`/`TIMESTAMP`/`TEXT`) and imports its rows, reporting `imported`/`failed`/per-row errors like the JSON bulk load; new `[rel].import_body_limit_bytes` config key (default 64 MiB).
@@ -122,7 +124,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.3.1...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/hwein/luradb/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hwein/luradb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hwein/luradb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hwein/luradb/compare/v0.2.0...v0.2.1

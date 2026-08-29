@@ -368,8 +368,8 @@ mod tests {
         }
     }
 
-    // An empty-but-active ring resumes gaplessly at its own head (spec §4.2:
-    // "Bei aktivem, aber noch leerem Ring greift dieselbe Arithmetik korrekt").
+    // An empty-but-active ring resumes gaplessly at its own head — the same
+    // arithmetic as a populated one, no special case (spec §4.2).
     #[test]
     fn test_fresh_ring_last_equals_head_is_gapless_empty_replay() {
         let ring: SeqRing<u32> = SeqRing::new(10);

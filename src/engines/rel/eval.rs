@@ -386,13 +386,13 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_millis(500), "took {elapsed:?}");
     }
 
-    // rel/017 Budget greift (spec §Tests 2): the rel/015 worst case — one '%'
+    // rel/017 budget stops the rel/015 worst case (spec §Tests 2): one '%'
     // plus a long self-similar literal that never actually matches (the text
-    // has no trailing 'b') — aborts with LikeBudgetExceeded. No wall-clock
+    // has no trailing 'b') aborts with LikeBudgetExceeded. No wall-clock
     // assertion: the step count is capped deterministically (boundary pair
     // below pins the formula), and a timing bound flaked on slower CI
     // hardware. Measured once: ~90 ms debug vs ~9.2 s unbounded (rel/015
-    // Umsetzungsnotiz, Prüfpunkt 1).
+    // as-built note, check 1).
     #[test]
     fn test_like_budget_exceeded() {
         let pattern = format!("%{}b", "a".repeat(32 * 1024));
@@ -401,21 +401,19 @@ mod tests {
         assert!(matches!(err, RelStoreError::LikeBudgetExceeded { .. }), "{err:?}");
     }
 
-    // rel/017 Budget schont Legitimes (spec §Tests 3): the rel/015
+    // rel/017 budget spares legitimate patterns (spec §Tests 3): the rel/015
     // measurement case — %-heavy but linear, each '%' only ever backtracks
     // against the next character — stays Ok at the same 64 Ki/64 Ki scale.
+    // Staying inside the budget is the assertion; a wall-clock bound would be
+    // CI-hardware dependent (general/008).
     #[test]
     fn test_like_budget_spares_linear_pattern() {
         let pattern = format!("{}b", "%a".repeat(32 * 1024));
         let text = format!("{}b", "a".repeat(64 * 1024));
-        let start = std::time::Instant::now();
-        let matched = like_match(&pattern, &text).unwrap();
-        let elapsed = start.elapsed();
-        assert!(matched);
-        assert!(elapsed < std::time::Duration::from_millis(500), "took {elapsed:?}");
+        assert!(like_match(&pattern, &text).unwrap());
     }
 
-    // rel/017 NOT LIKE über Budget (spec §Tests 4): the budget error
+    // rel/017 NOT LIKE over budget (spec §Tests 4): the budget error
     // propagates through eval() before maybe_negate — same error, never a
     // silently negated success.
     #[test]

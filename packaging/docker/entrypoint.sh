@@ -13,7 +13,10 @@ install -d -o luradb -g luradb -m 0750 /var/lib/luradb /run/luradb
 # no placeholder left, so this is a no-op and nothing is re-logged.
 if grep -q '@GENERATED_ON_INSTALL@' "$CONFIG"; then
     key="${LURADB_ADMIN_KEY:-lura_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
-    sed -i "s/@GENERATED_ON_INSTALL@/$key/" "$CONFIG"
+    # An operator-supplied key may contain sed metacharacters; escape them so
+    # the substitution inserts the key verbatim instead of mangling it.
+    key_escaped=$(printf '%s' "$key" | sed -e 's/[&/\]/\\&/g')
+    sed -i "s/@GENERATED_ON_INSTALL@/$key_escaped/" "$CONFIG"
     echo "luradb: generated admin api key: $key"
 fi
 

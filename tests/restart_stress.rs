@@ -309,8 +309,8 @@ async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_cou
     InstanceOutcome { findings, dir }
 }
 
-/// Pure load generator (spec kv/026 A1: "während derselbe Prozess parallel
-/// Schreib-/Flush-Last erzeugt") -- keeps flush/compaction/GC busy on its
+/// Pure load generator (spec kv/026 A1: restarts happen while the same
+/// process keeps producing write/flush load) -- keeps flush/compaction/GC busy on its
 /// own throwaway store while the main instances restart. Its own
 /// correctness is out of scope; errors are swallowed on purpose.
 async fn run_background_loader(id: usize, stop: Arc<AtomicBool>) {

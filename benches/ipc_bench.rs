@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -41,6 +42,15 @@ const MIXED_THREADS: usize = 4;
 const MIXED_WRITE_FRACTION: f64 = 0.20;
 /// Fixed seed for scenario D's per-thread RNG — reproducible runs (Finding 4).
 const MIXED_RNG_SEED: u64 = 42;
+
+// Spec perf/016 step 0 — multicore baseline (B1 contention, B2 scaling).
+// `NOISE_DOMAIN` holds exactly as many keys as `bench`, so the noise operation
+// costs the same in both B1 variants and only the *domain* differs.
+const NOISE_DOMAIN: &str = "noisy";
+const B1_DURATION: Duration = Duration::from_secs(10);
+const B1_NOISE_CLIENTS: usize = 2;
+const B2_DURATION: Duration = Duration::from_secs(5);
+const B2_CLIENT_COUNTS: [usize; 4] = [1, 2, 4, 8];
 
 // ── Criterion async glue (no "async_tokio" feature — see Cargo.toml comment) ──
 
@@ -333,7 +343,7 @@ fn cleanup_tmp() {
 }
 
 impl BenchInstance {
-    fn start(rt: &Runtime) -> Self {
+    fn start(rt: &Runtime, with_noise_domain: bool) -> Self {
         cleanup_tmp();
         let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/bench_config.toml");
         let log_path = "/tmp/luradb_bench_server.log";
@@ -364,14 +374,19 @@ impl BenchInstance {
         let healthy = rt.block_on(wait_health(tcp_addr, Duration::from_secs(15)));
         assert!(healthy, "server did not become healthy within 15s — see {log_path}");
 
-        rt.block_on(instance.seed());
+        rt.block_on(instance.seed(with_noise_domain));
         instance
     }
 
-    async fn seed(&self) {
+    async fn seed(&self, with_noise_domain: bool) {
         let mut admin = HttpConn::connect_tcp(self.tcp_addr).await;
         let status = admin.post_json("/store-api/domains", br#"{"name":"bench"}"#.to_vec()).await;
         assert_eq!(status, StatusCode::CREATED, "create bench domain");
+        if with_noise_domain {
+            let body = format!(r#"{{"name":"{NOISE_DOMAIN}"}}"#).into_bytes();
+            let status = admin.post_json("/store-api/domains", body).await;
+            assert_eq!(status, StatusCode::CREATED, "create noise domain");
+        }
 
         let value = vec![b'v'; VALUE_LEN];
         let status = admin.put("/store-api/kv/bench/keys/bench_key", value.clone()).await;
@@ -379,18 +394,24 @@ impl BenchInstance {
         drop(admin);
 
         const SHARDS: usize = 8;
+        let mut domains = vec![BENCH_DOMAIN];
+        if with_noise_domain {
+            domains.push(NOISE_DOMAIN);
+        }
         let mut tasks = Vec::new();
-        for shard in 0..SHARDS {
-            let addr = self.tcp_addr;
-            let value = value.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut conn = HttpConn::connect_tcp(addr).await;
-                for i in (shard..SEED_KEYS).step_by(SHARDS) {
-                    let path = format!("/store-api/kv/bench/keys/k{i:05}");
-                    let status = conn.put(&path, value.clone()).await;
-                    assert_eq!(status, StatusCode::OK, "seed put k{i:05}");
-                }
-            }));
+        for domain in domains {
+            for shard in 0..SHARDS {
+                let addr = self.tcp_addr;
+                let value = value.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut conn = HttpConn::connect_tcp(addr).await;
+                    for i in (shard..SEED_KEYS).step_by(SHARDS) {
+                        let path = format!("/store-api/kv/{domain}/keys/k{i:05}");
+                        let status = conn.put(&path, value.clone()).await;
+                        assert_eq!(status, StatusCode::OK, "seed put {domain}/k{i:05}");
+                    }
+                }));
+            }
         }
         for t in tasks {
             t.await.expect("seed task panicked");
@@ -780,6 +801,163 @@ fn scenario_d(rt: &Runtime, instance: &BenchInstance, filter: &Option<String>) -
     out
 }
 
+// ── Scenario B1/B2: multicore baseline (spec perf/016 step 0) ─────────────────
+//
+// B1 measures how much a legitimate CPU-heavy operation delays small GETs. The
+// noise operation is a full-domain `scan_keys` with a substring filter that
+// matches nothing: it materializes every key of the domain server-side and
+// returns an almost empty body, so the cost is CPU inside the server, not
+// transfer. Two variants, same cost, different domain — that separates the
+// contention a domain-sharded server would remove (noise in *another* domain)
+// from the contention it would not (noise in the *same* domain).
+
+struct LoadStats {
+    p50_us: f64,
+    p99_us: f64,
+    p999_us: f64,
+    ops_per_sec: f64,
+    /// Server-process CPU over the run — 100% means one core fully busy.
+    cpu_pct: f64,
+    noise_ops: usize,
+}
+
+fn build_load_stats(mut lat: Vec<u64>, elapsed: Duration, cpu_pct: f64, noise_ops: usize) -> LoadStats {
+    lat.sort_unstable();
+    let pct = |p: f64| -> f64 {
+        if lat.is_empty() {
+            return 0.0;
+        }
+        let idx = ((p * lat.len() as f64) as usize).min(lat.len() - 1);
+        lat[idx] as f64 / 1000.0 // ns -> µs
+    };
+    LoadStats {
+        p50_us: pct(0.50),
+        p99_us: pct(0.99),
+        p999_us: pct(0.999),
+        ops_per_sec: lat.len() as f64 / elapsed.as_secs_f64(),
+        cpu_pct,
+        noise_ops,
+    }
+}
+
+fn run_b1(rt: &Runtime, instance: &BenchInstance, noise_domain: Option<&str>) -> LoadStats {
+    let addr = instance.tcp_addr;
+    let noise_domain = noise_domain.map(str::to_string);
+    let cpu_before = read_cpu_ticks(instance.pid);
+    let wall = Instant::now();
+    let stats = rt.block_on(async move {
+        let deadline = Instant::now() + B1_DURATION;
+        let noise_ops = Arc::new(AtomicUsize::new(0));
+        let mut noise_tasks = JoinSet::new();
+        if let Some(domain) = noise_domain {
+            for _ in 0..B1_NOISE_CLIENTS {
+                let counter = Arc::clone(&noise_ops);
+                let path = format!("/store-api/kv/{domain}/keys?contains=zzzz&limit=1");
+                noise_tasks.spawn(async move {
+                    let mut conn = HttpConn::connect_tcp(addr).await;
+                    while Instant::now() < deadline {
+                        let (status, _) = conn.get(&path).await;
+                        assert_eq!(status, StatusCode::OK, "b1 noise scan");
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        }
+
+        let mut conn = HttpConn::connect_tcp(addr).await;
+        let mut lat = Vec::new();
+        let start = Instant::now();
+        while Instant::now() < deadline {
+            let t = Instant::now();
+            let (status, _) = conn.get("/store-api/kv/bench/keys/bench_key").await;
+            assert_eq!(status, StatusCode::OK, "b1 foreground get");
+            lat.push(t.elapsed().as_nanos() as u64);
+        }
+        let elapsed = start.elapsed();
+        while noise_tasks.join_next().await.is_some() {}
+        (lat, elapsed, noise_ops.load(Ordering::Relaxed))
+    });
+    let wall = wall.elapsed();
+    let cpu = cpu_pct(cpu_before, read_cpu_ticks(instance.pid), wall);
+    build_load_stats(stats.0, stats.1, cpu, stats.2)
+}
+
+fn scenario_b1(rt: &Runtime, instance: &BenchInstance, filter: &Option<String>) -> Vec<(String, LoadStats)> {
+    let mut out = Vec::new();
+    if wants(filter, "bench_b1_quiet") {
+        out.push(("bench_b1_quiet".to_string(), run_b1(rt, instance, None)));
+    }
+    if wants(filter, "bench_b1_noise_other_domain") {
+        out.push(("bench_b1_noise_other_domain".to_string(), run_b1(rt, instance, Some(NOISE_DOMAIN))));
+    }
+    if wants(filter, "bench_b1_noise_same_domain") {
+        out.push(("bench_b1_noise_same_domain".to_string(), run_b1(rt, instance, Some(BENCH_DOMAIN))));
+    }
+    out
+}
+
+fn run_b2(rt: &Runtime, instance: &BenchInstance, clients: usize, write_fraction: f64) -> LoadStats {
+    let addr = instance.tcp_addr;
+    let cpu_before = read_cpu_ticks(instance.pid);
+    let wall = Instant::now();
+    let stats = rt.block_on(async move {
+        let mut conns = Vec::with_capacity(clients);
+        for _ in 0..clients {
+            conns.push(HttpConn::connect_tcp(addr).await);
+        }
+        let deadline = Instant::now() + B2_DURATION;
+        let start = Instant::now();
+        let mut set = JoinSet::new();
+        for (idx, mut conn) in conns.into_iter().enumerate() {
+            set.spawn(async move {
+                let mut rng = StdRng::seed_from_u64(MIXED_RNG_SEED + idx as u64);
+                let value = vec![b'b'; VALUE_LEN];
+                let mut lat = Vec::new();
+                while Instant::now() < deadline {
+                    let key = rng.gen_range(0..SEED_KEYS);
+                    let write = write_fraction > 0.0 && rng.gen_bool(write_fraction);
+                    let path = format!("/store-api/kv/bench/keys/k{key:05}");
+                    let t = Instant::now();
+                    if write {
+                        conn.put(&path, value.clone()).await;
+                    } else {
+                        conn.get(&path).await;
+                    }
+                    lat.push(t.elapsed().as_nanos() as u64);
+                }
+                lat
+            });
+        }
+        let mut all = Vec::new();
+        while let Some(r) = set.join_next().await {
+            all.extend(r.expect("b2 task panicked"));
+        }
+        (all, start.elapsed())
+    });
+    let wall = wall.elapsed();
+    let cpu = cpu_pct(cpu_before, read_cpu_ticks(instance.pid), wall);
+    build_load_stats(stats.0, stats.1, cpu, 0)
+}
+
+/// Two profiles: `read` is CPU-bound (no fsync in the path) and shows how far
+/// the request path itself scales; `mixed` keeps the 80/20 write share, where
+/// group commit — not core parallelism — drives most of the gain.
+fn scenario_b2(
+    rt: &Runtime,
+    instance: &BenchInstance,
+    filter: &Option<String>,
+) -> Vec<(&'static str, usize, LoadStats)> {
+    let mut out = Vec::new();
+    for (profile, write_fraction) in [("read", 0.0), ("mixed", MIXED_WRITE_FRACTION)] {
+        for clients in B2_CLIENT_COUNTS {
+            if wants(filter, &format!("bench_b2_{profile}_{clients}c")) {
+                out.push((profile, clients, run_b2(rt, instance, clients, write_fraction)));
+            }
+        }
+    }
+    out
+}
+
 // ── Scenario E: WAL Write Latency (in-process, no server) ─────────────────────
 
 fn scenario_e(c: &mut Criterion, rt: &Runtime) {
@@ -877,7 +1055,13 @@ fn fmt_ops(ops: Option<f64>) -> String {
     }
 }
 
-fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], filter: &Option<String>) {
+fn write_report(
+    throughput: &[(String, f64)],
+    mixed: &[(String, MixedResult)],
+    b1: &[(String, LoadStats)],
+    b2: &[(&'static str, usize, LoadStats)],
+    filter: &Option<String>,
+) {
     let thr = |name: &str| throughput.iter().find(|(n, _)| n == name).map(|(_, v)| *v);
     let mix = |name: &str| mixed.iter().find(|(n, _)| n == name).map(|(_, v)| v);
     let mix_fmt = |name: &str, f: fn(&MixedResult) -> String| mix(name).map(f).unwrap_or_else(|| "N/A".to_string());
@@ -972,6 +1156,57 @@ fn write_report(throughput: &[(String, f64)], mixed: &[(String, MixedResult)], f
         crit_mean("bench_sstable_read_mmap"),
     ));
 
+    if !b1.is_empty() {
+        md.push_str("\n## B1 — Contention latency (spec perf/016 step 0)\n\n");
+        md.push_str(
+            "Small GETs on domain `bench`, measured while a full-domain scan (`contains` filter, \
+             matches nothing) runs in parallel. Both noise variants scan an equally sized domain — \
+             only the domain differs.\n\n",
+        );
+        md.push_str("| Run | p50 | p99 | p999 | GET ops/sec | server CPU | noise scans |\n");
+        md.push_str("|---|---|---|---|---|---|---|\n");
+        for (name, s) in b1 {
+            md.push_str(&format!(
+                "| {} | {:.2} µs | {:.2} µs | {:.2} µs | {} | {:.0}% | {} |\n",
+                name,
+                s.p50_us,
+                s.p99_us,
+                s.p999_us,
+                fmt_ops(Some(s.ops_per_sec)),
+                s.cpu_pct,
+                s.noise_ops,
+            ));
+        }
+    }
+
+    if !b2.is_empty() {
+        md.push_str("\n## B2 — Throughput scaling (spec perf/016 step 0)\n\n");
+        md.push_str(
+            "`read`: 100% GET (CPU-bound, no fsync in the path). \
+             `mixed`: 80% GET / 20% PUT — its gain is dominated by group commit, not by cores.\n\n",
+        );
+        md.push_str("| Profile | Clients | ops/sec | scaling vs. 1 client | p50 | p99 | server CPU |\n");
+        md.push_str("|---|---|---|---|---|---|---|\n");
+        for (profile, clients, s) in b2 {
+            let base =
+                b2.iter().find(|(p, c, _)| p == profile && *c == 1).map(|(_, _, s)| s.ops_per_sec);
+            let scale = match base {
+                Some(b) if b > 0.0 => format!("{:.2}x", s.ops_per_sec / b),
+                _ => "N/A".to_string(),
+            };
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {:.2} µs | {:.2} µs | {:.0}% |\n",
+                profile,
+                clients,
+                fmt_ops(Some(s.ops_per_sec)),
+                scale,
+                s.p50_us,
+                s.p99_us,
+                s.cpu_pct,
+            ));
+        }
+    }
+
     let out_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/results/latest.md");
     std::fs::create_dir_all(out_path.parent().unwrap()).ok();
     std::fs::write(&out_path, md).expect("write benches/results/latest.md");
@@ -1007,7 +1242,8 @@ fn main() {
     let filter = cli_filter();
     let rt = Runtime::new().expect("build tokio runtime");
 
-    let need_server = ["bench_get", "bench_put", "bench_throughput", "bench_mixed"]
+    let need_b1 = category_wanted(&filter, "bench_b1");
+    let need_server = ["bench_get", "bench_put", "bench_throughput", "bench_mixed", "bench_b1", "bench_b2"]
         .iter()
         .any(|s| category_wanted(&filter, s));
     let need_wal = category_wanted(&filter, "bench_wal_append");
@@ -1021,9 +1257,11 @@ fn main() {
 
     let mut throughput = Vec::new();
     let mut mixed = Vec::new();
+    let mut b1 = Vec::new();
+    let mut b2 = Vec::new();
 
     if need_server {
-        let instance = BenchInstance::start(&rt);
+        let instance = BenchInstance::start(&rt, need_b1);
         // Finding 1: catch a scenario panic so `stop()` still runs the graceful
         // shutdown (not just Drop's hard-kill fallback), then keep failing the
         // run — cleanup must never turn a real failure into a green exit.
@@ -1032,13 +1270,17 @@ fn main() {
             scenario_c(&mut criterion, &rt, &instance);
             let throughput = scenario_b(&rt, &instance, &filter);
             let mixed = scenario_d(&rt, &instance, &filter);
-            (throughput, mixed)
+            let b1 = scenario_b1(&rt, &instance, &filter);
+            let b2 = scenario_b2(&rt, &instance, &filter);
+            (throughput, mixed, b1, b2)
         }));
         instance.stop();
         match outcome {
-            Ok((t, m)) => {
+            Ok((t, m, s1, s2)) => {
                 throughput = t;
                 mixed = m;
+                b1 = s1;
+                b2 = s2;
             }
             Err(payload) => std::panic::resume_unwind(payload),
         }
@@ -1051,5 +1293,5 @@ fn main() {
     }
 
     criterion.final_summary();
-    write_report(&throughput, &mixed, &filter);
+    write_report(&throughput, &mixed, &b1, &b2, &filter);
 }

@@ -95,6 +95,16 @@ impl RelEngine {
     ) -> Result<CreateFromFileResult, RelStoreError> {
         let (raw_headers, data_records) = read_records(format, header, body)?;
         let column_count = raw_headers.len();
+        // Cap first: normalization and inference below are per-column work, so
+        // a header far past the limit must be rejected before paying for it —
+        // `create_table` would reject the schema anyway (spec §1/§3).
+        let max_columns = self.catalog.max_columns();
+        if column_count > max_columns {
+            return Err(RelStoreError::LimitExceeded {
+                which: "max_columns".to_string(),
+                max: max_columns,
+            });
+        }
         let names = normalize_headers(&raw_headers);
         let pk = pk.map(|s| s.to_ascii_lowercase());
 
@@ -332,21 +342,27 @@ fn normalize_one_header(raw: &str, position: usize) -> String {
 /// left to right, so the first column keeps the bare name.
 fn dedupe_names(names: &mut [String]) {
     let mut seen: HashSet<String> = HashSet::with_capacity(names.len());
+    // Where the probe for a repeated name resumes. Without it a run of equal
+    // headers restarts at `_2` every time, i.e. quadratic work; `seen` still
+    // decides uniqueness, so a stale hint only costs a few extra probes.
+    let mut resume: HashMap<String, u32> = HashMap::new();
     for name in names.iter_mut() {
         if seen.insert(name.clone()) {
             continue;
         }
-        let mut n = 2u32;
+        let original = name.clone();
+        let mut n = resume.get(&original).copied().unwrap_or(2);
         loop {
             let suffix = format!("_{n}");
             let max_base = MAX_IDENTIFIER_LEN.saturating_sub(suffix.len());
             let base: String = name.chars().take(max_base).collect();
             let candidate = format!("{base}{suffix}");
+            n += 1;
             if seen.insert(candidate.clone()) {
+                resume.insert(original, n);
                 *name = candidate;
                 break;
             }
-            n += 1;
         }
     }
 }
@@ -604,6 +620,42 @@ mod tests {
         let (_, rows) = select_all(&rel, "SELECT label FROM t ORDER BY _row").await;
         assert_eq!(rows[0][0], ScalarValue::Text("cl\u{e9}".to_string()));
         assert_eq!(rows[1][0], ScalarValue::Text("\u{1F600}".to_string()));
+    }
+
+    // The column cap is checked before any per-column work, so a header far
+    // past it costs nothing: with `max_columns = 2`, 5000 identical headers
+    // (which would otherwise be normalized and deduplicated first) are
+    // rejected, and no name normalization result can be observed.
+    #[tokio::test]
+    async fn test_oversized_header_rejected_before_normalization() {
+        let (rel, _dir) =
+            make_engine_with(RelStoreConfig { max_columns: 2, ..RelStoreConfig::default() }).await;
+        let header = vec!["a"; 5_000].join(",");
+        let row = vec!["1"; 5_000].join(",");
+        let csv = format!("{header}\n{row}\n");
+
+        let err = rel
+            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, csv.as_bytes())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelStoreError::LimitExceeded { ref which, .. } if which == "max_columns"), "got: {err}");
+        assert!(rel.get_object("default", "wide").is_err(), "no table created");
+    }
+
+    // Repeated headers keep their left-to-right suffixes even though the probe
+    // now resumes at the last suffix used instead of restarting at `_2`.
+    #[test]
+    fn test_dedupe_names_suffixes_stay_sequential() {
+        let mut names: Vec<String> = vec!["col".to_string(); 5];
+        dedupe_names(&mut names);
+        assert_eq!(names, vec!["col", "col_2", "col_3", "col_4", "col_5"]);
+
+        // A name that already looks like another's suffix must not be stolen:
+        // `col_2` is taken by the literal header, so the duplicate skips it.
+        let mut mixed: Vec<String> =
+            ["col", "col_2", "col"].iter().map(|s| s.to_string()).collect();
+        dedupe_names(&mut mixed);
+        assert_eq!(mixed, vec!["col", "col_2", "col_3"]);
     }
 
     // 8. Top-level failures (spec §1/§7 test 8): an existing table name, an

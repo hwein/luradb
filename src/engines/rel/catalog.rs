@@ -672,6 +672,12 @@ impl RelCatalog {
         prospective
     }
 
+    /// The `rel.max_columns` cap, so a caller can reject an oversized schema
+    /// before doing per-column work (`create_table` enforces it again).
+    pub(crate) fn max_columns(&self) -> usize {
+        self.limits.max_columns
+    }
+
     /// Validates all columns and returns `(stored columns, unique column names)`.
     fn validate_columns(
         &self,

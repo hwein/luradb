@@ -16,12 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
-use super::{PublishOutcome, ShmManager, SnapshotWriter, StateHeader};
+use super::{PublishOutcome, ReaderRegistry, ShmManager, SnapshotWriter, StateHeader};
 
 /// Per-entry byte estimate on top of key+value: covers rkyv relative pointers,
 /// length fields, the fixed `ShmEntry` fields and alignment padding. Kept
 /// generous so the accumulation budget stays conservative.
 const PER_ENTRY_OVERHEAD: usize = 64;
+
+/// Warn on every N-th consecutive skipped publish (spec perf/012 §9) — about
+/// once a second at the default interval.
+const SKIP_WARN_EVERY: u32 = 10;
 
 // ── SHM snapshot format (spec §1) ──────────────────────────────────────────────
 
@@ -178,6 +182,27 @@ fn to_entry(user_key: Vec<u8>, meta: ValueWithMetadata) -> ShmEntry {
 
 // ── SnapshotPublisher (spec §4, §7) ─────────────────────────────────────────────
 
+/// Counts consecutive skipped publishes so the livelock guard (spec perf/012
+/// §9) can log without a wall clock — and stays testable without log capture.
+#[derive(Default)]
+struct SkipTracker {
+    consecutive: u32,
+}
+
+impl SkipTracker {
+    /// Records a skip; true on every `SKIP_WARN_EVERY`-th one in a row.
+    fn on_skipped(&mut self) -> bool {
+        self.consecutive += 1;
+        self.consecutive % SKIP_WARN_EVERY == 0
+    }
+
+    /// Records a successful publish; `Some(n)` if it ended a run of `n` skips.
+    fn on_published(&mut self) -> Option<u32> {
+        let skipped = std::mem::take(&mut self.consecutive);
+        (skipped > 0).then_some(skipped)
+    }
+}
+
 /// Background task that publishes snapshots into the SHM double buffer.
 ///
 /// Runs via `tokio_uring::spawn`: it holds a `!Send` [`SnapshotWriter`] (raw
@@ -188,6 +213,8 @@ pub struct SnapshotPublisher {
     manager: Arc<ShmManager>,
     interval: Duration,
     wait_timeout_us: u64,
+    /// Reader slots of the registered clients; scanned before every flip.
+    readers: Arc<ReaderRegistry>,
     /// Notified after each MemTable flush — an extra rebuild trigger (spec §4b).
     flush_notify: Arc<Notify>,
     /// Set to true at shutdown to stop the loop.
@@ -200,17 +227,25 @@ impl SnapshotPublisher {
         manager: Arc<ShmManager>,
         interval: Duration,
         wait_timeout_us: u64,
+        readers: Arc<ReaderRegistry>,
         flush_notify: Arc<Notify>,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
-        Self { builder, manager, interval, wait_timeout_us, flush_notify, shutdown }
+        Self { builder, manager, interval, wait_timeout_us, readers, flush_notify, shutdown }
     }
 
     /// Runs until the shutdown signal fires. The loop always survives build and
     /// publish errors (logged and retried on the next tick) — spec §4.
     pub async fn run(self) {
-        let SnapshotPublisher { builder, manager, interval, wait_timeout_us, flush_notify, mut shutdown } =
-            self;
+        let SnapshotPublisher {
+            builder,
+            manager,
+            interval,
+            wait_timeout_us,
+            readers,
+            flush_notify,
+            mut shutdown,
+        } = self;
 
         // Build the writer inside the task body from the live segments; `manager`
         // (moved in) keeps the mappings alive for the whole task.
@@ -234,8 +269,10 @@ impl SnapshotPublisher {
                 data_b.as_ptr() as *mut u8,
                 data_a.len(),
                 wait_timeout_us,
+                Arc::clone(&readers),
             )
         };
+        let mut skips = SkipTracker::default();
 
         loop {
             if *shutdown.borrow() {
@@ -243,7 +280,23 @@ impl SnapshotPublisher {
             }
             match builder.build().await {
                 Ok(bytes) => match writer.publish(&bytes) {
-                    Ok(PublishOutcome::Published) | Ok(PublishOutcome::SkippedBusy) => {}
+                    Ok(PublishOutcome::Published) => {
+                        if let Some(n) = skips.on_published() {
+                            tracing::info!("SHM snapshot publishing resumed after {n} skipped publishes");
+                        }
+                    }
+                    // No force-flip (spec perf/012 §9): a pinned buffer is never
+                    // overwritten, the state is only made visible.
+                    Ok(PublishOutcome::SkippedBusy { buffer }) => {
+                        if skips.on_skipped() {
+                            tracing::warn!(
+                                "SHM snapshot stale: {} consecutive publishes skipped, buffer {buffer} \
+                                 still pinned by (client_id, readers) {:?}",
+                                skips.consecutive,
+                                readers.blockers(buffer)
+                            );
+                        }
+                    }
                     Err(e) => tracing::error!("SHM snapshot publish failed: {e}"),
                 },
                 Err(e) => tracing::error!("SHM snapshot build failed: {e}"),
@@ -266,7 +319,7 @@ mod tests {
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::domain::DomainConfig;
     use crate::engines::lsm::engine::LsmEngineOptions;
-    use crate::ipc::{SnapshotGuard, PUBLISH_WAIT_TIMEOUT_US};
+    use crate::ipc::{ReaderSlot, ReaderSlotHandle, SnapshotGuard, PUBLISH_WAIT_TIMEOUT_US};
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
@@ -443,20 +496,41 @@ mod tests {
         let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap();
 
         // Arena models the SHM state header + two data buffers (page-aligned in
-        // production; here we copy into an AlignedVec before validating).
+        // production; here we copy into an AlignedVec before validating), plus
+        // the registered client's reader slot.
         let header = Box::new(StateHeader::zeroed());
         header.init();
+        let slot = Arc::new(ReaderSlot::zeroed());
+        let readers = Arc::new(ReaderRegistry::new());
+        // Safe: the pointer targets the slot inside `slot`, whose `Arc` clone the
+        // handle keeps alive.
+        let handle = unsafe {
+            ReaderSlotHandle::new(
+                1,
+                Arc::as_ptr(&slot),
+                Arc::clone(&slot) as Arc<dyn std::any::Any + Send + Sync>,
+            )
+        };
+        let _lease = readers.register(handle);
+
         let len = 1 << 20;
         let mut buf_a = vec![0u8; len];
         let mut buf_b = vec![0u8; len];
         // Safe: single writer, two distinct buffers of `len` bytes, header valid.
         let writer = unsafe {
-            SnapshotWriter::new(&*header, buf_a.as_mut_ptr(), buf_b.as_mut_ptr(), len, PUBLISH_WAIT_TIMEOUT_US)
+            SnapshotWriter::new(
+                &*header,
+                buf_a.as_mut_ptr(),
+                buf_b.as_mut_ptr(),
+                len,
+                PUBLISH_WAIT_TIMEOUT_US,
+                Arc::clone(&readers),
+            )
         };
         assert_eq!(writer.publish(&bytes).unwrap(), PublishOutcome::Published);
         drop(writer);
 
-        let guard = SnapshotGuard::acquire(&*header, &buf_a, &buf_b).expect("snapshot available");
+        let guard = SnapshotGuard::acquire(&*header, &slot, &buf_a, &buf_b).expect("snapshot available");
 
         // Client side: validate, then read zero-copy from the mapped bytes.
         let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
@@ -488,6 +562,22 @@ mod tests {
         let dom = find(&snap, "default").unwrap();
         assert!(dom.entries.iter().any(|e| e.key == b"stays"));
         assert!(!dom.entries.iter().any(|e| e.key == b"gone"), "expired key must be absent");
+    }
+
+    // Spec perf/012 test 10: the livelock guard's counting logic — warn on every
+    // K-th consecutive skip, report and reset the run on the next publish.
+    #[test]
+    fn test_skip_tracker_warns_every_k_and_resets() {
+        let mut t = SkipTracker::default();
+        assert_eq!(t.on_published(), None, "no skips yet");
+
+        for i in 1..=(2 * SKIP_WARN_EVERY) {
+            let warn = t.on_skipped();
+            assert_eq!(warn, i % SKIP_WARN_EVERY == 0, "skip {i} warn flag");
+        }
+        assert_eq!(t.on_published(), Some(2 * SKIP_WARN_EVERY));
+        assert_eq!(t.on_published(), None, "counter reset");
+        assert!(!t.on_skipped(), "counting restarts after a publish");
     }
 
     // 10. A domain in Deleting state does not appear in the snapshot.

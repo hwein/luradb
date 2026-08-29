@@ -9,11 +9,14 @@
 //! segments). Command semantics match the REST handlers in `api::kv`.
 
 use super::commands::{ShmCommand, ShmGetValue, ShmResponse};
+use super::protocol::{ReaderSlot, READER_SLOT_OFFSET};
+use super::readers::ReaderSlotHandle;
 use super::ringbuffer::{
     DoubleMmapRegion, RingConsumer, RingCorrupt, RingProducer, RingSendError, RingbufferHeader,
 };
 use super::shm::ClientShm;
 use crate::engines::lsm::{DomainRegistry, DomainStore, GetResult};
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -59,13 +62,14 @@ pub enum ClientEvent {
 impl ClientConnection {
     /// Creates the client's shm quartet and wires the server ends — a consumer
     /// on the cmd ring, a producer on the resp ring — returning the four segment
-    /// names to hand back over the registration socket.
+    /// names to hand back over the registration socket plus the handle on the
+    /// client's reader slot (spec perf/012 §6).
     pub fn create(
         instance_id: &str,
         client_id: u64,
         ring_size: usize,
         mode: u32,
-    ) -> anyhow::Result<(Self, [String; 4])> {
+    ) -> anyhow::Result<(Self, [String; 4], ReaderSlotHandle)> {
         let shm = ClientShm::create(instance_id, client_id, ring_size, mode)?;
         let names = shm.segment_names();
         // Copyable handles: no borrow of `shm` outlives these, so `shm` can move
@@ -77,7 +81,7 @@ impl ClientConnection {
         // Safe: `_shm` outlives the rings (field order); header ptrs are
         // 128-byte-aligned page starts; data fds are sized to `ring_size` (a
         // validated power-of-two page multiple). Fresh segments are zeroed, i.e.
-        // an empty ring.
+        // an empty ring and both reader counters at 0.
         let consumer = unsafe {
             let header = RingbufferHeader::from_ptr(cmd_hdr_ptr, cmd_hdr_len) as *const RingbufferHeader;
             RingConsumer::new(header, DoubleMmapRegion::new(cmd_fd, ring_size)?)
@@ -86,7 +90,16 @@ impl ClientConnection {
             let header = RingbufferHeader::from_ptr(resp_hdr_ptr, resp_hdr_len) as *const RingbufferHeader;
             RingProducer::new(header, DoubleMmapRegion::new(resp_fd, ring_size)?)
         };
-        Ok((Self { client_id, consumer, producer, _shm: Some(shm) }, names))
+        // Safe: the slot sits behind the ring header in the same page, and the
+        // `Arc` clone keeps that mapping alive for the handle's whole life.
+        let slot_handle = unsafe {
+            let slot = ReaderSlot::from_ptr(
+                cmd_hdr_ptr.add(READER_SLOT_OFFSET),
+                cmd_hdr_len - READER_SLOT_OFFSET,
+            ) as *const ReaderSlot;
+            ReaderSlotHandle::new(client_id, slot, shm.cmd_hdr_arc() as Arc<dyn Any + Send + Sync>)
+        };
+        Ok((Self { client_id, consumer, producer, _shm: Some(shm) }, names, slot_handle))
     }
 
     /// Drains up to `DRAIN_BATCH` currently-available commands, dispatching each

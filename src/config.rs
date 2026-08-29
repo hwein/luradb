@@ -887,9 +887,12 @@ impl ShmConfig {
             "shm.command_buffer_size must be at least 4096 bytes, got {}",
             self.command_buffer_size
         );
+        // Same bound the startup path checks, taken from the type itself so the
+        // two can't drift apart (spec perf/012 §8).
         anyhow::ensure!(
-            self.state_size >= 64,
-            "shm.state_size must be at least 64 bytes, got {}",
+            self.state_size >= crate::ipc::StateHeader::SIZE,
+            "shm.state_size must be at least {} bytes, got {}",
+            crate::ipc::StateHeader::SIZE,
             self.state_size
         );
         anyhow::ensure!(
@@ -1454,8 +1457,11 @@ mod tests {
     #[test]
     fn test_shm_state_and_data_size_minimums() {
         let mut config = ShmConfig::default();
-        config.state_size = 32;
+        // The bound is the header size itself (spec perf/012 §8).
+        config.state_size = crate::ipc::StateHeader::SIZE - 1;
         assert!(config.validate().is_err());
+        config.state_size = crate::ipc::StateHeader::SIZE;
+        assert!(config.validate().is_ok());
 
         config.state_size = 4096;
         config.data_buffer_size = 100;

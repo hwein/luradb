@@ -432,6 +432,10 @@ async fn start_shm(
         let dispatcher = ipc::ShmDispatcher::new(Arc::clone(registry));
         let dispatcher_task = tokio::spawn(dispatcher.run(events_rx, shutdown_rx.clone()));
 
+        // Reader slots of the registered clients (spec perf/012): the
+        // registration listener leases them, the publisher scans them.
+        let readers = Arc::new(ipc::ReaderRegistry::new());
+
         // RCU read-snapshot publisher (spec perf/009): rebuilds the SHM
         // double-buffer snapshot on an interval and after every flush.
         // Spawned on the tokio-uring executor since SnapshotWriter is !Send.
@@ -444,6 +448,7 @@ async fn start_shm(
             Arc::clone(shm_manager.as_ref().expect("shm_manager present when shm.enabled")),
             std::time::Duration::from_millis(cfg.shm.snapshot_interval_ms),
             ipc::PUBLISH_WAIT_TIMEOUT_US,
+            Arc::clone(&readers),
             lsm_store.flush_notify(),
             shutdown_rx.clone(),
         );
@@ -459,6 +464,7 @@ async fn start_shm(
             segment_mode: cfg.shm.segment_mode,
             auth_enabled: cfg.auth.enabled,
             trusted_uids: Arc::new(cfg.auth.trusted_uids.clone()),
+            readers,
         };
         let reg_task = tokio::spawn(ipc::serve_registration(listener, reg_config, events_tx, shutdown_rx));
         tracing::info!("SHM registration listener active on {reg_path}");

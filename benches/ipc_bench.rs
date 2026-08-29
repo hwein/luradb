@@ -14,8 +14,9 @@ use hyper_util::rt::TokioIo;
 use luradb::core::storage_thread::{StorageThread, StorageThreadConfig};
 use luradb::core::wal::WriteAheadLog;
 use luradb::ipc::{
-    DoubleMmapRegion, RingConsumer, RingProducer, RingbufferHeader, ShmCommand, ShmGetValue,
-    ShmResponse, ShmSegment, ShmSnapshot, SnapshotGuard, StateHeader,
+    DoubleMmapRegion, ReadOnlySegment, ReaderSlot, RingConsumer, RingProducer, RingbufferHeader,
+    ShmCommand, ShmGetValue, ShmResponse, ShmSegment, ShmSnapshot, SnapshotGuard, StateHeader,
+    READER_SLOT_OFFSET,
 };
 use luradb::storage::sstable::{SSTableBuilder, SSTableReader};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -25,6 +26,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
@@ -141,9 +143,13 @@ struct ShmClient {
     tx: RingProducer,
     rx: RingConsumer,
     next_id: u64,
-    _segs: [ShmSegment; 4],
+    /// Shared with this client's `ShmSnapshotClient`: the reader slot the server
+    /// registered for us lives in this page (spec perf/012 §1).
+    cmd_hdr: Arc<ShmSegment>,
+    _segs: [ShmSegment; 3],
     /// Registration socket — MUST stay open for the dispatcher to keep this
-    /// client's rings alive (EOF = disconnect = segments unlinked).
+    /// client's rings alive (EOF = disconnect = segments unlinked) and for the
+    /// reader slot to stay registered (EOF = lease dropped).
     _keepalive: UnixStream,
 }
 
@@ -160,7 +166,7 @@ impl ShmClient {
         assert_eq!(parts.first().copied(), Some("OK"), "registration failed: {line:?}");
 
         let cmd_seg = ShmSegment::open(parts[2]).expect("open cmd segment");
-        let cmd_hdr_seg = ShmSegment::open(parts[3]).expect("open cmd_hdr segment");
+        let cmd_hdr_seg = Arc::new(ShmSegment::open(parts[3]).expect("open cmd_hdr segment"));
         let resp_seg = ShmSegment::open(parts[4]).expect("open resp segment");
         let resp_hdr_seg = ShmSegment::open(parts[5]).expect("open resp_hdr segment");
 
@@ -182,9 +188,15 @@ impl ShmClient {
             tx,
             rx,
             next_id: 1,
-            _segs: [cmd_seg, cmd_hdr_seg, resp_seg, resp_hdr_seg],
+            cmd_hdr: cmd_hdr_seg,
+            _segs: [cmd_seg, resp_seg, resp_hdr_seg],
             _keepalive: stream,
         }
+    }
+
+    /// Handle on the page holding this client's registered reader slot.
+    fn cmd_hdr(&self) -> Arc<ShmSegment> {
+        Arc::clone(&self.cmd_hdr)
     }
 
     fn call(&mut self, cmd: ShmCommand) -> ShmResponse {
@@ -229,24 +241,41 @@ impl ShmClient {
 
 // ── SHM snapshot client (mirrors the E2E test in ipc/snapshot.rs) ─────────────
 
+/// The read path of a *registered* client: `state`/`data_a`/`data_b` mapped
+/// `PROT_READ` (spec perf/012 §10), pinning through the reader slot in the
+/// `cmd_hdr` page its `ShmClient` registered. A bench-local slot would be
+/// invisible to the server's registry and would read unprotected.
 struct ShmSnapshotClient {
-    state: ShmSegment,
-    data_a: ShmSegment,
-    data_b: ShmSegment,
+    state: ReadOnlySegment,
+    data_a: ReadOnlySegment,
+    data_b: ReadOnlySegment,
+    cmd_hdr: Arc<ShmSegment>,
 }
 
 impl ShmSnapshotClient {
-    fn open(instance_id: &str) -> Self {
-        let state = ShmSegment::open(&format!("/luradb_{instance_id}_state")).expect("open state segment");
-        let data_a = ShmSegment::open(&format!("/luradb_{instance_id}_data_a")).expect("open data_a segment");
-        let data_b = ShmSegment::open(&format!("/luradb_{instance_id}_data_b")).expect("open data_b segment");
-        Self { state, data_a, data_b }
+    fn open(instance_id: &str, cmd_hdr: Arc<ShmSegment>) -> Self {
+        let seg = |purpose: &str| {
+            ShmSegment::open_readonly(&format!("/luradb_{instance_id}_{purpose}"))
+                .unwrap_or_else(|e| panic!("open {purpose} segment read-only: {e}"))
+        };
+        Self { state: seg("state"), data_a: seg("data_a"), data_b: seg("data_b"), cmd_hdr }
     }
 
     fn header(&self) -> &StateHeader {
         // Safe: `state` is a live mapping >= StateHeader::SIZE (validated by the
         // server at startup) held for the lifetime of `self`.
         unsafe { StateHeader::from_ptr(self.state.as_ptr(), self.state.len()) }
+    }
+
+    fn slot(&self) -> &ReaderSlot {
+        // Safe: the slot sits behind the ring header in the page `cmd_hdr` keeps
+        // mapped for the lifetime of `self`.
+        unsafe {
+            ReaderSlot::from_ptr(
+                self.cmd_hdr.as_ptr().add(READER_SLOT_OFFSET),
+                self.cmd_hdr.len() - READER_SLOT_OFFSET,
+            )
+        }
     }
 
     fn bufs(&self) -> (&[u8], &[u8]) {
@@ -264,7 +293,7 @@ impl ShmSnapshotClient {
     /// all values are 64 bytes, well under the inline threshold).
     fn get(&self, domain: &str, key: &[u8]) -> Option<Vec<u8>> {
         let (a, b) = self.bufs();
-        let guard = SnapshotGuard::acquire(self.header(), a, b)?;
+        let guard = SnapshotGuard::acquire(self.header(), self.slot(), a, b)?;
         let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
         aligned.extend_from_slice(guard.data());
         let archived =
@@ -368,8 +397,11 @@ impl BenchInstance {
         }
 
         // Give the SHM snapshot publisher a chance to pick up the seed data —
-        // scenario A's snapshot benchmark needs `bench_key` visible.
-        let snap = ShmSnapshotClient::open(&self.instance_id);
+        // scenario A's snapshot benchmark needs `bench_key` visible. Reading
+        // needs a registration: the reader slot lives in the client's own
+        // cmd_hdr page.
+        let client = ShmClient::register(&self.reg_sock_path).await;
+        let snap = ShmSnapshotClient::open(&self.instance_id, client.cmd_hdr());
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if snap.get(BENCH_DOMAIN, b"bench_key").is_some() {
@@ -453,11 +485,11 @@ fn scenario_a(c: &mut Criterion, rt: &Runtime, instance: &BenchInstance) {
     });
 
     let mut shm_client = rt.block_on(ShmClient::register(&instance.reg_sock_path));
+    let snap_client = ShmSnapshotClient::open(&instance.instance_id, shm_client.cmd_hdr());
     c.bench_function("bench_get_shm_command", |b| {
         b.iter(|| black_box(shm_client.get(BENCH_DOMAIN, b"bench_key")));
     });
 
-    let snap_client = ShmSnapshotClient::open(&instance.instance_id);
     c.bench_function("bench_get_shm_snapshot", |b| {
         b.iter(|| black_box(snap_client.get(BENCH_DOMAIN, b"bench_key")));
     });
@@ -552,12 +584,15 @@ fn scenario_b(rt: &Runtime, instance: &BenchInstance, filter: &Option<String>) -
 
     if wants(filter, "bench_throughput_shm_4t") {
         let instance_id = instance.instance_id.clone();
+        // One registration per reader thread: each needs its own reader slot.
+        let clients: Vec<ShmClient> =
+            (0..THREADS).map(|_| rt.block_on(ShmClient::register(&instance.reg_sock_path))).collect();
         let start = Instant::now();
         std::thread::scope(|scope| {
-            for t in 0..THREADS {
+            for (t, client) in clients.into_iter().enumerate() {
                 let instance_id = instance_id.clone();
                 scope.spawn(move || {
-                    let snap = ShmSnapshotClient::open(&instance_id);
+                    let snap = ShmSnapshotClient::open(&instance_id, client.cmd_hdr());
                     for i in 0..per_thread {
                         let key = format!("k{:05}", (i + t) % SEED_KEYS);
                         black_box(snap.get(BENCH_DOMAIN, key.as_bytes()));
@@ -702,9 +737,10 @@ fn run_mixed_shm(rt: &Runtime, instance: &BenchInstance) -> MixedResult {
             .enumerate()
             .map(|(idx, mut client)| {
                 let instance_id = instance_id.clone();
+                let cmd_hdr = client.cmd_hdr();
                 scope.spawn(move || {
                     let mut rng = StdRng::seed_from_u64(MIXED_RNG_SEED + idx as u64);
-                    let snap = ShmSnapshotClient::open(&instance_id);
+                    let snap = ShmSnapshotClient::open(&instance_id, cmd_hdr);
                     let value = vec![b'm'; VALUE_LEN];
                     let mut lat = Vec::new();
                     while Instant::now() < deadline {

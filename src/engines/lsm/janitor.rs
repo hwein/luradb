@@ -154,10 +154,25 @@ pub struct Janitor {
     /// that have no MemTables at all.
     flush_barrier: Option<FlushBarrier>,
 
+    /// The engine's flush lock: held over the manifest swap and the level
+    /// install, it keeps a flush from installing an SSTable the reload would
+    /// not see (spec general/029). `None` only for fixtures without an engine.
+    flush_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+
+    /// The engine's maintenance lock: held over a whole GC cycle, it keeps a
+    /// compaction from entering the manifest between the live scan and the
+    /// retire (spec general/029). `None` only for fixtures without an engine.
+    maintenance_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+
     /// Test-only pause point between opening the rebuilt readers and
     /// installing them (spec general/028).
     #[cfg(test)]
     install_hook: Option<Arc<TestHook>>,
+
+    /// Test-only pause point after the rebuild and before the flush lock —
+    /// the window a whole flush fits into (spec general/029).
+    #[cfg(test)]
+    before_manifest_swap_hook: Option<Arc<TestHook>>,
 }
 
 impl Janitor {
@@ -178,6 +193,8 @@ impl Janitor {
         storage_handle: Option<StorageHandle>,
         janitor_runs: Arc<AtomicU64>,
         flush_barrier: Option<FlushBarrier>,
+        flush_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+        maintenance_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     ) -> Self {
         Self {
             vlog,
@@ -194,8 +211,12 @@ impl Janitor {
             storage_handle,
             janitor_runs,
             flush_barrier,
+            flush_lock,
+            maintenance_lock,
             #[cfg(test)]
             install_hook: None,
+            #[cfg(test)]
+            before_manifest_swap_hook: None,
         }
     }
 
@@ -204,6 +225,14 @@ impl Janitor {
     #[cfg(test)]
     pub(crate) fn set_install_hook(&mut self, hook: Arc<TestHook>) {
         self.install_hook = Some(hook);
+    }
+
+    /// Parks the next [`Self::run_gc`] after its rebuild, before it takes the
+    /// flush lock — a flush released here reaches the manifest in full, which
+    /// the snapshot the rebuild worked on never listed (spec general/029).
+    #[cfg(test)]
+    pub(crate) fn set_before_manifest_swap_hook(&mut self, hook: Arc<TestHook>) {
+        self.before_manifest_swap_hook = Some(hook);
     }
 
     // -----------------------------------------------------------------------
@@ -275,6 +304,16 @@ impl Janitor {
             dead_ratio * 100.0
         );
 
+        // Whole cycle under the maintenance lock, barrier included: no
+        // compaction can enter the manifest between the live scan below and
+        // the retire at the end, so nothing the scan never saw survives into
+        // the generations this cycle deletes (spec general/029). Taken before
+        // the flush lock, never after it.
+        let _maintenance = match &self.maintenance_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         // ── Roll forward to a fresh generation ───────────────────────────
         //
         // New writes land here from now on; `u32` overflow needs 4 billion GC
@@ -316,8 +355,23 @@ impl Janitor {
             self.rebuild_all_sstables(&manifest_snapshot, &remap, new_id).await?;
         let sstables_rebuilt = old_file_ids.len();
 
-        self.apply_manifest_update(&old_file_ids, &new_level_metas);
-        self.reload_level_readers(&new_level_metas).await?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_manifest_swap_hook {
+            hook.pause().await;
+        }
+
+        {
+            // Manifest swap and level install under the flush lock: what the
+            // reload reads from the manifest is exactly what the read path
+            // ends up with, an SSTable flushed since the snapshot included
+            // (spec general/029).
+            let _flush = match &self.flush_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            self.apply_manifest_update(&old_file_ids, &new_level_metas);
+            self.reload_level_readers().await?;
+        }
 
         // ── Persist manifest ───────────────────────────────────────────────
         let manifest_for_save = self.manifest.read().clone();
@@ -545,6 +599,10 @@ impl Janitor {
     }
 
     /// Applies the GC result to the shared manifest (sync — no await under the lock).
+    ///
+    /// Every rebuild carries the content of a snapshot table and is therefore
+    /// older than anything flushed since; L0 is read newest-last, so they go in
+    /// front of what the level gained meanwhile (spec general/029).
     fn apply_manifest_update(
         &self,
         old_file_ids: &[(usize, u64)],
@@ -554,23 +612,24 @@ impl Janitor {
         for (level, file_id) in old_file_ids {
             manifest.remove_sstable(*level, *file_id);
         }
-        for level_metas in new_level_metas {
-            for meta in level_metas {
-                manifest.add_sstable(meta.clone());
-            }
+        for (level, level_metas) in new_level_metas.iter().enumerate() {
+            manifest.prepend_sstables(level, level_metas.clone());
         }
     }
 
-    /// Reopens the rebuilt SSTables and swaps them into the level manager.
+    /// Reopens every level from the current manifest — the rebuilt tables plus
+    /// whatever else the manifest gained meanwhile — and swaps them in.
     ///
     /// Install before remove, no await in between — readers sample sources
     /// without a version (spec general/028): every level keeps its old readers
     /// until all new ones are open, then they change together.
-    async fn reload_level_readers(&self, new_level_metas: &[Vec<SSTableMetadata>]) -> Result<()> {
-        let mut updates = Vec::with_capacity(new_level_metas.len());
-        for (level_idx, new_metas) in new_level_metas.iter().enumerate() {
+    async fn reload_level_readers(&self) -> Result<()> {
+        let num_levels = self.manifest.read().levels.len();
+        let mut updates = Vec::with_capacity(num_levels);
+        for level_idx in 0..num_levels {
+            let metas = self.manifest.read().get_level(level_idx).to_vec();
             let mut sstables = Vec::new();
-            for meta in new_metas {
+            for meta in &metas {
                 sstables.push(Arc::new(
                     LsmStorageEngine::open_sstable_reader(
                         &self.file_manager,
@@ -721,6 +780,8 @@ mod tests {
             Some(handle.clone()),
             Arc::new(AtomicU64::new(0)),
             None,
+            None,
+            None,
         );
 
         StFixture { st, handle, vlog_path, registry, janitor, live_val }
@@ -851,6 +912,8 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             None,
             janitor_runs,
+            None,
+            None,
             None,
         )
     }

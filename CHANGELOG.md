@@ -7,6 +7,7 @@ All notable changes to LuraDB are documented in this file.
 ### Fixed
 
 - Reads no longer miss keys while a MemTable flush or a compaction installs its result.
+- Reads no longer fail or return stale values when vLog garbage collection overlaps a MemTable flush or a compaction.
 
 ## [0.4.0] - 2026-08-29
 

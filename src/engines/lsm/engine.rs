@@ -371,6 +371,21 @@ pub struct LsmStorageEngine {
     /// own read guard.
     in_flight_writes: tokio::sync::RwLock<()>,
 
+    /// Held by a flush from its claim to its install, so L0 and the manifest
+    /// carry the SSTables in MemTable age order and whoever takes this lock
+    /// knows that no flush claimed before it is still in flight (spec
+    /// general/029). Lock order is `flush_lock` → `manifest` /
+    /// `immutable_memtables` / `flushing`, never the other way round; `Arc`
+    /// because the Janitor's GC install takes it too.
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
+
+    /// Held by a whole GC cycle and by a whole compaction, so neither of the
+    /// two jobs that rewrite entire levels enters the manifest while the other
+    /// is running (spec general/029). Lock order is `maintenance_lock` →
+    /// `flush_lock`; the flush path never takes it, so a GC cycle cannot stall
+    /// a write.
+    maintenance_lock: Arc<tokio::sync::Mutex<()>>,
+
     #[cfg(test)]
     pub(crate) hooks: TestHooks,
 }
@@ -452,6 +467,8 @@ impl LsmStorageEngine {
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
             in_flight_writes: tokio::sync::RwLock::new(()),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             hooks: TestHooks::default(),
         };
@@ -657,6 +674,8 @@ impl LsmStorageEngine {
             self.storage_handle.clone(),
             Arc::clone(&self.janitor_runs),
             Some(flush_barrier),
+            Some(Arc::clone(&self.flush_lock)),
+            Some(Arc::clone(&self.maintenance_lock)),
         )
     }
 
@@ -730,6 +749,17 @@ impl LsmStorageEngine {
         while !self.immutable_memtables.read().is_empty() {
             self.flush_memtable().await?;
         }
+        // The barrier: `flush_lock` is free only once every flush claimed
+        // before this point has installed its SSTable, so nothing this caller
+        // has to wait for is left in flight (spec general/029). Acquired after
+        // the drain loop, never around it — `flush_memtable` takes the same
+        // lock and `tokio::sync::Mutex` is not reentrant. The check belongs
+        // under the guard: released first, the flush loop could claim the next
+        // MemTable before it runs.
+        {
+            let _flush = self.flush_lock.lock().await;
+            debug_assert!(self.flushing.read().is_empty());
+        }
         Ok(())
     }
 
@@ -772,10 +802,6 @@ impl LsmStorageEngine {
             eprintln!("[Engine] Shutdown flush error: {e}");
             return;
         }
-
-        // Background tasks are joined, so no flush is still in flight
-        // (spec general/028).
-        debug_assert!(self.flushing.read().is_empty());
 
         // All data is now in SSTables — WAL entries are redundant.
         // Clear it so the next startup finds an empty WAL and skips
@@ -1423,7 +1449,11 @@ impl LsmStorageEngine {
     /// into `flushing` in one lock section: the removal still keeps concurrent
     /// callers from flushing it twice, while readers keep seeing it until its
     /// SSTable is installed (spec general/028).
+    ///
+    /// [`Self::flush_lock`] spans claim and install, so the SSTables enter L0
+    /// and the manifest in MemTable age order (spec general/029).
     pub async fn flush_memtable(&self) -> Result<Option<u64>> {
+        let _flush = self.flush_lock.lock().await;
         let memtable_to_flush = {
             let mut imm = self.immutable_memtables.write();
             if imm.is_empty() { return Ok(None); }
@@ -1634,6 +1664,12 @@ impl LsmStorageEngine {
     /// removed from the working set (the merged source + target inputs) so the
     /// caller can deregister exactly those from the `IoEngine` (perf/004).
     pub async fn compact_level(&self, source_level: usize) -> Result<Vec<u64>> {
+        // Whole run under the maintenance lock: a GC cycle either sees this
+        // compaction's output from its start or not at all, so it can neither
+        // orphan the vLog pointers the output copied nor re-enter the SSTables
+        // it merged away (spec general/029).
+        let _maintenance = self.maintenance_lock.lock().await;
+
         // Inject the current low watermark so tombstones below it can be GC'd.
         let mut config = self.compaction_config.clone();
         config.low_watermark = self.snapshot_registry.low_watermark();
@@ -1667,7 +1703,13 @@ impl LsmStorageEngine {
             for meta in &new_metas  { manifest.add_sstable(meta.clone()); }
         }
 
-        self.rebuild_levels_from_manifest([source_level, target_level], use_mmap).await?;
+        {
+            // Under the flush lock the manifest cannot gain an L0 table
+            // between the rebuild's read and its swap, which would drop that
+            // table from the read path (spec general/029).
+            let _flush = self.flush_lock.lock().await;
+            self.rebuild_levels_from_manifest([source_level, target_level], use_mmap).await?;
+        }
 
         // Persist manifest.
         let snap = self.manifest.read().clone();
@@ -4022,8 +4064,10 @@ mod tests {
         assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
     }
 
-    // Spec general/028 test 3: the claim stays exclusive -- while one flush is
-    // parked, a second call finds nothing to flush, and only one L0 file results.
+    // Spec general/028 test 3: the claim stays exclusive -- a second call
+    // never flushes the same MemTable, and only one L0 file results. Since
+    // spec general/029 it waits for the flush lock instead of returning right
+    // away, so it runs as its own task.
     #[tokio::test]
     async fn test_concurrent_flush_calls_claim_the_memtable_once() {
         let (mut engine, _dir) = make_engine().await;
@@ -4039,13 +4083,19 @@ mod tests {
         };
         hook.reached.notified().await;
 
-        assert!(
-            engine.flush_memtable().await.unwrap().is_none(),
-            "the second call must find the MemTable already claimed"
-        );
+        let second = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        yield_repeatedly().await;
+        assert!(!second.is_finished(), "the second call waits for the flush in flight");
 
         hook.release.notify_one();
         assert!(flusher.await.unwrap().unwrap().is_some());
+        assert!(
+            second.await.unwrap().unwrap().is_none(),
+            "the second call must find the MemTable already flushed"
+        );
         assert_eq!(engine.level_manager.get_level(0).len(), 1, "exactly one L0 file");
         assert!(engine.flushing.read().is_empty());
         assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
@@ -4142,5 +4192,373 @@ mod tests {
         assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
         assert_eq!(engine.get(b"b").await.unwrap(), Some(big));
         assert_readers_match_manifest(&engine);
+    }
+
+    // ── Spec general/029: maintenance against a concurrent flush ─────────────
+
+    /// Gives every other task room to run, without ever asserting on
+    /// wall-clock time (spec general/029): a fixed yield budget, no deadline.
+    async fn yield_repeatedly() {
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Spec general/029 test 1 (B1): the flush barrier must not return while a
+    // flush claimed before it is still in flight -- the GC behind it would
+    // otherwise scan a manifest that is missing that MemTable's SSTable.
+    #[tokio::test]
+    async fn test_barrier_waits_for_a_flush_in_flight() {
+        let (mut engine, _dir) = make_engine().await;
+        let hook = hook_flush_write(&mut engine);
+        let engine = Arc::new(engine);
+
+        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+        engine.put(b"parked", &big).await.unwrap();
+        engine.freeze_active_memtable();
+
+        let flusher = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        hook.reached.notified().await;
+        assert_eq!(engine.flushing.read().len(), 1, "the flush claimed the MemTable");
+        assert!(
+            engine.immutable_memtables.read().is_empty(),
+            "the barrier finds an empty queue and must still wait"
+        );
+
+        let barrier = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_all_memtables().await })
+        };
+        yield_repeatedly().await;
+        assert!(!barrier.is_finished(), "the barrier must wait for the flush in flight");
+
+        hook.release.notify_one();
+        barrier.await.unwrap().unwrap();
+        assert!(flusher.await.unwrap().unwrap().is_some());
+        assert!(engine.flushing.read().is_empty(), "no flush is left in flight");
+        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
+    }
+
+    // Spec general/029 test 2 (B1): a GC cycle must not retire the generation
+    // a flush in flight still points into -- before the fix its barrier
+    // returned early, the live scan missed that SSTable, and the key came back
+    // as a pointer into a deleted generation.
+    #[tokio::test]
+    async fn test_gc_waits_for_a_flush_in_flight_before_it_scans() {
+        let (mut engine, _dir) = make_engine().await;
+        let hook = hook_flush_write(&mut engine);
+        let engine = Arc::new(engine);
+
+        let big = vec![b'x'; 4096];
+        engine.put(b"parked", &big).await.unwrap();
+        engine.freeze_active_memtable();
+
+        let flusher = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        hook.reached.notified().await;
+
+        let janitor = Arc::new(engine.build_janitor(gc_always()));
+        let gc = {
+            let janitor = Arc::clone(&janitor);
+            tokio::spawn(async move { janitor.run_gc().await })
+        };
+        yield_repeatedly().await;
+        assert!(!gc.is_finished(), "the GC must not scan past a flush in flight");
+        assert!(engine.vlog.get(1).is_some(), "its source generation is still live");
+
+        hook.release.notify_one();
+        assert!(flusher.await.unwrap().unwrap().is_some());
+        assert!(gc.await.unwrap().unwrap().ran);
+
+        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
+        assert_readers_match_manifest(&engine);
+    }
+
+    // Spec general/029 test 3 (B2): L0 follows claim order, not completion
+    // order. A second flush cannot claim while the first is in flight, so the
+    // older MemTable's SSTable always lands first -- before the fix both ran
+    // at once and whoever finished last counted as the newest source.
+    #[tokio::test]
+    async fn test_l0_follows_claim_order_not_completion_order() {
+        let (mut engine, _dir) = make_engine().await;
+        let hook = hook_flush_write(&mut engine);
+        let engine = Arc::new(engine);
+
+        engine.put(b"k", b"old").await.unwrap();
+        engine.freeze_active_memtable();
+        engine.put(b"k", b"new").await.unwrap();
+        engine.freeze_active_memtable();
+        assert_eq!(engine.immutable_memtables.read().len(), 2);
+
+        let older = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        hook.reached.notified().await;
+
+        let newer = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        yield_repeatedly().await;
+        assert_eq!(engine.flushing.read().len(), 1, "only one flush may be in flight");
+        assert_eq!(
+            engine.immutable_memtables.read().len(),
+            1,
+            "the younger MemTable stays queued until the older one is installed"
+        );
+        assert!(!newer.is_finished(), "it waits for the flush lock instead of claiming");
+
+        hook.release.notify_one();
+        let older_id = older.await.unwrap().unwrap().unwrap();
+        hook.reached.notified().await;
+        hook.release.notify_one();
+        let newer_id = newer.await.unwrap().unwrap().unwrap();
+
+        let l0: Vec<u64> = engine.level_manager.get_level(0).iter().map(|r| r.file_id).collect();
+        assert_eq!(l0, vec![older_id, newer_id], "L0 lists the SSTables oldest first");
+        let manifest_l0: Vec<u64> =
+            engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
+        assert_eq!(manifest_l0, l0, "the manifest keeps that order across a restart");
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+    }
+
+    // Spec general/029 test 4 (B3): no flush may install while the GC swaps
+    // manifest and levels -- before the fix one could, and the GC then rebuilt
+    // every level from its own snapshot, so that SSTable kept its manifest
+    // entry but lost its reader and every key with it.
+    #[tokio::test]
+    async fn test_gc_install_keeps_a_concurrently_flushed_sstable() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+
+        engine.put(b"a", &big).await.unwrap();
+        freeze_and_flush(&engine).await;
+
+        let hook = Arc::new(TestHook::default());
+        let mut janitor = engine.build_janitor(gc_always());
+        janitor.set_install_hook(Arc::clone(&hook));
+        let janitor = Arc::new(janitor);
+
+        let gc = {
+            let janitor = Arc::clone(&janitor);
+            tokio::spawn(async move { janitor.run_gc().await })
+        };
+        hook.reached.notified().await;
+
+        engine.put(b"b", b"2").await.unwrap();
+        engine.freeze_active_memtable();
+        let flusher = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        yield_repeatedly().await;
+        assert!(engine.flushing.read().is_empty(), "the GC install holds the flush lock");
+        assert_eq!(
+            engine.immutable_memtables.read().len(),
+            1,
+            "the flush waits for the install instead of landing inside it"
+        );
+
+        hook.release.notify_one();
+        assert!(gc.await.unwrap().unwrap().ran);
+        assert!(flusher.await.unwrap().unwrap().is_some());
+
+        assert_readers_match_manifest(&engine);
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(big));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+    }
+
+    // Spec general/029 test 4, the wider window (A3): a flush that completes
+    // between the GC's manifest snapshot and its install must survive that
+    // install -- with its reader, because the reload reads the current
+    // manifest and not the snapshot, and as the newest L0 source, because
+    // every rebuild carries snapshot content and belongs in front of it.
+    #[tokio::test]
+    async fn test_gc_install_adopts_an_sstable_flushed_since_its_snapshot() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let old = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+        let new = vec![b'y'; 4096];
+
+        engine.put(b"shared", &old).await.unwrap();
+        freeze_and_flush(&engine).await;
+
+        let hook = Arc::new(TestHook::default());
+        let mut janitor = engine.build_janitor(gc_always());
+        janitor.set_before_manifest_swap_hook(Arc::clone(&hook));
+        let janitor = Arc::new(janitor);
+
+        let gc = {
+            let janitor = Arc::clone(&janitor);
+            tokio::spawn(async move { janitor.run_gc().await })
+        };
+        hook.reached.notified().await;
+
+        // The whole flush fits into the window: it overwrites a key the
+        // snapshot table carries and enters the manifest the GC never saw.
+        engine.put(b"shared", &new).await.unwrap();
+        engine.put(b"late", &new).await.unwrap();
+        engine.freeze_active_memtable();
+        let flushed_id = engine.flush_memtable().await.unwrap().unwrap();
+
+        hook.release.notify_one();
+        let stats = gc.await.unwrap().unwrap();
+        assert_eq!(stats.sstables_rebuilt, 1, "only the snapshot table was rebuilt");
+
+        assert_readers_match_manifest(&engine);
+        assert_eq!(engine.get(b"late").await.unwrap(), Some(new.clone()));
+        assert_eq!(
+            engine.get(b"shared").await.unwrap(),
+            Some(new),
+            "the rebuild carries the version the flush replaced"
+        );
+
+        let l0: Vec<u64> = engine.level_manager.get_level(0).iter().map(|r| r.file_id).collect();
+        assert_eq!(l0.len(), 2);
+        assert_eq!(l0[1], flushed_id, "the rebuild is older and goes in front of the flush");
+        let manifest_l0: Vec<u64> =
+            engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
+        assert_eq!(manifest_l0, l0, "the manifest keeps that order across a restart");
+    }
+
+    // Spec general/029 test 5 (A4): the same for a compaction install -- it
+    // reads its levels from the manifest, so a flush landing in L0 between
+    // that read and the swap would be replaced away.
+    #[tokio::test]
+    async fn test_compaction_install_keeps_a_concurrently_flushed_sstable() {
+        let (mut engine, _dir) = make_engine().await;
+        engine.put(b"a", b"1").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"b", b"2").await.unwrap();
+        freeze_and_flush(&engine).await;
+
+        let hook = Arc::new(TestHook::default());
+        engine.hooks.before_level_install = Some(Arc::clone(&hook));
+        let engine = Arc::new(engine);
+
+        let compactor = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.compact_level(0).await })
+        };
+        hook.reached.notified().await;
+
+        engine.put(b"c", b"3").await.unwrap();
+        engine.freeze_active_memtable();
+        let flusher = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        yield_repeatedly().await;
+        assert!(engine.flushing.read().is_empty(), "the compaction install holds the flush lock");
+        assert_eq!(
+            engine.immutable_memtables.read().len(),
+            1,
+            "the flush waits for the install instead of landing inside it"
+        );
+
+        hook.release.notify_one();
+        compactor.await.unwrap().unwrap();
+        assert!(flusher.await.unwrap().unwrap().is_some());
+
+        assert_readers_match_manifest(&engine);
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+        assert_eq!(engine.get(b"c").await.unwrap(), Some(b"3".to_vec()));
+    }
+
+    /// A level below L0 must be free of overlaps: the read path iterates it in
+    /// undefined order, so one user key in two of its SSTables makes the
+    /// winning version a coin toss (spec general/029 B4).
+    fn assert_levels_below_l0_are_disjoint(engine: &LsmStorageEngine) {
+        for (lvl, readers) in engine.level_manager.get_all_levels().iter().enumerate().skip(1) {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            for reader in readers {
+                let mut keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+                for entry in reader.iter() {
+                    let (key, _) = entry.unwrap();
+                    if let Some(user_key) = InternalKey::extract_user_key(key) {
+                        keys.insert(user_key.to_vec());
+                    }
+                }
+                for key in keys {
+                    assert!(
+                        seen.insert(key.clone()),
+                        "L{lvl} carries {} in two SSTables",
+                        String::from_utf8_lossy(&key)
+                    );
+                }
+            }
+        }
+    }
+
+    // Spec general/029 test 6 (B4): a compaction must not run inside a GC
+    // cycle -- it would copy vLog pointers into the generations the cycle is
+    // about to delete, and its manifest swap would make the GC re-enter the
+    // very SSTables the compaction merged away.
+    #[tokio::test]
+    async fn test_compaction_waits_for_the_gc_cycle() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+        let keys: [&[u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
+
+        engine.put(keys[0], &big).await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap(); // "a" moves down to L1
+        for key in &keys[1..] {
+            engine.put(key, &big).await.unwrap();
+            freeze_and_flush(&engine).await;
+        }
+        assert_eq!(engine.level_manager.get_level(0).len(), 4);
+        assert_eq!(engine.level_manager.get_level(1).len(), 1);
+
+        let hook = Arc::new(TestHook::default());
+        let mut janitor = engine.build_janitor(gc_always());
+        janitor.set_install_hook(Arc::clone(&hook));
+        let janitor = Arc::new(janitor);
+
+        let gc = {
+            let janitor = Arc::clone(&janitor);
+            tokio::spawn(async move { janitor.run_gc().await })
+        };
+        hook.reached.notified().await;
+
+        let compactor = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.compact_level(0).await })
+        };
+        // The second one would find L2 empty and return without touching a
+        // file, so its "not finished" says the lock spans the whole run and
+        // not merely the I/O the first one happens to be busy with.
+        let idle = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.compact_level(2).await })
+        };
+        yield_repeatedly().await;
+        assert!(!compactor.is_finished(), "a compaction must not run inside a GC cycle");
+        assert!(!idle.is_finished(), "not even one that has nothing to compact");
+        assert_eq!(
+            engine.manifest.read().get_level(0).len(),
+            4,
+            "and none of them may swap the GC's tables out of the manifest"
+        );
+
+        hook.release.notify_one();
+        assert!(gc.await.unwrap().unwrap().ran);
+        compactor.await.unwrap().unwrap();
+        assert!(idle.await.unwrap().unwrap().is_empty());
+
+        assert_readers_match_manifest(&engine);
+        assert_levels_below_l0_are_disjoint(&engine);
+        for key in keys {
+            assert_eq!(engine.get(key).await.unwrap(), Some(big.clone()), "key must survive");
+        }
     }
 }

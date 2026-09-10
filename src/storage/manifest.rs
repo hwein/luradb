@@ -69,6 +69,24 @@ impl Manifest {
         self.version += 1;
     }
 
+    /// Inserts SSTables at the front of a level, keeping their order among
+    /// themselves.
+    ///
+    /// L0 is read newest-last, so tables that are older than everything the
+    /// level already holds go here instead of through [`Self::add_sstable`].
+    pub fn prepend_sstables(&mut self, level: usize, metas: Vec<SSTableMetadata>) {
+        if metas.is_empty() {
+            return;
+        }
+
+        while self.levels.len() <= level {
+            self.levels.push(Vec::new());
+        }
+
+        self.levels[level].splice(0..0, metas);
+        self.version += 1;
+    }
+
     /// Removes an SSTable from the manifest.
     pub fn remove_sstable(&mut self, level: usize, file_id: u64) -> Option<SSTableMetadata> {
         if level < self.levels.len() {

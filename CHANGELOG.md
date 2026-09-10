@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reads no longer miss keys while a MemTable flush or a compaction installs its result.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added

@@ -25,6 +25,8 @@
 use crate::core::storage_thread::StorageHandle;
 use crate::engines::lsm::block_cache::BlockCache;
 use crate::engines::lsm::engine::LsmStorageEngine;
+#[cfg(test)]
+use crate::engines::lsm::engine::TestHook;
 use crate::engines::lsm::levels::LevelManager;
 use crate::engines::lsm::reader::SnapshotRegistry;
 use crate::storage::file_manager::FileManager;
@@ -151,6 +153,11 @@ pub struct Janitor {
     /// Drains all MemTables before the live scan. `None` only for fixtures
     /// that have no MemTables at all.
     flush_barrier: Option<FlushBarrier>,
+
+    /// Test-only pause point between opening the rebuilt readers and
+    /// installing them (spec general/028).
+    #[cfg(test)]
+    install_hook: Option<Arc<TestHook>>,
 }
 
 impl Janitor {
@@ -187,7 +194,16 @@ impl Janitor {
             storage_handle,
             janitor_runs,
             flush_barrier,
+            #[cfg(test)]
+            install_hook: None,
         }
+    }
+
+    /// Parks the next [`Self::reload_level_readers`] right before it installs
+    /// the rebuilt levels (spec general/028).
+    #[cfg(test)]
+    pub(crate) fn set_install_hook(&mut self, hook: Arc<TestHook>) {
+        self.install_hook = Some(hook);
     }
 
     // -----------------------------------------------------------------------
@@ -546,7 +562,12 @@ impl Janitor {
     }
 
     /// Reopens the rebuilt SSTables and swaps them into the level manager.
+    ///
+    /// Install before remove, no await in between — readers sample sources
+    /// without a version (spec general/028): every level keeps its old readers
+    /// until all new ones are open, then they change together.
     async fn reload_level_readers(&self, new_level_metas: &[Vec<SSTableMetadata>]) -> Result<()> {
+        let mut updates = Vec::with_capacity(new_level_metas.len());
         for (level_idx, new_metas) in new_level_metas.iter().enumerate() {
             let mut sstables = Vec::new();
             for meta in new_metas {
@@ -559,8 +580,15 @@ impl Janitor {
                     .await?,
                 ));
             }
-            self.level_manager.replace_level(level_idx, sstables);
+            updates.push((level_idx, sstables));
         }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.install_hook {
+            hook.pause().await;
+        }
+
+        self.level_manager.replace_levels(updates);
         Ok(())
     }
 

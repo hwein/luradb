@@ -124,14 +124,24 @@ impl LevelManager {
     ///
     /// This is useful during compaction when we want to atomically replace multiple SSTables.
     pub fn replace_level(&self, level: usize, sstables: Vec<Arc<SSTableReader>>) {
+        self.replace_levels(vec![(level, sstables)]);
+    }
+
+    /// Replaces several levels under a single write lock, so a reader sees
+    /// either all of them or none — a compaction whose inputs left one level
+    /// before its outputs entered the other would be a hole in the read path
+    /// (spec general/028).
+    pub fn replace_levels(&self, updates: Vec<(usize, Vec<Arc<SSTableReader>>)>) {
         let mut levels = self.levels.write();
 
-        // Ensure the levels vector is large enough
-        while levels.len() <= level {
-            levels.push(Vec::new());
-        }
+        for (level, sstables) in updates {
+            // Ensure the levels vector is large enough
+            while levels.len() <= level {
+                levels.push(Vec::new());
+            }
 
-        levels[level] = sstables;
+            levels[level] = sstables;
+        }
     }
 }
 

@@ -244,6 +244,36 @@ fn scan_sstable_for_prefix(
     Ok(false)
 }
 
+/// Test-only rendezvous for the install-window tests (spec general/028): the
+/// paused path signals `reached`, then waits for `release`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHook {
+    pub reached: Notify,
+    pub release: Notify,
+}
+
+#[cfg(test)]
+impl TestHook {
+    /// Signals arrival and parks until the test releases it.
+    pub async fn pause(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+}
+
+/// Test-only pause points inside the engine's install sequences (spec
+/// general/028) — set before the engine is shared, never in a release build.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    /// Parks `flush_memtable` between its claim and the SSTable write.
+    pub before_flush_write: Option<Arc<TestHook>>,
+    /// Parks `rebuild_levels_from_manifest` between opening the new readers
+    /// and installing them.
+    pub before_level_install: Option<Arc<TestHook>>,
+}
+
 /// LSM-Tree Storage Engine with MVCC and background maintenance.
 ///
 /// All long-lived background tasks (flush, compaction, Janitor GC) are spawned
@@ -254,6 +284,14 @@ pub struct LsmStorageEngine {
 
     /// Frozen MemTables waiting to be flushed to L0.
     immutable_memtables: Arc<RwLock<Vec<Arc<MemTable>>>>,
+
+    /// MemTables claimed by a flush in flight, oldest first — the handover
+    /// slot between [`Self::immutable_memtables`] and L0. A claimed MemTable
+    /// is installed in L0 before it leaves this slot and returns here on a
+    /// failed flush, so readers always find it in one of the three places
+    /// (spec general/028). Lock order is always `immutable_memtables` →
+    /// `flushing`.
+    flushing: RwLock<Vec<Arc<MemTable>>>,
 
     /// Hierarchical SSTable levels.
     level_manager: Arc<LevelManager>,
@@ -332,6 +370,9 @@ pub struct LsmStorageEngine {
     /// writer needs while it waits, and no write path drains while holding its
     /// own read guard.
     in_flight_writes: tokio::sync::RwLock<()>,
+
+    #[cfg(test)]
+    pub(crate) hooks: TestHooks,
 }
 
 impl LsmStorageEngine {
@@ -387,6 +428,7 @@ impl LsmStorageEngine {
         let engine = Self {
             memtable: Arc::new(RwLock::new(Arc::new(MemTable::new()))),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
+            flushing: RwLock::new(Vec::new()),
             level_manager,
             wal,
             vlog,
@@ -410,6 +452,8 @@ impl LsmStorageEngine {
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
             in_flight_writes: tokio::sync::RwLock::new(()),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         };
 
         // Spec kv/026 M3: a fresh HLC only reads the wall clock, so after a
@@ -672,13 +716,16 @@ impl LsmStorageEngine {
         // new MemTable. Everything below the guard is synchronous -- no await.
         {
             let _drain = self.in_flight_writes.write().await;
-            let frozen = {
-                let mut mt = self.memtable.write();
-                std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
-            };
-            if !frozen.is_empty() {
-                self.immutable_memtables.write().push(frozen);
+            // Both guards over the whole rotation, like every other one: with
+            // the active MemTable already swapped out and the frozen one not
+            // yet in `imm`, a reader on another thread would see neither
+            // (spec general/028).
+            let mut mt = self.memtable.write();
+            let mut imm = self.immutable_memtables.write();
+            if !mt.is_empty() {
+                imm.push(Arc::clone(&*mt));
             }
+            *mt = Arc::new(MemTable::new());
         }
         while !self.immutable_memtables.read().is_empty() {
             self.flush_memtable().await?;
@@ -690,10 +737,10 @@ impl LsmStorageEngine {
     /// MemTables and truncates the WAL. Idempotent: a second call finds no
     /// handles left to join and flushes/truncates an already-clean state.
     ///
-    /// A failed flush skips the truncate (spec kv/026 M1): `flush_memtable`
-    /// already removes a MemTable from `immutable_memtables` before its
-    /// fallible SSTable/manifest I/O, so once that I/O fails the WAL is the
-    /// only remaining copy of its data — truncating anyway would destroy it.
+    /// A failed flush skips the truncate (spec kv/026 M1): a failed
+    /// `flush_memtable` puts its MemTable back into `immutable_memtables`
+    /// (spec general/028), but nothing persisted its data, so the WAL is the
+    /// only durable copy of it — truncating anyway would destroy it.
     /// The next startup replays the WAL instead. The failure stays an
     /// `eprintln!`, not just `tracing::error!`: no tracing subscriber runs
     /// under `cargo test`, so this line is the only surviving evidence in a
@@ -725,6 +772,10 @@ impl LsmStorageEngine {
             eprintln!("[Engine] Shutdown flush error: {e}");
             return;
         }
+
+        // Background tasks are joined, so no flush is still in flight
+        // (spec general/028).
+        debug_assert!(self.flushing.read().is_empty());
 
         // All data is now in SSTables — WAL entries are redundant.
         // Clear it so the next startup finds an empty WAL and skips
@@ -773,8 +824,14 @@ impl LsmStorageEngine {
 
         let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
         {
+            // Both slots in one section, so a claim cannot fall between them
+            // (spec general/028). The reader walks this vector back to front,
+            // so the older flushes in flight go in front of `imm`.
             let imm = self.immutable_memtables.read();
-            reader.set_immutable_memtables(imm.clone());
+            let flushing = self.flushing.read();
+            let mut tables = flushing.clone();
+            tables.extend(imm.iter().cloned());
+            reader.set_immutable_memtables(tables);
         }
         reader.set_sstables(self.level_manager.get_all_levels());
         reader
@@ -834,7 +891,11 @@ impl LsmStorageEngine {
 
         let memtables = {
             let mut tables = vec![Arc::clone(&*self.memtable.read())];
-            tables.extend(self.immutable_memtables.read().iter().cloned());
+            // Both slots in one section (spec general/028).
+            let imm = self.immutable_memtables.read();
+            let flushing = self.flushing.read();
+            tables.extend(imm.iter().cloned());
+            tables.extend(flushing.iter().cloned());
             tables
         };
         for mt in &memtables {
@@ -1283,9 +1344,12 @@ impl LsmStorageEngine {
         scan_memtable_for_prefix(&memtable, prefix, now, limit, snapshot, &mut live, &mut decided);
 
         {
+            // Both slots in one section (spec general/028).
             let imm = self.immutable_memtables.read();
-            // Frozen MemTables are pushed to the back — iterate newest-first.
-            for mt in imm.iter().rev() {
+            let flushing = self.flushing.read();
+            // Frozen MemTables are pushed to the back — iterate newest-first,
+            // then the flushes in flight, which are older than all of them.
+            for mt in imm.iter().rev().chain(flushing.iter().rev()) {
                 scan_memtable_for_prefix(mt, prefix, now, limit, snapshot, &mut live, &mut decided);
             }
         }
@@ -1354,13 +1418,46 @@ impl LsmStorageEngine {
 
     /// Flushes the oldest immutable MemTable, returning the new SSTable's
     /// `file_id` (or `None` when there was nothing to flush).
+    ///
+    /// The claim removes the MemTable from `immutable_memtables` and puts it
+    /// into `flushing` in one lock section: the removal still keeps concurrent
+    /// callers from flushing it twice, while readers keep seeing it until its
+    /// SSTable is installed (spec general/028).
     pub async fn flush_memtable(&self) -> Result<Option<u64>> {
         let memtable_to_flush = {
             let mut imm = self.immutable_memtables.write();
             if imm.is_empty() { return Ok(None); }
-            imm.remove(0)
+            let mut flushing = self.flushing.write();
+            let claimed = imm.remove(0);
+            flushing.push(Arc::clone(&claimed));
+            claimed
         };
 
+        match self.write_memtable_to_l0(&memtable_to_flush).await {
+            Ok(file_id) => Ok(Some(file_id)),
+            Err(e) => {
+                self.abort_flush(&memtable_to_flush);
+                Err(e)
+            }
+        }
+    }
+
+    /// Returns a failed flush's MemTable to the head of `immutable_memtables`,
+    /// so the next call is its retry. A no-op once the SSTable was installed —
+    /// the flush slot no longer holds it then (spec general/028).
+    fn abort_flush(&self, memtable: &Arc<MemTable>) {
+        let mut imm = self.immutable_memtables.write();
+        let mut flushing = self.flushing.write();
+        let claimed = flushing.len();
+        flushing.retain(|m| !Arc::ptr_eq(m, memtable));
+        if flushing.len() < claimed {
+            imm.insert(0, Arc::clone(memtable));
+        }
+    }
+
+    /// Builds the SSTable of an already-claimed MemTable, installs it in L0 and
+    /// persists the manifest. Any error leaves the claim to [`Self::abort_flush`].
+    async fn write_memtable_to_l0(&self, memtable_to_flush: &Arc<MemTable>) -> Result<u64> {
         let mut builder = SSTableBuilder::new();
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
@@ -1428,6 +1525,11 @@ impl LsmStorageEngine {
         let file_size = sstable_data.len() as u64;
         let file_id = self.file_manager.allocate_file_id();
 
+        #[cfg(test)]
+        if let Some(hook) = &self.hooks.before_flush_write {
+            hook.pause().await;
+        }
+
         // With the storage thread active, route the SSTable write through it
         // (crash-safe temp + fsync + rename); it hands the bytes back so the
         // non-mmap reader below needs no extra copy.
@@ -1448,7 +1550,10 @@ impl LsmStorageEngine {
         };
         sstable.set_file_id(file_id);
         let sstable = Arc::new(sstable);
+        // Install before remove, no await in between — readers sample sources
+        // without a version (spec general/028).
         self.level_manager.add_sstable(0, Arc::clone(&sstable));
+        self.flushing.write().retain(|m| !Arc::ptr_eq(m, memtable_to_flush));
 
         {
             let mut manifest = self.manifest.write();
@@ -1468,7 +1573,7 @@ impl LsmStorageEngine {
         // Event trigger for the SHM snapshot publisher (spec perf/009 §4): a
         // stored permit means a flush that races the publisher is not missed.
         self.flush_notify.notify_one();
-        Ok(Some(file_id))
+        Ok(file_id)
     }
 
     // ── IoEngine registration (spec perf/004 scaffolding) ────────────────────
@@ -1646,12 +1751,23 @@ impl LsmStorageEngine {
     }
 
     /// Rebuilds `levels`' readers from the manifest (post manifest-swap).
+    ///
+    /// Install before remove, no await in between — readers sample sources
+    /// without a version (spec general/028): both levels keep their old
+    /// readers until every new one is open, then change together.
     async fn rebuild_levels_from_manifest(&self, levels: [usize; 2], use_mmap: bool) -> Result<()> {
+        let mut updates = Vec::with_capacity(levels.len());
         for lvl in levels {
             let metas = self.manifest.read().get_level(lvl).to_vec();
-            let sstables = self.open_sstable_readers(&metas, use_mmap).await?;
-            self.level_manager.replace_level(lvl, sstables);
+            updates.push((lvl, self.open_sstable_readers(&metas, use_mmap).await?));
         }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.hooks.before_level_install {
+            hook.pause().await;
+        }
+
+        self.level_manager.replace_levels(updates);
         Ok(())
     }
 
@@ -1699,7 +1815,12 @@ impl LsmStorageEngine {
     /// Returns the data needed for the `/health` heartbeat response.
     pub fn heartbeat_data(&self) -> EngineHeartbeatData {
         let mt_len = self.memtable.read().len() as u64;
-        let imm_len: u64 = self.immutable_memtables.read().iter().map(|m| m.len() as u64).sum();
+        // A flush in flight is still MemTable-resident (spec general/028).
+        let imm_len: u64 = {
+            let imm = self.immutable_memtables.read();
+            let flushing = self.flushing.read();
+            imm.iter().chain(flushing.iter()).map(|m| m.len() as u64).sum()
+        };
         let vlog_bytes = self.vlog.total_size();
         let l0_count = self.level_manager.get_level(0).len();
         EngineHeartbeatData {
@@ -1726,9 +1847,11 @@ impl LsmStorageEngine {
     pub fn stats(&self) -> EngineStats {
         let memtable = self.memtable.read();
         let imm = self.immutable_memtables.read();
+        let flushing = self.flushing.read();
         EngineStats {
             memtable_size: memtable.approximate_size(),
-            num_immutable_memtables: imm.len(),
+            // A flush in flight is still MemTable-resident (spec general/028).
+            num_immutable_memtables: imm.len() + flushing.len(),
             num_levels: self.level_manager.num_levels(),
             total_sstables: self.level_manager.total_sstables(),
         }
@@ -1965,10 +2088,10 @@ mod tests {
         assert!(engine.background_tasks.lock().is_empty());
     }
 
-    // Spec kv/026 M1: flush_memtable removes the MemTable from
-    // `immutable_memtables` before its fallible SSTable write, so once that
-    // write fails the WAL is the only remaining copy -- shutdown() must not
-    // truncate it in that case. The SSTable directory is split out from the
+    // Spec kv/026 M1: a failed SSTable write persists nothing (the MemTable
+    // goes back into `immutable_memtables`, spec general/028), so the WAL is
+    // the only durable copy -- shutdown() must not truncate it in that case.
+    // The SSTable directory is split out from the
     // WAL/manifest one so making it read-only fails only the flush, not the
     // truncate that would otherwise follow it.
     #[tokio::test]
@@ -3813,5 +3936,211 @@ mod tests {
             set_handle.await.unwrap();
             del_handle.await.unwrap();
         }
+    }
+
+    // ── Spec general/028: atomic install at flush and compaction ─────────────
+
+    /// Parks the next `flush_memtable` right before its SSTable write.
+    fn hook_flush_write(engine: &mut LsmStorageEngine) -> Arc<TestHook> {
+        let hook = Arc::new(TestHook::default());
+        engine.hooks.before_flush_write = Some(Arc::clone(&hook));
+        hook
+    }
+
+    // Spec general/028 test 1: a MemTable claimed by a flush in flight stays
+    // readable. Task B reads while the flush is parked between its claim and
+    // the SSTable write -- before the fix the MemTable was in neither
+    // `immutable_memtables` nor L0, so every key read as absent.
+    #[tokio::test]
+    async fn test_reads_see_flushing_memtable_during_the_install_window() {
+        let (mut engine, _dir) = make_engine().await;
+        let hook = hook_flush_write(&mut engine);
+        let engine = Arc::new(engine);
+
+        for i in 0..1000u32 {
+            engine.put(format!("k{i:04}").as_bytes(), b"v").await.unwrap();
+        }
+        engine.freeze_active_memtable();
+
+        let flusher = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        hook.reached.notified().await;
+        assert!(engine.immutable_memtables.read().is_empty(), "the claim removed it");
+        assert_eq!(engine.flushing.read().len(), 1, "the claim parked it in the slot");
+
+        for i in 0..1000u32 {
+            assert_eq!(
+                engine.get(format!("k{i:04}").as_bytes()).await.unwrap(),
+                Some(b"v".to_vec()),
+                "k{i:04} must stay readable while its MemTable is being flushed"
+            );
+        }
+        assert_eq!(engine.scan_keys(b"k").await.unwrap().len(), 1000);
+
+        hook.release.notify_one();
+        let file_id = flusher.await.unwrap().unwrap();
+        assert!(file_id.is_some(), "the flush must have produced an SSTable");
+
+        assert!(engine.flushing.read().is_empty());
+        assert!(engine.immutable_memtables.read().is_empty());
+        assert_eq!(engine.level_manager.get_level(0).len(), 1);
+        assert_eq!(engine.get(b"k0000").await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(engine.scan_keys(b"k").await.unwrap().len(), 1000);
+    }
+
+    // Spec general/028 test 2: a failed flush hands its MemTable back to
+    // `immutable_memtables` and leaves the flush slot empty, so the next call
+    // is its retry -- the keys stay readable throughout and end up in exactly
+    // one L0 file. The fault is a read-only SSTable directory (same lever as
+    // the kv/026 M1 test above), which fails the write before the install.
+    #[tokio::test]
+    async fn test_failed_flush_returns_its_memtable_for_the_retry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sstable_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&sstable_dir).unwrap();
+        let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        engine.put(b"a", b"1").await.unwrap();
+        engine.put(b"b", b"2").await.unwrap();
+        engine.freeze_active_memtable();
+
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(engine.flush_memtable().await.is_err(), "the SSTable write must fail");
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(engine.flushing.read().is_empty(), "a failed flush claims nothing");
+        assert_eq!(engine.immutable_memtables.read().len(), 1, "its MemTable is back");
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+
+        assert!(engine.flush_memtable().await.unwrap().is_some(), "the retry succeeds");
+        assert_eq!(engine.level_manager.get_level(0).len(), 1, "exactly one L0 file");
+        assert!(engine.immutable_memtables.read().is_empty());
+        assert!(engine.flushing.read().is_empty());
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+    }
+
+    // Spec general/028 test 3: the claim stays exclusive -- while one flush is
+    // parked, a second call finds nothing to flush, and only one L0 file results.
+    #[tokio::test]
+    async fn test_concurrent_flush_calls_claim_the_memtable_once() {
+        let (mut engine, _dir) = make_engine().await;
+        let hook = hook_flush_write(&mut engine);
+        let engine = Arc::new(engine);
+
+        engine.put(b"a", b"1").await.unwrap();
+        engine.freeze_active_memtable();
+
+        let flusher = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        hook.reached.notified().await;
+
+        assert!(
+            engine.flush_memtable().await.unwrap().is_none(),
+            "the second call must find the MemTable already claimed"
+        );
+
+        hook.release.notify_one();
+        assert!(flusher.await.unwrap().unwrap().is_some());
+        assert_eq!(engine.level_manager.get_level(0).len(), 1, "exactly one L0 file");
+        assert!(engine.flushing.read().is_empty());
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+    }
+
+    // Spec general/028 test 4: a compaction installs both levels at once. Task
+    // B reads while the compaction is parked after opening its new readers --
+    // before the fix the source level was already emptied while the target
+    // level still carried the old versions, so `a` and `b` read as `old`.
+    #[tokio::test]
+    async fn test_reads_see_newest_versions_while_a_compaction_installs() {
+        let (mut engine, _dir) = make_engine().await;
+
+        // L1 keeps the old versions, L0 two files with the newer ones.
+        engine.put(b"a", b"old").await.unwrap();
+        engine.put(b"b", b"old").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap();
+        assert_eq!(engine.level_manager.get_level(1).len(), 1);
+        engine.put(b"a", b"new").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.put(b"b", b"new").await.unwrap();
+        freeze_and_flush(&engine).await;
+        assert_eq!(engine.level_manager.get_level(0).len(), 2);
+
+        // Armed only now: the setup compaction above must not park.
+        let hook = Arc::new(TestHook::default());
+        engine.hooks.before_level_install = Some(Arc::clone(&hook));
+        let engine = Arc::new(engine);
+
+        let compactor = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.compact_level(0).await })
+        };
+        hook.reached.notified().await;
+
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"new".to_vec()));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"new".to_vec()));
+        assert_eq!(
+            engine.scan_keys(b"").await.unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "no key may disappear while the compaction installs"
+        );
+
+        hook.release.notify_one();
+        compactor.await.unwrap().unwrap();
+
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"new".to_vec()));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"new".to_vec()));
+        assert!(engine.level_manager.get_level(0).is_empty());
+        assert_readers_match_manifest(&engine);
+    }
+
+    // Spec general/028 test 5: the Janitor installs every rebuilt level at
+    // once. Task B reads across both levels while the GC is parked after
+    // opening its new readers -- level by level, a reader could otherwise
+    // catch a mix of rebuilt and retired ones.
+    #[tokio::test]
+    async fn test_reads_see_every_key_while_the_janitor_installs() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+
+        engine.put(b"a", &big).await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap(); // "a" moves down to L1
+        engine.put(b"b", &big).await.unwrap();
+        freeze_and_flush(&engine).await;
+        assert_eq!(engine.level_manager.get_level(0).len(), 1);
+        assert_eq!(engine.level_manager.get_level(1).len(), 1);
+
+        let hook = Arc::new(TestHook::default());
+        let mut janitor = engine.build_janitor(gc_always());
+        janitor.set_install_hook(Arc::clone(&hook));
+        let janitor = Arc::new(janitor);
+
+        let gc = {
+            let janitor = Arc::clone(&janitor);
+            tokio::spawn(async move { janitor.run_gc().await })
+        };
+        hook.reached.notified().await;
+
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(big.clone()));
+        assert_eq!(
+            engine.scan_keys(b"").await.unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "no key may disappear while the GC installs its rebuilt levels"
+        );
+
+        hook.release.notify_one();
+        assert!(gc.await.unwrap().unwrap().ran);
+
+        assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
+        assert_eq!(engine.get(b"b").await.unwrap(), Some(big));
+        assert_readers_match_manifest(&engine);
     }
 }

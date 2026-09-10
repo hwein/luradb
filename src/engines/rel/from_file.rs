@@ -12,8 +12,10 @@ use super::dml::{coerce_json, RowPlan};
 use super::error::RelStoreError;
 use super::types::{ColumnType, ScalarValue};
 use super::RelEngine;
+use crate::core::coop::{self, YieldEvery};
 use crate::engines::lsm::engine::BatchOp;
 use crate::metrics::EngineKind;
+use bytes::Bytes;
 use csv::{ReaderBuilder, StringRecord};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +23,9 @@ use std::collections::{HashMap, HashSet};
 /// Rows staged per `write_batch` group (spec §5), mirroring the DDL backfill
 /// chunk size (`ddl.rs`'s `BACKFILL_CHUNK`) rather than a new config knob.
 const IMPORT_BATCH_SIZE: usize = 500;
+
+/// Rows staged between two yields (spec perf/017 A2).
+const IMPORT_ROW_YIELD_INTERVAL: u32 = 64;
 
 /// Server-side file formats (spec §2 decision 2 -- no Excel/ODS/Sheets here).
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +89,9 @@ impl RelEngine {
     /// Creates a table from an uploaded CSV/TSV file and imports its rows
     /// (spec rel/019 §1-§5). `pk` is the caller's raw query value, if any;
     /// matched against the normalized column names case-insensitively.
+    /// Parsing, header normalization and Pass-1 inference are pure CPU work
+    /// and run on the blocking pool (spec perf/017 A4), which is why the body
+    /// arrives owned; the insert pass below stays on the engine thread.
     pub async fn create_table_from_file(
         &self,
         domain: &str,
@@ -91,52 +99,15 @@ impl RelEngine {
         format: FileFormat,
         header: bool,
         pk: Option<&str>,
-        body: &[u8],
+        body: Bytes,
     ) -> Result<CreateFromFileResult, RelStoreError> {
-        let (raw_headers, data_records) = read_records(format, header, body)?;
-        let column_count = raw_headers.len();
-        // Cap first: normalization and inference below are per-column work, so
-        // a header far past the limit must be rejected before paying for it —
-        // `create_table` would reject the schema anyway (spec §1/§3).
         let max_columns = self.catalog.max_columns();
-        if column_count > max_columns {
-            return Err(RelStoreError::LimitExceeded {
-                which: "max_columns".to_string(),
-                max: max_columns,
-            });
-        }
-        let names = normalize_headers(&raw_headers);
         let pk = pk.map(|s| s.to_ascii_lowercase());
-
-        // `_row` reservation (spec §3): only allowed as a file column when it
-        // is itself the chosen PK.
-        if let Some(pos) = names.iter().position(|n| n == "_row") {
-            if pk.as_deref() != Some("_row") {
-                return Err(RelStoreError::InvalidSchema(format!(
-                    "column '{}' normalizes to the reserved name '_row' \
-                     (use ?pk=_row to make it the primary key)",
-                    raw_headers[pos].as_deref().unwrap_or("_row")
-                )));
-            }
-        }
-        if let Some(pk_name) = &pk {
-            if !names.iter().any(|n| n == pk_name) {
-                return Err(RelStoreError::InvalidSchema(format!("pk column '{pk_name}' not found")));
-            }
-        }
-
-        // Pass 1 (spec §5.1): narrowest type per column over every non-empty
-        // value of the fully-buffered file.
-        let col_types: Vec<ColumnType> = (0..column_count)
-            .map(|i| {
-                let values = data_records
-                    .iter()
-                    .filter_map(|r| r.as_ref().ok())
-                    .filter_map(move |r| r.get(i))
-                    .filter(|v| !v.is_empty());
-                infer_column_type(values)
-            })
-            .collect();
+        let owned_pk = pk.clone();
+        let ParsedFile { raw_headers, data_records, names, col_types } =
+            coop::offload(move || parse_file(format, header, &body, owned_pk.as_deref(), max_columns))
+                .await?;
+        let column_count = raw_headers.len();
 
         // Column plan, in the table's final column order (spec §4): a
         // synthetic `_row` PK when none was requested, else the CSV columns
@@ -185,6 +156,7 @@ impl RelEngine {
         let mut seen_unique: HashSet<(u32, Vec<u8>)> = HashSet::new();
 
         let write_start = std::time::Instant::now();
+        let mut coop = YieldEvery::new(IMPORT_ROW_YIELD_INTERVAL);
         let mut start = 0usize;
         while start < data_records.len() {
             let end = (start + IMPORT_BATCH_SIZE).min(data_records.len());
@@ -195,6 +167,7 @@ impl RelEngine {
             let mut ops: Vec<BatchOp> = Vec::new();
 
             for (offset, record_result) in data_records[start..end].iter().enumerate() {
+                coop.tick().await;
                 let row_number = (start + offset + 1) as u64;
                 let record = match record_result {
                     Ok(r) => r,
@@ -260,6 +233,73 @@ impl RelEngine {
         let failed = errors.len() as u64;
         Ok(CreateFromFileResult { table: schema.name.clone(), columns, imported, failed, errors })
     }
+}
+
+/// Everything [`RelEngine::create_table_from_file`] derives from the file
+/// alone — the result of the offloaded parse pass.
+struct ParsedFile {
+    raw_headers: Vec<Option<String>>,
+    data_records: Vec<Result<StringRecord, csv::Error>>,
+    /// Normalized column names, one per file column.
+    names: Vec<String>,
+    /// Pass-1 inferred type, one per file column.
+    col_types: Vec<ColumnType>,
+}
+
+/// The whole file-derived half of the import (spec perf/017 A4): read, column
+/// cap, header normalization, `_row`/PK checks and Pass-1 inference. Pure —
+/// it touches no engine state, so it runs on the blocking pool.
+fn parse_file(
+    format: FileFormat,
+    header: bool,
+    body: &[u8],
+    pk: Option<&str>,
+    max_columns: usize,
+) -> Result<ParsedFile, RelStoreError> {
+    let (raw_headers, data_records) = read_records(format, header, body)?;
+    let column_count = raw_headers.len();
+    // Cap first: normalization and inference below are per-column work, so
+    // a header far past the limit must be rejected before paying for it —
+    // `create_table` would reject the schema anyway (spec §1/§3).
+    if column_count > max_columns {
+        return Err(RelStoreError::LimitExceeded {
+            which: "max_columns".to_string(),
+            max: max_columns,
+        });
+    }
+    let names = normalize_headers(&raw_headers);
+
+    // `_row` reservation (spec §3): only allowed as a file column when it
+    // is itself the chosen PK.
+    if let Some(pos) = names.iter().position(|n| n == "_row") {
+        if pk != Some("_row") {
+            return Err(RelStoreError::InvalidSchema(format!(
+                "column '{}' normalizes to the reserved name '_row' \
+                 (use ?pk=_row to make it the primary key)",
+                raw_headers[pos].as_deref().unwrap_or("_row")
+            )));
+        }
+    }
+    if let Some(pk_name) = pk {
+        if !names.iter().any(|n| n == pk_name) {
+            return Err(RelStoreError::InvalidSchema(format!("pk column '{pk_name}' not found")));
+        }
+    }
+
+    // Pass 1 (spec §5.1): narrowest type per column over every non-empty
+    // value of the fully-buffered file.
+    let col_types: Vec<ColumnType> = (0..column_count)
+        .map(|i| {
+            let values = data_records
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .filter_map(move |r| r.get(i))
+                .filter(|v| !v.is_empty());
+            infer_column_type(values)
+        })
+        .collect();
+
+    Ok(ParsedFile { raw_headers, data_records, names, col_types })
 }
 
 /// Reads the file into `(raw_headers, data_records)` (spec §2/§3): with
@@ -423,6 +463,114 @@ mod tests {
     use crate::metrics::{MetricsConfig, MetricsStore};
     use std::sync::Arc;
 
+    /// A CSV body with `rows` data rows over `id,label` (spec perf/017 tests).
+    fn wide_csv(rows: usize) -> Bytes {
+        let mut csv = String::from("id,label\n");
+        for i in 0..rows {
+            csv.push_str(&format!("{i},row{i}\n"));
+        }
+        Bytes::from(csv)
+    }
+
+    // Spec perf/017 test 6 (unindexed SELECT vs PK point): the scanning
+    // statement hands the thread back, so the point read spawned after it
+    // answers first.
+    #[tokio::test]
+    async fn test_unindexed_select_interleaves_with_pk_point_select() {
+        let (rel, _d) = make_engine_with(RelStoreConfig::default()).await;
+        rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, wide_csv(20_000))
+            .await
+            .unwrap();
+
+        let scanner = Arc::clone(&rel);
+        let reader = Arc::clone(&rel);
+        let order = crate::core::coop::completion_order(
+            async move {
+                // Unindexed residual matching nothing: every one of the
+                // 20 000 candidate rows is fetched and filtered out.
+                let out = scanner.execute("default", "SELECT * FROM t WHERE label = 'none'", &[]).await;
+                match out.unwrap() {
+                    ExecOutcome::Select(r) => assert!(r.rows.is_empty()),
+                    o => panic!("expected SELECT, got {o:?}"),
+                }
+            },
+            async move {
+                let out = reader.execute("default", "SELECT * FROM t WHERE _row = 5", &[]).await;
+                match out.unwrap() {
+                    ExecOutcome::Select(r) => assert_eq!(r.rows.len(), 1),
+                    o => panic!("expected SELECT, got {o:?}"),
+                }
+            },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
+    }
+
+    // Spec perf/017 test 6 (import vs SELECT on another table of the same
+    // domain): the import hands the thread back between its row batches.
+    #[tokio::test]
+    async fn test_import_interleaves_with_select_on_another_table() {
+        let (rel, _d) = make_engine_with(RelStoreConfig::default()).await;
+        rel.execute("default", "CREATE TABLE other (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+        rel.execute("default", "INSERT INTO other VALUES (1)", &[]).await.unwrap();
+
+        let importer = Arc::clone(&rel);
+        let reader = Arc::clone(&rel);
+        let order = crate::core::coop::completion_order(
+            async move {
+                let result = importer
+                    .create_table_from_file("default", "t", FileFormat::Csv, true, None, wide_csv(10_000))
+                    .await
+                    .unwrap();
+                assert_eq!(result.imported, 10_000);
+                assert_eq!(result.failed, 0);
+            },
+            async move {
+                let out = reader.execute("default", "SELECT * FROM other WHERE id = 1", &[]).await;
+                match out.unwrap() {
+                    ExecOutcome::Select(r) => assert_eq!(r.rows.len(), 1),
+                    o => panic!("expected SELECT, got {o:?}"),
+                }
+            },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
+    }
+
+    // Spec perf/017 test 6 (unindexed UPDATE vs PK point SELECT): the
+    // candidate scan hands the thread back. The UPDATE matches nothing, so
+    // it never reaches a commit that would suspend on its own.
+    #[tokio::test]
+    async fn test_unindexed_update_interleaves_with_pk_point_select() {
+        let (rel, _d) = make_engine_with(RelStoreConfig::default()).await;
+        rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, wide_csv(20_000))
+            .await
+            .unwrap();
+
+        let updater = Arc::clone(&rel);
+        let reader = Arc::clone(&rel);
+        let order = crate::core::coop::completion_order(
+            async move {
+                let out = updater
+                    .execute("default", "UPDATE t SET label = 'x' WHERE label = 'none'", &[])
+                    .await;
+                match out.unwrap() {
+                    ExecOutcome::Dml(r) => assert_eq!(r.affected, 0),
+                    o => panic!("expected DML, got {o:?}"),
+                }
+            },
+            async move {
+                let out = reader.execute("default", "SELECT * FROM t WHERE _row = 5", &[]).await;
+                match out.unwrap() {
+                    ExecOutcome::Select(r) => assert_eq!(r.rows.len(), 1),
+                    o => panic!("expected SELECT, got {o:?}"),
+                }
+            },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
+    }
+
     async fn make_engine_with(overrides: RelStoreConfig) -> (Arc<RelEngine>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let config = RelStoreConfig {
@@ -457,7 +605,7 @@ mod tests {
                    1,42,true,2024-01-01T00:00:00Z,alpha\n\
                    2,7.5,false,2024-02-01T00:00:00Z,beta\n";
         let result = rel
-            .create_table_from_file("default", "sales", FileFormat::Csv, true, None, csv.as_bytes())
+            .create_table_from_file("default", "sales", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes()))
             .await
             .unwrap();
         assert_eq!(result.table, "sales");
@@ -496,7 +644,7 @@ mod tests {
         let (rel, _dir) = make_engine().await;
         let tsv = "id\tamount\n1\t10\n2\t20\n";
         let result =
-            rel.create_table_from_file("default", "t", FileFormat::Tsv, true, None, tsv.as_bytes()).await.unwrap();
+            rel.create_table_from_file("default", "t", FileFormat::Tsv, true, None, Bytes::copy_from_slice(tsv.as_bytes())).await.unwrap();
         assert_eq!(result.imported, 2);
         assert_eq!(result.columns.iter().find(|c| c.name == "amount").unwrap().col_type, ColumnType::Integer);
         let (_, rows) = select_all(&rel, "SELECT id, amount FROM t ORDER BY id").await;
@@ -510,7 +658,7 @@ mod tests {
         let (rel, _dir) = make_engine().await;
         let csv = "1,alpha\n2,beta\n";
         let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, false, None, csv.as_bytes()).await.unwrap();
+            rel.create_table_from_file("default", "t", FileFormat::Csv, false, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
         let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["_row", "col_1", "col_2"]);
         assert!(result.columns.iter().all(|c| c.source_header.is_none()));
@@ -525,7 +673,7 @@ mod tests {
         let long = "a".repeat(60);
         let csv = format!("Revenue (EUR),revenue (eur),{long}\n1,2,3\n");
         let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
+            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
         // columns[0] is the synthetic _row; the three CSV columns follow in order.
         assert_eq!(result.columns[1].name, "revenue__eur_");
         assert_eq!(result.columns[1].source_header.as_deref(), Some("Revenue (EUR)"));
@@ -540,7 +688,7 @@ mod tests {
         let (rel, _dir) = make_engine().await;
         let csv = "mixed,real_col,gap\n1,1,x\n2,2.5,\nx,,\n";
         let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
+            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
         let ty = |name: &str| result.columns.iter().find(|c| c.name == name).unwrap().col_type;
         assert_eq!(ty("mixed"), ColumnType::Text, "a non-numeric value forces TEXT");
         assert_eq!(ty("real_col"), ColumnType::Real, "an int and a real value together -> REAL");
@@ -558,7 +706,7 @@ mod tests {
         let (rel, _dir) = make_engine().await;
         let csv = "id,name\n1,alpha\n2,beta\n2,gamma\n";
         let result = rel
-            .create_table_from_file("default", "t", FileFormat::Csv, true, Some("id"), csv.as_bytes())
+            .create_table_from_file("default", "t", FileFormat::Csv, true, Some("id"), Bytes::copy_from_slice(csv.as_bytes()))
             .await
             .unwrap();
         assert!(!result.columns.iter().any(|c| c.name == "_row"), "no synthetic _row when ?pk= is set");
@@ -579,7 +727,7 @@ mod tests {
         let (rel, _dir) = make_engine_with(RelStoreConfig { max_text_len: 4, ..RelStoreConfig::default() }).await;
         let csv = "id,label\n1,ok\n2,a,extra\n3,toolong\n4,fine\n";
         let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
+            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
         assert_eq!(result.imported, 2, "rows 1 and 4 succeed");
         assert_eq!(result.failed, 2);
         let rows: Vec<u64> = result.errors.iter().map(|e| e.row).collect();
@@ -599,7 +747,7 @@ mod tests {
         body.push(0xFF); // a lone byte that is not valid UTF-8 on its own
         body.extend_from_slice(b"\n3,fine\n");
 
-        let result = rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, &body).await.unwrap();
+        let result = rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::from(body)).await.unwrap();
         assert_eq!(result.imported, 2, "rows 1 and 3 succeed");
         assert_eq!(result.failed, 1);
         assert_eq!(result.errors[0].row, 2);
@@ -613,7 +761,7 @@ mod tests {
         let (rel, _dir) = make_engine().await;
         let csv = "id,label\n1,cl\u{e9}\n2,\u{1F600}\n";
         let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
+            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
         assert_eq!(result.imported, 2);
         assert_eq!(result.columns.iter().find(|c| c.name == "label").unwrap().col_type, ColumnType::Text);
 
@@ -635,7 +783,7 @@ mod tests {
         let csv = format!("{header}\n{row}\n");
 
         let err = rel
-            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, csv.as_bytes())
+            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes()))
             .await
             .unwrap_err();
         assert!(matches!(err, RelStoreError::LimitExceeded { ref which, .. } if which == "max_columns"), "got: {err}");
@@ -666,25 +814,25 @@ mod tests {
         let (rel, _dir) = make_engine().await;
         rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
         let err = rel
-            .create_table_from_file("default", "t", FileFormat::Csv, true, None, b"a,b\n1,2\n")
+            .create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::from_static(b"a,b\n1,2\n"))
             .await
             .unwrap_err();
         assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
 
-        let err = rel.create_table_from_file("default", "empty", FileFormat::Csv, true, None, b"").await.unwrap_err();
+        let err = rel.create_table_from_file("default", "empty", FileFormat::Csv, true, None, Bytes::from_static(b"")).await.unwrap_err();
         assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
         assert!(rel.get_object("default", "empty").is_err(), "no table created");
 
         let (rel2, _dir2) = make_engine_with(RelStoreConfig { max_columns: 2, ..RelStoreConfig::default() }).await;
         let err = rel2
-            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, b"a,b,c\n1,2,3\n")
+            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, Bytes::from_static(b"a,b,c\n1,2,3\n"))
             .await
             .unwrap_err();
         assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "got: {err}");
         assert!(rel2.get_object("default", "wide").is_err(), "no table created");
 
         let err = rel
-            .create_table_from_file("default", "u", FileFormat::Csv, true, Some("ghost"), b"a,b\n1,2\n")
+            .create_table_from_file("default", "u", FileFormat::Csv, true, Some("ghost"), Bytes::from_static(b"a,b\n1,2\n"))
             .await
             .unwrap_err();
         assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
@@ -698,14 +846,14 @@ mod tests {
     async fn test_row_header_conflict_without_pk_row() {
         let (rel, _dir) = make_engine().await;
         let err = rel
-            .create_table_from_file("default", "t", FileFormat::Csv, true, None, b"_row,name\n1,a\n")
+            .create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::from_static(b"_row,name\n1,a\n"))
             .await
             .unwrap_err();
         assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
         assert!(rel.get_object("default", "t").is_err());
 
         let result = rel
-            .create_table_from_file("default", "t2", FileFormat::Csv, true, Some("_row"), b"_row,name\n5,a\n")
+            .create_table_from_file("default", "t2", FileFormat::Csv, true, Some("_row"), Bytes::from_static(b"_row,name\n5,a\n"))
             .await
             .unwrap();
         assert_eq!(result.columns.len(), 2);

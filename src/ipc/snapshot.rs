@@ -8,6 +8,7 @@
 //! values the entry carries only a `is_vlog_pointer` flag and the client falls
 //! back to a command-ring GET.
 
+use crate::core::coop::{self, YieldEvery};
 use crate::engines::lsm::{Domain, DomainRegistry, LsmStorageEngine, RegistrySnapshot, ValueWithMetadata};
 use anyhow::Result;
 use rkyv::util::AlignedVec;
@@ -26,6 +27,9 @@ const PER_ENTRY_OVERHEAD: usize = 64;
 /// Warn on every N-th consecutive skipped publish (spec perf/012 §9) — about
 /// once a second at the default interval.
 const SKIP_WARN_EVERY: u32 = 10;
+
+/// Entries collected between two yields (spec perf/017 A2).
+const ENTRY_YIELD_INTERVAL: u32 = 1024;
 
 // ── SHM snapshot format (spec §1) ──────────────────────────────────────────────
 
@@ -136,7 +140,9 @@ impl SnapshotBuilder {
         }
 
         let snapshot = ShmSnapshot { version: ts, timestamp: ts, domains: domain_indices };
-        Ok(serialize_snapshot(&snapshot))
+        // rkyv serialization is pure CPU work over an owned value — it runs
+        // on the blocking pool (spec perf/017 A4).
+        Ok(coop::offload(move || serialize_snapshot(&snapshot)).await)
     }
 
     /// Collects one domain's entries against the shared byte budget, stopping at
@@ -154,7 +160,9 @@ impl SnapshotBuilder {
         let raw_keys = self.engine.scan_keys(&domain.system_prefix).await?;
         let mut entries = Vec::new();
         let mut truncated = false;
+        let mut coop = YieldEvery::new(ENTRY_YIELD_INTERVAL);
         for raw_key in raw_keys {
+            coop.tick().await;
             let meta = match self.engine.get_with_metadata(&raw_key, snap.snapshot()).await? {
                 Some(m) => m,
                 None => continue, // vanished or expired between scan and read
@@ -369,6 +377,40 @@ mod tests {
 
     fn find<'a>(snap: &'a ShmSnapshot, name: &str) -> Option<&'a ShmDomainIndex> {
         snap.domains.iter().find(|d| d.name == name)
+    }
+
+    // Spec perf/017 test 7: a 20 000-key snapshot build hands the thread
+    // back, so a point `get` spawned after it answers first.
+    #[tokio::test]
+    async fn test_snapshot_build_interleaves_with_get() {
+        use crate::engines::lsm::engine::BatchOp;
+        use crate::engines::StorageEngine;
+
+        let (engine, registry, _dir) = make_setup().await;
+        let domain = registry.create_domain("shm").await.unwrap();
+        let ops: Vec<BatchOp> = (0..20_000u32)
+            .map(|i| BatchOp::Put {
+                key: [domain.system_prefix.as_slice(), format!("k:{i:05}").as_bytes()].concat(),
+                value: b"v".to_vec(),
+            })
+            .collect();
+        engine.write_batch(ops).await.unwrap();
+
+        let builder = builder(&registry, &engine, 32 * 1024 * 1024);
+        let reader = Arc::clone(&engine);
+        let probe_key = [domain.system_prefix.as_slice(), b"k:00001".as_slice()].concat();
+        let order = crate::core::coop::completion_order(
+            async move {
+                let bytes = builder.build().await.unwrap();
+                let snapshot = decode(bytes.as_slice());
+                assert_eq!(find(&snapshot, "shm").unwrap().entries.len(), 20_000);
+            },
+            async move {
+                assert!(reader.get(&probe_key).await.unwrap().is_some());
+            },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
     }
 
     // 1. ShmSnapshot serialize/deserialize roundtrip.

@@ -6,6 +6,7 @@ use crate::{
     config::{resolve_config_path, LuraConfig},
     core::{
         buffer_pool::BufferPoolManager,
+        coop,
         disk_manager::DiskManager,
         io_engine::{IoEngine, VLOG_LOGICAL_ID, WAL_LOGICAL_ID},
         storage_thread::{StorageHandle, StorageThread, StorageThreadConfig},
@@ -680,6 +681,7 @@ fn main() -> anyhow::Result<()> {
                 config.server.bind_address
             );
         }
+        coop::init(config.multicore.cpu_offload_threads);
 
         let (engine_config, compaction_config, janitor_config, domain_config, metrics) =
             build_engine_configs(&config);

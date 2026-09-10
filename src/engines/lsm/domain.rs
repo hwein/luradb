@@ -11,6 +11,7 @@
 //!
 //! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
 
+use crate::core::coop::YieldEvery;
 use crate::core::events::{GlobalEventBus, Resume};
 use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
@@ -31,6 +32,35 @@ use tokio::time::{sleep, Duration};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const SYS_DOMAIN_PREFIX: &[u8] = b"__sys:domain:";
+
+/// Keys one post-scan loop processes between two yields (spec perf/017 A2).
+const KEY_LOOP_YIELD_INTERVAL: u32 = 4096;
+
+/// Strips the domain's system prefix off every scanned key.
+async fn strip_domain_prefix(raw_keys: Vec<Vec<u8>>, prefix_len: usize) -> Vec<Vec<u8>> {
+    let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+    let mut out = Vec::with_capacity(raw_keys.len());
+    for key in raw_keys {
+        coop.tick().await;
+        out.push(key[prefix_len..].to_vec());
+    }
+    out
+}
+
+/// Keeps the user-keys containing `needle` (case-sensitive, spec kv/023). A
+/// non-UTF-8 key would be an invariant break (general/007 guarantees UTF-8
+/// keys) — skip it rather than fail the request.
+async fn filter_contains(keys: Vec<Vec<u8>>, needle: &str) -> Vec<Vec<u8>> {
+    let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+    let mut out = Vec::new();
+    for key in keys {
+        coop.tick().await;
+        if std::str::from_utf8(&key).is_ok_and(|s| s.contains(needle)) {
+            out.push(key);
+        }
+    }
+    out
+}
 
 // ── DomainConfig ──────────────────────────────────────────────────────────────
 
@@ -580,8 +610,7 @@ impl DomainStore {
         }
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys(&full_prefix).await?;
-        let prefix_len = self.domain.system_prefix.len();
-        Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
+        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len()).await)
     }
 
     /// Returns one page of live user-keys whose raw form starts with
@@ -604,16 +633,9 @@ impl DomainStore {
         }
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys(&full_prefix).await?;
-        let prefix_len = self.domain.system_prefix.len();
-        let matched: Vec<Vec<u8>> = raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect();
-        let matched: Vec<Vec<u8>> = match contains {
-            // A non-UTF-8 key would be an invariant break (general/007
-            // guarantees UTF-8 keys) — skip it rather than fail the request
-            // (same rule as delete_by_prefix).
-            Some(needle) => matched
-                .into_iter()
-                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
-                .collect(),
+        let matched = strip_domain_prefix(raw_keys, self.domain.system_prefix.len()).await;
+        let matched = match contains {
+            Some(needle) => filter_contains(matched, needle).await,
             None => matched,
         };
         let total = matched.len() as u64;
@@ -648,14 +670,8 @@ impl DomainStore {
         }
 
         let matched = self.scan_keys(prefix).await?;
-        let matched: Vec<Vec<u8>> = match contains {
-            // A non-UTF-8 key would be an invariant break (general/007
-            // guarantees UTF-8 keys) — skip it from the filtered match set
-            // rather than fail the whole request.
-            Some(needle) => matched
-                .into_iter()
-                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
-                .collect(),
+        let matched = match contains {
+            Some(needle) => filter_contains(matched, needle).await,
             None => matched,
         };
 
@@ -666,8 +682,12 @@ impl DomainStore {
             self.max_bulk_delete_keys
         );
 
-        let ops: Vec<BatchOp> =
-            matched.iter().map(|k| BatchOp::Delete { key: self.prefixed_key(k) }).collect();
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(matched.len());
+        for k in &matched {
+            coop.tick().await;
+            ops.push(BatchOp::Delete { key: self.prefixed_key(k) });
+        }
         let start = std::time::Instant::now();
         self.engine.write_batch(ops).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
@@ -734,8 +754,7 @@ impl DomainStore {
     pub async fn scan_keys_with_snapshot(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys_with_snapshot(&full_prefix, snapshot).await?;
-        let prefix_len = self.domain.system_prefix.len();
-        Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
+        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len()).await)
     }
 
     /// Subscribes to write events for this domain (domain prefix already
@@ -1607,5 +1626,38 @@ mod tests {
         assert_eq!(store2.get(b"p:2").await.unwrap(), GetResult::Absent);
         assert_eq!(store2.get(b"p:3").await.unwrap(), GetResult::Absent);
         assert_eq!(store2.get(b"other").await.unwrap(), GetResult::Present(b"vx".to_vec()));
+    }
+
+    // Spec perf/017 test 4: a 20 000-key `scan_keys_page` with a `contains`
+    // filter hands the thread back, so a point `get` spawned after it
+    // answers first.
+    #[tokio::test]
+    async fn test_scan_keys_page_interleaves_with_get() {
+        let (engine, registry, _dir) = make_setup().await;
+        let domain = registry.create_domain("paged").await.unwrap();
+        let ops: Vec<BatchOp> = (0..20_000u32)
+            .map(|i| BatchOp::Put {
+                key: [domain.system_prefix.as_slice(), format!("k:{i:05}").as_bytes()].concat(),
+                value: b"v".to_vec(),
+            })
+            .collect();
+        engine.write_batch(ops).await.unwrap();
+
+        let scanner = registry.store("paged").await.unwrap();
+        let reader = registry.store("paged").await.unwrap();
+        let order = crate::core::coop::completion_order(
+            async move {
+                let (page, total) = scanner.scan_keys_page(b"k:", Some("1"), 0, 10).await.unwrap();
+                assert_eq!(page.len(), 10);
+                // 20 000 minus the 9^4 five-digit numbers below 20 000 that
+                // use no '1' at all.
+                assert_eq!(total, 13_439);
+            },
+            async move {
+                assert_eq!(reader.get(b"k:00001").await.unwrap(), GetResult::Present(b"v".to_vec()));
+            },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
     }
 }

@@ -15,10 +15,11 @@ use super::plan;
 use super::row::decode_row;
 use super::select::{
     self, flatten, Filter, OffsetLimitOp, PlanRow, ProjectedColumn, RowScan, RowSource, Sort,
-    SourceBinding,
+    SourceBinding, ROW_YIELD_INTERVAL,
 };
 use super::types::{encode_sortable, ColumnType, ScalarValue};
 use super::{ExecOutcome, RelEngine};
+use crate::core::coop::YieldEvery;
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::reader::Snapshot;
 use crate::metrics::MetricsStore;
@@ -159,7 +160,9 @@ impl JoinProbe {
         let hits = self.engine.scan_keys_with_snapshot(&scan_prefix, &self.snapshot).await?;
         self.metrics.record_rel_select_scanned_keys(hits.len() as u64);
         let mut out = Vec::with_capacity(hits.len());
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for h in &hits {
+            coop.tick().await;
             let pk_enc = &h[scan_prefix.len()..];
             let row_key = keys::row_key(&self.right_prefix, self.right_table.table_id, pk_enc);
             self.metrics.record_rel_select_scanned_keys(1);
@@ -196,7 +199,9 @@ impl JoinProbe {
             rhs: PredOperand::Value(v.clone()),
         };
         let mut out = Vec::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for k in &scan_keys {
+            coop.tick().await;
             if let Some(bytes) = self.engine.get_with_snapshot(k, &self.snapshot).await?.into_option() {
                 let values = decode_row(&bytes, &self.right_table);
                 if matches!(eval(&pred, &values)?, Bool3::True) {
@@ -786,16 +791,19 @@ fn base_order_hint(sel: &Select, bindings: &[BindingInfo], is_count: bool) -> Ve
 /// pipeline (residual-filtered, if any).
 async fn count_join_rows(chain: IndexNestedLoopJoin, residual: Option<Pred>) -> Result<i64, RelStoreError> {
     let mut count: i64 = 0;
+    let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
     match residual {
         None => {
             let mut c = chain;
             while c.next().await?.is_some() {
+                coop.tick().await;
                 count += 1;
             }
         }
         Some(pred) => {
-            let mut f = Filter { input: chain, pred };
+            let mut f = Filter::new(chain, pred);
             while f.next().await?.is_some() {
+                coop.tick().await;
                 count += 1;
             }
         }
@@ -957,6 +965,7 @@ impl RelEngine {
             alias: bindings[0].alias.clone(),
             keys: row_keys.into_iter(),
             mask,
+            coop: YieldEvery::new(ROW_YIELD_INTERVAL),
         };
 
         // One JoinProbe per stage, in statement order (left-deep, spec §6).
@@ -1002,7 +1011,7 @@ impl RelEngine {
         let mut pipeline = match (residual, needs_sort) {
             (None, false) => JoinRowPipeline::Plain(OffsetLimitOp::new(chain, offset, limit)),
             (Some(pred), false) => {
-                JoinRowPipeline::Filtered(OffsetLimitOp::new(Filter { input: chain, pred }, offset, limit))
+                JoinRowPipeline::Filtered(OffsetLimitOp::new(Filter::new(chain, pred), offset, limit))
             }
             (None, true) => JoinRowPipeline::Sorted(OffsetLimitOp::new(
                 Sort::new(chain, order_items_flat.clone(), self.max_sort_rows),
@@ -1010,14 +1019,16 @@ impl RelEngine {
                 limit,
             )),
             (Some(pred), true) => JoinRowPipeline::FilteredSorted(OffsetLimitOp::new(
-                Sort::new(Filter { input: chain, pred }, order_items_flat.clone(), self.max_sort_rows),
+                Sort::new(Filter::new(chain, pred), order_items_flat.clone(), self.max_sort_rows),
                 offset,
                 limit,
             )),
         };
 
         let mut rows = Vec::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         while let Some(row) = pipeline.next().await? {
+            coop.tick().await;
             let values = flatten(&row.bindings);
             rows.push(proj.iter().map(|p| values[p.pos].clone()).collect());
         }

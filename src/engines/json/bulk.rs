@@ -7,6 +7,7 @@ use super::document::{
 };
 use super::error::JsonStoreError;
 use super::JsonEngine;
+use crate::core::coop::{self, YieldEvery};
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::lsm::reader::Snapshot;
 use crate::metrics::EngineKind;
@@ -14,6 +15,9 @@ use futures::Stream;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Documents or document keys processed between two yields (spec perf/017 A2).
+const DOC_LOOP_YIELD_INTERVAL: u32 = 4096;
 
 #[derive(Debug, Default)]
 pub struct BulkLoadResult {
@@ -43,6 +47,27 @@ pub(crate) fn parse_ndjson_line(line: &str) -> Result<(Option<String>, Value), S
         Value::Object(map)
     };
     Ok((key, content))
+}
+
+type ParsedNdjson = (Vec<(Option<String>, Value)>, Vec<(String, String)>);
+
+/// Parses a whole NDJSON body into `(documents, per-line parse errors)` —
+/// the pure function [`JsonEngine::bulk_load_ndjson`] offloads (spec
+/// perf/017 A4). Blank lines are skipped.
+fn parse_ndjson_body(ndjson: &str) -> ParsedNdjson {
+    let mut docs = Vec::new();
+    let mut errors = Vec::new();
+    for (i, line) in ndjson.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_ndjson_line(line) {
+            Ok(pair) => docs.push(pair),
+            Err(msg) => errors.push((format!("line {}", i + 1), msg)),
+        }
+    }
+    (docs, errors)
 }
 
 /// Merges content with `_key`/`_version` metadata into one JSON object.
@@ -156,7 +181,9 @@ impl JsonEngine {
         let mut batches: Vec<Vec<(String, Value)>> = Vec::new();
         let mut batch: Vec<(String, Value)> = Vec::new();
         let mut keys_in_batch: HashSet<String> = HashSet::new();
+        let mut coop = YieldEvery::new(DOC_LOOP_YIELD_INTERVAL);
         for (maybe_key, content) in documents {
+            coop.tick().await;
             let key = maybe_key.unwrap_or_else(generate_uuid_v4);
             if let Err(e) = validate_document_key(&key, self.max_document_key_length) {
                 result.failed += 1;
@@ -174,7 +201,10 @@ impl JsonEngine {
             batches.push(batch);
         }
 
+        // One yield per batch — the batch itself is bounded by `bulk_batch_size`.
+        let mut coop = YieldEvery::new(1);
         for batch in batches {
+            coop.tick().await;
             self.load_batch(domain, batch, &mut result).await?;
         }
         self.metrics.record_engine_write(EngineKind::Json, start.elapsed().as_micros() as u64);
@@ -183,23 +213,15 @@ impl JsonEngine {
 
     /// NDJSON convenience wrapper around [`JsonEngine::bulk_load`]. Unparseable
     /// lines are reported as `("line N", message)` and skipped.
+    ///
+    /// Line parsing is pure CPU work and runs on the blocking pool (spec
+    /// perf/017 A4), which is why the body arrives owned.
     pub async fn bulk_load_ndjson(
         &self,
         domain: &str,
-        ndjson: &str,
+        ndjson: String,
     ) -> Result<BulkLoadResult, JsonStoreError> {
-        let mut parse_errors = Vec::new();
-        let mut docs = Vec::new();
-        for (i, line) in ndjson.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            match parse_ndjson_line(line) {
-                Ok(pair) => docs.push(pair),
-                Err(msg) => parse_errors.push((format!("line {}", i + 1), msg)),
-            }
-        }
+        let (docs, parse_errors) = coop::offload(move || parse_ndjson_body(&ndjson)).await;
         let mut result = self.bulk_load(domain, docs).await?;
         result.failed += parse_errors.len() as u64;
         result.errors.extend(parse_errors);
@@ -270,10 +292,15 @@ impl JsonEngine {
             .engine
             .scan_keys_with_snapshot(&doc_scan_prefix(&dom.system_prefix), snapshot)
             .await?;
-        Ok(keys
-            .into_iter()
-            .filter_map(|lsm_key| parse_doc_key(&lsm_key).map(|(_, document_key)| document_key))
-            .collect())
+        let mut coop = YieldEvery::new(DOC_LOOP_YIELD_INTERVAL);
+        let mut document_keys = Vec::with_capacity(keys.len());
+        for lsm_key in &keys {
+            coop.tick().await;
+            if let Some((_, document_key)) = parse_doc_key(lsm_key) {
+                document_keys.push(document_key);
+            }
+        }
+        Ok(document_keys)
     }
 }
 
@@ -298,6 +325,33 @@ mod tests {
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         (engine, dir)
+    }
+
+    // Spec perf/017 test 5 (import): a 10 000-line NDJSON import hands the
+    // thread back between its batches — parsing runs off the engine thread
+    // entirely — so a `get_document` on another domain answers first.
+    #[tokio::test]
+    async fn test_bulk_load_ndjson_interleaves_with_get_document() {
+        let (json, _dir) = make_engine_with_batch(500).await;
+        json.create_domain("other").await.unwrap();
+        json.put_document("other", "small", json!({"n": 1})).await.unwrap();
+        let ndjson: String =
+            (0..10_000).map(|i| format!("{{\"_key\": \"d{i:05}\", \"n\": {i}}}\n")).collect();
+
+        let importer = Arc::clone(&json);
+        let reader = Arc::clone(&json);
+        let order = crate::core::coop::completion_order(
+            async move {
+                let result = importer.bulk_load_ndjson("default", ndjson).await.unwrap();
+                assert_eq!(result.imported, 10_000);
+                assert_eq!(result.failed, 0);
+            },
+            async move {
+                assert!(reader.get_document("other", "small").await.unwrap().is_some());
+            },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
     }
 
     // 1. Bulk load across batch boundaries → every doc retrievable.
@@ -457,7 +511,7 @@ mod tests {
         assert!(parse_ndjson_line(r#"[1, 2]"#).is_err());
 
         let (json, _dir) = make_engine_with_batch(100).await;
-        json.bulk_load_ndjson("default", "{\"city\": \"Essen\"}\n").await.unwrap();
+        json.bulk_load_ndjson("default", "{\"city\": \"Lyon\"}\n".to_string()).await.unwrap();
         let stream = json.bulk_export("default").await.unwrap();
         let docs: Vec<Document> = stream.collect().await;
         assert_eq!(docs.len(), 1);
@@ -477,7 +531,7 @@ mod tests {
             "{\"_key\": \"r3\", \"_foo\": \"bar\"}\n",
             "{\"_key\": \"r4\", \"_content\": 99}\n",
         );
-        let result = json.bulk_load_ndjson("default", ndjson).await.unwrap();
+        let result = json.bulk_load_ndjson("default", ndjson.to_string()).await.unwrap();
         assert_eq!(result.imported, 4);
         assert_eq!(result.failed, 0);
 
@@ -503,9 +557,9 @@ mod tests {
         let (json, _dir) = make_engine_with_batch(100).await;
         let ndjson = concat!(
             "{\"_key\":\"a\",\"_content\":1,\"x\":2}\n",
-            "{\"_key\":\"b\",\"city\":\"Essen\"}\n",
+            "{\"_key\":\"b\",\"city\":\"Lyon\"}\n",
         );
-        let result = json.bulk_load_ndjson("default", ndjson).await.unwrap();
+        let result = json.bulk_load_ndjson("default", ndjson.to_string()).await.unwrap();
         assert_eq!(result.imported, 1);
         assert_eq!(result.failed, 1);
         assert_eq!(result.errors.len(), 1);

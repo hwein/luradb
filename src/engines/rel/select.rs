@@ -18,12 +18,19 @@ use super::plan::{self, AccessPath, RangeBounds};
 use super::row::decode_row;
 use super::types::{encode_sortable, ColumnType, ScalarValue};
 use super::{ExecOutcome, RelEngine};
+use crate::core::coop::YieldEvery;
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::reader::Snapshot;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::future::Future;
 use std::sync::Arc;
+
+/// Rows one operator consumes between two yields (spec perf/017 A2).
+pub(super) const ROW_YIELD_INTERVAL: u32 = 256;
+
+/// Scanned keys post-processed between two yields (spec perf/017 A2).
+const KEY_YIELD_INTERVAL: u32 = 4096;
 
 // ── PlanRow / SourceBinding (spec §2) ────────────────────────────────────────
 //
@@ -86,12 +93,14 @@ pub(super) struct RowScan {
     pub(super) keys: std::vec::IntoIter<Vec<u8>>,
     /// Read masking (spec rel/012 §3): masked link cells decode as `NULL`.
     pub(super) mask: LinkMask,
+    pub(super) coop: YieldEvery,
 }
 
 impl RowSource for RowScan {
     fn next(&mut self) -> impl Future<Output = Result<Option<PlanRow>, RelStoreError>> + Send {
         async move {
             loop {
+                self.coop.tick().await;
                 let Some(key) = self.keys.next() else { return Ok(None) };
                 // A key live during the key-list scan but gone at the
                 // snapshot fetch is a ghost (spec §2 "Snapshot &
@@ -111,14 +120,22 @@ impl RowSource for RowScan {
 /// all bindings concatenated in binding order) — for the v1 single-binding
 /// case this is exactly `bindings[0].values`, so no behavior changes there.
 pub(super) struct Filter<S> {
-    pub(super) input: S,
-    pub(super) pred: Pred,
+    input: S,
+    pred: Pred,
+    coop: YieldEvery,
+}
+
+impl<S> Filter<S> {
+    pub(super) fn new(input: S, pred: Pred) -> Self {
+        Self { input, pred, coop: YieldEvery::new(ROW_YIELD_INTERVAL) }
+    }
 }
 
 impl<S: RowSource + Send> RowSource for Filter<S> {
     fn next(&mut self) -> impl Future<Output = Result<Option<PlanRow>, RelStoreError>> + Send {
         async move {
             loop {
+                self.coop.tick().await;
                 match self.input.next().await? {
                     None => return Ok(None),
                     Some(row) => {
@@ -149,11 +166,12 @@ pub(super) struct Sort<S> {
     items: Vec<(usize, bool)>,
     max_rows: usize,
     buffer: Option<std::vec::IntoIter<PlanRow>>,
+    coop: YieldEvery,
 }
 
 impl<S> Sort<S> {
     pub(super) fn new(input: S, items: Vec<(usize, bool)>, max_rows: usize) -> Self {
-        Self { input, items, max_rows, buffer: None }
+        Self { input, items, max_rows, buffer: None, coop: YieldEvery::new(ROW_YIELD_INTERVAL) }
     }
 }
 
@@ -163,6 +181,7 @@ impl<S: RowSource + Send> RowSource for Sort<S> {
             if self.buffer.is_none() {
                 let mut rows = Vec::new();
                 while let Some(row) = self.input.next().await? {
+                    self.coop.tick().await;
                     rows.push(row);
                     if rows.len() > self.max_rows {
                         return Err(RelStoreError::SortBufferExceeded {
@@ -216,11 +235,21 @@ pub(super) struct OffsetLimitOp<S> {
     taken: u64,
     peeked: bool,
     more: bool,
+    coop: YieldEvery,
 }
 
 impl<S> OffsetLimitOp<S> {
     pub(super) fn new(input: S, offset: u64, limit: u64) -> Self {
-        Self { input, offset, limit, skipped: 0, taken: 0, peeked: false, more: false }
+        Self {
+            input,
+            offset,
+            limit,
+            skipped: 0,
+            taken: 0,
+            peeked: false,
+            more: false,
+            coop: YieldEvery::new(ROW_YIELD_INTERVAL),
+        }
     }
 
     pub(super) fn limit_applied(&self) -> bool {
@@ -232,6 +261,7 @@ impl<S: RowSource + Send> RowSource for OffsetLimitOp<S> {
     fn next(&mut self) -> impl Future<Output = Result<Option<PlanRow>, RelStoreError>> + Send {
         async move {
             while self.skipped < self.offset {
+                self.coop.tick().await;
                 match self.input.next().await? {
                     None => {
                         self.peeked = true;
@@ -335,10 +365,14 @@ pub(super) async fn resolve_candidate_keys(
             let row_prefix = keys::row_table_prefix(prefix, schema.table_id);
             let all = engine.scan_keys_with_snapshot(&row_prefix, snapshot).await?;
             let n = all.len() as u64;
-            let out = all
-                .into_iter()
-                .filter(|k| bounds_match(&k[row_prefix.len()..], bounds))
-                .collect();
+            let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
+            let mut out = Vec::new();
+            for k in all {
+                coop.tick().await;
+                if bounds_match(&k[row_prefix.len()..], bounds) {
+                    out.push(k);
+                }
+            }
             Ok((out, n))
         }
         AccessPath::PkPrefix(literal) => {
@@ -355,10 +389,12 @@ pub(super) async fn resolve_candidate_keys(
             let scan_prefix = keys::index_value_prefix(prefix, index.index_id, &val_enc);
             let hits = engine.scan_keys_with_snapshot(&scan_prefix, snapshot).await?;
             let n = hits.len() as u64;
-            let row_keys = hits
-                .iter()
-                .map(|k| keys::row_key(prefix, schema.table_id, &k[scan_prefix.len()..]))
-                .collect();
+            let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
+            let mut row_keys = Vec::with_capacity(hits.len());
+            for k in &hits {
+                coop.tick().await;
+                row_keys.push(keys::row_key(prefix, schema.table_id, &k[scan_prefix.len()..]));
+            }
             Ok((row_keys, n))
         }
         AccessPath::IndexRange { index, bounds } => {
@@ -366,8 +402,10 @@ pub(super) async fn resolve_candidate_keys(
             let scan_prefix = keys::index_value_prefix(prefix, index.index_id, &[]);
             let all = engine.scan_keys_with_snapshot(&scan_prefix, snapshot).await?;
             let n = all.len() as u64;
+            let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
             let mut out = Vec::new();
             for k in &all {
+                coop.tick().await;
                 let rest = &k[scan_prefix.len()..];
                 let Some((val_enc, pk_enc)) = split_val_enc(phys, rest) else { continue };
                 if bounds_match(val_enc, bounds) {
@@ -382,14 +420,14 @@ pub(super) async fn resolve_candidate_keys(
             scan_prefix.extend_from_slice(&encode_text_prefix(literal));
             let hits = engine.scan_keys_with_snapshot(&scan_prefix, snapshot).await?;
             let n = hits.len() as u64;
-            let row_keys = hits
-                .iter()
-                .map(|k| {
-                    let rest = &k[value_prefix.len()..];
-                    let pk_enc = split_val_enc(ColumnType::Text, rest).map(|(_, pk)| pk).unwrap_or(rest);
-                    keys::row_key(prefix, schema.table_id, pk_enc)
-                })
-                .collect();
+            let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
+            let mut row_keys = Vec::with_capacity(hits.len());
+            for k in &hits {
+                coop.tick().await;
+                let rest = &k[value_prefix.len()..];
+                let pk_enc = split_val_enc(ColumnType::Text, rest).map(|(_, pk)| pk).unwrap_or(rest);
+                row_keys.push(keys::row_key(prefix, schema.table_id, pk_enc));
+            }
             Ok((row_keys, n))
         }
         AccessPath::FullScan => {
@@ -665,13 +703,14 @@ impl RelEngine {
             alias,
             keys: row_keys.into_iter(),
             mask,
+            coop: YieldEvery::new(ROW_YIELD_INTERVAL),
         };
 
         let needs_sort = !order_by.is_empty() && !plan.order_free;
         let mut pipeline = match (plan.residual, needs_sort) {
             (None, false) => RowPipeline::Plain(OffsetLimitOp::new(scan, offset, limit)),
             (Some(pred), false) => {
-                RowPipeline::Filtered(OffsetLimitOp::new(Filter { input: scan, pred }, offset, limit))
+                RowPipeline::Filtered(OffsetLimitOp::new(Filter::new(scan, pred), offset, limit))
             }
             (None, true) => RowPipeline::Sorted(OffsetLimitOp::new(
                 Sort::new(scan, order_by.clone(), self.max_sort_rows),
@@ -679,14 +718,16 @@ impl RelEngine {
                 limit,
             )),
             (Some(pred), true) => RowPipeline::FilteredSorted(OffsetLimitOp::new(
-                Sort::new(Filter { input: scan, pred }, order_by.clone(), self.max_sort_rows),
+                Sort::new(Filter::new(scan, pred), order_by.clone(), self.max_sort_rows),
                 offset,
                 limit,
             )),
         };
 
         let mut rows = Vec::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         while let Some(row) = pipeline.next().await? {
+            coop.tick().await;
             let values = &row.bindings[0].values;
             rows.push(proj.iter().map(|p| values[p.pos].clone()).collect());
         }
@@ -752,9 +793,12 @@ impl RelEngine {
                     alias,
                     keys: row_keys.into_iter(),
                     mask,
+                    coop: YieldEvery::new(ROW_YIELD_INTERVAL),
                 };
                 let mut count = 0i64;
+                let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
                 while let Some(row) = scan.next().await? {
+                    coop.tick().await;
                     if matches!(eval(&pred, &row.bindings[0].values)?, Bool3::True) {
                         count += 1;
                     }
@@ -1211,6 +1255,7 @@ mod tests {
             alias: "t".to_string(),
             keys: vec![key1, key2].into_iter(),
             mask: LinkMask::default(),
+            coop: YieldEvery::new(ROW_YIELD_INTERVAL),
         };
         let row1 = scan.next().await.unwrap().expect("key1 exists at snap");
         assert_eq!(row1.bindings[0].values[0], ScalarValue::Integer(1));

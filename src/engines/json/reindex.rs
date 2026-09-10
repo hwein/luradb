@@ -11,6 +11,7 @@ use super::domain::JsonDomain;
 use super::error::JsonStoreError;
 use super::index::{encode_index_value, extract_field, index_key, IndexDefinition};
 use super::{JsonEngine, DOC_WRITE_SHARDS};
+use crate::core::coop::YieldEvery;
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::StorageEngine;
 use serde::Serialize;
@@ -127,7 +128,10 @@ impl JsonEngine {
         let total = keys.len() as u64;
         self.set_running_status(task_id, dom, 0, total);
 
+        // One yield per chunk — the chunk itself is bounded (spec perf/017 A2).
+        let mut coop = YieldEvery::new(1);
         for chunk in keys.chunks(self.reindex_batch_size.max(1)) {
+            coop.tick().await;
             self.reindex_chunk(dom, defs, chunk, &mut processed)
                 .await
                 .map_err(|e| (processed, e))?;

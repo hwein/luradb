@@ -17,6 +17,7 @@ use crate::engines::lsm::janitor::{FlushBarrier, Janitor, JanitorConfig};
 use crate::engines::lsm::hlc::HybridLogicalClock;
 use crate::engines::lsm::watcher::{OpType, WalEvent, WATCH_TAG};
 use crate::engines::StorageEngine;
+use crate::core::coop::YieldEvery;
 use crate::core::events::{stream_epoch, Resume, SeqRing};
 use crate::core::io_engine::IoEngine;
 use crate::core::storage_thread::StorageHandle;
@@ -131,7 +132,9 @@ fn now_secs() -> u64 {
 /// behavior); `Some` skips versions newer than the snapshot instead of
 /// deciding the key, so an older, visible version further along can still
 /// decide it (spec general/006 backup export).
-fn scan_memtable_for_prefix(
+///
+/// `coop` counts across all sources of one scan (spec perf/017 A2).
+async fn scan_memtable_for_prefix(
     mt: &MemTable,
     prefix: &[u8],
     now: u64,
@@ -139,8 +142,10 @@ fn scan_memtable_for_prefix(
     snapshot: Option<&Snapshot>,
     live: &mut BTreeSet<Vec<u8>>,
     decided: &mut BTreeSet<Vec<u8>>,
+    coop: &mut YieldEvery,
 ) {
     for (encoded_key, value) in mt.iter() {
+        coop.tick().await;
         if live.len() >= limit {
             return;
         }
@@ -189,6 +194,9 @@ fn is_live_version(value: &Value, now: u64) -> bool {
     value.version_state(now) == VersionState::Live
 }
 
+/// Entries a prefix scan visits between two yield points (spec perf/017 A2).
+const SCAN_KEYS_YIELD_INTERVAL: u32 = 1024;
+
 /// Entries the expiry scan checks between two yield points (spec kv/025 §7).
 const SCAN_EXPIRED_YIELD_INTERVAL: usize = 1024;
 
@@ -216,19 +224,21 @@ fn push_expired_candidate(candidates: &mut BTreeSet<Vec<u8>>, limit: usize, key:
 /// Sweeps one SSTable for keys with `prefix` (see [`scan_memtable_for_prefix`]
 /// for the newest-first decision protocol and the `snapshot` contract).
 /// Returns `true` once `live` holds `limit` keys so the caller can stop.
-fn scan_sstable_for_prefix(
+async fn scan_sstable_for_prefix(
     sstable: &SSTableReader,
     prefix: &[u8],
     limit: usize,
     snapshot: Option<&Snapshot>,
     live: &mut BTreeSet<Vec<u8>>,
     decided: &mut BTreeSet<Vec<u8>>,
+    coop: &mut YieldEvery,
 ) -> Result<bool> {
-    let entries: Box<dyn Iterator<Item = Result<(Vec<u8>, bool)>> + '_> = match snapshot {
+    let entries: Box<dyn Iterator<Item = Result<(Vec<u8>, bool)>> + Send + '_> = match snapshot {
         Some(snap) => Box::new(sstable.keys_with_prefix_at(prefix, snap.timestamp().inverted())),
         None => Box::new(sstable.keys_with_prefix(prefix)),
     };
     for entry in entries {
+        coop.tick().await;
         if live.len() >= limit {
             return Ok(true);
         }
@@ -1365,19 +1375,26 @@ impl LsmStorageEngine {
         // User keys already decided by a newer version (live OR dead).
         let mut decided: BTreeSet<Vec<u8>> = BTreeSet::new();
         let now = now_secs();
+        let mut coop = YieldEvery::new(SCAN_KEYS_YIELD_INTERVAL);
 
         let memtable = { Arc::clone(&*self.memtable.read()) };
-        scan_memtable_for_prefix(&memtable, prefix, now, limit, snapshot, &mut live, &mut decided);
+        scan_memtable_for_prefix(&memtable, prefix, now, limit, snapshot, &mut live, &mut decided, &mut coop)
+            .await;
 
-        {
-            // Both slots in one section (spec general/028).
+        // Both slots in one section (spec general/028), cloned out before the
+        // iteration: the loop below yields, and a rotation waiting for
+        // `immutables.write()` under a read guard would deadlock the thread
+        // (spec perf/017 A3). Frozen MemTables are pushed to the back —
+        // iterate newest-first, then the flushes in flight, which are older
+        // than all of them.
+        let frozen: Vec<Arc<MemTable>> = {
             let imm = self.immutable_memtables.read();
             let flushing = self.flushing.read();
-            // Frozen MemTables are pushed to the back — iterate newest-first,
-            // then the flushes in flight, which are older than all of them.
-            for mt in imm.iter().rev().chain(flushing.iter().rev()) {
-                scan_memtable_for_prefix(mt, prefix, now, limit, snapshot, &mut live, &mut decided);
-            }
+            imm.iter().rev().chain(flushing.iter().rev()).cloned().collect()
+        };
+        for mt in &frozen {
+            scan_memtable_for_prefix(mt, prefix, now, limit, snapshot, &mut live, &mut decided, &mut coop)
+                .await;
         }
 
         let mut levels = self.level_manager.get_all_levels();
@@ -1387,7 +1404,11 @@ impl LsmStorageEngine {
         }
         for level_sstables in levels {
             for sstable in level_sstables {
-                if scan_sstable_for_prefix(&sstable, prefix, limit, snapshot, &mut live, &mut decided)? {
+                if scan_sstable_for_prefix(
+                    &sstable, prefix, limit, snapshot, &mut live, &mut decided, &mut coop,
+                )
+                .await?
+                {
                     return Ok(live.into_iter().collect());
                 }
             }
@@ -4192,6 +4213,91 @@ mod tests {
         assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
         assert_eq!(engine.get(b"b").await.unwrap(), Some(big));
         assert_readers_match_manifest(&engine);
+    }
+
+    // ── Spec perf/017: cooperative yields in the scan path ──────────────────
+
+    use crate::core::coop::completion_order;
+
+    /// 20 000 keys under `k:` in one batch — enough scan work that a missing
+    /// yield point is unmistakable, small enough to stay in the MemTable.
+    async fn fill_scan_keys(engine: &LsmStorageEngine) {
+        let ops: Vec<BatchOp> = (0..20_000u32)
+            .map(|i| BatchOp::Put { key: format!("k:{i:05}").into_bytes(), value: b"v".to_vec() })
+            .collect();
+        engine.write_batch(ops).await.unwrap();
+    }
+
+    // Spec perf/017 test 3 (MemTable branch): a 20 000-key `scan_keys` hands
+    // the thread back, so a point `get` spawned after it answers first.
+    #[tokio::test]
+    async fn test_scan_keys_interleaves_with_get_in_memtable() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        fill_scan_keys(&engine).await;
+
+        let scanner = Arc::clone(&engine);
+        let reader = Arc::clone(&engine);
+        let order = completion_order(
+            async move { assert_eq!(scanner.scan_keys(b"k:").await.unwrap().len(), 20_000) },
+            async move { assert!(reader.get(b"k:00001").await.unwrap().is_some()) },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
+    }
+
+    // Spec perf/017 test 3 (SSTable branch): same, with the keys flushed to
+    // L0 so the scan runs through `scan_sstable_for_prefix`.
+    #[tokio::test]
+    async fn test_scan_keys_interleaves_with_get_in_sstable() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        fill_scan_keys(&engine).await;
+        engine.freeze_active_memtable();
+        engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
+
+        let scanner = Arc::clone(&engine);
+        let reader = Arc::clone(&engine);
+        let order = completion_order(
+            async move { assert_eq!(scanner.scan_keys(b"k:").await.unwrap().len(), 20_000) },
+            async move { assert!(reader.get(b"k:00001").await.unwrap().is_some()) },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
+    }
+
+    // Spec perf/017 test 8 (A3): a MemTable rotation runs while the scan sits
+    // in a yield *inside its frozen-list iteration* — exactly where
+    // `immutable_memtables.read()` used to be held. No `parking_lot` guard
+    // survives a yield, so the rotation gets its write locks instead of
+    // deadlocking the one thread, and the scan still returns every key it
+    // started with.
+    #[tokio::test]
+    async fn test_scan_keys_survives_memtable_rotation_mid_scan() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        // The bulk goes to the frozen list without a flush; the active
+        // MemTable keeps far fewer keys than one yield interval, so the scan's
+        // first yield can only fall into the frozen-list iteration.
+        fill_scan_keys(&engine).await;
+        engine.freeze_active_memtable();
+        for i in 0..4u32 {
+            let key = format!("k:9000{i}");
+            engine.set(key.as_bytes(), b"v").await.unwrap();
+        }
+
+        let scanner = Arc::clone(&engine);
+        let scan = tokio::spawn(async move { scanner.scan_keys(b"k:").await.unwrap() });
+        let rotator = Arc::clone(&engine);
+        let rotate = tokio::spawn(async move {
+            rotator.freeze_active_memtable();
+            rotator.set(b"k:99999", b"v").await.unwrap();
+        });
+
+        let scanned = scan.await.unwrap();
+        rotate.await.unwrap();
+        assert_eq!(scanned.len(), 20_004, "the rotation must not cost the scan a key");
+        assert_eq!(engine.scan_keys(b"k:").await.unwrap().len(), 20_005);
     }
 
     // ── Spec general/029: maintenance against a concurrent flush ─────────────

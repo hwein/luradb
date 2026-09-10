@@ -27,6 +27,7 @@ pub struct LuraConfig {
     pub backup: BackupConfig,
     pub events: EventsConfig,
     pub cors: CorsConfig,
+    pub multicore: MulticoreConfig,
 }
 
 impl Default for LuraConfig {
@@ -53,6 +54,7 @@ impl Default for LuraConfig {
             backup: BackupConfig::default(),
             events: EventsConfig::default(),
             cors: CorsConfig::default(),
+            multicore: MulticoreConfig::default(),
         }
     }
 }
@@ -1152,9 +1154,42 @@ fn is_valid_origin_form(origin: &str) -> bool {
     }
 }
 
+// ── Multicore (spec perf/017) ─────────────────────────────────────────────────
+
+/// Sizing of the CPU offload pool behind `core::coop::offload`.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MulticoreConfig {
+    /// Permits for concurrent CPU offloads. `0` = auto = one per core beyond
+    /// the request-path thread and one core of headroom.
+    pub cpu_offload_threads: usize,
+}
+
+impl Default for MulticoreConfig {
+    fn default() -> Self {
+        Self { cpu_offload_threads: 0 }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_multicore_defaults_and_toml_override() {
+        assert_eq!(LuraConfig::default().multicore.cpu_offload_threads, 0);
+
+        let toml_str = r#"
+            [multicore]
+            cpu_offload_threads = 6
+        "#;
+        let config: LuraConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.multicore.cpu_offload_threads, 6);
+
+        // Absent section stays at the default (`#[serde(default)]`).
+        let config: LuraConfig = toml::from_str("[server]\nport = 1234\n").unwrap();
+        assert_eq!(config.multicore.cpu_offload_threads, 0);
+    }
 
     #[test]
     fn test_json_store_defaults() {

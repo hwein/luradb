@@ -611,7 +611,7 @@ pub async fn bulk_load(
     body: String,
 ) -> Result<Json<BulkLoadResponse>, ApiError> {
     let engine = json_engine(&state)?;
-    let result = engine.bulk_load_ndjson(&domain, &body).await?;
+    let result = engine.bulk_load_ndjson(&domain, body).await?;
     Ok(Json(BulkLoadResponse {
         imported: result.imported,
         failed: result.failed,

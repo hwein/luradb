@@ -13,7 +13,9 @@ use super::eval::{eval, Bool3, Pred, PredOperand};
 use super::keys;
 use super::row::{decode_row, encode_row};
 use super::types::{encode_sortable, ColumnType, ScalarValue};
+use super::select::ROW_YIELD_INTERVAL;
 use super::{ExecOutcome, RelEngine};
+use crate::core::coop::YieldEvery;
 use crate::engines::lsm::engine::BatchOp;
 use crate::engines::lsm::reader::Snapshot;
 use crate::metrics::EngineKind;
@@ -191,7 +193,9 @@ impl RelEngine {
         let mut seen_unique: HashSet<(u32, Vec<u8>)> = HashSet::new();
         let mut last_pk = None;
 
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for row in &rows {
+            coop.tick().await;
             let pk_v = self
                 .stage_insert_row(domain, &schema, prefix, row, snap, &mut seen_pk, &mut seen_unique, &mut ops, auth)
                 .await?;
@@ -290,7 +294,9 @@ impl RelEngine {
 
         let mut ops: Vec<BatchOp> = Vec::new();
         let mut seen_unique: HashSet<(u32, Vec<u8>)> = HashSet::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for cand in &candidates {
+            coop.tick().await;
             let old = values_by_col_id(&schema, &cand.values);
             let mut new = old.clone();
             for (c, v) in &sets {
@@ -402,7 +408,9 @@ impl RelEngine {
             .await?;
 
         let mut ops: Vec<BatchOp> = Vec::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for cand in &candidates {
+            coop.tick().await;
             let values = values_by_col_id(&schema, &cand.values);
             let pk_enc = pk_enc_of(&schema, &values)?;
             for k in row_index_keys(&schema, &values, prefix, &pk_enc) {
@@ -448,7 +456,9 @@ impl RelEngine {
         let keys = self.engine.scan_keys(&keys::row_table_prefix(prefix, schema.table_id)).await?;
         let mut out = Vec::new();
         let mut scanned = 0u64;
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for key in keys {
+            coop.tick().await;
             let Some(bytes) = self.engine.get_with_snapshot(&key, snap).await?.into_option() else {
                 continue;
             };

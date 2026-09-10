@@ -4,6 +4,14 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- New `[multicore].cpu_offload_threads` config key caps concurrent CPU offloads (`0` = auto).
+
+### Changed
+
+- Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.
+
 ### Fixed
 
 - Reads no longer miss keys while a MemTable flush or a compaction installs its result.

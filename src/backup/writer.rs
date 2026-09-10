@@ -4,6 +4,7 @@
 
 use super::{BackupError, BackupScope};
 use crate::auth::{DomainPermission, UserRecord, PREFIX_PERM, PREFIX_USER};
+use crate::core::coop::YieldEvery;
 use crate::engines::json::{IndexFieldType, JsonDomain, JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{now_secs, Domain, DomainRegistry};
 use crate::engines::lsm::{GetResult, RegistrySnapshot};
@@ -15,6 +16,9 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 pub(crate) const FORMAT_VERSION: u32 = 1;
+
+/// Keys exported between two yields (spec perf/017 A2).
+const EXPORT_KEY_YIELD_INTERVAL: u32 = 1024;
 
 // ── Wire format (shared with `restore`) ─────────────────────────────────
 
@@ -290,7 +294,9 @@ async fn write_kv_section<W: tokio::io::AsyncWrite + Unpin>(
 
         let store = params.kv_registry.store(&domain.name).await?;
         let keys = store.scan_keys_with_snapshot(b"", snap.snapshot()).await?;
+        let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
         for (i, key) in keys.iter().enumerate() {
+            coop.tick().await;
             let (result, expires_at) = store.get_with_snapshot(key, snap.snapshot()).await?;
             let v = match result {
                 GetResult::Present(bytes) => Some(hex::encode(bytes)),
@@ -321,8 +327,10 @@ async fn write_auth_section<W: tokio::io::AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     let engine = kv_registry.engine();
 
+    let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
     let user_keys = engine.scan_keys_with_snapshot(PREFIX_USER.as_bytes(), snap.snapshot()).await?;
     for key in &user_keys {
+        coop.tick().await;
         let (result, _) = engine.get_with_expiry(key, snap.snapshot()).await?;
         if let GetResult::Present(bytes) = result {
             let record: UserRecord = serde_json::from_slice(&bytes)?;
@@ -332,6 +340,7 @@ async fn write_auth_section<W: tokio::io::AsyncWrite + Unpin>(
 
     let perm_keys = engine.scan_keys_with_snapshot(PREFIX_PERM.as_bytes(), snap.snapshot()).await?;
     for key in &perm_keys {
+        coop.tick().await;
         let (result, _) = engine.get_with_expiry(key, snap.snapshot()).await?;
         if let GetResult::Present(bytes) = result {
             let perm: DomainPermission = serde_json::from_slice(&bytes)?;
@@ -376,7 +385,9 @@ async fn write_json_section<W: tokio::io::AsyncWrite + Unpin>(
         }
 
         let keys = json.scan_document_keys_with_snapshot(&domain.name, snap.snapshot()).await?;
+        let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
         for (i, key) in keys.iter().enumerate() {
+            coop.tick().await;
             if let Some(doc) = json.get_document_with_snapshot(&domain.name, key, snap.snapshot()).await? {
                 write_line(
                     out,

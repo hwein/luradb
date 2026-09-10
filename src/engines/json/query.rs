@@ -12,12 +12,19 @@ use super::index::{
     self, encode_index_value, index_field_prefix, index_scan_prefix, IndexDefinition,
 };
 use super::JsonEngine;
+use crate::core::coop::YieldEvery;
 use crate::metrics::EngineKind;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 1000;
+
+/// Documents read between two yields (spec perf/017 A2).
+const DOC_YIELD_INTERVAL: u32 = 256;
+
+/// Keys post-processed between two yields (spec perf/017 A2).
+const KEY_YIELD_INTERVAL: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub enum FilterCondition {
@@ -124,7 +131,9 @@ impl JsonEngine {
 
         // Only the requested page is actually fetched.
         let mut documents = Vec::new();
+        let mut coop = YieldEvery::new(DOC_YIELD_INTERVAL);
         for key in matched.iter().skip(query.offset as usize).take(limit as usize) {
+            coop.tick().await;
             if let Some(stored) = self.read_stored(&dom, key).await? {
                 documents.push(Document {
                     key: key.clone(),
@@ -159,10 +168,14 @@ impl JsonEngine {
             .engine
             .scan_keys(&doc_scan_prefix(&dom.system_prefix))
             .await?;
-        let all_keys: Vec<String> = lsm_keys
-            .iter()
-            .filter_map(|k| parse_doc_key(k).map(|(_, doc_key)| doc_key))
-            .collect();
+        let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
+        let mut all_keys: Vec<String> = Vec::with_capacity(lsm_keys.len());
+        for lsm_key in &lsm_keys {
+            coop.tick().await;
+            if let Some((_, doc_key)) = parse_doc_key(lsm_key) {
+                all_keys.push(doc_key);
+            }
+        }
         let total = all_keys.len() as u64;
         let keys: Vec<String> = all_keys
             .into_iter()
@@ -171,7 +184,9 @@ impl JsonEngine {
             .collect();
         let mut documents = Vec::new();
         if !options.keys_only {
+            let mut coop = YieldEvery::new(DOC_YIELD_INTERVAL);
             for key in &keys {
+                coop.tick().await;
                 if let Some(stored) = self.read_stored(&dom, key).await? {
                     documents.push(Document {
                         key: key.clone(),
@@ -239,7 +254,9 @@ impl JsonEngine {
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let mut matches = BTreeSet::new();
         let prefix = index_scan_prefix(&dom.system_prefix, &def.field, encoded);
+        let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
         for lsm_key in self.engine.scan_keys(&prefix).await? {
+            coop.tick().await;
             let Some((_, _, value_bytes, doc_key)) = index::parse_index_key(&lsm_key) else {
                 continue;
             };
@@ -261,7 +278,9 @@ impl JsonEngine {
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let mut matches = BTreeSet::new();
         let prefix = index_field_prefix(&dom.system_prefix, &def.field);
+        let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
         for lsm_key in self.engine.scan_keys(&prefix).await? {
+            coop.tick().await;
             let Some((_, _, value_bytes, doc_key)) = index::parse_index_key(&lsm_key) else {
                 continue;
             };
@@ -302,6 +321,30 @@ mod tests {
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         (engine, dir)
+    }
+
+    // Spec perf/017 test 5 (listing): a 5 000-document `list_documents`
+    // hands the thread back, so a `get_document` spawned after it answers
+    // first.
+    #[tokio::test]
+    async fn test_list_documents_interleaves_with_get_document() {
+        let (json, _dir) = make_engine().await;
+        let docs = (0..5_000).map(|i| (Some(format!("d{i:05}")), json!({"n": i}))).collect();
+        assert_eq!(json.bulk_load("default", docs).await.unwrap().imported, 5_000);
+
+        let lister = Arc::clone(&json);
+        let reader = Arc::clone(&json);
+        let order = crate::core::coop::completion_order(
+            async move {
+                let listed = lister.list_documents("default", ListOptions::default()).await.unwrap();
+                assert_eq!(listed.total, 5_000);
+            },
+            async move {
+                assert!(reader.get_document("default", "d00001").await.unwrap().is_some());
+            },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
     }
 
     fn eq_query(pairs: &[(&str, Value)]) -> SearchQuery {

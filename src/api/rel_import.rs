@@ -119,7 +119,7 @@ pub async fn create_table_from_file(
     };
     let pk = params.get("pk").map(|s| s.as_str()).filter(|s| !s.is_empty());
 
-    let result = engine.create_table_from_file(&domain, name, format, header, pk, &body).await?;
+    let result = engine.create_table_from_file(&domain, name, format, header, pk, body).await?;
     let response = CreateFromFileResponse {
         table: result.table,
         columns: result

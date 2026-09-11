@@ -17,6 +17,7 @@ use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::engines::lsm::watcher::{WalEvent, WatchMessage};
+use crate::metrics::window::MetricsWindow;
 use crate::metrics::MetricsStore;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -182,12 +183,16 @@ impl Domain {
 /// Non-serializable, per-domain in-memory state.
 struct DomainRuntime {
     rate_limiter: RateLimiter,
+    /// The domain's metrics window, fetched on its first read and kept, so
+    /// reads record without a lookup (spec kv/031 A6).
+    metrics_window: OnceLock<Arc<MetricsWindow>>,
 }
 
 impl DomainRuntime {
     fn new(quota: DomainQuota) -> Arc<Self> {
         Arc::new(Self {
             rate_limiter: RateLimiter::new(quota),
+            metrics_window: OnceLock::new(),
         })
     }
 }
@@ -394,11 +399,12 @@ impl DomainRegistry {
     /// Finalises a purged domain: removes metadata from engine and cache.
     pub async fn finalize_domain_deletion(&self, name: &str) -> Result<()> {
         self.engine.write_tombstone(&sys_key(name)).await?;
-        // runtimes before domains: a create_domain that passed the domains
-        // check can then never lose its freshly inserted runtime.
+        // Metrics window, then runtime, then domain: a create_domain that
+        // passed the domains check can then neither lose its freshly
+        // inserted runtime nor cache the window removed after it.
+        self.metrics.remove_domain(name);
         self.runtimes.write().remove(name);
         self.domains.write().remove(name);
-        self.metrics.remove_domain(name);
         self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
@@ -482,6 +488,11 @@ impl DomainStore {
         k
     }
 
+    /// The domain's metrics window, looked up once per runtime.
+    fn metrics_window(&self) -> &MetricsWindow {
+        self.runtime.metrics_window.get_or_init(|| self.metrics.domain_window(&self.domain.name))
+    }
+
     fn validate_user_key(&self, key: &[u8]) -> Result<()> {
         anyhow::ensure!(!key.is_empty(), "400 Bad Request: Key must not be empty");
         anyhow::ensure!(
@@ -545,8 +556,8 @@ impl DomainStore {
     /// Like [`Self::get`], but also returns `expire_at` (absolute Unix
     /// seconds, 0 = no TTL) — spec kv/022, backs the `X-Expires-At` response
     /// header. Same validation, rate-limiting and hit/miss accounting as
-    /// `get`; unlike [`Self::get_with_snapshot`] this acquires its own
-    /// snapshot and goes through the read rate limiter.
+    /// `get`; unlike [`Self::get_with_snapshot`] this reads the current state
+    /// (unregistered, spec kv/031 A3) and goes through the read rate limiter.
     pub async fn get_with_expiry(&self, key: &[u8]) -> Result<(GetResult, u64)> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_read() {
@@ -554,13 +565,9 @@ impl DomainStore {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let start = std::time::Instant::now();
-        let snap = self.engine.snapshot();
-        let result = self
-            .engine
-            .get_with_expiry(&self.prefixed_key(key), snap.snapshot())
-            .await?;
+        let result = self.engine.get_latest_with_expiry(&self.prefixed_key(key)).await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.metrics.record_read(&self.domain.name, elapsed_us, !matches!(result.0, GetResult::Absent));
+        self.metrics.record_read(self.metrics_window(), elapsed_us, !matches!(result.0, GetResult::Absent));
         Ok(result)
     }
 
@@ -576,13 +583,9 @@ impl DomainStore {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let start = std::time::Instant::now();
-        let snap = self.engine.snapshot();
-        let result = self
-            .engine
-            .get_with_metadata(&self.prefixed_key(key), snap.snapshot())
-            .await?;
+        let result = self.engine.get_latest_with_metadata(&self.prefixed_key(key)).await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.metrics.record_read(&self.domain.name, elapsed_us, result.is_some());
+        self.metrics.record_read(self.metrics_window(), elapsed_us, result.is_some());
         Ok(result.map(|m| KeyMeta { expire_at: m.expire_at, last_modified_ms: m.last_modified_ms }))
     }
 
@@ -748,8 +751,8 @@ impl DomainStore {
     }
 
     /// Reads a value against an externally held snapshot, with `expire_at`
-    /// (spec general/006 backup export) instead of acquiring a snapshot
-    /// internally like [`Self::get`] — lets the backup writer pin every read
+    /// (spec general/006 backup export) instead of reading the current state
+    /// like [`Self::get`] — lets the backup writer pin every read
     /// of a domain export to the same point in time. Bypasses the rate
     /// limiter (admin maintenance operation, per spec general/006's
     /// authorization section).
@@ -974,6 +977,48 @@ mod tests {
         let err = registry.create_domain("beta").await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("409"));
+    }
+
+    // Spec kv/031 A3: KV point reads (value and meta) register no snapshot.
+    #[tokio::test]
+    async fn test_point_reads_register_no_snapshot() {
+        let (engine, registry, _dir) = make_setup().await;
+        let store = registry.default_store().await.unwrap();
+        store.put(b"k", b"v").await.unwrap();
+        let acquired = engine.snapshot_registry().acquire_count();
+
+        assert_eq!(store.get(b"k").await.unwrap(), GetResult::Present(b"v".to_vec()));
+        assert_eq!(store.get_with_expiry(b"k").await.unwrap().0, GetResult::Present(b"v".to_vec()));
+        assert!(store.get_meta(b"k").await.unwrap().is_some());
+        assert_eq!(engine.snapshot_registry().acquire_count(), acquired);
+    }
+
+    // Spec kv/031 test 8: after a domain's first read the read path looks up
+    // no map -- the window hangs off the domain's runtime -- and the numbers
+    // `/metrics` reports stay what they were.
+    #[tokio::test]
+    async fn test_reads_record_metrics_without_a_map_lookup() {
+        let (engine, _, _dir) = make_setup().await;
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let registry = DomainRegistry::recover(engine, DomainConfig::default(), Arc::clone(&metrics)).await.unwrap();
+        let store = registry.default_store().await.unwrap();
+        store.put(b"k", b"v").await.unwrap();
+        store.get(b"k").await.unwrap();
+        let lookups = metrics.domain_map_reads();
+
+        for _ in 0..100 {
+            assert_eq!(store.get(b"k").await.unwrap(), GetResult::Present(b"v".to_vec()));
+            assert!(store.get_meta(b"k").await.unwrap().is_some());
+        }
+        registry.default_store().await.unwrap().get(b"k").await.unwrap();
+        assert_eq!(metrics.domain_map_reads(), lookups, "the read path must not look up the domain map");
+
+        metrics.tick_all();
+        let window = metrics.get_domain_metrics("default").unwrap();
+        assert_eq!((window.read_ops, window.write_ops), (202, 1));
+        assert_eq!(window.cache_hit_rate, 1.0);
+        assert_eq!(metrics.system.total_reads.load(Ordering::Relaxed), 202);
+        assert_eq!(metrics.engine_metrics()[0].read_ops, 202);
     }
 
     // 3. put in domain A, get in domain B → None (isolation).

@@ -16,6 +16,7 @@ All notable changes to LuraDB are documented in this file.
 - Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.
 - SHM snapshots are only rebuilt after data changes, cutting tail latency of small requests on idle servers.
 - Key listings, counts and queries no longer read unrelated recent writes.
+- The read path is thread-safe: readers see one consistent version of an engine's sources, and the block cache is striped.
 
 ### Removed
 
@@ -30,6 +31,9 @@ All notable changes to LuraDB are documented in this file.
 - Startup detects data paths that point to the same location through different spellings or symlinks.
 - `lsm.memtable_size_threshold` and the `memtable_size_bytes` metric now measure actual bytes instead of an entry-count estimate.
 - The TTL sweeper no longer discards a write that races with it on the same key.
+- A write that ties with a TTL sweeper tombstone is no longer lost once both are compacted.
+- Value log generations are no longer dropped while a memtable a failed flush handed back still points into them.
+- Shutdown saves the manifest before it truncates the WAL, so a flush whose manifest save failed is no longer lost.
 
 ## [0.4.0] - 2026-08-29
 

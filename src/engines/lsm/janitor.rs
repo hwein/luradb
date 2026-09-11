@@ -8,14 +8,16 @@
 //! rolling the vLog forward one *generation* per cycle (spec kv/017):
 //!
 //! 1. Gate on the estimated dead-byte ratio; below the threshold, skip.
-//! 2. Open generation `N+1` and publish it as the active append target.
+//! 2. Open generation `N+1` and publish it as the active append target,
+//!    together with a fresh MemTable.
 //! 3. Seal every generation `<= N`, so no new pointer into them can appear.
 //! 4. Flush barrier: freeze and flush all MemTables, so every remaining
 //!    pointer into `<= N` resides in an SSTable.
 //! 5. Snapshot the manifest and collect the live `(file_id, offset, len)` set.
 //! 6. Copy those values into `N+1`, recording the remap.
 //! 7. Rebuild every snapshot SSTable with the remapped pointers.
-//! 8. Drop the old generations from the registry and delete their files.
+//! 8. Install a version without the old generations; each file is deleted
+//!    once no version holds its generation any more (spec kv/031 A5).
 //! 9. With a storage thread, roll one more generation that the thread owns, so
 //!    thread and local writers never append to the same file.
 //!
@@ -23,17 +25,17 @@
 //! periods, so normal reads and writes are never stalled.
 
 use crate::core::storage_thread::StorageHandle;
-use crate::engines::lsm::block_cache::BlockCache;
+use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::engine::LsmStorageEngine;
 #[cfg(test)]
 use crate::engines::lsm::engine::TestHook;
-use crate::engines::lsm::levels::LevelManager;
 use crate::engines::lsm::reader::SnapshotRegistry;
+use crate::engines::lsm::version::VersionCell;
 use crate::storage::file_manager::FileManager;
 use crate::storage::format::DataBlockValue;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
-use crate::storage::vlog::{generation_path, VLog, VLogRegistry};
+use crate::storage::vlog::{generation_path, VLog};
 use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -113,19 +115,19 @@ impl GcStats {
 
 /// Background garbage collector for the Value Log.
 pub struct Janitor {
-    /// All live vLog generations; GC publishes the new one here.
-    vlog: Arc<VLogRegistry>,
+    /// The engine's version: the GC reads the vLog generations from it and
+    /// installs every change it makes (spec kv/031 A1).
+    version: Arc<VersionCell>,
 
     /// Canonical vLog path — generation 1 and base for every later generation.
     vlog_base_path: PathBuf,
 
-    level_manager: Arc<LevelManager>,
     manifest: Arc<RwLock<Manifest>>,
     manifest_manager: Arc<ManifestManager>,
     file_manager: Arc<FileManager>,
 
     /// Shared block cache — entries of SSTables replaced by GC are invalidated.
-    block_cache: Arc<Mutex<BlockCache>>,
+    block_cache: Arc<StripedBlockCache>,
 
     /// Used to check whether a GC cycle is safe (e.g. no active readers that
     /// might hold stale vLog offsets).  Currently informational only — the GC
@@ -164,6 +166,16 @@ pub struct Janitor {
     /// retire (spec general/029). `None` only for fixtures without an engine.
     maintenance_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 
+    /// The engine's write drain (`in_flight_writes`): held while a new active
+    /// generation and its fresh MemTable are installed, so no writer sits
+    /// between its stamp and its apply across that rotation (spec kv/029).
+    /// `None` only for fixtures without writers.
+    write_drain: Option<Arc<tokio::sync::RwLock<()>>>,
+
+    /// Generations already out of the current version whose files wait until
+    /// no older version holds them (spec kv/031 A5).
+    retired: Mutex<Vec<Arc<VLog>>>,
+
     /// Test-only pause point between opening the rebuilt readers and
     /// installing them (spec general/028).
     #[cfg(test)]
@@ -178,14 +190,13 @@ pub struct Janitor {
 impl Janitor {
     /// Creates a new Janitor.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        vlog: Arc<VLogRegistry>,
+    pub(crate) fn new(
+        version: Arc<VersionCell>,
         vlog_base_path: PathBuf,
-        level_manager: Arc<LevelManager>,
         manifest: Arc<RwLock<Manifest>>,
         manifest_manager: Arc<ManifestManager>,
         file_manager: Arc<FileManager>,
-        block_cache: Arc<Mutex<BlockCache>>,
+        block_cache: Arc<StripedBlockCache>,
         snapshot_registry: Arc<SnapshotRegistry>,
         config: JanitorConfig,
         use_mmap: bool,
@@ -195,11 +206,11 @@ impl Janitor {
         flush_barrier: Option<FlushBarrier>,
         flush_lock: Option<Arc<tokio::sync::Mutex<()>>>,
         maintenance_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+        write_drain: Option<Arc<tokio::sync::RwLock<()>>>,
     ) -> Self {
         Self {
-            vlog,
+            version,
             vlog_base_path,
-            level_manager,
             manifest,
             manifest_manager,
             file_manager,
@@ -213,6 +224,8 @@ impl Janitor {
             flush_barrier,
             flush_lock,
             maintenance_lock,
+            write_drain,
+            retired: Mutex::new(Vec::new()),
             #[cfg(test)]
             install_hook: None,
             #[cfg(test)]
@@ -260,6 +273,10 @@ impl Janitor {
                 eprintln!("[Janitor] GC cycle failed: {e}");
             }
         }
+
+        // The rest goes now; a reader still holding one keeps reading from its
+        // open descriptor.
+        self.delete_retired_generations(true).await;
     }
 
     // -----------------------------------------------------------------------
@@ -269,10 +286,16 @@ impl Janitor {
     /// Runs one GC cycle.
     ///
     /// Returns [`GcStats`] describing what happened.  If the dead-byte ratio
-    /// is below the threshold the cycle is a no-op.
+    /// is below the threshold the cycle is a no-op. Every run, a skipped one
+    /// included, first deletes the retired generations no version holds any
+    /// more.
     pub async fn run_gc(&self) -> Result<GcStats> {
-        let source_ids = self.vlog.ids();
-        let vlog_size = self.vlog.total_size();
+        self.delete_retired_generations(false).await;
+
+        let (source_ids, vlog_size) = {
+            let version = self.version.get();
+            (version.vlog_ids(), version.vlog_size())
+        };
 
         // ── Decide whether to run ────────────────────────────────────────
         //
@@ -321,14 +344,17 @@ impl Janitor {
         let new_id = source_ids.iter().max().copied().unwrap_or(0) + 1;
         let new_path = generation_path(&self.vlog_base_path, new_id);
         let new_vlog = Arc::new(VLog::open(&new_path, new_id).await?);
-        self.vlog.set_active(Arc::clone(&new_vlog));
+        self.activate(Arc::clone(&new_vlog)).await;
 
         // Invariant 1: seal AFTER publishing N+1 and BEFORE the flush barrier.
         // A racing append then fails with `Sealed` and retries against N+1, so
         // the set of pointers into the old generations is closed from here on.
-        for id in &source_ids {
-            if let Some(vlog) = self.vlog.get(*id) {
-                vlog.seal();
+        {
+            let version = self.version.get();
+            for id in &source_ids {
+                if let Some(vlog) = version.vlog.get(id) {
+                    vlog.seal();
+                }
             }
         }
 
@@ -360,7 +386,7 @@ impl Janitor {
             hook.pause().await;
         }
 
-        {
+        let retired = {
             // Manifest swap and level install under the flush lock: what the
             // reload reads from the manifest is exactly what the read path
             // ends up with, an SSTable flushed since the snapshot included
@@ -370,19 +396,19 @@ impl Janitor {
                 None => None,
             };
             self.apply_manifest_update(&old_file_ids, &new_level_metas);
-            self.reload_level_readers().await?;
-        }
+            self.reload_level_readers().await?
+        };
 
         // ── Persist manifest ───────────────────────────────────────────────
         let manifest_for_save = self.manifest.read().clone();
         self.manifest_manager.save(&manifest_for_save).await?;
 
-        self.retire_old_sstables(&old_file_ids).await;
+        self.retire_old_sstables(&retired, &old_file_ids).await;
 
         // ── Drop the source generations ────────────────────────────────────
         //
-        // No SSTable references them anymore. Readers that still hold an `Arc`
-        // finish against their already-open file descriptor.
+        // No SSTable references them anymore. A reader's version that still
+        // holds one keeps its file until that version is dropped.
         let live_bytes_by_generation = live_bytes_per_generation(&source_ids, &live);
         let live_bytes: u64 = live_bytes_by_generation.iter().map(|(_, b)| *b).sum();
         let reclaimed_bytes = self.retire_generations(&source_ids).await.saturating_sub(live_bytes);
@@ -394,21 +420,14 @@ impl Janitor {
         // a local cursor, while the thread seeds its own cursor from the file
         // length at reopen time — everything written after that stat would be
         // overwritten. Roll one more generation that only the thread writes.
-        //
-        // One-fd window (perf/013): a reader holding a stale remote `Arc` of a
-        // source generation now gets a clean generation-mismatch error from
-        // the reopened fd instead of silently reading the wrong file — the
-        // window is detected, not avoided (avoidance needs multi-fd, out of
-        // scope).
+        // Reads never use the thread's fd (spec kv/031 A5), so the reopen
+        // leaves every reader of a source generation on its own descriptor.
         if let Some(handle) = &self.storage_handle {
             let thread_id = new_id + 1;
             let thread_path = generation_path(&self.vlog_base_path, thread_id);
             handle.vlog_reopen(thread_path.clone(), thread_id).await?;
-            self.vlog.set_active(Arc::new(VLog::with_storage_handle(
-                &thread_path,
-                handle.clone(),
-                thread_id,
-            )));
+            self.activate(Arc::new(VLog::with_storage_handle(&thread_path, handle.clone(), thread_id)?))
+                .await;
             // Invariant 1 again: seal only after publishing. In-flight appends
             // past the seal check finish alone in the local file, later fetches
             // retry against `N+2`. `N+1` stays registered and readable; the next
@@ -442,6 +461,16 @@ impl Janitor {
     // -----------------------------------------------------------------------
     // GC phases (helpers of run_gc)
     // -----------------------------------------------------------------------
+
+    /// Installs `vlog` as the active generation with a fresh MemTable, under
+    /// the engine's write drain (see [`Self::write_drain`]).
+    async fn activate(&self, vlog: Arc<VLog>) {
+        let _drain = match &self.write_drain {
+            Some(drain) => Some(drain.write().await),
+            None => None,
+        };
+        self.version.install(|v| v.with_active_vlog(vlog));
+    }
 
     /// Collects all live value pointers `(file_id, offset, len)` from every
     /// SSTable.
@@ -493,29 +522,51 @@ impl Janitor {
         target: &Arc<VLog>,
     ) -> Result<HashMap<(u32, u64), u64>> {
         let mut remap: HashMap<(u32, u64), u64> = HashMap::with_capacity(live.len());
+        let version = self.version.get();
         for (file_id, old_offset, len) in live {
-            let source = self.vlog.get(*file_id).ok_or_else(|| {
+            let source = version.vlog.get(file_id).ok_or_else(|| {
                 anyhow::anyhow!("live pointer references unknown vLog generation {file_id}")
             })?;
-            let value = source.read(*old_offset, *len as usize).await?;
+            // On the blocking pool: the values a GC copies are mostly cold.
+            let (source, offset, len) = (Arc::clone(source), *old_offset, *len as usize);
+            let value = tokio::task::spawn_blocking(move || source.read(offset, len)).await??;
             let new_offset = target.append(&value).await?;
             remap.insert((*file_id, *old_offset), new_offset);
         }
         Ok(remap)
     }
 
-    /// Removes the source generations from the registry and deletes their
-    /// files; returns the total number of bytes they held.
+    /// Installs a version without the source generations and queues them for
+    /// deletion; returns the total number of bytes they held.
     async fn retire_generations(&self, source_ids: &[u32]) -> u64 {
-        let mut removed_bytes = 0;
-        for id in source_ids {
-            let Some(vlog) = self.vlog.remove(*id) else { continue };
-            removed_bytes += vlog.size();
+        let mut retired = Vec::new();
+        self.version.install(|v| {
+            let mut next = v.clone();
+            let generations = Arc::make_mut(&mut next.vlog);
+            retired.extend(source_ids.iter().filter_map(|id| generations.remove(id)));
+            next
+        });
+        let removed_bytes = retired.iter().map(|vlog| vlog.size()).sum();
+        self.retired.lock().extend(retired);
+        self.delete_retired_generations(false).await;
+        removed_bytes
+    }
+
+    /// Deletes the files of retired generations. Without `held_too`, only
+    /// those the queue holds the last reference to: a reader's version that
+    /// still names one keeps it.
+    async fn delete_retired_generations(&self, held_too: bool) {
+        let doomed: Vec<Arc<VLog>> = {
+            let mut retired = self.retired.lock();
+            let (doomed, kept) = retired.drain(..).partition(|vlog| held_too || Arc::strong_count(vlog) == 1);
+            *retired = kept;
+            doomed
+        };
+        for vlog in doomed {
             if let Err(e) = tokio::fs::remove_file(vlog.path()).await {
-                eprintln!("[Janitor] Warning: could not delete vLog generation {id}: {e}");
+                eprintln!("[Janitor] Warning: could not delete vLog generation {}: {e}", vlog.id());
             }
         }
-        removed_bytes
     }
 
     /// Rebuilds one SSTable with pointers remapped into generation `new_id`.
@@ -617,28 +668,21 @@ impl Janitor {
         }
     }
 
-    /// Reopens every level from the current manifest — the rebuilt tables plus
-    /// whatever else the manifest gained meanwhile — and swaps them in.
+    /// Swaps in readers for every level of the current manifest — the rebuilt
+    /// tables plus whatever else the manifest gained meanwhile — and returns
+    /// the readers the install dropped. A table the version already holds
+    /// keeps its reader (see [`LsmStorageEngine::level_readers`]).
     ///
-    /// Install before remove, no await in between — readers sample sources
-    /// without a version (spec general/028): every level keeps its old readers
-    /// until all new ones are open, then they change together.
-    async fn reload_level_readers(&self) -> Result<()> {
+    /// Every level keeps its old readers until all new ones are open, then
+    /// they change in one install (spec general/028, kv/031 A1).
+    async fn reload_level_readers(&self) -> Result<Vec<Arc<SSTableReader>>> {
+        let current = self.version.get();
         let num_levels = self.manifest.read().levels.len();
         let mut updates = Vec::with_capacity(num_levels);
         for level_idx in 0..num_levels {
             let metas = self.manifest.read().get_level(level_idx).to_vec();
-            let mut sstables = Vec::new();
-            for meta in &metas {
-                sstables.push(Arc::new(
-                    LsmStorageEngine::open_sstable_reader(
-                        &self.file_manager,
-                        meta.file_id,
-                        self.use_mmap,
-                    )
-                    .await?,
-                ));
-            }
+            let sstables =
+                LsmStorageEngine::level_readers(&self.file_manager, &current, &metas, self.use_mmap).await?;
             updates.push((level_idx, sstables));
         }
 
@@ -647,18 +691,23 @@ impl Janitor {
             hook.pause().await;
         }
 
-        self.level_manager.replace_levels(updates);
-        Ok(())
+        let mut dropped = Vec::new();
+        self.version.install(|v| {
+            let next = v.with_levels(updates);
+            dropped = v.sstables_dropped_by(&next);
+            next
+        });
+        Ok(dropped)
     }
 
-    /// Invalidates cached blocks of the replaced SSTables, then deletes the files.
-    async fn retire_old_sstables(&self, old_file_ids: &[(usize, u64)]) {
-        // Cache lock scope ends before the await-ing deletes (invalidate before delete).
-        {
-            let mut cache = self.block_cache.lock();
-            for (_, file_id) in old_file_ids {
-                cache.invalidate_file(*file_id);
-            }
+    /// Retires the dropped readers, invalidates cached blocks of the replaced
+    /// SSTables, then deletes the files.
+    async fn retire_old_sstables(&self, retired: &[Arc<SSTableReader>], old_file_ids: &[(usize, u64)]) {
+        for reader in retired {
+            reader.retire();
+        }
+        for (_, file_id) in old_file_ids {
+            self.block_cache.invalidate_file(*file_id);
         }
         for (_, file_id) in old_file_ids {
             if let Err(e) = self.file_manager.delete_sstable(*file_id).await {
@@ -689,8 +738,15 @@ mod tests {
     use super::*;
     use crate::config::BlockCacheConfig;
     use crate::core::storage_thread::{StorageThread, StorageThreadConfig};
+    use crate::engines::lsm::version::Version;
     use crate::storage::format::ValuePointer;
     use crate::storage::vlog::VLogError;
+
+    /// The engine-less fixtures' state: `vlog` as the only generation, plus
+    /// `levels`.
+    fn version_over(vlog: Arc<VLog>, levels: Vec<(usize, Vec<Arc<SSTableReader>>)>) -> Arc<VersionCell> {
+        Arc::new(VersionCell::new(Version::new(vlog).with_levels(levels)))
+    }
 
     fn st_config() -> StorageThreadConfig {
         StorageThreadConfig {
@@ -705,9 +761,8 @@ mod tests {
     /// Everything a storage-thread GC test needs; `st` must be shut down last.
     struct StFixture {
         st: StorageThread,
-        handle: StorageHandle,
         vlog_path: PathBuf,
-        registry: Arc<VLogRegistry>,
+        version: Arc<VersionCell>,
         janitor: Janitor,
         live_val: Vec<u8>,
     }
@@ -719,7 +774,7 @@ mod tests {
         let (st, handle) =
             StorageThread::new(st_config(), dir.join("wal"), vlog_path.clone()).unwrap();
 
-        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1));
+        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
         let live_val = vec![b'L'; 100];
         let live_off = vlog.append(&live_val).await.unwrap();
         vlog.append(&vec![b'D'; 900]).await.unwrap();
@@ -747,28 +802,15 @@ mod tests {
         });
         let manifest = Arc::new(RwLock::new(manifest));
 
-        let level_manager = Arc::new(LevelManager::new());
-        level_manager.replace_level(
-            0,
-            vec![Arc::new(
-                LsmStorageEngine::open_sstable_reader(&file_manager, file_id, false)
-                    .await
-                    .unwrap(),
-            )],
-        );
+        let reader = LsmStorageEngine::open_sstable_reader(&file_manager, file_id, false).await.unwrap();
+        let version = version_over(vlog, vec![(0, vec![Arc::new(reader)])]);
 
         let bc = BlockCacheConfig::default();
-        let block_cache = Arc::new(Mutex::new(BlockCache::new(
-            bc.capacity_bytes,
-            bc.small_ratio,
-            bc.ghost_capacity,
-        )));
-        let registry = Arc::new(VLogRegistry::new(vlog));
+        let block_cache = Arc::new(StripedBlockCache::new(bc.capacity_bytes, bc.small_ratio, bc.ghost_capacity));
 
         let janitor = Janitor::new(
-            Arc::clone(&registry),
+            Arc::clone(&version),
             vlog_path.clone(),
-            level_manager,
             manifest,
             Arc::new(ManifestManager::new(dir)),
             file_manager,
@@ -782,9 +824,10 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
-        StFixture { st, handle, vlog_path, registry, janitor, live_val }
+        StFixture { st, vlog_path, version, janitor, live_val }
     }
 
     // Finding 3: a GC pass with an active storage thread must leave the vLog
@@ -802,49 +845,44 @@ mod tests {
 
         // The thread rolled a further generation instead of taking over the
         // copy target; both stay registered.
-        let swapped = fx.registry.active();
+        let version = fx.version.get();
+        let swapped = Arc::clone(&version.active_vlog);
         assert_eq!(swapped.id(), 3);
         assert_eq!(swapped.path(), generation_path(&fx.vlog_path, 3));
-        assert_eq!(fx.registry.ids(), vec![2, 3]);
+        assert_eq!(version.vlog_ids(), vec![2, 3]);
 
         // The live value survives at its remapped offset (0 — first value
         // copied) in the copy generation, which is sealed.
-        assert_eq!(fx.registry.read(2, 0, 100).await.unwrap(), fx.live_val);
-        assert!(fx.registry.get(2).unwrap().is_sealed());
+        assert_eq!(version.vlog[&2].read(0, 100).unwrap(), fx.live_val);
+        assert!(version.vlog[&2].is_sealed());
 
         // Remote append still routes through the thread and starts at 0 in the
-        // fresh generation; the storage-thread handle sees the same bytes.
+        // fresh generation, the thread's own file.
         let new_off = swapped.append(b"AFTER-GC").await.unwrap();
         assert_eq!(new_off, 0);
-        assert_eq!(swapped.read(new_off, 8).await.unwrap(), b"AFTER-GC");
-        assert_eq!(fx.handle.vlog_read(0, 8, 3).await.unwrap(), b"AFTER-GC");
+        assert_eq!(swapped.read(new_off, 8).unwrap(), b"AFTER-GC");
+        assert_eq!(std::fs::read(generation_path(&fx.vlog_path, 3)).unwrap(), b"AFTER-GC");
 
         fx.st.shutdown();
     }
 
-    // Spec perf/013 test 2: a remote `Arc` of the source generation grabbed
-    // before the GC gets a clean error after the reopen instead of bytes read
-    // from the thread's new file -- the one-fd read window is detected, not
-    // just theoretically possible in a race.
+    // Spec kv/031 test 7 (storage thread): reads never go through the thread,
+    // so a source generation held across the GC still reads its own file,
+    // which stays on disk until the holder lets go.
     #[tokio::test]
-    async fn test_gc_stale_source_generation_read_fails_after_reopen() {
+    async fn test_gc_keeps_a_held_source_generation_readable_until_released() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut fx = storage_thread_fixture(dir.path()).await;
-
-        // Grab the Arc for the source generation (1) before GC swaps and
-        // retires it -- deterministic, no race required.
-        let stale = fx.registry.get(1).unwrap();
-        assert_eq!(stale.id(), 1);
+        let held = Arc::clone(&fx.version.get().vlog[&1]);
 
         assert!(fx.janitor.run_gc().await.unwrap().ran);
+        assert!(!fx.version.get().vlog.contains_key(&1), "generation 1 is retired");
+        assert_eq!(held.read(0, 100).unwrap(), fx.live_val, "the thread has moved on to generation 3");
+        assert!(fx.vlog_path.exists(), "a holder keeps the file");
 
-        // The thread now owns generation 3; a read through the stale handle
-        // is a generation mismatch, not silently-wrong bytes from file 3.
-        let err = stale.read(0, 100).await.unwrap_err();
-        match err {
-            VLogError::Io(e) => assert!(e.to_string().contains("generation mismatch"), "{e}"),
-            other => panic!("expected an I/O error wrapping a generation mismatch, got {other:?}"),
-        }
+        drop(held);
+        assert!(!fx.janitor.run_gc().await.unwrap().ran, "nothing left to collect");
+        assert!(!fx.vlog_path.exists(), "the next run deletes the released generation");
 
         fx.st.shutdown();
     }
@@ -859,8 +897,9 @@ mod tests {
 
         // A late writer still holding the copy generation is bounced to the
         // active one instead of writing a second cursor into that file.
-        let copy_gen = fx.registry.get(2).unwrap();
-        let active = fx.registry.active();
+        let version = fx.version.get();
+        let copy_gen = Arc::clone(&version.vlog[&2]);
+        let active = Arc::clone(&version.active_vlog);
         assert_ne!(copy_gen.path(), active.path());
         assert!(matches!(copy_gen.append(b"late").await, Err(VLogError::Sealed { id: 2 })));
 
@@ -874,7 +913,7 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(active.path()).unwrap().len(), 40);
         assert_eq!(std::fs::metadata(copy_gen.path()).unwrap().len(), copy_len);
-        assert_eq!(copy_gen.read(0, 100).await.unwrap(), fx.live_val);
+        assert_eq!(copy_gen.read(0, 100).unwrap(), fx.live_val);
 
         fx.st.shutdown();
     }
@@ -885,9 +924,8 @@ mod tests {
     /// inspect it keeps its own clone.
     fn build_janitor(
         dir: &std::path::Path,
-        vlog_shared: Arc<VLogRegistry>,
+        version: Arc<VersionCell>,
         vlog_path: PathBuf,
-        level_manager: Arc<LevelManager>,
         manifest: Arc<RwLock<Manifest>>,
         file_manager: Arc<FileManager>,
         config: JanitorConfig,
@@ -895,23 +933,19 @@ mod tests {
     ) -> Janitor {
         let bc = BlockCacheConfig::default();
         Janitor::new(
-            vlog_shared,
+            version,
             vlog_path,
-            level_manager,
             manifest,
             Arc::new(ManifestManager::new(dir)),
             file_manager,
-            Arc::new(Mutex::new(BlockCache::new(
-                bc.capacity_bytes,
-                bc.small_ratio,
-                bc.ghost_capacity,
-            ))),
+            Arc::new(StripedBlockCache::new(bc.capacity_bytes, bc.small_ratio, bc.ghost_capacity)),
             Arc::new(SnapshotRegistry::new()),
             config,
             false,
             Arc::new(AtomicBool::new(false)),
             None,
             janitor_runs,
+            None,
             None,
             None,
             None,
@@ -958,25 +992,16 @@ mod tests {
         let mut manifest = Manifest::new();
         manifest.add_sstable(meta.clone());
         let manifest = Arc::new(RwLock::new(manifest));
-        let level_manager = Arc::new(LevelManager::new());
-        level_manager.replace_level(
-            0,
-            vec![Arc::new(
-                LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false)
-                    .await
-                    .unwrap(),
-            )],
-        );
-        let vlog_shared = Arc::new(VLogRegistry::new(vlog));
-        let before = vlog_shared.active();
+        let reader = LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false).await.unwrap();
+        let version = version_over(vlog, vec![(0, vec![Arc::new(reader)])]);
+        let before = Arc::clone(&version.get().active_vlog);
         let janitor_runs = Arc::new(AtomicU64::new(0));
 
         // (a) vLog smaller than min_vlog_size_bytes.
         let janitor = build_janitor(
             dir.path(),
-            Arc::clone(&vlog_shared),
+            Arc::clone(&version),
             vlog_path.clone(),
-            Arc::clone(&level_manager),
             Arc::clone(&manifest),
             Arc::clone(&file_manager),
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
@@ -988,9 +1013,8 @@ mod tests {
         // (b) dead ratio below threshold.
         let janitor = build_janitor(
             dir.path(),
-            Arc::clone(&vlog_shared),
+            Arc::clone(&version),
             vlog_path.clone(),
-            level_manager,
             Arc::clone(&manifest),
             Arc::clone(&file_manager),
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.95, min_vlog_size_bytes: 1 },
@@ -1002,7 +1026,7 @@ mod tests {
         assert_eq!(janitor_runs.load(Ordering::Relaxed), 0, "skip cycles (ran == false) must not increment janitor_runs");
 
         // Nothing was touched: same vLog Arc, no new generation, SSTable intact.
-        let after = vlog_shared.active();
+        let after = Arc::clone(&version.get().active_vlog);
         assert!(Arc::ptr_eq(&before, &after));
         assert!(!generation_path(&vlog_path, 2).exists());
         assert_eq!(manifest.read().get_level(0)[0].file_id, meta.file_id);
@@ -1030,9 +1054,8 @@ mod tests {
 
         let janitor = build_janitor(
             dir.path(),
-            Arc::new(VLogRegistry::new(vlog)),
+            version_over(vlog, Vec::new()),
             vlog_path,
-            Arc::new(LevelManager::new()),
             Arc::new(RwLock::new(manifest)),
             file_manager,
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
@@ -1067,25 +1090,18 @@ mod tests {
         manifest.add_sstable(l1.clone());
         let manifest = Arc::new(RwLock::new(manifest));
 
-        let level_manager = Arc::new(LevelManager::new());
+        let mut levels = Vec::new();
         for meta in [&l0, &l1] {
-            level_manager.replace_level(
-                meta.level,
-                vec![Arc::new(
-                    LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false)
-                        .await
-                        .unwrap(),
-                )],
-            );
+            let reader = LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false).await.unwrap();
+            levels.push((meta.level, vec![Arc::new(reader)]));
         }
-        let vlog_shared = Arc::new(VLogRegistry::new(vlog));
+        let version = version_over(vlog, levels);
         let janitor_runs = Arc::new(AtomicU64::new(0));
 
         let janitor = build_janitor(
             dir.path(),
-            Arc::clone(&vlog_shared),
+            Arc::clone(&version),
             vlog_path.clone(),
-            level_manager,
             Arc::clone(&manifest),
             Arc::clone(&file_manager),
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 1 },
@@ -1099,10 +1115,10 @@ mod tests {
         assert_eq!(janitor_runs.load(Ordering::Relaxed), 1, "a ran == true cycle must increment janitor_runs");
 
         // Deduped copy: A at 0, B at 100, nothing else.
-        let swapped = vlog_shared.active();
+        let swapped = Arc::clone(&version.get().active_vlog);
         assert_eq!(swapped.size(), 200);
-        assert_eq!(swapped.read(0, 100).await.unwrap(), val_a);
-        assert_eq!(swapped.read(100, 100).await.unwrap(), val_b);
+        assert_eq!(swapped.read(0, 100).unwrap(), val_a);
+        assert_eq!(swapped.read(100, 100).unwrap(), val_b);
 
         // Both levels rebuilt with pointers remapped into generation 2; old
         // files deleted.
@@ -1138,6 +1154,6 @@ mod tests {
         // The source generation is gone, the new one carries the live values.
         assert!(!vlog_path.exists());
         assert!(generation_path(&vlog_path, 2).exists());
-        assert_eq!(vlog_shared.ids(), vec![2]);
+        assert_eq!(version.get().vlog_ids(), vec![2]);
     }
 }

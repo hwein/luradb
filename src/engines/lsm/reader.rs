@@ -3,15 +3,15 @@
 //! This module implements the read logic for the LSM-Tree with snapshot isolation.
 //! It searches through multiple levels: MemTable → Immutable MemTables → SSTables.
 
-use crate::engines::lsm::block_cache::BlockCache;
+use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::hlc::HLCTimestamp;
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::memtable::{MemTable, Value};
+use crate::engines::lsm::version::Version;
 use crate::storage::format::{self, CachedValue, VersionState};
 use crate::storage::sstable::SSTableReader;
-use crate::storage::vlog::VLogRegistry;
+use crate::storage::vlog::VLogError;
 use anyhow::Result;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::collections::{BinaryHeap, BTreeSet};
 use std::cmp::Ordering;
@@ -69,20 +69,11 @@ impl Snapshot {
 /// This reader performs point lookups and scans across multiple levels of the LSM-Tree,
 /// applying MVCC filtering to return only the appropriate version for a given snapshot.
 pub struct LsmReader {
-    /// Active MemTable (currently being written to)
-    memtable: Arc<MemTable>,
-
-    /// Immutable MemTables (not yet flushed to disk)
-    immutable_memtables: Vec<Arc<MemTable>>,
-
-    /// SSTables organized by level (L0, L1, ..., Ln)
-    sstables: Vec<Vec<Arc<SSTableReader>>>,
-
-    /// Value log generations for dereferencing large values
-    vlog: Arc<VLogRegistry>,
+    /// Every source of this read, vLog generations included (spec kv/031 A1).
+    version: Arc<Version>,
 
     /// Shared S3-FIFO block cache — checked before every SSTable block read.
-    cache: Arc<Mutex<BlockCache>>,
+    cache: Arc<StripedBlockCache>,
 }
 
 /// Three-valued result of a KV point read (spec kv/018): a live value, an
@@ -127,53 +118,29 @@ pub struct ValueWithMetadata {
 }
 
 impl LsmReader {
-    /// Creates a new LSM reader.
-    pub fn new(
-        memtable: Arc<MemTable>,
-        vlog: Arc<VLogRegistry>,
-        cache: Arc<Mutex<BlockCache>>,
-    ) -> Self {
-        Self {
-            memtable,
-            immutable_memtables: Vec::new(),
-            sstables: Vec::new(),
-            vlog,
-            cache,
-        }
+    /// A reader over `version`'s sources.
+    pub(crate) fn new(version: Arc<Version>, cache: Arc<StripedBlockCache>) -> Self {
+        Self { version, cache }
     }
 
-    /// Sets the immutable MemTables for this reader.
-    pub fn set_immutable_memtables(&mut self, tables: Vec<Arc<MemTable>>) {
-        self.immutable_memtables = tables;
-    }
-
-    /// Sets the SSTables for this reader.
-    pub fn set_sstables(&mut self, sstables: Vec<Vec<Arc<SSTableReader>>>) {
-        self.sstables = sstables;
-    }
-
-    /// MemTables newest-first: active, then immutables newest-to-oldest.
-    fn memtables_newest_first(&self) -> impl Iterator<Item = &MemTable> + '_ {
-        std::iter::once(&*self.memtable)
-            .chain(self.immutable_memtables.iter().rev().map(|m| &**m))
-    }
-
-    /// SSTables newest-first: L0 newest-to-oldest (flush order, newest last),
-    /// then L1..Ln (key-disjoint, order irrelevant).
-    fn sstables_newest_first(&self) -> impl Iterator<Item = &Arc<SSTableReader>> + '_ {
-        self.sstables
-            .first()
-            .into_iter()
-            .flat_map(|l0| l0.iter().rev())
-            .chain(self.sstables.iter().skip(1).flatten())
+    /// Resolves a vLog pointer through this reader's own version, never
+    /// through a live registry: a generation retired meanwhile stays open for
+    /// as long as the version holds it (spec kv/031 A5).
+    async fn read_vlog(&self, file_id: u32, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let vlog = self
+            .version
+            .vlog
+            .get(&file_id)
+            .ok_or(VLogError::UnknownGeneration { id: file_id })?;
+        Ok(vlog.read_async(offset, len).await?)
     }
 
     /// Performs a point lookup with MVCC support.
     ///
-    /// Sources are searched newest-first (see [`Self::memtables_newest_first`]
-    /// then [`Self::sstables_newest_first`]); each yields its newest version
-    /// <= snapshot timestamp, so the first hit decides for good. Returns None
-    /// if the key is absent or that version is a tombstone.
+    /// Sources are searched newest-first ([`Version::memtables_newest_first`]
+    /// then [`Version::sstables_newest_first`]); each yields its newest
+    /// version <= snapshot timestamp, so the first hit decides for good.
+    /// Returns None if the key is absent or that version is a tombstone.
     pub async fn get(&self, user_key: &[u8], snapshot: &Snapshot) -> Result<GetResult> {
         Ok(self.get_with_expiry(user_key, snapshot).await?.0)
     }
@@ -184,12 +151,12 @@ impl LsmReader {
     /// Same newest-first source order and MVCC/TTL/tombstone semantics as
     /// `get`, VLog pointers are dereferenced.
     pub async fn get_with_expiry(&self, user_key: &[u8], snapshot: &Snapshot) -> Result<(GetResult, u64)> {
-        for memtable in self.memtables_newest_first() {
+        for memtable in self.version.memtables_newest_first() {
             if let Some(result) = self.get_from_memtable(memtable, user_key, snapshot).await? {
                 return Ok(result);
             }
         }
-        for sstable in self.sstables_newest_first() {
+        for sstable in self.version.sstables_newest_first() {
             if let Some(result) = self.get_from_sstable(sstable, user_key, snapshot).await? {
                 return Ok(result);
             }
@@ -215,7 +182,7 @@ impl LsmReader {
                     }
                     Value::Pointer { file_id, offset, len, expire_at } => {
                         if is_expired(expire_at) { return Ok(Some((GetResult::Absent, 0))); }
-                        let v = self.vlog.read(file_id, offset, len).await?;
+                        let v = self.read_vlog(file_id, offset, len).await?;
                         Ok(Some((GetResult::Present(v), expire_at.unwrap_or(0))))
                     }
                     Value::Null => Ok(Some((GetResult::Null, 0))),
@@ -241,10 +208,7 @@ impl LsmReader {
         let search_key = InternalKey::new(user_key.to_vec(), snapshot.timestamp());
         let encoded_key = search_key.encode();
 
-        let maybe_value = {
-            let mut cache = self.cache.lock();
-            sstable.get_with_cache(&encoded_key, &mut *cache)?
-        };
+        let maybe_value = sstable.get_with_cache(&encoded_key, &self.cache)?;
 
         // Zero-copy until here (spec perf/002): the value is materialized
         // exactly once, after the visible version has been found.
@@ -256,7 +220,7 @@ impl LsmReader {
                 if format::is_expired(expire_at, now_secs()) {
                     return Ok(Some((GetResult::Absent, 0)));
                 }
-                let value = self.vlog.read(file_id, value_offset, value_len as usize).await?;
+                let value = self.read_vlog(file_id, value_offset, value_len as usize).await?;
                 Ok(Some((GetResult::Present(value), expire_at)))
             }
             Some(value) => {
@@ -279,12 +243,12 @@ impl LsmReader {
         user_key: &[u8],
         snapshot: &Snapshot,
     ) -> Result<Option<ValueWithMetadata>> {
-        for memtable in self.memtables_newest_first() {
+        for memtable in self.version.memtables_newest_first() {
             if let Some(result) = self.meta_from_memtable(memtable, user_key, snapshot)? {
                 return Ok(result);
             }
         }
-        for sstable in self.sstables_newest_first() {
+        for sstable in self.version.sstables_newest_first() {
             if let Some(result) = self.meta_from_sstable(sstable, user_key, snapshot)? {
                 return Ok(result);
             }
@@ -328,10 +292,7 @@ impl LsmReader {
         let search_key = InternalKey::new(user_key.to_vec(), snapshot.timestamp());
         let encoded_key = search_key.encode();
 
-        let maybe_value = {
-            let mut cache = self.cache.lock();
-            sstable.get_with_cache_and_ts(&encoded_key, &mut *cache)?
-        };
+        let maybe_value = sstable.get_with_cache_and_ts(&encoded_key, &self.cache)?;
 
         match maybe_value {
             None => Ok(None),
@@ -366,42 +327,19 @@ impl LsmReader {
         snapshot: &Snapshot,
     ) -> Result<Option<(Timestamp, VersionState)>> {
         let now = now_secs();
-        for memtable in self.memtables_newest_first() {
+        for memtable in self.version.memtables_newest_first() {
             if let Some((value, ts)) = memtable.get_with_ts(user_key, snapshot.timestamp()) {
                 return Ok(Some((ts, value.version_state(now))));
             }
         }
 
         let encoded_key = InternalKey::new(user_key.to_vec(), snapshot.timestamp()).encode();
-        for sstable in self.sstables_newest_first() {
-            let hit = {
-                let mut cache = self.cache.lock();
-                sstable.get_with_cache_and_ts(&encoded_key, &mut *cache)?
-            };
-            if let Some((value, ts)) = hit {
+        for sstable in self.version.sstables_newest_first() {
+            if let Some((value, ts)) = sstable.get_with_cache_and_ts(&encoded_key, &self.cache)? {
                 return Ok(Some((ts, value.version_state(now))));
             }
         }
         Ok(None)
-    }
-
-    /// Adds an SSTable to a specific level.
-    ///
-    /// This is used during flush and compaction operations.
-    #[allow(dead_code)]
-    pub fn add_sstable(&mut self, level: usize, sstable: Arc<SSTableReader>) {
-        while self.sstables.len() <= level {
-            self.sstables.push(Vec::new());
-        }
-        self.sstables[level].push(sstable);
-    }
-
-    /// Adds an immutable MemTable.
-    ///
-    /// Called when the active MemTable is frozen and a new one is created.
-    #[allow(dead_code)]
-    pub fn add_immutable_memtable(&mut self, memtable: Arc<MemTable>) {
-        self.immutable_memtables.push(memtable);
     }
 }
 
@@ -797,22 +735,39 @@ mod merge_iterator_tests {
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotRegistry {
     active: Arc<parking_lot::Mutex<BTreeSet<u64>>>,
+
+    /// Test-only count of every `acquire_at` (spec kv/031 test 6).
+    #[cfg(test)]
+    acquires: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SnapshotRegistry {
     /// Creates a new, empty registry.
     pub fn new() -> Self {
-        Self {
-            active: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
-        }
+        Self::default()
     }
 
-    /// Registers a snapshot at timestamp  and returns an RAII guard.
+    /// Registers a snapshot at the stamp `stamp` draws and returns an RAII
+    /// guard that deregisters it on drop.
     ///
-    /// The snapshot is automatically deregistered when the guard is dropped,
-    /// ensuring the low watermark always reflects the true oldest active reader.
-    pub fn acquire(&self, ts: Timestamp) -> RegistrySnapshot {
-        self.active.lock().insert(ts.as_u64());
+    /// `stamp` runs under the lock [`Self::low_watermark`] takes, so a
+    /// compaction either sees the snapshot or chose its inputs before the
+    /// stamp existed. Every stamp must be unique, e.g. drawn from the clock.
+    /// A draw that yields none is retried after a pause without the lock:
+    /// nothing waits for the clock while holding it.
+    pub fn acquire_at(&self, mut stamp: impl FnMut() -> Option<Timestamp>) -> RegistrySnapshot {
+        #[cfg(test)]
+        self.acquires.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ts = loop {
+            let mut active = self.active.lock();
+            if let Some(ts) = stamp() {
+                let fresh = active.insert(ts.as_u64());
+                debug_assert!(fresh, "registered stamps are unique");
+                break ts;
+            }
+            drop(active);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         RegistrySnapshot {
             active: Arc::clone(&self.active),
             ts_raw: ts.as_u64(),
@@ -832,6 +787,24 @@ impl SnapshotRegistry {
             .next()
             .copied()
             .map(Timestamp::new)
+    }
+
+    /// Test-only: `acquire_at` calls so far.
+    #[cfg(test)]
+    pub(crate) fn acquire_count(&self) -> u64 {
+        self.acquires.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only: snapshots registered right now.
+    #[cfg(test)]
+    pub(crate) fn active_count(&self) -> usize {
+        self.active.lock().len()
+    }
+
+    /// Test-only: whether some thread holds the registry lock right now.
+    #[cfg(test)]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.active.is_locked()
     }
 }
 
@@ -870,16 +843,16 @@ mod snapshot_registry_tests {
     #[test]
     fn test_low_watermark_single() {
         let reg = SnapshotRegistry::new();
-        let _s = reg.acquire(Timestamp::new(42));
+        let _s = reg.acquire_at(|| Some(Timestamp::new(42)));
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 42);
     }
 
     #[test]
     fn test_low_watermark_multiple() {
         let reg = SnapshotRegistry::new();
-        let _s1 = reg.acquire(Timestamp::new(100));
-        let _s2 = reg.acquire(Timestamp::new(50));
-        let _s3 = reg.acquire(Timestamp::new(200));
+        let _s1 = reg.acquire_at(|| Some(Timestamp::new(100)));
+        let _s2 = reg.acquire_at(|| Some(Timestamp::new(50)));
+        let _s3 = reg.acquire_at(|| Some(Timestamp::new(200)));
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 50);
     }
 
@@ -887,17 +860,33 @@ mod snapshot_registry_tests {
     fn test_deregistration_on_drop() {
         let reg = SnapshotRegistry::new();
         {
-            let _s = reg.acquire(Timestamp::new(77));
+            let _s = reg.acquire_at(|| Some(Timestamp::new(77)));
             assert_eq!(reg.low_watermark().unwrap().as_u64(), 77);
         }
         assert!(reg.low_watermark().is_none());
     }
 
+    // A draw that yields no stamp is retried until one does; only that stamp
+    // is registered.
+    #[test]
+    fn test_acquire_at_retries_until_a_stamp_is_drawn() {
+        let reg = SnapshotRegistry::new();
+        let mut draws = 0;
+        let s = reg.acquire_at(|| {
+            draws += 1;
+            (draws == 3).then(|| Timestamp::new(42))
+        });
+        assert_eq!(draws, 3);
+        assert_eq!(s.snapshot().timestamp().as_u64(), 42);
+        assert_eq!(reg.low_watermark().unwrap().as_u64(), 42);
+        assert_eq!(reg.active_count(), 1);
+    }
+
     #[test]
     fn test_low_watermark_advances_after_oldest_drops() {
         let reg = SnapshotRegistry::new();
-        let s1 = reg.acquire(Timestamp::new(10));
-        let _s2 = reg.acquire(Timestamp::new(20));
+        let s1 = reg.acquire_at(|| Some(Timestamp::new(10)));
+        let _s2 = reg.acquire_at(|| Some(Timestamp::new(20)));
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 10);
         drop(s1);
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 20);

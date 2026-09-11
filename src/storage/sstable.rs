@@ -1,4 +1,4 @@
-use crate::engines::lsm::block_cache::{BlockCache, BlockCacheKey, CachedBlock};
+use crate::engines::lsm::block_cache::{BlockCacheKey, CachedBlock, StripedBlockCache};
 use crate::engines::lsm::key::Timestamp;
 use crate::storage::format::{
     ArchivedDataBlockValue, BlockHandle, BloomFilter, CachedValue, DataBlock, DataBlockValue,
@@ -8,6 +8,7 @@ use crate::storage::bloom::BloomFilter as BloomFilterImpl;
 use rkyv::util::AlignedVec;
 use rkyv::{rancor, Archived};
 use anyhow::{Result, bail};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const BLOCK_SIZE_TARGET: usize = 4096; // 4KB target for data blocks
 
@@ -194,6 +195,7 @@ pub struct SSTableReader {
     /// Set to 0 by default; call `set_file_id` after opening to assign the
     /// correct ID from the manifest.
     pub file_id: u64,
+    retired: AtomicBool,
 }
 
 impl SSTableReader {
@@ -208,7 +210,8 @@ impl SSTableReader {
 
     /// Memory-maps an SSTable file and advises the kernel to pre-fault its
     /// pages (spec perf/003). The `unsafe` map is sound: SSTables are
-    /// immutable and only unlinked after the LevelManager drops them.
+    /// immutable, and an unlinked file stays mapped for every version still
+    /// holding its reader.
     pub fn open_mmap(path: &std::path::Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -289,12 +292,20 @@ impl SSTableReader {
             index,
             bloom_filter,
             file_id: 0,
+            retired: AtomicBool::new(false),
         })
     }
 
     /// Sets the file ID used as part of the block cache key.
     pub fn set_file_id(&mut self, file_id: u64) {
         self.file_id = file_id;
+    }
+
+    /// Marks the table as out of every current version: readers on an older
+    /// one still read it, but its blocks no longer enter the cache. Call
+    /// before the cache invalidates the file.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
     }
 
     /// Point lookup that checks and populates the block cache.
@@ -305,7 +316,7 @@ impl SSTableReader {
     pub fn get_with_cache(
         &self,
         key: &[u8],
-        cache: &mut BlockCache,
+        cache: &StripedBlockCache,
     ) -> Result<Option<CachedValue>> {
         Ok(self.get_with_cache_and_ts(key, cache)?.map(|(v, _)| v))
     }
@@ -317,7 +328,7 @@ impl SSTableReader {
     pub fn get_with_cache_and_ts(
         &self,
         key: &[u8],
-        cache: &mut BlockCache,
+        cache: &StripedBlockCache,
     ) -> Result<Option<(CachedValue, Timestamp)>> {
         let bloom_key = mvcc_user_key(key);
         if !self.bloom_filter.contains(bloom_key) {
@@ -357,7 +368,7 @@ impl SSTableReader {
     fn get_mvcc_prefix_cached(
         &self,
         key: &[u8],
-        cache: &mut BlockCache,
+        cache: &StripedBlockCache,
     ) -> Result<Option<(CachedValue, Timestamp)>> {
         let search_user_key = mvcc_user_key(key);
         let search_inv_ts = mvcc_inv_ts(key);
@@ -405,14 +416,16 @@ impl SSTableReader {
     /// Returns the raw bytes of a data block, using the cache when available.
     ///
     /// On a cache miss the bytes are extracted from the in-memory `AlignedVec`
-    /// and inserted into the cache before being returned.
+    /// and, unless the table is retired, inserted into the cache before being
+    /// returned. Only the block's own stripe is locked (spec kv/031 A2).
     fn get_or_cache_block(
         &self,
         handle: &Archived<BlockHandle>,
         cache_key: &BlockCacheKey,
-        cache: &mut BlockCache,
+        cache: &StripedBlockCache,
     ) -> Result<CachedBlock> {
-        if let Some(cached) = cache.get(cache_key) {
+        let mut stripe = cache.stripe(cache_key);
+        if let Some(cached) = stripe.get(cache_key) {
             return Ok(cached);
         }
 
@@ -442,7 +455,11 @@ impl SSTableReader {
             0,
             "data block must be 8-byte aligned for rkyv"
         );
-        cache.insert(*cache_key, block.clone());
+        // Under the stripe guard, which `invalidate_file` takes after
+        // `retire`: an insert either precedes that invalidation or sees the mark.
+        if !self.retired.load(Ordering::Acquire) {
+            stripe.insert(*cache_key, block.clone());
+        }
         Ok(block)
     }
 
@@ -796,9 +813,9 @@ mod tests {
         );
         let bytes = builder.finish()?;
         let reader = SSTableReader::open(bytes)?;
-        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
 
-        match reader.get_with_cache(b"inline-key", &mut cache)? {
+        match reader.get_with_cache(b"inline-key", &cache)? {
             Some(CachedValue::Cached { ref block, offset, len, expire_at }) => {
                 assert_eq!(expire_at, 99);
                 assert_eq!(len, b"hello-inline".len());
@@ -807,25 +824,25 @@ mod tests {
             other => panic!("expected Cached, got {other:?}"),
         }
 
-        match reader.get_with_cache(b"pointer-key", &mut cache)? {
+        match reader.get_with_cache(b"pointer-key", &cache)? {
             Some(CachedValue::VLogPointer { file_id, value_offset, value_len, expire_at }) => {
                 assert_eq!((file_id, value_offset, value_len, expire_at), (3, 1234, 56, 7));
             }
             other => panic!("expected VLogPointer, got {other:?}"),
         }
 
-        match reader.get_with_cache(b"tombstone-key", &mut cache)? {
+        match reader.get_with_cache(b"tombstone-key", &cache)? {
             Some(CachedValue::Tombstone) => {}
             other => panic!("expected Tombstone, got {other:?}"),
         }
 
         // kv/018: the NULL sentinel is distinct from the tombstone sentinel.
-        match reader.get_with_cache(b"null-key", &mut cache)? {
+        match reader.get_with_cache(b"null-key", &cache)? {
             Some(CachedValue::Null) => {}
             other => panic!("expected Null, got {other:?}"),
         }
 
-        assert!(reader.get_with_cache(b"missing-key", &mut cache)?.is_none());
+        assert!(reader.get_with_cache(b"missing-key", &cache)?.is_none());
         Ok(())
     }
 
@@ -847,17 +864,17 @@ mod tests {
         builder.add_inline(older, b"v1".to_vec(), 0);
         let bytes = builder.finish()?;
         let reader = SSTableReader::open(bytes)?;
-        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
 
         // Exact-match path: the search key equals the stored newer key.
         let search_key = InternalKey::new(b"k".to_vec(), Timestamp::new(2000)).encode();
-        let (_, ts) = reader.get_with_cache_and_ts(&search_key, &mut cache)?.expect("must find entry");
+        let (_, ts) = reader.get_with_cache_and_ts(&search_key, &cache)?.expect("must find entry");
         assert_eq!(ts, Timestamp::new(2000), "must report the write timestamp, not its inverted on-disk form");
 
         // MVCC-fallback path: a snapshot newer than both writes must resolve
         // to the newest version (2000) and report its un-inverted timestamp.
         let snapshot_key = InternalKey::new(b"k".to_vec(), Timestamp::new(9999)).encode();
-        let (_, ts) = reader.get_with_cache_and_ts(&snapshot_key, &mut cache)?.expect("must find entry");
+        let (_, ts) = reader.get_with_cache_and_ts(&snapshot_key, &cache)?.expect("must find entry");
         assert_eq!(ts, Timestamp::new(2000));
 
         Ok(())
@@ -879,15 +896,15 @@ mod tests {
         std::fs::write(&path, &bytes)?;
 
         let reader = SSTableReader::open_mmap(&path)?;
-        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
-        match reader.get_with_cache(b"mkey", &mut cache)? {
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+        match reader.get_with_cache(b"mkey", &cache)? {
             Some(CachedValue::Cached { ref block, offset, len, .. }) => {
                 assert!(matches!(block, CachedBlock::Mapped { .. }), "block must be mmap-backed");
                 assert_eq!(&block.as_bytes()[offset..offset + len], b"mval");
             }
             other => panic!("expected mmap-backed Cached, got {other:?}"),
         }
-        match reader.get_with_cache(b"pkey", &mut cache)? {
+        match reader.get_with_cache(b"pkey", &cache)? {
             Some(CachedValue::VLogPointer { file_id: 2, .. }) => {}
             other => panic!("expected VLogPointer, got {other:?}"),
         }
@@ -1153,8 +1170,8 @@ mod tests {
     fn test_get_or_cache_block_rejects_overflowing_block_handle() -> anyhow::Result<()> {
         let buf = build_sstable_with_corrupt_block_handle()?;
         let reader = SSTableReader::open(buf)?;
-        let mut cache = BlockCache::new(1024 * 1024, 0.1, 100);
-        let result = reader.get_with_cache(b"key1", &mut cache);
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+        let result = reader.get_with_cache(b"key1", &cache);
         assert!(result.is_err(), "overflowing block handle must be rejected, not panic");
         Ok(())
     }

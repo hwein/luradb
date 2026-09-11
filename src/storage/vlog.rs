@@ -10,17 +10,17 @@
 //! active and takes appends, older ones are sealed and read-only until the
 //! Janitor has copied their live values forward. A pointer therefore carries
 //! the generation id (`file_id`) it was written to, and reads resolve it
-//! through the [`VLogRegistry`].
+//! through the generation map of the reader's own engine version.
 
 use crate::core::storage_thread::StorageHandle;
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Error, Debug)]
 pub enum VLogError {
@@ -36,9 +36,9 @@ pub enum VLogError {
     UnknownGeneration { id: u32 },
 }
 
-/// `Local` owns the file (default). `Remote` forwards append/read to the perf/005
-/// storage thread, which owns the file; `offset` then tracks the size as a
-/// high-water mark for reporting only.
+/// How appends reach the file. `Local` owns a write handle (default).
+/// `Remote` forwards appends to the perf/005 storage thread, which owns the
+/// file; `offset` then tracks the size as a high-water mark for reporting only.
 enum VLogMode {
     Local(tokio::sync::Mutex<File>),
     Remote(StorageHandle),
@@ -47,6 +47,9 @@ enum VLogMode {
 /// Append-only Value Log — one generation.
 pub struct VLog {
     inner: VLogMode,
+    /// Read-only descriptor for positional reads in both modes: no cursor, no
+    /// lock, any thread at once (spec kv/031 A5).
+    reader: std::fs::File,
     /// Generation id, stamped into every `ValuePointer` written here.
     id: u32,
     /// Sealed generations reject appends but stay readable.
@@ -55,7 +58,17 @@ pub struct VLog {
     offset: AtomicU64,
     /// Filesystem path of the backing file (needed by the Janitor for GC).
     path: PathBuf,
+    /// Test-only count of reads handed to the blocking pool.
+    #[cfg(test)]
+    offloaded: AtomicU64,
 }
+
+/// Cold reads on the blocking pool at a time, process-wide: enough to keep a
+/// fast SSD's queue full, far below the pool's 512 threads that WAL commits
+/// and file writes need as well.
+const COLD_READ_LIMIT: usize = 64;
+
+static COLD_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(COLD_READ_LIMIT);
 
 impl VLog {
     /// Opens or creates the canonical vLog, which is always generation 1.
@@ -79,28 +92,36 @@ impl VLog {
 
         let initial_size = file.metadata().await?.len();
         file.seek(std::io::SeekFrom::Start(initial_size)).await?;
+        let reader = File::open(&path).await?.into_std().await;
 
         Ok(Self {
             inner: VLogMode::Local(tokio::sync::Mutex::new(file)),
+            reader,
             id,
             sealed: AtomicBool::new(false),
             offset: AtomicU64::new(initial_size),
             path,
+            #[cfg(test)]
+            offloaded: AtomicU64::new(0),
         })
     }
 
-    /// Routes all vLog I/O through the perf/005 storage thread, which owns the
-    /// file. The size counter is seeded from the file's current length.
-    pub fn with_storage_handle(path: impl AsRef<Path>, handle: StorageHandle, id: u32) -> Self {
+    /// Routes appends through the perf/005 storage thread, which owns the file
+    /// and has already created it. The size counter is seeded from the file's
+    /// current length.
+    pub fn with_storage_handle(path: impl AsRef<Path>, handle: StorageHandle, id: u32) -> Result<Self, VLogError> {
         let path = path.as_ref().to_path_buf();
         let initial_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Self {
+        Ok(Self {
             inner: VLogMode::Remote(handle),
+            reader: std::fs::File::open(&path)?,
             id,
             sealed: AtomicBool::new(false),
             offset: AtomicU64::new(initial_size),
             path,
-        }
+            #[cfg(test)]
+            offloaded: AtomicU64::new(0),
+        })
     }
 
     /// Generation id of this log.
@@ -136,6 +157,10 @@ impl VLog {
                 let offset = self.offset.fetch_add(value.len() as u64, Ordering::SeqCst);
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
                 file.write_all(value).await?;
+                // tokio completes the write in the background; the bytes must
+                // be in the file before the pointer is handed out, since
+                // reads go through `reader`, not this handle.
+                file.flush().await?;
                 Ok(offset)
             }
             VLogMode::Remote(handle) => {
@@ -152,20 +177,48 @@ impl VLog {
         self.offset.load(Ordering::Relaxed)
     }
 
-    /// Reads `len` bytes starting at `offset`.
-    pub async fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, VLogError> {
-        match &self.inner {
-            VLogMode::Local(file) => {
-                let mut file = file.lock().await;
-                file.seek(std::io::SeekFrom::Start(offset)).await?;
-                let mut buf = vec![0u8; len];
-                file.read_exact(&mut buf).await?;
-                Ok(buf)
-            }
-            VLogMode::Remote(handle) => {
-                handle.vlog_read(offset, len, self.id).await.map_err(vlog_remote_err)
-            }
+    /// Reads `len` bytes starting at `offset`, positionally on this
+    /// generation's own descriptor — in both modes, never through the
+    /// storage thread (spec kv/031 A5). Blocks the calling thread until the
+    /// bytes are there; see [`Self::read_async`].
+    pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, VLogError> {
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact_at(&mut buf, offset)?;
+        Ok(buf)
+    }
+
+    /// Reads like [`Self::read`], but never waits for the disk on the calling
+    /// thread: what the page cache holds is read in place, the rest on the
+    /// blocking pool, by at most [`COLD_READ_LIMIT`] reads at a time.
+    pub async fn read_async(self: &Arc<Self>, offset: u64, len: usize) -> Result<Vec<u8>, VLogError> {
+        let mut buf = vec![0u8; len];
+        let cached = self.read_cached(&mut buf, offset);
+        if cached == len {
+            return Ok(buf);
         }
+        // Waits here, not in the pool: a read dropped meanwhile takes no thread.
+        let permit = COLD_READS.acquire().await.map_err(|e| VLogError::Io(std::io::Error::other(e)))?;
+        #[cfg(test)]
+        self.offloaded.fetch_add(1, Ordering::Relaxed);
+        let vlog = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            vlog.reader.read_exact_at(&mut buf[cached..], offset + cached as u64)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| VLogError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Fills `buf` from `offset` as far as the page cache holds it, without
+    /// blocking (`RWF_NOWAIT`); the bytes read, 0 on any error.
+    fn read_cached(&self, buf: &mut [u8], offset: u64) -> usize {
+        let iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+        // SAFETY: `iov` describes `buf`, which outlives the call.
+        let read = unsafe {
+            libc::preadv2(self.reader.as_raw_fd(), &iov, 1, offset as libc::off_t, libc::RWF_NOWAIT)
+        };
+        usize::try_from(read).unwrap_or(0)
     }
 
     /// Returns the current logical size of the vLog in bytes.
@@ -224,75 +277,6 @@ pub async fn discover_generations(base: &Path) -> Result<Vec<u32>, VLogError> {
     Ok(ids)
 }
 
-/// All live vLog generations by id, plus the active one that takes appends.
-///
-/// The active reference stays the fast write path; readers resolve a pointer's
-/// `file_id` through [`Self::read`] so values in sealed generations remain
-/// reachable until the Janitor has copied them forward.
-pub struct VLogRegistry {
-    active: RwLock<Arc<VLog>>,
-    generations: RwLock<HashMap<u32, Arc<VLog>>>,
-}
-
-impl VLogRegistry {
-    /// Registry holding a single generation, which is also the active one.
-    pub fn new(active: Arc<VLog>) -> Self {
-        let mut generations = HashMap::new();
-        generations.insert(active.id(), Arc::clone(&active));
-        Self {
-            active: RwLock::new(active),
-            generations: RwLock::new(generations),
-        }
-    }
-
-    /// The generation new values are appended to.
-    pub fn active(&self) -> Arc<VLog> {
-        self.active.read().clone()
-    }
-
-    /// Registers `vlog` and makes it the target of all subsequent appends.
-    pub fn set_active(&self, vlog: Arc<VLog>) {
-        self.generations.write().insert(vlog.id(), Arc::clone(&vlog));
-        *self.active.write() = vlog;
-    }
-
-    /// Registers a non-active (readable) generation.
-    pub fn register(&self, vlog: Arc<VLog>) {
-        self.generations.write().insert(vlog.id(), vlog);
-    }
-
-    pub fn get(&self, id: u32) -> Option<Arc<VLog>> {
-        self.generations.read().get(&id).cloned()
-    }
-
-    /// Drops a generation from the registry; readers holding an `Arc` finish
-    /// against their open file descriptor.
-    pub fn remove(&self, id: u32) -> Option<Arc<VLog>> {
-        self.generations.write().remove(&id)
-    }
-
-    /// Registered generation ids, ascending.
-    pub fn ids(&self) -> Vec<u32> {
-        let mut ids: Vec<u32> = self.generations.read().keys().copied().collect();
-        ids.sort_unstable();
-        ids
-    }
-
-    /// Summed size of all live generations.
-    pub fn total_size(&self) -> u64 {
-        self.generations.read().values().map(|v| v.size()).sum()
-    }
-
-    /// Resolves a pointer against its generation. An unknown `file_id` is a
-    /// clean error, never a read against the wrong file.
-    pub async fn read(&self, file_id: u32, offset: u64, len: usize) -> Result<Vec<u8>, VLogError> {
-        let vlog = self
-            .get(file_id)
-            .ok_or(VLogError::UnknownGeneration { id: file_id })?;
-        vlog.read(offset, len).await
-    }
-}
-
 /// Maps a storage-thread `anyhow` error back into the vLog's error type.
 fn vlog_remote_err(e: anyhow::Error) -> VLogError {
     VLogError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
@@ -301,6 +285,7 @@ fn vlog_remote_err(e: anyhow::Error) -> VLogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // Spec kv/017 test 2: a sealed generation rejects appends but stays readable.
     #[tokio::test]
@@ -315,7 +300,7 @@ mod tests {
             Err(VLogError::Sealed { id: 1 }) => {}
             other => panic!("expected Sealed, got {other:?}"),
         }
-        assert_eq!(vlog.read(offset, 7).await.unwrap(), b"payload");
+        assert_eq!(vlog.read(offset, 7).unwrap(), b"payload");
         assert_eq!(vlog.size(), 7, "the rejected append must not move the cursor");
     }
 
@@ -339,31 +324,109 @@ mod tests {
         assert_eq!(discover_generations(&base).await.unwrap(), vec![1, 2]);
     }
 
-    // Registry resolution: known ids read from their own file, unknown ids are
-    // a clean error instead of a read against the wrong generation.
+    // Spec kv/031 test 7: reads are positional on the generation's own
+    // descriptor -- two threads read one generation at once, each gets
+    // exactly its bytes, and neither moves the append cursor.
     #[tokio::test]
-    async fn test_registry_resolves_generations() {
+    async fn test_two_threads_read_one_generation_at_once() {
         let dir = tempfile::TempDir::new().unwrap();
-        let base = dir.path().join("vlog");
-        let gen1 = Arc::new(VLog::new(&base).await.unwrap());
-        let off1 = gen1.append(b"one").await.unwrap();
-        let registry = VLogRegistry::new(gen1);
+        let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
+        let mut entries = Vec::new();
+        for i in 0..64u8 {
+            let value = vec![i; 100 + i as usize];
+            entries.push((vlog.append(&value).await.unwrap(), value));
+        }
+        let entries = Arc::new(entries);
+        let size = vlog.size();
 
-        let gen2 = Arc::new(VLog::open(generation_path(&base, 2), 2).await.unwrap());
-        let off2 = gen2.append(b"two").await.unwrap();
-        registry.set_active(Arc::clone(&gen2));
+        let readers: Vec<_> = (0..2)
+            .map(|t| {
+                let vlog = Arc::clone(&vlog);
+                let entries = Arc::clone(&entries);
+                std::thread::spawn(move || {
+                    for round in 0..200 {
+                        let (offset, value) = &entries[(round * 7 + t * 13) % entries.len()];
+                        assert_eq!(&vlog.read(*offset, value.len()).unwrap(), value);
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
 
-        assert_eq!(registry.active().id(), 2);
-        assert_eq!(registry.ids(), vec![1, 2]);
-        assert_eq!(registry.read(1, off1, 3).await.unwrap(), b"one");
-        assert_eq!(registry.read(2, off2, 3).await.unwrap(), b"two");
-        assert_eq!(registry.total_size(), 6);
-        assert!(matches!(
-            registry.read(7, 0, 1).await,
-            Err(VLogError::UnknownGeneration { id: 7 })
-        ));
+        assert_eq!(vlog.size(), size);
+        assert_eq!(vlog.append(b"next").await.unwrap(), size, "appends continue at the cursor");
+    }
 
-        registry.remove(1);
-        assert_eq!(registry.ids(), vec![2]);
+    // `read_async` takes what the page cache holds in place and reads the
+    // rest off the calling thread, from where the cached part ends: all,
+    // part or none of the value cached, exactly the appended bytes, and a
+    // read past the end is an error, never a short value.
+    #[tokio::test]
+    async fn test_read_async_returns_the_bytes_cached_or_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
+        let value: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let offset = vlog.append(&value).await.unwrap();
+        assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+        assert!(vlog.read_async(vlog.size(), 1).await.is_err());
+
+        let file = std::fs::File::open(vlog.path()).unwrap();
+        file.sync_all().unwrap();
+        let advise = |advice| {
+            assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) }, 0);
+        };
+        // Drops the file's clean pages, after a blocking read that waits out
+        // any readahead still in flight (pages under I/O would stay). The
+        // whole file: a large folio reaching below a range start stays too.
+        let drop_pages = || {
+            assert_eq!(vlog.read(offset, value.len()).unwrap(), value);
+            advise(libc::POSIX_FADV_DONTNEED);
+        };
+        // Caches the first half alone: `file` reads without readahead.
+        advise(libc::POSIX_FADV_RANDOM);
+        let half = value.len() / 2;
+        let cache_first_half = || {
+            let mut first = vec![0u8; half];
+            file.read_exact_at(&mut first, offset).unwrap();
+        };
+        let mut buf = vec![0u8; value.len()];
+
+        drop_pages();
+        let cached = vlog.read_cached(&mut buf, offset);
+        if cached == value.len() {
+            return; // the filesystem keeps its pages regardless of the advice
+        }
+        assert_eq!(cached, 0, "nothing is cached");
+        drop_pages();
+        assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+
+        drop_pages();
+        cache_first_half();
+        let cached = vlog.read_cached(&mut buf, offset);
+        assert!(0 < cached && cached < value.len(), "only the first half is cached, read {cached}");
+        drop_pages();
+        cache_first_half();
+        assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+    }
+
+    // Past the end nothing is cached, so the read needs the blocking pool.
+    // With every permit taken it waits for one without a thread, and a read
+    // dropped while it waits never takes one.
+    #[tokio::test]
+    async fn test_a_cold_read_waits_for_a_permit_before_it_takes_a_thread() {
+        use futures::FutureExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
+        vlog.append(b"payload").await.unwrap();
+
+        let all = COLD_READS.acquire_many(COLD_READ_LIMIT as u32).await.unwrap();
+        assert!(vlog.read_async(vlog.size(), 1).now_or_never().is_none(), "the read waits for a permit");
+        assert_eq!(vlog.offloaded.load(Ordering::Relaxed), 0, "a read dropped while it waits takes no thread");
+
+        drop(all);
+        assert!(vlog.read_async(vlog.size(), 1).await.is_err());
+        assert_eq!(vlog.offloaded.load(Ordering::Relaxed), 1);
     }
 }

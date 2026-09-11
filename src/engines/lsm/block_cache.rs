@@ -18,6 +18,7 @@
 //!    at tail (one CLOCK-like chance); if freq ≤ 1 → permanent eviction.
 //! 5. Ghost Buffer hit on insert → block goes directly to Main Queue.
 
+use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -163,17 +164,19 @@ impl BlockCache {
     /// Inserts a block into the cache.
     ///
     /// - If the block is already cached, the call is a no-op.
+    /// - A block larger than the whole capacity is not inserted either: it
+    ///   would evict everything and still not stay.
     /// - If the key is in the Ghost Buffer, the block is inserted directly
     ///   into the Main Queue (bypassing Small).
     /// - Otherwise the block enters the Small Queue.
     ///
     /// After insertion the eviction policy is applied to enforce capacity limits.
     pub fn insert(&mut self, key: BlockCacheKey, block: CachedBlock) {
-        if self.index.contains_key(&key) {
+        let block_size = block.len();
+        if self.index.contains_key(&key) || block_size > self.capacity_bytes {
             return;
         }
 
-        let block_size = block.len();
         let is_ghost = self.ghost_set.contains(&key);
 
         if is_ghost {
@@ -365,6 +368,69 @@ impl BlockCache {
     fn remove_from_ghost(&mut self, key: &BlockCacheKey) {
         self.ghost_set.remove(key);
     }
+}
+
+// ── StripedBlockCache ─────────────────────────────────────────────────────────
+
+/// Number of independently locked parts of a [`StripedBlockCache`].
+const STRIPES: usize = 16;
+
+/// The block cache as [`STRIPES`] S3-FIFO caches, each behind its own lock
+/// (spec kv/031 A2): readers of different blocks rarely wait for each other.
+pub struct StripedBlockCache {
+    stripes: Box<[Mutex<BlockCache>; STRIPES]>,
+}
+
+impl StripedBlockCache {
+    /// `capacity_bytes` and `ghost_capacity` are totals, split evenly over
+    /// the stripes.
+    pub fn new(capacity_bytes: usize, small_ratio: f32, ghost_capacity: usize) -> Self {
+        let share = |total: usize, stripe: usize| total / STRIPES + usize::from(stripe < total % STRIPES);
+        Self {
+            stripes: Box::new(std::array::from_fn(|i| {
+                Mutex::new(BlockCache::new(share(capacity_bytes, i), small_ratio, share(ghost_capacity, i)))
+            })),
+        }
+    }
+
+    /// The locked stripe that owns `key`.
+    pub fn stripe(&self, key: &BlockCacheKey) -> MutexGuard<'_, BlockCache> {
+        self.stripes[stripe_index(key)].lock()
+    }
+
+    /// Removes every block of `file_id`, whichever stripe holds it.
+    pub fn invalidate_file(&self, file_id: u64) {
+        for stripe in self.stripes.iter() {
+            stripe.lock().invalidate_file(file_id);
+        }
+    }
+
+    /// Counters summed over all stripes at the time of the call.
+    pub fn metrics(&self) -> Arc<BlockCacheMetrics> {
+        let sum = BlockCacheMetrics::default();
+        for stripe in self.stripes.iter() {
+            let m = stripe.lock().metrics();
+            for (total, part) in [
+                (&sum.hits, &m.hits),
+                (&sum.misses, &m.misses),
+                (&sum.small_hits, &m.small_hits),
+                (&sum.main_hits, &m.main_hits),
+                (&sum.small_evictions, &m.small_evictions),
+                (&sum.main_evictions, &m.main_evictions),
+                (&sum.current_bytes, &m.current_bytes),
+            ] {
+                total.fetch_add(part.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+        Arc::new(sum)
+    }
+}
+
+/// Stripe of `key`: the top bits of a multiplicative hash over both fields
+/// (block offsets are block-size multiples, their low bits say little).
+fn stripe_index(key: &BlockCacheKey) -> usize {
+    let hash = (key.file_id.rotate_left(32) ^ key.block_offset).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (hash >> (u64::BITS - STRIPES.trailing_zeros())) as usize
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -586,5 +652,92 @@ mod tests {
         assert!(cache.index.contains_key(&live), "round aborts before touching live entries");
         assert_eq!(cache.metrics.main_evictions.load(Ordering::Relaxed), 0);
         assert!(!cache.main.contains(&stale), "stale key is consumed");
+    }
+
+    // ── Spec kv/031 test 4: StripedBlockCache ────────────────────────────────
+
+    /// Block `n` of `file_id`, at a real block-size offset.
+    fn block_key(file_id: u64, n: u64) -> BlockCacheKey {
+        BlockCacheKey { file_id, block_offset: n * 4096 }
+    }
+
+    /// Get-or-insert over 4 files x 64 blocks, three rounds — room for all of
+    /// it, so nothing is evicted in either cache.
+    #[test]
+    fn test_striped_cache_counts_like_the_single_cache() {
+        let mut single = BlockCache::new(16 << 20, 0.10, 1000);
+        let striped = StripedBlockCache::new(16 << 20, 0.10, 1000);
+        let keys: Vec<BlockCacheKey> = (1..=4).flat_map(|f| (0..64).map(move |n| block_key(f, n))).collect();
+
+        for _ in 0..3 {
+            for key in &keys {
+                if single.get(key).is_none() {
+                    single.insert(*key, make_aligned(0, 64));
+                }
+                let mut stripe = striped.stripe(key);
+                if stripe.get(key).is_none() {
+                    stripe.insert(*key, make_aligned(0, 64));
+                }
+            }
+        }
+
+        let (one, sum) = (single.metrics(), striped.metrics());
+        assert_eq!((one.misses.load(Ordering::Relaxed), one.hits.load(Ordering::Relaxed)), (256, 512));
+        assert_eq!(sum.misses.load(Ordering::Relaxed), 256);
+        assert_eq!(sum.hits.load(Ordering::Relaxed), 512);
+        assert_eq!(sum.small_hits.load(Ordering::Relaxed), one.small_hits.load(Ordering::Relaxed));
+        assert_eq!(sum.current_bytes.load(Ordering::Relaxed), 256 * 64);
+
+        let used: HashSet<usize> = keys.iter().map(stripe_index).collect();
+        assert_eq!(used.len(), STRIPES, "the workload spreads over every stripe");
+    }
+
+    #[test]
+    fn test_striped_invalidate_file_clears_every_stripe() {
+        let striped = StripedBlockCache::new(16 << 20, 0.10, 1000);
+        for file_id in [1, 2] {
+            for n in 0..64 {
+                let key = block_key(file_id, n);
+                striped.stripe(&key).insert(key, make_aligned(0, 64));
+            }
+        }
+        let file1_stripes: HashSet<usize> = (0..64).map(|n| stripe_index(&block_key(1, n))).collect();
+        assert!(file1_stripes.len() > 1, "file 1 must span several stripes");
+
+        striped.invalidate_file(1);
+
+        for n in 0..64 {
+            let gone = block_key(1, n);
+            assert!(striped.stripe(&gone).get(&gone).is_none(), "block {n} of file 1 must be gone");
+            let kept = block_key(2, n);
+            assert!(striped.stripe(&kept).get(&kept).is_some(), "block {n} of file 2 must stay");
+        }
+        assert_eq!(striped.metrics().current_bytes.load(Ordering::Relaxed), 64 * 64);
+    }
+
+    // A block larger than its stripe's share goes around the cache: inserting
+    // it neither caches it nor evicts what the stripe already holds.
+    #[test]
+    fn test_block_larger_than_its_stripe_bypasses_the_cache() {
+        let striped = StripedBlockCache::new(16 * 1024, 0.10, 100); // 1 KiB per stripe
+        let held = block_key(1, 0);
+        let big = (1..).map(|n| block_key(2, n)).find(|k| stripe_index(k) == stripe_index(&held)).unwrap();
+        striped.stripe(&held).insert(held, make_aligned(0, 64));
+
+        striped.stripe(&big).insert(big, make_aligned(0, 2048));
+
+        assert!(striped.stripe(&big).get(&big).is_none(), "the oversized block is not cached");
+        assert!(striped.stripe(&held).get(&held).is_some(), "the stripe keeps what it held");
+    }
+
+    #[test]
+    fn test_striped_capacity_sums_to_the_configured_total() {
+        for (capacity, ghosts) in [(64 << 20, 10_000), (1000, 100), (15, 7)] {
+            let striped = StripedBlockCache::new(capacity, 0.10, ghosts);
+            let bytes: usize = striped.stripes.iter().map(|s| s.lock().capacity_bytes).sum();
+            let ghost_slots: usize = striped.stripes.iter().map(|s| s.lock().ghost_capacity).sum();
+            assert_eq!(bytes, capacity);
+            assert_eq!(ghost_slots, ghosts);
+        }
     }
 }

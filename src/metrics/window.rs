@@ -5,11 +5,9 @@
 //! accumulators into a `BucketSnapshot` and appends it to the `VecDeque`.
 //! Buckets older than `capacity` seconds are discarded automatically.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{DomainWindowMetrics, EngineWindowMetrics};
 
@@ -157,7 +155,7 @@ impl MetricsWindow {
             rate_limit_rejections: self.cur_rate_limit_rejections.swap(0, Ordering::AcqRel),
         };
 
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.lock();
         buckets.push_back(snapshot);
         if buckets.len() > self.capacity {
             buckets.pop_front();
@@ -167,7 +165,7 @@ impl MetricsWindow {
     /// Sums every committed bucket in the window in one pass, shared by
     /// `aggregate` and `aggregate_engine` so neither duplicates the loop.
     fn sum_buckets(&self) -> BucketTotals {
-        let buckets = self.buckets.lock().unwrap();
+        let buckets = self.buckets.lock();
         let mut t = BucketTotals::default();
         for b in buckets.iter() {
             t.read_ops += b.read_ops;

@@ -11,7 +11,7 @@
 pub mod window;
 
 use crate::engines::lsm::engine::EngineHeartbeatData;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{
@@ -195,7 +195,13 @@ pub struct EngineWindowMetrics {
 
 pub struct MetricsStore {
     pub system: SystemMetrics,
-    domains: RwLock<HashMap<String, MetricsWindow>>,
+    /// Per-domain windows, created on a domain's first recorded op. `Arc` so
+    /// a domain's runtime can keep its own window and record reads without
+    /// a lookup here (spec kv/031 A6).
+    domains: RwLock<HashMap<String, Arc<MetricsWindow>>>,
+    /// Test-only count of read locks taken on `domains` (spec kv/031 test 8).
+    #[cfg(test)]
+    domain_map_reads: AtomicU64,
     /// Per-engine aggregate windows (spec general/019), indexed by
     /// `EngineKind`. Fixed at construction — no lazy insert, no removal on
     /// domain deletion — so engine windows outlive individual domains.
@@ -212,6 +218,8 @@ impl MetricsStore {
         Arc::new(Self {
             system: SystemMetrics::default(),
             domains: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            domain_map_reads: AtomicU64::new(0),
             engines: std::array::from_fn(|_| MetricsWindow::new(window_secs)),
             rel_catalog_objects: RwLock::new(HashMap::new()),
             started_at: now_secs(),
@@ -379,27 +387,38 @@ impl MetricsStore {
         self.system.rel_orphan_ranges_purged_total.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Lazily creates a `MetricsWindow` for `domain` if it doesn't exist yet.
-    fn ensure_domain(&self, domain: &str) {
-        if self.domains.read().contains_key(domain) {
-            return;
+    /// Read access to the domain map, counted in test builds.
+    fn domains(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<MetricsWindow>>> {
+        #[cfg(test)]
+        self.domain_map_reads.fetch_add(1, Ordering::Relaxed);
+        self.domains.read()
+    }
+
+    /// Test-only: read locks taken on the domain map so far.
+    #[cfg(test)]
+    pub(crate) fn domain_map_reads(&self) -> u64 {
+        self.domain_map_reads.load(Ordering::Relaxed)
+    }
+
+    /// The window of `domain`, created on first use.
+    pub fn domain_window(&self, domain: &str) -> Arc<MetricsWindow> {
+        if let Some(window) = self.domains().get(domain) {
+            return Arc::clone(window);
         }
-        self.domains
-            .write()
+        let mut domains = self.domains.write();
+        let window = domains
             .entry(domain.to_string())
-            .or_insert_with(|| MetricsWindow::new(self.config.window_secs as usize));
+            .or_insert_with(|| Arc::new(MetricsWindow::new(self.config.window_secs as usize)));
+        Arc::clone(window)
     }
 
     /// KV-only (every current call site is `DomainStore`'s read path) —
     /// also mirrors into the KV engine-aggregate window (spec general/019).
-    /// JSON and rel use `record_engine_read` instead.
-    pub fn record_read(&self, domain: &str, latency_us: u64, is_hit: bool) {
+    /// `window` comes from [`Self::domain_window`]. JSON and rel use
+    /// `record_engine_read` instead.
+    pub fn record_read(&self, window: &MetricsWindow, latency_us: u64, is_hit: bool) {
         self.system.total_reads.fetch_add(1, Ordering::Relaxed);
-        self.ensure_domain(domain);
-        let domains = self.domains.read();
-        if let Some(w) = domains.get(domain) {
-            w.record_read(latency_us, is_hit);
-        }
+        window.record_read(latency_us, is_hit);
         self.engines[EngineKind::Kv as usize].record_read(latency_us, is_hit);
     }
 
@@ -407,11 +426,7 @@ impl MetricsStore {
     /// `record_engine_write` instead.
     pub fn record_write(&self, domain: &str, latency_us: u64) {
         self.system.total_writes.fetch_add(1, Ordering::Relaxed);
-        self.ensure_domain(domain);
-        let domains = self.domains.read();
-        if let Some(w) = domains.get(domain) {
-            w.record_write(latency_us);
-        }
+        self.domain_window(domain).record_write(latency_us);
         self.engines[EngineKind::Kv as usize].record_write(latency_us);
     }
 
@@ -435,11 +450,7 @@ impl MetricsStore {
     }
 
     pub fn record_rate_limit_rejection(&self, domain: &str) {
-        self.ensure_domain(domain);
-        let domains = self.domains.read();
-        if let Some(w) = domains.get(domain) {
-            w.record_rate_limit_rejection();
-        }
+        self.domain_window(domain).record_rate_limit_rejection();
     }
 
     /// Removes a domain's metrics window (called when domain is purged).
@@ -449,21 +460,23 @@ impl MetricsStore {
     }
 
     pub fn get_domain_metrics(&self, domain: &str) -> Option<DomainWindowMetrics> {
-        let domains = self.domains.read();
+        let domains = self.domains();
         domains.get(domain).map(|w| w.aggregate(domain, self.config.window_secs))
     }
 
     pub fn get_all_domain_metrics(&self) -> Vec<DomainWindowMetrics> {
-        let domains = self.domains.read();
+        let domains = self.domains();
         domains.iter().map(|(name, w)| w.aggregate(name, self.config.window_secs)).collect()
     }
 
     /// Advances all per-domain rolling windows by one second.
     ///
-    /// Called by `MetricsTicker` once per tick interval.
+    /// Called by `MetricsTicker` once per tick interval. Ticks a copy of the
+    /// window list, so the map is not locked for the whole round (spec
+    /// kv/031 A6).
     pub fn tick_all(&self) {
-        let domains = self.domains.read();
-        for w in domains.values() {
+        let windows: Vec<Arc<MetricsWindow>> = self.domains().values().cloned().collect();
+        for w in &windows {
             w.tick();
         }
         for w in &self.engines {

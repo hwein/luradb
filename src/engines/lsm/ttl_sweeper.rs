@@ -107,7 +107,7 @@ mod tests {
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::engine::LsmEngineOptions;
     use crate::engines::lsm::hlc::HLCTimestamp;
-    use crate::engines::lsm::reader::GetResult;
+    use crate::engines::lsm::reader::{GetResult, Snapshot};
     use crate::engines::lsm::watcher::{OpType, WalEvent};
     use crate::engines::StorageEngine;
     use crate::storage::file_manager::FileManager;
@@ -429,6 +429,66 @@ mod tests {
         let (newest_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
         assert_eq!(newest_ts.as_u64(), tie.as_u64(), "the client write must tie with the tombstone");
         assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+    }
+
+    // The same tie across sources: the tombstone sits in the pinned, older
+    // MemTable, the client write in the newer one. Reads take the newer
+    // source, and a compaction of both flushed tables must decide the same.
+    #[tokio::test]
+    async fn test_tie_across_sources_keeps_the_client_value_through_compaction() {
+        let (engine, _dir) = make_engine().await;
+        // Far ahead of the wall clock: the next stamp is exactly `seed + 1`.
+        let seed = HLCTimestamp::from_components(1 << 47, 0).as_u64();
+        engine.hlc().seed(seed);
+        let tie = Timestamp::new(seed + 1);
+        let pinned = engine.pin_memtable();
+        engine.freeze_active_memtable();
+
+        engine.put(b"k", b"client").await.unwrap();
+        engine.write_tombstone_at(&pinned, b"k", tie).await.unwrap();
+        let (newest_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+        assert_eq!(newest_ts.as_u64(), tie.as_u64(), "the client write must tie with the tombstone");
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+
+        engine.freeze_active_memtable();
+        engine.flush_memtable().await.unwrap();
+        engine.flush_memtable().await.unwrap();
+        engine.compact().await.unwrap();
+
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+    }
+
+    // The same tie above the low watermark: a snapshot registered below it
+    // keeps every version the tie holds, yet the compaction writes each
+    // internal key once -- the newer source's entry, the one reads see. A
+    // second entry could open the next data block, where a read at the tie
+    // would find the tombstone.
+    #[tokio::test]
+    async fn test_tie_above_the_watermark_leaves_one_entry_after_compaction() {
+        let (engine, _dir) = make_engine().await;
+        let below = engine.snapshot();
+        // Far ahead of the wall clock: the next stamp is exactly `seed + 1`.
+        let seed = HLCTimestamp::from_components(1 << 47, 0).as_u64();
+        engine.hlc().seed(seed);
+        let tie = Timestamp::new(seed + 1);
+        assert!(below.snapshot().timestamp().as_u64() < tie.as_u64());
+        let pinned = engine.pin_memtable();
+        engine.freeze_active_memtable();
+
+        engine.put(b"k", b"client").await.unwrap();
+        engine.write_tombstone_at(&pinned, b"k", tie).await.unwrap();
+        engine.freeze_active_memtable();
+        engine.flush_memtable().await.unwrap();
+        engine.flush_memtable().await.unwrap();
+        engine.compact().await.unwrap();
+
+        let entries: usize = engine.version().level(1).iter().map(|t| t.iter().count()).sum();
+        assert_eq!(entries, 1, "one entry per internal key");
+        assert_eq!(
+            engine.get_with_snapshot(b"k", &Snapshot::new(tie)).await.unwrap(),
+            GetResult::Present(b"client".to_vec())
+        );
+        drop(below);
     }
 
     // Spec kv/032 test 5: the dropped tombstone adds no bytes (general/032).

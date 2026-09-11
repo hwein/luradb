@@ -56,21 +56,13 @@ pub enum IoRequest {
         expected_generation: u32,
         response: oneshot::Sender<Result<(u64, usize)>>,
     },
-    /// Read `len` bytes at `offset` from the VLog. Rejected the same way as
-    /// `VlogAppend` on a generation mismatch (spec perf/013).
-    VlogRead {
-        offset: u64,
-        len: usize,
-        expected_generation: u32,
-        response: oneshot::Sender<Result<Vec<u8>>>,
-    },
     /// Write a complete SSTable to `path` (temp file + fsync + atomic rename).
     /// Returns `data` back so a non-mmap flush can build the reader without a copy.
     SstableWrite { path: PathBuf, data: Vec<u8>, response: oneshot::Sender<Result<Vec<u8>>> },
     /// Reopen the VLog on `path` after GC: close the old fd, reset the offset
     /// to the file length, refresh the fixed-file slot, and record
-    /// `generation` as the id now open (checked against by `VlogRead`/
-    /// `VlogAppend`, spec perf/013).
+    /// `generation` as the id now open (checked against by `VlogAppend`,
+    /// spec perf/013).
     VlogReopen { path: PathBuf, generation: u32, response: oneshot::Sender<Result<()>> },
     /// Drain pending requests, then stop the thread.
     Shutdown,
@@ -105,15 +97,6 @@ impl StorageHandle {
         let (tx, rx) = oneshot::channel();
         self.request_tx
             .send(IoRequest::VlogAppend { data, expected_generation, response: tx })
-            .await
-            .map_err(|_| anyhow!("storage thread shut down"))?;
-        rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
-    }
-
-    pub async fn vlog_read(&self, offset: u64, len: usize, expected_generation: u32) -> Result<Vec<u8>> {
-        let (tx, rx) = oneshot::channel();
-        self.request_tx
-            .send(IoRequest::VlogRead { offset, len, expected_generation, response: tx })
             .await
             .map_err(|_| anyhow!("storage thread shut down"))?;
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
@@ -216,9 +199,9 @@ struct StorageState {
     vlog_offset: u64,
     /// Generation id of the currently open `vlog` file (spec perf/013);
     /// starts at 1 (the thread always spawns on the canonical path) and is
-    /// updated by `VlogReopen`. Checked against `VlogRead`/`VlogAppend` so a
-    /// caller holding a stale generation gets a clean error instead of I/O
-    /// against the wrong file.
+    /// updated by `VlogReopen`. Checked against `VlogAppend` so a caller
+    /// holding a stale generation gets a clean error instead of a write
+    /// into the wrong file.
     vlog_generation: u32,
     /// WAL and VLog are registered as fixed files (slots 0 and 1); `false` after
     /// a failed `register_files` — ops then fall back to raw fds.
@@ -350,9 +333,6 @@ fn process_batch(state: &mut StorageState, batch: Vec<IoRequest>) -> bool {
             IoRequest::VlogAppend { data, expected_generation, response } => {
                 let _ = response.send(do_vlog_append(state, &data, expected_generation));
             }
-            IoRequest::VlogRead { offset, len, expected_generation, response } => {
-                let _ = response.send(do_vlog_read(state, offset, len, expected_generation));
-            }
             IoRequest::SstableWrite { path, data, response } => {
                 let result = do_sstable_write(state, &path, &data).map(|()| data);
                 let _ = response.send(result);
@@ -412,8 +392,8 @@ fn do_wal_truncate(state: &mut StorageState) -> Result<()> {
 }
 
 /// Rejects a request made against any generation other than the one the
-/// thread currently has open — the one-fd read/write window becomes a clean
-/// `Err` instead of silent I/O against the wrong file (spec perf/013).
+/// thread currently has open — the one-fd write window becomes a clean
+/// `Err` instead of a silent write into the wrong file (spec perf/013).
 fn check_vlog_generation(state: &StorageState, expected: u32) -> Result<()> {
     if expected != state.vlog_generation {
         return Err(anyhow!(
@@ -434,14 +414,6 @@ fn do_vlog_append(state: &mut StorageState, data: &[u8], expected_generation: u3
     ring_write_all(&mut state.ring, vlog, offset, data)?;
     state.vlog_offset += data.len() as u64;
     Ok((offset, data.len()))
-}
-
-fn do_vlog_read(state: &mut StorageState, offset: u64, len: usize, expected_generation: u32) -> Result<Vec<u8>> {
-    check_vlog_generation(state, expected_generation)?;
-    let mut buf = vec![0u8; len];
-    let vlog = state.vlog_file();
-    ring_read_exact(&mut state.ring, vlog, offset, &mut buf)?;
-    Ok(buf)
 }
 
 /// Reopens the VLog on `path` after GC: swaps in the new fd (refreshing fixed
@@ -568,14 +540,6 @@ fn write_entry(file: RingFile, ptr: *const u8, len: u32, offset: u64) -> squeue:
     }
 }
 
-/// Builds a Read SQE for either a fixed-file slot or a raw fd.
-fn read_entry(file: RingFile, ptr: *mut u8, len: u32, offset: u64) -> squeue::Entry {
-    match file {
-        RingFile::Fixed(i) => opcode::Read::new(types::Fixed(i), ptr, len).offset(offset).build(),
-        RingFile::Raw(fd) => opcode::Read::new(types::Fd(fd), ptr, len).offset(offset).build(),
-    }
-}
-
 /// Builds an Fsync SQE for either a fixed-file slot or a raw fd.
 fn fsync_entry(file: RingFile, datasync: bool) -> squeue::Entry {
     let flags = if datasync { types::FsyncFlags::DATASYNC } else { types::FsyncFlags::empty() };
@@ -596,24 +560,6 @@ fn ring_write_all(ring: &mut IoUring, file: RingFile, mut offset: u64, data: &[u
         }
         if res == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "io_uring write returned 0"));
-        }
-        pos += res as usize;
-        offset += res as u64;
-    }
-    Ok(())
-}
-
-fn ring_read_exact(ring: &mut IoUring, file: RingFile, mut offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut pos = 0usize;
-    while pos < buf.len() {
-        let dst = &mut buf[pos..];
-        let entry = read_entry(file, dst.as_mut_ptr(), dst.len() as u32, offset);
-        let res = ring_op(ring, entry)?;
-        if res < 0 {
-            return Err(std::io::Error::from_raw_os_error(-res));
-        }
-        if res == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "io_uring read hit EOF"));
         }
         pos += res as usize;
         offset += res as u64;
@@ -707,20 +653,35 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"helloworld!");
     }
 
-    // 3. vlog_read -- data read correctly.
+    // 3. vlog_append -- data lands at the returned offset.
     #[tokio::test]
-    async fn test_vlog_append_then_read() {
+    async fn test_vlog_append_writes_at_the_returned_offset() {
         let dir = tempfile::TempDir::new().unwrap();
         let (mut st, handle) = spawn(dir.path(), false, 64);
         let (off, len) = handle.vlog_append(b"payload-XYZ".to_vec(), 1).await.unwrap();
         assert_eq!((off, len), (0, 11));
-        let got = handle.vlog_read(off, len, 1).await.unwrap();
-        assert_eq!(got, b"payload-XYZ");
         st.shutdown();
+        assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"payload-XYZ");
     }
 
-    // Spec perf/013 test 1: vlog_read/vlog_append reject a request whose
-    // expected generation does not match the one the thread has open, and
+    // Spec kv/031 test 7 (remote mode): a thread-backed generation reads
+    // through its own descriptor -- the thread has no read command left, and
+    // the reads keep working after it is gone.
+    #[tokio::test]
+    async fn test_thread_backed_vlog_reads_without_the_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut st, handle) = spawn(dir.path(), false, 64);
+        let vlog = VLog::with_storage_handle(dir.path().join("vlog"), handle.clone(), 1).unwrap();
+        let off = vlog.append(b"thread-appended").await.unwrap();
+        assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
+
+        drop(handle);
+        st.shutdown();
+        assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
+    }
+
+    // Spec perf/013 test 1: vlog_append rejects a request whose expected
+    // generation does not match the one the thread has open, and
     // vlog_reopen's id becomes the new expectation.
     #[tokio::test]
     async fn test_vlog_generation_mismatch_is_rejected() {
@@ -730,22 +691,20 @@ mod tests {
         // Thread spawns on generation 1; any other id is rejected.
         let err = handle.vlog_append(b"x".to_vec(), 2).await.unwrap_err();
         assert!(err.to_string().contains("generation mismatch"), "{err}");
-        let err = handle.vlog_read(0, 1, 2).await.unwrap_err();
-        assert!(err.to_string().contains("generation mismatch"), "{err}");
 
         // The right id still performs unchanged I/O.
-        let (off, len) = handle.vlog_append(b"hello".to_vec(), 1).await.unwrap();
-        assert_eq!(handle.vlog_read(off, len, 1).await.unwrap(), b"hello");
+        handle.vlog_append(b"hello".to_vec(), 1).await.unwrap();
 
         // After a reopen to generation 2, the old id is rejected and the new
         // one succeeds.
         let new_path = dir.path().join("vlog.2");
-        handle.vlog_reopen(new_path, 2).await.unwrap();
+        handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
         assert!(handle.vlog_append(b"y".to_vec(), 1).await.is_err());
-        let (off2, len2) = handle.vlog_append(b"world".to_vec(), 2).await.unwrap();
-        assert_eq!(handle.vlog_read(off2, len2, 2).await.unwrap(), b"world");
+        handle.vlog_append(b"world".to_vec(), 2).await.unwrap();
 
         st.shutdown();
+        assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(new_path).unwrap(), b"world");
     }
 
     // 4. Batching: 100 concurrent wal_append requests processed correctly.
@@ -872,9 +831,9 @@ mod tests {
         assert!(pin_to_cpu(libc::CPU_SETSIZE + 1000).is_err());
     }
 
-    // Finding 1: registered (fixed) files — WAL slot 0 / VLog slot 1 round-trip.
+    // Finding 1: registered (fixed) files — WAL slot 0 / VLog slot 1 writes.
     #[test]
-    fn test_fixed_files_write_read_roundtrip() {
+    fn test_fixed_files_write_through_both_slots() {
         let dir = tempfile::TempDir::new().unwrap();
         let wal = open_rw(&dir.path().join("wal")).unwrap();
         let vlog = open_rw(&dir.path().join("vlog")).unwrap();
@@ -884,10 +843,6 @@ mod tests {
             .unwrap();
 
         ring_write_all(&mut ring, RingFile::Fixed(VLOG_SLOT), 0, b"fixed-vlog").unwrap();
-        let mut buf = vec![0u8; 10];
-        ring_read_exact(&mut ring, RingFile::Fixed(VLOG_SLOT), 0, &mut buf).unwrap();
-        assert_eq!(&buf, b"fixed-vlog");
-
         ring_write_all(&mut ring, RingFile::Fixed(WAL_SLOT), 0, b"fixed-wal").unwrap();
         ring_fsync(&mut ring, RingFile::Fixed(WAL_SLOT), true).unwrap();
 
@@ -909,8 +864,8 @@ mod tests {
         // Offset now tracks the new file: the append lands after its 3 bytes.
         let (off, len) = handle.vlog_append(b"XY".to_vec(), 2).await.unwrap();
         assert_eq!((off, len), (3, 2));
-        assert_eq!(handle.vlog_read(0, 5, 2).await.unwrap(), b"NEWXY");
         st.shutdown();
+        assert_eq!(std::fs::read(&new_path).unwrap(), b"NEWXY");
     }
 
     // 8. Integration: LsmStorageEngine with StorageHandle -> write + read E2E.
@@ -922,7 +877,7 @@ mod tests {
         let (mut st, handle) = spawn(dir.path(), false, 1024);
 
         let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
-        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1));
+        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
         let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
         let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
         let engine = LsmStorageEngine::new(

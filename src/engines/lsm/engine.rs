@@ -4,17 +4,17 @@
 //! MemTable, WAL, VLog, SSTable levels, compaction, and the Janitor GC.
 
 use crate::config::BlockCacheConfig;
-use crate::engines::lsm::block_cache::BlockCache;
+use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::memtable::{MemTable, Value};
 use crate::engines::lsm::reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata};
 use crate::engines::lsm::key::{InternalKey, Timestamp};
-use crate::engines::lsm::levels::LevelManager;
+use crate::engines::lsm::version::{Version, VersionCell};
 use crate::engines::lsm::compaction::{
     CompactionConfig, CompactionJob, select_sstables_for_level_compaction,
     select_level_to_compact, should_compact,
 };
 use crate::engines::lsm::janitor::{FlushBarrier, Janitor, JanitorConfig};
-use crate::engines::lsm::hlc::HybridLogicalClock;
+use crate::engines::lsm::hlc::{HLCTimestamp, HybridLogicalClock};
 use crate::engines::lsm::watcher::{OpType, WalEvent, WATCH_TAG};
 use crate::engines::StorageEngine;
 use crate::core::coop::YieldEvery;
@@ -22,14 +22,14 @@ use crate::core::events::{stream_epoch, Resume, SeqRing};
 use crate::core::io_engine::IoEngine;
 use crate::core::storage_thread::StorageHandle;
 use crate::core::wal::WriteAheadLog;
-use crate::storage::vlog::{discover_generations, generation_path, VLog, VLogError, VLogRegistry};
+use crate::storage::vlog::{discover_generations, generation_path, VLog, VLogError};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
 use crate::storage::format::VersionState;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use tokio::sync::{broadcast, watch, Notify};
@@ -180,13 +180,13 @@ async fn scan_memtable_for_prefix(
 /// A `Sealed` error means the Janitor swapped the active generation between the
 /// lookup and the append; it publishes the new generation before sealing the
 /// old one, so a single retry converges (spec kv/017).
-async fn append_to_active(vlog: &VLogRegistry, value: &[u8]) -> Result<(u32, u64)> {
+async fn append_to_active(versions: &VersionCell, value: &[u8]) -> Result<(u32, u64)> {
     loop {
-        let active = vlog.active();
+        let active = Arc::clone(&versions.get().active_vlog);
         match active.append(value).await {
             Ok(offset) => return Ok((active.id(), offset)),
             Err(VLogError::Sealed { id }) => anyhow::ensure!(
-                vlog.active().id() != id,
+                versions.get().active_vlog.id() != id,
                 "active value log generation {id} is sealed"
             ),
             Err(e) => return Err(e.into()),
@@ -277,6 +277,31 @@ impl TestHook {
     }
 }
 
+/// Test-only rendezvous for a synchronous path on a thread of its own: the
+/// first `pause` signals `reached`, then blocks until `release` is sent.
+#[cfg(test)]
+pub(crate) struct ThreadHook {
+    ends: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+#[cfg(test)]
+impl ThreadHook {
+    /// The hook plus the test's ends: `reached` receives once the path is
+    /// parked, a send on `release` lets it go on.
+    pub fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (Arc::new(Self { ends: Mutex::new(Some((reached_tx, release_rx))) }), reached_rx, release_tx)
+    }
+
+    /// Parks the first caller only; later calls pass straight through.
+    pub fn pause(&self) {
+        let Some((reached, release)) = self.ends.lock().take() else { return };
+        reached.send(()).unwrap();
+        release.recv().unwrap();
+    }
+}
+
 /// Test-only pause points inside the engine's install sequences (spec
 /// general/028) — set before the engine is shared, never in a release build.
 #[cfg(test)]
@@ -287,6 +312,8 @@ pub(crate) struct TestHooks {
     /// Parks `rebuild_levels_from_manifest` between opening the new readers
     /// and installing them.
     pub before_level_install: Option<Arc<TestHook>>,
+    /// Parks `snapshot` right after it drew its stamp.
+    pub snapshot_stamp_drawn: Option<Arc<ThreadHook>>,
 }
 
 /// LSM-Tree Storage Engine with MVCC and background maintenance.
@@ -294,27 +321,12 @@ pub(crate) struct TestHooks {
 /// All long-lived background tasks (flush, compaction, Janitor GC) are spawned
 /// via [`start_background_tasks`] and stopped gracefully via [`shutdown`].
 pub struct LsmStorageEngine {
-    /// Active (writable) MemTable.
-    memtable: Arc<RwLock<Arc<MemTable>>>,
-
-    /// Frozen MemTables waiting to be flushed to L0.
-    immutable_memtables: Arc<RwLock<Vec<Arc<MemTable>>>>,
-
-    /// MemTables claimed by a flush in flight, oldest first — the handover
-    /// slot between [`Self::immutable_memtables`] and L0. A claimed MemTable
-    /// is installed in L0 before it leaves this slot and returns here on a
-    /// failed flush, so readers always find it in one of the three places
-    /// (spec general/028). Lock order is always `immutable_memtables` →
-    /// `flushing`.
-    flushing: RwLock<Vec<Arc<MemTable>>>,
-
-    /// Hierarchical SSTable levels.
-    level_manager: Arc<LevelManager>,
+    /// MemTables, SSTable levels and vLog generations as one value (spec
+    /// kv/031 A1): readers clone it, every change installs a successor.
+    /// Shared with the Janitor, which installs its GC results itself.
+    version: Arc<VersionCell>,
 
     wal: Arc<WriteAheadLog>,
-
-    /// All live vLog generations; the active one takes new appends.
-    vlog: Arc<VLogRegistry>,
 
     /// Canonical vLog path (generation 1) — base for every later generation.
     vlog_path: PathBuf,
@@ -350,8 +362,9 @@ pub struct LsmStorageEngine {
     /// before it touches MemTables/WAL (M1).
     background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 
-    /// S3-FIFO block cache shared across all read operations.
-    block_cache: Arc<Mutex<BlockCache>>,
+    /// S3-FIFO block cache shared across all read operations, striped
+    /// (spec kv/031 A2).
+    block_cache: Arc<StripedBlockCache>,
 
     /// Number of successfully completed `compact_next_level` calls since
     /// process start (spec general/024) -- `/metrics` system block.
@@ -388,15 +401,16 @@ pub struct LsmStorageEngine {
     /// in flight, never for ones started after it — no starvation under
     /// sustained write load, and no deadlock: the drain holds no other lock a
     /// writer needs while it waits, and no write path drains while holding its
-    /// own read guard.
-    in_flight_writes: tokio::sync::RwLock<()>,
+    /// own read guard. `Arc` because the Janitor drains around its switch of
+    /// the active vLog generation.
+    in_flight_writes: Arc<tokio::sync::RwLock<()>>,
 
     /// Held by a flush from its claim to its install, so L0 and the manifest
     /// carry the SSTables in MemTable age order and whoever takes this lock
     /// knows that no flush claimed before it is still in flight (spec
-    /// general/029). Lock order is `flush_lock` → `manifest` /
-    /// `immutable_memtables` / `flushing`, never the other way round; `Arc`
-    /// because the Janitor's GC install takes it too.
+    /// general/029). Lock order is `flush_lock` → `manifest` / `version`,
+    /// never the other way round; `Arc` because the Janitor's GC install takes
+    /// it too.
     flush_lock: Arc<tokio::sync::Mutex<()>>,
 
     /// Held by a whole GC cycle and by a whole compaction, so neither of the
@@ -428,13 +442,16 @@ impl LsmStorageEngine {
             block_cache: block_cache_config,
         } = options;
 
-        let vlog = Self::build_vlog_registry(vlog, &vlog_path).await?;
+        let mut version = Self::discover_vlog_generations(vlog, &vlog_path).await?;
 
         // Recover the MemTable from the WAL first.
-        let (recovered, wal_max_ts) =
-            Self::recover_from_wal(&wal_path, &vlog, engine_config.vlog_inline_threshold).await?;
+        let (recovered, wal_max_ts) = Self::recover_from_wal(
+            &wal_path,
+            &version.active_vlog,
+            engine_config.vlog_inline_threshold,
+        )
+        .await?;
 
-        let level_manager = Arc::new(LevelManager::new());
         let manifest = manifest_manager.load().await?;
 
         // High-water mark of everything already persisted (spec kv/026 M3).
@@ -447,26 +464,22 @@ impl LsmStorageEngine {
             .unwrap_or(0);
 
         // Then, recover SSTable levels from the manifest.
-        Self::recover_sstables(&manifest, &file_manager, &level_manager, engine_config.use_mmap)
-            .await?;
+        let levels = Self::recover_sstables(&manifest, &file_manager, engine_config.use_mmap).await?;
+        version = version.with_levels(levels);
 
         let (change_tx, _) = broadcast::channel(engine_config.wal_event_channel_capacity);
         let watch_log = SeqRing::new(engine_config.watch_replay_buffer_size);
 
-        let block_cache = Arc::new(Mutex::new(BlockCache::new(
+        let block_cache = Arc::new(StripedBlockCache::new(
             block_cache_config.capacity_bytes,
             block_cache_config.small_ratio,
             block_cache_config.ghost_capacity,
-        )));
+        ));
 
         let (shutdown_tx, _) = watch::channel(false);
         let engine = Self {
-            memtable: Arc::new(RwLock::new(Arc::new(MemTable::new()))),
-            immutable_memtables: Arc::new(RwLock::new(Vec::new())),
-            flushing: RwLock::new(Vec::new()),
-            level_manager,
+            version: Arc::new(VersionCell::new(version)),
             wal,
-            vlog,
             vlog_path,
             file_manager,
             manifest: Arc::new(RwLock::new(manifest)),
@@ -487,7 +500,7 @@ impl LsmStorageEngine {
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
             change_epoch: AtomicU64::new(0),
-            in_flight_writes: tokio::sync::RwLock::new(()),
+            in_flight_writes: Arc::new(tokio::sync::RwLock::new(())),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -504,7 +517,11 @@ impl LsmStorageEngine {
         // Recovered WAL data is RAM-only: flush it to an SSTable BEFORE
         // truncating the WAL, so no later startup failure can lose it.
         if !recovered.is_empty() {
-            engine.immutable_memtables.write().push(Arc::new(recovered));
+            engine.install(|v| {
+                let mut next = v.clone();
+                next.immutables.push(Arc::new(recovered));
+                next
+            });
             engine.flush_memtable().await?;
         }
         engine.wal.truncate().await?;
@@ -534,36 +551,41 @@ impl LsmStorageEngine {
     /// The thread's single fd can back only one generation at a time, so
     /// generation 1 — no longer thread-owned once this swap runs — is
     /// reopened locally afterward; every other generation was already local
-    /// (`build_vlog_registry` opens ids > 1 via `tokio::fs`).
+    /// (`discover_vlog_generations` opens ids > 1 via `tokio::fs`).
     pub async fn route_active_vlog_to_thread(&self, handle: &StorageHandle) -> Result<()> {
-        let active = self.vlog.active();
+        let active = Arc::clone(&self.version().active_vlog);
         let id = active.id();
         if id <= 1 {
             return Ok(());
         }
         let path = active.path().to_path_buf();
         handle.vlog_reopen(path.clone(), id).await?;
-        self.vlog.set_active(Arc::new(VLog::with_storage_handle(path, handle.clone(), id)));
-
-        let gen1 = VLog::open(&self.vlog_path, 1).await?;
-        self.vlog.register(Arc::new(gen1));
+        let routed = Arc::new(VLog::with_storage_handle(path, handle.clone(), id)?);
+        let gen1 = Arc::new(VLog::open(&self.vlog_path, 1).await?);
+        self.install(|v| {
+            let mut next = v.with_active_vlog(routed);
+            Arc::make_mut(&mut next.vlog).insert(1, gen1);
+            next
+        });
         Ok(())
     }
 
     // ── Recovery ────────────────────────────────────────────────────────────
 
-    /// Registers every vLog generation that exists next to `vlog_path`; the
-    /// highest id becomes the active one (spec kv/017). `vlog` is the caller's
-    /// handle on the canonical path, which is generation 1 — a store without
-    /// further generations therefore starts exactly as before.
-    async fn build_vlog_registry(vlog: Arc<VLog>, vlog_path: &Path) -> Result<Arc<VLogRegistry>> {
-        let registry = VLogRegistry::new(vlog);
+    /// A version over every vLog generation that exists next to `vlog_path`;
+    /// the highest id becomes the active one (spec kv/017). `vlog` is the
+    /// caller's handle on the canonical path, which is generation 1 — a store
+    /// without further generations therefore starts exactly as before.
+    async fn discover_vlog_generations(vlog: Arc<VLog>, vlog_path: &Path) -> Result<Version> {
+        let mut version = Version::new(vlog);
         for id in discover_generations(vlog_path).await? {
             if id > 1 {
-                registry.set_active(Arc::new(VLog::open(generation_path(vlog_path, id), id).await?));
+                let generation = Arc::new(VLog::open(generation_path(vlog_path, id), id).await?);
+                Arc::make_mut(&mut version.vlog).insert(id, Arc::clone(&generation));
+                version.active_vlog = generation;
             }
         }
-        Ok(Arc::new(registry))
+        Ok(version)
     }
 
     /// Recovers the MemTable state from the WAL, together with the highest
@@ -578,7 +600,7 @@ impl LsmStorageEngine {
     /// data to an SSTable, so an interrupted startup never loses it.
     async fn recover_from_wal(
         wal_path: &PathBuf,
-        vlog: &VLogRegistry,
+        vlog: &VLog,
         vlog_inline_threshold: usize,
     ) -> Result<(MemTable, u64)> {
         let memtable = MemTable::new();
@@ -592,8 +614,8 @@ impl LsmStorageEngine {
                     let ts = Timestamp::new(timestamp);
                     let expire_at_opt = if expire_at == 0 { None } else { Some(expire_at) };
                     if value.len() >= vlog_inline_threshold {
-                        let (file_id, offset) = append_to_active(vlog, &value).await?;
-                        memtable.set(key, ts, Value::Pointer { file_id, offset, len: value.len(), expire_at: expire_at_opt });
+                        let offset = vlog.append(&value).await?;
+                        memtable.set(key, ts, Value::Pointer { file_id: vlog.id(), offset, len: value.len(), expire_at: expire_at_opt });
                     } else {
                         memtable.set(key, ts, Value::Inline(value, expire_at_opt));
                     }
@@ -635,15 +657,36 @@ impl LsmStorageEngine {
         Ok(reader)
     }
 
+    /// Serving readers for `metas`: the instance `current` holds for a file,
+    /// a new one only for a file it lacks. One instance per file, so
+    /// [`SSTableReader::retire`] marks it for every version that holds it.
+    pub(crate) async fn level_readers(
+        file_manager: &FileManager,
+        current: &Version,
+        metas: &[SSTableMetadata],
+        use_mmap: bool,
+    ) -> Result<Vec<Arc<SSTableReader>>> {
+        let held: HashMap<u64, &Arc<SSTableReader>> =
+            current.levels.iter().flatten().map(|t| (t.file_id, t)).collect();
+        let mut readers = Vec::with_capacity(metas.len());
+        for meta in metas {
+            readers.push(match held.get(&meta.file_id) {
+                Some(reader) => Arc::clone(reader),
+                None => Arc::new(Self::open_sstable_reader(file_manager, meta.file_id, use_mmap).await?),
+            });
+        }
+        Ok(readers)
+    }
+
     /// An unopenable SSTable that the manifest still lists is a startup
     /// error (spec kv/026 M2), not a warning: silently installing a partial
     /// level would start the database without a part of its data.
     async fn recover_sstables(
         manifest: &Manifest,
         file_manager: &Arc<FileManager>,
-        level_manager: &Arc<LevelManager>,
         use_mmap: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<(usize, Vec<Arc<SSTableReader>>)>> {
+        let mut levels = Vec::new();
         for (level_idx, level_metas) in manifest.levels.iter().enumerate() {
             let mut sstables = Vec::new();
             for meta in level_metas {
@@ -653,10 +696,10 @@ impl LsmStorageEngine {
                 sstables.push(Arc::new(reader));
             }
             if !sstables.is_empty() {
-                level_manager.replace_level(level_idx, sstables);
+                levels.push((level_idx, sstables));
             }
         }
-        Ok(())
+        Ok(levels)
     }
 
     // ── Background tasks ────────────────────────────────────────────────────
@@ -689,9 +732,8 @@ impl LsmStorageEngine {
             Box::pin(async move { engine.flush_all_memtables().await })
         });
         Janitor::new(
-            Arc::clone(&self.vlog),
+            Arc::clone(&self.version),
             self.vlog_path.clone(),
-            Arc::clone(&self.level_manager),
             Arc::clone(&self.manifest),
             Arc::clone(&self.manifest_manager),
             Arc::clone(&self.file_manager),
@@ -705,13 +747,14 @@ impl LsmStorageEngine {
             Some(flush_barrier),
             Some(Arc::clone(&self.flush_lock)),
             Some(Arc::clone(&self.maintenance_lock)),
+            Some(Arc::clone(&self.in_flight_writes)),
         )
     }
 
     async fn background_flush_loop(&self) {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         while !self.shutdown.load(Ordering::Relaxed) {
-            let has_immutable = !self.immutable_memtables.read().is_empty();
+            let has_immutable = !self.version().immutables.is_empty();
             if has_immutable {
                 if let Err(e) = self.flush_memtable().await {
                     eprintln!("[Engine] Flush error: {e}");
@@ -764,32 +807,27 @@ impl LsmStorageEngine {
         // new MemTable. Everything below the guard is synchronous -- no await.
         {
             let _drain = self.in_flight_writes.write().await;
-            // Both guards over the whole rotation, like every other one: with
-            // the active MemTable already swapped out and the frozen one not
-            // yet in `imm`, a reader on another thread would see neither
-            // (spec general/028).
-            let mut mt = self.memtable.write();
-            let mut imm = self.immutable_memtables.write();
-            if !mt.is_empty() {
-                imm.push(Arc::clone(&*mt));
+            self.install(Version::rotated);
+        }
+        loop {
+            while !self.version().immutables.is_empty() {
+                self.flush_memtable().await?;
             }
-            *mt = Arc::new(MemTable::new());
-        }
-        while !self.immutable_memtables.read().is_empty() {
-            self.flush_memtable().await?;
-        }
-        // The barrier: `flush_lock` is free only once every flush claimed
-        // before this point has installed its SSTable, so nothing this caller
-        // has to wait for is left in flight (spec general/029). Acquired after
-        // the drain loop, never around it — `flush_memtable` takes the same
-        // lock and `tokio::sync::Mutex` is not reentrant. The check belongs
-        // under the guard: released first, the flush loop could claim the next
-        // MemTable before it runs.
-        {
+            // The barrier: `flush_lock` is free only once every flush claimed
+            // before this point has installed its SSTable or, failed, handed
+            // its MemTable back to the immutables (spec general/029). Acquired
+            // after the drain loop, never around it — `flush_memtable` takes
+            // the same lock and `tokio::sync::Mutex` is not reentrant. The
+            // check belongs under the guard: released first, the flush loop
+            // could claim the next MemTable before it runs. A MemTable handed
+            // back is drained again.
             let _flush = self.flush_lock.lock().await;
-            debug_assert!(self.flushing.read().is_empty());
+            let version = self.version();
+            debug_assert!(version.flushing.is_empty());
+            if version.immutables.is_empty() {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Signals background tasks to stop, joins them, then flushes remaining
@@ -797,9 +835,12 @@ impl LsmStorageEngine {
     /// handles left to join and flushes/truncates an already-clean state.
     ///
     /// A failed flush skips the truncate (spec kv/026 M1): a failed
-    /// `flush_memtable` puts its MemTable back into `immutable_memtables`
+    /// `flush_memtable` puts its MemTable back among the immutables
     /// (spec general/028), but nothing persisted its data, so the WAL is the
-    /// only durable copy of it — truncating anyway would destroy it.
+    /// only durable copy of it — truncating anyway would destroy it. So does
+    /// a failed manifest save: an earlier flush can have installed its
+    /// SSTable and then failed to save, leaving the table in L0 and in no
+    /// MANIFEST on disk, where the next startup would not find it.
     /// The next startup replays the WAL instead. The failure stays an
     /// `eprintln!`, not just `tracing::error!`: no tracing subscriber runs
     /// under `cargo test`, so this line is the only surviving evidence in a
@@ -831,6 +872,13 @@ impl LsmStorageEngine {
             eprintln!("[Engine] Shutdown flush error: {e}");
             return;
         }
+        // A no-op unless a flush's own save failed: the manifest carries the
+        // version already on disk then (spec kv/027 §A).
+        let snap = self.manifest.read().clone();
+        if let Err(e) = self.manifest_manager.save(&snap).await {
+            eprintln!("[Engine] Shutdown manifest save error: {e}");
+            return;
+        }
 
         // All data is now in SSTables — WAL entries are redundant.
         // Clear it so the next startup finds an empty WAL and skips
@@ -840,24 +888,57 @@ impl LsmStorageEngine {
         }
     }
 
+    // ── Version (spec kv/031 A1) ────────────────────────────────────────────
+
+    /// The current sources as one value; holding it costs no lock.
+    pub(crate) fn version(&self) -> Arc<Version> {
+        self.version.get()
+    }
+
+    /// Installs the successor `f` builds from the current version — one
+    /// install per change, synchronous, see [`VersionCell::install`].
+    pub(crate) fn install(&self, f: impl FnOnce(&Version) -> Version) {
+        self.version.install(f)
+    }
+
     // ── MVCC helpers ────────────────────────────────────────────────────────
 
     fn next_timestamp(&self) -> Timestamp {
         Timestamp::new(self.hlc.now().as_u64())
     }
 
+    /// Stamp of a point read: the last one the clock issued, raised to the
+    /// wall clock, without issuing one (spec kv/031 A4). A confirmed write
+    /// drew its stamp before its confirmation, so every later read sees it;
+    /// the wall clock covers stored stamps no seed knows of (a manifest
+    /// written before `max_timestamp`), as a drawn stamp did.
+    fn read_timestamp(&self) -> Timestamp {
+        let wall = HLCTimestamp::from_components(HybridLogicalClock::physical_time(), 0);
+        Timestamp::new(self.hlc.peek().max(wall).as_u64())
+    }
+
     /// Creates an MVCC snapshot and registers it with the [`SnapshotRegistry`].
     ///
     /// The returned guard deregisters itself when dropped, automatically
     /// advancing the low watermark used by the compaction filter.
+    ///
+    /// Unlike a point read, it draws a stamp of its own: one per snapshot,
+    /// under the registry lock (see [`SnapshotRegistry::acquire_at`]).
     pub fn snapshot(&self) -> RegistrySnapshot {
-        let ts = self.next_timestamp();
-        self.snapshot_registry.acquire(ts)
+        self.snapshot_registry.acquire_at(|| {
+            let stamp = self.hlc.try_now()?;
+            #[cfg(test)]
+            if let Some(hook) = &self.hooks.snapshot_stamp_drawn {
+                hook.pause();
+            }
+            Some(Timestamp::new(stamp.as_u64()))
+        })
     }
 
-    /// Returns a plain (unregistered) snapshot for internal use.
-    fn snapshot_unregistered(&self) -> Snapshot {
-        Snapshot::new(self.next_timestamp())
+    /// Test-only: the registry `snapshot` registers in.
+    #[cfg(test)]
+    pub(crate) fn snapshot_registry(&self) -> &SnapshotRegistry {
+        &self.snapshot_registry
     }
 
     pub fn hlc(&self) -> &Arc<HybridLogicalClock> {
@@ -883,24 +964,35 @@ impl LsmStorageEngine {
 
     // ── Read path ───────────────────────────────────────────────────────────
 
-    /// Reader over the current MemTable, immutables and levels. Every guard is
-    /// released before it returns, so no lock is held across an await.
+    /// Reader over the current version.
     fn build_reader(&self) -> LsmReader {
-        let memtable = { Arc::clone(&*self.memtable.read()) };
+        LsmReader::new(self.version(), Arc::clone(&self.block_cache))
+    }
 
-        let mut reader = LsmReader::new(memtable, Arc::clone(&self.vlog), Arc::clone(&self.block_cache));
-        {
-            // Both slots in one section, so a claim cannot fall between them
-            // (spec general/028). The reader walks this vector back to front,
-            // so the older flushes in flight go in front of `imm`.
-            let imm = self.immutable_memtables.read();
-            let flushing = self.flushing.read();
-            let mut tables = flushing.clone();
-            tables.extend(imm.iter().cloned());
-            reader.set_immutable_memtables(tables);
-        }
-        reader.set_sstables(self.level_manager.get_all_levels());
-        reader
+    /// Reader and snapshot of an unregistered point read at the current state
+    /// (spec kv/031 A3). The version is taken before the stamp: compaction
+    /// and GC only drop what every registered snapshot sees as shadowed, and
+    /// the reader keeps its own sources as `Arc`s, so they still hold the
+    /// newest version of every key at that stamp. A stamp taken first could
+    /// meet a version whose compaction already dropped what the stamp sees.
+    fn latest_view(&self) -> (LsmReader, Snapshot) {
+        let reader = self.build_reader();
+        (reader, Snapshot::new(self.read_timestamp()))
+    }
+
+    /// Point read at the current state, with `expire_at` (0 = no TTL) — the
+    /// KV `get` path. Registers no snapshot, see [`Self::latest_view`].
+    pub async fn get_latest_with_expiry(&self, key: &[u8]) -> Result<(GetResult, u64)> {
+        let (reader, snapshot) = self.latest_view();
+        reader.get_with_expiry(key, &snapshot).await
+    }
+
+    /// Metadata point read at the current state — the KV `meta` path; never
+    /// dereferences the vLog. Registers no snapshot, see
+    /// [`Self::latest_view`].
+    pub async fn get_latest_with_metadata(&self, key: &[u8]) -> Result<Option<ValueWithMetadata>> {
+        let (reader, snapshot) = self.latest_view();
+        reader.get_with_metadata(key, &snapshot).await
     }
 
     /// MVCC-aware point read. Three-valued (spec kv/018): a live value, an
@@ -939,10 +1031,13 @@ impl LsmStorageEngine {
     /// Newest version of `key` as (write stamp, liveness) — the TTL sweeper's
     /// authoritative re-check (spec kv/025 §3.1). Takes no snapshot argument:
     /// the sweeper always wants the current state, so it is pulled internally
-    /// and cannot accidentally be a stale one.
+    /// and cannot accidentally be a stale one. It draws a fresh stamp instead
+    /// of peeking (spec kv/031 A4): the sweeper dates its tombstone one above
+    /// the version found, and the draw keeps that date within the clock.
     pub(super) async fn newest_version(&self, key: &[u8]) -> Result<Option<(Timestamp, VersionState)>> {
-        let snapshot = self.snapshot_unregistered();
-        self.build_reader().newest_version(key, &snapshot).await
+        let reader = self.build_reader();
+        let snapshot = Snapshot::new(self.next_timestamp());
+        reader.newest_version(key, &snapshot).await
     }
 
     /// Collects the `limit` smallest user-keys above `after` that carry *some*
@@ -955,16 +1050,8 @@ impl LsmStorageEngine {
         let now = now_secs();
         let mut checked = 0usize;
 
-        let memtables = {
-            let mut tables = vec![Arc::clone(&*self.memtable.read())];
-            // Both slots in one section (spec general/028).
-            let imm = self.immutable_memtables.read();
-            let flushing = self.flushing.read();
-            tables.extend(imm.iter().cloned());
-            tables.extend(flushing.iter().cloned());
-            tables
-        };
-        for mt in &memtables {
+        let version = self.version();
+        for mt in version.memtables_newest_first() {
             for (encoded_key, value) in mt.iter() {
                 scan_expired_yield(&mut checked).await;
                 let Some(user_key) = InternalKey::extract_user_key(&encoded_key) else {
@@ -977,7 +1064,7 @@ impl LsmStorageEngine {
             }
         }
 
-        for level_sstables in self.level_manager.get_all_levels() {
+        for level_sstables in &version.levels {
             for sstable in level_sstables {
                 for entry in sstable.prefix_entries(&[], None) {
                     scan_expired_yield(&mut checked).await;
@@ -994,9 +1081,10 @@ impl LsmStorageEngine {
         Ok(candidates.into_iter().collect())
     }
 
-    /// Returns a handle to the block cache metrics for the `/metrics` endpoint.
+    /// Block cache counters summed over its stripes, for the `/metrics`
+    /// endpoint.
     pub fn block_cache_metrics(&self) -> Arc<crate::engines::lsm::block_cache::BlockCacheMetrics> {
-        self.block_cache.lock().metrics()
+        self.block_cache.metrics()
     }
 
     // ── Write path helpers ──────────────────────────────────────────────────
@@ -1013,15 +1101,16 @@ impl LsmStorageEngine {
     /// call it before acquiring theirs.
     pub(super) async fn maybe_freeze_memtable(&self) -> Result<()> {
         let threshold = self.engine_config.memtable_size_threshold;
-        let size = { self.memtable.read().size_bytes() };
-        if size >= threshold {
+        if self.version().memtable.size_bytes() >= threshold {
             let _drain = self.in_flight_writes.write().await;
-            let mut mt = self.memtable.write();
-            let mut imm = self.immutable_memtables.write();
-            if mt.size_bytes() >= threshold {
-                imm.push(Arc::clone(&*mt));
-                *mt = Arc::new(MemTable::new());
-            }
+            self.install(|v| {
+                let mut next = v.clone();
+                if v.memtable.size_bytes() >= threshold {
+                    next.immutables.push(Arc::clone(&v.memtable));
+                    next.memtable = Arc::new(MemTable::new());
+                }
+                next
+            });
         }
         Ok(())
     }
@@ -1070,13 +1159,12 @@ impl LsmStorageEngine {
         self.wal.append(&log_entry).await?;
 
         let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
-            let (file_id, offset) = append_to_active(&self.vlog, value).await?;
+            let (file_id, offset) = append_to_active(&self.version, value).await?;
             Value::Pointer { file_id, offset, len: value.len(), expire_at }
         } else {
             Value::Inline(value.to_vec(), expire_at)
         };
-        let memtable = Arc::clone(&*self.memtable.read());
-        memtable.set(key.to_vec(), timestamp, resolved);
+        self.version().memtable.set(key.to_vec(), timestamp, resolved);
         self.raise_change_epoch();
 
         // Broadcast after the apply is visible, not just WAL-durable (spec
@@ -1110,8 +1198,7 @@ impl LsmStorageEngine {
 
         // Still pinned after the WAL append; the guard above now closes the
         // inversion window this placement only narrowed (spec kv/025 §3.2).
-        let memtable = Arc::clone(&*self.memtable.read());
-        memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+        self.version().memtable.set(key.to_vec(), timestamp, Value::Tombstone);
         self.raise_change_epoch();
 
         // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
@@ -1122,12 +1209,12 @@ impl LsmStorageEngine {
     /// Pins the active MemTable — every tombstone of one sweep tick goes into
     /// exactly this one (spec kv/025 §3 step 2, §4.2).
     pub(super) fn pin_memtable(&self) -> Arc<MemTable> {
-        Arc::clone(&*self.memtable.read())
+        Arc::clone(&self.version().memtable)
     }
 
     /// Writes a tombstone dated `timestamp` into the *given* MemTable — the
     /// TTL sweeper's pinned one (spec kv/025 §3.2). Deliberately without
-    /// `maybe_freeze_memtable` and without re-reading `self.memtable`: a
+    /// `maybe_freeze_memtable` and without re-reading the active MemTable: a
     /// tombstone that ends up in a newer source than the value it dates
     /// against would win despite its older stamp (§4.2). A write that drew
     /// the same stamp and is already in that MemTable keeps its entry; the
@@ -1172,8 +1259,7 @@ impl LsmStorageEngine {
         log_entry.extend_from_slice(key);
         self.wal.append(&log_entry).await?;
 
-        let memtable = Arc::clone(&*self.memtable.read());
-        memtable.set(key.to_vec(), timestamp, Value::Null);
+        self.version().memtable.set(key.to_vec(), timestamp, Value::Null);
         self.raise_change_epoch();
 
         // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
@@ -1244,7 +1330,7 @@ impl LsmStorageEngine {
             resolved.push(match op {
                 BatchOp::Put { key, value } => {
                     if value.len() >= self.engine_config.vlog_inline_threshold {
-                        let (file_id, offset) = append_to_active(&self.vlog, &value).await?;
+                        let (file_id, offset) = append_to_active(&self.version, &value).await?;
                         (key, Value::Pointer { file_id, offset, len: value.len(), expire_at: None })
                     } else {
                         (key, Value::Inline(value, None))
@@ -1296,7 +1382,7 @@ impl LsmStorageEngine {
         let resolved = self.resolve_batch_values(ops).await?;
 
         // Phase 2 (infallible): apply the whole batch to the MemTable.
-        let memtable = Arc::clone(&*self.memtable.read());
+        let memtable = Arc::clone(&self.version().memtable);
         for (key, value) in resolved {
             memtable.set(key, timestamp, value);
         }
@@ -1430,40 +1516,18 @@ impl LsmStorageEngine {
         let now = now_secs();
         let mut coop = YieldEvery::new(SCAN_KEYS_YIELD_INTERVAL);
 
-        let memtable = { Arc::clone(&*self.memtable.read()) };
-        scan_memtable_for_prefix(&memtable, prefix, now, limit, snapshot, &mut live, &mut decided, &mut coop)
-            .await;
-
-        // Both slots in one section (spec general/028), cloned out before the
-        // iteration: the loop below yields, and a rotation waiting for
-        // `immutables.write()` under a read guard would deadlock the thread
-        // (spec perf/017 A3). Frozen MemTables are pushed to the back —
-        // iterate newest-first, then the flushes in flight, which are older
-        // than all of them.
-        let frozen: Vec<Arc<MemTable>> = {
-            let imm = self.immutable_memtables.read();
-            let flushing = self.flushing.read();
-            imm.iter().rev().chain(flushing.iter().rev()).cloned().collect()
-        };
-        for mt in &frozen {
+        // One version for the whole scan: its yields hold an `Arc`, no guard
+        // (spec perf/017 A3), and every source comes from the same state.
+        let version = self.version();
+        for mt in version.memtables_newest_first() {
             scan_memtable_for_prefix(mt, prefix, now, limit, snapshot, &mut live, &mut decided, &mut coop)
                 .await;
         }
-
-        let mut levels = self.level_manager.get_all_levels();
-        if let Some(l0) = levels.first_mut() {
-            // L0 tables are appended in flush order — newest last.
-            l0.reverse();
-        }
-        for level_sstables in levels {
-            for sstable in level_sstables {
-                if scan_sstable_for_prefix(
-                    &sstable, prefix, limit, snapshot, &mut live, &mut decided, &mut coop,
-                )
+        for sstable in version.sstables_newest_first() {
+            if scan_sstable_for_prefix(sstable, prefix, limit, snapshot, &mut live, &mut decided, &mut coop)
                 .await?
-                {
-                    return Ok(live.into_iter().collect());
-                }
+            {
+                return Ok(live.into_iter().collect());
             }
         }
 
@@ -1510,32 +1574,37 @@ impl LsmStorageEngine {
     /// build the stranded-stamp state the drain now prevents.
     #[cfg(test)]
     pub fn freeze_active_memtable(&self) {
-        let mut mt = self.memtable.write();
-        let mut imm = self.immutable_memtables.write();
-        let old = std::mem::replace(&mut *mt, Arc::new(MemTable::new()));
-        imm.push(old);
+        self.install(|v| {
+            let mut next = v.clone();
+            next.immutables.push(Arc::clone(&v.memtable));
+            next.memtable = Arc::new(MemTable::new());
+            next
+        });
     }
 
     /// Flushes the oldest immutable MemTable, returning the new SSTable's
     /// `file_id` (or `None` when there was nothing to flush).
     ///
-    /// The claim removes the MemTable from `immutable_memtables` and puts it
-    /// into `flushing` in one lock section: the removal still keeps concurrent
-    /// callers from flushing it twice, while readers keep seeing it until its
-    /// SSTable is installed (spec general/028).
+    /// The claim moves the MemTable from the immutables into the flush slot
+    /// in one install: the removal still keeps concurrent callers from
+    /// flushing it twice, while readers keep seeing it until its SSTable is
+    /// installed (spec general/028).
     ///
     /// [`Self::flush_lock`] spans claim and install, so the SSTables enter L0
     /// and the manifest in MemTable age order (spec general/029).
     pub async fn flush_memtable(&self) -> Result<Option<u64>> {
         let _flush = self.flush_lock.lock().await;
-        let memtable_to_flush = {
-            let mut imm = self.immutable_memtables.write();
-            if imm.is_empty() { return Ok(None); }
-            let mut flushing = self.flushing.write();
-            let claimed = imm.remove(0);
-            flushing.push(Arc::clone(&claimed));
-            claimed
-        };
+        let mut claimed = None;
+        self.install(|v| {
+            let mut next = v.clone();
+            if !next.immutables.is_empty() {
+                let memtable = next.immutables.remove(0);
+                next.flushing.push(Arc::clone(&memtable));
+                claimed = Some(memtable);
+            }
+            next
+        });
+        let Some(memtable_to_flush) = claimed else { return Ok(None) };
 
         match self.write_memtable_to_l0(&memtable_to_flush).await {
             Ok(file_id) => Ok(Some(file_id)),
@@ -1546,17 +1615,19 @@ impl LsmStorageEngine {
         }
     }
 
-    /// Returns a failed flush's MemTable to the head of `immutable_memtables`,
-    /// so the next call is its retry. A no-op once the SSTable was installed —
-    /// the flush slot no longer holds it then (spec general/028).
+    /// Returns a failed flush's MemTable to the head of the immutables, so the
+    /// next call is its retry. A no-op once the SSTable was installed — the
+    /// flush slot no longer holds it then (spec general/028).
     fn abort_flush(&self, memtable: &Arc<MemTable>) {
-        let mut imm = self.immutable_memtables.write();
-        let mut flushing = self.flushing.write();
-        let claimed = flushing.len();
-        flushing.retain(|m| !Arc::ptr_eq(m, memtable));
-        if flushing.len() < claimed {
-            imm.insert(0, Arc::clone(memtable));
-        }
+        self.install(|v| {
+            let mut next = v.clone();
+            let claimed = next.flushing.len();
+            next.flushing.retain(|m| !Arc::ptr_eq(m, memtable));
+            if next.flushing.len() < claimed {
+                next.immutables.insert(0, Arc::clone(memtable));
+            }
+            next
+        });
     }
 
     /// Builds the SSTable of an already-claimed MemTable, installs it in L0 and
@@ -1654,10 +1725,17 @@ impl LsmStorageEngine {
         };
         sstable.set_file_id(file_id);
         let sstable = Arc::new(sstable);
-        // Install before remove, no await in between — readers sample sources
-        // without a version (spec general/028).
-        self.level_manager.add_sstable(0, Arc::clone(&sstable));
-        self.flushing.write().retain(|m| !Arc::ptr_eq(m, memtable_to_flush));
+        // One install: the SSTable enters L0 as the MemTable leaves the flush
+        // slot (spec kv/031 A1).
+        self.install(|v| {
+            let mut next = v.clone();
+            if next.levels.is_empty() {
+                next.levels.push(Vec::new());
+            }
+            next.levels[0].push(sstable);
+            next.flushing.retain(|m| !Arc::ptr_eq(m, memtable_to_flush));
+            next
+        });
 
         {
             let mut manifest = self.manifest.write();
@@ -1693,7 +1771,8 @@ impl LsmStorageEngine {
     /// Registers every currently loaded SSTable with `io_engine` -- called
     /// once at startup, after recovery.
     pub async fn register_sstables_with_io_engine(&self, io_engine: &mut IoEngine) -> Result<()> {
-        for readers in self.level_manager.get_all_levels() {
+        let version = self.version();
+        for readers in &version.levels {
             for r in readers {
                 let path = self.file_manager.file_path(r.file_id);
                 if let Err(e) = io_engine.register_file(r.file_id, &path).await {
@@ -1777,19 +1856,19 @@ impl LsmStorageEngine {
             for meta in &new_metas  { manifest.add_sstable(meta.clone()); }
         }
 
-        {
+        let retired = {
             // Under the flush lock the manifest cannot gain an L0 table
             // between the rebuild's read and its swap, which would drop that
             // table from the read path (spec general/029).
             let _flush = self.flush_lock.lock().await;
-            self.rebuild_levels_from_manifest([source_level, target_level], use_mmap).await?;
-        }
+            self.rebuild_levels_from_manifest([source_level, target_level], use_mmap).await?
+        };
 
         // Persist manifest.
         let snap = self.manifest.read().clone();
         self.manifest_manager.save(&snap).await?;
 
-        self.retire_compacted_sstables(&src_metas, &tgt_metas).await;
+        self.retire_compacted_sstables(&retired, &src_metas, &tgt_metas).await;
 
         Ok(crate::engines::lsm::compaction::deleted_file_ids(&src_metas, &tgt_metas))
     }
@@ -1866,16 +1945,22 @@ impl LsmStorageEngine {
         Ok((smallest_key.unwrap_or_default(), largest_key.unwrap_or_default(), max_timestamp))
     }
 
-    /// Rebuilds `levels`' readers from the manifest (post manifest-swap).
+    /// Rebuilds `levels`' readers from the manifest (post manifest-swap) and
+    /// returns the readers the install dropped; a table the version already
+    /// holds keeps its reader (see [`Self::level_readers`]).
     ///
-    /// Install before remove, no await in between — readers sample sources
-    /// without a version (spec general/028): both levels keep their old
-    /// readers until every new one is open, then change together.
-    async fn rebuild_levels_from_manifest(&self, levels: [usize; 2], use_mmap: bool) -> Result<()> {
+    /// Both levels keep their old readers until every new one is open, then
+    /// change in one install (spec general/028, kv/031 A1).
+    async fn rebuild_levels_from_manifest(
+        &self,
+        levels: [usize; 2],
+        use_mmap: bool,
+    ) -> Result<Vec<Arc<SSTableReader>>> {
+        let current = self.version();
         let mut updates = Vec::with_capacity(levels.len());
         for lvl in levels {
             let metas = self.manifest.read().get_level(lvl).to_vec();
-            updates.push((lvl, self.open_sstable_readers(&metas, use_mmap).await?));
+            updates.push((lvl, Self::level_readers(&self.file_manager, &current, &metas, use_mmap).await?));
         }
 
         #[cfg(test)]
@@ -1883,17 +1968,28 @@ impl LsmStorageEngine {
             hook.pause().await;
         }
 
-        self.level_manager.replace_levels(updates);
-        Ok(())
+        let mut dropped = Vec::new();
+        self.install(|v| {
+            let next = v.with_levels(updates);
+            dropped = v.sstables_dropped_by(&next);
+            next
+        });
+        Ok(dropped)
     }
 
-    /// Invalidates cached blocks of the retired inputs, then deletes their files.
-    async fn retire_compacted_sstables(&self, src: &[SSTableMetadata], tgt: &[SSTableMetadata]) {
-        {
-            let mut cache = self.block_cache.lock();
-            for meta in src.iter().chain(tgt.iter()) {
-                cache.invalidate_file(meta.file_id);
-            }
+    /// Retires the dropped readers, invalidates cached blocks of the merged
+    /// inputs, then deletes their files.
+    async fn retire_compacted_sstables(
+        &self,
+        retired: &[Arc<SSTableReader>],
+        src: &[SSTableMetadata],
+        tgt: &[SSTableMetadata],
+    ) {
+        for reader in retired {
+            reader.retire();
+        }
+        for meta in src.iter().chain(tgt.iter()) {
+            self.block_cache.invalidate_file(meta.file_id);
         }
 
         for meta in src.iter().chain(tgt.iter()) {
@@ -1930,19 +2026,13 @@ impl LsmStorageEngine {
 
     /// Returns the data needed for the `/health` heartbeat response.
     pub fn heartbeat_data(&self) -> EngineHeartbeatData {
-        let mt_len = self.memtable.read().len() as u64;
+        let version = self.version();
         // A flush in flight is still MemTable-resident (spec general/028).
-        let imm_len: u64 = {
-            let imm = self.immutable_memtables.read();
-            let flushing = self.flushing.read();
-            imm.iter().chain(flushing.iter()).map(|m| m.len() as u64).sum()
-        };
-        let vlog_bytes = self.vlog.total_size();
-        let l0_count = self.level_manager.get_level(0).len();
+        let memtable_keys: u64 = version.memtables_newest_first().map(|m| m.len() as u64).sum();
         EngineHeartbeatData {
-            estimated_memtable_keys: mt_len + imm_len,
-            vlog_size_bytes: vlog_bytes,
-            l0_sstable_count: l0_count,
+            estimated_memtable_keys: memtable_keys,
+            vlog_size_bytes: version.vlog_size(),
+            l0_sstable_count: version.level(0).len(),
         }
     }
 
@@ -1961,15 +2051,13 @@ impl LsmStorageEngine {
     }
 
     pub fn stats(&self) -> EngineStats {
-        let memtable = self.memtable.read();
-        let imm = self.immutable_memtables.read();
-        let flushing = self.flushing.read();
+        let version = self.version();
         EngineStats {
-            memtable_size: memtable.size_bytes(),
+            memtable_size: version.memtable.size_bytes(),
             // A flush in flight is still MemTable-resident (spec general/028).
-            num_immutable_memtables: imm.len() + flushing.len(),
-            num_levels: self.level_manager.num_levels(),
-            total_sstables: self.level_manager.total_sstables(),
+            num_immutable_memtables: version.immutables.len() + version.flushing.len(),
+            num_levels: version.levels.len(),
+            total_sstables: version.levels.iter().map(Vec::len).sum(),
         }
     }
 }
@@ -2004,10 +2092,7 @@ impl StorageEngine for LsmStorageEngine {
     // collapses `Null` into `None`, like every caller outside the KV engine
     // (spec kv/018). Callers that must distinguish Null use `get_with_snapshot`.
     fn get(&self, key: &[u8]) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
-        async move {
-            let snapshot = self.snapshot_unregistered();
-            Ok(self.get_with_snapshot(key, &snapshot).await?.into_option())
-        }
+        async move { Ok(self.get_latest_with_expiry(key).await?.0.into_option()) }
     }
 
     fn set(&self, key: &[u8], value: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
@@ -2235,7 +2320,7 @@ mod tests {
     }
 
     // Spec kv/026 M1: a failed SSTable write persists nothing (the MemTable
-    // goes back into `immutable_memtables`, spec general/028), so the WAL is
+    // goes back among the immutables, spec general/028), so the WAL is
     // the only durable copy -- shutdown() must not truncate it in that case.
     // The SSTable directory is split out from the
     // WAL/manifest one so making it read-only fails only the flush, not the
@@ -2272,6 +2357,33 @@ mod tests {
             std::fs::read(&wal_path).unwrap().is_empty(),
             "a successful shutdown flush still truncates the WAL"
         );
+    }
+
+    // A flush whose manifest save fails after its install leaves the table
+    // in L0 but in no MANIFEST on disk: shutdown must save the manifest
+    // before it truncates the WAL, or the next start loses those writes.
+    // With the SSTable directory split out, a read-only `dir` fails only the
+    // manifest save (verified non-root).
+    #[tokio::test]
+    async fn test_shutdown_saves_the_manifest_a_failed_flush_left_unsaved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sstable_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&sstable_dir).unwrap();
+
+        let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        engine.put(b"k", b"v").await.unwrap();
+        engine.freeze_active_memtable();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let flushed = engine.flush_memtable().await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(flushed.is_err(), "the manifest save must fail");
+        assert_eq!(engine.version().level(0).len(), 1, "the table was installed before the save");
+
+        engine.shutdown().await;
+        drop(engine);
+
+        let engine2 = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"v".to_vec()));
     }
 
     // Batch: all ops visible after write, and WAL replay (record type 3)
@@ -2347,7 +2459,8 @@ mod tests {
 
         // Writes to /dev/full fail with ENOSPC. tokio buffers file writes,
         // so the error surfaces on the NEXT vLog op — hence two large Puts.
-        engine.vlog.set_active(Arc::new(VLog::new("/dev/full").await.unwrap()));
+        let full = Arc::new(VLog::new("/dev/full").await.unwrap());
+        engine.install(|v| v.with_active_vlog(full));
         let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog append
         let res = engine
             .write_batch(vec![
@@ -2560,6 +2673,39 @@ mod tests {
 
         let engine2 = engine_on(&dir).await;
         assert_all_readable(&engine2, 0..10).await;
+    }
+
+    // Spec kv/031 A4: point reads peek at the clock, raised to the wall
+    // clock. A store whose manifest predates `max_timestamp` and whose WAL
+    // is empty seeds nothing, yet once the wall clock has passed its data,
+    // reads before the first write see every key, as a drawn stamp did.
+    #[tokio::test]
+    async fn test_reads_before_the_first_write_see_a_store_without_max_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        put_range(&engine, 0..5).await;
+        let newest = engine.hlc().peek();
+        engine.shutdown().await;
+        drop(engine);
+
+        let manifest_path = dir.path().join("MANIFEST");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        for level in json["levels"].as_array_mut().unwrap() {
+            for meta in level.as_array_mut().unwrap() {
+                assert!(meta.as_object_mut().unwrap().remove("max_timestamp").is_some());
+            }
+        }
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let engine2 = engine_on(&dir).await;
+        assert_eq!(engine2.hlc().peek().as_u64(), 0, "nothing seeds the clock");
+        // The last write may share the current millisecond; the wall clock's
+        // `(ms, 0)` covers it once that millisecond is over.
+        while HybridLogicalClock::physical_time() <= newest.physical() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_all_readable(&engine2, 0..5).await;
     }
 
     // ── Lifecycle tests ──────────────────────────────────────────────────────
@@ -2797,7 +2943,7 @@ mod tests {
             assert_ne!(expire_at, Some(0), "no write path may produce Some(0)");
         }
 
-        for (_, value) in engine.memtable.read().iter() {
+        for (_, value) in engine.version().memtable.iter() {
             assert_no_some_zero(&value);
         }
 
@@ -2806,7 +2952,7 @@ mod tests {
         let wal_path = dir.path().join("wal.log");
         let (recovered, _) = LsmStorageEngine::recover_from_wal(
             &wal_path,
-            &engine.vlog,
+            &engine.version().active_vlog,
             engine.engine_config.vlog_inline_threshold,
         )
         .await
@@ -3389,13 +3535,7 @@ mod tests {
             .unwrap_or(0);
 
         // Freeze the active MemTable and flush it to an SSTable.
-        {
-            let old_mt = {
-                let mut mt = engine.memtable.write();
-                std::mem::replace(&mut *mt, Arc::new(MemTable::new()))
-            };
-            engine.immutable_memtables.write().push(old_mt);
-        }
+        engine.freeze_active_memtable();
         engine.flush_memtable().await.unwrap();
 
         // VLog must not have grown — inline values go directly into the SSTable DataBlock.
@@ -3424,7 +3564,7 @@ mod tests {
     /// unstamped (id-0) readers collide in the block cache across tables.
     fn assert_readers_match_manifest(engine: &LsmStorageEngine) {
         let manifest = engine.manifest.read();
-        for (lvl, readers) in engine.level_manager.get_all_levels().iter().enumerate() {
+        for (lvl, readers) in engine.version().levels.iter().enumerate() {
             let mut reader_ids: Vec<u64> = readers.iter().map(|r| r.file_id).collect();
             let mut manifest_ids: Vec<u64> =
                 manifest.get_level(lvl).iter().map(|m| m.file_id).collect();
@@ -3474,7 +3614,8 @@ mod tests {
         engine.freeze_active_memtable();
         let id = engine.flush_memtable().await.unwrap().expect("a table was flushed");
 
-        let l0 = engine.level_manager.get_level(0);
+        let version = engine.version();
+        let l0 = version.level(0);
         assert_eq!(l0.len(), 1);
         assert_eq!(l0[0].file_id, id, "returned id must be the flushed table's id");
     }
@@ -3492,7 +3633,7 @@ mod tests {
 
         // Two L0 tables, L1 empty -> both source tables are deleted, no targets.
         let mut expected: Vec<u64> =
-            engine.level_manager.get_level(0).iter().map(|r| r.file_id).collect();
+            engine.version().level(0).iter().map(|r| r.file_id).collect();
         expected.sort_unstable();
 
         let mut deleted = engine.compact_level(0).await.unwrap();
@@ -3565,23 +3706,18 @@ mod tests {
         // Populate the block cache under the pre-GC file id (first table = 0).
         assert_eq!(engine.get(b"small").await.unwrap(), Some(b"v".to_vec()));
         let pre_gc_key = BlockCacheKey { file_id: 0, block_offset: 0 };
-        assert!(engine.block_cache.lock().get(&pre_gc_key).is_some());
+        assert!(engine.block_cache.stripe(&pre_gc_key).get(&pre_gc_key).is_some());
 
         let stats = engine.build_janitor(gc_always()).run_gc().await.unwrap();
         assert!(stats.ran);
 
         assert_readers_match_manifest(&engine);
         assert!(
-            engine
-                .level_manager
-                .get_all_levels()
-                .iter()
-                .flatten()
-                .all(|r| r.file_id != 0),
+            engine.version().levels.iter().flatten().all(|r| r.file_id != 0),
             "rebuilt readers must carry the new (non-zero) file ids"
         );
         // Cached blocks of the deleted pre-GC table must be invalidated.
-        assert!(engine.block_cache.lock().get(&pre_gc_key).is_none());
+        assert!(engine.block_cache.stripe(&pre_gc_key).get(&pre_gc_key).is_none());
 
         // Data reads correctly through rebuilt readers and the new vLog.
         assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
@@ -3591,7 +3727,7 @@ mod tests {
     /// vLog generation ids stamped into the pointers of all L0 SSTables.
     fn l0_pointer_generations(engine: &LsmStorageEngine) -> Vec<u32> {
         let mut ids = Vec::new();
-        for sstable in engine.level_manager.get_level(0) {
+        for sstable in engine.version().level(0) {
             for entry in sstable.iter() {
                 if let (_, crate::storage::format::DataBlockValue::Pointer(vp)) = entry.unwrap() {
                     if vp.file_id != 0 {
@@ -3603,22 +3739,16 @@ mod tests {
         ids
     }
 
-    /// Every vLog-pointer `file_id` reachable from any MemTable (active +
-    /// immutable) or any SSTable at any level — a full scan (spec kv/020 test
-    /// 3), not just a read-back, so a dangling pointer into a retired
-    /// generation would show up here even if no test happens to read that key.
+    /// Every vLog-pointer `file_id` reachable from any MemTable (active,
+    /// immutable, flushing) or any SSTable at any level — a full scan (spec
+    /// kv/020 test 3), not just a read-back, so a dangling pointer into a
+    /// retired generation would show up here even if no test happens to read
+    /// that key.
     fn all_pointer_generations(engine: &LsmStorageEngine) -> Vec<u32> {
         let mut ids = Vec::new();
+        let version = engine.version();
 
-        let active = engine.memtable.read();
-        for (_, value) in active.iter() {
-            if let Value::Pointer { file_id, .. } = value {
-                ids.push(file_id);
-            }
-        }
-        drop(active);
-
-        for mt in engine.immutable_memtables.read().iter() {
+        for mt in version.memtables_newest_first() {
             for (_, value) in mt.iter() {
                 if let Value::Pointer { file_id, .. } = value {
                     ids.push(file_id);
@@ -3626,7 +3756,7 @@ mod tests {
             }
         }
 
-        for level in engine.level_manager.get_all_levels() {
+        for level in &version.levels {
             for sstable in level {
                 for entry in sstable.iter() {
                     if let (_, crate::storage::format::DataBlockValue::Pointer(vp)) = entry.unwrap() {
@@ -3663,17 +3793,17 @@ mod tests {
     #[tokio::test]
     async fn test_write_after_generation_swap_uses_new_generation() {
         let (engine, _dir) = make_engine().await;
-        let gen1 = engine.vlog.active();
+        let gen1 = Arc::clone(&engine.version().active_vlog);
         let gen2 =
             Arc::new(VLog::open(generation_path(&engine.vlog_path, 2), 2).await.unwrap());
-        engine.vlog.set_active(gen2);
+        engine.install(|v| v.with_active_vlog(gen2));
         gen1.seal();
 
         let big = vec![b'y'; 4096];
         engine.put(b"big", &big).await.unwrap();
 
         assert_eq!(gen1.size(), 0, "the sealed generation must not grow");
-        assert_eq!(engine.vlog.active().size(), 4096);
+        assert_eq!(engine.version().active_vlog.size(), 4096);
         assert_eq!(engine.get(b"big").await.unwrap(), Some(big.clone()));
 
         freeze_and_flush(&engine).await;
@@ -3749,11 +3879,11 @@ mod tests {
     /// path has to agree with (spec kv/029). Inline values only; its callers
     /// write no pointers.
     fn newest_memtable_version(engine: &LsmStorageEngine, user_key: &[u8]) -> Option<(u64, Vec<u8>)> {
-        let mut sources = vec![Arc::clone(&*engine.memtable.read())];
-        sources.extend(engine.immutable_memtables.read().iter().cloned());
+        let version = engine.version();
+        let sources = std::iter::once(&version.memtable).chain(version.immutables.iter());
 
         let mut newest: Option<(u64, Vec<u8>)> = None;
-        for memtable in &sources {
+        for memtable in sources {
             for (encoded_key, value) in memtable.iter() {
                 if InternalKey::extract_user_key(&encoded_key) != Some(user_key) {
                     continue;
@@ -3785,13 +3915,13 @@ mod tests {
 
         // Writer B: newer stamp, applied into the MemTable that is frozen next.
         let newer = engine.next_timestamp();
-        engine.memtable.read().set(b"k".to_vec(), newer, Value::Inline(b"newer".to_vec(), None));
+        engine.version().memtable.set(b"k".to_vec(), newer, Value::Inline(b"newer".to_vec(), None));
 
         engine.freeze_active_memtable();
 
         // Writer A: stamp drawn before the rotation, applied after it.
         let older = Timestamp::new(newer.as_u64() - 1);
-        engine.memtable.read().set(b"k".to_vec(), older, Value::Inline(b"older".to_vec(), None));
+        engine.version().memtable.set(b"k".to_vec(), older, Value::Inline(b"older".to_vec(), None));
 
         assert_eq!(
             engine.get(b"k").await.unwrap(),
@@ -3842,14 +3972,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = engine_with_threshold(&dir, 1).await;
         engine.put(b"k", b"v").await.unwrap();
-        assert!(engine.immutable_memtables.read().is_empty(), "the first write does not rotate");
+        assert!(engine.version().immutables.is_empty(), "the first write does not rotate");
 
         // Simulates a write that has drawn its stamp and not applied it yet.
         let guard = engine.in_flight_writes.read().await;
 
         let blocked = tokio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable()).await;
         assert!(blocked.is_err(), "the freeze must wait while a writer guard is held");
-        assert!(engine.immutable_memtables.read().is_empty(), "nothing rotated under the held guard");
+        assert!(engine.version().immutables.is_empty(), "nothing rotated under the held guard");
 
         drop(guard);
 
@@ -3857,8 +3987,8 @@ mod tests {
             .await
             .expect("the freeze must proceed once the guard is released")
             .unwrap();
-        assert_eq!(engine.immutable_memtables.read().len(), 1, "the rotation happened after the drain");
-        assert!(engine.memtable.read().is_empty(), "the active MemTable is fresh");
+        assert_eq!(engine.version().immutables.len(), 1, "the rotation happened after the drain");
+        assert!(engine.version().memtable.is_empty(), "the active MemTable is fresh");
     }
 
     // Spec general/032 test 1: each entry contributes its encoded internal key
@@ -4040,7 +4170,7 @@ mod tests {
             }
         }
 
-        let live_ids = engine.vlog.ids();
+        let live_ids = engine.version().vlog_ids();
         for id in all_pointer_generations(&engine) {
             assert!(
                 live_ids.contains(&id),
@@ -4054,7 +4184,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_to_permanently_sealed_generation_fails() {
         let (engine, _dir) = make_engine().await;
-        engine.vlog.active().seal();
+        engine.version().active_vlog.seal();
 
         let err = engine.put(b"big", &vec![b'x'; 4096]).await.unwrap_err();
         assert!(err.to_string().contains("sealed"), "unexpected error: {err}");
@@ -4069,18 +4199,18 @@ mod tests {
         let engine = Arc::new(engine);
         let before = vec![b'1'; 4096];
         engine.put(b"before", &before).await.unwrap();
-        let gen1 = engine.vlog.active();
+        let gen1 = Arc::clone(&engine.version().active_vlog);
 
         engine.build_janitor(gc_always()).run_gc().await.unwrap();
-        assert_eq!(engine.vlog.active().id(), 2);
-        assert_eq!(engine.vlog.ids(), vec![2], "generation 1 is retired");
+        assert_eq!(engine.version().active_vlog.id(), 2);
+        assert_eq!(engine.version().vlog_ids(), vec![2], "generation 1 is retired");
 
         let after = vec![b'2'; 4096];
         engine.put(b"after", &after).await.unwrap();
 
         assert_eq!(engine.get(b"before").await.unwrap(), Some(before.clone()));
         assert_eq!(engine.get(b"after").await.unwrap(), Some(after));
-        assert_eq!(gen1.read(0, 4096).await.unwrap(), before);
+        assert_eq!(gen1.read(0, 4096).unwrap(), before);
     }
 
     // Spec kv/017 test 5: startup registers every generation found on disk and
@@ -4092,21 +4222,21 @@ mod tests {
         let vlog_path = dir.path().join("vlog.log");
 
         let engine = engine_on(&dir).await;
-        assert_eq!(engine.vlog.ids(), vec![1], "legacy store is generation 1");
-        assert_eq!(engine.vlog.active().id(), 1);
+        assert_eq!(engine.version().vlog_ids(), vec![1], "legacy store is generation 1");
+        assert_eq!(engine.version().active_vlog.id(), 1);
         drop(engine);
 
         std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
         let engine = engine_on(&dir).await;
-        assert_eq!(engine.vlog.ids(), vec![1, 2]);
-        assert_eq!(engine.vlog.active().id(), 2);
-        assert_eq!(engine.vlog.read(2, 0, 12).await.unwrap(), b"generation-2");
+        assert_eq!(engine.version().vlog_ids(), vec![1, 2]);
+        assert_eq!(engine.version().active_vlog.id(), 2);
+        assert_eq!(engine.version().vlog[&2].read(0, 12).unwrap(), b"generation-2");
         drop(engine);
 
         std::fs::write(generation_path(&vlog_path, 3), b"").unwrap(); // orphan
         let engine = engine_on(&dir).await;
-        assert_eq!(engine.vlog.ids(), vec![1, 2, 3]);
-        assert_eq!(engine.vlog.active().id(), 3);
+        assert_eq!(engine.version().vlog_ids(), vec![1, 2, 3]);
+        assert_eq!(engine.version().active_vlog.id(), 3);
         let big = vec![b'o'; 4096];
         engine.put(b"k", &big).await.unwrap();
         assert_eq!(engine.get(b"k").await.unwrap(), Some(big));
@@ -4135,7 +4265,7 @@ mod tests {
             StorageThread::new(st_config, wal_path.clone(), vlog_path.clone()).unwrap();
 
         let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
-        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1));
+        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
         let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
         let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
         let engine = LsmStorageEngine::new(
@@ -4150,23 +4280,24 @@ mod tests {
         .await
         .unwrap();
 
-        // Before the repoint: registry-only bookkeeping, thread still on gen 1.
-        assert_eq!(engine.vlog.active().id(), 2, "generation 2 is the highest on disk");
+        // Before the repoint: version-only bookkeeping, thread still on gen 1.
+        assert_eq!(engine.version().active_vlog.id(), 2, "generation 2 is the highest on disk");
 
         engine.route_active_vlog_to_thread(&handle).await.unwrap();
 
-        let active = engine.vlog.active();
+        let active = Arc::clone(&engine.version().active_vlog);
         assert_eq!(active.id(), 2, "active reference is handle-backed generation 2");
         let off = active.append(b"-added").await.unwrap();
         assert_eq!(off, 12, "cursor seeded from generation 2's on-disk length");
         assert_eq!(
-            handle.vlog_read(off, 6, 2).await.unwrap(),
-            b"-added",
-            "the append routed through the thread's own fd"
+            std::fs::read(generation_path(&engine.vlog_path, 2)).unwrap(),
+            b"generation-2-added",
+            "the append routed through the thread into generation 2's file"
         );
+        assert_eq!(active.read(off, 6).unwrap(), b"-added");
 
         // Generation 1 is no longer thread-owned but stays correctly readable.
-        assert_eq!(engine.vlog.read(1, 0, 12).await.unwrap(), b"generation-1");
+        assert_eq!(engine.version().vlog[&1].read(0, 12).unwrap(), b"generation-1");
 
         st.shutdown();
     }
@@ -4190,13 +4321,13 @@ mod tests {
             engine.put(b"a", b"1").await.unwrap();
             engine.freeze_active_memtable();
             engine.flush_memtable_and_register(&mut io_engine).await.unwrap();
-            let first_id = engine.level_manager.get_level(0)[0].file_id;
+            let first_id = engine.version().level(0)[0].file_id;
             assert!(io_engine.get_file(first_id).is_some(), "flushed SSTable must be registered");
 
             engine.put(b"b", b"2").await.unwrap();
             engine.freeze_active_memtable();
             engine.flush_memtable_and_register(&mut io_engine).await.unwrap();
-            let second_id = engine.level_manager.get_level(0)[1].file_id;
+            let second_id = engine.version().level(0)[1].file_id;
             assert!(io_engine.get_file(second_id).is_some(), "second flushed SSTable must be registered");
 
             engine.compact_level_and_deregister(0, &mut io_engine).await.unwrap();
@@ -4222,7 +4353,7 @@ mod tests {
 
             // Fresh engine instance recovers the SSTable written above.
             let engine2 = engine_on(&dir).await;
-            let file_id = engine2.level_manager.get_level(0)[0].file_id;
+            let file_id = engine2.version().level(0)[0].file_id;
 
             let mut io_engine = IoEngine::new(4, 4096).unwrap();
             engine2.register_sstables_with_io_engine(&mut io_engine).await.unwrap();
@@ -4361,8 +4492,8 @@ mod tests {
 
     // Spec general/028 test 1: a MemTable claimed by a flush in flight stays
     // readable. Task B reads while the flush is parked between its claim and
-    // the SSTable write -- before the fix the MemTable was in neither
-    // `immutable_memtables` nor L0, so every key read as absent.
+    // the SSTable write -- before the fix the MemTable was in neither the
+    // immutables nor L0, so every key read as absent.
     #[tokio::test]
     async fn test_reads_see_flushing_memtable_during_the_install_window() {
         let (mut engine, _dir) = make_engine().await;
@@ -4379,8 +4510,8 @@ mod tests {
             tokio::spawn(async move { engine.flush_memtable().await })
         };
         hook.reached.notified().await;
-        assert!(engine.immutable_memtables.read().is_empty(), "the claim removed it");
-        assert_eq!(engine.flushing.read().len(), 1, "the claim parked it in the slot");
+        assert!(engine.version().immutables.is_empty(), "the claim removed it");
+        assert_eq!(engine.version().flushing.len(), 1, "the claim parked it in the slot");
 
         for i in 0..1000u32 {
             assert_eq!(
@@ -4395,15 +4526,15 @@ mod tests {
         let file_id = flusher.await.unwrap().unwrap();
         assert!(file_id.is_some(), "the flush must have produced an SSTable");
 
-        assert!(engine.flushing.read().is_empty());
-        assert!(engine.immutable_memtables.read().is_empty());
-        assert_eq!(engine.level_manager.get_level(0).len(), 1);
+        assert!(engine.version().flushing.is_empty());
+        assert!(engine.version().immutables.is_empty());
+        assert_eq!(engine.version().level(0).len(), 1);
         assert_eq!(engine.get(b"k0000").await.unwrap(), Some(b"v".to_vec()));
         assert_eq!(engine.scan_keys(b"k").await.unwrap().len(), 1000);
     }
 
-    // Spec general/028 test 2: a failed flush hands its MemTable back to
-    // `immutable_memtables` and leaves the flush slot empty, so the next call
+    // Spec general/028 test 2: a failed flush hands its MemTable back to the
+    // immutables and leaves the flush slot empty, so the next call
     // is its retry -- the keys stay readable throughout and end up in exactly
     // one L0 file. The fault is a read-only SSTable directory (same lever as
     // the kv/026 M1 test above), which fails the write before the install.
@@ -4421,15 +4552,15 @@ mod tests {
         assert!(engine.flush_memtable().await.is_err(), "the SSTable write must fail");
         std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(engine.flushing.read().is_empty(), "a failed flush claims nothing");
-        assert_eq!(engine.immutable_memtables.read().len(), 1, "its MemTable is back");
+        assert!(engine.version().flushing.is_empty(), "a failed flush claims nothing");
+        assert_eq!(engine.version().immutables.len(), 1, "its MemTable is back");
         assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
         assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
 
         assert!(engine.flush_memtable().await.unwrap().is_some(), "the retry succeeds");
-        assert_eq!(engine.level_manager.get_level(0).len(), 1, "exactly one L0 file");
-        assert!(engine.immutable_memtables.read().is_empty());
-        assert!(engine.flushing.read().is_empty());
+        assert_eq!(engine.version().level(0).len(), 1, "exactly one L0 file");
+        assert!(engine.version().immutables.is_empty());
+        assert!(engine.version().flushing.is_empty());
         assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
         assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
     }
@@ -4466,8 +4597,8 @@ mod tests {
             second.await.unwrap().unwrap().is_none(),
             "the second call must find the MemTable already flushed"
         );
-        assert_eq!(engine.level_manager.get_level(0).len(), 1, "exactly one L0 file");
-        assert!(engine.flushing.read().is_empty());
+        assert_eq!(engine.version().level(0).len(), 1, "exactly one L0 file");
+        assert!(engine.version().flushing.is_empty());
         assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
     }
 
@@ -4484,12 +4615,12 @@ mod tests {
         engine.put(b"b", b"old").await.unwrap();
         freeze_and_flush(&engine).await;
         engine.compact_level(0).await.unwrap();
-        assert_eq!(engine.level_manager.get_level(1).len(), 1);
+        assert_eq!(engine.version().level(1).len(), 1);
         engine.put(b"a", b"new").await.unwrap();
         freeze_and_flush(&engine).await;
         engine.put(b"b", b"new").await.unwrap();
         freeze_and_flush(&engine).await;
-        assert_eq!(engine.level_manager.get_level(0).len(), 2);
+        assert_eq!(engine.version().level(0).len(), 2);
 
         // Armed only now: the setup compaction above must not park.
         let hook = Arc::new(TestHook::default());
@@ -4515,7 +4646,7 @@ mod tests {
 
         assert_eq!(engine.get(b"a").await.unwrap(), Some(b"new".to_vec()));
         assert_eq!(engine.get(b"b").await.unwrap(), Some(b"new".to_vec()));
-        assert!(engine.level_manager.get_level(0).is_empty());
+        assert!(engine.version().level(0).is_empty());
         assert_readers_match_manifest(&engine);
     }
 
@@ -4534,8 +4665,8 @@ mod tests {
         engine.compact_level(0).await.unwrap(); // "a" moves down to L1
         engine.put(b"b", &big).await.unwrap();
         freeze_and_flush(&engine).await;
-        assert_eq!(engine.level_manager.get_level(0).len(), 1);
-        assert_eq!(engine.level_manager.get_level(1).len(), 1);
+        assert_eq!(engine.version().level(0).len(), 1);
+        assert_eq!(engine.version().level(1).len(), 1);
 
         let hook = Arc::new(TestHook::default());
         let mut janitor = engine.build_janitor(gc_always());
@@ -4616,11 +4747,10 @@ mod tests {
     }
 
     // Spec perf/017 test 8 (A3): a MemTable rotation runs while the scan sits
-    // in a yield *inside its frozen-list iteration* — exactly where
-    // `immutable_memtables.read()` used to be held. No `parking_lot` guard
-    // survives a yield, so the rotation gets its write locks instead of
-    // deadlocking the one thread, and the scan still returns every key it
-    // started with.
+    // in a yield *inside its frozen-list iteration* — where a read guard on
+    // the frozen list used to be held. No `parking_lot` guard survives a
+    // yield, so the rotation gets its write lock instead of deadlocking the
+    // one thread, and the scan still returns every key it started with.
     #[tokio::test]
     async fn test_scan_keys_survives_memtable_rotation_mid_scan() {
         let (engine, _dir) = make_engine().await;
@@ -4677,9 +4807,9 @@ mod tests {
             tokio::spawn(async move { engine.flush_memtable().await })
         };
         hook.reached.notified().await;
-        assert_eq!(engine.flushing.read().len(), 1, "the flush claimed the MemTable");
+        assert_eq!(engine.version().flushing.len(), 1, "the flush claimed the MemTable");
         assert!(
-            engine.immutable_memtables.read().is_empty(),
+            engine.version().immutables.is_empty(),
             "the barrier finds an empty queue and must still wait"
         );
 
@@ -4693,7 +4823,7 @@ mod tests {
         hook.release.notify_one();
         barrier.await.unwrap().unwrap();
         assert!(flusher.await.unwrap().unwrap().is_some());
-        assert!(engine.flushing.read().is_empty(), "no flush is left in flight");
+        assert!(engine.version().flushing.is_empty(), "no flush is left in flight");
         assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
     }
 
@@ -4724,7 +4854,7 @@ mod tests {
         };
         yield_repeatedly().await;
         assert!(!gc.is_finished(), "the GC must not scan past a flush in flight");
-        assert!(engine.vlog.get(1).is_some(), "its source generation is still live");
+        assert!(engine.version().vlog.contains_key(&1), "its source generation is still live");
 
         hook.release.notify_one();
         assert!(flusher.await.unwrap().unwrap().is_some());
@@ -4732,6 +4862,67 @@ mod tests {
 
         assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
         assert_readers_match_manifest(&engine);
+    }
+
+    // Same wait, but the parked flush fails and hands its MemTable back to
+    // the immutables. The barrier must not report success while that
+    // MemTable still points into the generation the GC is about to retire:
+    // the cycle fails instead, generation 1 stays, and the next cycle, with
+    // the SSTable directory writable again, carries the value over.
+    #[tokio::test]
+    async fn test_gc_keeps_the_generation_a_failed_flush_hands_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sstable_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&sstable_dir).unwrap();
+        let mut engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+        let hook = hook_flush_write(&mut engine);
+        let engine = Arc::new(engine);
+
+        let big = vec![b'x'; 4096];
+        engine.put(b"parked", &big).await.unwrap();
+        engine.freeze_active_memtable();
+
+        let flusher = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.flush_memtable().await })
+        };
+        hook.reached.notified().await;
+
+        let janitor = Arc::new(engine.build_janitor(gc_always()));
+        let gc = {
+            let janitor = Arc::clone(&janitor);
+            tokio::spawn(async move { janitor.run_gc().await })
+        };
+        // Generation 2 is active once the GC is past its switch; from there
+        // to the barrier's wait on the flush lock nothing yields.
+        while engine.version().active_vlog.id() != 2 {
+            assert!(!gc.is_finished(), "the GC ended before its switch");
+            tokio::task::yield_now().await;
+        }
+
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Lets the parked flush go on, and every later one that parks.
+        let releaser = {
+            let hook = Arc::clone(&hook);
+            tokio::spawn(async move {
+                loop {
+                    hook.release.notify_one();
+                    hook.reached.notified().await;
+                }
+            })
+        };
+        assert!(flusher.await.unwrap().is_err(), "the parked SSTable write must fail");
+        let cycle = gc.await.unwrap();
+        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(cycle.is_err(), "the GC must not go on past a MemTable its barrier left behind");
+        assert!(engine.version().vlog.contains_key(&1), "generation 1 stays live");
+        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big.clone()));
+
+        assert!(janitor.run_gc().await.unwrap().ran);
+        assert!(!engine.version().vlog.contains_key(&1));
+        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
+        releaser.abort();
     }
 
     // Spec general/029 test 3 (B2): L0 follows claim order, not completion
@@ -4748,7 +4939,7 @@ mod tests {
         engine.freeze_active_memtable();
         engine.put(b"k", b"new").await.unwrap();
         engine.freeze_active_memtable();
-        assert_eq!(engine.immutable_memtables.read().len(), 2);
+        assert_eq!(engine.version().immutables.len(), 2);
 
         let older = {
             let engine = Arc::clone(&engine);
@@ -4761,9 +4952,9 @@ mod tests {
             tokio::spawn(async move { engine.flush_memtable().await })
         };
         yield_repeatedly().await;
-        assert_eq!(engine.flushing.read().len(), 1, "only one flush may be in flight");
+        assert_eq!(engine.version().flushing.len(), 1, "only one flush may be in flight");
         assert_eq!(
-            engine.immutable_memtables.read().len(),
+            engine.version().immutables.len(),
             1,
             "the younger MemTable stays queued until the older one is installed"
         );
@@ -4775,7 +4966,7 @@ mod tests {
         hook.release.notify_one();
         let newer_id = newer.await.unwrap().unwrap().unwrap();
 
-        let l0: Vec<u64> = engine.level_manager.get_level(0).iter().map(|r| r.file_id).collect();
+        let l0: Vec<u64> = engine.version().level(0).iter().map(|r| r.file_id).collect();
         assert_eq!(l0, vec![older_id, newer_id], "L0 lists the SSTables oldest first");
         let manifest_l0: Vec<u64> =
             engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
@@ -4814,9 +5005,9 @@ mod tests {
             tokio::spawn(async move { engine.flush_memtable().await })
         };
         yield_repeatedly().await;
-        assert!(engine.flushing.read().is_empty(), "the GC install holds the flush lock");
+        assert!(engine.version().flushing.is_empty(), "the GC install holds the flush lock");
         assert_eq!(
-            engine.immutable_memtables.read().len(),
+            engine.version().immutables.len(),
             1,
             "the flush waits for the install instead of landing inside it"
         );
@@ -4875,7 +5066,7 @@ mod tests {
             "the rebuild carries the version the flush replaced"
         );
 
-        let l0: Vec<u64> = engine.level_manager.get_level(0).iter().map(|r| r.file_id).collect();
+        let l0: Vec<u64> = engine.version().level(0).iter().map(|r| r.file_id).collect();
         assert_eq!(l0.len(), 2);
         assert_eq!(l0[1], flushed_id, "the rebuild is older and goes in front of the flush");
         let manifest_l0: Vec<u64> =
@@ -4911,9 +5102,9 @@ mod tests {
             tokio::spawn(async move { engine.flush_memtable().await })
         };
         yield_repeatedly().await;
-        assert!(engine.flushing.read().is_empty(), "the compaction install holds the flush lock");
+        assert!(engine.version().flushing.is_empty(), "the compaction install holds the flush lock");
         assert_eq!(
-            engine.immutable_memtables.read().len(),
+            engine.version().immutables.len(),
             1,
             "the flush waits for the install instead of landing inside it"
         );
@@ -4932,7 +5123,7 @@ mod tests {
     /// undefined order, so one user key in two of its SSTables makes the
     /// winning version a coin toss (spec general/029 B4).
     fn assert_levels_below_l0_are_disjoint(engine: &LsmStorageEngine) {
-        for (lvl, readers) in engine.level_manager.get_all_levels().iter().enumerate().skip(1) {
+        for (lvl, readers) in engine.version().levels.iter().enumerate().skip(1) {
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for reader in readers {
                 let mut keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -4971,8 +5162,8 @@ mod tests {
             engine.put(key, &big).await.unwrap();
             freeze_and_flush(&engine).await;
         }
-        assert_eq!(engine.level_manager.get_level(0).len(), 4);
-        assert_eq!(engine.level_manager.get_level(1).len(), 1);
+        assert_eq!(engine.version().level(0).len(), 4);
+        assert_eq!(engine.version().level(1).len(), 1);
 
         let hook = Arc::new(TestHook::default());
         let mut janitor = engine.build_janitor(gc_always());
@@ -5062,5 +5253,568 @@ mod tests {
             BatchOp::Delete { key: b"b".to_vec() },
         ];
         assert_raises_change_epoch(&engine, engine.write_batch(ops)).await;
+    }
+
+    // ── Spec kv/031: thread-safe read path ───────────────────────────────────
+
+    /// Sources a reader over `version` searches: MemTables plus SSTables.
+    fn source_count(version: &Version) -> usize {
+        version.memtables_newest_first().count() + version.sstables_newest_first().count()
+    }
+
+    // Spec kv/031 test 1: an install is one swap. While an install is parked
+    // mid-build -- the claimed MemTable already out of the immutables, not
+    // yet in the flush slot -- a reader holding the old version still reads
+    // it whole; after the swap the new version is whole. No reader can meet
+    // the mix the builder holds.
+    #[tokio::test]
+    async fn test_install_swaps_the_whole_version_at_once() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        for i in 0..100u32 {
+            engine.put(format!("k{i:03}").as_bytes(), b"v").await.unwrap();
+        }
+        engine.freeze_active_memtable();
+        let before = engine.version();
+        assert_eq!((before.immutables.len(), before.flushing.len()), (1, 0));
+        assert_eq!(source_count(&before), 2);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let installer = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                engine.install(|v| {
+                    let mut next = v.clone();
+                    let claimed = next.immutables.remove(0);
+                    reached_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    next.flushing.push(claimed);
+                    next
+                });
+            })
+        };
+        reached_rx.recv().unwrap();
+
+        assert_eq!(source_count(&before), 2, "the old version is untouched mid-install");
+        let reader = LsmReader::new(Arc::clone(&before), Arc::clone(&engine.block_cache));
+        let snapshot = Snapshot::new(engine.next_timestamp());
+        for i in 0..100u32 {
+            assert_eq!(
+                reader.get(format!("k{i:03}").as_bytes(), &snapshot).await.unwrap(),
+                GetResult::Present(b"v".to_vec()),
+                "k{i:03} reads from the old version while the install is parked"
+            );
+        }
+
+        release_tx.send(()).unwrap();
+        installer.join().unwrap();
+        let after = engine.version();
+        assert_eq!((after.immutables.len(), after.flushing.len()), (0, 1));
+        assert_eq!(source_count(&after), 2);
+    }
+
+    // Spec kv/031 test 5: point reads peek at the clock instead of advancing
+    // it -- a thousand of them leave it where it was -- while each registered
+    // snapshot draws a stamp of its own; a write confirmed on one thread is
+    // visible to a read that follows on another.
+    #[tokio::test]
+    async fn test_reads_peek_at_the_clock_and_see_confirmed_writes() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        engine.put(b"k", b"v").await.unwrap();
+
+        let before = engine.hlc().peek();
+        for _ in 0..1_000 {
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+            assert!(engine.get_latest_with_metadata(b"k").await.unwrap().is_some());
+        }
+        assert_eq!(engine.hlc().peek(), before, "point reads must not draw stamps");
+
+        let first = engine.snapshot();
+        let second = engine.snapshot();
+        assert!(first.snapshot().timestamp().as_u64() > before.as_u64());
+        assert!(
+            second.snapshot().timestamp().as_u64() > first.snapshot().timestamp().as_u64(),
+            "every registered snapshot has a stamp of its own"
+        );
+        assert_eq!(engine.get_with_snapshot(b"k", second.snapshot()).await.unwrap(), GetResult::Present(b"v".to_vec()));
+
+        // Thread A writes, then hands over to thread B, which reads.
+        let (confirmed_tx, confirmed_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(engine.put(b"handover", b"from-a")).unwrap();
+                confirmed_tx.send(()).unwrap();
+            })
+        };
+        let reader = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                confirmed_rx.recv().unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(engine.get(b"handover")).unwrap()
+            })
+        };
+        // Joined off the test runtime: the WAL committer runs on it.
+        let read = tokio::task::spawn_blocking(move || {
+            writer.join().unwrap();
+            reader.join().unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(read, Some(b"from-a".to_vec()));
+    }
+
+    // Spec kv/031 test 6: point reads leave the snapshot registry alone; a
+    // scan pinned to a registered snapshot keeps exactly that one entry while
+    // it yields, a point read in between adds none, and the entry leaves with
+    // the guard.
+    #[tokio::test]
+    async fn test_point_reads_register_nothing_and_a_scan_holds_one_snapshot() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        fill_scan_keys(&engine).await;
+        let registry = Arc::clone(&engine.snapshot_registry);
+        let acquired = registry.acquire_count();
+
+        assert!(engine.get(b"k:00001").await.unwrap().is_some());
+        assert!(engine.get_latest_with_expiry(b"k:00001").await.unwrap().0 != GetResult::Absent);
+        assert!(engine.get_latest_with_metadata(b"k:00001").await.unwrap().is_some());
+        assert_eq!(registry.acquire_count(), acquired, "point reads must not register");
+        assert_eq!(registry.active_count(), 0);
+
+        let scanner = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let guard = engine.snapshot();
+                engine.scan_keys_with_snapshot(b"k:", guard.snapshot()).await.unwrap().len()
+            })
+        };
+        let mut checks = 0;
+        loop {
+            tokio::task::yield_now().await;
+            if scanner.is_finished() {
+                break;
+            }
+            assert_eq!(registry.active_count(), 1, "exactly the scan's snapshot is registered");
+            assert!(engine.get(b"k:00002").await.unwrap().is_some());
+            assert_eq!(registry.active_count(), 1, "a point read mid-scan registers nothing");
+            checks += 1;
+        }
+        assert!(checks > 0, "the scan must have yielded at least once");
+        assert_eq!(scanner.await.unwrap(), 20_000);
+        assert_eq!(registry.active_count(), 0, "the guard deregisters on drop");
+    }
+
+    // A registered snapshot draws its stamp under the lock a compaction's
+    // low watermark takes: parked on another thread right after the draw,
+    // the reader still holds it, so no compaction can choose its inputs
+    // between the stamp and its registration. The version the stamp sees
+    // then survives an overwrite and the compaction that merges both.
+    #[tokio::test]
+    async fn test_registered_snapshot_reads_the_key_a_compaction_rewrote_meanwhile() {
+        let (mut engine, _dir) = make_engine().await;
+        let (hook, reached, release) = ThreadHook::new();
+        engine.hooks.snapshot_stamp_drawn = Some(hook);
+        let engine = Arc::new(engine);
+        // `a` and `z` widen the L1 table's range, so the later compaction
+        // merges the new L0 table with it.
+        for key in [b"a", b"k", b"z"] {
+            engine.put(key, b"old").await.unwrap();
+        }
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap();
+
+        let reader = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || engine.snapshot())
+        };
+        reached.recv().unwrap();
+        assert!(engine.snapshot_registry().is_locked(), "the stamp is drawn under the registry lock");
+        engine.put(b"k", b"new").await.unwrap();
+        freeze_and_flush(&engine).await;
+        release.send(()).unwrap();
+        let registered = tokio::task::spawn_blocking(move || reader.join().unwrap()).await.unwrap();
+
+        engine.compact_level(0).await.unwrap();
+        assert_eq!(engine.version().level(1).len(), 1, "the compaction merged both versions");
+        assert_eq!(
+            engine.get_with_snapshot(b"k", registered.snapshot()).await.unwrap(),
+            GetResult::Present(b"old".to_vec()),
+            "the compaction keeps the version the snapshot reads"
+        );
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+    }
+
+    // Spec kv/031 test 7: a version holding a retired generation keeps its
+    // file -- a reader on it still gets the value -- until the version is
+    // dropped; the Janitor's next run deletes the file.
+    #[tokio::test]
+    async fn test_retired_generation_lives_until_the_last_version_drops() {
+        let (engine, dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        let big = vec![b'r'; 4096]; // >= vlog_inline_threshold → vLog pointer
+        engine.put(b"held", &big).await.unwrap();
+        let held = engine.version();
+        let gen1_path = dir.path().join("vlog.log");
+        let janitor = engine.build_janitor(gc_always());
+
+        assert!(janitor.run_gc().await.unwrap().ran);
+        assert!(!engine.version().vlog.contains_key(&1), "generation 1 is retired");
+        assert!(gen1_path.exists(), "a version still holds generation 1");
+        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache));
+        let snapshot = Snapshot::new(engine.read_timestamp());
+        assert_eq!(reader.get(b"held", &snapshot).await.unwrap(), GetResult::Present(big.clone()));
+
+        drop(reader);
+        drop(held);
+        assert!(gen1_path.exists(), "the Janitor deletes it, not the drop");
+        janitor.run_gc().await.unwrap();
+        assert!(!gen1_path.exists(), "the next run deletes the released generation");
+        assert_eq!(engine.get(b"held").await.unwrap(), Some(big));
+    }
+
+    // A reader still on the version from before a compaction or a GC probes
+    // a table that job retired: it reads through the table's own mapping, but
+    // no block of it goes back into the cache, where it would keep the deleted
+    // file allocated.
+    #[tokio::test]
+    async fn test_reads_on_an_old_version_cache_no_block_of_a_retired_sstable() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        engine.put(b"k", b"v").await.unwrap();
+        freeze_and_flush(&engine).await;
+
+        let before_compaction = engine.version();
+        engine.compact_level(0).await.unwrap();
+        let before_gc = engine.version();
+        assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
+
+        for (version, job) in [(before_compaction, "compaction"), (before_gc, "GC")] {
+            let retired = version.sstables_newest_first().next().unwrap().file_id;
+            let reader = LsmReader::new(Arc::clone(&version), Arc::clone(&engine.block_cache));
+            let snapshot = Snapshot::new(engine.read_timestamp());
+            assert_eq!(reader.get(b"k", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
+            let block = BlockCacheKey { file_id: retired, block_offset: 0 };
+            assert!(
+                engine.block_cache.stripe(&block).get(&block).is_none(),
+                "no block of the table the {job} retired may be cached again"
+            );
+        }
+    }
+
+    // The same for a reader two maintenance installs behind: the compaction
+    // in between keeps the reader's table, and the GC after it retires the
+    // table for that reader's version too.
+    #[tokio::test]
+    async fn test_reads_two_installs_behind_cache_no_block_of_a_retired_sstable() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+        engine.put(b"a", b"v").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap();
+        let held = engine.version();
+        let table = held.level(1)[0].file_id;
+
+        // `z` lies beyond the L1 table's range, so the compaction keeps it.
+        engine.put(b"z", b"v").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap();
+        assert!(engine.version().level(1).iter().any(|t| t.file_id == table), "the compaction kept the table");
+        assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
+        assert!(engine.version().level(1).iter().all(|t| t.file_id != table), "the GC retired the table");
+
+        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache));
+        let snapshot = Snapshot::new(engine.read_timestamp());
+        assert_eq!(reader.get(b"a", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
+        let block = BlockCacheKey { file_id: table, block_offset: 0 };
+        assert!(
+            engine.block_cache.stripe(&block).get(&block).is_none(),
+            "no block of the retired table may be cached again"
+        );
+    }
+
+    const STRESS_KEYS: u64 = 20_000;
+    /// Keys every phase after the first overwrites.
+    const STRESS_OVERWRITES: u64 = 5_000;
+
+    fn stress_key(i: u64) -> Vec<u8> {
+        format!("s{i:05}").into_bytes()
+    }
+
+    /// Key `i`'s value in write phase `phase`: phase and key up front, the
+    /// rest padding above the inline threshold, so every value lives in the
+    /// vLog.
+    fn stress_value(i: u64, phase: u64) -> Vec<u8> {
+        let mut value = format!("{phase}:{i:05}:").into_bytes();
+        value.resize(1_100, b'x');
+        value
+    }
+
+    /// The phase `value` was written in; panics unless it is a value of key `i`.
+    fn stress_phase(i: u64, value: &[u8]) -> u64 {
+        let text = std::str::from_utf8(&value[..value.len().min(16)]).unwrap_or("");
+        let mut fields = text.split(':');
+        let phase = fields.next().and_then(|p| p.parse().ok());
+        match (phase, fields.next()) {
+            (Some(phase), Some(key)) if key == format!("{i:05}") => phase,
+            _ => panic!("key {i} read a foreign value"),
+        }
+    }
+
+    /// Keys the writer has confirmed at `mark` (`phase << 32 | keys confirmed
+    /// in that phase`): phase 0 writes every key, each later phase overwrites
+    /// the first [`STRESS_OVERWRITES`].
+    fn stress_known(mark: u64) -> u64 {
+        if mark >> 32 == 0 { mark & u64::from(u32::MAX) } else { STRESS_KEYS }
+    }
+
+    /// Oldest phase a read of confirmed key `i` may return at `mark`.
+    fn stress_least_phase(mark: u64, i: u64) -> u64 {
+        let (phase, upto) = (mark >> 32, mark & u64::from(u32::MAX));
+        if i < upto {
+            phase
+        } else if i < STRESS_OVERWRITES {
+            phase - 1
+        } else {
+            0
+        }
+    }
+
+    /// `keys`, a sorted scan result, lists the first `known` keys.
+    fn assert_lists_known_keys(keys: &[Vec<u8>], known: u64) {
+        assert!(keys.len() as u64 >= known, "a scan lost confirmed keys");
+        for (n, key) in keys.iter().take(known as usize).enumerate() {
+            assert_eq!(key, &stress_key(n as u64), "a scan lost confirmed key {n}");
+        }
+    }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Sets its flag when dropped -- on an unwind too, so the stress readers
+    /// stop when the writer fails.
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// One reader thread of the stress test: its own current-thread runtime,
+    /// random point reads of confirmed keys with a full scan every 2 000
+    /// reads, until `done`. A read returns at least the phase confirmed for
+    /// its key before it started.
+    fn spawn_stress_reader(
+        engine: Arc<LsmStorageEngine>,
+        mark: Arc<AtomicU64>,
+        done: Arc<AtomicBool>,
+        started: Arc<std::sync::Barrier>,
+        seed: u64,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async move {
+                let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ seed;
+                let mut reads = 0u64;
+                started.wait();
+                loop {
+                    let finished = done.load(Ordering::Acquire);
+                    let at = mark.load(Ordering::Acquire);
+                    let known = stress_known(at);
+                    if known == 0 {
+                        if finished {
+                            break;
+                        }
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    let i = next_random(&mut rng) % known;
+                    let least = stress_least_phase(at, i);
+                    match engine.get(&stress_key(i)).await {
+                        Ok(Some(value)) => {
+                            let phase = stress_phase(i, &value);
+                            assert!(phase >= least, "key {i} read phase {phase}, below the confirmed {least}");
+                        }
+                        Ok(None) => panic!("confirmed key {i} read as absent"),
+                        Err(e) => panic!("read of confirmed key {i} failed: {e}"),
+                    }
+                    reads += 1;
+                    if reads % 2_000 == 0 || finished {
+                        assert_lists_known_keys(&engine.scan_keys(b"s").await.unwrap(), known);
+                    }
+                    if finished {
+                        break;
+                    }
+                    if reads % 64 == 0 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+            });
+        })
+    }
+
+    /// The stress test's reader on registered snapshots: each is held while
+    /// the writer moves on, and its point reads and scans keep seeing what
+    /// they saw first -- no confirmed key missing, no key back at an older
+    /// phase than its first read at that stamp.
+    fn spawn_pinned_stress_reader(
+        engine: Arc<LsmStorageEngine>,
+        mark: Arc<AtomicU64>,
+        done: Arc<AtomicBool>,
+        started: Arc<std::sync::Barrier>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async move {
+                let mut rng = 0x2545_F491_4F6C_DD1Du64;
+                started.wait();
+                while !done.load(Ordering::Acquire) {
+                    let at = mark.load(Ordering::Acquire);
+                    let known = stress_known(at);
+                    if known == 0 {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    let pinned = engine.snapshot();
+                    let snapshot = pinned.snapshot();
+                    let sample: Vec<u64> = (0..32).map(|_| next_random(&mut rng) % known).collect();
+                    let mut first = Vec::with_capacity(sample.len());
+                    for round in 0..4 {
+                        assert_lists_known_keys(&engine.scan_keys_with_snapshot(b"s", snapshot).await.unwrap(), known);
+                        for (n, &i) in sample.iter().enumerate() {
+                            let phase = match engine.get_with_snapshot(&stress_key(i), snapshot).await {
+                                Ok(GetResult::Present(value)) => stress_phase(i, &value),
+                                other => panic!("confirmed key {i} read {other:?} at a pinned stamp"),
+                            };
+                            if round == 0 {
+                                assert!(phase >= stress_least_phase(at, i), "key {i} read below its confirmed phase");
+                                first.push(phase);
+                            } else {
+                                assert!(phase >= first[n], "key {i} went back to an older phase at a pinned stamp");
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+        })
+    }
+
+    // Spec kv/031 test 3: four reader threads, each on its own runtime, read
+    // while this current-thread runtime writes 20 000 vLog-sized keys, then
+    // overwrites the first 5 000 in two more phases, through forced rotations,
+    // flushes, compactions and a vLog GC. A read of a confirmed key always
+    // returns a value of at least the phase confirmed for it -- never absent,
+    // never an error such as an unknown generation -- and a scan always lists
+    // every confirmed key. A fifth reader holds registered snapshots across
+    // the writer's progress, so compactions meet a watermark, and checks that
+    // each stays consistent. A fixed amount of writes, no clock.
+    #[tokio::test]
+    async fn test_readers_on_other_threads_never_miss_a_confirmed_key() {
+        const PHASES: u64 = 3;
+        const BATCH: u64 = 100;
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(engine_with_threshold(&dir, 64 * 1024).await);
+        let janitor = engine.build_janitor(gc_always());
+        let mark = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(std::sync::Barrier::new(6));
+
+        let mut readers: Vec<_> = (0..4)
+            .map(|t| {
+                spawn_stress_reader(
+                    Arc::clone(&engine),
+                    Arc::clone(&mark),
+                    Arc::clone(&done),
+                    Arc::clone(&started),
+                    t + 1,
+                )
+            })
+            .collect();
+        readers.push(spawn_pinned_stress_reader(
+            Arc::clone(&engine),
+            Arc::clone(&mark),
+            Arc::clone(&done),
+            Arc::clone(&started),
+        ));
+        let stop_readers = SetOnDrop(Arc::clone(&done));
+        started.wait();
+
+        for phase in 0..PHASES {
+            let batches = if phase == 0 { STRESS_KEYS } else { STRESS_OVERWRITES } / BATCH;
+            for batch in 0..batches {
+                let first = batch * BATCH;
+                let ops = (first..first + BATCH)
+                    .map(|i| BatchOp::Put { key: stress_key(i), value: stress_value(i, phase) })
+                    .collect();
+                engine.write_batch(ops).await.unwrap();
+                mark.store(phase << 32 | (first + BATCH), Ordering::Release);
+
+                let written = batch + 1;
+                if written % 25 == 0 {
+                    engine.flush_all_memtables().await.unwrap();
+                }
+                if written == batches / 2 {
+                    engine.compact_level(0).await.unwrap();
+                }
+                if phase == 0 && written == batches * 3 / 4 {
+                    assert!(janitor.run_gc().await.unwrap().ran);
+                }
+            }
+            engine.compact_level(0).await.unwrap();
+        }
+        drop(stop_readers);
+
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(engine.version().vlog.keys().all(|id| *id > 1), "the GC retired generation 1");
+        assert_eq!(engine.scan_keys(b"s").await.unwrap().len() as u64, STRESS_KEYS);
+        for i in 0..STRESS_KEYS {
+            let phase = if i < STRESS_OVERWRITES { PHASES - 1 } else { 0 };
+            assert_eq!(engine.get(&stress_key(i)).await.unwrap(), Some(stress_value(i, phase)));
+        }
+    }
+
+    // Spec kv/031 A5: a new active generation comes with a fresh MemTable, so
+    // a version taken before the switch never meets a pointer into the new
+    // generation -- the write after it lands in a MemTable that version does
+    // not hold.
+    #[tokio::test]
+    async fn test_version_before_a_generation_switch_never_sees_its_pointers() {
+        let (engine, _dir) = make_engine().await;
+        let big = vec![b'n'; 4096]; // >= vlog_inline_threshold → vLog pointer
+        let before = engine.version();
+        let gen2 = Arc::new(VLog::open(generation_path(&engine.vlog_path, 2), 2).await.unwrap());
+        engine.install(|v| v.with_active_vlog(gen2));
+        engine.put(b"late", &big).await.unwrap();
+
+        let reader = LsmReader::new(before, Arc::clone(&engine.block_cache));
+        let snapshot = Snapshot::new(engine.read_timestamp());
+        assert_eq!(reader.get(b"late", &snapshot).await.unwrap(), GetResult::Absent);
+        assert_eq!(engine.get(b"late").await.unwrap(), Some(big));
+    }
+
+    // A pointer is resolved through the reader's own version only: a
+    // generation the version does not know is a clean error, never a read
+    // from some other file.
+    #[tokio::test]
+    async fn test_pointer_into_an_unknown_generation_is_a_clean_error() {
+        let (engine, _dir) = make_engine().await;
+        let stamp = engine.next_timestamp();
+        let dangling = Value::Pointer { file_id: 7, offset: 0, len: 4, expire_at: None };
+        engine.version().memtable.set(b"k".to_vec(), stamp, dangling);
+
+        let err = engine.get(b"k").await.unwrap_err();
+        assert!(err.to_string().contains("Unknown value log generation 7"), "{err}");
     }
 }

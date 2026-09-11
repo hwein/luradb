@@ -93,24 +93,25 @@ impl CompactionJob {
     }
 
     /// Runs the compaction job and returns the raw bytes of the new SSTables.
+    ///
+    /// Tables enter the merge newest first, in the read path's order: the
+    /// sources reversed, then the targets, which sit one level below and are
+    /// older than every source. Of identical internal keys (a stamp tie, spec
+    /// kv/032) only the newest source's entry is kept, the one reads see.
     pub fn compact(&self) -> Result<Vec<Vec<u8>>> {
         let mut all_entries: Vec<(Vec<u8>, DataBlockValue)> = Vec::new();
 
-        for sstable in &self.source_sstables {
-            for entry in sstable.iter() {
-                let (key, dbv) = entry?;
-                all_entries.push((key.to_vec(), dbv));
-            }
-        }
-        for sstable in &self.target_sstables {
+        for sstable in self.source_sstables.iter().rev().chain(&self.target_sstables) {
             for entry in sstable.iter() {
                 let (key, dbv) = entry?;
                 all_entries.push((key.to_vec(), dbv));
             }
         }
 
-        // Sort by InternalKey encoding: same user key → newest version first.
+        // Sort by InternalKey encoding: same user key → newest version first;
+        // stable, so identical keys keep the table order above.
         all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        all_entries.dedup_by(|later, first| later.0 == first.0);
 
         let filtered = self.filter_entries(all_entries)?;
         self.build_sstables(filtered)

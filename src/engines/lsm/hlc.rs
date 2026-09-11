@@ -64,7 +64,7 @@ impl HybridLogicalClock {
     }
 
     /// Gets the current physical time in milliseconds since UNIX epoch.
-    fn physical_time() -> u64 {
+    pub(crate) fn physical_time() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("System time before UNIX epoch")
@@ -75,6 +75,18 @@ impl HybridLogicalClock {
     ///
     /// This is called when creating a new write operation locally.
     pub fn now(&self) -> HLCTimestamp {
+        loop {
+            if let Some(ts) = self.try_now() {
+                return ts;
+            }
+            // Logical counter overflow - wait for physical time to advance
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Like [`Self::now`], but `None` where `now` would sleep: the logical
+    /// counter is saturated and the wall clock has not moved past the clock.
+    pub fn try_now(&self) -> Option<HLCTimestamp> {
         loop {
             let current_physical = Self::physical_time();
             let last = self.last_timestamp.load(Ordering::SeqCst);
@@ -89,9 +101,7 @@ impl HybridLogicalClock {
             } else {
                 // Physical time hasn't advanced - increment logical counter
                 if last_logical == u16::MAX {
-                    // Logical counter overflow - wait for physical time to advance
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
+                    return None;
                 }
                 (last_physical, last_logical + 1)
             };
@@ -104,7 +114,7 @@ impl HybridLogicalClock {
                 .compare_exchange(last, new_ts.value, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return new_ts;
+                return Some(new_ts);
             }
             // If CAS failed, another thread updated it - retry
         }
@@ -214,8 +224,11 @@ mod tests {
 
         let ts1 = hlc.now();
 
-        // Wait for physical time to advance
-        thread::sleep(Duration::from_millis(10));
+        // Waits for the wall clock to pass this stamp instead of assuming a
+        // sleep does it: a backwards step only makes the wait longer.
+        while HybridLogicalClock::physical_time() <= ts1.physical() {
+            thread::sleep(Duration::from_millis(1));
+        }
 
         let ts2 = hlc.now();
 
@@ -321,6 +334,21 @@ mod tests {
         let ts2 = hlc.update(received);
         assert!(ts2.as_u64() > received.as_u64());
         assert!(ts2.as_u64() > ts1.as_u64());
+    }
+
+    // A saturated logical counter ahead of the wall clock: where `now` would
+    // sleep until the wall clock catches up, `try_now` returns at once and
+    // issues nothing.
+    #[test]
+    fn test_try_now_returns_none_on_a_saturated_counter() {
+        let hlc = HybridLogicalClock::new();
+        let ahead = HybridLogicalClock::physical_time() + 60_000;
+        hlc.seed(HLCTimestamp::from_components(ahead, u16::MAX - 1).as_u64());
+
+        let last = HLCTimestamp::from_components(ahead, u16::MAX);
+        assert_eq!(hlc.try_now(), Some(last));
+        assert_eq!(hlc.try_now(), None);
+        assert_eq!(hlc.peek(), last, "a failed draw issues nothing");
     }
 
     #[test]

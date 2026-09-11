@@ -1,7 +1,10 @@
 use crate::core::wal::WAL_MAX_FIELD_LEN;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -70,6 +73,155 @@ impl LuraConfig {
             .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
         Ok(config)
     }
+
+    /// Rejects data paths that share a real location or land on a vLog
+    /// generation file `<vlog_path>.<n>`; relative paths resolve against `base`.
+    pub fn validate_data_paths(&self, base: &Path) -> anyhow::Result<()> {
+        let mut entries: Vec<(&str, &str, bool)> = vec![
+            ("storage.db_path", self.storage.db_path.as_str(), false),
+            ("storage.wal_path", self.storage.wal_path.as_str(), false),
+            ("storage.vlog_path", self.storage.vlog_path.as_str(), true),
+            ("storage.sstable_dir", self.storage.sstable_dir.as_str(), false),
+        ];
+        if self.json.enabled {
+            entries.push(("json.wal_path", self.json.wal_path.as_str(), false));
+            entries.push(("json.vlog_path", self.json.vlog_path.as_str(), true));
+            entries.push(("json.sstable_dir", self.json.sstable_dir.as_str(), false));
+        }
+        if self.rel.enabled {
+            entries.push(("rel.wal_path", self.rel.wal_path.as_str(), false));
+            entries.push(("rel.vlog_path", self.rel.vlog_path.as_str(), true));
+            entries.push(("rel.sstable_dir", self.rel.sstable_dir.as_str(), false));
+        }
+        if self.backup.enabled {
+            entries.push(("backup.dir", self.backup.dir.as_str(), false));
+        }
+        let paths = entries
+            .into_iter()
+            .map(|(key, raw, is_vlog)| DataPath::new(base, key, raw, is_vlog))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // Rule 1: no two resolved locations coincide.
+        for (i, a) in paths.iter().enumerate() {
+            if let Some(b) = paths[i + 1..].iter().find(|b| b.resolved == a.resolved) {
+                return Err(same_location(a.key, b.key, &a.resolved));
+            }
+        }
+
+        // Rule 2: no location is a vLog generation file. The entry's slot counts
+        // too: the vLog would write that file through a symlink placed there.
+        for vlog in paths.iter().filter(|p| p.is_vlog) {
+            let vlog_name = vlog.slot.file_name().unwrap_or_default();
+            for entry in paths.iter().filter(|p| p.key != vlog.key) {
+                for location in [&entry.resolved, &entry.slot] {
+                    if location.parent() == vlog.slot.parent()
+                        && matches_generation_name(location.file_name(), vlog_name)
+                    {
+                        return Err(same_location(vlog.key, entry.key, location));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A data path resolved once. `slot` is its resolved parent plus its own file
+/// name, where vLog generation files go; it differs from `resolved` when the
+/// last segment is a symlink.
+struct DataPath<'a> {
+    key: &'a str,
+    resolved: PathBuf,
+    slot: PathBuf,
+    is_vlog: bool,
+}
+
+impl<'a> DataPath<'a> {
+    fn new(base: &Path, key: &'a str, raw: &str, is_vlog: bool) -> anyhow::Result<Self> {
+        let path = base.join(raw);
+        let resolve = |p: &Path| resolve_real_path(p).map_err(|e| anyhow::anyhow!("invalid config: {key} {e}"));
+        let resolved = resolve(&path)?;
+        let slot = resolve(path.parent().unwrap_or(Path::new("/")))?.join(path.file_name().unwrap_or_default());
+        Ok(Self { key, resolved, slot, is_vlog })
+    }
+}
+
+fn same_location(a: &str, b: &str, location: &Path) -> anyhow::Error {
+    anyhow::anyhow!("invalid config: {a} and {b} resolve to the same location '{}'", location.display())
+}
+
+/// Linux's MAXSYMLINKS; ends symlink loops.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+/// Owned `Component`, so symlink targets can be spliced into the queue.
+enum PathPart {
+    Root,
+    CurDir,
+    ParentDir,
+    Normal(OsString),
+}
+
+fn path_parts(p: &Path) -> VecDeque<PathPart> {
+    p.components()
+        .map(|c| match c {
+            Component::RootDir => PathPart::Root,
+            Component::CurDir => PathPart::CurDir,
+            Component::ParentDir => PathPart::ParentDir,
+            Component::Normal(name) => PathPart::Normal(name.to_os_string()),
+            Component::Prefix(_) => unreachable!(),
+        })
+        .collect()
+}
+
+/// Resolves `path` component by component, following symlinks like the
+/// kernel; components that do not exist stay lexical.
+fn resolve_real_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut pending = path_parts(path);
+    let mut resolved = PathBuf::new();
+    let mut hops = 0u32;
+
+    while let Some(part) = pending.pop_front() {
+        match part {
+            PathPart::Root => resolved = PathBuf::from("/"),
+            PathPart::CurDir => {}
+            PathPart::ParentDir => {
+                resolved.pop();
+            }
+            PathPart::Normal(name) => {
+                resolved.push(&name);
+                // Dangling symlinks are followed too: the engines open with
+                // O_CREAT and would create the target.
+                let is_symlink = std::fs::symlink_metadata(&resolved)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false);
+                if is_symlink {
+                    hops += 1;
+                    anyhow::ensure!(hops <= MAX_SYMLINK_HOPS, "has more than {MAX_SYMLINK_HOPS} symlink hops");
+                    let target = std::fs::read_link(&resolved)
+                        .map_err(|e| anyhow::anyhow!("has an unreadable symlink '{}': {e}", resolved.display()))?;
+                    // A relative target continues from the symlink's directory;
+                    // a later `..` then acts on the target, not on the link.
+                    resolved.pop();
+                    let mut next = path_parts(&target);
+                    next.extend(pending);
+                    pending = next;
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// True if `candidate` is `<vlog_filename>.<digits>`. Any digits count, even
+/// `.0`/`.1`, which the vLog never writes (spec rule 2).
+fn matches_generation_name(candidate: Option<&OsStr>, vlog_filename: &OsStr) -> bool {
+    let Some(candidate) = candidate else { return false };
+    let candidate = candidate.as_bytes();
+    let prefix = vlog_filename.as_bytes();
+    if candidate.len() <= prefix.len() + 1 || candidate[..prefix.len()] != *prefix || candidate[prefix.len()] != b'.' {
+        return false;
+    }
+    candidate[prefix.len() + 1..].iter().all(u8::is_ascii_digit)
 }
 
 /// Resolves the effective config path when `--config` was not given:
@@ -643,34 +795,6 @@ pub struct JsonStoreConfig {
     pub block_cache: BlockCacheConfig,
 }
 
-impl JsonStoreConfig {
-    /// Rejects JSON paths that collide with each other or with the KV
-    /// instance's files — two LSM instances on the same files corrupt each
-    /// other silently. Lexical comparison only (no canonicalization).
-    pub fn validate_paths(&self, storage: &StorageConfig) -> anyhow::Result<()> {
-        let json_paths = [
-            ("json.wal_path", self.wal_path.as_str()),
-            ("json.vlog_path", self.vlog_path.as_str()),
-            ("json.sstable_dir", self.sstable_dir.as_str()),
-        ];
-        let kv_paths = [
-            ("storage.db_path", storage.db_path.as_str()),
-            ("storage.wal_path", storage.wal_path.as_str()),
-            ("storage.vlog_path", storage.vlog_path.as_str()),
-            ("storage.sstable_dir", storage.sstable_dir.as_str()),
-        ];
-        for (i, (a_name, a)) in json_paths.iter().enumerate() {
-            for (b_name, b) in json_paths.iter().skip(i + 1).chain(kv_paths.iter()) {
-                anyhow::ensure!(
-                    Path::new(a) != Path::new(b),
-                    "invalid config: {a_name} and {b_name} point to the same path '{a}' — the JSON engine needs dedicated files"
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
 impl Default for JsonStoreConfig {
     fn default() -> Self {
         Self {
@@ -749,47 +873,6 @@ pub struct RelStoreConfig {
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
     pub block_cache: BlockCacheConfig,
-}
-
-impl RelStoreConfig {
-    /// Rejects rel paths that collide with each other, with the KV instance's
-    /// files, or with the JSON instance's files — three LSM instances on the
-    /// same files corrupt each other silently. Lexical comparison only (no
-    /// canonicalization). `JsonStoreConfig::validate_paths` already covers
-    /// json↔kv and json↔json; together, every pairwise collision among the
-    /// three engines is covered.
-    pub fn validate_paths(&self, storage: &StorageConfig, json: &JsonStoreConfig) -> anyhow::Result<()> {
-        let rel_paths = [
-            ("rel.wal_path", self.wal_path.as_str()),
-            ("rel.vlog_path", self.vlog_path.as_str()),
-            ("rel.sstable_dir", self.sstable_dir.as_str()),
-        ];
-        let kv_paths = [
-            ("storage.db_path", storage.db_path.as_str()),
-            ("storage.wal_path", storage.wal_path.as_str()),
-            ("storage.vlog_path", storage.vlog_path.as_str()),
-            ("storage.sstable_dir", storage.sstable_dir.as_str()),
-        ];
-        let json_paths = [
-            ("json.wal_path", json.wal_path.as_str()),
-            ("json.vlog_path", json.vlog_path.as_str()),
-            ("json.sstable_dir", json.sstable_dir.as_str()),
-        ];
-        for (i, (a_name, a)) in rel_paths.iter().enumerate() {
-            for (b_name, b) in rel_paths
-                .iter()
-                .skip(i + 1)
-                .chain(kv_paths.iter())
-                .chain(json_paths.iter())
-            {
-                anyhow::ensure!(
-                    Path::new(a) != Path::new(b),
-                    "invalid config: {a_name} and {b_name} point to the same path '{a}' — the relational engine needs dedicated files"
-                );
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Default for RelStoreConfig {
@@ -928,8 +1011,8 @@ impl ShmConfig {
 pub struct BackupConfig {
     /// Master switch. `false` = no scheduler task, backup endpoints answer 503.
     pub enabled: bool,
-    /// Target directory for backup artifacts. Must not collide with any
-    /// storage.*/json.*/rel.* path.
+    /// Target directory for backup artifacts. Collisions with storage.*/
+    /// json.*/rel.* paths are rejected by `LuraConfig::validate_data_paths`.
     pub dir: String,
     /// Entries scanned per batch and the pause between batches (pattern:
     /// json.reindex_batch_size/reindex_pause_ms) — keeps the foreground
@@ -971,34 +1054,11 @@ impl BackupConfig {
     /// Startup validation (spec general/006, fail fast). A no-op when
     /// `enabled = false` — a disabled backup config runs no scheduler and
     /// serves no endpoints, so its contents are never acted on.
-    pub fn validate(&self, storage: &StorageConfig, json: &JsonStoreConfig, rel: &RelStoreConfig) -> anyhow::Result<()> {
+    pub fn validate(&self) -> anyhow::Result<()> {
         if !self.enabled {
             return Ok(());
         }
         anyhow::ensure!(!self.dir.is_empty(), "invalid config: backup.dir must not be empty");
-
-        // The spec names only storage.*/json.* explicitly, but rel.* paths
-        // are the same failure class (a third LSM instance's files) — included
-        // here for consistency with `RelStoreConfig::validate_paths`.
-        let other_paths = [
-            ("storage.db_path", storage.db_path.as_str()),
-            ("storage.wal_path", storage.wal_path.as_str()),
-            ("storage.vlog_path", storage.vlog_path.as_str()),
-            ("storage.sstable_dir", storage.sstable_dir.as_str()),
-            ("json.wal_path", json.wal_path.as_str()),
-            ("json.vlog_path", json.vlog_path.as_str()),
-            ("json.sstable_dir", json.sstable_dir.as_str()),
-            ("rel.wal_path", rel.wal_path.as_str()),
-            ("rel.vlog_path", rel.vlog_path.as_str()),
-            ("rel.sstable_dir", rel.sstable_dir.as_str()),
-        ];
-        for (name, path) in other_paths {
-            anyhow::ensure!(
-                Path::new(&self.dir) != Path::new(path),
-                "invalid config: backup.dir and {name} point to the same path '{}' — backups need a dedicated directory",
-                self.dir
-            );
-        }
 
         let mut seen_names = std::collections::HashSet::new();
         for sched in &self.schedule {
@@ -1220,27 +1280,23 @@ mod tests {
     }
 
     #[test]
-    fn test_json_default_paths_valid() {
-        let config = LuraConfig::default();
-        assert!(config.json.validate_paths(&config.storage).is_ok());
-    }
-
-    #[test]
     fn test_json_path_collisions_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
         // JSON path colliding with a KV path.
         let mut config = LuraConfig::default();
         config.json.sstable_dir = config.storage.sstable_dir.clone();
-        assert!(config.json.validate_paths(&config.storage).is_err());
+        assert!(config.validate_data_paths(tmp.path()).is_err());
 
         // Two JSON paths colliding with each other.
         let mut config = LuraConfig::default();
         config.json.vlog_path = config.json.wal_path.clone();
-        assert!(config.json.validate_paths(&config.storage).is_err());
+        assert!(config.validate_data_paths(tmp.path()).is_err());
 
         // Trailing slash must not mask a collision.
         let mut config = LuraConfig::default();
         config.json.sstable_dir = "luradb_sstables/".to_string();
-        assert!(config.json.validate_paths(&config.storage).is_err());
+        assert!(config.validate_data_paths(tmp.path()).is_err());
     }
 
     #[test]
@@ -1271,32 +1327,28 @@ mod tests {
     }
 
     #[test]
-    fn test_rel_default_paths_valid() {
-        let config = LuraConfig::default();
-        assert!(config.rel.validate_paths(&config.storage, &config.json).is_ok());
-    }
-
-    #[test]
     fn test_rel_path_collisions_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
         // rel path colliding with a KV path.
         let mut config = LuraConfig::default();
         config.rel.sstable_dir = config.storage.sstable_dir.clone();
-        assert!(config.rel.validate_paths(&config.storage, &config.json).is_err());
+        assert!(config.validate_data_paths(tmp.path()).is_err());
 
         // rel path colliding with a JSON path.
         let mut config = LuraConfig::default();
         config.rel.wal_path = config.json.wal_path.clone();
-        assert!(config.rel.validate_paths(&config.storage, &config.json).is_err());
+        assert!(config.validate_data_paths(tmp.path()).is_err());
 
         // Two rel paths colliding with each other.
         let mut config = LuraConfig::default();
         config.rel.vlog_path = config.rel.wal_path.clone();
-        assert!(config.rel.validate_paths(&config.storage, &config.json).is_err());
+        assert!(config.validate_data_paths(tmp.path()).is_err());
 
         // Trailing slash must not mask a collision.
         let mut config = LuraConfig::default();
         config.rel.sstable_dir = "luradb_sstables/".to_string();
-        assert!(config.rel.validate_paths(&config.storage, &config.json).is_err());
+        assert!(config.validate_data_paths(tmp.path()).is_err());
     }
 
     #[test]
@@ -1629,7 +1681,7 @@ mod tests {
             include_auth: false,
             keep_last: 0,
         });
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_ok());
+        assert!(config.backup.validate().is_ok());
     }
 
     #[test]
@@ -1637,7 +1689,7 @@ mod tests {
         let mut config = LuraConfig::default();
         config.backup.enabled = true;
         config.backup.schedule.push(valid_backup_schedule("nightly-all"));
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_ok());
+        assert!(config.backup.validate().is_ok());
     }
 
     #[test]
@@ -1645,34 +1697,32 @@ mod tests {
         let mut config = LuraConfig::default();
         config.backup.enabled = true;
         config.backup.dir = String::new();
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        assert!(config.backup.validate().is_err());
     }
 
     #[test]
-    fn test_backup_validate_rejects_path_collision_with_storage() {
-        let mut config = LuraConfig::default();
-        config.backup.enabled = true;
-        config.backup.dir = config.storage.sstable_dir.clone();
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
-    }
+    fn test_validate_data_paths_backup_dir_equal_to_json_or_rel_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
 
-    #[test]
-    fn test_backup_validate_rejects_path_collision_with_json() {
         let mut config = LuraConfig::default();
         config.backup.enabled = true;
         config.backup.dir = config.json.sstable_dir.clone();
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
-    }
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("backup.dir") && err.contains("json.sstable_dir"), "{err}");
 
-    #[test]
-    fn test_backup_validate_rejects_path_collision_with_rel() {
-        // Not literally named in the spec text (which says storage.*/json.*
-        // only) but the same failure class as the other two — a third LSM
-        // instance's files, so it is included here too (see BackupConfig::validate).
         let mut config = LuraConfig::default();
         config.backup.enabled = true;
         config.backup.dir = config.rel.sstable_dir.clone();
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("backup.dir") && err.contains("rel.sstable_dir"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_data_paths_backup_enabled_default_dir_ok() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        assert!(config.validate_data_paths(tmp.path()).is_ok());
     }
 
     #[test]
@@ -1682,7 +1732,7 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.cron = "not a cron".to_string();
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        assert!(config.backup.validate().is_err());
     }
 
     #[test]
@@ -1692,7 +1742,7 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.scope = "not-a-scope".to_string();
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        assert!(config.backup.validate().is_err());
     }
 
     #[test]
@@ -1702,7 +1752,7 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.keep_last = 0;
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        assert!(config.backup.validate().is_err());
     }
 
     #[test]
@@ -1711,7 +1761,7 @@ mod tests {
         config.backup.enabled = true;
         config.backup.schedule.push(valid_backup_schedule("dup"));
         config.backup.schedule.push(valid_backup_schedule("dup"));
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        assert!(config.backup.validate().is_err());
     }
 
     #[test]
@@ -1721,7 +1771,7 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.name = "bad name!".to_string();
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        assert!(config.backup.validate().is_err());
     }
 
     #[test]
@@ -1731,7 +1781,7 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.name = "a".repeat(51);
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate(&config.storage, &config.json, &config.rel).is_err());
+        assert!(config.backup.validate().is_err());
     }
 
     // ── Log HTTP access (spec general/005) ──────────────────────────────────
@@ -2073,5 +2123,156 @@ mod tests {
         config.rel.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
         let err = config.rel.lsm.validate("rel.lsm").unwrap_err().to_string();
         assert!(err.contains("rel.lsm.max_value_size"), "{err}");
+    }
+
+    // ── Data path collisions via real locations (spec general/031) ──────────
+
+    #[test]
+    fn test_validate_data_paths_dot_segment_collision() {
+        // Test 1: `x` and `./x` resolve to the same location.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.storage.wal_path = "x".to_string();
+        config.storage.vlog_path = "./x".to_string();
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_relative_vs_absolute_in_base_collision() {
+        // Test 2: a relative path and the same location spelled absolute.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.storage.wal_path = "y".to_string();
+        config.storage.sstable_dir = tmp.path().join("y").to_str().unwrap().to_string();
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_symlink_directory_collision() {
+        // Test 3: a symlinked directory pointing at another data directory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        std::fs::create_dir(tmp.path().join(&config.storage.sstable_dir)).unwrap();
+        std::os::unix::fs::symlink(&config.storage.sstable_dir, tmp.path().join("link")).unwrap();
+
+        config.json.sstable_dir = "link".to_string();
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_wal_collides_with_vlog_generation_file() {
+        // Test 4: `json.wal_path` equal to `<storage.vlog_path>.1`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.json.wal_path = format!("{}.1", config.storage.vlog_path);
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_storage_wal_equals_vlog_rejected() {
+        // Test 5: `storage.wal_path` equal to `storage.vlog_path`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.storage.wal_path = config.storage.vlog_path.clone();
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_backup_dir_collides_with_storage_different_spelling() {
+        // Test 6: `backup.dir` equal to a data directory in another spelling.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        config.backup.dir = format!("./{}", config.storage.sstable_dir);
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_distinct_paths_some_nonexistent_ok() {
+        // Test 7: distinct paths, some existing, some not yet.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = LuraConfig::default();
+        std::fs::create_dir(tmp.path().join(&config.storage.sstable_dir)).unwrap();
+        std::fs::write(tmp.path().join(&config.storage.wal_path), b"").unwrap();
+        assert!(config.validate_data_paths(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_data_paths_disabled_json_with_paths_equal_to_kv_ok() {
+        // Test 8: a disabled engine's paths are not checked.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.json.enabled = false;
+        config.json.wal_path = config.storage.wal_path.clone();
+        config.json.vlog_path = config.storage.vlog_path.clone();
+        config.json.sstable_dir = config.storage.sstable_dir.clone();
+        assert!(config.validate_data_paths(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_data_paths_error_message_names_both_keys_and_location() {
+        // Test 9: both keys and the resolved location, behind a symlinked base.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", tmp.path().join("alias")).unwrap();
+
+        let mut config = LuraConfig::default();
+        config.storage.wal_path = config.storage.vlog_path.clone();
+        let err = config.validate_data_paths(&tmp.path().join("alias")).unwrap_err().to_string();
+        assert!(err.contains("storage.wal_path"), "{err}");
+        assert!(err.contains("storage.vlog_path"), "{err}");
+        let location = std::fs::canonicalize(tmp.path()).unwrap().join("real").join(&config.storage.vlog_path);
+        assert!(err.contains(&format!("'{}'", location.display())), "{err}");
+    }
+
+    #[test]
+    fn test_validate_data_paths_dangling_symlink_target_detected() {
+        // The engines' O_CREAT would create a dangling symlink's target.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.path().join("link")).unwrap();
+
+        let mut config = LuraConfig::default();
+        config.storage.wal_path = "link".to_string();
+        config.storage.vlog_path = "nowhere".to_string();
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_dotdot_after_symlink_uses_target_parent() {
+        // Like the kernel: `..` after a symlink acts on its target.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        std::fs::create_dir(tmp.path().join("nested/dirA")).unwrap();
+        std::os::unix::fs::symlink("nested/dirA", tmp.path().join("link")).unwrap();
+
+        let mut config = LuraConfig::default();
+        config.storage.wal_path = "link/../x".to_string();
+        config.storage.vlog_path = "nested/x".to_string();
+        assert!(config.validate_data_paths(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_validate_data_paths_symlink_named_like_vlog_generation_rejected() {
+        // Rule 2 via the slot: the target misses the pattern, the link's own name hits it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        let generation_name = format!("{}.2", config.storage.vlog_path);
+        std::os::unix::fs::symlink("elsewhere", tmp.path().join(&generation_name)).unwrap();
+
+        config.json.wal_path = generation_name;
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("storage.vlog_path") && err.contains("json.wal_path"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_data_paths_symlink_loop_error_names_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("loop", tmp.path().join("loop")).unwrap();
+
+        let mut config = LuraConfig::default();
+        config.storage.wal_path = "loop".to_string();
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.starts_with("invalid config: storage.wal_path "), "{err}");
+        assert!(err.contains("symlink hops"), "{err}");
     }
 }

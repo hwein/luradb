@@ -210,7 +210,6 @@ async fn init_io_engine(
 // --- JSON engine (dedicated second LSM instance) ---
 async fn init_json_engine(cfg: &LuraConfig, metrics: &Arc<MetricsStore>) -> anyhow::Result<Option<Arc<JsonEngine>>> {
     if cfg.json.enabled {
-        cfg.json.validate_paths(&cfg.storage)?;
         let engine = JsonEngine::bootstrap(&cfg.json, Arc::clone(metrics)).await?;
         tracing::info!("JSON engine ready.");
         Ok(Some(engine))
@@ -228,7 +227,6 @@ async fn init_rel_engine(
     metrics: &Arc<MetricsStore>,
 ) -> anyhow::Result<Option<Arc<RelEngine>>> {
     if cfg.rel.enabled {
-        cfg.rel.validate_paths(&cfg.storage, &cfg.json)?;
         // Cross-engine bridge (spec rel/012 §1): both target handles exist
         // here, before the rel bootstrap — a pure startup-sequence wiring.
         let resolver = crate::engines::rel::CrossEngineResolver::new(
@@ -657,7 +655,10 @@ fn main() -> anyhow::Result<()> {
     let config = Arc::new(LuraConfig::load(&config_path)?);
     config.server.validate()?;
     config.log.validate()?;
-    config.backup.validate(&config.storage, &config.json, &config.rel)?;
+    config.backup.validate()?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to determine the current working directory: {e}"))?;
+    config.validate_data_paths(&cwd)?;
     config.auth.validate(&config.server)?;
     config.cors.validate()?;
     config.lsm.validate("lsm")?;

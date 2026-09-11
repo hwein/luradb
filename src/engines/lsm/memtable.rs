@@ -7,6 +7,7 @@ use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::storage::format::{is_expired, ValuePointer, VersionState};
 use crossbeam_skiplist::SkipMap;
 use std::cell::Cell;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -186,6 +187,14 @@ impl MemTable {
         self.map.iter().map(|entry| {
             (entry.key().clone(), entry.value().clone())
         })
+    }
+
+    /// Like [`Self::iter`], but starting at the first encoded key `>= start`
+    /// (spec perf/029).
+    pub fn iter_from<'a>(&'a self, start: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, Value)> + 'a {
+        self.map
+            .range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
     }
 
     /// Payload bytes of all entries (spec general/032).

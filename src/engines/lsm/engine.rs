@@ -123,6 +123,11 @@ fn now_secs() -> u64 {
 
 /// Scans one MemTable for keys starting with `prefix`.
 ///
+/// Encoded keys lead with the user key, so a prefix's entries are contiguous:
+/// the scan starts at `prefix` and ends at the first encoded key without it
+/// (spec perf/029). Inside, the user key is still checked — a shorter one
+/// plus its stamp bytes can start with `prefix`.
+///
 /// Callers process sources newest-first, so the first version seen for a
 /// user-key anywhere is its newest and decides for good (`decided`): live
 /// versions land in `live`, tombstoned or TTL-expired ones suppress the key.
@@ -144,9 +149,9 @@ async fn scan_memtable_for_prefix(
     decided: &mut BTreeSet<Vec<u8>>,
     coop: &mut YieldEvery,
 ) {
-    for (encoded_key, value) in mt.iter() {
+    for (encoded_key, value) in mt.iter_from(prefix) {
         coop.tick().await;
-        if live.len() >= limit {
+        if live.len() >= limit || !encoded_key.starts_with(prefix) {
             return;
         }
         if let Some(user_key) = InternalKey::extract_user_key(&encoded_key) {
@@ -3064,6 +3069,104 @@ mod tests {
         let snap = engine.snapshot();
         let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
         assert_eq!(keys, vec![b"user:1".to_vec()]);
+    }
+
+    // ── Spec perf/029: MemTable prefix scan by range ─────────────────────────
+    // All keys stay in the active MemTable (no flush).
+
+    // Test 1: keys before, inside and behind the range, one a prefix of others.
+    #[tokio::test]
+    async fn test_scan_keys_memtable_range_returns_exactly_the_prefix_keys() {
+        let (engine, _dir) = make_engine().await;
+        let keys: [&[u8]; 6] = [b"aa", b"ab", b"abc", b"abd", b"ac", b"b"];
+        for key in keys {
+            engine.put(key, b"v").await.unwrap();
+        }
+
+        let scanned = engine.scan_keys(b"ab").await.unwrap();
+        assert_eq!(scanned, vec![b"ab".to_vec(), b"abc".to_vec(), b"abd".to_vec()]);
+    }
+
+    // Test 2: several versions per key in the range — the newest decides.
+    #[tokio::test]
+    async fn test_scan_keys_memtable_range_newest_version_decides() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"ab:1", b"v1").await.unwrap();
+        engine.put(b"ab:1", b"v2").await.unwrap();
+        engine.delete(b"ab:1").await.unwrap();
+        engine.put(b"ab:2", b"v1").await.unwrap();
+        engine.delete(b"ab:2").await.unwrap();
+        engine.put(b"ab:2", b"v2").await.unwrap();
+        engine.put(b"ac", b"v").await.unwrap();
+
+        let scanned = engine.scan_keys(b"ab").await.unwrap();
+        assert_eq!(scanned, vec![b"ab:2".to_vec()]);
+    }
+
+    // Test 3: `limit` stops after exactly `limit` hits; keys around the range
+    // never count.
+    #[tokio::test]
+    async fn test_scan_keys_limited_memtable_range_stops_at_limit() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"aa", b"v").await.unwrap();
+        for i in 0..10 {
+            engine.put(format!("ab:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        engine.put(b"ac", b"v").await.unwrap();
+
+        let scanned = engine.scan_keys_limited(b"ab", 3).await.unwrap();
+        assert_eq!(scanned.len(), 3);
+        assert!(scanned.iter().all(|k| k.starts_with(b"ab:")));
+    }
+
+    // Test 4: an empty prefix still reads the whole MemTable.
+    #[tokio::test]
+    async fn test_scan_keys_empty_prefix_returns_all_live_keys() {
+        let (engine, _dir) = make_engine().await;
+        let keys: [&[u8]; 5] = [b"\x00k", b"ab", b"b", b"zz", b"\xffk"];
+        for key in keys {
+            engine.put(key, b"v").await.unwrap();
+        }
+        engine.delete(b"b").await.unwrap();
+
+        let scanned = engine.scan_keys(b"").await.unwrap();
+        assert_eq!(scanned, vec![b"\x00k".to_vec(), b"ab".to_vec(), b"zz".to_vec(), b"\xffk".to_vec()]);
+    }
+
+    // Test 5: under a snapshot, newer versions in the range stay invisible and
+    // the older visible version decides.
+    #[tokio::test]
+    async fn test_scan_keys_with_snapshot_memtable_range_older_version_decides() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"ab:1", b"v1").await.unwrap();
+        engine.put(b"ab:2", b"v1").await.unwrap();
+        engine.delete(b"ab:2").await.unwrap();
+        engine.put(b"ac", b"v1").await.unwrap();
+        let snap = engine.snapshot();
+        engine.delete(b"ab:1").await.unwrap();
+        engine.put(b"ab:2", b"v2").await.unwrap();
+        engine.put(b"ab:3", b"v1").await.unwrap();
+
+        let scanned = engine.scan_keys_with_snapshot(b"ab", snap.snapshot()).await.unwrap();
+        assert_eq!(scanned, vec![b"ab:1".to_vec()]);
+    }
+
+    // A shorter user key plus its stamp bytes can start with the prefix: it
+    // must neither be returned nor end the range before a real match.
+    #[tokio::test]
+    async fn test_scan_keys_skips_shorter_key_whose_stamp_starts_with_prefix() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"k", b"v").await.unwrap();
+        let (ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+        let mut prefix = b"k".to_vec();
+        prefix.push(ts.to_be_bytes()[0]);
+        // All-0xFF tail: sorts behind the encoded "k" plus stamp.
+        let mut matching = prefix.clone();
+        matching.resize(1 + 8, 0xFF);
+        engine.put(&matching, b"v").await.unwrap();
+
+        let scanned = engine.scan_keys(&prefix).await.unwrap();
+        assert_eq!(scanned, vec![matching]);
     }
 
     // ── Point-read MVCC ordering tests (overlapping L0 / frozen MemTables) ───

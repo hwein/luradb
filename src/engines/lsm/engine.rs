@@ -570,6 +570,10 @@ impl LsmStorageEngine {
     /// raw MVCC timestamp it replayed (0 for an empty WAL) — [`Self::new`]
     /// seeds the HLC with it (spec kv/026 M3).
     ///
+    /// A single DELETE record keeps an entry with the identical internal key,
+    /// as [`Self::write_tombstone_at`] does live (spec kv/032); ops of one
+    /// batch share a stamp and replay in order, the later one wins.
+    ///
     /// Does NOT truncate the WAL — [`Self::new`] first flushes the recovered
     /// data to an SSTable, so an interrupted startup never loses it.
     async fn recover_from_wal(
@@ -594,10 +598,14 @@ impl LsmStorageEngine {
                         memtable.set(key, ts, Value::Inline(value, expire_at_opt));
                     }
                 }
-                crate::core::wal::WalEntry::Delete { timestamp, key } => {
+                crate::core::wal::WalEntry::Delete { timestamp, key, in_batch } => {
                     max_ts = max_ts.max(timestamp);
                     let ts = Timestamp::new(timestamp);
-                    memtable.set(key, ts, Value::Tombstone);
+                    if in_batch {
+                        memtable.set(key, ts, Value::Tombstone);
+                    } else {
+                        memtable.set_if_absent(key, ts, Value::Tombstone);
+                    }
                 }
                 crate::core::wal::WalEntry::SetNull { timestamp, key } => {
                     max_ts = max_ts.max(timestamp);
@@ -1079,8 +1087,7 @@ impl LsmStorageEngine {
     }
 
     /// Serialises one DELETE record (WAL type 2): [type=2][ts:u64][key_len:u32][key].
-    /// Shared by the client delete path and the TTL sweeper (spec kv/025 §3.2);
-    /// the record format and its replay are unchanged.
+    /// Shared by the client delete path and the TTL sweeper (spec kv/025 §3.2).
     fn encode_tombstone_wal_record(timestamp: Timestamp, key: &[u8]) -> Vec<u8> {
         let mut log_entry = Vec::new();
         log_entry.push(2u8);
@@ -1122,8 +1129,10 @@ impl LsmStorageEngine {
     /// TTL sweeper's pinned one (spec kv/025 §3.2). Deliberately without
     /// `maybe_freeze_memtable` and without re-reading `self.memtable`: a
     /// tombstone that ends up in a newer source than the value it dates
-    /// against would win despite its older stamp (§4.2). Sweeper-exclusive —
-    /// [`Self::write_tombstone`] does not delegate here.
+    /// against would win despite its older stamp (§4.2). A write that drew
+    /// the same stamp and is already in that MemTable keeps its entry; the
+    /// tombstone and its event are then dropped (spec kv/032).
+    /// Sweeper-exclusive — [`Self::write_tombstone`] does not delegate here.
     pub(super) async fn write_tombstone_at(
         &self,
         memtable: &Arc<MemTable>,
@@ -1132,7 +1141,9 @@ impl LsmStorageEngine {
     ) -> Result<()> {
         self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
-        memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+        if !memtable.set_if_absent(key.to_vec(), timestamp, Value::Tombstone) {
+            return Ok(());
+        }
         self.raise_change_epoch();
 
         // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
@@ -2287,6 +2298,43 @@ mod tests {
         assert_eq!(engine2.get(b"batch-a").await.unwrap(), Some(b"1".to_vec()));
         assert_eq!(engine2.get(b"batch-b").await.unwrap(), Some(b"2".to_vec()));
         assert_eq!(engine2.get(b"pre").await.unwrap(), None);
+    }
+
+    // Spec kv/032 test 3: a sweeper DELETE record sharing a client write's
+    // stamp replays as it applied live — the client value stays.
+    #[tokio::test]
+    async fn test_replayed_sweeper_tombstone_keeps_identical_internal_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        engine.put(b"k", b"client").await.unwrap();
+        let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+        let memtable = engine.pin_memtable();
+        engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+        drop(engine);
+
+        let engine2 = engine_on(&dir).await;
+        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+    }
+
+    // Spec kv/032 test 4 (regression): a batch Delete still replaces the Put
+    // of the same batch (shared stamp) on replay — the later op wins.
+    #[tokio::test]
+    async fn test_replayed_batch_delete_replaces_put_of_same_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_on(&dir).await;
+        engine
+            .write_batch(vec![
+                BatchOp::Put { key: b"k".to_vec(), value: b"v".to_vec() },
+                BatchOp::Delete { key: b"k".to_vec() },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(engine.get(b"k").await.unwrap(), None);
+        drop(engine);
+
+        let engine2 = engine_on(&dir).await;
+        assert_eq!(engine2.get(b"k").await.unwrap(), None);
     }
 
     // A vLog failure mid-batch must not leave the batch half-applied to the

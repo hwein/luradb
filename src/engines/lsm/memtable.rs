@@ -108,6 +108,28 @@ impl MemTable {
         self.size_bytes.fetch_sub(replaced.get(), Ordering::Relaxed);
     }
 
+    /// Like [`Self::set`], but keeps an existing entry with the identical
+    /// internal key (spec kv/032). Returns whether `value` was inserted.
+    pub fn set_if_absent(&self, user_key: Vec<u8>, timestamp: Timestamp, value: Value) -> bool {
+        let encoded_key = InternalKey::new(user_key, timestamp).encode();
+        let size = encoded_key.len() + value.stored_size();
+        // Counted up front like `set`, so a racing replace of this entry
+        // never subtracts bytes that were not added yet.
+        self.size_bytes.fetch_add(size, Ordering::Relaxed);
+
+        // compare_insert calls the closure only for an existing identical key
+        // (possibly more than once); `false` keeps that entry.
+        let existed = Cell::new(false);
+        self.map.compare_insert(encoded_key, value, |_| {
+            existed.set(true);
+            false
+        });
+        if existed.get() {
+            self.size_bytes.fetch_sub(size, Ordering::Relaxed);
+        }
+        !existed.get()
+    }
+
     /// Retrieves the latest version of a key visible to the given snapshot.
     pub fn get(&self, user_key: &[u8], snapshot_ts: Timestamp) -> Option<Value> {
         self.get_with_ts(user_key, snapshot_ts).map(|(v, _)| v)

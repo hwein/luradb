@@ -106,6 +106,7 @@ mod tests {
     use super::*;
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::engine::LsmEngineOptions;
+    use crate::engines::lsm::hlc::HLCTimestamp;
     use crate::engines::lsm::reader::GetResult;
     use crate::engines::lsm::watcher::{OpType, WalEvent};
     use crate::engines::StorageEngine;
@@ -393,5 +394,54 @@ mod tests {
             engine.get_with_snapshot(b"k", snapshot.snapshot()).await.unwrap(),
             GetResult::Absent
         );
+    }
+
+    // Spec kv/032 test 1: a client write that drew the tombstone's stamp
+    // (`ts + 1`) and landed first keeps its entry; tombstone and event drop.
+    #[tokio::test]
+    async fn test_tombstone_on_identical_internal_key_keeps_client_value() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"k", b"client").await.unwrap();
+        let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+        let memtable = engine.pin_memtable();
+        let mut rx = engine.watch_subscribe();
+
+        engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
+
+        assert!(drained_deletes(&mut rx).is_empty());
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+    }
+
+    // Spec kv/032 test 2 (regression): the tombstone landed first, the client
+    // write with the same stamp replaces it.
+    #[tokio::test]
+    async fn test_client_write_replaces_tombstone_on_identical_internal_key() {
+        let (engine, _dir) = make_engine().await;
+        // Far ahead of the wall clock: the next stamp is exactly `seed + 1`.
+        let seed = HLCTimestamp::from_components(1 << 47, 0).as_u64();
+        engine.hlc().seed(seed);
+        let tie = Timestamp::new(seed + 1);
+        let memtable = engine.pin_memtable();
+
+        engine.write_tombstone_at(&memtable, b"k", tie).await.unwrap();
+        engine.put(b"k", b"client").await.unwrap();
+
+        let (newest_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+        assert_eq!(newest_ts.as_u64(), tie.as_u64(), "the client write must tie with the tombstone");
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+    }
+
+    // Spec kv/032 test 5: the dropped tombstone adds no bytes (general/032).
+    #[tokio::test]
+    async fn test_dropped_tombstone_adds_no_bytes() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"k", b"client").await.unwrap();
+        let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+        let memtable = engine.pin_memtable();
+
+        engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
+
+        // The client entry only: 1-byte user key + 8-byte stamp + 6 value bytes.
+        assert_eq!(memtable.size_bytes(), 1 + 8 + 6);
     }
 }

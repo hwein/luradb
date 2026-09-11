@@ -41,6 +41,9 @@ pub enum WalEntry {
     Delete {
         timestamp: u64,
         key: Vec<u8>,
+        /// An op of a BATCH record (type 3), not a single DELETE record
+        /// (type 2): batch ops share one stamp and replay in order (spec kv/032).
+        in_batch: bool,
     },
     SetNull {
         timestamp: u64,
@@ -82,7 +85,7 @@ pub async fn recover(path: impl AsRef<Path>) -> Result<Vec<WalEntry>, WalError> 
             2 => {
                 let timestamp = file.read_u64().await?;
                 let key = read_len_prefixed(&mut file).await?;
-                entries.push(WalEntry::Delete { timestamp, key });
+                entries.push(WalEntry::Delete { timestamp, key, in_batch: false });
             }
             // BATCH: [ts:u64][count:u32] then per op [op:u8][key]([value][expire_at]).
             // Parsed all-or-nothing: a torn batch record fails recovery instead of
@@ -99,7 +102,7 @@ pub async fn recover(path: impl AsRef<Path>) -> Result<Vec<WalEntry>, WalError> 
                             let expire_at = file.read_u64().await?;
                             entries.push(WalEntry::Set { timestamp, key, value, expire_at });
                         }
-                        2 => entries.push(WalEntry::Delete { timestamp, key }),
+                        2 => entries.push(WalEntry::Delete { timestamp, key, in_batch: true }),
                         _ => return Err(invalid_entry_error()),
                     }
                 }

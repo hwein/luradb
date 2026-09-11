@@ -29,6 +29,7 @@ All notable changes to LuraDB are documented in this file.
 - Disabling the JSON engine no longer permanently clears JSON references in relational tables.
 - Startup detects data paths that point to the same location through different spellings or symlinks.
 - `lsm.memtable_size_threshold` and the `memtable_size_bytes` metric now measure actual bytes instead of an entry-count estimate.
+- The TTL sweeper no longer discards a write that races with it on the same key.
 
 ## [0.4.0] - 2026-08-29
 

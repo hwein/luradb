@@ -18,6 +18,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+/// Data keys/candidate probes tombstoned per batch and seconds between ticks.
+pub const PURGER_BATCH_SIZE: usize = 100;
+pub const PURGER_INTERVAL_SECS: u64 = 5;
+
 pub struct RelDomainPurger {
     engine: Arc<RelEngine>,
     shutdown: Arc<AtomicBool>,
@@ -35,7 +39,7 @@ impl RelDomainPurger {
         Self {
             engine,
             shutdown,
-            batch_size: batch_size.max(1),
+            batch_size,
             interval: Duration::from_secs(interval_secs),
         }
     }

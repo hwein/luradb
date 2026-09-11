@@ -8,8 +8,8 @@ use crate::{
         buffer_pool::BufferPoolManager,
         coop,
         disk_manager::DiskManager,
-        io_engine::{IoEngine, VLOG_LOGICAL_ID, WAL_LOGICAL_ID},
-        storage_thread::{StorageHandle, StorageThread, StorageThreadConfig},
+        io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID, WAL_LOGICAL_ID},
+        storage_thread::{self, StorageHandle, StorageThread, StorageThreadConfig},
     },
     engines::json::JsonEngine,
     engines::lsm::{
@@ -101,8 +101,8 @@ fn build_engine_configs(
         flush_check_interval_ms: cfg.lsm.flush_check_interval_ms,
         compaction_check_interval_ms: cfg.lsm.compaction_check_interval_ms,
         wal_event_channel_capacity: cfg.lsm.wal_event_channel_capacity,
-        use_mmap: cfg.lsm.use_mmap,
         watch_replay_buffer_size: cfg.lsm.watch_replay_buffer_size,
+        ..LsmEngineConfig::default()
     };
     let compaction_config = CompactionConfig {
         l0_compaction_threshold: cfg.compaction.l0_threshold,
@@ -127,11 +127,7 @@ fn build_engine_configs(
         purger_interval_secs: cfg.domains.purger_interval_secs,
         max_bulk_delete_keys: cfg.domains.max_bulk_delete_keys,
     };
-    let metrics_config = MetricsConfig {
-        window_secs: cfg.metrics.window_secs,
-        ticker_interval_ms: cfg.metrics.ticker_interval_ms,
-    };
-    let metrics = MetricsStore::new(metrics_config);
+    let metrics = MetricsStore::new(MetricsConfig::default());
     (engine_config, compaction_config, janitor_config, domain_config, metrics)
 }
 
@@ -146,11 +142,11 @@ fn start_storage_thread(
     let mut storage_thread: Option<StorageThread> = None;
     let storage_handle: Option<StorageHandle> = if cfg.io_engine.enabled {
         let st_config = StorageThreadConfig {
-            sqpoll_enabled: cfg.io_engine.sqpoll_enabled,
-            sqpoll_idle_ms: cfg.io_engine.sqpoll_idle_ms,
-            ring_depth: cfg.io_engine.ring_depth,
-            channel_capacity: cfg.io_engine.request_channel_capacity,
-            cpu: cfg.io_engine.storage_thread_cpu,
+            sqpoll_enabled: storage_thread::SQPOLL_ENABLED,
+            sqpoll_idle_ms: storage_thread::SQPOLL_IDLE_MS,
+            ring_depth: storage_thread::RING_DEPTH,
+            channel_capacity: storage_thread::REQUEST_CHANNEL_CAPACITY,
+            cpu: storage_thread::STORAGE_THREAD_CPU,
         };
         match StorageThread::new(st_config, wal_path.to_path_buf(), vlog_path.to_path_buf()) {
             Ok((st, handle)) => {
@@ -175,12 +171,10 @@ async fn init_io_engine(
     vlog_path: &std::path::Path,
 ) -> Option<IoEngine> {
     let mut io_engine = if cfg.io_engine.enabled {
-        match IoEngine::new(cfg.io_engine.registered_buffer_count, cfg.io_engine.registered_buffer_size) {
+        match IoEngine::new(REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE) {
             Ok(engine) => {
                 tracing::info!(
-                    "IoEngine ready: {} registered buffers x {} bytes.",
-                    cfg.io_engine.registered_buffer_count,
-                    cfg.io_engine.registered_buffer_size
+                    "IoEngine ready: {REGISTERED_BUFFER_COUNT} registered buffers x {REGISTERED_BUFFER_SIZE} bytes."
                 );
                 Some(engine)
             }
@@ -349,8 +343,8 @@ fn spawn_background_tasks(
         let json_purger = Arc::new(crate::engines::json::JsonDomainPurger::new(
             Arc::clone(engine),
             Arc::clone(&shutdown_flag),
-            cfg.json.purger_batch_size,
-            cfg.json.purger_interval_secs,
+            crate::engines::json::purger::PURGER_BATCH_SIZE,
+            crate::engines::json::purger::PURGER_INTERVAL_SECS,
         ));
         tokio::spawn(async move { json_purger.run().await });
     }
@@ -361,8 +355,8 @@ fn spawn_background_tasks(
             let sweeper = Arc::new(crate::engines::rel::RelCrossEngineSweeper::new(
                 Arc::clone(engine),
                 Arc::clone(&shutdown_flag),
-                cfg.rel.cross_engine_sweep_batch_size,
-                cfg.rel.cross_engine_sweep_interval_secs,
+                crate::engines::rel::cross_engine::SWEEP_BATCH_SIZE,
+                crate::engines::rel::cross_engine::SWEEP_INTERVAL_SECS,
             ));
             tokio::spawn(async move { sweeper.run().await });
         }
@@ -373,8 +367,8 @@ fn spawn_background_tasks(
         let rel_purger = Arc::new(crate::engines::rel::RelDomainPurger::new(
             Arc::clone(engine),
             Arc::clone(&shutdown_flag),
-            cfg.rel.purger_batch_size,
-            cfg.rel.purger_interval_secs,
+            crate::engines::rel::purger::PURGER_BATCH_SIZE,
+            crate::engines::rel::purger::PURGER_INTERVAL_SECS,
         ));
         tokio::spawn(async move { rel_purger.run().await });
     }
@@ -403,12 +397,6 @@ async fn start_shm(
     let shm_manager: Option<Arc<ShmManager>> = if cfg.shm.enabled {
         let manager = ShmManager::new(cfg.shm.clone())?;
         if let Some(state) = manager.get_segment("state") {
-            anyhow::ensure!(
-                state.len() >= crate::ipc::StateHeader::SIZE,
-                "shm.state_size ({}) is smaller than the state header ({} bytes)",
-                state.len(),
-                crate::ipc::StateHeader::SIZE
-            );
             // Initialize the state header (spec perf/007 §7). Safe: the
             // segment outlives `manager` and is only touched via StateHeader.
             unsafe { crate::ipc::StateHeader::from_ptr(state.as_ptr(), state.len()) }.init();
@@ -460,8 +448,8 @@ async fn start_shm(
 
         let reg_config = ipc::RegistrationConfig {
             instance_id: cfg.shm.instance_id.clone(),
-            ring_size: cfg.shm.command_buffer_size,
-            segment_mode: cfg.shm.segment_mode,
+            ring_size: ipc::CLIENT_RING_SIZE,
+            segment_mode: ipc::SEGMENT_MODE,
             auth_enabled: cfg.auth.enabled,
             trusted_uids: Arc::new(cfg.auth.trusted_uids.clone()),
             readers,
@@ -543,7 +531,7 @@ fn spawn_uds_listener(
     let (uds_shutdown_tx, uds_shutdown_rx) = tokio::sync::watch::channel(false);
     let mut uds_task = None;
     if let Some(path) = uds_path {
-        let uds_listener = uds::prepare_uds_socket(path, cfg.server.unix_socket_mode)?;
+        let uds_listener = uds::prepare_uds_socket(path)?;
         tracing::info!("UDS listener active on {}", path);
         let uds_router = app.clone();
         let trusted_uids = Arc::new(cfg.auth.trusted_uids.clone());
@@ -652,7 +640,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let config_path = resolve_config_path(cli.config, |p| p.exists());
-    let config = Arc::new(LuraConfig::load(&config_path)?);
+    let (config, unknown_keys) = LuraConfig::load(&config_path)?;
+    let config = Arc::new(config);
     config.server.validate()?;
     config.log.validate()?;
     config.backup.validate()?;
@@ -661,9 +650,11 @@ fn main() -> anyhow::Result<()> {
     config.validate_data_paths(&cwd)?;
     config.auth.validate(&config.server)?;
     config.cors.validate()?;
-    config.lsm.validate("lsm")?;
-    config.json.lsm.validate("json.lsm")?;
-    config.rel.lsm.validate("rel.lsm")?;
+    config.lsm.validate()?;
+    config.json.validate()?;
+    config.rel.validate()?;
+    config.shm.validate_registration_socket(&config.server)?;
+    config.multicore.validate(coop::available_cores())?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tokio_uring::start(async move {
@@ -673,6 +664,9 @@ fn main() -> anyhow::Result<()> {
             tracing::info!("Config loaded from {}", config_path.display());
         } else {
             tracing::info!("No config file found at {}, using defaults", config_path.display());
+        }
+        for key in &unknown_keys {
+            tracing::warn!("unknown config key '{key}' is ignored");
         }
         // `config.auth.validate` already rejected a non-loopback bind above,
         // so reaching here with auth disabled means the dev-mode loopback
@@ -712,12 +706,6 @@ fn main() -> anyhow::Result<()> {
 
         let mut io_engine = init_io_engine(&config, &wal_path, &vlog_path).await;
 
-        let block_cache_config = crate::config::BlockCacheConfig {
-            capacity_bytes: config.block_cache.capacity_bytes,
-            small_ratio: config.block_cache.small_ratio,
-            ghost_capacity: config.block_cache.ghost_capacity,
-        };
-
         let mut lsm_engine = LsmStorageEngine::new(
             wal,
             wal_path,
@@ -729,7 +717,7 @@ fn main() -> anyhow::Result<()> {
                 engine: engine_config,
                 compaction: compaction_config,
                 janitor: janitor_config,
-                block_cache: block_cache_config,
+                block_cache: crate::config::BlockCacheConfig::default(),
             },
         )
         .await?;

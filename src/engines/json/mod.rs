@@ -19,7 +19,7 @@ pub use purger::JsonDomainPurger;
 pub use query::{DocumentListResult, FilterCondition, ListOptions, SearchQuery, SearchResult};
 pub use reindex::{ReindexResult, ReindexStatus};
 
-use crate::config::JsonStoreConfig;
+use crate::config::{BlockCacheConfig, JsonStoreConfig};
 use crate::core::events::GlobalEventBus;
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
@@ -48,6 +48,14 @@ use std::sync::{Arc, OnceLock};
 /// Number of document-write lock shards (spec json/018). Not configurable —
 /// the number only caps the collision probability.
 const DOC_WRITE_SHARDS: usize = 64;
+
+/// Upper bound on document keys; `json.lsm.max_key_length` may cap it further.
+const MAX_DOCUMENT_KEY_LENGTH: usize = 256;
+/// Documents per atomic write batch during bulk load.
+const BULK_BATCH_SIZE: usize = 100;
+/// Documents per re-index batch and the throttle pause between batches.
+const REINDEX_BATCH_SIZE: usize = 500;
+const REINDEX_PAUSE_MS: u64 = 10;
 
 /// Central entry point for all JSON-store operations.
 pub struct JsonEngine {
@@ -94,32 +102,10 @@ impl JsonEngine {
         let manifest_manager = Arc::new(ManifestManager::new(&config.sstable_dir));
 
         let engine_config = LsmEngineConfig {
-            vlog_inline_threshold: config.lsm.vlog_inline_threshold,
-            memtable_size_threshold: config.lsm.memtable_size_threshold,
             max_key_length: config.lsm.max_key_length,
             max_value_size: config.lsm.max_value_size,
-            flush_check_interval_ms: config.lsm.flush_check_interval_ms,
-            compaction_check_interval_ms: config.lsm.compaction_check_interval_ms,
-            wal_event_channel_capacity: config.lsm.wal_event_channel_capacity,
-            use_mmap: config.lsm.use_mmap,
             watch_replay_buffer_size: 0, // no watch endpoint on the JSON engine (spec kv/024 §3)
-        };
-        let compaction_config = CompactionConfig {
-            l0_compaction_threshold: config.compaction.l0_threshold,
-            l1_max_size: config.compaction.l1_max_size,
-            level_size_ratio: config.compaction.level_size_ratio,
-            max_sstable_size: config.compaction.max_sstable_size,
-            low_watermark: None,
-        };
-        let janitor_config = JanitorConfig {
-            check_interval_secs: config.janitor.check_interval_secs,
-            dead_bytes_threshold: config.janitor.dead_bytes_threshold,
-            min_vlog_size_bytes: config.janitor.min_vlog_size_bytes,
-        };
-        let block_cache_config = crate::config::BlockCacheConfig {
-            capacity_bytes: config.block_cache.capacity_bytes,
-            small_ratio: config.block_cache.small_ratio,
-            ghost_capacity: config.block_cache.ghost_capacity,
+            ..LsmEngineConfig::default()
         };
 
         let engine = Arc::new(
@@ -132,9 +118,9 @@ impl JsonEngine {
                 manifest_manager,
                 LsmEngineOptions {
                     engine: engine_config,
-                    compaction: compaction_config,
-                    janitor: janitor_config,
-                    block_cache: block_cache_config,
+                    compaction: CompactionConfig::default(),
+                    janitor: JanitorConfig::default(),
+                    block_cache: BlockCacheConfig::default(),
                 },
             )
             .await?,
@@ -149,14 +135,13 @@ impl JsonEngine {
             max_value_size: config.lsm.max_value_size,
             // Effective limit: the composite doc key must fit the LSM key
             // limit, otherwise valid keys fail deep in the engine (500).
-            max_document_key_length: config
-                .max_document_key_length
+            max_document_key_length: MAX_DOCUMENT_KEY_LENGTH
                 .min(config.lsm.max_key_length.saturating_sub(DOC_KEY_OVERHEAD)),
             max_lsm_key_length: config.lsm.max_key_length,
-            bulk_batch_size: config.bulk_batch_size.max(1),
+            bulk_batch_size: BULK_BATCH_SIZE,
             bulk_body_limit_bytes: config.bulk_body_limit_bytes,
-            reindex_batch_size: config.reindex_batch_size.max(1),
-            reindex_pause_ms: config.reindex_pause_ms,
+            reindex_batch_size: REINDEX_BATCH_SIZE,
+            reindex_pause_ms: REINDEX_PAUSE_MS,
             reindex_tasks: RwLock::new(HashMap::new()),
             reindex_running: SyncMutex::new(HashMap::new()),
             doc_write_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
@@ -314,7 +299,7 @@ impl JsonEngine {
         let dom = self.domains.require_active(domain)?;
         if key.len() > self.max_document_key_length {
             return Err(JsonStoreError::InvalidKey(format!(
-                "generated UUID key needs {} chars but the effective key limit is {} — raise json.max_document_key_length or json.lsm.max_key_length",
+                "generated UUID key needs {} chars but the effective key limit is {} — raise json.lsm.max_key_length",
                 key.len(),
                 self.max_document_key_length
             )));
@@ -1309,7 +1294,10 @@ mod tests {
             json.put_document("default", &long_key, json!({"n": 1})).await.unwrap();
             json.shutdown().await;
         }
-        let lowered = JsonStoreConfig { max_document_key_length: 32, ..config };
+        let lowered = JsonStoreConfig {
+            lsm: crate::config::JsonLsmConfig { max_key_length: 32 + DOC_KEY_OVERHEAD, ..config.lsm },
+            ..config
+        };
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let json = JsonEngine::bootstrap(&lowered, metrics).await.unwrap();
         let snap = json.engine().snapshot();
@@ -1336,13 +1324,40 @@ mod tests {
             wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
             vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
             sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            max_document_key_length: 20,
+            lsm: crate::config::JsonLsmConfig { max_key_length: 20 + DOC_KEY_OVERHEAD, ..Default::default() },
             ..JsonStoreConfig::default()
         };
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
         let err = json.create_document("default", json!({})).await.unwrap_err();
         assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+        json.shutdown().await;
+    }
+
+    // Spec general/030 test 6: with both LSM limits at their startup lower
+    // bounds, a domain with a maximal name and a document with a 1-byte key work.
+    #[tokio::test]
+    async fn test_lsm_limits_at_lower_bounds_still_work() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = JsonStoreConfig {
+            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+            lsm: crate::config::JsonLsmConfig {
+                max_key_length: domain::MIN_LSM_KEY_LENGTH,
+                max_value_size: crate::config::JSON_LSM_MIN_VALUE_SIZE,
+            },
+            ..JsonStoreConfig::default()
+        };
+        config.validate().unwrap();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+
+        let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
+        json.create_domain(&domain).await.unwrap();
+        json.put_document(&domain, "a", json!({"n": 1})).await.unwrap();
+        let doc = json.get_document(&domain, "a").await.unwrap().expect("document stored");
+        assert_eq!(doc.content, json!({"n": 1}));
         json.shutdown().await;
     }
 

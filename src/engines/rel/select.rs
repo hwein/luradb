@@ -1151,7 +1151,8 @@ mod tests {
     #[tokio::test]
     async fn test_limit_offset_semantics() {
         let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { default_limit: 3, max_limit: 5, ..config_in(dir.path()) }).await;
+        let mut rel = boot(RelStoreConfig { max_limit: 5, ..config_in(dir.path()) }).await;
+        Arc::get_mut(&mut rel).unwrap().set_default_limit(3);
         ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
         ok(&rel, "INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7)").await;
 

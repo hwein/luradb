@@ -26,6 +26,11 @@ pub const LURADB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+/// Width of the rolling window in seconds.
+const WINDOW_SECS: u64 = 60;
+/// Tick interval of the background task in milliseconds.
+const TICKER_INTERVAL_MS: u64 = 1000;
+
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
     /// Width of the rolling window in seconds.
@@ -37,8 +42,8 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
-            window_secs: 60,
-            ticker_interval_ms: 1000,
+            window_secs: WINDOW_SECS,
+            ticker_interval_ms: TICKER_INTERVAL_MS,
         }
     }
 }

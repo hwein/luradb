@@ -1543,11 +1543,10 @@ mod tests {
     // 13. Size guards: TextTooLong, RowTooLarge, KeyTooLong (not an LSM-500).
     #[tokio::test]
     async fn test_size_guards() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_text_len: 10, ..config_in(dir.path()) }).await;
+        let (rel, _d) = make().await;
         ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
-        let long = "x".repeat(20);
-        assert!(matches!(err(&rel, &format!("INSERT INTO t VALUES (1, '{long}')"), &[]).await, RelStoreError::TextTooLong { .. }));
+        let long = json!("x".repeat(64 * 1024 + 1));
+        assert!(matches!(err(&rel, "INSERT INTO t VALUES (1, ?)", &[long]).await, RelStoreError::TextTooLong { max: 65_536, .. }));
 
         let dir2 = tempfile::TempDir::new().unwrap();
         let rel2 = boot(RelStoreConfig { max_row_size: 16, ..config_in(dir2.path()) }).await;
@@ -1558,6 +1557,32 @@ mod tests {
         ok(&rel3, "CREATE TABLE t (k TEXT PRIMARY KEY)").await;
         let huge = "y".repeat(300); // ROW key > max_key_length (256)
         assert!(matches!(err(&rel3, &format!("INSERT INTO t VALUES ('{huge}')"), &[]).await, RelStoreError::KeyTooLong { .. }));
+    }
+
+    // Spec general/030 test 7: the storage value limit is the larger of
+    // 512 KiB and max_row_size, so rows above 512 KiB need only max_row_size
+    // and a tiny max_row_size leaves the catalog its room.
+    #[tokio::test]
+    async fn test_value_limit_follows_max_row_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rel = boot(RelStoreConfig { max_row_size: 1024 * 1024, ..config_in(dir.path()) }).await;
+        // 15 x 60 KiB = 900 KiB: each value stays under the fixed 64 KiB text
+        // limit, and parameters keep the statement under its fixed limit.
+        let columns: Vec<String> = (0..15).map(|i| format!("c{i} TEXT")).collect();
+        ok(&rel, &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "))).await;
+        let chunk = "x".repeat(60 * 1024);
+        let mut params = vec![json!(1)];
+        params.extend((0..15).map(|_| json!(chunk)));
+        let insert = format!("INSERT INTO t VALUES ({})", vec!["?"; 16].join(", "));
+        assert_eq!(dml(&rel, &insert, &params).await.affected, 1);
+        let s = sel(&rel, "SELECT c14 FROM t WHERE id = 1", &[]).await;
+        assert_eq!(s.rows[0][0], ScalarValue::Text(chunk));
+
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let rel2 = boot(RelStoreConfig { max_row_size: 1024, ..config_in(dir2.path()) }).await;
+        // 40 columns with 48-character names: a catalog entry well over 1 KiB.
+        let columns: Vec<String> = (0..40).map(|i| format!("column_{i:02}_{} TEXT", "n".repeat(38))).collect();
+        ok(&rel2, &format!("CREATE TABLE wide (id INTEGER PRIMARY KEY, {})", columns.join(", "))).await;
     }
 
     // 14. UPDATE swaps the changed index entry; unchanged index survives.
@@ -1635,14 +1660,13 @@ mod tests {
     // apply on the UPDATE path (quality/007 prep work).
     #[tokio::test]
     async fn test_update_size_guards() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_text_len: 10, ..config_in(dir.path()) }).await;
+        let (rel, _d) = make().await;
         ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
         ok(&rel, "INSERT INTO t (id) VALUES (1)").await;
-        let long = "x".repeat(20);
+        let long = json!("x".repeat(64 * 1024 + 1));
         assert!(matches!(
-            err(&rel, &format!("UPDATE t SET s = '{long}' WHERE id = 1"), &[]).await,
-            RelStoreError::TextTooLong { .. }
+            err(&rel, "UPDATE t SET s = ? WHERE id = 1", &[long]).await,
+            RelStoreError::TextTooLong { max: 65_536, .. }
         ));
 
         // Row encoding is a fixed 32 bytes for this schema with `s` NULL, and

@@ -2011,6 +2011,36 @@ mod tests {
     use crate::engines::lsm::watcher::OpType;
     use std::os::unix::fs::PermissionsExt;
 
+    // Spec general/030: the JSON and rel instances run on these defaults, so
+    // they must stay the spec's fixed tuning.
+    #[test]
+    fn test_defaults_match_fixed_json_and_rel_tuning() {
+        let engine = LsmEngineConfig::default();
+        assert_eq!(engine.vlog_inline_threshold, 1024);
+        assert_eq!(engine.memtable_size_threshold, 4 * 1024 * 1024);
+        assert_eq!(engine.flush_check_interval_ms, 100);
+        assert_eq!(engine.compaction_check_interval_ms, 1000);
+        assert_eq!(engine.wal_event_channel_capacity, 256);
+        assert!(engine.use_mmap);
+
+        let compaction = CompactionConfig::default();
+        assert_eq!(compaction.l0_compaction_threshold, 4);
+        assert_eq!(compaction.l1_max_size, 100 * 1024 * 1024);
+        assert_eq!(compaction.level_size_ratio, 10);
+        assert_eq!(compaction.max_sstable_size, 64 * 1024 * 1024);
+        assert!(compaction.low_watermark.is_none());
+
+        let janitor = JanitorConfig::default();
+        assert_eq!(janitor.check_interval_secs, 60);
+        assert_eq!(janitor.dead_bytes_threshold, 0.30);
+        assert_eq!(janitor.min_vlog_size_bytes, 64 * 1024 * 1024);
+
+        let block_cache = BlockCacheConfig::default();
+        assert_eq!(block_cache.capacity_bytes, 64 * 1024 * 1024);
+        assert_eq!(block_cache.small_ratio, 0.10);
+        assert_eq!(block_cache.ghost_capacity, 10_000);
+    }
+
     async fn make_engine() -> (LsmStorageEngine, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");

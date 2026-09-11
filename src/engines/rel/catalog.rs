@@ -74,6 +74,12 @@ fn seq_key(domain: &str) -> Vec<u8> {
     k
 }
 
+/// Lower bound of `rel.lsm.max_key_length` (spec general/030): the longest
+/// management key, `__sys:rel_catalog_seq:{domain}` at a maximal name, plus
+/// 1 byte.
+pub(crate) const MIN_LSM_KEY_LENGTH: usize =
+    SYS_CATALOG_SEQ_PREFIX.len() + super::domain::MAX_DOMAIN_NAME_LEN + 1;
+
 /// Splits a `CAT:` key into `(system_prefix, name)`.
 fn parse_cat_key(key: &[u8]) -> Option<(Vec<u8>, String)> {
     let rest = key.strip_prefix(CAT_PREFIX)?;
@@ -211,7 +217,8 @@ pub struct TableInput {
     pub columns: Vec<ColumnInput>,
 }
 
-/// Catalog limits (concept 8, from the `[rel]` config).
+/// Catalog limits (concept 8): `max_tables_per_domain` from the `[rel]`
+/// config, the other two fixed (spec general/030).
 #[derive(Debug, Clone, Copy)]
 pub struct CatalogLimits {
     pub max_columns: usize,
@@ -672,7 +679,7 @@ impl RelCatalog {
         prospective
     }
 
-    /// The `rel.max_columns` cap, so a caller can reject an oversized schema
+    /// The `max_columns` cap, so a caller can reject an oversized schema
     /// before doing per-column work (`create_table` enforces it again).
     pub(crate) fn max_columns(&self) -> usize {
         self.limits.max_columns
@@ -1392,6 +1399,21 @@ mod tests {
             max_indexes_per_table: 16,
             max_tables_per_domain: 256,
         }
+    }
+
+    // Spec general/030: the id counter key at a maximal domain name, the CAT
+    // key at a maximal identifier and the AUTOINCREMENT key fit the startup
+    // lower bound of rel.lsm.max_key_length.
+    #[test]
+    fn test_management_keys_at_max_names_fit_key_limit_lower_bound() {
+        let bound = MIN_LSM_KEY_LENGTH;
+        let system_prefix = [b'f'; 16];
+        let seq = seq_key(&"d".repeat(crate::engines::rel::domain::MAX_DOMAIN_NAME_LEN));
+        assert!(seq.len() < bound, "{}", seq.len());
+        let cat = cat_key(&system_prefix, &"t".repeat(MAX_IDENTIFIER_LEN));
+        assert!(cat.len() < bound, "{}", cat.len());
+        let autoincrement = crate::engines::rel::keys::seq_key(&system_prefix, u32::MAX);
+        assert!(autoincrement.len() < bound, "{}", autoincrement.len());
     }
 
     async fn make_engine(dir: &std::path::Path) -> Arc<LsmStorageEngine> {

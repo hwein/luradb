@@ -39,7 +39,7 @@ fn permit_count(configured: usize, cores: usize) -> usize {
     }
 }
 
-fn available_cores() -> usize {
+pub(crate) fn available_cores() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 

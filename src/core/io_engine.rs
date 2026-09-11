@@ -16,6 +16,10 @@ use tokio_uring::buf::fixed::{FixedBuf, FixedBufPool};
 use tokio_uring::buf::{BoundedBuf, Slice};
 use tokio_uring::fs::{File, OpenOptions};
 
+/// Registered-buffer pool of the IoEngine.
+pub const REGISTERED_BUFFER_COUNT: usize = 128;
+pub const REGISTERED_BUFFER_SIZE: usize = 64 * 1024;
+
 /// SSTable ids are allocated upwards from 0 (`FileManager`), so the WAL and
 /// VLog get reserved ids at the top of the range — one shared namespace,
 /// no collisions.

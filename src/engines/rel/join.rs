@@ -177,12 +177,13 @@ impl JoinProbe {
         let row_prefix = keys::row_table_prefix(&self.right_prefix, self.right_table.table_id);
         // Cap the scan itself (spec rel/007 F1): scan only the remaining
         // budget + 1, so a right table bigger than the cap is never fully
-        // materialized before the cap check below ever runs.
+        // materialized before the cap check below ever runs. Saturating, so a
+        // budget of usize::MAX does not overflow (spec general/030).
         let consumed = self.fallback_budget.load(Ordering::Relaxed);
         let remaining = (self.max_fallback_scan as u64).saturating_sub(consumed);
         let scan_keys = self
             .engine
-            .scan_keys_limited_with_snapshot(&row_prefix, remaining as usize + 1, &self.snapshot)
+            .scan_keys_limited_with_snapshot(&row_prefix, (remaining as usize).saturating_add(1), &self.snapshot)
             .await?;
         let n = scan_keys.len() as u64;
         self.metrics.record_rel_select_scanned_keys(n);
@@ -1297,12 +1298,36 @@ mod tests {
         assert!(matches!(e, RelStoreError::UnindexedJoinScanExceeded { .. }), "got: {e}");
     }
 
+    // Spec general/030 test 8: the fallback's scan budget derived from
+    // max_sort_rows saturates, so usize::MAX (not reachable via TOML) still
+    // finds the matches.
+    #[tokio::test]
+    async fn test_unindexed_join_fallback_with_max_sort_rows_at_usize_max() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rel = boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: usize::MAX, ..config_in(dir.path()) })
+            .await;
+        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+        ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 9)").await;
+        ok(&rel, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
+
+        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag ORDER BY a.id").await;
+        assert_eq!(
+            s.rows,
+            vec![
+                vec![ScalarValue::Integer(10), ScalarValue::Integer(1)],
+                vec![ScalarValue::Integer(11), ScalarValue::Integer(2)],
+            ]
+        );
+    }
+
     // 11. max_join_depth: a chain longer than the limit -> JoinDepthExceeded,
     // before any execution.
     #[tokio::test]
     async fn test_max_join_depth_exceeded() {
         let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_join_depth: 1, ..config_in(dir.path()) }).await;
+        let mut rel = boot(config_in(dir.path())).await;
+        Arc::get_mut(&mut rel).unwrap().set_max_join_depth(1);
         ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
         ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
         ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY)").await;

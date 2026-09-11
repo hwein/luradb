@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 const SYS_REL_DOMAIN_PREFIX: &[u8] = b"__sys:rel_domain:";
 pub(crate) const DEFAULT_DOMAIN: &str = "default";
-const MAX_DOMAIN_NAME_LEN: usize = 50;
+pub(super) const MAX_DOMAIN_NAME_LEN: usize = 50;
 
 fn sys_key(name: &str) -> Vec<u8> {
     let mut k = SYS_REL_DOMAIN_PREFIX.to_vec();
@@ -292,6 +292,14 @@ mod tests {
     async fn make_registry() -> (Arc<RelDomainRegistry>, tempfile::TempDir) {
         let (_, registry, dir) = make_setup().await;
         (registry, dir)
+    }
+
+    // Spec general/030: the domain key at a maximal name stays below the
+    // startup lower bound of rel.lsm.max_key_length.
+    #[test]
+    fn test_sys_key_at_max_name_fits_key_limit_lower_bound() {
+        let key = sys_key(&"d".repeat(MAX_DOMAIN_NAME_LEN));
+        assert!(key.len() < crate::engines::rel::catalog::MIN_LSM_KEY_LENGTH, "{}", key.len());
     }
 
     // 1. create_domain -> get_domain returns it; system_prefix is 16 bytes.

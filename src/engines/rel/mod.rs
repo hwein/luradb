@@ -50,7 +50,7 @@ pub enum ExecOutcome {
     Select(SelectResult),
 }
 
-use crate::config::RelStoreConfig;
+use crate::config::{BlockCacheConfig, RelStoreConfig};
 use crate::core::events::GlobalEventBus;
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
@@ -67,6 +67,24 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+
+/// The storage value limit is the larger of this and `rel.max_row_size`:
+/// catalog entries keep their room, and rows may grow past it.
+const LSM_MIN_VALUE_SIZE_LIMIT: usize = 512 * 1024;
+
+/// Catalog limits (spec rel/003).
+const MAX_COLUMNS: usize = 128;
+const MAX_INDEXES_PER_TABLE: usize = 16;
+/// Statements longer than this many bytes are rejected before lexing (spec rel/004).
+const MAX_STATEMENT_LEN: usize = 64 * 1024;
+/// Max bytes per TEXT/KVREF/JSONREF value (spec rel/005).
+const MAX_TEXT_LEN: usize = 64 * 1024;
+/// Applied when a SELECT has no explicit LIMIT (spec rel/006).
+const DEFAULT_LIMIT: usize = 1_000;
+/// Max `LEFT JOIN` stages plus expand columns per statement (spec rel/007).
+const MAX_JOIN_DEPTH: usize = 8;
+/// The REST handlers reject a larger serialized response with 413 (spec rel/009).
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Central entry point for all relational-store operations. For now it
 /// wraps the dedicated LSM instance plus domain management (rel/002) —
@@ -139,32 +157,10 @@ impl RelEngine {
         let manifest_manager = Arc::new(ManifestManager::new(&config.sstable_dir));
 
         let engine_config = LsmEngineConfig {
-            vlog_inline_threshold: config.lsm.vlog_inline_threshold,
-            memtable_size_threshold: config.lsm.memtable_size_threshold,
             max_key_length: config.lsm.max_key_length,
-            max_value_size: config.lsm.max_value_size,
-            flush_check_interval_ms: config.lsm.flush_check_interval_ms,
-            compaction_check_interval_ms: config.lsm.compaction_check_interval_ms,
-            wal_event_channel_capacity: config.lsm.wal_event_channel_capacity,
-            use_mmap: config.lsm.use_mmap,
+            max_value_size: LSM_MIN_VALUE_SIZE_LIMIT.max(config.max_row_size),
             watch_replay_buffer_size: 0, // no watch endpoint on the relational engine (spec kv/024 §3)
-        };
-        let compaction_config = CompactionConfig {
-            l0_compaction_threshold: config.compaction.l0_threshold,
-            l1_max_size: config.compaction.l1_max_size,
-            level_size_ratio: config.compaction.level_size_ratio,
-            max_sstable_size: config.compaction.max_sstable_size,
-            low_watermark: None,
-        };
-        let janitor_config = JanitorConfig {
-            check_interval_secs: config.janitor.check_interval_secs,
-            dead_bytes_threshold: config.janitor.dead_bytes_threshold,
-            min_vlog_size_bytes: config.janitor.min_vlog_size_bytes,
-        };
-        let block_cache_config = crate::config::BlockCacheConfig {
-            capacity_bytes: config.block_cache.capacity_bytes,
-            small_ratio: config.block_cache.small_ratio,
-            ghost_capacity: config.block_cache.ghost_capacity,
+            ..LsmEngineConfig::default()
         };
 
         let engine = Arc::new(
@@ -177,9 +173,9 @@ impl RelEngine {
                 manifest_manager,
                 LsmEngineOptions {
                     engine: engine_config,
-                    compaction: compaction_config,
-                    janitor: janitor_config,
-                    block_cache: block_cache_config,
+                    compaction: CompactionConfig::default(),
+                    janitor: JanitorConfig::default(),
+                    block_cache: BlockCacheConfig::default(),
                 },
             )
             .await?,
@@ -187,8 +183,8 @@ impl RelEngine {
         engine.start_background_tasks();
         let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await?);
         let limits = CatalogLimits {
-            max_columns: config.max_columns,
-            max_indexes_per_table: config.max_indexes_per_table,
+            max_columns: MAX_COLUMNS,
+            max_indexes_per_table: MAX_INDEXES_PER_TABLE,
             max_tables_per_domain: config.max_tables_per_domain,
         };
         let catalog = Arc::new(RelCatalog::recover(Arc::clone(&engine), limits, Arc::clone(&metrics)).await?);
@@ -198,18 +194,18 @@ impl RelEngine {
             catalog,
             metrics,
             cross_engine,
-            max_statement_len: config.max_statement_len,
+            max_statement_len: MAX_STATEMENT_LEN,
             table_locks: dml::TableLocks::default(),
             write_guard: tokio::sync::Mutex::new(()),
-            max_text_len: config.max_text_len,
+            max_text_len: MAX_TEXT_LEN,
             max_row_size: config.max_row_size,
             max_key_length: config.lsm.max_key_length,
-            default_limit: config.default_limit,
+            default_limit: DEFAULT_LIMIT,
             max_limit: config.max_limit,
             max_sort_rows: config.max_sort_rows,
-            max_join_depth: config.max_join_depth,
+            max_join_depth: MAX_JOIN_DEPTH,
             allow_unindexed_joins: config.allow_unindexed_joins,
-            max_response_bytes: config.max_response_bytes,
+            max_response_bytes: MAX_RESPONSE_BYTES,
             import_body_limit_bytes: config.import_body_limit_bytes,
             rate_limiters: RwLock::new(HashMap::new()),
             event_bus: OnceLock::new(),
@@ -331,6 +327,22 @@ impl RelEngine {
     #[cfg(test)]
     pub(crate) fn has_rate_limiter(&self, domain: &str) -> bool {
         self.rate_limiters.read().contains_key(domain)
+    }
+
+    // Overrides of fixed limits, for tests that need a small one.
+    #[cfg(test)]
+    pub(crate) fn set_default_limit(&mut self, limit: usize) {
+        self.default_limit = limit;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_join_depth(&mut self, depth: usize) {
+        self.max_join_depth = depth;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_response_bytes(&mut self, bytes: usize) {
+        self.max_response_bytes = bytes;
     }
 
     // ── Cross-engine links (spec rel/012) ───────────────────────────────────────
@@ -552,6 +564,35 @@ mod tests {
         rel.shutdown().await;
     }
 
+    // Spec general/030 test 6: with rel.lsm.max_key_length at its startup
+    // lower bound, a domain with a maximal name, a table and a row with a
+    // 1-byte key work.
+    #[tokio::test]
+    async fn test_key_limit_at_lower_bound_still_works() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = RelStoreConfig {
+            wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
+            vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
+            sstable_dir: dir.path().join("rel_sstables").to_string_lossy().into_owned(),
+            lsm: crate::config::RelLsmConfig { max_key_length: catalog::MIN_LSM_KEY_LENGTH },
+            ..RelStoreConfig::default()
+        };
+        config.validate().unwrap();
+        let metrics = MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
+        let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
+
+        let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
+        rel.create_domain(&domain).await.unwrap();
+        rel.execute(&domain, "CREATE TABLE t (k TEXT PRIMARY KEY)", &[]).await.unwrap();
+        rel.execute(&domain, "INSERT INTO t VALUES ('a')", &[]).await.unwrap();
+        match rel.execute(&domain, "SELECT k FROM t", &[]).await.unwrap() {
+            ExecOutcome::Select(s) => assert_eq!(s.rows, vec![vec![ScalarValue::Text("a".to_string())]]),
+            o => panic!("expected SELECT, got {o:?}"),
+        }
+        rel.shutdown().await;
+    }
+
     // 8. Domain management (rel/002) wires through RelEngine's public API:
     //    the default domain exists right after bootstrap, and
     //    create/get/list/delete all delegate to the registry.
@@ -593,30 +634,13 @@ mod tests {
 
     // ── SQL frontend & DDL end-to-end (spec rel/004) ────────────────────────────
 
-    async fn make_engine_with(overrides: RelStoreConfig) -> (Arc<RelEngine>, tempfile::TempDir) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = RelStoreConfig {
-            wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("rel_sstables").to_string_lossy().into_owned(),
-            ..overrides
-        };
-        let metrics = MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
-        let engine = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
-        (engine, dir)
-    }
-
     // 2. max_statement_len guard fires end-to-end, before lexing.
     #[tokio::test]
     async fn test_execute_statement_too_long() {
-        let (rel, _dir) = make_engine_with(RelStoreConfig {
-            max_statement_len: 10,
-            ..RelStoreConfig::default()
-        })
-        .await;
-        let err = rel.execute("default", "SELECT * FROM t", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::StatementTooLong { max: 10, .. }), "got: {err}");
+        let (rel, _dir) = make_engine().await;
+        let sql = format!("SELECT * FROM t{}", " ".repeat(64 * 1024));
+        let err = rel.execute("default", &sql, &[]).await.unwrap_err();
+        assert!(matches!(err, RelStoreError::StatementTooLong { max: 65_536, .. }), "got: {err}");
         rel.shutdown().await;
     }
 
@@ -747,16 +771,11 @@ mod tests {
         assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
         rel.shutdown().await;
 
-        let (rel2, _dir2) = make_engine_with(RelStoreConfig {
-            max_columns: 2,
-            ..RelStoreConfig::default()
-        })
-        .await;
-        let err = rel2
-            .execute("default", "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER)", &[])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "got: {err}");
+        let (rel2, _dir2) = make_engine().await;
+        let columns: Vec<String> = (0..128).map(|i| format!("c{i} INTEGER")).collect();
+        let sql = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "));
+        let err = rel2.execute("default", &sql, &[]).await.unwrap_err();
+        assert!(matches!(err, RelStoreError::LimitExceeded { max: 128, .. }), "got: {err}");
         rel2.shutdown().await;
     }
 
@@ -830,20 +849,18 @@ mod tests {
     //     INDEX on a missing name -> IndexNotFound.
     #[tokio::test]
     async fn test_execute_index_limits_and_errors() {
-        let (rel, _dir) = make_engine_with(RelStoreConfig {
-            max_indexes_per_table: 1,
-            ..RelStoreConfig::default()
-        })
-        .await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)", &[])
-            .await
-            .unwrap();
-        rel.execute("default", "CREATE INDEX idx_a ON t (a)", &[]).await.unwrap();
+        let (rel, _dir) = make_engine().await;
+        let columns: Vec<String> = (0..17).map(|i| format!("c{i} INTEGER")).collect();
+        let sql = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "));
+        rel.execute("default", &sql, &[]).await.unwrap();
+        for i in 0..16 {
+            rel.execute("default", &format!("CREATE INDEX idx_{i} ON t (c{i})"), &[]).await.unwrap();
+        }
 
-        let err = rel.execute("default", "CREATE INDEX idx_b ON t (b)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "got: {err}");
+        let err = rel.execute("default", "CREATE INDEX idx_16 ON t (c16)", &[]).await.unwrap_err();
+        assert!(matches!(err, RelStoreError::LimitExceeded { max: 16, .. }), "got: {err}");
 
-        let err = rel.execute("default", "CREATE INDEX idx_a ON t (b)", &[]).await.unwrap_err();
+        let err = rel.execute("default", "CREATE INDEX idx_0 ON t (c16)", &[]).await.unwrap_err();
         assert!(matches!(err, RelStoreError::IndexAlreadyExists { .. }), "got: {err}");
 
         let err = rel.execute("default", "CREATE INDEX idx_c ON t (ghost)", &[]).await.unwrap_err();
@@ -852,7 +869,7 @@ mod tests {
         let err = rel.execute("default", "DROP INDEX ghost_idx", &[]).await.unwrap_err();
         assert!(matches!(err, RelStoreError::IndexNotFound { .. }), "got: {err}");
 
-        rel.execute("default", "DROP INDEX idx_a", &[]).await.unwrap();
+        rel.execute("default", "DROP INDEX idx_0", &[]).await.unwrap();
         rel.shutdown().await;
     }
 

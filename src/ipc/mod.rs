@@ -26,7 +26,9 @@ pub use registration::{prepare_registration_socket, serve_registration, Registra
 pub use ringbuffer::{
     DoubleMmapRegion, RingConsumer, RingCorrupt, RingProducer, RingSendError, RingbufferHeader,
 };
-pub use shm::{ClientShm, ReadOnlySegment, ShmManager, ShmSegment, CLIENT_HDR_SIZE};
+pub use shm::{
+    ClientShm, ReadOnlySegment, ShmManager, ShmSegment, CLIENT_HDR_SIZE, CLIENT_RING_SIZE, SEGMENT_MODE,
+};
 pub use snapshot::{
     ShmDomainIndex, ShmEntry, ShmSnapshot, SnapshotBuilder, SnapshotPublisher,
 };

@@ -724,8 +724,9 @@ mod tests {
     //    (spec §7 test 7).
     #[tokio::test]
     async fn test_row_errors_continue_import() {
-        let (rel, _dir) = make_engine_with(RelStoreConfig { max_text_len: 4, ..RelStoreConfig::default() }).await;
-        let csv = "id,label\n1,ok\n2,a,extra\n3,toolong\n4,fine\n";
+        let (rel, _dir) = make_engine().await;
+        let too_long = "x".repeat(64 * 1024 + 1);
+        let csv = format!("id,label\n1,ok\n2,a,extra\n3,{too_long}\n4,fine\n");
         let result =
             rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
         assert_eq!(result.imported, 2, "rows 1 and 4 succeed");
@@ -771,13 +772,12 @@ mod tests {
     }
 
     // The column cap is checked before any per-column work, so a header far
-    // past it costs nothing: with `max_columns = 2`, 5000 identical headers
-    // (which would otherwise be normalized and deduplicated first) are
-    // rejected, and no name normalization result can be observed.
+    // past it costs nothing: 5000 identical headers (which would otherwise be
+    // normalized and deduplicated first) are rejected against the 128-column
+    // cap, and no name normalization result can be observed.
     #[tokio::test]
     async fn test_oversized_header_rejected_before_normalization() {
-        let (rel, _dir) =
-            make_engine_with(RelStoreConfig { max_columns: 2, ..RelStoreConfig::default() }).await;
+        let (rel, _dir) = make_engine().await;
         let header = vec!["a"; 5_000].join(",");
         let row = vec!["1"; 5_000].join(",");
         let csv = format!("{header}\n{row}\n");
@@ -823,13 +823,14 @@ mod tests {
         assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
         assert!(rel.get_object("default", "empty").is_err(), "no table created");
 
-        let (rel2, _dir2) = make_engine_with(RelStoreConfig { max_columns: 2, ..RelStoreConfig::default() }).await;
-        let err = rel2
-            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, Bytes::from_static(b"a,b,c\n1,2,3\n"))
+        let header: Vec<String> = (0..129).map(|i| format!("c{i}")).collect();
+        let csv = format!("{}\n{}\n", header.join(","), vec!["1"; 129].join(","));
+        let err = rel
+            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes()))
             .await
             .unwrap_err();
         assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "got: {err}");
-        assert!(rel2.get_object("default", "wide").is_err(), "no table created");
+        assert!(rel.get_object("default", "wide").is_err(), "no table created");
 
         let err = rel
             .create_table_from_file("default", "u", FileFormat::Csv, true, Some("ghost"), Bytes::from_static(b"a,b\n1,2\n"))

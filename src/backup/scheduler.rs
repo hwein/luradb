@@ -167,8 +167,6 @@ mod tests {
         let config = BackupConfig {
             enabled: true,
             dir: backup_dir.path().to_string_lossy().into_owned(),
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
             schedule: Vec::new(),
         };
         let manager = BackupManager::new(&config, registry, None).unwrap();

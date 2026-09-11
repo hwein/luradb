@@ -73,11 +73,10 @@ pub(crate) fn directive_string(cfg: &LogConfig) -> String {
 pub(crate) fn build_filter_string(cfg: &LogConfig) -> String {
     let global = level_to_str(&cfg.level);
     let mut directives = format!("luradb={global}");
-    let modules: [(&str, &Option<LogLevel>); 5] = [
+    let modules: [(&str, &Option<LogLevel>); 4] = [
         ("luradb::auth", &cfg.modules.auth),
         ("luradb::api", &cfg.modules.api),
         ("luradb::engines", &cfg.modules.engine),
-        ("luradb::engines::lsm::domain", &cfg.modules.domains),
         ("luradb::storage", &cfg.modules.storage),
     ];
     for (target, level_opt) in &modules {

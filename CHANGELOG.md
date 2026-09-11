@@ -7,11 +7,19 @@ All notable changes to LuraDB are documented in this file.
 ### Added
 
 - New `[multicore].cpu_offload_threads` config key caps concurrent CPU offloads (`0` = auto).
+- The shipped luradb.toml documents every configuration key.
+- Startup rejects out-of-range values for the remaining configuration keys.
+- Startup warns about unknown configuration keys.
 
 ### Changed
 
 - Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.
 - SHM snapshots are only rebuilt after data changes, cutting tail latency of small requests on idle servers.
+
+### Removed
+
+- **BREAKING** API: GET /store-api/config no longer reports the removed configuration keys.
+- 72 undocumented tuning keys are no longer configurable; their former defaults are fixed.
 
 ### Fixed
 

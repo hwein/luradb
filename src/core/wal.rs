@@ -14,10 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 /// to one field: axum's default per-request body cap is 2 MiB (see
 /// `api/mod.rs`), the JSON bulk import's explicit override
 /// (`json.bulk_body_limit_bytes`) defaults to 64 MiB, and the IPC/SHM
-/// command ring (`shm.command_buffer_size`) defaults to 4 MiB -- all well
-/// above `LsmConfig::max_value_size`'s own 512 KiB default, which every
-/// engine (kv/json/rel) validates a value against before it ever reaches
-/// the WAL. 64 MiB (the JSON bulk body cap) is the largest of these; 96 MiB
+/// command ring (`CLIENT_RING_SIZE`) is 4 MiB -- all well above the
+/// engines' 512 KiB default value limit, which every engine (kv/json/rel)
+/// checks a value against before it ever reaches the WAL. 64 MiB (the JSON bulk body cap) is the largest of these; 96 MiB
 /// gives it headroom no legitimate write can reach.
 pub const WAL_MAX_FIELD_LEN: usize = 96 * 1024 * 1024;
 

@@ -22,6 +22,15 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
+/// SQPOLL ring; falls back to the standard ring on EPERM (missing CAP_SYS_NICE).
+pub const SQPOLL_ENABLED: bool = true;
+pub const SQPOLL_IDLE_MS: u32 = 2000;
+pub const RING_DEPTH: u32 = 256;
+/// Bounded request channel capacity for backpressure.
+pub const REQUEST_CHANNEL_CAPACITY: usize = 1024;
+/// No CPU pinning.
+pub const STORAGE_THREAD_CPU: i32 = -1;
+
 /// Runtime parameters for [`StorageThread::new`].
 #[derive(Debug, Clone, Copy)]
 pub struct StorageThreadConfig {
@@ -144,9 +153,7 @@ impl StorageThread {
         wal_path: PathBuf,
         vlog_path: PathBuf,
     ) -> Result<(Self, StorageHandle)> {
-        // `.max(1)`: tokio's bounded channel panics on capacity 0; a misconfig
-        // must not crash startup.
-        let (request_tx, request_rx) = mpsc::channel(config.channel_capacity.max(1));
+        let (request_tx, request_rx) = mpsc::channel(config.channel_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool>>();
         let thread_shutdown = Arc::clone(&shutdown);

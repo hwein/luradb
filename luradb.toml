@@ -82,7 +82,7 @@ replay_buffer_size = 1024   # ring for Last-Event-ID resume; 0 = resume off
 [log]
 level = "verbose"
 format = "text"
-# path = "/var/log/luradb"   # empty = stdout
+# path = "logs"   # empty = stdout
 rotation = "daily"
 retention_days = 30
 

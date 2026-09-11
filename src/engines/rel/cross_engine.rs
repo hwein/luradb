@@ -299,6 +299,12 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 
 // ── Physical sweep (spec §5) ──────────────────────────────────────────────────
 
+/// Seconds between sweep ticks and the max cells nulled per (domain,
+/// column, tick): a gentler cadence than the rel/013 purger, since it
+/// rewrites live rows.
+pub const SWEEP_INTERVAL_SECS: u64 = 10;
+pub const SWEEP_BATCH_SIZE: usize = 100;
+
 /// Background task that physically nulls link cells whose same-named target
 /// domain vanished in a foreign engine — the durable half of "nulled stays
 /// nulled". Distinct from the rel/013 purger (which tombstones a rel domain's
@@ -320,8 +326,8 @@ impl RelCrossEngineSweeper {
         Self {
             engine,
             shutdown,
-            batch_size: batch_size.max(1),
-            interval: Duration::from_secs(interval_secs.max(1)),
+            batch_size,
+            interval: Duration::from_secs(interval_secs),
         }
     }
 
@@ -987,7 +993,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_expand_max_join_depth() {
-        let e = env_with(RelStoreConfig { max_join_depth: 0, ..RelStoreConfig::default() }, true, true).await;
+        let mut e = env_with(RelStoreConfig::default(), true, true).await;
+        Arc::get_mut(&mut e.rel).unwrap().set_max_join_depth(0);
         kv_put(&e.kv, "default", b"k", b"v").await;
         ok(&e.rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
         ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'k')").await;

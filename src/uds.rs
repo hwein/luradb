@@ -24,9 +24,12 @@ pub struct UdsConnectInfo {
     pub peer_addr: Arc<tokio::net::unix::SocketAddr>,
 }
 
+/// Filesystem mode of every socket file.
+const SOCKET_MODE: u32 = 0o660;
+
 /// Validates the path, removes a stale socket file from a previous run,
-/// binds the listener, and applies the configured filesystem mode.
-pub fn prepare_uds_socket(path: &str, mode: Option<u32>) -> anyhow::Result<UnixListener> {
+/// binds the listener, and applies `SOCKET_MODE`.
+pub fn prepare_uds_socket(path: &str) -> anyhow::Result<UnixListener> {
     let p = Path::new(path);
     anyhow::ensure!(p.is_absolute(), "unix_socket_path must be absolute: {path}");
     let parent = p
@@ -47,7 +50,7 @@ pub fn prepare_uds_socket(path: &str, mode: Option<u32>) -> anyhow::Result<UnixL
         std::fs::remove_file(p)?;
     }
     let listener = UnixListener::bind(p)?;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode.unwrap_or(0o660)))?;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(SOCKET_MODE))?;
     Ok(listener)
 }
 
@@ -141,9 +144,9 @@ mod tests {
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
         assert!(sock.exists());
 
-        let listener = prepare_uds_socket(&path, Some(0o600)).unwrap();
+        let listener = prepare_uds_socket(&path).unwrap();
         let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(mode & 0o777, 0o660);
 
         let router = Router::new().route("/ping", get(|| async { "pong" }));
         let (tx, rx) = watch::channel(false);
@@ -168,13 +171,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_rejects_relative_and_missing_parent() {
-        assert!(prepare_uds_socket("relative.sock", None).is_err());
-        assert!(prepare_uds_socket("/nonexistent-dir-xyz/luradb.sock", None).is_err());
+        assert!(prepare_uds_socket("relative.sock").is_err());
+        assert!(prepare_uds_socket("/nonexistent-dir-xyz/luradb.sock").is_err());
         // A regular file at the path must be rejected, not deleted.
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("regular.txt");
         std::fs::write(&file, b"keep me").unwrap();
-        assert!(prepare_uds_socket(&file.to_string_lossy(), None).is_err());
+        assert!(prepare_uds_socket(&file.to_string_lossy()).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
     }
 
@@ -183,7 +186,7 @@ mod tests {
     async fn test_uds_shutdown_drains_inflight_connection() {
         let dir = tempfile::TempDir::new().unwrap();
         let sock = dir.path().join("drain.sock");
-        let listener = prepare_uds_socket(&sock.to_string_lossy(), None).unwrap();
+        let listener = prepare_uds_socket(&sock.to_string_lossy()).unwrap();
 
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));

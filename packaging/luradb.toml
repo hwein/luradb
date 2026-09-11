@@ -1,97 +1,240 @@
 [server]
+# Serves the Swagger UI and /api-docs/openapi.json; with auth on, they need a valid key.
 swagger_enabled = false
+# URL path of the Swagger UI.
+swagger_url = "/test-ui"
+# Address of the HTTP and HTTPS listeners; with auth off, only loopback is allowed.
 bind_address = "127.0.0.1"
+# Port of the plain HTTP listener.
 port = 3000
+# Starts the plain HTTP listener; at least one of HTTP and HTTPS must be on.
 http_enabled = true
+# Registers the root route / that answers with the hello message. Default: true.
 hello_enabled = false
-# UDS for local clients; /run/luradb is created by systemd (RuntimeDirectory).
-# Access: group luradb (socket mode default 0o660).
+# Response text of the root route.
+hello_message = "Hello from LuraDB"
+# Unix domain socket for local clients. Default: not set (no socket).
+# /run/luradb is created by systemd (RuntimeDirectory).
+# Access: group luradb (fixed socket mode 0o660).
 unix_socket_path = "/run/luradb/luradb.sock"
 
-# Native HTTPS listener (spec general/011), opt-in. Quickstart to enable:
-# packaging/INSTALL.md "Enabling HTTPS".
+# Starts the native HTTPS listener (spec general/011), opt-in. Quickstart to
+# enable: packaging/INSTALL.md "Enabling HTTPS".
 tls_enabled = false
+# Port of the HTTPS listener; must differ from the HTTP port.
 tls_port = 3443
+# PEM certificate of the HTTPS listener, optionally with its chain.
 tls_cert_path = "/etc/luradb/tls/server.crt"
+# PEM private key (PKCS#8, RSA or EC) of the HTTPS listener.
 tls_key_path = "/etc/luradb/tls/server.key"
 
 [auth]
+# Requires a key on every request; off is only allowed on a loopback address.
+# Default: false.
 enabled = true
+# Unix user IDs that authenticate by their peer credentials instead of a key.
+# Warning: these UIDs get full access without an API key via the Unix socket and SHM.
+trusted_uids = []
 
+# Admin accounts: every start creates or updates them and removes admins no
+# longer listed here. Default: none.
 [[auth.admins]]
+# Name of the admin account.
 name = "admin"
+# Secret of the admin account, sent as a Bearer token.
 # Placeholder — postinst replaces it with a random key on first install.
 api_key = "@GENERATED_ON_INSTALL@"
 
+# Files of the key-value engine. Relative paths resolve against the working
+# directory; no two data paths may resolve to the same location.
 [storage]
+# Page file of the buffer pool. Default: luradb.db
 db_path = "/var/lib/luradb/luradb.db"
+# Write-ahead log. Default: luradb.wal
 wal_path = "/var/lib/luradb/luradb.wal"
+# Value log for large values. Default: luradb.vlog
 vlog_path = "/var/lib/luradb/luradb.vlog"
+# SSTable directory. Default: luradb_sstables
 sstable_dir = "/var/lib/luradb/sstables"
 
+[io_engine]
+# Runs the key-value engine's WAL and value-log I/O on a dedicated io_uring
+# thread; falls back to standard file I/O if that thread cannot start.
+enabled = false
+
+[multicore]
+# Parallel CPU-heavy tasks moved off the request thread: 0 is automatic
+# (cores minus 2, at least 1), otherwise at most the number of cores.
+cpu_offload_threads = 0
+
 [buffer_pool]
+# Pages (4 KiB each) the buffer pool keeps in memory.
 pool_size = 1024
 
+# LSM storage of the key-value engine.
 [lsm]
+# Values of at least this many bytes go to the value log instead of the SSTables.
 vlog_inline_threshold = 1024
+# MemTable size in bytes (keys plus stored values) at which it is written to disk.
 memtable_size_threshold = 4194304
+# Longest stored key in bytes, including the internal domain prefix.
 max_key_length = 256
+# Largest value in bytes; larger writes are rejected.
 max_value_size = 524288
+# How often, in milliseconds, the flush loop checks for a full MemTable.
 flush_check_interval_ms = 100
+# How often, in milliseconds, the compaction loop checks for work.
 compaction_check_interval_ms = 1000
+# Change events buffered for watch streams; a watcher further behind gets `reset`.
 wal_event_channel_capacity = 256
 # KV watch replay-ring size (spec kv/024). 0 = resume off (every
 # reconnect with a Last-Event-ID gets `reset`); id: fields always exist.
 watch_replay_buffer_size = 1024
 
+# SSTable compaction of the key-value engine.
 [compaction]
+# Number of level-0 SSTables that starts a compaction into level 1.
 l0_threshold = 4
+# Level-1 size in bytes that starts a compaction into level 2.
 l1_max_size = 104857600
+# Size factor between consecutive levels (level 2 holds 10 times level 1).
 level_size_ratio = 10
+# Largest SSTable in bytes a compaction writes; larger results are split.
 max_sstable_size = 67108864
 
+# Garbage collection of the key-value engine's value log.
 [janitor]
+# How often, in seconds, the janitor checks whether a GC run is due.
 check_interval_secs = 60
+# Share of dead bytes in the value log (0 to 1) that starts a GC run.
 dead_bytes_threshold = 0.30
+# Value-log size in bytes below which GC never runs.
 min_vlog_size_bytes = 67108864
 
 # Background removal of TTL-expired keys (spec kv/025): each swept key gets a
 # tombstone and a delete event. Disabling it restores purely lazy expiry.
 [ttl_sweeper]
+# Runs the sweeper; while off, expired keys are only hidden on read.
 enabled = true
+# Seconds between two sweeper ticks.
 interval_secs = 60
 # Candidates checked per tick — discarded ones count too.
 batch_size = 500
 
+# Domains of the key-value engine.
 [domains]
+# Longest domain name in characters ([a-zA-Z0-9_-]).
 max_name_length = 50
+# Longest key a client may use, in bytes.
 max_user_key_length = 256
+# Domain created at every start if it is missing.
 default_domain = "default"
+# Keys removed per step while a deleted domain is purged in the background.
 purger_batch_size = 100
+# Seconds between two purge steps.
 purger_interval_secs = 5
 # Cap on keys removed by one DELETE …/keys?prefix= bulk delete (spec kv/023).
 max_bulk_delete_keys = 10000
 
+# Limits of every key-value domain.
 [rate_limit]
+# Reads per second per domain.
 default_read_iops = 1000
+# Writes per second per domain.
 default_write_iops = 500
+# Stored bytes per domain; 0 means no limit.
 default_max_storage_bytes = 0
 
+# JSON document engine with its own LSM storage.
+[json]
+# Starts the JSON document engine.
+# While disabled, relational tables show JSON references as NULL.
+enabled = true
+# Write-ahead log; relative paths resolve against the working directory.
+wal_path = "luradb_json.wal"
+# Value log for large documents.
+vlog_path = "luradb_json.vlog"
+# SSTable directory.
+sstable_dir = "luradb_json_sstables"
+# Largest request body of POST /store-api/json/{domain}/bulk in bytes.
+# The whole request body is held in memory.
+bulk_body_limit_bytes = 67108864
+
+[json.lsm]
+# Longest stored key in bytes; document keys get this minus an internal
+# prefix, at most 256 bytes.
+max_key_length = 256
+# Largest stored document in bytes.
+max_value_size = 524288
+
+# Relational engine with its own LSM storage.
 [rel]
+# Starts the relational engine.
+enabled = true
+# Write-ahead log; relative paths resolve against the working directory.
+wal_path = "luradb_rel.wal"
+# Value log for large rows.
+vlog_path = "luradb_rel.vlog"
+# SSTable directory.
+sstable_dir = "luradb_rel_sstables"
+# Most tables per relational domain.
+# Catalog entries are held in memory.
+max_tables_per_domain = 256
+# Largest encoded row in bytes; the storage accepts values up to this or
+# 512 KiB, whichever is larger.
+max_row_size = 524288
+# Most rows a query returns; a larger LIMIT is reduced to it.
+# All result rows up to this limit are held in memory.
+max_limit = 10000
+# Most rows an ORDER BY sorts or an unindexed join scans; more fail with 400.
+# Rows up to this limit are held in memory while sorting.
+max_sort_rows = 100000
+# Lets a join on an unindexed column scan the table per row instead of
+# failing with 400.
+allow_unindexed_joins = false
 # Body-size cap for POST .../tables/from-file (spec rel/019).
 import_body_limit_bytes = 67108864
 
-[events]
+[rel.lsm]
+# Longest stored key in bytes; it bounds primary-key and index values.
+max_key_length = 256
+
 # Live broadcast for GET /store-api/events (spec general/018).
-channel_capacity = 256      # a consumer this far behind gets `reset` (reason: lagged)
-replay_buffer_size = 1024   # ring for Last-Event-ID resume; 0 = resume off
+[events]
+# Events buffered per consumer; one this far behind gets `reset` (reason: lagged).
+channel_capacity = 256
+# Ring for Last-Event-ID resume; 0 = resume off.
+replay_buffer_size = 1024
 
 [log]
+# Level: verbose, info or prod (warnings and errors only); RUST_LOG overrides it.
 level = "info"
+# Line format: text or json.
 format = "text"
-# No path: stdout → journald (journalctl -u luradb)
+# Directory for log files, created if missing. Not set: stdout only, which
+# systemd hands to journald (journalctl -u luradb).
+# path = "/var/lib/luradb/logs"
+# Rotation of the log files: none, daily or hourly; needs a log path.
+rotation = "daily"
+# Days to keep rotated log files; 0 keeps them forever.
+retention_days = 30
+# Serves GET /store-api/logs and /store-api/logs/files; needs a log path.
+http_access = false
+
+# Levels per module; a module without its own level uses the global level.
+[log.modules]
+# Level of the authentication module.
+# auth = "info"
+# Level of the REST API.
+# api = "info"
+# Level of the storage engines, including the domain registry.
+# engine = "prod"
+# Level of the file layer (SSTables, value log, manifest).
+# storage = "prod"
 
 [proxy]
+# Reverse proxies (IPs or CIDR ranges) whose X-Real-IP and X-Forwarded-For
+# headers are trusted. Default: [] (direct access, headers ignored).
 trusted_proxies = ["127.0.0.1", "::1"]
 
 [cors]
@@ -99,3 +242,45 @@ trusted_proxies = ["127.0.0.1", "::1"]
 enabled = false
 # Exact origins, e.g. ["https://console.example.com", "http://localhost:5173"].
 allowed_origins = []
+
+# Shared-memory read path for local clients.
+[shm]
+# Publishes read snapshots in shared memory.
+# Warning: members of the luradb group can read all data via SHM without an API key.
+enabled = false
+# Name suffix of the shared-memory segments, so several servers can share a
+# host ([A-Za-z0-9-]).
+instance_id = "0"
+# Size in bytes of each shared-memory data segment.
+# Two segments of this size plus one copy per rebuild are held in memory.
+data_buffer_size = 268435456
+# Unix socket where SHM clients register; {instance_id} is replaced. It must
+# differ from the Unix socket of the server section.
+registration_socket_path = "/run/luradb/{instance_id}.sock"
+# How often, in milliseconds, the snapshot is checked for changes; it is
+# rebuilt only after a change.
+# Lower values mean fresher snapshots and more CPU load.
+snapshot_interval_ms = 100
+
+# Backups on demand and by schedule.
+[backup]
+# Enables backups; while off, the backup endpoints answer 503.
+enabled = false
+# Directory of the backup files; relative paths resolve against the working directory.
+# Warning: use a separate directory per server; retention deletes backups by schedule name.
+dir = "luradb_backups"
+
+# Example schedule; repeat the block for more. Without a schedule, backups
+# run only on demand.
+# [[backup.schedule]]
+# Unique schedule name: 1 to 50 characters of [a-zA-Z0-9_-].
+# name = "nightly"
+# When the schedule runs: a 5-field cron expression in UTC that fires within 4 years.
+# cron = "0 3 * * *"
+# Data to back up: all, kv, json, kv:<domain>, json:<domain> or domain:<name>.
+# scope = "all"
+# Also backs up users and permissions (scopes all and kv only).
+# The backup file then contains API key hashes.
+# include_auth = false
+# How many of this schedule's newest backups to keep (at least 1).
+# keep_last = 7

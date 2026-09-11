@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+/// Keys tombstoned per purger tick and seconds between ticks.
+pub const PURGER_BATCH_SIZE: usize = 100;
+pub const PURGER_INTERVAL_SECS: u64 = 5;
+
 pub struct JsonDomainPurger {
     engine: Arc<JsonEngine>,
     shutdown: Arc<AtomicBool>,
@@ -29,7 +33,7 @@ impl JsonDomainPurger {
         Self {
             engine,
             shutdown,
-            batch_size: batch_size.max(1),
+            batch_size,
             interval: Duration::from_secs(interval_secs),
         }
     }
@@ -320,9 +324,9 @@ mod tests {
     #[tokio::test]
     async fn test_bulk_flush_aborts_when_domain_deleted_mid_import() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = JsonStoreConfig { bulk_batch_size: 1, ..config_for(&dir) };
         let metrics = MetricsStore::new(MetricsConfig::default());
-        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+        let mut json = JsonEngine::bootstrap(&config_for(&dir), metrics).await.unwrap();
+        Arc::get_mut(&mut json).unwrap().bulk_batch_size = 1;
         json.create_domain("doomed").await.unwrap();
         let prefix = json.get_domain("doomed").unwrap().system_prefix;
 

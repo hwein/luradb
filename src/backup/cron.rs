@@ -64,6 +64,28 @@ impl CronSchedule {
             (false, false) => self.day_of_month.contains(&day_of_month) || self.weekday.contains(&weekday),
         }
     }
+
+    /// Whether the schedule fires after `now` (Unix seconds, UTC) and within
+    /// `days` days. Minute and hour always hold at least one value, so only
+    /// the date fields can keep a schedule silent: one check per day suffices.
+    pub fn fires_within_days(&self, now: u64, days: u64) -> bool {
+        let start = civil_from_unix(now);
+        // Like the scheduler, the start minute itself never fires.
+        let later_today = self
+            .hour
+            .iter()
+            .flat_map(|&hour| self.minute.iter().map(move |&minute| (hour, minute)))
+            .find(|&time| time > (start.hour, start.minute));
+        if let Some((hour, minute)) = later_today {
+            if self.matches(minute, hour, start.day, start.month, start.weekday) {
+                return true;
+            }
+        }
+        (1..=days).any(|day| {
+            let t = civil_from_unix(now + day * 86400);
+            self.matches(self.minute[0], self.hour[0], t.day, t.month, t.weekday)
+        })
+    }
 }
 
 /// Parses one field, returning its expanded, sorted, deduped value set and

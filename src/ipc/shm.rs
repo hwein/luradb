@@ -171,6 +171,14 @@ fn errno_context(context: String) -> anyhow::Error {
 /// mints a dedicated `ClientShm` quartet per client instead.
 const SEGMENT_PURPOSES: &[&str] = &["state", "data_a", "data_b"];
 
+/// Size of the `state` segment in bytes.
+const STATE_SEGMENT_SIZE: usize = 4096;
+const _: () = assert!(STATE_SEGMENT_SIZE >= crate::ipc::StateHeader::SIZE);
+
+/// Filesystem mode of every SHM segment; fixed so it cannot be loosened to
+/// foreign users (spec general/030).
+pub const SEGMENT_MODE: u32 = 0o660;
+
 /// Owns every SHM segment and the instance lock file for one LuraDB process.
 pub struct ShmManager {
     instance_id: String,
@@ -211,7 +219,7 @@ impl ShmManager {
         cleanup_stale_segments(&manager.instance_id)?;
 
         let sizes = [
-            manager.config.state_size,
+            STATE_SEGMENT_SIZE,
             manager.config.data_buffer_size,
             manager.config.data_buffer_size,
         ];
@@ -227,7 +235,7 @@ impl ShmManager {
     /// Creates and registers a new segment named `/luradb_{instance_id}_{purpose}`.
     pub fn create_segment(&mut self, purpose: &str, size: usize) -> Result<&mut ShmSegment> {
         let name = format!("/luradb_{}_{}", self.instance_id, purpose);
-        let segment = ShmSegment::create(&name, size, self.config.segment_mode)?;
+        let segment = ShmSegment::create(&name, size, SEGMENT_MODE)?;
         self.segments.insert(purpose.to_string(), segment);
         Ok(self.segments.get_mut(purpose).expect("just inserted"))
     }
@@ -271,6 +279,11 @@ impl Drop for ShmManager {
 /// `cmd_hdr` also carries the client's `ReaderSlot` (spec perf/012 §1).
 pub const CLIENT_HDR_SIZE: usize = 4096;
 
+/// Size of each per-client cmd/resp ring. `DoubleMmapRegion` needs a
+/// power-of-two page multiple.
+pub const CLIENT_RING_SIZE: usize = 4 * 1024 * 1024;
+const _: () = assert!(CLIENT_RING_SIZE.is_power_of_two() && CLIENT_RING_SIZE >= 4096);
+
 /// The four per-client ring segments (spec perf/008 Multi-Client): a cmd ring
 /// (client→server) and a resp ring (server→client), each a data segment plus a
 /// one-page header segment. Owns all four and unlinks them on drop.
@@ -290,8 +303,8 @@ pub struct ClientShm {
 
 impl ClientShm {
     /// Creates `/luradb_{instance_id}_{cmd,cmd_hdr,resp,resp_hdr}_{client_id}`.
-    /// `ring_size` is the validated `command_buffer_size` (power-of-two page
-    /// multiple, required by `DoubleMmapRegion`); headers are one page.
+    /// `ring_size` must be a power-of-two page multiple (`DoubleMmapRegion`),
+    /// in production `CLIENT_RING_SIZE`; headers are one page.
     pub fn create(instance_id: &str, client_id: u64, ring_size: usize, mode: u32) -> Result<Self> {
         let names = client_segment_names(instance_id, client_id);
         let build = || -> Result<Self> {
@@ -466,10 +479,7 @@ mod tests {
         ShmConfig {
             enabled: true,
             instance_id: instance_id.to_string(),
-            state_size: 4096,
             data_buffer_size: 8192,
-            command_buffer_size: 4096,
-            segment_mode: 0o600,
             registration_socket_path: "/run/luradb/{instance_id}.sock".to_string(),
             snapshot_interval_ms: 100,
         }
@@ -547,7 +557,7 @@ mod tests {
         }
 
         let manager = ShmManager::new(small_config(&instance_id)).unwrap();
-        // Recreated at the configured size, not the stale 999 bytes.
+        // Recreated at the fixed size, not the stale 999 bytes.
         assert_eq!(manager.get_segment("state").unwrap().len(), 4096);
     }
 
@@ -720,15 +730,5 @@ mod tests {
         assert_eq!(server_slot.counter(1).load(Ordering::SeqCst), 1, "pin visible to the server");
         drop(guard);
         assert_eq!(server_slot.counter(1).load(Ordering::SeqCst), 0);
-    }
-
-    // 8. command_buffer_size not a power of two -> validation error (via ShmManager::new()).
-    #[test]
-    fn test_manager_new_rejects_non_power_of_two_command_buffer() {
-        let instance_id = unique_tag("badcfg");
-        let mut config = small_config(&instance_id);
-        config.command_buffer_size = 3_000_000;
-        let err = ShmManager::new(config).err().unwrap();
-        assert!(err.to_string().contains("power of two"), "{err}");
     }
 }

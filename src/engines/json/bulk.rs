@@ -319,11 +319,11 @@ mod tests {
             wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
             vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
             sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            bulk_batch_size: batch,
             ..JsonStoreConfig::default()
         };
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+        let mut engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+        Arc::get_mut(&mut engine).unwrap().bulk_batch_size = batch;
         (engine, dir)
     }
 

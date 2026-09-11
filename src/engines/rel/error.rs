@@ -58,7 +58,7 @@ pub enum RelStoreError {
         expected: String,
         actual: String,
     },
-    /// A configured catalog limit was exceeded (→ 400).
+    /// A catalog limit was exceeded (→ 400).
     #[error("limit exceeded: {which} (max {max})")]
     LimitExceeded { which: String, max: usize },
     /// `ALTER`/`DROP`/`REFERENCES`/`CREATE INDEX` target table missing (→ 404).

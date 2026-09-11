@@ -293,6 +293,7 @@ mod tests {
             ] {
                 assert!(block.get(field).is_some(), "engines.{engine}.{field} missing");
             }
+            assert_eq!(block["window_secs"], 60, "engines.{engine}.window_secs");
         }
 
         let domain = body["domains"]
@@ -309,6 +310,7 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(fields, expected, "domains[] must keep exactly its eight known fields");
+        assert_eq!(domain["window_secs"], 60);
     }
 
     // Test 10: a disabled JSON engine (json_engine: None in AppState) still
@@ -494,6 +496,27 @@ mod tests {
         let mut expected: Vec<String> = expected_value.as_object().unwrap().keys().cloned().collect();
         expected.sort();
         assert_eq!(got, expected);
+    }
+
+    // Spec general/030 test 9: removed keys and their sections are gone from
+    // the response, checked on JSON keys (an explicit `null` still counts).
+    #[tokio::test]
+    async fn config_endpoint_omits_removed_keys() {
+        let (state, _dir) =
+            make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await;
+        let resp = config_response(state).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        let sections = [
+            "metrics", "block_cache",
+            "json.compaction", "json.janitor", "json.block_cache",
+            "rel.compaction", "rel.janitor", "rel.block_cache",
+        ];
+        for key in sections.iter().chain(crate::config::REMOVED_KEYS) {
+            let pointer = format!("/config/{}", key.replace('.', "/"));
+            assert!(body.pointer(&pointer).is_none(), "removed key {key} is still reported");
+        }
     }
 
     // Test 7: a TOML-loaded config with a non-default value (server.port)

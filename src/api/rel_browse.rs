@@ -711,6 +711,16 @@ mod tests {
         (crate::api::create_router(state, Arc::new(vec![])), dir)
     }
 
+    /// `rel_config`, with `tune` overriding the engine's fixed limits.
+    async fn make_tuned_app(
+        rel_config: RelStoreConfig,
+        tune: impl FnOnce(&mut RelEngine),
+    ) -> (axum::Router, tempfile::TempDir) {
+        let (mut state, dir) = make_state(Some(rel_config), false).await;
+        tune(Arc::get_mut(state.rel_engine.as_mut().unwrap()).unwrap());
+        (crate::api::create_router(state, Arc::new(vec![])), dir)
+    }
+
     async fn make_default_app() -> (axum::Router, tempfile::TempDir) {
         make_app(Some(RelStoreConfig::default())).await
     }
@@ -847,8 +857,10 @@ mod tests {
     //    max_limit capped -> limit_applied = true; offset correct.
     #[tokio::test]
     async fn test_browse_rows_pagination() {
-        let (app, _dir) =
-            make_app(Some(RelStoreConfig { default_limit: 2, max_limit: 3, ..RelStoreConfig::default() })).await;
+        let (app, _dir) = make_tuned_app(RelStoreConfig { max_limit: 3, ..RelStoreConfig::default() }, |rel| {
+            rel.set_default_limit(2)
+        })
+        .await;
         sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
         sql(&app, "default", r#"{"sql": "INSERT INTO t VALUES (1),(2),(3),(4),(5)"}"#).await;
 
@@ -994,8 +1006,7 @@ mod tests {
     //    now resolve — see test 5; no more CrossEngineExpand 400.)
     #[tokio::test]
     async fn test_browse_rows_expand_errors() {
-        let (app, _dir) =
-            make_app(Some(RelStoreConfig { max_join_depth: 0, ..RelStoreConfig::default() })).await;
+        let (app, _dir) = make_tuned_app(RelStoreConfig::default(), |rel| rel.set_max_join_depth(0)).await;
         setup_customers_orders(&app).await;
 
         let (status, _) =
@@ -1220,8 +1231,7 @@ mod tests {
     // 12. max_response_bytes: a Row-Browse response over a tiny cap -> 413.
     #[tokio::test]
     async fn test_max_response_bytes_413() {
-        let (app, _dir) =
-            make_app(Some(RelStoreConfig { max_response_bytes: 40, ..RelStoreConfig::default() })).await;
+        let (app, _dir) = make_tuned_app(RelStoreConfig::default(), |rel| rel.set_max_response_bytes(40)).await;
         sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"}"#).await;
         sql(&app, "default", r#"{"sql": "INSERT INTO t VALUES (1, 'a reasonably long text value')"}"#).await;
 

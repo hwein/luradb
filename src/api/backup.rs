@@ -661,11 +661,15 @@ mod tests {
     use serde_json::json;
 
     fn enabled_backup_config() -> BackupConfig {
-        BackupConfig { enabled: true, dir: "unused".to_string(), scan_batch_size: 500, scan_pause_ms: 0, schedule: Vec::new() }
+        BackupConfig { enabled: true, dir: "unused".to_string(), schedule: Vec::new() }
     }
 
-    fn slow_backup_config() -> BackupConfig {
-        BackupConfig { enabled: true, dir: "unused".to_string(), scan_batch_size: 1, scan_pause_ms: 300, schedule: Vec::new() }
+    /// Backup enabled with a scan of one entry per 300 ms, so a job keeps the slot busy.
+    async fn make_slow_state() -> (AppState, tempfile::TempDir) {
+        let (mut state, dir) = make_state(Some(enabled_backup_config()), false).await;
+        let manager = state.backup_manager.as_mut().unwrap();
+        Arc::get_mut(manager).unwrap().set_scan_throttle(1, 300);
+        (state, dir)
     }
 
     /// `backup_config = None` -> `backup_manager: None`; `Some(cfg)` -> enabled,
@@ -854,7 +858,7 @@ mod tests {
     // 11a. A second POST /backups while one is running -> 409 (job slot busy).
     #[tokio::test]
     async fn test_second_backup_conflicts_with_running_job() {
-        let (state, _dir) = make_state(Some(slow_backup_config()), false).await;
+        let (state, _dir) = make_slow_state().await;
         let store = state.registry.store("default").await.unwrap();
         for i in 0..5 {
             store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
@@ -873,7 +877,7 @@ mod tests {
     // (job slot busy), rejected synchronously before any file is even read.
     #[tokio::test]
     async fn test_restore_conflicts_with_running_job() {
-        let (state, dir) = make_state(Some(slow_backup_config()), false).await;
+        let (state, dir) = make_slow_state().await;
         let backup_dir = dir.path().join("backups");
         write_fake_backup(&backup_dir, "bk_fake", "all", now_secs(), None, true);
         let store = state.registry.store("default").await.unwrap();
@@ -902,7 +906,7 @@ mod tests {
     // state="running" from the job slot instead of 404 (orchestrator hint 3).
     #[tokio::test]
     async fn test_download_and_delete_conflict_while_backup_running() {
-        let (state, _dir) = make_state(Some(slow_backup_config()), false).await;
+        let (state, _dir) = make_slow_state().await;
         let store = state.registry.store("default").await.unwrap();
         for i in 0..5 {
             store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
@@ -936,7 +940,7 @@ mod tests {
     // manifest (regression: the slot early-return ignored the job kind).
     #[tokio::test]
     async fn test_get_backup_ignores_running_restore_job() {
-        let (state, _dir) = make_state(Some(slow_backup_config()), false).await;
+        let (state, _dir) = make_slow_state().await;
         state.registry.create_domain("shop").await.unwrap();
         let store = state.registry.store("shop").await.unwrap();
         for i in 0..3 {
@@ -1047,7 +1051,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["backup"], serde_json::Value::Null, "disabled backup must report a null block");
 
-        let (state, _dir) = make_state(Some(slow_backup_config()), false).await;
+        let (state, _dir) = make_slow_state().await;
         let store = state.registry.store("default").await.unwrap();
         for i in 0..5 {
             store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();

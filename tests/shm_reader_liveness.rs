@@ -137,10 +137,7 @@ fn shm_config(instance_id: &str, sock: &Path) -> ShmConfig {
     ShmConfig {
         enabled: true,
         instance_id: instance_id.to_string(),
-        state_size: 4096,
         data_buffer_size: 8192,
-        command_buffer_size: 4096,
-        segment_mode: 0o600,
         registration_socket_path: sock.to_string_lossy().to_string(),
         snapshot_interval_ms: 100,
     }

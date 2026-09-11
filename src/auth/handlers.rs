@@ -585,7 +585,6 @@ mod tests {
                 wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
                 vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
                 sstable_dir: dir.path().join("json_sst").to_string_lossy().into_owned(),
-                reindex_pause_ms: 0,
                 ..crate::config::JsonStoreConfig::default()
             };
             Some(JsonEngine::bootstrap(&config, Arc::clone(&metrics)).await.unwrap())

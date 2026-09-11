@@ -1081,7 +1081,8 @@ mod tests {
     #[tokio::test]
     async fn test_max_join_depth_over_combined_chain() {
         let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_join_depth: 1, ..config_in(dir.path()) }).await;
+        let mut rel = boot(config_in(dir.path())).await;
+        Arc::get_mut(&mut rel).unwrap().set_max_join_depth(1);
         ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
         ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, c_id INTEGER)").await;
         ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY)").await;

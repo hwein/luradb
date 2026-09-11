@@ -1,6 +1,9 @@
 use crate::core::wal::WAL_MAX_FIELD_LEN;
+use crate::engines::json::domain as json_domain;
+use crate::engines::rel::{catalog as rel_catalog, row::ROW_HEADER_LEN};
+use serde::de::{self, value::StrDeserializer, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
@@ -13,7 +16,6 @@ pub struct LuraConfig {
     pub storage: StorageConfig,
     pub io_engine: IoEngineConfig,
     pub buffer_pool: BufferPoolConfig,
-    pub block_cache: BlockCacheConfig,
     pub lsm: LsmConfig,
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
@@ -22,7 +24,6 @@ pub struct LuraConfig {
     pub rate_limit: RateLimitConfig,
     pub log: LogConfig,
     pub auth: AuthConfig,
-    pub metrics: MetricsCfg,
     pub proxy: ProxyConfig,
     pub json: JsonStoreConfig,
     pub rel: RelStoreConfig,
@@ -40,7 +41,6 @@ impl Default for LuraConfig {
             storage: StorageConfig::default(),
             io_engine: IoEngineConfig::default(),
             buffer_pool: BufferPoolConfig::default(),
-            block_cache: BlockCacheConfig::default(),
             lsm: LsmConfig::default(),
             compaction: CompactionCfg::default(),
             janitor: JanitorCfg::default(),
@@ -49,7 +49,6 @@ impl Default for LuraConfig {
             rate_limit: RateLimitConfig::default(),
             log: LogConfig::default(),
             auth: AuthConfig::default(),
-            metrics: MetricsCfg::default(),
             proxy: ProxyConfig::default(),
             json: JsonStoreConfig::default(),
             rel: RelStoreConfig::default(),
@@ -63,15 +62,23 @@ impl Default for LuraConfig {
 }
 
 impl LuraConfig {
-    /// Loads config from `path`. Returns `Default` if the file does not exist.
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
+    /// Loads config from `path` plus its unknown keys (see [`Self::parse`]).
+    /// Returns `Default` if the file does not exist.
+    pub fn load(path: &Path) -> anyhow::Result<(Self, Vec<String>)> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), Vec::new()));
         }
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
-        Ok(config)
+        Self::parse(&content).map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))
+    }
+
+    /// Parses config text. Also returns the keys it sets that the server does
+    /// not read, sorted and deduplicated; they are ignored (spec general/030).
+    pub fn parse(content: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
+        let config = toml::from_str(content)?;
+        let mut keys = Vec::new();
+        toml_keys(&content.parse()?, "", &mut keys);
+        Ok((config, unknown_keys(keys, &known_keys())))
     }
 
     /// Rejects data paths that share a real location or land on a vLog
@@ -268,8 +275,6 @@ pub struct ServerConfig {
     pub hello_message: String,
     /// Absolute path for the Unix Domain Socket. `None` = UDS disabled.
     pub unix_socket_path: Option<String>,
-    /// Filesystem mode for the socket (e.g. 432 = 0o660). Default: 0o660.
-    pub unix_socket_mode: Option<u32>,
     /// Set to `false` to disable the plain HTTP listener (spec general/011).
     pub http_enabled: bool,
     /// Enables the native HTTPS listener on `tls_port` (spec general/011).
@@ -292,7 +297,6 @@ impl Default for ServerConfig {
             hello_enabled: true,
             hello_message: "Hello from LuraDB".to_string(),
             unix_socket_path: None,
-            unix_socket_mode: None,
             http_enabled: true,
             tls_enabled: false,
             tls_port: 3443,
@@ -355,35 +359,11 @@ impl Default for StorageConfig {
 pub struct IoEngineConfig {
     /// Enables the IoEngine (Default: false). Also gates the perf/005 storage thread.
     pub enabled: bool,
-    /// Number of registered buffer slots (Default: 128).
-    pub registered_buffer_count: usize,
-    /// Size of each slot in bytes (Default: 65536 = 64 KB).
-    pub registered_buffer_size: usize,
-    /// Storage thread: use an io_uring SQPOLL ring (Default: true). Falls back
-    /// to the standard ring on EPERM (missing CAP_SYS_NICE).
-    pub sqpoll_enabled: bool,
-    /// SQPOLL kernel-thread idle timeout in milliseconds (Default: 2000).
-    pub sqpoll_idle_ms: u32,
-    /// CPU core to pin the storage thread to (`-1` = no pinning). Default: -1.
-    pub storage_thread_cpu: i32,
-    /// io_uring submission/completion queue depth (Default: 256).
-    pub ring_depth: u32,
-    /// Bounded request channel capacity for backpressure (Default: 1024).
-    pub request_channel_capacity: usize,
 }
 
 impl Default for IoEngineConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            registered_buffer_count: 128,
-            registered_buffer_size: 65536,
-            sqpoll_enabled: true,
-            sqpoll_idle_ms: 2000,
-            storage_thread_cpu: -1,
-            ring_depth: 256,
-            request_channel_capacity: 1024,
-        }
+        Self { enabled: false }
     }
 }
 
@@ -403,8 +383,9 @@ impl Default for BufferPoolConfig {
 
 // ── Block Cache (Spec 015) ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
+/// Block-cache sizing of one LSM instance. A parameter type, not a config
+/// section: the engines pass fixed values (spec general/030).
+#[derive(Debug)]
 pub struct BlockCacheConfig {
     /// Maximum total size of the block cache in bytes (default: 64 MB).
     pub capacity_bytes: usize,
@@ -436,12 +417,9 @@ pub struct LsmConfig {
     pub flush_check_interval_ms: u64,
     pub compaction_check_interval_ms: u64,
     pub wal_event_channel_capacity: usize,
-    /// Access SSTables via mmap (perf/003). `false` = load files fully (escape hatch).
-    pub use_mmap: bool,
     /// KV watch replay-ring capacity (spec kv/024). `0` disables resume —
     /// every reconnect with a `Last-Event-ID` gets `reset`, but `id:` fields
-    /// are still assigned. Only the KV engine uses this; json/rel force it
-    /// to `0` (no watch endpoint there).
+    /// are still assigned.
     pub watch_replay_buffer_size: usize,
 }
 
@@ -455,31 +433,83 @@ impl Default for LsmConfig {
             flush_check_interval_ms: 100,
             compaction_check_interval_ms: 1000,
             wal_event_channel_capacity: 256,
-            use_mmap: true,
             watch_replay_buffer_size: 1024,
         }
     }
 }
 
 impl LsmConfig {
-    /// Startup validation (spec general/025): `max_value_size` and
-    /// `max_key_length` are the two WAL length-prefixed fields this engine
-    /// writes. A value above `WAL_MAX_FIELD_LEN` would still write today and
-    /// only fail recovery on the *next* restart -- reject it at startup
-    /// instead. `prefix` names the TOML block (`"lsm"`, `"json.lsm"`,
-    /// `"rel.lsm"`) in the error message.
-    pub fn validate(&self, prefix: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.max_value_size <= WAL_MAX_FIELD_LEN,
-            "invalid config: {prefix}.max_value_size ({}) exceeds the WAL recovery field cap ({WAL_MAX_FIELD_LEN} bytes) — writes this large could never be recovered",
-            self.max_value_size
-        );
-        anyhow::ensure!(
-            self.max_key_length <= WAL_MAX_FIELD_LEN,
-            "invalid config: {prefix}.max_key_length ({}) exceeds the WAL recovery field cap ({WAL_MAX_FIELD_LEN} bytes) — writes this large could never be recovered",
-            self.max_key_length
-        );
-        Ok(())
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_wal_field("lsm.max_value_size", self.max_value_size)?;
+        check_wal_field("lsm.max_key_length", self.max_key_length)
+    }
+}
+
+/// Startup validation (spec general/025): a key or value limit above
+/// `WAL_MAX_FIELD_LEN` would still write today and only fail recovery on the
+/// *next* restart -- reject it at startup instead.
+fn check_wal_field(key: &str, value: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value <= WAL_MAX_FIELD_LEN,
+        "invalid config: {key} ({value}) exceeds the WAL recovery field cap ({WAL_MAX_FIELD_LEN} bytes) — writes this large could never be recovered"
+    );
+    Ok(())
+}
+
+/// Startup validation (spec general/030): rejects `value` below `min`.
+fn check_min(key: &str, value: usize, min: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(value >= min, "invalid config: {key} ({value}) must be at least {min}");
+    Ok(())
+}
+
+/// `[json.lsm]`: the JSON instance's key and value limits; its other LSM
+/// settings are the engine defaults.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct JsonLsmConfig {
+    pub max_key_length: usize,
+    pub max_value_size: usize,
+}
+
+impl Default for JsonLsmConfig {
+    fn default() -> Self {
+        Self {
+            max_key_length: 256,
+            max_value_size: 512 * 1024,
+        }
+    }
+}
+
+/// Lower bound of `json.lsm.max_value_size` (spec general/030).
+pub(crate) const JSON_LSM_MIN_VALUE_SIZE: usize = 4096;
+
+impl JsonLsmConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("json.lsm.max_value_size", self.max_value_size, JSON_LSM_MIN_VALUE_SIZE)?;
+        check_wal_field("json.lsm.max_value_size", self.max_value_size)?;
+        check_min("json.lsm.max_key_length", self.max_key_length, json_domain::MIN_LSM_KEY_LENGTH)?;
+        check_wal_field("json.lsm.max_key_length", self.max_key_length)
+    }
+}
+
+/// `[rel.lsm]`: the relational instance's key limit. Its value limit derives
+/// from `rel.max_row_size`; its other LSM settings are the engine defaults.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RelLsmConfig {
+    pub max_key_length: usize,
+}
+
+impl Default for RelLsmConfig {
+    fn default() -> Self {
+        Self { max_key_length: 256 }
+    }
+}
+
+impl RelLsmConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("rel.lsm.max_key_length", self.max_key_length, rel_catalog::MIN_LSM_KEY_LENGTH)?;
+        check_wal_field("rel.lsm.max_key_length", self.max_key_length)
     }
 }
 
@@ -655,24 +685,6 @@ pub struct AdminEntry {
     pub api_key: String,
 }
 
-// ── Metrics ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct MetricsCfg {
-    pub window_secs: u64,
-    pub ticker_interval_ms: u64,
-}
-
-impl Default for MetricsCfg {
-    fn default() -> Self {
-        Self {
-            window_secs: 60,
-            ticker_interval_ms: 1000,
-        }
-    }
-}
-
 // ── Logging ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -697,7 +709,7 @@ pub enum LogFormat {
 pub struct LogConfig {
     pub level: LogLevel,
     pub format: LogFormat,
-    /// Empty = stdout only. Recommended for systemd: "/var/log/luradb".
+    /// Empty = stdout only; the directory is created if missing.
     pub path: String,
     /// "none" | "daily" | "hourly" — ignored when path is empty.
     pub rotation: String,
@@ -741,7 +753,6 @@ pub struct LogModulesConfig {
     pub auth: Option<LogLevel>,
     pub api: Option<LogLevel>,
     pub engine: Option<LogLevel>,
-    pub domains: Option<LogLevel>,
     pub storage: Option<LogLevel>,
 }
 
@@ -765,7 +776,7 @@ impl Default for ProxyConfig {
 
 // ── JSON Store (spec json/001) ────────────────────────────────────────────────
 
-/// Config for the JSON engine's dedicated LSM instance (own paths & tuning).
+/// Config for the JSON engine's dedicated LSM instance (own paths & limits).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JsonStoreConfig {
@@ -774,25 +785,11 @@ pub struct JsonStoreConfig {
     pub wal_path: String,
     pub vlog_path: String,
     pub sstable_dir: String,
-    pub max_document_key_length: usize,
-    /// Documents per atomic write batch during bulk load.
-    pub bulk_batch_size: usize,
     /// Max HTTP request-body size for `/json/{domain}/bulk` in bytes
     /// (default 64 MB). Raises axum's 2 MB default so NDJSON exports can be
     /// re-imported in one request.
     pub bulk_body_limit_bytes: usize,
-    /// Documents per re-index batch.
-    pub reindex_batch_size: usize,
-    /// Throttle pause between re-index batches (ms).
-    pub reindex_pause_ms: u64,
-    /// Keys tombstoned per purger tick.
-    pub purger_batch_size: usize,
-    /// Seconds between purger ticks.
-    pub purger_interval_secs: u64,
-    pub lsm: LsmConfig,
-    pub compaction: CompactionCfg,
-    pub janitor: JanitorCfg,
-    pub block_cache: BlockCacheConfig,
+    pub lsm: JsonLsmConfig,
 }
 
 impl Default for JsonStoreConfig {
@@ -802,25 +799,25 @@ impl Default for JsonStoreConfig {
             wal_path: "luradb_json.wal".to_string(),
             vlog_path: "luradb_json.vlog".to_string(),
             sstable_dir: "luradb_json_sstables".to_string(),
-            max_document_key_length: 256,
-            bulk_batch_size: 100,
             bulk_body_limit_bytes: 64 * 1024 * 1024,
-            reindex_batch_size: 500,
-            reindex_pause_ms: 10,
-            purger_batch_size: 100,
-            purger_interval_secs: 5,
-            lsm: LsmConfig::default(),
-            compaction: CompactionCfg::default(),
-            janitor: JanitorCfg::default(),
-            block_cache: BlockCacheConfig::default(),
+            lsm: JsonLsmConfig::default(),
         }
+    }
+}
+
+impl JsonStoreConfig {
+    /// Startup validation of the limits; runs even while the engine is
+    /// disabled, since it can be switched on later (spec general/030).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("json.bulk_body_limit_bytes", self.bulk_body_limit_bytes, 1)?;
+        self.lsm.validate()
     }
 }
 
 // ── Relational Store (spec rel/001) ───────────────────────────────────────────
 
 /// Config for the relational engine's dedicated LSM instance (own paths &
-/// tuning). No `db_path` — like the JSON engine, this LSM instance has no
+/// limits). No `db_path` — like the JSON engine, this LSM instance has no
 /// buffer-pool/DiskManager stack, so there is no database file to point at.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -830,49 +827,24 @@ pub struct RelStoreConfig {
     pub wal_path: String,
     pub vlog_path: String,
     pub sstable_dir: String,
-    /// Catalog limits (spec rel/003, concept 8).
-    pub max_columns: usize,
-    pub max_indexes_per_table: usize,
+    /// Catalog limit (spec rel/003, concept 8).
     pub max_tables_per_domain: usize,
-    /// SQL frontend guard (spec rel/004, concept 8): a statement longer than
-    /// this many bytes is rejected before lexing.
-    pub max_statement_len: usize,
-    /// DML write-path guards (spec rel/005, concept 8): max bytes per
-    /// TEXT/KVREF/JSONREF value and max encoded LuraRow size.
-    pub max_text_len: usize,
+    /// DML write-path guard (spec rel/005, concept 8): max encoded LuraRow
+    /// size. The engine's storage value limit is the larger of this and
+    /// 512 KiB (spec general/030).
     pub max_row_size: usize,
-    /// SELECT executor limits (spec rel/006, concept 8): applied when no
-    /// explicit LIMIT is given, the hard cap on any explicit LIMIT, and the
-    /// hard cap on the in-memory ORDER BY sort buffer.
-    pub default_limit: usize,
+    /// SELECT executor limits (spec rel/006, concept 8): the hard cap on any
+    /// explicit LIMIT, and the hard cap on the in-memory ORDER BY sort buffer.
     pub max_limit: usize,
     pub max_sort_rows: usize,
-    /// JOIN governance (spec rel/007, concept 8): max `LEFT JOIN` stages per
-    /// statement, and whether an unindexed join column may fall back to a
-    /// per-row full scan (dev/tiny-table escape hatch) instead of a 400.
-    pub max_join_depth: usize,
+    /// JOIN governance (spec rel/007, concept 8): whether an unindexed join
+    /// column may fall back to a per-row full scan (dev/tiny-table escape
+    /// hatch) instead of a 400.
     pub allow_unindexed_joins: bool,
-    /// REST response cap (spec rel/009, concept 8): the `/sql` handler
-    /// rejects a serialized response (incl. `expanded`) larger than this
-    /// with 413, after `max_limit`/`max_sort_rows`/`max_join_depth` already
-    /// bounded its shape — the backstop, especially for expand fan-out.
-    pub max_response_bytes: usize,
-    /// Cross-engine sweep (spec rel/012 §5/§8): seconds between sweep ticks,
-    /// and the max cells nulled per (domain, column, tick). A separate, gentler
-    /// cadence than the rel/013 purger (read-modify-write on live rows).
-    pub cross_engine_sweep_interval_secs: u64,
-    pub cross_engine_sweep_batch_size: usize,
-    /// Domain purger (spec rel/013 §6): data keys/candidate probes tombstoned
-    /// per batch, and seconds between ticks. Mirrors `[json]`.
-    pub purger_batch_size: usize,
-    pub purger_interval_secs: u64,
     /// Body-size cap for `POST .../tables/from-file` (spec rel/019), analogous
     /// to `json.bulk_body_limit_bytes`.
     pub import_body_limit_bytes: usize,
-    pub lsm: LsmConfig,
-    pub compaction: CompactionCfg,
-    pub janitor: JanitorCfg,
-    pub block_cache: BlockCacheConfig,
+    pub lsm: RelLsmConfig,
 }
 
 impl Default for RelStoreConfig {
@@ -882,28 +854,34 @@ impl Default for RelStoreConfig {
             wal_path: "luradb_rel.wal".to_string(),
             vlog_path: "luradb_rel.vlog".to_string(),
             sstable_dir: "luradb_rel_sstables".to_string(),
-            max_columns: 128,
-            max_indexes_per_table: 16,
             max_tables_per_domain: 256,
-            max_statement_len: 64 * 1024,
-            max_text_len: 64 * 1024,
             max_row_size: 512 * 1024,
-            default_limit: 1_000,
             max_limit: 10_000,
             max_sort_rows: 100_000,
-            max_join_depth: 8,
             allow_unindexed_joins: false,
-            max_response_bytes: 32 * 1024 * 1024,
-            cross_engine_sweep_interval_secs: 10,
-            cross_engine_sweep_batch_size: 100,
-            purger_batch_size: 100,
-            purger_interval_secs: 5,
             import_body_limit_bytes: 64 * 1024 * 1024,
-            lsm: LsmConfig::default(),
-            compaction: CompactionCfg::default(),
-            janitor: JanitorCfg::default(),
-            block_cache: BlockCacheConfig::default(),
+            lsm: RelLsmConfig::default(),
         }
+    }
+}
+
+impl RelStoreConfig {
+    /// Startup validation of the limits; runs even while the engine is
+    /// disabled, since it can be switched on later (spec general/030).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // Table and index ids are u32.
+        let max_tables = u32::MAX as usize;
+        anyhow::ensure!(
+            (1..=max_tables).contains(&self.max_tables_per_domain),
+            "invalid config: rel.max_tables_per_domain ({}) must be between 1 and {max_tables}",
+            self.max_tables_per_domain
+        );
+        check_min("rel.max_row_size", self.max_row_size, ROW_HEADER_LEN + 1)?;
+        // The storage value limit is at least max_row_size.
+        check_wal_field("rel.max_row_size", self.max_row_size)?;
+        check_min("rel.max_limit", self.max_limit, 1)?;
+        check_min("rel.max_sort_rows", self.max_sort_rows, 1)?;
+        self.lsm.validate()
     }
 }
 
@@ -920,15 +898,8 @@ pub struct ShmConfig {
     /// Namespace suffix for segment/lock names — allows multiple instances
     /// on one host (Default: "0").
     pub instance_id: String,
-    /// Size of the state-header segment in bytes (Default: 4096).
-    pub state_size: usize,
     /// Size of each double-buffer data segment in bytes (Default: 256 MB).
     pub data_buffer_size: usize,
-    /// Size of the command ringbuffer segment in bytes; must be a power of
-    /// two (Default: 4 MB). Also the size of every per-client cmd/resp ring.
-    pub command_buffer_size: usize,
-    /// Filesystem mode for created segments (Default: 0o660).
-    pub segment_mode: u32,
     /// UDS path for the multi-client registration listener; `{instance_id}`
     /// is substituted at runtime (Default: "/run/luradb/{instance_id}.sock").
     pub registration_socket_path: String,
@@ -943,10 +914,7 @@ impl Default for ShmConfig {
         Self {
             enabled: false,
             instance_id: "0".to_string(),
-            state_size: 4096,
             data_buffer_size: 268_435_456,
-            command_buffer_size: 4_194_304,
-            segment_mode: 0o660,
             registration_socket_path: "/run/luradb/{instance_id}.sock".to_string(),
             snapshot_interval_ms: 100,
         }
@@ -959,46 +927,36 @@ impl ShmConfig {
         self.registration_socket_path.replace("{instance_id}", &self.instance_id)
     }
 
-    /// Validates the size constraints the segment/ringbuffer code relies on.
+    /// Validates the data buffer size, the instance id and the snapshot interval.
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.command_buffer_size.is_power_of_two(),
-            "shm.command_buffer_size must be a power of two, got {}",
-            self.command_buffer_size
-        );
-        // DoubleMmapRegion::new requires size >= page_size (4096); a smaller
-        // power of two passes startup but fails every client registration.
-        anyhow::ensure!(
-            self.command_buffer_size >= 4096,
-            "shm.command_buffer_size must be at least 4096 bytes, got {}",
-            self.command_buffer_size
-        );
-        // Same bound the startup path checks, taken from the type itself so the
-        // two can't drift apart (spec perf/012 §8).
-        anyhow::ensure!(
-            self.state_size >= crate::ipc::StateHeader::SIZE,
-            "shm.state_size must be at least {} bytes, got {}",
-            crate::ipc::StateHeader::SIZE,
-            self.state_size
-        );
-        anyhow::ensure!(
-            self.data_buffer_size >= 4096,
-            "shm.data_buffer_size must be at least 4096 bytes, got {}",
-            self.data_buffer_size
-        );
+        check_min("shm.data_buffer_size", self.data_buffer_size, 4096)?;
         // '_' would make the stale-scan prefix `luradb_{id}_` ambiguous across
         // instances (id "0" would match and unlink live segments of "0_backup").
         anyhow::ensure!(
             !self.instance_id.is_empty()
                 && self.instance_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-            "shm.instance_id must be non-empty and contain only [A-Za-z0-9-], got '{}'",
+            "invalid config: shm.instance_id ('{}') must be non-empty and contain only [A-Za-z0-9-]",
             self.instance_id
         );
         // 0 would turn the snapshot publisher into a busy loop of full scans.
         anyhow::ensure!(
             self.snapshot_interval_ms >= 1,
-            "shm.snapshot_interval_ms must be at least 1, got {}",
+            "invalid config: shm.snapshot_interval_ms ({}) must be at least 1",
             self.snapshot_interval_ms
+        );
+        Ok(())
+    }
+
+    /// Startup validation (spec general/030), a no-op while SHM is off: the
+    /// REST listener binds after the registration socket and would replace it.
+    pub fn validate_registration_socket(&self, server: &ServerConfig) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let registration = self.resolved_registration_socket_path();
+        anyhow::ensure!(
+            server.unix_socket_path.as_deref().map(Path::new) != Some(Path::new(&registration)),
+            "invalid config: shm.registration_socket_path ('{registration}') equals server.unix_socket_path — SHM clients could not register; use a different path"
         );
         Ok(())
     }
@@ -1014,11 +972,6 @@ pub struct BackupConfig {
     /// Target directory for backup artifacts. Collisions with storage.*/
     /// json.*/rel.* paths are rejected by `LuraConfig::validate_data_paths`.
     pub dir: String,
-    /// Entries scanned per batch and the pause between batches (pattern:
-    /// json.reindex_batch_size/reindex_pause_ms) — keeps the foreground
-    /// latency impact small. 0 is treated as 1.
-    pub scan_batch_size: usize,
-    pub scan_pause_ms: u64,
     /// Zero to many schedules; without one there are only on-demand backups.
     /// `[[backup.schedule]]` in TOML (singular) maps to this plural Vec field.
     pub schedule: Vec<BackupScheduleConfig>,
@@ -1029,8 +982,6 @@ impl Default for BackupConfig {
         Self {
             enabled: false,
             dir: "luradb_backups".to_string(),
-            scan_batch_size: 500,
-            scan_pause_ms: 10,
             schedule: Vec::new(),
         }
     }
@@ -1050,11 +1001,19 @@ pub struct BackupScheduleConfig {
     pub keep_last: usize,
 }
 
+/// A schedule must fire within 4 years including a leap day (spec general/030).
+const CRON_HORIZON_DAYS: u64 = 4 * 365 + 1;
+
 impl BackupConfig {
     /// Startup validation (spec general/006, fail fast). A no-op when
     /// `enabled = false` — a disabled backup config runs no scheduler and
     /// serves no endpoints, so its contents are never acted on.
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_at(crate::engines::lsm::domain::now_secs())
+    }
+
+    /// [`Self::validate`] for the start time `now` (Unix seconds, UTC).
+    fn validate_at(&self, now: u64) -> anyhow::Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -1064,33 +1023,39 @@ impl BackupConfig {
         for sched in &self.schedule {
             anyhow::ensure!(
                 crate::auth::handlers::valid_name(&sched.name),
-                "invalid config: backup schedule name '{}' must be 1-50 characters of [a-zA-Z0-9_-]",
+                "invalid config: backup.schedule.name ('{}') must be 1-50 characters of [a-zA-Z0-9_-]",
                 sched.name
             );
             anyhow::ensure!(
                 seen_names.insert(sched.name.clone()),
-                "invalid config: duplicate backup schedule name '{}'",
+                "invalid config: backup.schedule.name ('{}') must be unique across schedules",
                 sched.name
             );
-            crate::backup::cron::CronSchedule::parse(&sched.cron).map_err(|e| {
+            let cron = crate::backup::cron::CronSchedule::parse(&sched.cron).map_err(|e| {
                 anyhow::anyhow!(
-                    "invalid config: backup schedule '{}' has an invalid cron expression '{}': {e}",
-                    sched.name,
-                    sched.cron
+                    "invalid config: backup.schedule.cron ('{}') is not a valid cron expression: {e} (schedule '{}')",
+                    sched.cron,
+                    sched.name
                 )
             })?;
+            anyhow::ensure!(
+                cron.fires_within_days(now, CRON_HORIZON_DAYS),
+                "invalid config: backup.schedule.cron ('{}') has no date within 4 years — the schedule would never run (schedule '{}')",
+                sched.cron,
+                sched.name
+            );
             crate::backup::BackupScope::parse(&sched.scope).map_err(|e| {
                 anyhow::anyhow!(
-                    "invalid config: backup schedule '{}' has an invalid scope '{}': {e}",
-                    sched.name,
-                    sched.scope
+                    "invalid config: backup.schedule.scope ('{}') is not a valid scope: {e} (schedule '{}')",
+                    sched.scope,
+                    sched.name
                 )
             })?;
             anyhow::ensure!(
                 sched.keep_last >= 1,
-                "invalid config: backup schedule '{}' keep_last must be >= 1, got {}",
-                sched.name,
-                sched.keep_last
+                "invalid config: backup.schedule.keep_last ({}) must be at least 1 (schedule '{}')",
+                sched.keep_last,
+                sched.name
             );
         }
         Ok(())
@@ -1232,9 +1197,279 @@ impl Default for MulticoreConfig {
     }
 }
 
+impl MulticoreConfig {
+    /// Startup validation (spec general/030): more permits than `cores` would
+    /// not bound the offload pool at all.
+    pub fn validate(&self, cores: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.cpu_offload_threads <= cores,
+            "invalid config: multicore.cpu_offload_threads ({}) must be 0 (auto) or 1 to {cores} (available cores)",
+            self.cpu_offload_threads
+        );
+        Ok(())
+    }
+}
+
+// ── Key set (spec general/030) ────────────────────────────────────────────────
+
+/// Every leaf key the server reads, e.g. `auth.admins.api_key`, taken from
+/// the field lists serde passes while deserializing the config types.
+pub(crate) fn known_keys() -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    LuraConfig::deserialize(KeyRecorder { path: String::new(), keys: &mut keys })
+        .unwrap_or_else(|e| panic!("config key recorder: {e}"));
+    keys
+}
+
+/// Appends the leaf key paths a TOML table sets. Elements of a table array
+/// (`[[x]]`) share the path `x`; empty tables set no key. A segment with a
+/// dot stays quoted, so it matches no known key.
+fn toml_keys(table: &toml::Table, prefix: &str, keys: &mut Vec<String>) {
+    for (name, value) in table {
+        let segment = if name.contains('.') { format!("{name:?}") } else { name.clone() };
+        let path = if prefix.is_empty() { segment } else { format!("{prefix}.{segment}") };
+        match value {
+            toml::Value::Table(table) => toml_keys(table, &path, keys),
+            toml::Value::Array(items) if !items.is_empty() && items.iter().all(toml::Value::is_table) => {
+                for item in items.iter().filter_map(toml::Value::as_table) {
+                    toml_keys(item, &path, keys);
+                }
+            }
+            _ => keys.push(path),
+        }
+    }
+}
+
+/// The `keys` that are not in `known`, sorted and deduplicated. A section
+/// path counts as known: `admins = []` sets no key.
+fn unknown_keys(keys: Vec<String>, known: &BTreeSet<String>) -> Vec<String> {
+    let is_section = |key: &str| known.iter().any(|k| k.strip_prefix(key).is_some_and(|rest| rest.starts_with('.')));
+    keys.into_iter()
+        .filter(|key| !known.contains(key) && !is_section(key))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+type RecorderError = de::value::Error;
+
+/// Deserializer that hands every struct its own field names, every `Option`
+/// a value and every sequence one element, and records each leaf's path.
+struct KeyRecorder<'a> {
+    path: String,
+    keys: &'a mut BTreeSet<String>,
+}
+
+impl KeyRecorder<'_> {
+    fn record(self) {
+        self.keys.insert(self.path);
+    }
+}
+
+macro_rules! record_number {
+    ($($method:ident)*) => {$(
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            self.record();
+            visitor.visit_u64(0)
+        }
+    )*};
+}
+
+impl<'de> Deserializer<'de> for KeyRecorder<'_> {
+    type Error = RecorderError;
+
+    // Types without a field list would drop their keys silently.
+    fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
+        Err(de::Error::custom(format!("cannot walk the type of '{}'", self.path)))
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_map(FieldRecorder { path: self.path, keys: self.keys, fields: fields.iter(), field: "" })
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_seq(OneElement(Some(self)))
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        let Some(&variant) = variants.first() else {
+            return self.deserialize_any(visitor);
+        };
+        self.record();
+        visitor.visit_enum(StrDeserializer::new(variant))
+    }
+
+    fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.record();
+        visitor.visit_bool(false)
+    }
+
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.record();
+        visitor.visit_str("")
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_str(visitor)
+    }
+
+    record_number! {
+        deserialize_i8 deserialize_i16 deserialize_i32 deserialize_i64
+        deserialize_u8 deserialize_u16 deserialize_u32 deserialize_u64
+        deserialize_f32 deserialize_f64
+    }
+
+    serde::forward_to_deserialize_any! {
+        i128 u128 char bytes byte_buf unit unit_struct newtype_struct tuple tuple_struct map identifier ignored_any
+    }
+}
+
+/// A struct's fields as map entries; each value records under `path.field`.
+struct FieldRecorder<'a> {
+    path: String,
+    keys: &'a mut BTreeSet<String>,
+    fields: std::slice::Iter<'static, &'static str>,
+    field: &'static str,
+}
+
+impl<'de> MapAccess<'de> for FieldRecorder<'_> {
+    type Error = RecorderError;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error> {
+        let Some(&field) = self.fields.next() else {
+            return Ok(None);
+        };
+        self.field = field;
+        seed.deserialize(StrDeserializer::new(field)).map(Some)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Self::Error> {
+        let path = match self.path.as_str() {
+            "" => self.field.to_string(),
+            parent => format!("{parent}.{}", self.field),
+        };
+        seed.deserialize(KeyRecorder { path, keys: &mut *self.keys })
+    }
+}
+
+/// A sequence of one element, recorded under the sequence's own path.
+struct OneElement<'a>(Option<KeyRecorder<'a>>);
+
+impl<'de> SeqAccess<'de> for OneElement<'_> {
+    type Error = RecorderError;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error> {
+        self.0.take().map(|element| seed.deserialize(element)).transpose()
+    }
+}
+
+/// Keys removed by spec general/030, for the tests that check their absence.
+#[cfg(test)]
+pub(crate) const REMOVED_KEYS: &[&str] = &[
+    "server.unix_socket_mode",
+    "log.modules.domains",
+    "metrics.window_secs",
+    "metrics.ticker_interval_ms",
+    "io_engine.registered_buffer_count",
+    "io_engine.registered_buffer_size",
+    "io_engine.sqpoll_enabled",
+    "io_engine.sqpoll_idle_ms",
+    "io_engine.storage_thread_cpu",
+    "io_engine.ring_depth",
+    "io_engine.request_channel_capacity",
+    "lsm.use_mmap",
+    "block_cache.capacity_bytes",
+    "block_cache.small_ratio",
+    "block_cache.ghost_capacity",
+    "json.lsm.use_mmap",
+    "rel.lsm.use_mmap",
+    "shm.state_size",
+    "shm.command_buffer_size",
+    "shm.segment_mode",
+    "backup.scan_batch_size",
+    "backup.scan_pause_ms",
+    "json.max_document_key_length",
+    "json.bulk_batch_size",
+    "json.reindex_batch_size",
+    "json.reindex_pause_ms",
+    "json.purger_batch_size",
+    "json.purger_interval_secs",
+    "json.lsm.vlog_inline_threshold",
+    "json.lsm.memtable_size_threshold",
+    "json.lsm.flush_check_interval_ms",
+    "json.lsm.compaction_check_interval_ms",
+    "json.lsm.wal_event_channel_capacity",
+    "json.lsm.watch_replay_buffer_size",
+    "json.compaction.l0_threshold",
+    "json.compaction.l1_max_size",
+    "json.compaction.level_size_ratio",
+    "json.compaction.max_sstable_size",
+    "json.janitor.check_interval_secs",
+    "json.janitor.dead_bytes_threshold",
+    "json.janitor.min_vlog_size_bytes",
+    "json.block_cache.capacity_bytes",
+    "json.block_cache.small_ratio",
+    "json.block_cache.ghost_capacity",
+    "rel.max_columns",
+    "rel.max_indexes_per_table",
+    "rel.max_statement_len",
+    "rel.max_text_len",
+    "rel.default_limit",
+    "rel.max_join_depth",
+    "rel.max_response_bytes",
+    "rel.cross_engine_sweep_interval_secs",
+    "rel.cross_engine_sweep_batch_size",
+    "rel.purger_batch_size",
+    "rel.purger_interval_secs",
+    "rel.lsm.vlog_inline_threshold",
+    "rel.lsm.memtable_size_threshold",
+    "rel.lsm.max_value_size",
+    "rel.lsm.flush_check_interval_ms",
+    "rel.lsm.compaction_check_interval_ms",
+    "rel.lsm.wal_event_channel_capacity",
+    "rel.lsm.watch_replay_buffer_size",
+    "rel.compaction.l0_threshold",
+    "rel.compaction.l1_max_size",
+    "rel.compaction.level_size_ratio",
+    "rel.compaction.max_sstable_size",
+    "rel.janitor.check_interval_secs",
+    "rel.janitor.dead_bytes_threshold",
+    "rel.janitor.min_vlog_size_bytes",
+    "rel.block_cache.capacity_bytes",
+    "rel.block_cache.small_ratio",
+    "rel.block_cache.ghost_capacity",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Spec general/030: a config that still sets removed keys loads, and the
+    // values have no effect.
+    #[test]
+    fn test_removed_keys_load_without_effect() {
+        assert_eq!(REMOVED_KEYS.len(), 72, "the spec removes 72 keys");
+        let toml_str: String = REMOVED_KEYS.iter().map(|key| format!("{key} = 1\n")).collect();
+        let config: LuraConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(LuraConfig::default()).unwrap()
+        );
+    }
 
     #[test]
     fn test_multicore_defaults_and_toml_override() {
@@ -1250,6 +1485,27 @@ mod tests {
         // Absent section stays at the default (`#[serde(default)]`).
         let config: LuraConfig = toml::from_str("[server]\nport = 1234\n").unwrap();
         assert_eq!(config.multicore.cpu_offload_threads, 0);
+    }
+
+    /// Asserts a startup error in the house format (spec general/030): it
+    /// starts with `invalid config: <key> (<value>)` and names the allowed range.
+    fn assert_invalid(result: anyhow::Result<()>, key_and_value: &str, allowed: &str) {
+        let err = result.unwrap_err().to_string();
+        assert!(err.starts_with(&format!("invalid config: {key_and_value}")), "{err}");
+        assert!(err.contains(allowed), "{err}");
+    }
+
+    // Spec general/030 test 5: 0 (auto) and up to the core count are ok.
+    #[test]
+    fn test_multicore_validate_offload_threads_against_cores() {
+        let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 0\n").unwrap();
+        assert!(config.multicore.validate(8).is_ok());
+
+        let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 8\n").unwrap();
+        assert!(config.multicore.validate(8).is_ok());
+
+        let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 9\n").unwrap();
+        assert_invalid(config.multicore.validate(8), "multicore.cpu_offload_threads (9)", "1 to 8");
     }
 
     #[test]
@@ -1269,14 +1525,14 @@ mod tests {
             wal_path = "/data/json/wal.log"
 
             [json.lsm]
-            memtable_size_threshold = 8388608
+            max_value_size = 1048576
         "#;
         let config: LuraConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.json.enabled);
         assert_eq!(config.json.wal_path, "/data/json/wal.log");
-        assert_eq!(config.json.lsm.memtable_size_threshold, 8 * 1024 * 1024);
+        assert_eq!(config.json.lsm.max_value_size, 1024 * 1024);
+        assert_eq!(config.json.lsm.max_key_length, 256);
         assert_eq!(config.json.vlog_path, "luradb_json.vlog");
-        assert_eq!(config.json.compaction.l0_threshold, 4);
     }
 
     #[test]
@@ -1316,14 +1572,13 @@ mod tests {
             wal_path = "/data/rel/wal.log"
 
             [rel.lsm]
-            memtable_size_threshold = 8388608
+            max_key_length = 128
         "#;
         let config: LuraConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.rel.enabled);
         assert_eq!(config.rel.wal_path, "/data/rel/wal.log");
-        assert_eq!(config.rel.lsm.memtable_size_threshold, 8 * 1024 * 1024);
+        assert_eq!(config.rel.lsm.max_key_length, 128);
         assert_eq!(config.rel.vlog_path, "luradb_rel.vlog");
-        assert_eq!(config.rel.compaction.l0_threshold, 4);
     }
 
     #[test]
@@ -1356,14 +1611,12 @@ mod tests {
         let toml_str = r#"
             [server]
             unix_socket_path = "/run/luradb/luradb.sock"
-            unix_socket_mode = 432
 
             [auth]
             trusted_uids = [0, 1000]
         "#;
         let config: LuraConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server.unix_socket_path.as_deref(), Some("/run/luradb/luradb.sock"));
-        assert_eq!(config.server.unix_socket_mode, Some(432));
         assert_eq!(config.auth.trusted_uids, vec![0, 1000]);
     }
 
@@ -1371,7 +1624,6 @@ mod tests {
     fn test_uds_disabled_by_default() {
         let config = LuraConfig::default();
         assert!(config.server.unix_socket_path.is_none());
-        assert!(config.server.unix_socket_mode.is_none());
         assert!(config.auth.trusted_uids.is_empty());
     }
 
@@ -1450,14 +1702,6 @@ mod tests {
     fn test_io_engine_disabled_by_default() {
         let config = LuraConfig::default();
         assert!(!config.io_engine.enabled);
-        assert_eq!(config.io_engine.registered_buffer_count, 128);
-        assert_eq!(config.io_engine.registered_buffer_size, 65536);
-        // perf/005 storage-thread defaults
-        assert!(config.io_engine.sqpoll_enabled);
-        assert_eq!(config.io_engine.sqpoll_idle_ms, 2000);
-        assert_eq!(config.io_engine.storage_thread_cpu, -1);
-        assert_eq!(config.io_engine.ring_depth, 256);
-        assert_eq!(config.io_engine.request_channel_capacity, 1024);
     }
 
     #[test]
@@ -1465,23 +1709,9 @@ mod tests {
         let toml_str = r#"
             [io_engine]
             enabled = true
-            registered_buffer_count = 64
-            registered_buffer_size = 4096
-            sqpoll_enabled = false
-            sqpoll_idle_ms = 500
-            storage_thread_cpu = 2
-            ring_depth = 128
-            request_channel_capacity = 256
         "#;
         let config: LuraConfig = toml::from_str(toml_str).unwrap();
         assert!(config.io_engine.enabled);
-        assert_eq!(config.io_engine.registered_buffer_count, 64);
-        assert_eq!(config.io_engine.registered_buffer_size, 4096);
-        assert!(!config.io_engine.sqpoll_enabled);
-        assert_eq!(config.io_engine.sqpoll_idle_ms, 500);
-        assert_eq!(config.io_engine.storage_thread_cpu, 2);
-        assert_eq!(config.io_engine.ring_depth, 128);
-        assert_eq!(config.io_engine.request_channel_capacity, 256);
     }
 
     #[test]
@@ -1489,10 +1719,7 @@ mod tests {
         let config = LuraConfig::default();
         assert!(!config.shm.enabled);
         assert_eq!(config.shm.instance_id, "0");
-        assert_eq!(config.shm.state_size, 4096);
         assert_eq!(config.shm.data_buffer_size, 268_435_456);
-        assert_eq!(config.shm.command_buffer_size, 4_194_304);
-        assert_eq!(config.shm.segment_mode, 0o660);
     }
 
     #[test]
@@ -1501,14 +1728,10 @@ mod tests {
             [shm]
             enabled = true
             instance_id = "test"
-            state_size = 8192
-            command_buffer_size = 1048576
         "#;
         let config: LuraConfig = toml::from_str(toml_str).unwrap();
         assert!(config.shm.enabled);
         assert_eq!(config.shm.instance_id, "test");
-        assert_eq!(config.shm.state_size, 8192);
-        assert_eq!(config.shm.command_buffer_size, 1_048_576);
         assert_eq!(config.shm.data_buffer_size, 268_435_456); // untouched default
     }
 
@@ -1521,56 +1744,61 @@ mod tests {
     }
 
     #[test]
-    fn test_shm_command_buffer_size_must_be_power_of_two() {
+    fn test_shm_data_size_and_snapshot_interval_minimums() {
         let mut config = ShmConfig::default();
-        config.command_buffer_size = 3_000_000;
-        assert!(config.validate().is_err());
-
-        config.command_buffer_size = 4_194_304; // 2^22
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_shm_command_buffer_size_minimum() {
-        let mut config = ShmConfig::default();
-        // A power of two below the 4096-byte page size passes is_power_of_two
-        // but is too small for DoubleMmapRegion — must be rejected at startup.
-        config.command_buffer_size = 2048;
-        assert!(config.validate().is_err());
-
-        config.command_buffer_size = 4096;
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_shm_state_and_data_size_minimums() {
-        let mut config = ShmConfig::default();
-        // The bound is the header size itself (spec perf/012 §8).
-        config.state_size = crate::ipc::StateHeader::SIZE - 1;
-        assert!(config.validate().is_err());
-        config.state_size = crate::ipc::StateHeader::SIZE;
-        assert!(config.validate().is_ok());
-
-        config.state_size = 4096;
         config.data_buffer_size = 100;
-        assert!(config.validate().is_err());
+        assert_invalid(config.validate(), "shm.data_buffer_size (100)", "at least 4096");
 
         config.data_buffer_size = 8192;
         config.snapshot_interval_ms = 0;
-        assert!(config.validate().is_err());
+        assert_invalid(config.validate(), "shm.snapshot_interval_ms (0)", "at least 1");
     }
 
     #[test]
     fn test_shm_instance_id_charset() {
         let mut config = ShmConfig::default();
         config.instance_id = "0_backup".to_string();
-        assert!(config.validate().is_err());
+        assert_invalid(config.validate(), "shm.instance_id ('0_backup')", "[A-Za-z0-9-]");
 
         config.instance_id = String::new();
-        assert!(config.validate().is_err());
+        assert_invalid(config.validate(), "shm.instance_id ('')", "non-empty");
 
         config.instance_id = "prod-2".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    // Spec general/030 test 5: with SHM on, the resolved registration socket
+    // must not take the REST socket's path. The packaged REST socket collides
+    // with the default template for instance "luradb".
+    #[test]
+    fn test_shm_validate_registration_socket_against_rest_socket() {
+        let toml_str = r#"
+            [server]
+            unix_socket_path = "/run/luradb/luradb.sock"
+
+            [shm]
+            enabled = true
+            instance_id = "luradb"
+        "#;
+        let mut config: LuraConfig = toml::from_str(toml_str).unwrap();
+        let err = config.shm.validate_registration_socket(&config.server).unwrap_err().to_string();
+        assert!(err.starts_with("invalid config: shm.registration_socket_path ('/run/luradb/luradb.sock')"), "{err}");
+        assert!(err.contains("server.unix_socket_path"), "{err}");
+
+        // Compared per path component, so another spelling still collides.
+        config.server.unix_socket_path = Some("/run/luradb//luradb.sock".to_string());
+        assert!(config.shm.validate_registration_socket(&config.server).is_err());
+
+        config.shm.enabled = false;
+        assert!(config.shm.validate_registration_socket(&config.server).is_ok());
+
+        config.shm.enabled = true;
+        config.shm.instance_id = "0".to_string();
+        assert!(config.shm.validate_registration_socket(&config.server).is_ok());
+
+        config.shm.instance_id = "luradb".to_string();
+        config.server.unix_socket_path = None;
+        assert!(config.shm.validate_registration_socket(&config.server).is_ok());
     }
 
     #[test]
@@ -1613,8 +1841,6 @@ mod tests {
         let config = LuraConfig::default();
         assert!(!config.backup.enabled);
         assert_eq!(config.backup.dir, "luradb_backups");
-        assert_eq!(config.backup.scan_batch_size, 500);
-        assert_eq!(config.backup.scan_pause_ms, 10);
         assert!(config.backup.schedule.is_empty());
     }
 
@@ -1624,8 +1850,6 @@ mod tests {
             [backup]
             enabled = false
             dir = "luradb_backups"
-            scan_batch_size = 500
-            scan_pause_ms = 10
 
             [[backup.schedule]]
             name = "nightly-all"
@@ -1732,7 +1956,33 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.cron = "not a cron".to_string();
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate().is_err());
+        assert_invalid(config.backup.validate(), "backup.schedule.cron ('not a cron')", "(schedule 's1')");
+    }
+
+    // Spec general/030 test 5: a schedule without a date within 4 years of
+    // the start is a startup error. 29 February next fires 1461 days minus a
+    // minute after 2024-02-29T00:01Z, but not within 4 years of
+    // 2096-02-29T00:01Z (2100 is no leap year).
+    #[test]
+    fn test_backup_validate_rejects_cron_without_date_within_four_years() {
+        const LEAP_DAY_2024_AT_0001: u64 = 1_709_164_860;
+        const LEAP_DAY_2096_AT_0001: u64 = 3_981_312_060;
+        let mut config = LuraConfig::default();
+        config.backup.enabled = true;
+        let mut sched = valid_backup_schedule("feb-31");
+        sched.cron = "0 0 31 2 *".to_string();
+        config.backup.schedule.push(sched);
+        let err = config.backup.validate_at(LEAP_DAY_2024_AT_0001).unwrap_err().to_string();
+        assert!(err.starts_with("invalid config: backup.schedule.cron ('0 0 31 2 *')"), "{err}");
+        assert!(err.contains("4 years") && err.ends_with("(schedule 'feb-31')"), "{err}");
+
+        config.backup.schedule[0].cron = "0 0 29 2 *".to_string();
+        assert!(config.backup.validate_at(LEAP_DAY_2024_AT_0001).is_ok());
+        assert!(config.backup.validate_at(LEAP_DAY_2096_AT_0001).is_err());
+
+        config.backup.enabled = false;
+        config.backup.schedule[0].cron = "0 0 31 2 *".to_string();
+        assert!(config.backup.validate_at(LEAP_DAY_2024_AT_0001).is_ok());
     }
 
     #[test]
@@ -1742,7 +1992,7 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.scope = "not-a-scope".to_string();
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate().is_err());
+        assert_invalid(config.backup.validate(), "backup.schedule.scope ('not-a-scope')", "(schedule 's1')");
     }
 
     #[test]
@@ -1752,7 +2002,7 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.keep_last = 0;
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate().is_err());
+        assert_invalid(config.backup.validate(), "backup.schedule.keep_last (0)", "at least 1 (schedule 's1')");
     }
 
     #[test]
@@ -1761,7 +2011,7 @@ mod tests {
         config.backup.enabled = true;
         config.backup.schedule.push(valid_backup_schedule("dup"));
         config.backup.schedule.push(valid_backup_schedule("dup"));
-        assert!(config.backup.validate().is_err());
+        assert_invalid(config.backup.validate(), "backup.schedule.name ('dup')", "unique");
     }
 
     #[test]
@@ -1771,17 +2021,16 @@ mod tests {
         let mut sched = valid_backup_schedule("s1");
         sched.name = "bad name!".to_string();
         config.backup.schedule.push(sched);
-        assert!(config.backup.validate().is_err());
+        assert_invalid(config.backup.validate(), "backup.schedule.name ('bad name!')", "1-50 characters");
     }
 
     #[test]
     fn test_backup_validate_rejects_schedule_name_too_long() {
         let mut config = LuraConfig::default();
         config.backup.enabled = true;
-        let mut sched = valid_backup_schedule("s1");
-        sched.name = "a".repeat(51);
-        config.backup.schedule.push(sched);
-        assert!(config.backup.validate().is_err());
+        let name = "a".repeat(51);
+        config.backup.schedule.push(valid_backup_schedule(&name));
+        assert_invalid(config.backup.validate(), &format!("backup.schedule.name ('{name}')"), "1-50 characters");
     }
 
     // ── Log HTTP access (spec general/005) ──────────────────────────────────
@@ -2079,23 +2328,23 @@ mod tests {
     #[test]
     fn test_lsm_validate_default_ok() {
         let config = LuraConfig::default();
-        assert!(config.lsm.validate("lsm").is_ok());
-        assert!(config.json.lsm.validate("json.lsm").is_ok());
-        assert!(config.rel.lsm.validate("rel.lsm").is_ok());
+        assert!(config.lsm.validate().is_ok());
+        assert!(config.json.lsm.validate().is_ok());
+        assert!(config.rel.lsm.validate().is_ok());
     }
 
     #[test]
     fn test_lsm_validate_max_value_size_at_cap_ok() {
         let mut lsm = LsmConfig::default();
         lsm.max_value_size = WAL_MAX_FIELD_LEN;
-        assert!(lsm.validate("lsm").is_ok());
+        assert!(lsm.validate().is_ok());
     }
 
     #[test]
     fn test_lsm_validate_max_value_size_over_cap_rejected() {
         let mut lsm = LsmConfig::default();
         lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
-        let err = lsm.validate("lsm").unwrap_err().to_string();
+        let err = lsm.validate().unwrap_err().to_string();
         assert!(err.contains("lsm.max_value_size"), "{err}");
         assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
         assert!(err.contains(&WAL_MAX_FIELD_LEN.to_string()), "{err}");
@@ -2105,7 +2354,7 @@ mod tests {
     fn test_lsm_validate_max_key_length_over_cap_rejected() {
         let mut lsm = LsmConfig::default();
         lsm.max_key_length = WAL_MAX_FIELD_LEN + 1;
-        let err = lsm.validate("lsm").unwrap_err().to_string();
+        let err = lsm.validate().unwrap_err().to_string();
         assert!(err.contains("lsm.max_key_length"), "{err}");
     }
 
@@ -2113,16 +2362,23 @@ mod tests {
     fn test_lsm_validate_json_lsm_over_cap_rejected() {
         let mut config = LuraConfig::default();
         config.json.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
-        let err = config.json.lsm.validate("json.lsm").unwrap_err().to_string();
+        let err = config.json.lsm.validate().unwrap_err().to_string();
         assert!(err.contains("json.lsm.max_value_size"), "{err}");
+        assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
+
+        let mut config = LuraConfig::default();
+        config.json.lsm.max_key_length = WAL_MAX_FIELD_LEN + 1;
+        let err = config.json.lsm.validate().unwrap_err().to_string();
+        assert!(err.contains("json.lsm.max_key_length"), "{err}");
     }
 
     #[test]
     fn test_lsm_validate_rel_lsm_over_cap_rejected() {
         let mut config = LuraConfig::default();
-        config.rel.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
-        let err = config.rel.lsm.validate("rel.lsm").unwrap_err().to_string();
-        assert!(err.contains("rel.lsm.max_value_size"), "{err}");
+        config.rel.lsm.max_key_length = WAL_MAX_FIELD_LEN + 1;
+        let err = config.rel.lsm.validate().unwrap_err().to_string();
+        assert!(err.contains("rel.lsm.max_key_length"), "{err}");
+        assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
     }
 
     // ── Data path collisions via real locations (spec general/031) ──────────
@@ -2274,5 +2530,299 @@ mod tests {
         let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
         assert!(err.starts_with("invalid config: storage.wal_path "), "{err}");
         assert!(err.contains("symlink hops"), "{err}");
+    }
+
+    // ── Startup checks of the remaining keys (spec general/030) ─────────────
+
+    // Test 5; runs even with the JSON engine disabled (general/025 pattern).
+    #[test]
+    fn test_json_validate_bulk_body_limit() {
+        let config: LuraConfig = toml::from_str("[json]\nenabled = false\nbulk_body_limit_bytes = 0\n").unwrap();
+        assert_invalid(config.json.validate(), "json.bulk_body_limit_bytes (0)", "at least 1");
+
+        let config: LuraConfig = toml::from_str("[json]\nbulk_body_limit_bytes = 1\n").unwrap();
+        assert!(config.json.validate().is_ok());
+    }
+
+    // Test 5: table and index ids are u32, so 2^32 - 1 is the upper bound.
+    #[test]
+    fn test_rel_validate_max_tables_per_domain() {
+        let parse = |value: u64| -> LuraConfig {
+            toml::from_str(&format!("[rel]\nenabled = false\nmax_tables_per_domain = {value}\n")).unwrap()
+        };
+        assert_invalid(parse(0).rel.validate(), "rel.max_tables_per_domain (0)", "between 1 and 4294967295");
+        assert!(parse(1).rel.validate().is_ok());
+        assert!(parse(4_294_967_295).rel.validate().is_ok());
+        assert_invalid(
+            parse(4_294_967_296).rel.validate(),
+            "rel.max_tables_per_domain (4294967296)",
+            "between 1 and 4294967295",
+        );
+    }
+
+    // Test 5.
+    #[test]
+    fn test_rel_validate_max_limit_and_max_sort_rows() {
+        let mut rel = RelStoreConfig::default();
+        rel.max_limit = 0;
+        assert_invalid(rel.validate(), "rel.max_limit (0)", "at least 1");
+        rel.max_limit = 1;
+        assert!(rel.validate().is_ok());
+
+        rel.max_sort_rows = 0;
+        assert_invalid(rel.validate(), "rel.max_sort_rows (0)", "at least 1");
+        rel.max_sort_rows = 1;
+        assert!(rel.validate().is_ok());
+    }
+
+    // Test 5: the row needs room beyond its fixed 4-byte header, and the
+    // storage value limit (at least max_row_size) must fit the WAL field cap.
+    #[test]
+    fn test_rel_validate_max_row_size() {
+        let mut rel = RelStoreConfig::default();
+        rel.max_row_size = 4;
+        assert_invalid(rel.validate(), "rel.max_row_size (4)", "at least 5");
+        rel.max_row_size = 5;
+        assert!(rel.validate().is_ok());
+        rel.max_row_size = WAL_MAX_FIELD_LEN;
+        assert!(rel.validate().is_ok());
+        rel.max_row_size = WAL_MAX_FIELD_LEN + 1;
+        assert_invalid(
+            rel.validate(),
+            &format!("rel.max_row_size ({})", WAL_MAX_FIELD_LEN + 1),
+            &WAL_MAX_FIELD_LEN.to_string(),
+        );
+    }
+
+    // Test 6: one byte below the lower bounds is a startup error, the bounds
+    // themselves and the WAL field cap are accepted.
+    #[test]
+    fn test_json_and_rel_lsm_lower_bounds() {
+        let parse = |toml: &str| -> LuraConfig { toml::from_str(toml).unwrap() };
+
+        let config = parse("[json.lsm]\nmax_key_length = 68\n");
+        assert_invalid(config.json.validate(), "json.lsm.max_key_length (68)", "at least 69");
+        assert!(parse("[json.lsm]\nmax_key_length = 69\n").json.validate().is_ok());
+        assert!(parse(&format!("[json.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).json.validate().is_ok());
+
+        let config = parse("[json.lsm]\nmax_value_size = 4095\n");
+        assert_invalid(config.json.validate(), "json.lsm.max_value_size (4095)", "at least 4096");
+        assert!(parse("[json.lsm]\nmax_value_size = 4096\n").json.validate().is_ok());
+
+        let config = parse("[rel.lsm]\nmax_key_length = 72\n");
+        assert_invalid(config.rel.validate(), "rel.lsm.max_key_length (72)", "at least 73");
+        assert!(parse("[rel.lsm]\nmax_key_length = 73\n").rel.validate().is_ok());
+        assert!(parse(&format!("[rel.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).rel.validate().is_ok());
+    }
+
+    // ── Key set, unknown keys and config-file gate (spec general/030) ───────
+
+    // Test 3: optional fields and list elements count, section paths and
+    // removed keys do not.
+    #[test]
+    fn test_known_keys_include_optional_fields_and_list_elements() {
+        let keys = known_keys();
+        for key in [
+            "log.path",
+            "backup.schedule.cron",
+            "auth.admins.api_key",
+            "auth.trusted_uids",
+            "server.unix_socket_path",
+            "log.modules.auth",
+            "log.level",
+            "json.lsm.max_value_size",
+        ] {
+            assert!(keys.contains(key), "{key} missing from {keys:?}");
+        }
+        for section in ["server", "auth.admins", "log.modules", "json.lsm", "backup.schedule"] {
+            assert!(!keys.contains(section), "section path {section} in {keys:?}");
+        }
+        for removed in REMOVED_KEYS {
+            assert!(!keys.contains(*removed), "removed key {removed} in {keys:?}");
+        }
+    }
+
+    // Test 4: the config still loads; the detection names the key.
+    #[test]
+    fn test_parse_reports_unknown_key() {
+        let (config, unknown) = LuraConfig::parse("[metrics]\nwindow_secs = 60\n[server]\nport = 4000\n").unwrap();
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(unknown, ["metrics.window_secs"]);
+
+        let (_, unknown) = LuraConfig::parse("[server]\nport = 4000\n").unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    // Story 6: every removed key is reported after an update.
+    #[test]
+    fn test_parse_reports_every_removed_key() {
+        let toml_str: String = REMOVED_KEYS.iter().map(|key| format!("{key} = 1\n")).collect();
+        let (_, unknown) = LuraConfig::parse(&toml_str).unwrap();
+        let mut expected: Vec<&str> = REMOVED_KEYS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(unknown, expected);
+    }
+
+    // Array-of-tables elements share one path, each key is reported once,
+    // and neither an empty table nor an empty table array sets a key.
+    #[test]
+    fn test_parse_unknown_keys_in_table_arrays_and_empty_tables() {
+        let toml_str = r#"
+[auth]
+admins = []
+
+[[backup.schedule]]
+name = "a"
+cron = "0 3 * * *"
+scope = "all"
+keep_last = 1
+retention = 1
+
+[[backup.schedule]]
+name = "b"
+cron = "0 4 * * *"
+scope = "all"
+keep_last = 1
+retention = 1
+
+[json.compaction]
+
+[[stale]]
+flag = true
+"#;
+        let (_, unknown) = LuraConfig::parse(toml_str).unwrap();
+        assert_eq!(unknown, ["backup.schedule.retention", "stale.flag"]);
+    }
+
+    // A quoted segment with a dot matches no field, so serde ignores it.
+    #[test]
+    fn test_parse_reports_quoted_keys_with_dots() {
+        let toml_str = r#"
+"server.port" = 4000
+
+[auth]
+"admins.name" = "x"
+"#;
+        let (config, unknown) = LuraConfig::parse(toml_str).unwrap();
+        assert_eq!(config.server.port, LuraConfig::default().server.port);
+        assert_eq!(unknown, [r#""server.port""#, r#"auth."admins.name""#]);
+    }
+
+    /// What the config-file gate finds (spec general/030).
+    #[derive(Debug, Default, PartialEq)]
+    struct GateFindings {
+        /// Known keys absent from the shipped config.
+        missing: Vec<String>,
+        /// Keys in either config file that the server does not read.
+        unknown: Vec<String>,
+        /// Keys the shipped config holds more than once, active or commented.
+        duplicates: Vec<String>,
+    }
+
+    fn config_gate(known: &BTreeSet<String>, shipped: &str, dev: &str) -> GateFindings {
+        let shipped_keys = config_file_keys(shipped);
+        let mut seen = BTreeSet::new();
+        let duplicates: BTreeSet<String> = shipped_keys.iter().filter(|key| !seen.insert(*key)).cloned().collect();
+        let mut all_keys = config_file_keys(dev);
+        all_keys.extend(shipped_keys.iter().cloned());
+        GateFindings {
+            missing: known.iter().filter(|key| !shipped_keys.contains(key)).cloned().collect(),
+            unknown: unknown_keys(all_keys, known),
+            duplicates: duplicates.into_iter().collect(),
+        }
+    }
+
+    /// Keys a config file sets, active or commented, once per occurrence.
+    fn config_file_keys(content: &str) -> Vec<String> {
+        let table = content.parse().unwrap_or_else(|e| panic!("config file does not parse: {e}"));
+        let mut keys = commented_keys(content);
+        toml_keys(&table, "", &mut keys);
+        keys
+    }
+
+    /// Keys written as `# name = value` with a `[a-z][a-z0-9_]*` name, under
+    /// the latest section header, active or commented (`# [x]`, `# [[x]]`).
+    fn commented_keys(content: &str) -> Vec<String> {
+        let mut section = "";
+        let mut keys = Vec::new();
+        for line in content.lines() {
+            if let Some(header) = line.trim_start().strip_prefix('[').or_else(|| line.strip_prefix("# [")) {
+                section = header.trim_start_matches('[').split(']').next().unwrap_or_default().trim();
+            } else if let Some((name, _)) = line.strip_prefix("# ").and_then(|rest| rest.split_once(" = ")) {
+                let is_key = name.starts_with(|c: char| c.is_ascii_lowercase())
+                    && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if is_key {
+                    keys.push(if section.is_empty() { name.to_string() } else { format!("{section}.{name}") });
+                }
+            }
+        }
+        keys
+    }
+
+    // Test 2: commented keys count as present, explanation lines count as
+    // nothing, and each finding names its keys.
+    #[test]
+    fn test_config_gate_on_synthetic_configs() {
+        let known: BTreeSet<String> =
+            ["server.port", "server.swagger_url", "backup.schedule.name"].map(String::from).into();
+        let complete = "[server]\n# 0 = off\nport = 1\n# swagger_url = \"/x\"\n\n# [[backup.schedule]]\n# name = \"n\"\n";
+        assert_eq!(config_gate(&known, complete, ""), GateFindings::default());
+
+        let without_swagger_url = "[server]\nport = 1\n# [[backup.schedule]]\n# name = \"n\"\n";
+        assert_eq!(
+            config_gate(&known, without_swagger_url, ""),
+            GateFindings { missing: vec!["server.swagger_url".into()], ..Default::default() }
+        );
+
+        let with_unknown = format!("{complete}[metrics]\nwindow_secs = 60\n");
+        assert_eq!(
+            config_gate(&known, &with_unknown, "[server]\n# hello = 1\n"),
+            GateFindings { unknown: vec!["metrics.window_secs".into(), "server.hello".into()], ..Default::default() }
+        );
+
+        let port_twice = format!("{complete}# [server]\n# port = 2\n");
+        assert_eq!(
+            config_gate(&known, &port_twice, ""),
+            GateFindings { duplicates: vec!["server.port".into()], ..Default::default() }
+        );
+    }
+
+    const SHIPPED_CONFIG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/packaging/luradb.toml"));
+    const DEV_CONFIG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/luradb.toml"));
+
+    // Test 1: the gate on the real files.
+    #[test]
+    fn test_config_gate_on_shipped_and_dev_config() {
+        let findings = config_gate(&known_keys(), SHIPPED_CONFIG, DEV_CONFIG);
+        assert!(
+            findings == GateFindings::default(),
+            "packaging/luradb.toml, luradb.toml and the config types diverge.\n\
+             missing: add each key to packaging/luradb.toml with an explanation line above it\n\
+             unknown: remove the key from the file, or read it in a config type\n\
+             duplicates: keep one line per key in packaging/luradb.toml\n{findings:#?}"
+        );
+    }
+
+    // The release smoke test starts the shipped config; both files must pass
+    // the startup checks.
+    #[test]
+    fn test_shipped_and_dev_config_pass_startup_checks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for content in [SHIPPED_CONFIG, DEV_CONFIG] {
+            let (config, unknown) = LuraConfig::parse(content).unwrap();
+            assert!(unknown.is_empty(), "{unknown:?}");
+            config.server.validate().unwrap();
+            config.log.validate().unwrap();
+            config.backup.validate().unwrap();
+            config.validate_data_paths(tmp.path()).unwrap();
+            config.auth.validate(&config.server).unwrap();
+            config.cors.validate().unwrap();
+            config.lsm.validate().unwrap();
+            config.json.validate().unwrap();
+            config.rel.validate().unwrap();
+            config.shm.validate().unwrap();
+            config.shm.validate_registration_socket(&config.server).unwrap();
+            config.multicore.validate(1).unwrap();
+        }
     }
 }

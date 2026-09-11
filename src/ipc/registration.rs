@@ -38,7 +38,7 @@ const REGISTER_REQUEST: &str = "REGISTER";
 /// What the listener needs to mint a client's segments.
 pub struct RegistrationConfig {
     pub instance_id: String,
-    /// Size of each per-client cmd/resp ring (= `command_buffer_size`).
+    /// Size of each per-client cmd/resp ring (production: `CLIENT_RING_SIZE`).
     pub ring_size: usize,
     pub segment_mode: u32,
     /// When true, only `trusted_uids` may register (peer-credential gate,
@@ -59,7 +59,7 @@ pub fn prepare_registration_socket(path: &str) -> Result<UnixListener> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create registration socket directory {}", parent.display()))?;
     }
-    uds::prepare_uds_socket(path, None)
+    uds::prepare_uds_socket(path)
 }
 
 /// Accept loop: one task per connection, until `shutdown` flips. Returning drops

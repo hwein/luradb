@@ -20,6 +20,9 @@ use super::catalog::{ColumnDef, DefaultValue, TableSchema};
 use super::types::{ColumnType, ScalarValue};
 use std::collections::HashMap;
 
+/// Fixed header: `schema_version` + `col_count`.
+pub(crate) const ROW_HEADER_LEN: usize = 4;
+
 /// Encodes a row from `values_by_col_id`, writing one slot per column of the
 /// **current** schema in ascending `col_id` order.
 pub fn encode_row(schema: &TableSchema, values_by_col_id: &HashMap<u16, ScalarValue>) -> Vec<u8> {
@@ -30,6 +33,7 @@ pub fn encode_row(schema: &TableSchema, values_by_col_id: &HashMap<u16, ScalarVa
     let mut out = Vec::new();
     out.extend_from_slice(&schema.schema_version.to_le_bytes());
     out.extend_from_slice(&(n as u16).to_le_bytes());
+    debug_assert_eq!(out.len(), ROW_HEADER_LEN);
     for c in &cols {
         out.extend_from_slice(&c.col_id.to_le_bytes());
     }
@@ -100,11 +104,11 @@ struct RowView<'a> {
 
 impl<'a> RowView<'a> {
     fn new(bytes: &'a [u8]) -> Option<Self> {
-        if bytes.len() < 4 {
+        if bytes.len() < ROW_HEADER_LEN {
             return None;
         }
         let n = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-        let bitmap_start = 4 + 2 * n;
+        let bitmap_start = ROW_HEADER_LEN + 2 * n;
         let slots_start = (bitmap_start + n.div_ceil(8) + 7) & !7;
         let var_start = slots_start + 8 * n;
         if bytes.len() < var_start {
@@ -115,7 +119,7 @@ impl<'a> RowView<'a> {
 
     fn slot_index(&self, col_id: u16) -> Option<usize> {
         (0..self.n).find(|&i| {
-            let off = 4 + 2 * i;
+            let off = ROW_HEADER_LEN + 2 * i;
             u16::from_le_bytes([self.bytes[off], self.bytes[off + 1]]) == col_id
         })
     }

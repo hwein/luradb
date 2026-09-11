@@ -382,6 +382,13 @@ mod tests {
         make_app(Some(RelStoreConfig::default())).await
     }
 
+    /// The default rel config, with `tune` overriding the engine's fixed limits.
+    async fn make_tuned_app(tune: impl FnOnce(&mut RelEngine)) -> (axum::Router, tempfile::TempDir) {
+        let (mut state, dir) = make_state(Some(RelStoreConfig::default()), false).await;
+        tune(Arc::get_mut(state.rel_engine.as_mut().unwrap()).unwrap());
+        (crate::api::create_router(state, Arc::new(vec![])), dir)
+    }
+
     async fn request(app: &axum::Router, method: Method, uri: &str, body: Option<&str>) -> (StatusCode, String) {
         let mut builder = Request::builder().method(method).uri(uri);
         let req = if let Some(b) = body {
@@ -748,7 +755,7 @@ mod tests {
     //     400 JoinDepthExceeded.
     #[tokio::test]
     async fn test_expand_max_join_depth() {
-        let (app, _dir) = make_app(Some(RelStoreConfig { max_join_depth: 1, ..RelStoreConfig::default() })).await;
+        let (app, _dir) = make_tuned_app(|rel| rel.set_max_join_depth(1)).await;
         sql(&app, "default", r#"{"sql": "CREATE TABLE b (id INTEGER PRIMARY KEY)"}"#).await;
         sql(
             &app,
@@ -778,8 +785,7 @@ mod tests {
     //     with a LIMIT hint.
     #[tokio::test]
     async fn test_max_response_bytes_413() {
-        let (app, _dir) =
-            make_app(Some(RelStoreConfig { max_response_bytes: 40, ..RelStoreConfig::default() })).await;
+        let (app, _dir) = make_tuned_app(|rel| rel.set_max_response_bytes(40)).await;
         sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"}"#).await;
         sql(&app, "default", r#"{"sql": "INSERT INTO t VALUES (1, 'a reasonably long text value')"}"#).await;
 

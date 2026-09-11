@@ -261,6 +261,11 @@ pub struct BackupMetricsSnapshot {
 
 // ── BackupManager ────────────────────────────────────────────────────────
 
+/// Entries scanned per batch and the pause between batches; keeps the
+/// foreground latency impact small.
+const SCAN_BATCH_SIZE: usize = 500;
+const SCAN_PAUSE_MS: u64 = 10;
+
 /// Owns the global backup/restore job slot, ID assignment, the on-disk
 /// backup listing/retention, and the RAM restore-status registry.
 ///
@@ -297,10 +302,8 @@ impl BackupManager {
         sweep_scratch_files(&dir);
         Ok(Arc::new(Self {
             dir,
-            // 0 means "no throttling" in the KV paths but "flush after every
-            // document" in the JSON restore path — coerce it once here.
-            scan_batch_size: config.scan_batch_size.max(1),
-            scan_pause_ms: config.scan_pause_ms,
+            scan_batch_size: SCAN_BATCH_SIZE,
+            scan_pause_ms: SCAN_PAUSE_MS,
             kv_registry,
             json_engine,
             slot: parking_lot::Mutex::new(None),
@@ -308,6 +311,13 @@ impl BackupManager {
             upload_lock: parking_lot::Mutex::new(()),
             metrics: BackupMetrics::default(),
         }))
+    }
+
+    /// Overrides the fixed scan throttle, e.g. for a job that keeps the slot busy.
+    #[cfg(test)]
+    pub(crate) fn set_scan_throttle(&mut self, batch_size: usize, pause_ms: u64) {
+        self.scan_batch_size = batch_size;
+        self.scan_pause_ms = pause_ms;
     }
 
     /// `GET /store-api/metrics` "backup" block (spec general/006 metrics section).
@@ -900,8 +910,6 @@ mod manager_tests {
         let config = BackupConfig {
             enabled: true,
             dir: backup_dir.path().to_string_lossy().into_owned(),
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
             schedule: Vec::new(),
         };
         let manager = BackupManager::new(&config, registry, None).unwrap();
@@ -1209,11 +1217,10 @@ mod manager_tests {
 
     /// Second manager over the same backup dir (restart simulation), reusing
     /// the first one's registry.
-    fn restart_manager(manager: &Arc<BackupManager>, dir: &Path, scan_batch_size: usize) -> Arc<BackupManager> {
+    fn restart_manager(manager: &Arc<BackupManager>, dir: &Path) -> Arc<BackupManager> {
         let config = BackupConfig {
             enabled: true,
             dir: dir.to_string_lossy().into_owned(),
-            scan_batch_size,
             ..BackupConfig::default()
         };
         BackupManager::new(&config, Arc::clone(&manager.kv_registry), None).unwrap()
@@ -1228,7 +1235,7 @@ mod manager_tests {
         std::fs::write(backup_dir.path().join("upload-00000000deadbeef.part"), "x").unwrap();
         std::fs::write(backup_dir.path().join("bk_crashed.ndjson.part"), "x").unwrap();
 
-        let restarted = restart_manager(&manager, backup_dir.path(), 500);
+        let restarted = restart_manager(&manager, backup_dir.path());
 
         assert!(!backup_dir.path().join("upload-00000000deadbeef.part").exists());
         assert!(!backup_dir.path().join("bk_crashed.ndjson.part").exists());
@@ -1275,14 +1282,5 @@ mod manager_tests {
         assert!(restores.contains_key(&id), "the new restore must never evict itself");
         assert!(!restores.contains_key("rs_old_0"), "the oldest finished status goes first");
         assert!(restores.contains_key(&format!("rs_old_{}", MAX_RESTORE_STATUSES + 4)));
-    }
-
-    // 14. scan_batch_size 0 is coerced at the manager boundary: downstream it
-    //     means "no throttling" in one path and "flush per document" in another.
-    #[tokio::test]
-    async fn test_scan_batch_size_zero_is_coerced_to_one() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        let coerced = restart_manager(&manager, backup_dir.path(), 0);
-        assert_eq!(coerced.scan_batch_size, 1);
     }
 }

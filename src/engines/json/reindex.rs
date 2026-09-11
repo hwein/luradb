@@ -130,7 +130,7 @@ impl JsonEngine {
 
         // One yield per chunk — the chunk itself is bounded (spec perf/017 A2).
         let mut coop = YieldEvery::new(1);
-        for chunk in keys.chunks(self.reindex_batch_size.max(1)) {
+        for chunk in keys.chunks(self.reindex_batch_size) {
             coop.tick().await;
             self.reindex_chunk(dom, defs, chunk, &mut processed)
                 .await
@@ -234,12 +234,13 @@ mod tests {
             wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
             vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
             sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            reindex_batch_size: batch,
-            reindex_pause_ms: pause_ms,
             ..JsonStoreConfig::default()
         };
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+        let mut engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+        let tuned = Arc::get_mut(&mut engine).unwrap();
+        tuned.reindex_batch_size = batch;
+        tuned.reindex_pause_ms = pause_ms;
         (engine, dir)
     }
 

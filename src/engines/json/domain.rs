@@ -18,13 +18,17 @@ use tokio::sync::Mutex;
 
 const SYS_JSON_DOMAIN_PREFIX: &[u8] = b"__sys:json_domain:";
 pub(crate) const DEFAULT_DOMAIN: &str = "default";
-const MAX_DOMAIN_NAME_LEN: usize = 50;
+pub(super) const MAX_DOMAIN_NAME_LEN: usize = 50;
 
 fn sys_key(name: &str) -> Vec<u8> {
     let mut k = SYS_JSON_DOMAIN_PREFIX.to_vec();
     k.extend_from_slice(name.as_bytes());
     k
 }
+
+/// Lower bound of `json.lsm.max_key_length` (spec general/030): the longest
+/// management key, `__sys:json_domain:{name}` at a maximal name, plus 1 byte.
+pub(crate) const MIN_LSM_KEY_LENGTH: usize = SYS_JSON_DOMAIN_PREFIX.len() + MAX_DOMAIN_NAME_LEN + 1;
 
 fn validate_domain_name(name: &str) -> Result<(), JsonStoreError> {
     if name.is_empty() {
@@ -239,5 +243,18 @@ impl JsonDomainRegistry {
             }
             Some(d) => Ok(d),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Spec general/030: the domain key at a maximal name stays below the
+    // startup lower bound of json.lsm.max_key_length.
+    #[test]
+    fn test_sys_key_at_max_name_fits_key_limit_lower_bound() {
+        let key = sys_key(&"d".repeat(MAX_DOMAIN_NAME_LEN));
+        assert!(key.len() < MIN_LSM_KEY_LENGTH, "{}", key.len());
     }
 }

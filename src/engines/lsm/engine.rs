@@ -1000,12 +1000,12 @@ impl LsmStorageEngine {
     /// call it before acquiring theirs.
     pub(super) async fn maybe_freeze_memtable(&self) -> Result<()> {
         let threshold = self.engine_config.memtable_size_threshold;
-        let size = { self.memtable.read().approximate_size() };
+        let size = { self.memtable.read().size_bytes() };
         if size >= threshold {
             let _drain = self.in_flight_writes.write().await;
             let mut mt = self.memtable.write();
             let mut imm = self.immutable_memtables.write();
-            if mt.approximate_size() >= threshold {
+            if mt.size_bytes() >= threshold {
                 imm.push(Arc::clone(&*mt));
                 *mt = Arc::new(MemTable::new());
             }
@@ -1934,7 +1934,7 @@ impl LsmStorageEngine {
         let imm = self.immutable_memtables.read();
         let flushing = self.flushing.read();
         EngineStats {
-            memtable_size: memtable.approximate_size(),
+            memtable_size: memtable.size_bytes(),
             // A flush in flight is still MemTable-resident (spec general/028).
             num_immutable_memtables: imm.len() + flushing.len(),
             num_levels: self.level_manager.num_levels(),
@@ -2061,9 +2061,9 @@ mod tests {
         .unwrap()
     }
 
-    /// Like `engine_on`, but with a custom MemTable freeze threshold (spec
-    /// kv/029 tests). `approximate_size` counts 256 bytes per entry, so a
-    /// threshold of 256 rotates on every write after the first.
+    /// Like `engine_on`, but with a custom MemTable freeze threshold in bytes
+    /// (spec kv/029, general/032 tests). Every entry counts at least its
+    /// 8-byte stamp, so a threshold of 1 rotates on every write after the first.
     async fn engine_with_threshold(dir: &tempfile::TempDir, threshold: usize) -> LsmStorageEngine {
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -3611,7 +3611,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_writes_across_freezes_never_strand_an_older_stamp() {
         let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(engine_with_threshold(&dir, 256).await);
+        let engine = Arc::new(engine_with_threshold(&dir, 1).await);
 
         for round in 0..20u32 {
             let key = format!("k{round}");
@@ -3644,7 +3644,7 @@ mod tests {
     #[tokio::test]
     async fn test_freeze_waits_for_held_writer_guard_then_rotates() {
         let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_with_threshold(&dir, 256).await;
+        let engine = engine_with_threshold(&dir, 1).await;
         engine.put(b"k", b"v").await.unwrap();
         assert!(engine.immutable_memtables.read().is_empty(), "the first write does not rotate");
 
@@ -3663,6 +3663,137 @@ mod tests {
             .unwrap();
         assert_eq!(engine.immutable_memtables.read().len(), 1, "the rotation happened after the drain");
         assert!(engine.memtable.read().is_empty(), "the active MemTable is fresh");
+    }
+
+    // Spec general/032 test 1: each entry contributes its encoded internal key
+    // (user key + 8-byte stamp) plus its stored value bytes; TTL is not counted.
+    #[tokio::test]
+    async fn test_memtable_size_is_the_sum_of_entry_bytes() {
+        let (engine, _dir) = make_engine().await;
+        assert_eq!(engine.stats().memtable_size, 0, "a fresh MemTable holds no bytes");
+
+        engine.put(b"alpha", b"12345").await.unwrap(); // 5 + 8 + 5 = 18
+        engine.put("clé".as_bytes(), "clé".as_bytes()).await.unwrap(); // 4 + 8 + 4 = 16
+        engine.put_with_ttl(b"beta", b"xyz", 3600).await.unwrap(); // 4 + 8 + 3 = 15
+        engine.set_null(b"gamma").await.unwrap(); // 5 + 8 + 0 = 13
+        engine
+            .write_batch(vec![BatchOp::Put { key: b"delta".to_vec(), value: b"batched".to_vec() }])
+            .await
+            .unwrap(); // 5 + 8 + 7 = 20
+
+        assert_eq!(engine.stats().memtable_size, 18 + 16 + 15 + 13 + 20);
+    }
+
+    // Spec general/032 test 2: every write is its own version, and each one
+    // counts on its own.
+    #[tokio::test]
+    async fn test_memtable_size_counts_every_version_of_a_key() {
+        let (engine, _dir) = make_engine().await;
+
+        engine.put(b"k", b"v1").await.unwrap(); // 1 + 8 + 2 = 11
+        engine.put(b"k", b"v22").await.unwrap(); // 1 + 8 + 3 = 12
+        engine.put(b"k", b"v333").await.unwrap(); // 1 + 8 + 4 = 13
+
+        assert_eq!(engine.stats().memtable_size, 11 + 12 + 13);
+    }
+
+    // Spec general/032 test 3: a tombstone contributes only its internal key.
+    #[tokio::test]
+    async fn test_memtable_size_counts_a_tombstone_by_its_internal_key() {
+        let (engine, _dir) = make_engine().await;
+
+        engine.delete(b"gone").await.unwrap(); // 4 + 8 + 0
+
+        assert_eq!(engine.stats().memtable_size, 12);
+    }
+
+    // Spec general/032 test 4: the freeze trigger compares real bytes, not an
+    // entry count. The check runs before each write (kv/029), so the write
+    // that crosses the threshold still lands in the active MemTable and the
+    // next write rotates it.
+    #[tokio::test]
+    async fn test_memtable_freezes_on_the_write_after_its_bytes_cross_the_threshold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_with_threshold(&dir, 1000).await;
+        let value = [b'x'; 20]; // 2-byte keys: 2 + 8 + 20 = 30 bytes per entry
+
+        for i in 0..33 {
+            engine.put(format!("{i:02}").as_bytes(), &value).await.unwrap();
+        }
+        let stats = engine.stats();
+        assert_eq!(stats.memtable_size, 990);
+        assert_eq!(stats.num_immutable_memtables, 0, "33 small entries stay below 1000 bytes");
+
+        engine.put(b"33", &value).await.unwrap();
+        let stats = engine.stats();
+        assert_eq!(stats.memtable_size, 1020, "the crossing write lands in the active MemTable");
+        assert_eq!(stats.num_immutable_memtables, 0, "the check ran before that write");
+
+        engine.put(b"34", &value).await.unwrap();
+        let stats = engine.stats();
+        assert_eq!(stats.num_immutable_memtables, 1, "the next write rotates first");
+        assert_eq!(stats.memtable_size, 30, "and lands in the fresh MemTable");
+    }
+
+    // Spec general/032 test 4, large values: the same threshold is crossed
+    // after a few entries. 600 bytes stay inline (below vlog_inline_threshold).
+    #[tokio::test]
+    async fn test_large_inline_values_freeze_after_fewer_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_with_threshold(&dir, 1000).await;
+        let value = vec![b'x'; 600]; // 1 + 8 + 600 = 609 bytes per entry
+
+        engine.put(b"a", &value).await.unwrap(); // 609
+        engine.put(b"b", &value).await.unwrap(); // 1218: crosses, no rotation yet
+        assert_eq!(engine.stats().num_immutable_memtables, 0);
+
+        engine.put(b"c", &value).await.unwrap();
+        assert_eq!(engine.stats().num_immutable_memtables, 1, "the third write rotates");
+    }
+
+    // Spec general/032 test 5: an offloaded value counts with its vLog pointer,
+    // the only part of it held in memory.
+    #[tokio::test]
+    async fn test_memtable_size_counts_an_offloaded_value_by_its_pointer() {
+        let (engine, _dir) = make_engine().await;
+        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+
+        engine.put(b"big", &big).await.unwrap();
+
+        let pointer = std::mem::size_of::<crate::storage::format::ValuePointer>();
+        assert_eq!(engine.stats().memtable_size, 3 + 8 + pointer);
+    }
+
+    // Spec general/032 test 6: the MemTable created by a freeze starts at 0,
+    // so it reports only the writes that land in it.
+    #[tokio::test]
+    async fn test_memtable_size_starts_at_zero_after_a_freeze() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = engine_with_threshold(&dir, 1).await;
+        engine.put(b"k", b"v").await.unwrap(); // 1 + 8 + 1 = 10
+
+        engine.put(b"k2", b"v22").await.unwrap(); // rotates first; 2 + 8 + 3 = 13
+
+        let stats = engine.stats();
+        assert_eq!(stats.num_immutable_memtables, 1);
+        assert_eq!(stats.memtable_size, 13, "the fresh MemTable counts only the new write");
+    }
+
+    // Spec general/032: a batch shares one stamp, so [Delete k, Put k v]
+    // writes the same internal key twice; only the surviving Put counts.
+    #[tokio::test]
+    async fn test_memtable_size_counts_a_replaced_batch_entry_once() {
+        let (engine, _dir) = make_engine().await;
+
+        engine
+            .write_batch(vec![
+                BatchOp::Delete { key: b"k".to_vec() },
+                BatchOp::Put { key: b"k".to_vec(), value: b"val".to_vec() },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(engine.stats().memtable_size, 1 + 8 + 3);
     }
 
     // Spec kv/020 tests 2+3: sharpens test_gc_keeps_values_written_concurrently

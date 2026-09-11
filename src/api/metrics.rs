@@ -359,9 +359,8 @@ mod tests {
     // ── Spec general/024: compaction_runs/janitor_runs/memtable_size_bytes ───
 
     // Test 3: memtable_size_bytes is a live gauge read from the engine's
-    // active MemTable, not a maintained counter -- grows after a write, and
-    // shrinks back once flush_all_memtables drains it (approximate, so no
-    // exact post-flush value is asserted).
+    // active MemTable -- grows after a write, and shrinks back once
+    // flush_all_memtables drains it.
     #[tokio::test]
     async fn test_memtable_size_bytes_reflects_live_memtable() {
         let (state, _dir) = make_state().await;

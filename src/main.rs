@@ -437,8 +437,9 @@ async fn start_shm(
         // registration listener leases them, the publisher scans them.
         let readers = Arc::new(ipc::ReaderRegistry::new());
 
-        // RCU read-snapshot publisher (spec perf/009): rebuilds the SHM
-        // double-buffer snapshot on an interval and after every flush.
+        // RCU read-snapshot publisher (spec perf/009, perf/028): checks on an
+        // interval and after every flush, rebuilds the SHM double-buffer
+        // snapshot only after a change.
         // Spawned on the tokio-uring executor since SnapshotWriter is !Send.
         let publisher = ipc::SnapshotPublisher::new(
             ipc::SnapshotBuilder::new(

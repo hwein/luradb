@@ -74,7 +74,8 @@ pub struct StateHeader {
     /// Magic (`LURADBSH`); written last at init so its presence implies a
     /// fully initialized header.
     pub magic: AtomicU64,
-    /// Unix-epoch nanoseconds of the last publish (monitoring only).
+    /// Unix-epoch nanoseconds of the last publish or idle confirmation
+    /// (monitoring only).
     pub last_update_ns: AtomicU64,
     /// Wire-protocol version (compatibility gate, spec §6). A dedicated field
     /// rather than bits of `version`, so `version` keeps pure flip/sequence
@@ -263,6 +264,12 @@ impl<'a> SnapshotWriter<'a> {
         h.version.store(new_version, Ordering::Release);
         h.last_update_ns.store(now_ns(), Ordering::Relaxed);
         Ok(PublishOutcome::Published)
+    }
+
+    /// Idle confirmation (spec perf/028 A3): the active snapshot is still
+    /// current. Refreshes `last_update_ns` only — no flip, no buffer write.
+    pub fn confirm_unchanged(&self) {
+        self.header.last_update_ns.store(now_ns(), Ordering::Relaxed);
     }
 
     /// Spins until no registered client pins buffer `idx`, or the timeout

@@ -3,13 +3,16 @@
 //! [`SnapshotBuilder`] reads the current engine state into a compact,
 //! rkyv-serialized [`ShmSnapshot`] (a per-domain, key-sorted index of the live
 //! inline values); [`SnapshotPublisher`] pushes it through the spec 007
-//! [`SnapshotWriter`] on an interval and after every MemTable flush. Local
+//! [`SnapshotWriter`] whenever its content may have changed, checked on an
+//! interval and after every MemTable flush (spec perf/028). Local
 //! clients (spec 010) read it lock-free via `SnapshotGuard` — for VLog-backed
 //! values the entry carries only a `is_vlog_pointer` flag and the client falls
 //! back to a command-ring GET.
 
 use crate::core::coop::{self, YieldEvery};
+use crate::engines::lsm::domain::now_secs;
 use crate::engines::lsm::{Domain, DomainRegistry, LsmStorageEngine, RegistrySnapshot, ValueWithMetadata};
+use crate::storage::format::is_expired;
 use anyhow::Result;
 use rkyv::util::AlignedVec;
 use rkyv::{rancor, Archive, Deserialize, Serialize};
@@ -75,12 +78,26 @@ fn serialize_snapshot(snapshot: &ShmSnapshot) -> AlignedVec {
         .expect("rkyv serialization is infallible for in-memory values")
 }
 
+/// Earliest `expire_at > 0` among the snapshot's entries (spec perf/028 A2).
+fn earliest_expiry(snapshot: &ShmSnapshot) -> Option<u64> {
+    snapshot.domains.iter().flat_map(|d| &d.entries).map(|e| e.expire_at).filter(|&at| at > 0).min()
+}
+
+/// Result of [`SnapshotBuilder::build`].
+pub struct BuiltSnapshot {
+    /// rkyv-serialized [`ShmSnapshot`].
+    pub bytes: AlignedVec,
+    /// Earliest `expire_at > 0` among the included entries; reaching it
+    /// makes the publisher rebuild (spec perf/028 A2).
+    pub earliest_expiry: Option<u64>,
+}
+
 // ── SnapshotBuilder (spec §2, §3, §6) ──────────────────────────────────────────
 
 /// Builds an [`ShmSnapshot`] from the current engine state.
 ///
-/// Reads go straight through the engine (not `DomainStore`) so the periodic
-/// system rebuild is not charged against per-domain read rate limits.
+/// Reads go straight through the engine (not `DomainStore`) so the system
+/// rebuild is not charged against per-domain read rate limits.
 pub struct SnapshotBuilder {
     registry: Arc<DomainRegistry>,
     engine: Arc<LsmStorageEngine>,
@@ -97,13 +114,14 @@ impl SnapshotBuilder {
         Self { registry, engine, max_snapshot_size }
     }
 
-    /// Builds the snapshot and returns the rkyv-serialized bytes.
+    /// Builds the snapshot and returns the rkyv-serialized bytes plus the
+    /// earliest entry expiry.
     ///
     /// One MVCC snapshot pins a consistent point-in-time across all domains.
     /// Accumulation stops once a conservative budget (7/8 of the buffer) is hit;
     /// the truncated result is logged and still published. Whether it fits after
     /// serialization is the final call of [`SnapshotWriter::publish`].
-    pub async fn build(&self) -> Result<AlignedVec> {
+    pub async fn build(&self) -> Result<BuiltSnapshot> {
         let snap = self.engine.snapshot();
         // Point-in-time stamp of this snapshot = its MVCC read timestamp.
         let ts = snap.snapshot().timestamp().as_u64();
@@ -140,9 +158,13 @@ impl SnapshotBuilder {
         }
 
         let snapshot = ShmSnapshot { version: ts, timestamp: ts, domains: domain_indices };
-        // rkyv serialization is pure CPU work over an owned value — it runs
-        // on the blocking pool (spec perf/017 A4).
-        Ok(coop::offload(move || serialize_snapshot(&snapshot)).await)
+        // Serialization and the expiry scan are pure CPU work over an owned
+        // value — they run on the blocking pool (spec perf/017 A4).
+        Ok(coop::offload(move || BuiltSnapshot {
+            earliest_expiry: earliest_expiry(&snapshot),
+            bytes: serialize_snapshot(&snapshot),
+        })
+        .await)
     }
 
     /// Collects one domain's entries against the shared byte budget, stopping at
@@ -211,6 +233,95 @@ impl SkipTracker {
     }
 }
 
+/// What one publisher step did (spec perf/028 A2).
+#[derive(Debug, PartialEq, Eq)]
+enum Tick {
+    /// Content unchanged since the last publish: no build, only the header
+    /// timestamp confirmed.
+    Idle,
+    /// Rebuilt and handed to the writer.
+    Rebuilt(PublishOutcome),
+    /// Build or publish failed (logged); the next step rebuilds.
+    Failed,
+}
+
+/// The publisher's loop body plus the state it carries between ticks.
+struct PublishLoop<'w> {
+    builder: SnapshotBuilder,
+    writer: SnapshotWriter<'w>,
+    readers: Arc<ReaderRegistry>,
+    skips: SkipTracker,
+    /// Change epoch of the last publish; `None` before the first.
+    published_epoch: Option<u64>,
+    /// Earliest `expire_at > 0` among the last published entries.
+    earliest_expiry: Option<u64>,
+}
+
+impl<'w> PublishLoop<'w> {
+    fn new(builder: SnapshotBuilder, writer: SnapshotWriter<'w>, readers: Arc<ReaderRegistry>) -> Self {
+        Self {
+            builder,
+            writer,
+            readers,
+            skips: SkipTracker::default(),
+            published_epoch: None,
+            earliest_expiry: None,
+        }
+    }
+
+    /// One tick (spec perf/028 A2): rebuilds and publishes only if the
+    /// snapshot content may have changed since the last publish, else just
+    /// confirms the header timestamp (A3). `now` is the Unix time in seconds
+    /// checked against the earliest published expiry.
+    async fn step(&mut self, now: u64) -> Tick {
+        // Read before `build` takes its MVCC snapshot: a write in between
+        // leaves the epoch behind and triggers the next rebuild.
+        let epoch = self.builder.engine.change_epoch();
+        let expired = self.earliest_expiry.is_some_and(|at| is_expired(at, now));
+        if self.published_epoch == Some(epoch) && !expired {
+            self.writer.confirm_unchanged();
+            return Tick::Idle;
+        }
+        let built = match self.builder.build().await {
+            Ok(built) => built,
+            Err(e) => {
+                tracing::error!("SHM snapshot build failed: {e}");
+                return Tick::Failed;
+            }
+        };
+        let outcome = match self.writer.publish(&built.bytes) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!("SHM snapshot publish failed: {e}");
+                return Tick::Failed;
+            }
+        };
+        match outcome {
+            PublishOutcome::Published => {
+                // Only a publish moves the comparison state (A2.4).
+                self.published_epoch = Some(epoch);
+                self.earliest_expiry = built.earliest_expiry;
+                if let Some(n) = self.skips.on_published() {
+                    tracing::info!("SHM snapshot publishing resumed after {n} skipped publishes");
+                }
+            }
+            // No force-flip (spec perf/012 §9): a pinned buffer is never
+            // overwritten, the state is only made visible.
+            PublishOutcome::SkippedBusy { buffer } => {
+                if self.skips.on_skipped() {
+                    tracing::warn!(
+                        "SHM snapshot stale: {} consecutive publishes skipped, buffer {buffer} \
+                         still pinned by (client_id, readers) {:?}",
+                        self.skips.consecutive,
+                        self.readers.blockers(buffer)
+                    );
+                }
+            }
+        }
+        Tick::Rebuilt(outcome)
+    }
+}
+
 /// Background task that publishes snapshots into the SHM double buffer.
 ///
 /// Runs via `tokio_uring::spawn`: it holds a `!Send` [`SnapshotWriter`] (raw
@@ -223,7 +334,7 @@ pub struct SnapshotPublisher {
     wait_timeout_us: u64,
     /// Reader slots of the registered clients; scanned before every flip.
     readers: Arc<ReaderRegistry>,
-    /// Notified after each MemTable flush — an extra rebuild trigger (spec §4b).
+    /// Notified after each MemTable flush — an extra tick (spec §4b).
     flush_notify: Arc<Notify>,
     /// Set to true at shutdown to stop the loop.
     shutdown: watch::Receiver<bool>,
@@ -280,35 +391,13 @@ impl SnapshotPublisher {
                 Arc::clone(&readers),
             )
         };
-        let mut skips = SkipTracker::default();
+        let mut publish = PublishLoop::new(builder, writer, readers);
 
         loop {
             if *shutdown.borrow() {
                 break;
             }
-            match builder.build().await {
-                Ok(bytes) => match writer.publish(&bytes) {
-                    Ok(PublishOutcome::Published) => {
-                        if let Some(n) = skips.on_published() {
-                            tracing::info!("SHM snapshot publishing resumed after {n} skipped publishes");
-                        }
-                    }
-                    // No force-flip (spec perf/012 §9): a pinned buffer is never
-                    // overwritten, the state is only made visible.
-                    Ok(PublishOutcome::SkippedBusy { buffer }) => {
-                        if skips.on_skipped() {
-                            tracing::warn!(
-                                "SHM snapshot stale: {} consecutive publishes skipped, buffer {buffer} \
-                                 still pinned by (client_id, readers) {:?}",
-                                skips.consecutive,
-                                readers.blockers(buffer)
-                            );
-                        }
-                    }
-                    Err(e) => tracing::error!("SHM snapshot publish failed: {e}"),
-                },
-                Err(e) => tracing::error!("SHM snapshot build failed: {e}"),
-            }
+            publish.step(now_secs()).await;
 
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -327,12 +416,13 @@ mod tests {
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::domain::DomainConfig;
     use crate::engines::lsm::engine::LsmEngineOptions;
-    use crate::ipc::{ReaderSlot, ReaderSlotHandle, SnapshotGuard, PUBLISH_WAIT_TIMEOUT_US};
+    use crate::ipc::{ReaderSlot, ReaderSlotHandle, ReaderSlotLease, SnapshotGuard, PUBLISH_WAIT_TIMEOUT_US};
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
     use rkyv::Archived;
+    use std::sync::atomic::Ordering;
 
     async fn make_setup() -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -401,7 +491,7 @@ mod tests {
         let probe_key = [domain.system_prefix.as_slice(), b"k:00001".as_slice()].concat();
         let order = crate::core::coop::completion_order(
             async move {
-                let bytes = builder.build().await.unwrap();
+                let bytes = builder.build().await.unwrap().bytes;
                 let snapshot = decode(bytes.as_slice());
                 assert_eq!(find(&snapshot, "shm").unwrap().entries.len(), 20_000);
             },
@@ -436,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_empty_db() {
         let (engine, registry, _dir) = make_setup().await;
-        let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap();
+        let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes;
         let snap = decode(&bytes);
         let default = find(&snap, "default").expect("default domain present");
         assert!(default.entries.is_empty(), "no user keys written");
@@ -455,7 +545,7 @@ mod tests {
             b.put(format!("key{i:03}").as_bytes(), format!("vb{i}").as_bytes()).await.unwrap();
         }
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
         for name in ["alpha", "beta"] {
             let dom = find(&snap, name).unwrap();
             assert_eq!(dom.entries.len(), 50, "{name} entry count");
@@ -473,7 +563,7 @@ mod tests {
         let big = vec![b'x'; 2048]; // >= vlog_inline_threshold (1024)
         store.put(b"large", &big).await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
         let dom = find(&snap, "default").unwrap();
         let entry = dom.entries.iter().find(|e| e.key == b"large").unwrap();
         assert!(entry.is_vlog_pointer);
@@ -487,7 +577,7 @@ mod tests {
         let store = registry.default_store().await.unwrap();
         store.put(b"small", b"hello").await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
         let dom = find(&snap, "default").unwrap();
         let entry = dom.entries.iter().find(|e| e.key == b"small").unwrap();
         assert!(!entry.is_vlog_pointer);
@@ -502,7 +592,7 @@ mod tests {
         let store = registry.default_store().await.unwrap();
         store.set_null(b"nulled").await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
         let dom = find(&snap, "default").unwrap();
         let entry = dom.entries.iter().find(|e| e.key == b"nulled").expect("NULL key present");
         assert!(entry.is_null);
@@ -519,7 +609,7 @@ mod tests {
             store.put(format!("key{i:04}").as_bytes(), b"val").await.unwrap();
         }
         // Tiny budget forces truncation.
-        let snap = decode(&builder(&registry, &engine, 2048).build().await.unwrap());
+        let snap = decode(&builder(&registry, &engine, 2048).build().await.unwrap().bytes);
         let total: usize = snap.domains.iter().map(|d| d.entries.len()).sum();
         assert!(total > 0, "at least one entry fits");
         assert!(total < 200, "snapshot must be truncated, got {total}");
@@ -535,7 +625,7 @@ mod tests {
         store.put(b"alpha", b"1").await.unwrap();
         store.put(b"beta", b"2").await.unwrap();
 
-        let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap();
+        let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes;
 
         // Arena models the SHM state header + two data buffers (page-aligned in
         // production; here we copy into an AlignedVec before validating), plus
@@ -600,7 +690,7 @@ mod tests {
         // ttl 0 → expire_at = now, already expired at build time (no sleep).
         store.put_with_ttl(b"gone", b"v", 0).await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
         let dom = find(&snap, "default").unwrap();
         assert!(dom.entries.iter().any(|e| e.key == b"stays"));
         assert!(!dom.entries.iter().any(|e| e.key == b"gone"), "expired key must be absent");
@@ -630,8 +720,220 @@ mod tests {
         registry.store("temp").await.unwrap().put(b"k", b"v").await.unwrap();
         registry.delete_domain("temp").await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap());
+        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
         assert!(find(&snap, "temp").is_none(), "deleting domain must be absent");
         assert!(find(&snap, "default").is_some(), "active domain still present");
+    }
+
+    // ── Spec perf/028: publisher step ─────────────────────────────────────────────
+
+    const ARENA_LEN: usize = 1 << 20;
+
+    /// Step time for tests without TTL entries.
+    const BEFORE_ANY_EXPIRY: u64 = 0;
+
+    /// SHM stand-in for the step tests: state header, two data buffers and one
+    /// registered client slot.
+    struct Arena {
+        header: Box<StateHeader>,
+        slot: Arc<ReaderSlot>,
+        readers: Arc<ReaderRegistry>,
+        _lease: ReaderSlotLease,
+        buf_a: Vec<u8>,
+        buf_b: Vec<u8>,
+        /// Write pointers into the buffers, taken once: heap buffers never move.
+        ptr_a: *mut u8,
+        ptr_b: *mut u8,
+    }
+
+    impl Arena {
+        fn new() -> Self {
+            let header = Box::new(StateHeader::zeroed());
+            header.init();
+            let slot = Arc::new(ReaderSlot::zeroed());
+            let readers = Arc::new(ReaderRegistry::new());
+            // Safe: the pointer targets the slot inside `slot`, whose `Arc`
+            // clone the handle keeps alive.
+            let handle = unsafe {
+                ReaderSlotHandle::new(
+                    1,
+                    Arc::as_ptr(&slot),
+                    Arc::clone(&slot) as Arc<dyn std::any::Any + Send + Sync>,
+                )
+            };
+            let _lease = readers.register(handle);
+            let (mut buf_a, mut buf_b) = (vec![0u8; ARENA_LEN], vec![0u8; ARENA_LEN]);
+            let (ptr_a, ptr_b) = (buf_a.as_mut_ptr(), buf_b.as_mut_ptr());
+            Self { header, slot, readers, _lease, buf_a, buf_b, ptr_a, ptr_b }
+        }
+
+        /// Publisher loop writing into this arena — its only writer.
+        fn publish_loop(&self, builder: SnapshotBuilder) -> PublishLoop<'_> {
+            // Safe: single writer; two distinct buffers of ARENA_LEN bytes that
+            // live as long as `self`.
+            let writer = unsafe {
+                SnapshotWriter::new(
+                    &self.header,
+                    self.ptr_a,
+                    self.ptr_b,
+                    ARENA_LEN,
+                    PUBLISH_WAIT_TIMEOUT_US,
+                    Arc::clone(&self.readers),
+                )
+            };
+            PublishLoop::new(builder, writer, Arc::clone(&self.readers))
+        }
+
+        fn version(&self) -> u64 {
+            self.header.version.load(Ordering::Acquire)
+        }
+
+        /// Pins the active buffer like a client read in progress.
+        fn pin(&self) -> SnapshotGuard<'_> {
+            SnapshotGuard::acquire(&self.header, &self.slot, &self.buf_a, &self.buf_b).expect("snapshot available")
+        }
+
+        /// The active snapshot, read the way a client does.
+        fn read(&self) -> ShmSnapshot {
+            decode(self.pin().data())
+        }
+    }
+
+    /// `key`'s entry in the default domain.
+    fn default_entry<'a>(snap: &'a ShmSnapshot, key: &[u8]) -> Option<&'a ShmEntry> {
+        find(snap, "default")?.entries.iter().find(|e| e.key == key)
+    }
+
+    // Spec perf/028 test 1: without a write, the next step is idle — no build,
+    // no flip.
+    #[tokio::test]
+    async fn test_step_without_write_is_idle() {
+        let (engine, registry, _dir) = make_setup().await;
+        let arena = Arena::new();
+        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+        let version = arena.version();
+
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
+        assert_eq!(arena.version(), version, "an idle step must not flip");
+    }
+
+    // Spec perf/028 test 6: an idle step confirms the unchanged snapshot by
+    // refreshing `last_update_ns`; `version` stays.
+    #[tokio::test]
+    async fn test_idle_step_refreshes_last_update_ns() {
+        let (engine, registry, _dir) = make_setup().await;
+        let arena = Arena::new();
+        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+        publish.step(BEFORE_ANY_EXPIRY).await;
+        let version = arena.version();
+        arena.header.last_update_ns.store(0, Ordering::Relaxed);
+
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
+        assert_ne!(arena.header.last_update_ns.load(Ordering::Relaxed), 0, "idle step must refresh it");
+        assert_eq!(arena.version(), version);
+    }
+
+    // Spec perf/028 test 2: a write between two steps makes the second one
+    // rebuild, and the new value is in the snapshot.
+    #[tokio::test]
+    async fn test_step_after_write_rebuilds_with_new_value() {
+        let (engine, registry, _dir) = make_setup().await;
+        let store = registry.default_store().await.unwrap();
+        let arena = Arena::new();
+        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+        publish.step(BEFORE_ANY_EXPIRY).await;
+
+        store.put(b"k", b"new").await.unwrap();
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+        assert_eq!(default_entry(&arena.read(), b"k").expect("written key published").value, b"new");
+    }
+
+    fn domain_names(snap: &ShmSnapshot) -> Vec<&str> {
+        snap.domains.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    // Spec perf/028 test 3: creating and then deleting a domain each make the
+    // next step rebuild with the matching domain list.
+    #[tokio::test]
+    async fn test_step_after_domain_create_and_delete_rebuilds() {
+        let (engine, registry, _dir) = make_setup().await;
+        let arena = Arena::new();
+        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+        publish.step(BEFORE_ANY_EXPIRY).await;
+
+        registry.create_domain("fresh").await.unwrap();
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+        assert_eq!(domain_names(&arena.read()), ["default", "fresh"]);
+
+        registry.delete_domain("fresh").await.unwrap();
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+        assert_eq!(domain_names(&arena.read()), ["default"]);
+    }
+
+    // Spec perf/028 test 5: a skipped publish keeps the comparison state, so
+    // the next step rebuilds without a write and publishes once the pin is gone.
+    #[tokio::test]
+    async fn test_step_after_skipped_publish_rebuilds_without_write() {
+        let (engine, registry, _dir) = make_setup().await;
+        let store = registry.default_store().await.unwrap();
+        let arena = Arena::new();
+        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+        publish.step(BEFORE_ANY_EXPIRY).await;
+        // Pins buffer B, the target of the publish after next.
+        let guard = arena.pin();
+        store.put(b"k", b"1").await.unwrap();
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+        store.put(b"k", b"2").await.unwrap();
+        assert_eq!(
+            publish.step(BEFORE_ANY_EXPIRY).await,
+            Tick::Rebuilt(PublishOutcome::SkippedBusy { buffer: 1 })
+        );
+
+        drop(guard);
+        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+        assert_eq!(default_entry(&arena.read(), b"k").expect("key published").value, b"2");
+    }
+
+    // Spec perf/028 test 4, trigger: the step idles before the earliest
+    // published `expire_at` and rebuilds from it on. Stamps an hour out keep
+    // every entry published, so only the step time decides.
+    #[tokio::test]
+    async fn test_step_rebuilds_from_earliest_expiry_on() {
+        let (engine, registry, _dir) = make_setup().await;
+        let store = registry.default_store().await.unwrap();
+        let soon = now_secs() + 3600;
+        store.put(b"plain", b"v").await.unwrap();
+        store.put_unthrottled(b"late", b"v", Some(soon + 3600)).await.unwrap();
+        store.put_unthrottled(b"soon", b"v", Some(soon)).await.unwrap();
+        let arena = Arena::new();
+        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+        publish.step(BEFORE_ANY_EXPIRY).await;
+
+        assert_eq!(publish.step(soon - 1).await, Tick::Idle);
+        assert_eq!(publish.step(soon).await, Tick::Rebuilt(PublishOutcome::Published));
+    }
+
+    // Spec perf/028 test 4, removal: once the wall clock reached the stamp, the
+    // step at that time drops the expired entry.
+    #[tokio::test]
+    async fn test_step_at_expiry_drops_the_expired_entry() {
+        let (engine, registry, _dir) = make_setup().await;
+        let store = registry.default_store().await.unwrap();
+        let expire_at = now_secs() + 2;
+        store.put_unthrottled(b"ttl", b"v", Some(expire_at)).await.unwrap();
+        let arena = Arena::new();
+        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+        publish.step(BEFORE_ANY_EXPIRY).await;
+
+        // The engine hides expired entries by wall clock: poll it, a fixed
+        // sleep could be cut short by a backwards clock step.
+        while now_secs() < expire_at {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        publish.step(expire_at).await;
+        // Absence only: whether the first build still saw the entry depends
+        // on scheduling; the trigger itself is the test above.
+        assert!(default_entry(&arena.read(), b"ttl").is_none(), "expired entry must be gone");
     }
 }

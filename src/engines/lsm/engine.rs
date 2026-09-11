@@ -362,9 +362,14 @@ pub struct LsmStorageEngine {
     /// SSTables through it and the Janitor reopens the VLog through it after GC.
     storage_handle: Option<StorageHandle>,
 
-    /// Notified after every MemTable flush — the SHM snapshot publisher
-    /// (spec perf/009 §4) rebuilds on this event in addition to its interval.
+    /// Notified after every MemTable flush — an extra tick of the SHM snapshot
+    /// publisher (spec perf/009 §4) besides its interval.
     flush_notify: Arc<Notify>,
+
+    /// Raised after every visible change: each MemTable write and each domain
+    /// create/delete (spec perf/028 A1). Flush, compaction and vLog GC leave
+    /// it alone.
+    change_epoch: AtomicU64,
 
     /// In-flight guard for the client write sequence (spec kv/020, widened by
     /// kv/029). Every client write path holds the `read()` side from before its
@@ -476,6 +481,7 @@ impl LsmStorageEngine {
             janitor_runs: Arc::new(AtomicU64::new(0)),
             storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
+            change_epoch: AtomicU64::new(0),
             in_flight_writes: tokio::sync::RwLock::new(()),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -846,9 +852,20 @@ impl LsmStorageEngine {
     }
 
     /// Handle to the flush-notification (spec perf/009 §4). The SHM snapshot
-    /// publisher awaits it to rebuild right after a MemTable flush.
+    /// publisher awaits it as an extra tick right after a MemTable flush.
     pub fn flush_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.flush_notify)
+    }
+
+    /// Monotonic change epoch (spec perf/028 A1). Every change counted in a
+    /// loaded value is visible to reads started after the load.
+    pub fn change_epoch(&self) -> u64 {
+        self.change_epoch.load(Ordering::Acquire)
+    }
+
+    /// Counts one change; call only once readers can see it.
+    pub(super) fn raise_change_epoch(&self) {
+        self.change_epoch.fetch_add(1, Ordering::Release);
     }
 
     // ── Read path ───────────────────────────────────────────────────────────
@@ -1047,6 +1064,7 @@ impl LsmStorageEngine {
         };
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, resolved);
+        self.raise_change_epoch();
 
         // Broadcast after the apply is visible, not just WAL-durable (spec
         // kv/030): closes the window where a racing delete's event could
@@ -1082,6 +1100,7 @@ impl LsmStorageEngine {
         // inversion window this placement only narrowed (spec kv/025 §3.2).
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+        self.raise_change_epoch();
 
         // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
         self.publish_change(key, OpType::Delete);
@@ -1109,6 +1128,7 @@ impl LsmStorageEngine {
         self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
         memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+        self.raise_change_epoch();
 
         // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
         self.publish_change(key, OpType::Delete);
@@ -1138,6 +1158,7 @@ impl LsmStorageEngine {
 
         let memtable = Arc::clone(&*self.memtable.read());
         memtable.set(key.to_vec(), timestamp, Value::Null);
+        self.raise_change_epoch();
 
         // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
         // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
@@ -1263,6 +1284,7 @@ impl LsmStorageEngine {
         for (key, value) in resolved {
             memtable.set(key, timestamp, value);
         }
+        self.raise_change_epoch();
 
         // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
         self.broadcast_batch_events(&batch_events);
@@ -4666,5 +4688,52 @@ mod tests {
         for key in keys {
             assert_eq!(engine.get(key).await.unwrap(), Some(big.clone()), "key must survive");
         }
+    }
+
+    // ── Spec perf/028 test 7: every write path raises the change epoch ──────
+
+    async fn assert_raises_change_epoch(
+        engine: &LsmStorageEngine,
+        write: impl std::future::Future<Output = Result<()>>,
+    ) {
+        let before = engine.change_epoch();
+        write.await.unwrap();
+        assert!(engine.change_epoch() > before, "the write must raise the change epoch");
+    }
+
+    #[tokio::test]
+    async fn test_write_kv_pair_raises_change_epoch() {
+        let (engine, _dir) = make_engine().await;
+        assert_raises_change_epoch(&engine, engine.write_kv_pair(b"k", b"v", None)).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_tombstone_raises_change_epoch() {
+        let (engine, _dir) = make_engine().await;
+        assert_raises_change_epoch(&engine, engine.write_tombstone(b"k")).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_tombstone_at_raises_change_epoch() {
+        let (engine, _dir) = make_engine().await;
+        let memtable = engine.pin_memtable();
+        let stamp = engine.next_timestamp();
+        assert_raises_change_epoch(&engine, engine.write_tombstone_at(&memtable, b"k", stamp)).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_null_raises_change_epoch() {
+        let (engine, _dir) = make_engine().await;
+        assert_raises_change_epoch(&engine, engine.write_null(b"k")).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_raises_change_epoch() {
+        let (engine, _dir) = make_engine().await;
+        let ops = vec![
+            BatchOp::Put { key: b"a".to_vec(), value: b"v".to_vec() },
+            BatchOp::Delete { key: b"b".to_vec() },
+        ];
+        assert_raises_change_epoch(&engine, engine.write_batch(ops)).await;
     }
 }

@@ -849,8 +849,9 @@ pub struct ShmConfig {
     /// UDS path for the multi-client registration listener; `{instance_id}`
     /// is substituted at runtime (Default: "/run/luradb/{instance_id}.sock").
     pub registration_socket_path: String,
-    /// Interval between RCU snapshot publications in milliseconds (spec
-    /// perf/009 §4; Default: 100). A MemTable flush also triggers a rebuild.
+    /// Interval in milliseconds at which the RCU snapshot publisher checks for
+    /// changes (spec perf/009 §4, perf/028; Default: 100). A MemTable flush
+    /// also triggers a check; the snapshot is rebuilt only after a change.
     pub snapshot_interval_ms: u64,
 }
 

@@ -312,6 +312,8 @@ impl DomainRegistry {
         self.engine.put(&sys_key(name), &data).await?;
         self.runtimes.write().insert(name.to_string(), self.make_runtime());
         self.domains.write().insert(name.to_string(), domain.clone());
+        // The engine write above raised the epoch before `list_domains` changed (spec perf/028 A1.3).
+        self.engine.raise_change_epoch();
         self.publish_lifecycle_event("domain_created", name);
         Ok(domain)
     }
@@ -373,6 +375,8 @@ impl DomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain);
+        // The engine write above raised the epoch before `list_domains` changed (spec perf/028 A1.3).
+        self.engine.raise_change_epoch();
         self.publish_lifecycle_event("domain_deleted", name);
         Ok(())
     }

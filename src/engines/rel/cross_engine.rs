@@ -36,6 +36,12 @@ impl TargetDomain {
     fn is_active(self) -> bool {
         matches!(self, TargetDomain::Active)
     }
+
+    /// Only a gone/`Deleting` domain is swept, never a disabled engine: its
+    /// data stays on disk and is visible again once re-enabled (spec rel/020).
+    fn should_sweep(self) -> bool {
+        matches!(self, TargetDomain::GoneOrDeleting)
+    }
 }
 
 /// Outcome of a KVREF point lookup (raw KV value = bytes). `NullValue` is a
@@ -55,8 +61,8 @@ pub enum JsonResolution {
 }
 
 /// Bridge from the rel engine to the same-named KV/JSON domains. Both handles
-/// are optional: an engine can be disabled by config, and `disabled ⇒ target
-/// gone` is then structurally the same path.
+/// are optional: an engine can be disabled by config. Reads and writes treat a
+/// disabled engine like a gone target; the sweep does not (spec rel/020).
 pub struct CrossEngineResolver {
     kv: Option<Arc<DomainRegistry>>,
     json: Option<Arc<JsonEngine>>,
@@ -343,8 +349,8 @@ impl RelCrossEngineSweeper {
     }
 
     async fn sweep_domain(&self, dom: &RelDomain) -> anyhow::Result<()> {
-        let kv_gone = !self.engine.cross_engine.kv_domain_status(&dom.name).await?.is_active();
-        let json_gone = !self.engine.cross_engine.json_domain_status(&dom.name).is_active();
+        let kv_gone = self.engine.cross_engine.kv_domain_status(&dom.name).await?.should_sweep();
+        let json_gone = self.engine.cross_engine.json_domain_status(&dom.name).should_sweep();
         if !kv_gone && !json_gone {
             return Ok(());
         }
@@ -539,6 +545,7 @@ mod tests {
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::domain::DomainConfig;
     use crate::engines::lsm::engine::LsmStorageEngine;
+    use crate::engines::json::JsonDomainPurger;
     use crate::engines::rel::{ExecOutcome, ExpandedBlock, SqlOutcome};
     use crate::metrics::MetricsConfig;
     use crate::storage::file_manager::FileManager;
@@ -1404,5 +1411,142 @@ mod tests {
         let [_, _, rel_m] = e.metrics.engine_metrics();
         assert_eq!(rel_m.read_ops, 0);
         assert_eq!(rel_m.write_ops, 0);
+    }
+
+    // ── Spec rel/020: a disabled target engine is not "gone" for the sweep ───
+
+    // Tests 1+2 (JSONREF): masked while JSON is disabled, sweeper ticks must
+    // not physically null the cell, and the reference is back once JSON is
+    // re-enabled. Test 4 (regression): a non-NULL JSONREF write still 409s
+    // while JSON stays disabled.
+    #[tokio::test]
+    async fn test_jsonref_survives_disable_reenable_sweep() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let kv = make_kv(dir.path(), Arc::clone(&metrics)).await;
+        let json = make_json(dir.path(), Arc::clone(&metrics)).await;
+
+        // Phase 1: both engines enabled — schema + a non-NULL JSONREF row.
+        {
+            let resolver =
+                CrossEngineResolver::new(Some(Arc::clone(&kv)), Some(Arc::clone(&json)), Arc::clone(&metrics));
+            let rel = boot_rel(dir.path(), RelStoreConfig::default(), Arc::clone(&metrics), resolver).await;
+            json.put_document("default", "d1", json!({"a": 1})).await.unwrap();
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, doc JSONREF)").await;
+            ok(&rel, "default", "INSERT INTO t VALUES (1, 'd1')").await;
+            rel.shutdown().await;
+        }
+
+        // Phase 2: JSON disabled — masked read, several sweep ticks must
+        // leave the cell physically untouched, and a non-NULL write 409s.
+        {
+            let resolver = CrossEngineResolver::new(Some(Arc::clone(&kv)), None, Arc::clone(&metrics));
+            let rel = boot_rel(dir.path(), RelStoreConfig::default(), Arc::clone(&metrics), resolver).await;
+            let r = rows(&rel, "default", "SELECT doc FROM t WHERE id = 1").await;
+            assert_eq!(r[0][0], ScalarValue::Null, "masked while JSON disabled");
+
+            for _ in 0..3 {
+                sweep_once(&rel, 100).await;
+            }
+            assert_eq!(
+                raw_cell(&rel, "default", "t", 1, "doc").await,
+                ScalarValue::Text("d1".into()),
+                "sweep must not physically null a cell merely because its target engine is disabled"
+            );
+
+            let err = exec_err(&rel, "default", "INSERT INTO t VALUES (2, 'd1')").await;
+            assert!(
+                matches!(&err, RelStoreError::CrossEngineTargetUnavailable { engine, domain: Some(d) } if engine == "json" && d == "default"),
+                "got: {err}"
+            );
+            assert_eq!(count(&rel, "default", "t").await, 1, "the rejected insert left no row");
+            rel.shutdown().await;
+        }
+
+        // Phase 3: JSON re-enabled — the reference reads back unchanged.
+        {
+            let resolver =
+                CrossEngineResolver::new(Some(Arc::clone(&kv)), Some(Arc::clone(&json)), Arc::clone(&metrics));
+            let rel = boot_rel(dir.path(), RelStoreConfig::default(), metrics, resolver).await;
+            let r = rows(&rel, "default", "SELECT doc FROM t WHERE id = 1").await;
+            assert_eq!(r[0][0], ScalarValue::Text("d1".into()), "JSONREF survives disable+re-enable");
+        }
+    }
+
+    // Test 5 (KVREF counterpart): masked while KV is disabled, sweeper ticks
+    // must not physically null the cell, and the reference is back once KV is
+    // re-enabled.
+    #[tokio::test]
+    async fn test_kvref_survives_disable_reenable_sweep() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let kv = make_kv(dir.path(), Arc::clone(&metrics)).await;
+        let json = make_json(dir.path(), Arc::clone(&metrics)).await;
+
+        // Phase 1: both engines enabled — schema + a non-NULL KVREF row.
+        {
+            let resolver =
+                CrossEngineResolver::new(Some(Arc::clone(&kv)), Some(Arc::clone(&json)), Arc::clone(&metrics));
+            let rel = boot_rel(dir.path(), RelStoreConfig::default(), Arc::clone(&metrics), resolver).await;
+            kv_put(&kv, "default", b"k", b"v").await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
+            ok(&rel, "default", "INSERT INTO t VALUES (1, 'k')").await;
+            rel.shutdown().await;
+        }
+
+        // Phase 2: KV disabled — masked read, several sweep ticks must leave
+        // the cell physically untouched.
+        {
+            let resolver = CrossEngineResolver::new(None, Some(Arc::clone(&json)), Arc::clone(&metrics));
+            let rel = boot_rel(dir.path(), RelStoreConfig::default(), Arc::clone(&metrics), resolver).await;
+            let r = rows(&rel, "default", "SELECT payload FROM t WHERE id = 1").await;
+            assert_eq!(r[0][0], ScalarValue::Null, "masked while KV disabled");
+
+            for _ in 0..3 {
+                sweep_once(&rel, 100).await;
+            }
+            assert_eq!(
+                raw_cell(&rel, "default", "t", 1, "payload").await,
+                ScalarValue::Text("k".into()),
+                "sweep must not physically null a cell merely because its target engine is disabled"
+            );
+            rel.shutdown().await;
+        }
+
+        // Phase 3: KV re-enabled — the reference reads back unchanged.
+        {
+            let resolver = CrossEngineResolver::new(Some(kv), Some(json), Arc::clone(&metrics));
+            let rel = boot_rel(dir.path(), RelStoreConfig::default(), metrics, resolver).await;
+            let r = rows(&rel, "default", "SELECT payload FROM t WHERE id = 1").await;
+            assert_eq!(r[0][0], ScalarValue::Text("k".into()), "KVREF survives disable+re-enable");
+        }
+    }
+
+    // Test 3 (regression): a JSON domain that is really deleted — engine
+    // stays enabled throughout — is still swept: the JSONREF cell is
+    // physically nulled and stays NULL after the domain is finalized and
+    // recreated same-named.
+    #[tokio::test]
+    async fn test_sweep_physically_nulls_jsonref_on_domain_delete() {
+        let e = env().await;
+        e.rel.create_domain("d").await.unwrap();
+        e.json.create_domain("d").await.unwrap();
+        e.json.put_document("d", "j1", json!({"a": 1})).await.unwrap();
+        ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, doc JSONREF)").await;
+        ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'j1')").await;
+
+        e.json.delete_domain("d").await.unwrap();
+        sweep_once(&e.rel, 100).await;
+        assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Null, "cell physically NULL");
+
+        // Finalize the deletion (a document is present -> two ticks, mirrors
+        // json/013 purger tests) before recreating the domain same-named.
+        let purger = JsonDomainPurger::new(Arc::clone(&e.json), Arc::new(AtomicBool::new(false)), 100, 5);
+        purger.purge_tick().await.unwrap();
+        purger.purge_tick().await.unwrap();
+
+        e.json.create_domain("d").await.unwrap();
+        let r = rows(&e.rel, "d", "SELECT doc FROM t WHERE id = 1").await;
+        assert_eq!(r[0][0], ScalarValue::Null, "nulled stays nulled");
     }
 }

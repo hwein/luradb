@@ -806,7 +806,7 @@ mod tests {
 
     async fn make_app(json_enabled: bool) -> (axum::Router, tempfile::TempDir) {
         let (state, dir) = make_state(json_enabled, false).await;
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     async fn request(
@@ -1320,7 +1320,7 @@ mod tests {
 
         let (state, _dir) = make_state(true, true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let user_key = "lura_test_user_key";
         cache
@@ -1418,7 +1418,7 @@ mod tests {
         let (state, _dir) = make_state(false, true).await;
         let cache = Arc::clone(&state.auth_cache);
         let registry = Arc::clone(&state.registry);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         registry.create_domain("orders").await.unwrap();
 
@@ -1496,7 +1496,7 @@ mod tests {
 
         let (state, _dir) = make_state(false, true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let admin_key = "lura_test_admin_key";
         cache
@@ -1549,7 +1549,7 @@ mod tests {
     #[tokio::test]
     async fn test_trusted_peer_bypasses_auth() {
         let (state, _dir) = make_state(true, true).await;
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let req = Request::builder()
             .method(Method::GET)

@@ -5,17 +5,17 @@
 //! are authenticated via kernel-verified peer credentials (no API key).
 
 use crate::auth::middleware::TrustedPeer;
+use crate::server::serve_connection;
 use axum::extract::connect_info::ConnectInfo;
+use axum::http::Extensions;
 use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{unix::UCred, UnixListener};
 use tokio::sync::watch;
-use tower::ServiceExt;
 
 /// Connection info attached to every UDS request (kernel-verified peer creds).
 #[derive(Clone, Debug)]
@@ -76,6 +76,7 @@ pub async fn serve_uds(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut connections = tokio::task::JoinSet::new();
+    let connection_shutdown = shutdown.clone();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -98,24 +99,18 @@ pub async fn serve_uds(
                     peer_cred,
                     peer_addr: Arc::new(peer_addr),
                 };
-                let router = router.clone();
-                connections.spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let service =
-                        hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-                            req.extensions_mut().insert(ConnectInfo(connect_info.clone()));
-                            if trusted {
-                                req.extensions_mut().insert(TrustedPeer);
-                            }
-                            router.clone().oneshot(req)
-                        });
-                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                    {
-                        tracing::debug!("[uds] connection error: {e}");
-                    }
-                });
+                connections.spawn(serve_connection(
+                    TokioIo::new(stream),
+                    router.clone(),
+                    move |ext: &mut Extensions| {
+                        ext.insert(ConnectInfo(connect_info.clone()));
+                        if trusted {
+                            ext.insert(TrustedPeer);
+                        }
+                    },
+                    connection_shutdown.clone(),
+                    "uds",
+                ));
             }
         }
     }

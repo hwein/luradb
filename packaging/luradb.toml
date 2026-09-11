@@ -66,6 +66,13 @@ enabled = false
 # Parallel CPU-heavy tasks moved off the request thread: 0 is automatic
 # (cores minus 2, at least 1), otherwise at most the number of cores.
 cpu_offload_threads = 0
+# Threads that accept connections and parse HTTP/TLS in front of the storage
+# engine thread: 0 is automatic (cores / 8, 1 to 4), otherwise at most the
+# number of cores.
+frontend_workers = 0
+# Requests queued for the storage engine thread; when full, connections wait
+# until it catches up. At least 1.
+engine_queue_capacity = 1024
 
 [buffer_pool]
 # Pages (4 KiB each) the buffer pool keeps in memory.

@@ -126,8 +126,9 @@ pub struct CountResponse {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-/// Builds the full domain + KV + auth router with the given app state.
-pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Router {
+/// Builds the full domain + KV + auth router with the given app state — the
+/// routes only; the per-request layers come from [`frontend_layers`].
+pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState {
         cache: Arc::clone(&state.auth_cache),
         registry: Arc::clone(&state.registry),
@@ -279,7 +280,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         )
         .with_state(auth_state);
 
-    let mut router = Router::new()
+    let router = Router::new()
         // Heartbeat at root (infra convention for load balancers / k8s probes)
         .route("/health", get(metrics::health).with_state(state.clone()))
         // Version handshake at root, next to /health (spec 004 §7) — reads
@@ -287,17 +288,30 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         .route("/version", get(metrics::version))
         .nest("/store-api", store_router.merge(auth_router));
 
-    if state.auth_enabled {
-        router = router.layer(from_fn_with_state(
-            Arc::clone(&state.auth_cache),
-            auth_layer,
-        ));
-    }
-
-    // Proxy layer is outermost: runs first, sets ClientIp on every request.
-    router = router.layer(from_fn_with_state(trusted_cidrs, proxy_fn));
-
     router
+}
+
+/// Wraps `router` in the per-request layers that run on the frontend, ahead
+/// of the engine bridge (spec perf/018a A2): trusted-proxy resolution and,
+/// when `auth_cache` is set (auth enabled), auth. Neither calls an engine.
+pub fn frontend_layers(
+    router: Router,
+    auth_cache: Option<Arc<AuthCache>>,
+    trusted_cidrs: Arc<Vec<ParsedCidr>>,
+) -> Router {
+    let mut router = router;
+    if let Some(cache) = auth_cache {
+        router = router.layer(from_fn_with_state(cache, auth_layer));
+    }
+    // Proxy layer is outermost: runs first, sets ClientIp on every request.
+    router.layer(from_fn_with_state(trusted_cidrs, proxy_fn))
+}
+
+/// [`create_router`] inside [`frontend_layers`] as one router, without the
+/// bridge between them — the request path for router-level tests.
+pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Router {
+    let auth_cache = state.auth_enabled.then(|| Arc::clone(&state.auth_cache));
+    frontend_layers(create_router(state), auth_cache, trusted_cidrs)
 }
 
 // ── OpenAPI / Swagger ─────────────────────────────────────────────────────────
@@ -871,8 +885,8 @@ mod router_coverage_tests {
     /// The drift gate only guarantees definition == file; a route registered in
     /// `create_router` without a `paths(...)` entry would be silently missing on
     /// both sides. Axum offers no router introspection, hence the source-text parse.
-    /// Swagger's runtime routes and the hello route (main.rs) are deliberately not
-    /// part of the contract and live outside `create_router`.
+    /// Swagger's runtime routes and the hello route (`server::build_router`) are
+    /// deliberately not part of the contract and live outside `create_router`.
     #[test]
     fn every_registered_route_matches_contract_exactly() {
         let body = create_router_source();
@@ -895,7 +909,7 @@ mod router_coverage_tests {
         }
 
         let root_at = body
-            .find("let mut router = Router::new()")
+            .find("let router = Router::new()")
             .expect("root router marker not found — adjust the parser");
         let (nested, root) = body.split_at(root_at);
         let mut registered = route_pairs(nested, "/store-api");

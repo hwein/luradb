@@ -132,16 +132,16 @@ mod tests {
         (state, dir)
     }
 
-    // Mirrors `build_router` in main.rs: the CorsLayer goes on top of the
+    // Mirrors `server::build_router`: the CorsLayer goes on top of the
     // fully merged router (spec general/020 §Platzierung), not inside
-    // `create_router` — this is what puts it outside `auth_layer`.
+    // `frontend_layers` — this is what puts it outside `auth_layer`.
     async fn make_app(
         cors: CorsConfig,
         auth_enabled: bool,
     ) -> (axum::Router, Arc<crate::auth::AuthCache>, tempfile::TempDir) {
         let (state, dir) = make_state(auth_enabled).await;
         let auth_cache = Arc::clone(&state.auth_cache);
-        let mut app = crate::api::create_router(state, Arc::new(vec![]));
+        let mut app = crate::api::router_inline(state, Arc::new(vec![]));
         if let Some(layer) = build_layer(&cors) {
             app = app.layer(layer);
         }

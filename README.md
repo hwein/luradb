@@ -134,6 +134,9 @@ by default; the dev `luradb.toml` turns it on explicitly). When
 valid API key as the rest of the API. Use the UI's "Authorize" button to set
 the key.
 
+Requests on one connection are processed in order (HTTP/1.1 pipelining and
+HTTP/2 alike); open several connections for parallelism.
+
 ## License
 
 LuraDB is Fair Source (FSL-1.1-ALv2): free to use, modify and redistribute

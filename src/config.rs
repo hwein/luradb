@@ -1182,29 +1182,46 @@ fn is_valid_origin_form(origin: &str) -> bool {
 
 // ── Multicore (spec perf/017) ─────────────────────────────────────────────────
 
-/// Sizing of the CPU offload pool behind `core::coop::offload`.
+/// Sizing of the CPU offload pool behind `core::coop::offload` and of the
+/// frontend runtime in front of the engine thread (spec perf/018a).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MulticoreConfig {
     /// Permits for concurrent CPU offloads. `0` = auto = one per core beyond
     /// the request-path thread and one core of headroom.
     pub cpu_offload_threads: usize,
+    /// Worker threads of the frontend runtime (HTTP/TLS termination). `0` =
+    /// auto = an eighth of the cores, at least 1 and at most 4.
+    pub frontend_workers: usize,
+    /// Requests the bridge channel to the engine thread holds; a full channel
+    /// holds further requests back.
+    pub engine_queue_capacity: usize,
 }
 
 impl Default for MulticoreConfig {
     fn default() -> Self {
-        Self { cpu_offload_threads: 0 }
+        Self { cpu_offload_threads: 0, frontend_workers: 0, engine_queue_capacity: 1024 }
     }
 }
 
 impl MulticoreConfig {
-    /// Startup validation (spec general/030): more permits than `cores` would
-    /// not bound the offload pool at all.
+    /// Startup validation (spec general/030): more permits or workers than
+    /// `cores` would not bound anything; the bridge channel needs a slot.
     pub fn validate(&self, cores: usize) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.cpu_offload_threads <= cores,
             "invalid config: multicore.cpu_offload_threads ({}) must be 0 (auto) or 1 to {cores} (available cores)",
             self.cpu_offload_threads
+        );
+        anyhow::ensure!(
+            self.frontend_workers <= cores,
+            "invalid config: multicore.frontend_workers ({}) must be 0 (auto) or 1 to {cores} (available cores)",
+            self.frontend_workers
+        );
+        anyhow::ensure!(
+            self.engine_queue_capacity >= 1,
+            "invalid config: multicore.engine_queue_capacity ({}) must be at least 1",
+            self.engine_queue_capacity
         );
         Ok(())
     }
@@ -1506,6 +1523,26 @@ mod tests {
 
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 9\n").unwrap();
         assert_invalid(config.multicore.validate(8), "multicore.cpu_offload_threads (9)", "1 to 8");
+    }
+
+    // Spec perf/018a A5: defaults, then 0 (auto) up to the core count for
+    // the frontend workers, and at least one slot in the bridge channel.
+    #[test]
+    fn test_multicore_frontend_workers_and_engine_queue_capacity() {
+        let config = LuraConfig::default();
+        assert_eq!(config.multicore.frontend_workers, 0);
+        assert_eq!(config.multicore.engine_queue_capacity, 1024);
+        assert!(config.multicore.validate(1).is_ok());
+
+        let config: LuraConfig =
+            toml::from_str("[multicore]\nfrontend_workers = 8\nengine_queue_capacity = 1\n").unwrap();
+        assert!(config.multicore.validate(8).is_ok());
+
+        let config: LuraConfig = toml::from_str("[multicore]\nfrontend_workers = 9\n").unwrap();
+        assert_invalid(config.multicore.validate(8), "multicore.frontend_workers (9)", "1 to 8");
+
+        let config: LuraConfig = toml::from_str("[multicore]\nengine_queue_capacity = 0\n").unwrap();
+        assert_invalid(config.multicore.validate(8), "multicore.engine_queue_capacity (0)", "at least 1");
     }
 
     #[test]

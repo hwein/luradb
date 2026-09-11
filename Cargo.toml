@@ -78,6 +78,8 @@ csv = "1"
 
 [dev-dependencies]
 tempfile = "3.10"
+# h2c client for the per-connection ordering test (spec perf/018a).
+hyper = { version = "1", features = ["client", "http2"] }
 
 [package.metadata.deb]
 maintainer = "Heiko Wein <heiko.wein.hw@gmail.com>"

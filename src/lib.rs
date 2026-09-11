@@ -4,6 +4,7 @@
 pub mod api;
 pub mod auth;
 pub mod backup;
+pub mod bridge;
 pub mod config;
 pub mod core;
 pub mod cors;
@@ -11,6 +12,7 @@ pub mod engines;
 pub mod ipc;
 pub mod logging;
 pub mod metrics;
+pub mod server;
 pub mod storage;
 pub mod tls;
 pub mod uds;

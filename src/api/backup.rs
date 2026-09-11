@@ -732,7 +732,7 @@ mod tests {
 
     async fn make_app(backup_config: Option<BackupConfig>) -> (Router, tempfile::TempDir) {
         let (state, dir) = make_state(backup_config, false).await;
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     async fn make_admin(cache: &crate::auth::AuthCache, key: &str) {
@@ -815,7 +815,7 @@ mod tests {
     async fn test_all_backup_routes_require_admin() {
         let (state, _dir) = make_state(Some(enabled_backup_config()), true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let worker_key = "lura_test_backup_worker_key";
         make_user(&cache, "worker", worker_key).await;
@@ -863,7 +863,7 @@ mod tests {
         for i in 0..5 {
             store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
         }
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status1, body1) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
         assert_eq!(status1, StatusCode::ACCEPTED, "{body1}");
@@ -884,7 +884,7 @@ mod tests {
         for i in 0..5 {
             store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
         }
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -911,7 +911,7 @@ mod tests {
         for i in 0..5 {
             store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
         }
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -946,7 +946,7 @@ mod tests {
         for i in 0..3 {
             store.put(format!("order:{i}").as_bytes(), b"v").await.unwrap();
         }
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status, body) =
             request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:shop"}"#), None).await;
@@ -997,7 +997,7 @@ mod tests {
         let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
         let store = state.registry.store("default").await.unwrap();
         store.put(b"k1", b"v1").await.unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status, body) =
             request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:default"}"#), None).await;
@@ -1056,7 +1056,7 @@ mod tests {
         for i in 0..5 {
             store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
         }
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -1089,7 +1089,7 @@ mod tests {
         let store = state.registry.store("default").await.unwrap();
         store.put(b"k1", b"v1").await.unwrap();
         let manager = Arc::clone(state.backup_manager.as_ref().unwrap());
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (source_id, handle) = manager.start_backup(BackupScope::All, false, None).await.unwrap();
         handle.await.unwrap();
@@ -1117,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn test_upload_invalid_archive_rejected_and_discarded() {
         let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let req = Request::builder()
             .method(Method::POST)
@@ -1142,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn test_upload_accepts_body_larger_than_default_2mb_limit() {
         let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let oversized = vec![b'x'; 3 * 1024 * 1024]; // 3 MiB > axum's 2 MiB Bytes/Json default
         let req = Request::builder()
@@ -1164,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn test_aborted_upload_leaves_no_scratch_file() {
         let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         let backup_dir = dir.path().join("backups");
 
         // One chunk, then a body that never yields again and never ends.
@@ -1189,7 +1189,7 @@ mod tests {
     #[tokio::test]
     async fn test_upload_unsupported_format_version_keeps_its_message() {
         let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let manifest = json!({
             "t": "manifest", "format_version": 99, "id": "bk_x", "created_at": now_secs(),
@@ -1216,7 +1216,7 @@ mod tests {
         state.registry.create_domain("shop").await.unwrap();
         let store = state.registry.store("shop").await.unwrap();
         store.put(b"order:1", b"hello").await.unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:shop"}"#), None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -1252,7 +1252,7 @@ mod tests {
         write_fake_backup(&backup_dir, "bk_multi", "all", now_secs(), None, true);
         write_fake_backup(&backup_dir, "bk_incomplete", "kv:shop", now_secs(), None, false);
         write_fake_backup_bad_version(&backup_dir, "bk_badversion");
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let (status, body) = request(
             &app,

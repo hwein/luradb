@@ -622,7 +622,7 @@ mod tests {
             config_path: "test.toml".to_string(),
             config_file_loaded: false,
         };
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         (app, auth_cache, json_engine, rel_engine, dir)
     }
 

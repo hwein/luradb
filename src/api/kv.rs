@@ -565,7 +565,7 @@ mod tests {
     // default-quota `make_app` above.
     async fn make_app_with_config(config: crate::engines::lsm::domain::DomainConfig) -> (axum::Router, tempfile::TempDir) {
         let (state, dir) = make_state(config, false).await;
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         (app, dir)
     }
 
@@ -1046,7 +1046,7 @@ mod tests {
     async fn test_meta_rate_limit_429_with_retry_after() {
         let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), false).await;
         let store = state.registry.store("testdom").await.unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         let uri = "/store-api/kv/testdom/keys/ratekey";
         send(&app, Method::PUT, uri, Body::from("v")).await;
 
@@ -1135,7 +1135,7 @@ mod tests {
     async fn test_count_keys_rate_limit_429_with_retry_after() {
         let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), false).await;
         let store = state.registry.store("testdom").await.unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         let uri = "/store-api/kv/testdom/count";
 
         let resp = send(&app, Method::GET, uri, Body::empty()).await;
@@ -1174,7 +1174,7 @@ mod tests {
 
         let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         cache
             .upsert_user(UserRecord {
@@ -1379,7 +1379,7 @@ mod tests {
         config.default_read_iops = 1;
         let (state, _dir) = make_state(config, false).await;
         let store = state.registry.store("testdom").await.unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         send(&app, Method::PUT, "/store-api/kv/testdom/keys/ord:1", Body::from("v")).await;
 
@@ -1454,7 +1454,7 @@ mod tests {
 
         let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         cache
             .upsert_user(UserRecord {

@@ -708,7 +708,7 @@ mod tests {
 
     async fn make_app(rel_config: Option<RelStoreConfig>) -> (axum::Router, tempfile::TempDir) {
         let (state, dir) = make_state(rel_config, false).await;
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     /// `rel_config`, with `tune` overriding the engine's fixed limits.
@@ -718,7 +718,7 @@ mod tests {
     ) -> (axum::Router, tempfile::TempDir) {
         let (mut state, dir) = make_state(Some(rel_config), false).await;
         tune(Arc::get_mut(state.rel_engine.as_mut().unwrap()).unwrap());
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     async fn make_default_app() -> (axum::Router, tempfile::TempDir) {
@@ -1247,7 +1247,7 @@ mod tests {
     async fn test_rate_limit_429() {
         let (state, _dir) = make_state(Some(RelStoreConfig::default()), false).await;
         let engine = state.rel_engine.clone().unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
 
         engine.drain_domain_budget_for_test("default", true);
@@ -1415,7 +1415,7 @@ mod tests {
     async fn test_count_rows_rate_limit_429() {
         let (state, _dir) = make_state(Some(RelStoreConfig::default()), false).await;
         let engine = state.rel_engine.clone().unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
 
         engine.drain_domain_budget_for_test("default", false);
@@ -1447,7 +1447,7 @@ mod tests {
 
         let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
             let mut builder = Request::builder()

@@ -395,7 +395,7 @@ mod tests {
 
     async fn make_app(log_access: Option<LogAccessState>) -> (axum::Router, tempfile::TempDir) {
         let (state, dir) = make_state(log_access, false).await;
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     fn text_access(dir: &Path) -> LogAccessState {
@@ -445,7 +445,7 @@ mod tests {
         std::fs::write(log_dir.path().join("luradb.log"), "a line\n").unwrap();
         let (state, _dir) = make_state(Some(text_access(log_dir.path())), true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let worker_key = "lura_test_logs_worker_key";
         cache

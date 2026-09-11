@@ -432,15 +432,13 @@ mod tests {
     async fn make_app_with_auth() -> (axum::Router, Arc<crate::auth::AuthCache>, tempfile::TempDir) {
         let (state, dir) = make_test_state(true).await;
         let auth_cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         (app, auth_cache, dir)
     }
 
     /// Builds the Swagger/docs sub-router + `docs_auth_layer`, merged with the
-    /// regular API router — mirrors `build_router` in `main.rs` (spec
-    /// general/014). Can't call `build_router` itself: it's private to the
-    /// binary crate, and this test module also compiles under the library
-    /// crate (`src/lib.rs` declares the same `pub mod` tree).
+    /// regular API router — the docs part of the frontend router
+    /// (`server::build_router`, spec general/014), without the engine bridge.
     async fn make_docs_app(auth_enabled: bool) -> (axum::Router, Arc<crate::auth::AuthCache>, tempfile::TempDir) {
         let (state, dir) = make_test_state(auth_enabled).await;
         let auth_cache = Arc::clone(&state.auth_cache);
@@ -454,7 +452,7 @@ mod tests {
                 docs_auth_layer,
             ));
         }
-        let app = docs_router.merge(crate::api::create_router(state, Arc::new(vec![])));
+        let app = docs_router.merge(crate::api::router_inline(state, Arc::new(vec![])));
         (app, auth_cache, dir)
     }
 

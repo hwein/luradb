@@ -31,7 +31,7 @@ static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Resolves the configured permit count: `0` means auto — every core beyond
 /// the request-path thread and one core of headroom (spec perf/017 A5).
-fn permit_count(configured: usize, cores: usize) -> usize {
+pub(crate) fn permit_count(configured: usize, cores: usize) -> usize {
     if configured > 0 {
         configured
     } else {
@@ -39,7 +39,7 @@ fn permit_count(configured: usize, cores: usize) -> usize {
     }
 }
 
-pub(crate) fn available_cores() -> usize {
+pub fn available_cores() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
@@ -47,7 +47,7 @@ fn permits() -> &'static Arc<Semaphore> {
     PERMITS.get_or_init(|| Arc::new(Semaphore::new(permit_count(0, available_cores()))))
 }
 
-/// Sets the process-wide [`offload`] cap; called once from `main`.
+/// Sets the process-wide [`offload`] cap; called once at engine bootstrap.
 pub fn init(configured: usize) {
     let n = permit_count(configured, available_cores());
     if PERMITS.set(Arc::new(Semaphore::new(n))).is_ok() {

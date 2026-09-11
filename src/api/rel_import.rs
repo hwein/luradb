@@ -215,7 +215,7 @@ mod tests {
 
     async fn make_app(rel_config: Option<crate::config::RelStoreConfig>) -> (axum::Router, tempfile::TempDir) {
         let (state, dir) = make_state(rel_config, false).await;
-        (crate::api::create_router(state, std::sync::Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, std::sync::Arc::new(vec![])), dir)
     }
 
     async fn make_default_app() -> (axum::Router, tempfile::TempDir) {
@@ -326,7 +326,7 @@ mod tests {
 
         let (state, _dir) = make_state(Some(crate::config::RelStoreConfig::default()), true).await;
         let cache = std::sync::Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, std::sync::Arc::new(vec![]));
+        let app = crate::api::router_inline(state, std::sync::Arc::new(vec![]));
 
         let admin_key = "lura_test_admin_key";
         cache

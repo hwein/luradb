@@ -10,6 +10,7 @@ All notable changes to LuraDB are documented in this file.
 - The shipped luradb.toml documents every configuration key.
 - Startup rejects out-of-range values for the remaining configuration keys.
 - Startup warns about unknown configuration keys.
+- New `[multicore].frontend_workers` and `[multicore].engine_queue_capacity` config keys.
 
 ### Changed
 
@@ -17,6 +18,8 @@ All notable changes to LuraDB are documented in this file.
 - SHM snapshots are only rebuilt after data changes, cutting tail latency of small requests on idle servers.
 - Key listings, counts and queries no longer read unrelated recent writes.
 - The read path is thread-safe: readers see one consistent version of an engine's sources, and the block cache is striped.
+- HTTP and TLS termination run on a multi-threaded frontend runtime; the storage engines stay on a dedicated engine thread.
+- **BREAKING** API: requests on one connection are processed in order, HTTP/2 included — a connection serves one stream at a time, so clients need several connections for parallelism.
 
 ### Removed
 

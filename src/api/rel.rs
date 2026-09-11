@@ -374,7 +374,7 @@ mod tests {
 
     async fn make_app(rel_config: Option<RelStoreConfig>) -> (axum::Router, tempfile::TempDir) {
         let (state, dir) = make_state(rel_config, false).await;
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     /// The default rel config, enabled.
@@ -386,7 +386,7 @@ mod tests {
     async fn make_tuned_app(tune: impl FnOnce(&mut RelEngine)) -> (axum::Router, tempfile::TempDir) {
         let (mut state, dir) = make_state(Some(RelStoreConfig::default()), false).await;
         tune(Arc::get_mut(state.rel_engine.as_mut().unwrap()).unwrap());
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     async fn request(app: &axum::Router, method: Method, uri: &str, body: Option<&str>) -> (StatusCode, String) {
@@ -803,7 +803,7 @@ mod tests {
     async fn test_rate_limit_429() {
         let (state, _dir) = make_state(Some(RelStoreConfig::default()), false).await;
         let engine = state.rel_engine.clone().unwrap();
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         sql(&app, "default", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
 
         // Drain the write bucket and lock its refill (default 500 write
@@ -902,7 +902,7 @@ mod tests {
 
         let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
             let mut builder = Request::builder()
@@ -1039,7 +1039,7 @@ mod tests {
 
         let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
         let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let admin_key = "lura_test_admin_key";
         cache
@@ -1126,7 +1126,7 @@ mod tests {
         let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
         let cache = Arc::clone(&state.auth_cache);
         let kv_registry = Arc::clone(&state.registry);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
 
         let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
             let mut builder = Request::builder()

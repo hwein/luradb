@@ -184,8 +184,8 @@ mod tests {
     use tower::util::ServiceExt;
 
     /// Full three-engine test app, admin key pre-provisioned, bus wired to
-    /// all three engines before the router is built (mirrors main.rs's
-    /// startup order, spec §1).
+    /// all three engines before the router is built (mirrors the engine
+    /// bootstrap's startup order in `server`, spec §1).
     struct TestApp {
         app: axum::Router,
         admin_key: String,
@@ -275,7 +275,7 @@ mod tests {
             config_path: "test.toml".to_string(),
             config_file_loaded: false,
         };
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         (TestApp { app, admin_key }, dir)
     }
 

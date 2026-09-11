@@ -413,7 +413,7 @@ mod tests {
     }
 
     async fn config_response(state: AppState) -> axum::http::Response<Body> {
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         app.oneshot(Request::builder().uri("/store-api/config").body(Body::empty()).unwrap())
             .await
             .unwrap()

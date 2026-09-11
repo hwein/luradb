@@ -1324,6 +1324,21 @@ impl LsmStorageEngine {
         }
     }
 
+    /// Test-only: an already-expired entry (`expire_at = 1`) via the path of
+    /// [`Self::put_with_ttl`]; unlike ttl 0 it survives wall-clock steps.
+    #[cfg(test)]
+    pub fn put_expired_for_test<'a>(
+        &'a self,
+        key: &'a [u8],
+        value: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            validate_key(key, self.engine_config.max_key_length)?;
+            validate_value(value, self.engine_config.max_value_size)?;
+            self.write_kv_pair(key, value, Some(1)).await
+        }
+    }
+
     /// Sets `key` to the technical NULL state (spec kv/018): an update, not a
     /// delete. Upserts a non-existent key into the NULL state.
     pub fn set_null<'a>(

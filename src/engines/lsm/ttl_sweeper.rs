@@ -165,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn test_expired_key_yields_event_and_tombstone() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"v").await.unwrap();
         let mut rx = engine.watch_subscribe();
 
         sweeper(&engine, 500).sweep_tick().await.unwrap();
@@ -180,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn test_dated_tombstone_loses_against_newer_write() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"old").await.unwrap();
         let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
 
         engine.put(b"k", b"fresh").await.unwrap();
@@ -197,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn test_dated_tombstone_loses_against_newer_write_after_compaction() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"old").await.unwrap();
         let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
 
         engine.put(b"k", b"fresh").await.unwrap();
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn test_tombstone_in_pinned_memtable_loses_against_newer_source() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"old").await.unwrap();
         let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
 
         let memtable = engine.pin_memtable();
@@ -240,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn test_recheck_suppresses_write_and_event() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"old").await.unwrap();
         engine.put(b"k", b"alive").await.unwrap();
         assert_eq!(engine.scan_expired(b"", 500).await.unwrap(), vec![b"k".to_vec()]);
         let mut rx = engine.watch_subscribe();
@@ -257,8 +257,8 @@ mod tests {
     #[tokio::test]
     async fn test_tombstone_dates_on_the_recheck_version() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"first", 0).await.unwrap();
-        engine.put_with_ttl(b"k", b"second", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"first").await.unwrap();
+        engine.put_expired_for_test(b"k", b"second").await.unwrap();
 
         sweeper(&engine, 500).sweep_tick().await.unwrap();
 
@@ -271,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn test_second_tick_writes_nothing_and_stays_silent() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"v").await.unwrap();
         let sweeper = sweeper(&engine, 500);
         sweeper.sweep_tick().await.unwrap();
         let mut rx = engine.watch_subscribe();
@@ -287,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn test_without_a_tick_the_expired_key_stays_physically_present() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"v").await.unwrap();
 
         assert_eq!(engine.get(b"k").await.unwrap(), None);
         assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));
@@ -319,7 +319,7 @@ mod tests {
     async fn test_chunk_boundary_splits_over_two_ticks() {
         let (engine, _dir) = make_engine().await;
         for i in 0..7u32 {
-            engine.put_with_ttl(format!("k{i}").as_bytes(), b"v", 0).await.unwrap();
+            engine.put_expired_for_test(format!("k{i}").as_bytes(), b"v").await.unwrap();
         }
         let sweeper = sweeper(&engine, 5);
         let mut rx = engine.watch_subscribe();
@@ -343,10 +343,10 @@ mod tests {
         let (engine, _dir) = make_engine().await;
         for i in 0..6u32 {
             let key = format!("a{i}");
-            engine.put_with_ttl(key.as_bytes(), b"old", 0).await.unwrap();
+            engine.put_expired_for_test(key.as_bytes(), b"old").await.unwrap();
             engine.put(key.as_bytes(), b"alive").await.unwrap();
         }
-        engine.put_with_ttl(b"z", b"v", 0).await.unwrap();
+        engine.put_expired_for_test(b"z", b"v").await.unwrap();
         let sweeper = sweeper(&engine, 5);
         let mut rx = engine.watch_subscribe();
 
@@ -365,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn test_sweeps_expired_key_from_sstable() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"v").await.unwrap();
         engine.freeze_active_memtable();
         engine.flush_memtable().await.unwrap();
 
@@ -379,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn test_newest_version_distinguishes_expired_from_absent() {
         let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
+        engine.put_expired_for_test(b"k", b"v").await.unwrap();
         let snapshot = engine.snapshot();
 
         assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));

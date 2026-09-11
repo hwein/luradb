@@ -687,8 +687,8 @@ mod tests {
         let (engine, registry, _dir) = make_setup().await;
         let store = registry.default_store().await.unwrap();
         store.put(b"stays", b"v").await.unwrap();
-        // ttl 0 → expire_at = now, already expired at build time (no sleep).
-        store.put_with_ttl(b"gone", b"v", 0).await.unwrap();
+        // Already expired regardless of the wall clock (spec general/033).
+        store.put_expired_for_test(b"gone", b"v").await.unwrap();
 
         let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
         let dom = find(&snap, "default").unwrap();

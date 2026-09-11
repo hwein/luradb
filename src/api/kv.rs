@@ -910,12 +910,28 @@ mod tests {
         let uri = "/store-api/kv/testdom/keys/expiredkey";
         send(&app, Method::PUT, &format!("{uri}?ttl=0"), Body::from("v")).await;
 
-        let resp = send(&app, Method::GET, uri, Body::empty()).await;
+        // Bounded retry: a backwards wall-clock step (WSL2) can briefly
+        // un-expire a ttl=0 key.
+        let mut resp = send(&app, Method::GET, uri, Body::empty()).await;
+        for _ in 0..100 {
+            if resp.status() == StatusCode::NOT_FOUND {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            resp = send(&app, Method::GET, uri, Body::empty()).await;
+        }
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(resp.headers().get("x-expires-at").is_none());
 
-        let resp = send(&app, Method::GET, &format!("{uri}/meta"), Body::empty()).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let mut meta_resp = send(&app, Method::GET, &format!("{uri}/meta"), Body::empty()).await;
+        for _ in 0..100 {
+            if meta_resp.status() == StatusCode::NOT_FOUND {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            meta_resp = send(&app, Method::GET, &format!("{uri}/meta"), Body::empty()).await;
+        }
+        assert_eq!(meta_resp.status(), StatusCode::NOT_FOUND);
     }
 
     // Test 4: PATCH …/null -> GET 204 without X-Expires-At; …/meta 200 with

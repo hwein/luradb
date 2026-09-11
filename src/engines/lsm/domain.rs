@@ -528,6 +528,13 @@ impl DomainStore {
         Ok(())
     }
 
+    /// Test-only: see `LsmStorageEngine::put_expired_for_test`.
+    #[cfg(test)]
+    pub(crate) async fn put_expired_for_test(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.validate_user_key(key)?;
+        self.engine.write_kv_pair(&self.prefixed_key(key), value, Some(1)).await
+    }
+
     /// Reads a value by user key — three-valued (spec kv/018): `Present`,
     /// `Null` (key exists in the NULL state), or `Absent`. Records latency
     /// and hit/miss in MetricsStore (a `Null` read counts as a hit).

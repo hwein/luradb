@@ -76,6 +76,7 @@ fn build_engine_configs(
         level_size_ratio: cfg.compaction.level_size_ratio,
         max_sstable_size: cfg.compaction.max_sstable_size,
         low_watermark: None,
+        bottommost: true,
     };
     let janitor_config = JanitorConfig {
         check_interval_secs: cfg.janitor.check_interval_secs,

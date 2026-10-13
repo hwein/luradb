@@ -5,8 +5,10 @@
 //! # Tombstone safety rule
 //! A tombstone at timestamp T may only be dropped when `T < low_watermark`,
 //! where `low_watermark` is the oldest active snapshot timestamp from the
-//! `SnapshotRegistry`. This guarantees that no live reader can still observe
-//! the pre-deletion state of the key.
+//! `SnapshotRegistry`, and the job is bottommost: no level below its target
+//! level holds SSTables. The first guarantees that no live reader can still
+//! observe the pre-deletion state of the key, the second that no older
+//! version below the job resurfaces (spec kv/033).
 //!
 //! # Version safety rule
 //! Older versions may only be dropped behind a version at `T <= low_watermark`:
@@ -14,7 +16,9 @@
 //! everything older for every registered reader. Versions above the watermark
 //! may still be the newest visible version of a pinned snapshot — e.g. a
 //! running backup export (spec general/006), which would otherwise silently
-//! miss the key.
+//! miss the key. A TTL-expired version is dropped only as the oldest one kept
+//! and only by a bottommost job; otherwise it stays until the TTL sweeper
+//! replaces it with a tombstone.
 //!
 //! # Multi-level cascade
 //! - **L0**: triggers when file count reaches `l0_compaction_threshold`.
@@ -51,9 +55,15 @@ pub struct CompactionConfig {
 
     /// MVCC low watermark: the oldest active snapshot timestamp.
     ///
-    /// Tombstones with `timestamp < low_watermark` are safe to garbage-collect.
-    /// `None` means no active snapshots — tombstones must be retained.
+    /// Tombstones with `timestamp < low_watermark` are safe to garbage-collect
+    /// in a bottommost job. `None` means no active snapshots — tombstones must
+    /// be retained.
     pub low_watermark: Option<Timestamp>,
+
+    /// Whether no level below the job's target level holds SSTables. Only
+    /// then may tombstones and expired values be dropped: otherwise an older
+    /// version of the key down there would resurface (spec kv/033).
+    pub bottommost: bool,
 }
 
 impl Default for CompactionConfig {
@@ -64,6 +74,7 @@ impl Default for CompactionConfig {
             level_size_ratio: 10,
             max_sstable_size: 64 * 1024 * 1024, // 64 MB
             low_watermark: None,
+            bottommost: true,
         }
     }
 }
@@ -124,9 +135,9 @@ impl CompactionJob {
     ///    first one that shadows all older ones (see
     ///    [`Self::shadows_older_versions`]); drop the rest.
     /// 2. **Tombstone GC**: drop when `timestamp < low_watermark` (safe for all
-    ///    active snapshots); otherwise retain.
-    /// 3. **TTL**: expired values are dropped only while no older version of
-    ///    the key survives them.
+    ///    active snapshots) and the job is bottommost; otherwise retain.
+    /// 3. **TTL**: expired values are dropped only by a bottommost job and only
+    ///    while no older version of the key survives them.
     fn filter_entries(
         &self,
         entries: Vec<(Vec<u8>, DataBlockValue)>,
@@ -177,7 +188,8 @@ impl CompactionJob {
     }
 
     /// Keep-or-drop decision for one retained version: tombstones survive
-    /// unless below the low watermark, live values unless TTL-expired.
+    /// unless below the low watermark, live values unless TTL-expired, and
+    /// neither is dropped unless the job is bottommost.
     /// `oldest_kept` is false while older versions of the key still follow.
     fn retain_version(
         &self,
@@ -197,23 +209,26 @@ impl CompactionJob {
 
         if is_tombstone {
             // `timestamp < low_watermark` implies `oldest_kept`, so dropping
-            // the tombstone cannot expose an older version kept above.
-            let safe_to_drop = self
-                .config
-                .low_watermark
-                .map(|lw| timestamp.as_u64() < lw.as_u64())
-                .unwrap_or(false);
+            // the tombstone cannot expose an older version kept above;
+            // `bottommost` rules out one below the target level.
+            let safe_to_drop = self.config.bottommost
+                && self
+                    .config
+                    .low_watermark
+                    .map(|lw| timestamp.as_u64() < lw.as_u64())
+                    .unwrap_or(false);
 
             return if safe_to_drop { None } else { Some((encoded_key, dbv)) };
         }
 
-        // Drop TTL-expired live entries — but only the oldest kept one:
-        // removing a version that shadows another would resurrect that one.
+        // Drop TTL-expired live entries — but only the oldest kept one of a
+        // bottommost job: removing a version that shadows another, in the job
+        // or below its target level, would resurrect that one.
         let expire_at = match &dbv {
             DataBlockValue::Pointer(vp) => vp.expire_at,
             DataBlockValue::Inline { expire_at, .. } => *expire_at,
         };
-        if oldest_kept && expire_at != 0 {
+        if self.config.bottommost && oldest_kept && expire_at != 0 {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -356,6 +371,8 @@ pub fn select_sstables_for_level_compaction(
         vec![source_tables.into_iter().max_by_key(|m| m.file_size).unwrap()]
     };
 
+    // Bounds in internal key order, the one the tables are sorted in; their
+    // user keys span the source (spec kv/033).
     let mut min_key = selected[0].smallest_key.clone();
     let mut max_key = selected[0].largest_key.clone();
     for meta in &selected[1..] {
@@ -363,8 +380,11 @@ pub fn select_sstables_for_level_compaction(
         if meta.largest_key > max_key { max_key = meta.largest_key.clone(); }
     }
 
-    let target_tables =
-        manifest.find_overlapping_sstables(source_level + 1, &min_key, &max_key);
+    let target_tables = manifest.find_overlapping_sstables(
+        source_level + 1,
+        InternalKey::extract_user_key(&min_key).unwrap_or_default(),
+        InternalKey::extract_user_key(&max_key).unwrap_or_default(),
+    );
 
     (selected, target_tables)
 }
@@ -580,6 +600,45 @@ mod tests {
         Ok(())
     }
 
+    // kv/033: above a non-empty deeper level, the tombstone below the
+    // watermark stays to shadow the older versions down there; the older
+    // ones in the job still go.
+    #[test]
+    fn test_tombstone_below_low_watermark_kept_when_not_bottommost() -> Result<()> {
+        let mut cfg = CompactionConfig::default();
+        cfg.low_watermark = Some(Timestamp::new(200));
+        cfg.bottommost = false;
+        let entries = vec![
+            (encode(b"key1", 100), tombstone_vp()),
+            (encode(b"key1", 50), make_vp(500)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], cfg);
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 1, "only the tombstone survives");
+        assert_eq!(InternalKey::extract_timestamp(&out[0].0), Some(Timestamp::new(100)));
+        Ok(())
+    }
+
+    // kv/033: likewise an expired newest version, which the TTL sweeper later
+    // turns into a tombstone.
+    #[test]
+    fn test_expired_value_kept_when_not_bottommost() -> Result<()> {
+        let mut cfg = CompactionConfig::default();
+        cfg.bottommost = false;
+        let expired = DataBlockValue::Pointer(ValuePointer {
+            file_id: 1, value_offset: 100, value_len: 10, expire_at: 1,
+        });
+        let entries = vec![
+            (encode(b"key1", 100), expired),
+            (encode(b"key1", 50), make_vp(500)),
+        ];
+        let job = CompactionJob::new(vec![], vec![], cfg);
+        let out = job.filter_entries(entries)?;
+        assert_eq!(out.len(), 1, "only the expired version survives");
+        assert_eq!(InternalKey::extract_timestamp(&out[0].0), Some(Timestamp::new(100)));
+        Ok(())
+    }
+
     #[test]
     fn test_should_compact_l0_threshold() {
         let mut manifest = Manifest::new();
@@ -639,28 +698,74 @@ mod tests {
         let mut manifest = Manifest::new();
         manifest.add_sstable(SSTableMetadata {
             file_id: 1, level: 0,
-            smallest_key: b"a".to_vec(), largest_key: b"d".to_vec(), file_size: 1024,
+            smallest_key: encode(b"a", 20), largest_key: encode(b"d", 20), file_size: 1024,
             max_timestamp: 0,
         });
         manifest.add_sstable(SSTableMetadata {
             file_id: 2, level: 0,
-            smallest_key: b"e".to_vec(), largest_key: b"h".to_vec(), file_size: 1024,
+            smallest_key: encode(b"e", 20), largest_key: encode(b"h", 20), file_size: 1024,
             max_timestamp: 0,
         });
         manifest.add_sstable(SSTableMetadata {
             file_id: 10, level: 1,
-            smallest_key: b"c".to_vec(), largest_key: b"f".to_vec(), file_size: 2048,
+            smallest_key: encode(b"c", 10), largest_key: encode(b"f", 10), file_size: 2048,
             max_timestamp: 0,
         });
         manifest.add_sstable(SSTableMetadata {
             file_id: 11, level: 1,
-            smallest_key: b"i".to_vec(), largest_key: b"z".to_vec(), file_size: 2048,
+            smallest_key: encode(b"i", 10), largest_key: encode(b"z", 10), file_size: 2048,
             max_timestamp: 0,
         });
         let (src, tgt) = select_sstables_for_compaction(&manifest);
         assert_eq!(src.len(), 2);
         assert_eq!(tgt.len(), 1);
         assert_eq!(tgt[0].file_id, 10);
+    }
+
+    /// Target file ids an L0 compaction of `l0` into `l1` picks; each table
+    /// is given as its (smallest, largest) internal key.
+    fn targets_selected(l0: &[(Vec<u8>, Vec<u8>)], l1: &[(Vec<u8>, Vec<u8>)]) -> Vec<u64> {
+        let mut manifest = Manifest::new();
+        let tables = l0.iter().map(|t| (0, t)).chain(l1.iter().map(|t| (1, t)));
+        for (file_id, (level, (smallest, largest))) in tables.enumerate() {
+            manifest.add_sstable(SSTableMetadata {
+                file_id: file_id as u64, level,
+                smallest_key: smallest.clone(), largest_key: largest.clone(), file_size: 1024,
+                max_timestamp: 0,
+            });
+        }
+        let (_, tgt) = select_sstables_for_compaction(&manifest);
+        tgt.iter().map(|m| m.file_id).collect()
+    }
+
+    // kv/033: an older version of the source's largest user key sorts behind
+    // the source's largest internal key, yet its table must join the job.
+    #[test]
+    fn test_select_includes_target_starting_with_older_version_of_largest_key() {
+        let l0 = [(encode(b"a", 20), encode(b"k", 20))];
+        let l1 = [(encode(b"k", 10), encode(b"z", 10))];
+        assert_eq!(targets_selected(&l0, &l1), vec![1]);
+    }
+
+    // kv/033: stamped, `user:1` sorts after its extensions such as `user:15`;
+    // comparing bare user keys would miss this target table ...
+    #[test]
+    fn test_select_includes_target_spanning_a_key_and_its_extensions() {
+        let l0 = [(encode(b"user:15", 20), encode(b"user:15", 20))];
+        let l1 = [(encode(b"user:10", 10), encode(b"user:1", 10))];
+        assert_eq!(targets_selected(&l0, &l1), vec![1]);
+    }
+
+    // ... and would take `user:15` instead of `user:1` as the source's largest
+    // user key.
+    #[test]
+    fn test_select_bounds_the_source_in_internal_key_order() {
+        let l0 = [
+            (encode(b"user:1", 20), encode(b"user:1", 20)),
+            (encode(b"user:15", 20), encode(b"user:15", 20)),
+        ];
+        let l1 = [(encode(b"user:1", 10), encode(b"user:1", 10))];
+        assert_eq!(targets_selected(&l0, &l1), vec![2]);
     }
 
     fn unix_now() -> u64 {

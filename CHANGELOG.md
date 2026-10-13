@@ -37,6 +37,7 @@ All notable changes to LuraDB are documented in this file.
 - A write that ties with a TTL sweeper tombstone is no longer lost once both are compacted.
 - Value log generations are no longer dropped while a memtable a failed flush handed back still points into them.
 - Shutdown saves the manifest before it truncates the WAL, so a flush whose manifest save failed is no longer lost.
+- Deleted or expired keys no longer reappear with an older value after compaction.
 
 ## [0.4.0] - 2026-08-29
 

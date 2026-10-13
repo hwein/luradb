@@ -3,6 +3,7 @@
 //! The manifest tracks which SSTables exist at which levels,
 //! enabling recovery after crashes.
 
+use crate::engines::lsm::key::{InternalKey, Timestamp};
 use serde::{Serialize, Deserialize};
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context};
@@ -112,25 +113,28 @@ impl Manifest {
         self.levels.iter().map(|level| level.len()).sum()
     }
 
-    /// Finds SSTables that overlap with a given key range.
+    /// Finds the SSTables of `level` whose internal keys overlap the range
+    /// from the newest possible version of `start_user_key` to the oldest one
+    /// of `end_user_key`.
     ///
-    /// This is useful for compaction to find SSTables that need to be merged.
+    /// Both bounds come from internal key order, not user-key order: stamped,
+    /// `k` sorts after its extensions such as `k0`.
     pub fn find_overlapping_sstables(
         &self,
         level: usize,
-        start_key: &[u8],
-        end_key: &[u8],
+        start_user_key: &[u8],
+        end_user_key: &[u8],
     ) -> Vec<SSTableMetadata> {
         if level >= self.levels.len() {
             return Vec::new();
         }
 
+        let start = InternalKey::new(start_user_key.to_vec(), Timestamp::new(u64::MAX)).encode();
+        let end = InternalKey::new(end_user_key.to_vec(), Timestamp::new(0)).encode();
+
         self.levels[level]
             .iter()
-            .filter(|meta| {
-                // Check if ranges overlap
-                !(meta.largest_key.as_slice() < start_key || meta.smallest_key.as_slice() > end_key)
-            })
+            .filter(|meta| !(meta.largest_key < start || meta.smallest_key > end))
             .cloned()
             .collect()
     }
@@ -290,8 +294,8 @@ mod tests {
         manifest.add_sstable(SSTableMetadata {
             file_id: 1,
             level: 1,
-            smallest_key: b"a".to_vec(),
-            largest_key: b"d".to_vec(),
+            smallest_key: InternalKey::new(b"a".to_vec(), Timestamp::new(10)).encode(),
+            largest_key: InternalKey::new(b"d".to_vec(), Timestamp::new(10)).encode(),
             file_size: 1024,
             max_timestamp: 0,
         });
@@ -299,8 +303,8 @@ mod tests {
         manifest.add_sstable(SSTableMetadata {
             file_id: 2,
             level: 1,
-            smallest_key: b"e".to_vec(),
-            largest_key: b"h".to_vec(),
+            smallest_key: InternalKey::new(b"e".to_vec(), Timestamp::new(10)).encode(),
+            largest_key: InternalKey::new(b"h".to_vec(), Timestamp::new(10)).encode(),
             file_size: 1024,
             max_timestamp: 0,
         });
@@ -308,8 +312,8 @@ mod tests {
         manifest.add_sstable(SSTableMetadata {
             file_id: 3,
             level: 1,
-            smallest_key: b"i".to_vec(),
-            largest_key: b"z".to_vec(),
+            smallest_key: InternalKey::new(b"i".to_vec(), Timestamp::new(10)).encode(),
+            largest_key: InternalKey::new(b"z".to_vec(), Timestamp::new(10)).encode(),
             file_size: 1024,
             max_timestamp: 0,
         });

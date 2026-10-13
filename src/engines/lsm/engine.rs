@@ -1827,16 +1827,18 @@ impl LsmStorageEngine {
         let mut config = self.compaction_config.clone();
         config.low_watermark = self.snapshot_registry.low_watermark();
 
+        let target_level = source_level + 1;
         let (src_metas, tgt_metas) = {
             let manifest = self.manifest.read();
+            // Levels below the target stay as read here: flushes only add to
+            // L0, compaction and GC hold the maintenance lock.
+            config.bottommost = manifest.levels.iter().skip(target_level + 1).all(Vec::is_empty);
             select_sstables_for_level_compaction(source_level, &manifest)
         };
 
         if src_metas.is_empty() {
             return Ok(Vec::new());
         }
-
-        let target_level = source_level + 1;
 
         // Load SSTables from disk.
         let use_mmap = self.engine_config.use_mmap;
@@ -5816,5 +5818,83 @@ mod tests {
 
         let err = engine.get(b"k").await.unwrap_err();
         assert!(err.to_string().contains("Unknown value log generation 7"), "{err}");
+    }
+
+    // ── Spec kv/033: drops only on the bottommost level ──────────────────────
+
+    /// Writes `key` and moves it down to L2, leaving L0 and L1 empty.
+    async fn put_into_l2(engine: &LsmStorageEngine, key: &[u8], value: &[u8]) {
+        engine.put(key, value).await.unwrap();
+        freeze_and_flush(engine).await;
+        engine.compact_level(0).await.unwrap();
+        engine.compact_level(1).await.unwrap();
+        assert!(engine.version().level(1).is_empty());
+        assert_eq!(engine.version().level(2).len(), 1);
+    }
+
+    // Spec kv/033 test 1: dropping the expired version on its way to L1
+    // would bring back the older one in L2.
+    #[tokio::test]
+    async fn test_compaction_keeps_expired_value_over_an_older_one_below() {
+        let (engine, _dir) = make_engine().await;
+        put_into_l2(&engine, b"k", b"v1").await;
+        engine.put_expired_for_test(b"k", b"v2").await.unwrap();
+        freeze_and_flush(&engine).await;
+
+        engine.compact_level(0).await.unwrap();
+
+        assert_eq!(engine.get(b"k").await.unwrap(), None);
+    }
+
+    // Spec kv/033 test 2: the same for a tombstone below the watermark of a
+    // registered snapshot.
+    #[tokio::test]
+    async fn test_compaction_keeps_tombstone_over_an_older_version_below() {
+        let (engine, _dir) = make_engine().await;
+        put_into_l2(&engine, b"k", b"v1").await;
+        engine.delete(b"k").await.unwrap();
+        freeze_and_flush(&engine).await;
+        let snap = engine.snapshot(); // stamped above the tombstone
+
+        engine.compact_level(0).await.unwrap();
+
+        assert_eq!(engine.get(b"k").await.unwrap(), None);
+        assert_eq!(engine.get_with_snapshot(b"k", snap.snapshot()).await.unwrap(), GetResult::Absent);
+    }
+
+    // Spec kv/033 test 4: with no level below the target, both still go.
+    #[tokio::test]
+    async fn test_bottommost_compaction_drops_tombstone_and_expired_value() {
+        let (engine, _dir) = make_engine().await;
+        engine.put_expired_for_test(b"e", b"v").await.unwrap();
+        engine.delete(b"d").await.unwrap();
+        freeze_and_flush(&engine).await;
+        let _snap = engine.snapshot(); // stamped above the tombstone
+
+        engine.compact_level(0).await.unwrap();
+
+        assert!(engine.version().level(0).is_empty(), "L0 was compacted away");
+        assert!(engine.version().level(1).is_empty(), "nothing is left to write to L1");
+    }
+
+    // Spec kv/033 test 3: the L1 table starts with an older version of the
+    // L0 selection's largest user key, which sorts behind the selection's
+    // largest internal key; it must join the job all the same.
+    #[tokio::test]
+    async fn test_compaction_merges_target_table_starting_with_older_version_of_largest_key() {
+        let (engine, _dir) = make_engine().await;
+        engine.put(b"k", b"v1").await.unwrap();
+        engine.put(b"z", b"26").await.unwrap();
+        freeze_and_flush(&engine).await;
+        engine.compact_level(0).await.unwrap(); // L1 spans [k@t1, z]
+
+        engine.put(b"a", b"1").await.unwrap();
+        engine.put(b"k", b"v2").await.unwrap();
+        freeze_and_flush(&engine).await; // L0 spans [a, k@t2]
+
+        engine.compact_level(0).await.unwrap();
+
+        assert_levels_below_l0_are_disjoint(&engine);
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
     }
 }

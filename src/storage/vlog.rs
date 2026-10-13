@@ -365,7 +365,9 @@ mod tests {
     // read past the end is an error, never a short value.
     #[tokio::test]
     async fn test_read_async_returns_the_bytes_cached_or_not() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // On disk, not in `/tmp`: a tmpfs serves no `RWF_NOWAIT` reads on
+        // some kernels, and this test is about the page cache.
+        let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
         let value: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         let offset = vlog.append(&value).await.unwrap();

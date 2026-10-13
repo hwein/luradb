@@ -39,6 +39,10 @@ All notable changes to LuraDB are documented in this file.
 - Shutdown saves the manifest before it truncates the WAL, so a flush whose manifest save failed is no longer lost.
 - Deleted or expired keys no longer reappear with an older value after compaction.
 
+### Security
+
+- Upgraded rustls to 0.23.45+, resolving RUSTSEC-2026-0285.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added

@@ -176,6 +176,7 @@ async fn scan_memtable_for_prefix(
             if is_live_version(&value, now) {
                 live.insert(user_key.to_vec());
             }
+            coop.tick().await;
         }
     }
 }
@@ -205,7 +206,9 @@ fn is_live_version(value: &Value, now: u64) -> bool {
     value.version_state(now) == VersionState::Live
 }
 
-/// Entries a prefix scan visits between two yield points (spec perf/017 A2).
+/// Ticks between two yield points of a prefix scan (spec perf/017 A2): one
+/// per visited entry, one more per decided key, which copies the key into
+/// the result sets (spec perf/030).
 const SCAN_KEYS_YIELD_INTERVAL: u32 = 1024;
 
 /// Entries the expiry scan checks between two yield points (spec kv/025 §7).
@@ -274,6 +277,7 @@ async fn scan_sstable_for_prefix(
             live.insert(user_key.clone());
         }
         decided.insert(user_key);
+        coop.tick().await;
     }
     Ok(false)
 }
@@ -4829,6 +4833,50 @@ mod tests {
         rotate.await.unwrap();
         assert_eq!(scanned.len(), 20_004, "the rotation must not cost the scan a key");
         assert_eq!(engine.scan_keys(b"k:").await.unwrap().len(), 20_005);
+    }
+
+    // ── Spec perf/030: yields follow the scan's work ─────────────────────────
+
+    /// 600 keys under `a:` among 20 000 under `b:` — fewer `a:` entries than
+    /// one yield interval, yet enough work that the scan must yield.
+    async fn fill_dense_range_among_foreign_keys(engine: &LsmStorageEngine) {
+        let ops: Vec<BatchOp> = (0..600u32)
+            .map(|i| format!("a:{i:03}"))
+            .chain((0..20_000u32).map(|i| format!("b:{i:05}")))
+            .map(|key| BatchOp::Put { key: key.into_bytes(), value: b"v".to_vec() })
+            .collect();
+        engine.write_batch(ops).await.unwrap();
+    }
+
+    /// Completion order of a scan over `a:` (long) and a point `get` (small).
+    async fn dense_range_scan_order(engine: Arc<LsmStorageEngine>) -> Vec<&'static str> {
+        let reader = Arc::clone(&engine);
+        completion_order(
+            async move { assert_eq!(engine.scan_keys(b"a:").await.unwrap().len(), 600) },
+            async move { assert!(reader.get(b"b:00001").await.unwrap().is_some()) },
+        )
+        .await
+    }
+
+    // MemTable branch: the range seek (perf/029) skips the foreign keys, so
+    // every visited entry but the last is a decided key and ticks twice.
+    #[tokio::test]
+    async fn test_scan_keys_yields_within_a_dense_range_in_memtable() {
+        let (engine, _dir) = make_engine().await;
+        fill_dense_range_among_foreign_keys(&engine).await;
+
+        assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
+    }
+
+    // SSTable branch: the same keys flushed to L0, decided by the sweep.
+    #[tokio::test]
+    async fn test_scan_keys_yields_within_a_dense_range_in_sstable() {
+        let (engine, _dir) = make_engine().await;
+        fill_dense_range_among_foreign_keys(&engine).await;
+        engine.freeze_active_memtable();
+        engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
+
+        assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
     }
 
     // ── Spec general/029: maintenance against a concurrent flush ─────────────

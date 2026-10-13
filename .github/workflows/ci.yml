@@ -24,7 +24,11 @@ jobs:
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show
 
+      # A persistent runner keeps its own rustup in ~/.cargo/bin; caching
+      # that directory would prune it after the job.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-bin: false
 
       - name: cargo check --tests
         run: cargo check --tests

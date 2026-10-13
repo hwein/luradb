@@ -12,7 +12,7 @@ permissions:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
@@ -24,7 +24,11 @@ jobs:
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show
 
+      # A persistent runner keeps its own rustup in ~/.cargo/bin; caching
+      # that directory would prune it after the job.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-bin: false
 
       - name: cargo check --tests
         run: cargo check --tests
@@ -34,7 +38,7 @@ jobs:
 
   deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 

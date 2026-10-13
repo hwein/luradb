@@ -6,7 +6,9 @@
 use crate::config::BlockCacheConfig;
 use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::memtable::{MemTable, Value};
-use crate::engines::lsm::reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata};
+use crate::engines::lsm::reader::{
+    is_applying, GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata,
+};
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::version::{Version, VersionCell};
 use crate::engines::lsm::compaction::{
@@ -29,7 +31,7 @@ use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use tokio::sync::{broadcast, watch, Notify};
@@ -131,7 +133,8 @@ fn now_secs() -> u64 {
 /// Callers process sources newest-first, so the first version seen for a
 /// user-key anywhere is its newest and decides for good (`decided`): live
 /// versions land in `live`, tombstoned or TTL-expired ones suppress the key.
-/// Stops early once `live` holds `limit` keys.
+/// A version of the batch `applying_batch` names does not decide; the next
+/// older one does (spec kv/034). Stops early once `live` holds `limit` keys.
 ///
 /// `snapshot` of `None` matches every version (today's `scan_keys`
 /// behavior); `Some` skips versions newer than the snapshot instead of
@@ -145,6 +148,7 @@ async fn scan_memtable_for_prefix(
     now: u64,
     limit: usize,
     snapshot: Option<&Snapshot>,
+    applying_batch: &AtomicU64,
     live: &mut BTreeSet<Vec<u8>>,
     decided: &mut BTreeSet<Vec<u8>>,
     coop: &mut YieldEvery,
@@ -158,13 +162,15 @@ async fn scan_memtable_for_prefix(
             if !user_key.starts_with(prefix) || decided.contains(user_key) {
                 continue;
             }
+            let ts = InternalKey::extract_timestamp(&encoded_key);
             if let Some(snap) = snapshot {
-                let visible = InternalKey::extract_timestamp(&encoded_key)
-                    .map(|ts| snap.is_visible(ts))
-                    .unwrap_or(false);
+                let visible = ts.map(|ts| snap.is_visible(ts)).unwrap_or(false);
                 if !visible {
                     continue;
                 }
+            }
+            if ts.is_some_and(|ts| is_applying(applying_batch, ts)) {
+                continue;
             }
             decided.insert(user_key.to_vec());
             if is_live_version(&value, now) {
@@ -224,6 +230,19 @@ fn push_expired_candidate(candidates: &mut BTreeSet<Vec<u8>>, limit: usize, key:
     if candidates.len() > limit {
         candidates.pop_last();
     }
+}
+
+/// A batch's resolved ops reduced to each key's last one, in batch order —
+/// the state that applying all of them in order leaves, as WAL replay does.
+/// Phase 2 inserts each key once (spec kv/034): a reader on another thread
+/// that found a key's first insert might load the batch slot only after the
+/// batch and keep the superseded value.
+fn last_op_per_key(ops: Vec<(Vec<u8>, Value)>) -> impl Iterator<Item = (Vec<u8>, Value)> {
+    let last: Vec<bool> = {
+        let mut seen = HashSet::with_capacity(ops.len());
+        ops.iter().rev().map(|(key, _)| seen.insert(key.as_slice())).collect()
+    };
+    ops.into_iter().zip(last.into_iter().rev()).filter_map(|(op, last)| last.then_some(op))
 }
 
 /// Sweeps one SSTable for keys with `prefix` (see [`scan_memtable_for_prefix`]
@@ -302,8 +321,8 @@ impl ThreadHook {
     }
 }
 
-/// Test-only pause points inside the engine's install sequences (spec
-/// general/028) — set before the engine is shared, never in a release build.
+/// Test-only pause points inside the engine (spec general/028) — set before
+/// the engine is shared, never in a release build.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestHooks {
@@ -314,6 +333,8 @@ pub(crate) struct TestHooks {
     pub before_level_install: Option<Arc<TestHook>>,
     /// Parks `snapshot` right after it drew its stamp.
     pub snapshot_stamp_drawn: Option<Arc<ThreadHook>>,
+    /// Parks `write_batch` in Phase 2 right after its first MemTable insert.
+    pub batch_first_applied: Option<Arc<ThreadHook>>,
 }
 
 /// LSM-Tree Storage Engine with MVCC and background maintenance.
@@ -404,6 +425,13 @@ pub struct LsmStorageEngine {
     /// own read guard. `Arc` because the Janitor drains around its switch of
     /// the active vLog generation.
     in_flight_writes: Arc<tokio::sync::RwLock<()>>,
+
+    /// Stamp of the batch whose Phase 2 is applying it to the MemTable, 0
+    /// when none (spec kv/034): readers skip MemTable versions with this
+    /// stamp, so a reader on another thread sees a batch whole or not at
+    /// all. One slot suffices — Phase 2 is await-free and only the owner
+    /// thread runs it.
+    applying_batch: AtomicU64,
 
     /// Held by a flush from its claim to its install, so L0 and the manifest
     /// carry the SSTables in MemTable age order and whoever takes this lock
@@ -501,6 +529,7 @@ impl LsmStorageEngine {
             flush_notify: Arc::new(Notify::new()),
             change_epoch: AtomicU64::new(0),
             in_flight_writes: Arc::new(tokio::sync::RwLock::new(())),
+            applying_batch: AtomicU64::new(0),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -965,8 +994,8 @@ impl LsmStorageEngine {
     // ── Read path ───────────────────────────────────────────────────────────
 
     /// Reader over the current version.
-    fn build_reader(&self) -> LsmReader {
-        LsmReader::new(self.version(), Arc::clone(&self.block_cache))
+    fn build_reader(&self) -> LsmReader<'_> {
+        LsmReader::new(self.version(), Arc::clone(&self.block_cache), &self.applying_batch)
     }
 
     /// Reader and snapshot of an unregistered point read at the current state
@@ -975,7 +1004,7 @@ impl LsmStorageEngine {
     /// the reader keeps its own sources as `Arc`s, so they still hold the
     /// newest version of every key at that stamp. A stamp taken first could
     /// meet a version whose compaction already dropped what the stamp sees.
-    fn latest_view(&self) -> (LsmReader, Snapshot) {
+    fn latest_view(&self) -> (LsmReader<'_>, Snapshot) {
         let reader = self.build_reader();
         (reader, Snapshot::new(self.read_timestamp()))
     }
@@ -1344,7 +1373,9 @@ impl LsmStorageEngine {
 
     /// Writes all `ops` as ONE WAL record (type 3, single fsync) sharing one
     /// timestamp, then applies them to the MemTable. Recovery replays the
-    /// record all-or-nothing, so the batch is atomic (spec json/005).
+    /// record all-or-nothing, so the batch is atomic (spec json/005); while
+    /// the apply runs, `applying_batch` hides it from readers on other
+    /// threads (spec kv/034).
     pub async fn write_batch(&self, ops: Vec<BatchOp>) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
@@ -1381,11 +1412,20 @@ impl LsmStorageEngine {
         // half-applied (the WAL replays it fully after restart).
         let resolved = self.resolve_batch_values(ops).await?;
 
-        // Phase 2 (infallible): apply the whole batch to the MemTable.
+        // Phase 2 (infallible): apply the whole batch to the MemTable. The
+        // slot is set before the first insert and cleared before the batch
+        // counts as visible (spec kv/034).
+        let applied = last_op_per_key(resolved);
         let memtable = Arc::clone(&self.version().memtable);
-        for (key, value) in resolved {
+        self.applying_batch.store(timestamp.as_u64(), Ordering::SeqCst);
+        for (key, value) in applied {
             memtable.set(key, timestamp, value);
+            #[cfg(test)]
+            if let Some(hook) = &self.hooks.batch_first_applied {
+                hook.pause();
+            }
         }
+        self.applying_batch.store(0, Ordering::Release);
         self.raise_change_epoch();
 
         // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
@@ -1520,8 +1560,18 @@ impl LsmStorageEngine {
         // (spec perf/017 A3), and every source comes from the same state.
         let version = self.version();
         for mt in version.memtables_newest_first() {
-            scan_memtable_for_prefix(mt, prefix, now, limit, snapshot, &mut live, &mut decided, &mut coop)
-                .await;
+            scan_memtable_for_prefix(
+                mt,
+                prefix,
+                now,
+                limit,
+                snapshot,
+                &self.applying_batch,
+                &mut live,
+                &mut decided,
+                &mut coop,
+            )
+            .await;
         }
         for sstable in version.sstables_newest_first() {
             if scan_sstable_for_prefix(sstable, prefix, limit, snapshot, &mut live, &mut decided, &mut coop)
@@ -4108,9 +4158,9 @@ mod tests {
     }
 
     // Spec general/032: a batch shares one stamp, so [Delete k, Put k v]
-    // writes the same internal key twice; only the surviving Put counts.
+    // resolves to one insert of the Put (spec kv/034), which counts once.
     #[tokio::test]
-    async fn test_memtable_size_counts_a_replaced_batch_entry_once() {
+    async fn test_memtable_size_counts_a_key_written_twice_in_a_batch_once() {
         let (engine, _dir) = make_engine().await;
 
         engine
@@ -5299,7 +5349,7 @@ mod tests {
         reached_rx.recv().unwrap();
 
         assert_eq!(source_count(&before), 2, "the old version is untouched mid-install");
-        let reader = LsmReader::new(Arc::clone(&before), Arc::clone(&engine.block_cache));
+        let reader = LsmReader::new(Arc::clone(&before), Arc::clone(&engine.block_cache), &engine.applying_batch);
         let snapshot = Snapshot::new(engine.next_timestamp());
         for i in 0..100u32 {
             assert_eq!(
@@ -5467,7 +5517,7 @@ mod tests {
         assert!(janitor.run_gc().await.unwrap().ran);
         assert!(!engine.version().vlog.contains_key(&1), "generation 1 is retired");
         assert!(gen1_path.exists(), "a version still holds generation 1");
-        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache));
+        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache), &engine.applying_batch);
         let snapshot = Snapshot::new(engine.read_timestamp());
         assert_eq!(reader.get(b"held", &snapshot).await.unwrap(), GetResult::Present(big.clone()));
 
@@ -5497,7 +5547,7 @@ mod tests {
 
         for (version, job) in [(before_compaction, "compaction"), (before_gc, "GC")] {
             let retired = version.sstables_newest_first().next().unwrap().file_id;
-            let reader = LsmReader::new(Arc::clone(&version), Arc::clone(&engine.block_cache));
+            let reader = LsmReader::new(Arc::clone(&version), Arc::clone(&engine.block_cache), &engine.applying_batch);
             let snapshot = Snapshot::new(engine.read_timestamp());
             assert_eq!(reader.get(b"k", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
             let block = BlockCacheKey { file_id: retired, block_offset: 0 };
@@ -5529,7 +5579,7 @@ mod tests {
         assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
         assert!(engine.version().level(1).iter().all(|t| t.file_id != table), "the GC retired the table");
 
-        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache));
+        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache), &engine.applying_batch);
         let snapshot = Snapshot::new(engine.read_timestamp());
         assert_eq!(reader.get(b"a", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
         let block = BlockCacheKey { file_id: table, block_offset: 0 };
@@ -5800,7 +5850,7 @@ mod tests {
         engine.install(|v| v.with_active_vlog(gen2));
         engine.put(b"late", &big).await.unwrap();
 
-        let reader = LsmReader::new(before, Arc::clone(&engine.block_cache));
+        let reader = LsmReader::new(before, Arc::clone(&engine.block_cache), &engine.applying_batch);
         let snapshot = Snapshot::new(engine.read_timestamp());
         assert_eq!(reader.get(b"late", &snapshot).await.unwrap(), GetResult::Absent);
         assert_eq!(engine.get(b"late").await.unwrap(), Some(big));
@@ -5896,5 +5946,210 @@ mod tests {
 
         assert_levels_below_l0_are_disjoint(&engine);
         assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+    }
+
+    // ── Spec kv/034: a batch whole or not at all for other threads ───────────
+
+    /// Ends of a hook that parks `write_batch` after its first MemTable insert.
+    type BatchHook = (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>);
+
+    /// Engine whose `write_batch` parks after its first MemTable insert.
+    async fn engine_with_batch_hook() -> (Arc<LsmStorageEngine>, BatchHook, tempfile::TempDir) {
+        let (mut engine, dir) = make_engine().await;
+        let (hook, reached, release) = ThreadHook::new();
+        engine.hooks.batch_first_applied = Some(hook);
+        (Arc::new(engine), (reached, release), dir)
+    }
+
+    /// Writes `ops` as one batch; while its Phase 2 is parked, `read` runs on
+    /// a thread of its own with its own runtime. Returns what `read` saw.
+    async fn read_mid_batch<T, F>(
+        engine: &Arc<LsmStorageEngine>,
+        (reached, release): BatchHook,
+        ops: Vec<BatchOp>,
+        read: impl FnOnce(Arc<LsmStorageEngine>) -> F + Send + 'static,
+    ) -> T
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T>,
+    {
+        let reader = {
+            let engine = Arc::clone(engine);
+            std::thread::spawn(move || {
+                reached.recv().unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                let seen = rt.block_on(read(engine));
+                release.send(()).unwrap();
+                seen
+            })
+        };
+        engine.write_batch(ops).await.unwrap();
+        tokio::task::spawn_blocking(move || reader.join().unwrap()).await.unwrap()
+    }
+
+    fn put_op(key: &[u8], value: &[u8]) -> BatchOp {
+        BatchOp::Put { key: key.to_vec(), value: value.to_vec() }
+    }
+
+    // Spec kv/034 test 1: Phase 2 parked after `a` -- a reader on another
+    // thread reads `a` and `b` old through the point-read entries, although a
+    // reader blind to the batch slot already meets the new `a`; once the
+    // batch is through, both are new.
+    #[tokio::test]
+    async fn test_point_reads_on_another_thread_see_a_batch_whole_or_not_at_all() {
+        let (engine, hook, _dir) = engine_with_batch_hook().await;
+        for key in [b"a", b"b"] {
+            engine.put(key, b"old").await.unwrap();
+        }
+
+        let ops = vec![put_op(b"a", b"new"), put_op(b"b", b"new")];
+        let seen = read_mid_batch(&engine, hook, ops, |engine| async move {
+            let no_batch = AtomicU64::new(0);
+            let blind = LsmReader::new(engine.version(), Arc::clone(&engine.block_cache), &no_batch);
+            let registered = engine.snapshot();
+            let mut seen = Vec::new();
+            for key in [b"a", b"b"] {
+                seen.push((
+                    engine.get_latest_with_expiry(key).await.unwrap().0,
+                    engine.get_latest_with_metadata(key).await.unwrap().map(|m| m.data),
+                    engine.get_with_snapshot(key, registered.snapshot()).await.unwrap(),
+                    blind.get(key, registered.snapshot()).await.unwrap(),
+                ));
+            }
+            seen
+        })
+        .await;
+
+        let old = || GetResult::Present(b"old".to_vec());
+        let new = || GetResult::Present(b"new".to_vec());
+        assert_eq!(
+            seen,
+            vec![(old(), Some(b"old".to_vec()), old(), new()), (old(), Some(b"old".to_vec()), old(), old())]
+        );
+        for key in [b"a", b"b"] {
+            assert_eq!(engine.get(key).await.unwrap(), Some(b"new".to_vec()));
+        }
+    }
+
+    // Spec kv/034 test 2: the batch of a prefix delete -- three tombstones,
+    // parked after the first -- leaves all three keys present for a reader
+    // on another thread; once it is through, all three are gone.
+    #[tokio::test]
+    async fn test_a_prefix_delete_batch_is_whole_or_not_at_all_for_another_thread() {
+        let (engine, hook, _dir) = engine_with_batch_hook().await;
+        let keys = [b"p:1", b"p:2", b"p:3"];
+        for key in keys {
+            engine.put(key, b"v").await.unwrap();
+        }
+
+        let ops = keys.iter().map(|key| BatchOp::Delete { key: key.to_vec() }).collect();
+        let seen = read_mid_batch(&engine, hook, ops, move |engine| async move {
+            let mut seen = Vec::new();
+            for key in keys {
+                seen.push(engine.get_latest_with_expiry(key).await.unwrap().0);
+            }
+            seen
+        })
+        .await;
+
+        assert_eq!(seen, vec![GetResult::Present(b"v".to_vec()); 3]);
+        for key in keys {
+            assert_eq!(engine.get_latest_with_expiry(key).await.unwrap().0, GetResult::Absent);
+        }
+    }
+
+    // Spec kv/034 test 3: a key the batch writes twice never shows its first
+    // value -- neither to a reader while Phase 2 is parked nor to one blind
+    // to the slot, which stands for a reader that found the key mid-batch but
+    // loaded the slot only after the batch.
+    #[tokio::test]
+    async fn test_a_key_written_twice_in_a_batch_never_shows_its_first_value() {
+        let (engine, hook, _dir) = engine_with_batch_hook().await;
+        engine.put(b"k", b"old").await.unwrap();
+
+        let ops = vec![put_op(b"k", b"first"), put_op(b"k", b"last")];
+        let seen = read_mid_batch(&engine, hook, ops, |engine| async move {
+            let no_batch = AtomicU64::new(0);
+            let blind = LsmReader::new(engine.version(), Arc::clone(&engine.block_cache), &no_batch);
+            (
+                engine.get_latest_with_expiry(b"k").await.unwrap().0,
+                blind.get(b"k", &Snapshot::new(engine.read_timestamp())).await.unwrap(),
+            )
+        })
+        .await;
+
+        assert_eq!(seen, (GetResult::Present(b"old".to_vec()), GetResult::Present(b"last".to_vec())));
+        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"last".to_vec()));
+    }
+
+    // Spec kv/034 test 4: a scan on another thread while Phase 2 is parked
+    // after its first insert -- `p:new`, or the tombstone of `p:old` -- lists
+    // `p:old` and not `p:new`, with and without a snapshot; once the batch is
+    // through, it lists only `p:new`.
+    #[tokio::test]
+    async fn test_scans_on_another_thread_skip_a_batch_being_applied() {
+        let put_new = || put_op(b"p:new", b"v");
+        let delete_old = || BatchOp::Delete { key: b"p:old".to_vec() };
+        let mut seen = Vec::new();
+        for ops in [vec![put_new(), delete_old()], vec![delete_old(), put_new()]] {
+            // The hook parks only once: one engine per order.
+            let (engine, hook, _dir) = engine_with_batch_hook().await;
+            engine.put(b"p:old", b"v").await.unwrap();
+
+            let (unregistered, registered) = read_mid_batch(&engine, hook, ops, |engine| async move {
+                let registered = engine.snapshot();
+                (
+                    engine.scan_keys(b"p:").await.unwrap(),
+                    engine.scan_keys_with_snapshot(b"p:", registered.snapshot()).await.unwrap(),
+                )
+            })
+            .await;
+            seen.push((unregistered, registered, engine.scan_keys(b"p:").await.unwrap()));
+        }
+
+        let (old, new) = (vec![b"p:old".to_vec()], vec![b"p:new".to_vec()]);
+        assert_eq!(seen, vec![(old.clone(), old, new); 2], "per order: scans mid-batch, scan after");
+    }
+
+    // Spec kv/034 test 5: a batch confirmed on thread A is whole for the
+    // point reads and the scan that follow on thread B -- the slot no longer
+    // names it once the batch is confirmed.
+    #[tokio::test]
+    async fn test_a_batch_confirmed_on_one_thread_is_whole_for_reads_on_another() {
+        let (engine, _dir) = make_engine().await;
+        let engine = Arc::new(engine);
+
+        let (confirmed_tx, confirmed_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(engine.write_batch(vec![put_op(b"a", b"v"), put_op(b"b", b"v")])).unwrap();
+                confirmed_tx.send(()).unwrap();
+            })
+        };
+        let reader = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                confirmed_rx.recv().unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    (
+                        engine.get(b"a").await.unwrap(),
+                        engine.get(b"b").await.unwrap(),
+                        engine.scan_keys(b"").await.unwrap(),
+                    )
+                })
+            })
+        };
+        // Joined off the test runtime: the WAL committer runs on it.
+        let read = tokio::task::spawn_blocking(move || {
+            writer.join().unwrap();
+            reader.join().unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(read, (Some(b"v".to_vec()), Some(b"v".to_vec()), vec![b"a".to_vec(), b"b".to_vec()]));
     }
 }

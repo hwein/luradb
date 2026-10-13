@@ -16,6 +16,7 @@ All notable changes to LuraDB are documented in this file.
 
 - Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.
 - SHM snapshots are only rebuilt after data changes, cutting tail latency of small requests on idle servers.
+- The SHM command dispatcher wakes on a per-client doorbell passed with the registration reply instead of a 10 µs idle sleep loop.
 - Key listings, counts and queries no longer read unrelated recent writes.
 - The read path is thread-safe: readers see one consistent version of an engine's sources, and the block cache is striped.
 - HTTP and TLS termination run on a multi-threaded frontend runtime; the storage engines stay on a dedicated engine thread.

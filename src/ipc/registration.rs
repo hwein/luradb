@@ -5,13 +5,18 @@
 //!
 //! ```text
 //!   request : REGISTER\n
-//!   success : OK <client_id> <cmd> <cmd_hdr> <resp> <resp_hdr>\n
+//!   success : OK <client_id> <cmd> <cmd_hdr> <resp> <resp_hdr>\n  + SCM_RIGHTS: doorbell pipe write end
 //!   failure : ERR <message>\n
 //! ```
 //!
 //! Segment names never contain spaces, so the reply is a single space-split
-//! line. After the reply the socket stays open purely for liveness: a read of
-//! 0 bytes (EOF) or an error means the client is gone and its segments drop.
+//! line. The success line carries the write end of the client's doorbell pipe
+//! as `SCM_RIGHTS` ancillary data (spec perf/014): after each cmd-ring send
+//! the client writes one byte to it to wake the dispatcher. A client that
+//! reads the line without `recvmsg` loses only the fd; the dispatcher's
+//! fallback tick still serves it. After the reply the socket stays open purely for
+//! liveness: a read of 0 bytes (EOF) or an error means the client is gone and
+//! its segments drop.
 //!
 //! ## Trust model
 //!
@@ -25,15 +30,21 @@ use super::dispatcher::{ClientConnection, ClientEvent};
 use super::readers::ReaderRegistry;
 use crate::uds;
 use anyhow::{Context, Result};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, watch};
 
 const REGISTER_REQUEST: &str = "REGISTER";
+
+/// Control-buffer bytes for one `SCM_RIGHTS` fd.
+// Safe: pure arithmetic on a constant size.
+const FD_CMSG_SPACE: usize = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
 
 /// What the listener needs to mint a client's segments.
 pub struct RegistrationConfig {
@@ -138,7 +149,7 @@ async fn handle_connection(
     }
 
     // 3. Mint the segment quartet + the server ring ends.
-    let (conn, names, slot_handle) =
+    let (conn, names, slot_handle, doorbell) =
         match ClientConnection::create(&config.instance_id, client_id, config.ring_size, config.segment_mode) {
             Ok(v) => v,
             Err(e) => {
@@ -160,9 +171,12 @@ async fn handle_connection(
     // frees the slot on every exit below, cancellation at an `.await` included.
     let lease = config.readers.register(slot_handle);
 
-    // 6. Reply with the segment names.
+    // 6. Reply with the segment names, the doorbell's write end attached (spec
+    // perf/014). Ours closes right after: only the client's copy stays open.
     let reply = format!("OK {} {} {} {} {}\n", client_id, names[0], names[1], names[2], names[3]);
-    if let Err(e) = write_half.write_all(reply.as_bytes()).await {
+    let sent = send_with_fd(&write_half, reply.as_bytes(), doorbell.as_fd()).await;
+    drop(doorbell);
+    if let Err(e) = sent {
         tracing::warn!("[shm-reg] reply to client {client_id} failed: {e}");
         drop(lease);
         let _ = events.send(ClientEvent::Disconnect(client_id));
@@ -193,6 +207,54 @@ fn peer_is_trusted(stream: &tokio::net::UnixStream, trusted_uids: &[u32]) -> boo
     stream.peer_cred().is_ok_and(|c| trusted_uids.contains(&c.uid()))
 }
 
+/// Writes all of `bytes` with `fd` attached as `SCM_RIGHTS` to the first
+/// chunk. A peer reading without `recvmsg` gets the bytes; the kernel then
+/// closes the fd on its side.
+async fn send_with_fd(half: &OwnedWriteHalf, bytes: &[u8], fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    let stream: &tokio::net::UnixStream = half.as_ref();
+    let mut sent = 0;
+    while sent < bytes.len() {
+        stream.writable().await?;
+        let attach = (sent == 0).then_some(fd);
+        match stream.try_io(Interest::WRITABLE, || sendmsg_once(stream.as_raw_fd(), &bytes[sent..], attach)) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// One non-blocking `sendmsg`, optionally carrying `fd` as `SCM_RIGHTS`.
+fn sendmsg_once(sock: RawFd, bytes: &[u8], fd: Option<BorrowedFd<'_>>) -> std::io::Result<usize> {
+    let mut iov = libc::iovec { iov_base: bytes.as_ptr() as *mut libc::c_void, iov_len: bytes.len() };
+    // `u64` elements keep the buffer aligned for `cmsghdr`.
+    let mut cmsg_buf = [0u64; FD_CMSG_SPACE.div_ceil(8)];
+    // Safe: a zeroed msghdr is valid, every pointer targets a live local, and
+    // header plus fd fit `cmsg_buf` (sized by CMSG_SPACE).
+    let n = unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if let Some(fd) = fd {
+            msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+            msg.msg_controllen = FD_CMSG_SPACE as _;
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd.as_raw_fd());
+        }
+        libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL)
+    };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::dispatcher::ShmDispatcher;
@@ -210,8 +272,9 @@ mod tests {
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
     use crate::engines::lsm::domain::DomainRegistry;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Interest};
     use tokio::net::UnixStream;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -389,6 +452,123 @@ mod tests {
         panic!("no response within timeout");
     }
 
+    /// One `recvmsg` into `buf`: the byte count plus the fd passed as
+    /// `SCM_RIGHTS` with these bytes, if any.
+    fn recv_with_fd(sock: RawFd, buf: &mut [u8]) -> std::io::Result<(usize, Option<OwnedFd>)> {
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+        let mut cmsg_buf = [0u64; 8];
+        // Safe: a zeroed msghdr is valid and every pointer targets a live local;
+        // a received SCM_RIGHTS fd is new and owned by nobody else.
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+            msg.msg_controllen = std::mem::size_of_val(&cmsg_buf) as _;
+            let n = libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC);
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut fd = None;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let raw = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
+                    fd = Some(OwnedFd::from_raw_fd(raw));
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+            Ok((n as usize, fd))
+        }
+    }
+
+    /// Registers like a doorbell-aware client (spec perf/014): the reply line
+    /// via `recvmsg`, plus the doorbell pipe's write end attached to it.
+    async fn register_with_doorbell(stream: &mut UnixStream) -> (String, OwnedFd) {
+        stream.write_all(b"REGISTER\n").await.unwrap();
+        let mut line = Vec::new();
+        let mut doorbell = None;
+        let mut buf = [0u8; 256];
+        while !line.ends_with(b"\n") {
+            stream.readable().await.unwrap();
+            match stream.try_io(Interest::READABLE, || recv_with_fd(stream.as_raw_fd(), &mut buf)) {
+                Ok((0, _)) => panic!("EOF before the full reply: {line:?}"),
+                Ok((n, fd)) => {
+                    line.extend_from_slice(&buf[..n]);
+                    doorbell = doorbell.or(fd);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("recvmsg: {e}"),
+            }
+        }
+        let line = String::from_utf8(line).unwrap();
+        (line, doorbell.expect("doorbell fd attached to the reply"))
+    }
+
+    /// What a doorbell-aware client does after each cmd-ring send.
+    fn ring(doorbell: &OwnedFd) {
+        // Safe: a 1-byte write from a live local to a pipe end we own.
+        let n = unsafe { libc::write(doorbell.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        assert_eq!(n, 1, "doorbell write");
+    }
+
+    /// The `pipe:[<inode>]` link of a pipe end: both ends of one pipe share it.
+    fn pipe_link(fd: &OwnedFd) -> std::path::PathBuf {
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+        assert!(link.to_string_lossy().starts_with("pipe:["), "a pipe end: {link:?}");
+        link
+    }
+
+    /// How many fds of this process are open on the pipe with `link`.
+    fn fds_on_pipe(link: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == link))
+            .count()
+    }
+
+    /// Bounded wait for the fds on the pipe with `link` to drop to `n`: the
+    /// server closes its own asynchronously to this test.
+    async fn poll_fds_on_pipe(link: &Path, n: usize) -> bool {
+        for _ in 0..2000 {
+            if fds_on_pipe(link) == n {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    /// A client's ring ends over the four segments named in its `OK` reply:
+    /// producer on the cmd ring, consumer on the resp ring.
+    struct ClientRings {
+        tx: RingProducer,
+        rx: RingConsumer,
+        /// Declared last: the rings map into these segments.
+        _segs: [ShmSegment; 4],
+    }
+
+    impl ClientRings {
+        fn open(reply: &str) -> Self {
+            let names: Vec<&str> = reply.split_whitespace().skip(2).collect();
+            assert_eq!(names.len(), 4, "OK <id> + four names: {reply:?}");
+            let segs: [ShmSegment; 4] = std::array::from_fn(|i| ShmSegment::open(names[i]).unwrap());
+            let [cmd, cmd_hdr, resp, resp_hdr] = &segs;
+            // Safe: header segments are page-sized server mappings, data
+            // segments are sized to the ring, and `_segs` outlives the rings.
+            let tx = unsafe {
+                let h = RingbufferHeader::from_ptr(cmd_hdr.as_ptr(), cmd_hdr.len()) as *const RingbufferHeader;
+                RingProducer::new(h, DoubleMmapRegion::new(cmd.fd(), cmd.len()).unwrap())
+            };
+            let rx = unsafe {
+                let h = RingbufferHeader::from_ptr(resp_hdr.as_ptr(), resp_hdr.len()) as *const RingbufferHeader;
+                RingConsumer::new(h, DoubleMmapRegion::new(resp.fd(), resp.len()).unwrap())
+            };
+            Self { tx, rx, _segs: segs }
+        }
+    }
+
     // The reply names a client_id and the four segments, which now exist.
     #[tokio::test]
     async fn test_register_wire_format() {
@@ -546,7 +726,9 @@ mod tests {
     }
 
     // Full loop: register, open the segments, drive Put+Get over the rings, then
-    // disconnect and watch the segments get unlinked.
+    // disconnect and watch the segments get unlinked. A legacy client: it reads
+    // the reply with `read_line`, never sees the doorbell fd and is served by
+    // the fallback tick (spec perf/014 test 2).
     #[tokio::test]
     async fn test_e2e_put_get_roundtrip_and_cleanup() {
         let (registry, _dir) = make_registry().await;
@@ -608,6 +790,67 @@ mod tests {
         // The dispatcher unlinks all four on the disconnect event.
         for name in [cmd_name, cmd_hdr_name, resp_name, resp_hdr_name] {
             assert!(poll_gone(name).await, "{name} should be unlinked after disconnect");
+        }
+
+        server.stop().await;
+    }
+
+    // Spec perf/014: a doorbell-aware client receives the doorbell's write end
+    // with the `OK` line and rings it after every cmd-ring send; Put+Get
+    // round-trip.
+    #[tokio::test]
+    async fn test_e2e_doorbell_client_put_get_roundtrip() {
+        let (registry, _dir) = make_registry().await;
+        registry.create_domain("d1").await.unwrap();
+        let server = start_server(Arc::clone(&registry), 4096).await;
+
+        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+        let (reply, doorbell) = register_with_doorbell(&mut stream).await;
+        assert!(reply.starts_with("OK "), "{reply:?}");
+        let mut client = ClientRings::open(&reply);
+
+        let put = ShmCommand::Put {
+            request_id: 1,
+            domain: "d1".into(),
+            key: "clé".into(),
+            value: b"v".to_vec(),
+            ttl_secs: 0,
+        };
+        client.tx.send(put.encode().as_slice()).unwrap();
+        ring(&doorbell);
+        assert_eq!(recv_response(&mut client.rx).await, ShmResponse::Ok { request_id: 1 });
+
+        let get = ShmCommand::Get { request_id: 2, domain: "d1".into(), key: "clé".into() };
+        client.tx.send(get.encode().as_slice()).unwrap();
+        ring(&doorbell);
+        assert_eq!(
+            recv_response(&mut client.rx).await,
+            ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Present(b"v".to_vec()) }
+        );
+
+        drop(client);
+        drop(stream);
+        server.stop().await;
+    }
+
+    // Spec perf/014 test 4: the disconnect teardown closes the server's doorbell
+    // fds, cycle after cycle. Counted per pipe: a plain fd count would include
+    // the fds of tests running in parallel.
+    #[tokio::test]
+    async fn test_disconnect_closes_doorbell_fd() {
+        let (registry, _dir) = make_registry().await;
+        let server = start_server(Arc::clone(&registry), 4096).await;
+
+        for cycle in 0..3 {
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            let (reply, doorbell) = register_with_doorbell(&mut stream).await;
+            assert!(reply.starts_with("OK "), "{reply:?}");
+            let link = pipe_link(&doorbell);
+            assert!(fds_on_pipe(&link) >= 2, "cycle {cycle}: the server holds the doorbell while registered");
+
+            drop(stream);
+            let closed = poll_fds_on_pipe(&link, 1).await;
+            assert!(closed, "cycle {cycle}: server doorbell fd left open after disconnect");
         }
 
         server.stop().await;

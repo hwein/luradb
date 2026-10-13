@@ -2,11 +2,13 @@
 //!
 //! Owns one [`ClientConnection`] per registered client — each a cmd
 //! `RingConsumer` plus a resp `RingProducer` over that client's shm quartet —
-//! and polls them all in a single adaptive loop: no sleep while any ring yields
-//! work, a short idle sleep once every ring is empty. New clients arrive over a
-//! channel from the registration listener; a disconnect, or a corrupt cmd ring
-//! from one client, drops just that connection (its `ClientShm` unlinks the
-//! segments). Command semantics match the REST handlers in `api::kv`.
+//! and polls them all in a single adaptive loop: no pause while any ring yields
+//! work; once every ring is empty it parks until a client rings its doorbell
+//! pipe or the fallback tick expires (spec perf/014). New clients arrive
+//! over a channel from the registration listener; a disconnect, or a corrupt
+//! cmd ring from one client, drops just that connection (its `ClientShm`
+//! unlinks the segments, its doorbell fd closes). Command semantics match the
+//! REST handlers in `api::kv`.
 
 use super::commands::{ShmCommand, ShmGetValue, ShmResponse};
 use super::protocol::{ReaderSlot, READER_SLOT_OFFSET};
@@ -17,12 +19,20 @@ use super::ringbuffer::{
 use super::shm::ClientShm;
 use crate::engines::lsm::{DomainRegistry, DomainStore, GetResult};
 use std::any::Any;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::sync::{mpsc, watch};
 
-/// Idle backoff between empty polls; skipped while commands keep arriving.
-const POLL_IDLE_US: u64 = 10;
+/// Longest idle wait without a doorbell: serves clients that never ring theirs
+/// and covers lost wakeups (spec perf/014).
+const FALLBACK_TICK: Duration = Duration::from_millis(1);
+/// Reads of 4 KiB per doorbell drain: empties a full default-size pipe
+/// (64 KiB), yet a client refilling it concurrently cannot pin the drain.
+const DOORBELL_DRAIN_READS: usize = 16;
 /// Response-ring-full backoff: brief bounded retries before dropping the
 /// response (flow control is out of scope — spec non-goals).
 const RESPOND_RETRIES: usize = 8;
@@ -45,6 +55,9 @@ pub struct ClientConnection {
     pub client_id: u64,
     consumer: RingConsumer,
     producer: RingProducer,
+    /// Read end of the pipe the client writes a byte to after each cmd-ring
+    /// send (spec perf/014); `None` once the client closed its write end.
+    doorbell: Option<AsyncFd<OwnedFd>>,
     /// Declared last: the rings (mappings into these segments) must drop before
     /// `_shm` closes the fds and unlinks the names. `None` in unit tests that
     /// wire raw rings without a quartet.
@@ -62,14 +75,15 @@ pub enum ClientEvent {
 impl ClientConnection {
     /// Creates the client's shm quartet and wires the server ends — a consumer
     /// on the cmd ring, a producer on the resp ring — returning the four segment
-    /// names to hand back over the registration socket plus the handle on the
-    /// client's reader slot (spec perf/012 §6).
+    /// names to hand back over the registration socket, the handle on the
+    /// client's reader slot (spec perf/012 §6) and the doorbell pipe's write
+    /// end to pass to the client (spec perf/014).
     pub fn create(
         instance_id: &str,
         client_id: u64,
         ring_size: usize,
         mode: u32,
-    ) -> anyhow::Result<(Self, [String; 4], ReaderSlotHandle)> {
+    ) -> anyhow::Result<(Self, [String; 4], ReaderSlotHandle, OwnedFd)> {
         let shm = ClientShm::create(instance_id, client_id, ring_size, mode)?;
         let names = shm.segment_names();
         // Copyable handles: no borrow of `shm` outlives these, so `shm` can move
@@ -99,7 +113,9 @@ impl ClientConnection {
             ) as *const ReaderSlot;
             ReaderSlotHandle::new(client_id, slot, shm.cmd_hdr_arc() as Arc<dyn Any + Send + Sync>)
         };
-        Ok((Self { client_id, consumer, producer, _shm: Some(shm) }, names, slot_handle))
+        let (doorbell, client_doorbell) = new_doorbell()?;
+        let conn = Self { client_id, consumer, producer, doorbell: Some(doorbell), _shm: Some(shm) };
+        Ok((conn, names, slot_handle, client_doorbell))
     }
 
     /// Drains up to `DRAIN_BATCH` currently-available commands, dispatching each
@@ -164,17 +180,68 @@ impl ClientConnection {
         }
         SendOutcome::Full
     }
+
+    /// Whether the doorbell rang; if so, drains the pipe. Readiness is cleared
+    /// before the pipe is read, so a ring racing the drain re-arms it. EOF (the
+    /// client closed its end) or an error retires the doorbell: the fallback
+    /// tick serves this client from then on.
+    fn drain_doorbell(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(doorbell) = &self.doorbell else { return false };
+        let Poll::Ready(Ok(mut guard)) = doorbell.poll_read_ready(cx) else {
+            return false;
+        };
+        guard.clear_ready();
+        let mut buf = [0u8; 4096];
+        let mut retire = false;
+        for _ in 0..DOORBELL_DRAIN_READS {
+            // Safe: a read into a live local buffer of its own length.
+            let n = unsafe { libc::read(doorbell.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                continue;
+            }
+            retire = n == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock;
+            break;
+        }
+        if retire {
+            self.doorbell = None;
+        }
+        true
+    }
+}
+
+/// A fresh doorbell pipe: the read end registered with the runtime's I/O
+/// driver, plus the write end for the client. The ends are separate open file
+/// descriptions, so flags the client sets on its end never reach ours.
+fn new_doorbell() -> std::io::Result<(AsyncFd<OwnedFd>, OwnedFd)> {
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    // Safe: pipe2 fills the live two-int array; on success both fds are new
+    // and owned by nobody else.
+    let (read_end, write_end) = unsafe {
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+    };
+    Ok((AsyncFd::with_interest(read_end, Interest::READABLE)?, write_end))
 }
 
 /// Polls every registered client's rings and dispatches their commands.
 pub struct ShmDispatcher {
     clients: Vec<ClientConnection>,
     registry: Arc<DomainRegistry>,
+    /// `FALLBACK_TICK` outside tests.
+    idle_tick: Duration,
 }
 
 impl ShmDispatcher {
     pub fn new(registry: Arc<DomainRegistry>) -> Self {
-        Self { clients: Vec::new(), registry }
+        Self { clients: Vec::new(), registry, idle_tick: FALLBACK_TICK }
+    }
+
+    /// A tick out of reach leaves the doorbell as the only idle wakeup.
+    #[cfg(test)]
+    fn with_idle_tick(registry: Arc<DomainRegistry>, idle_tick: Duration) -> Self {
+        Self { idle_tick, ..Self::new(registry) }
     }
 
     /// Runs until `shutdown` flips. Consumes `self`, so returning drops every
@@ -197,11 +264,13 @@ impl ShmDispatcher {
                 // never lets its ring go empty (e.g. a Ping flood).
                 tokio::task::yield_now().await;
             } else {
-                // Every ring empty: idle for the poll interval (or wake early on
-                // shutdown). New connect/disconnect events are absorbed by the
-                // try_recv at the top of the next iteration.
+                // Every ring empty: park until a doorbell rings, the fallback
+                // tick expires or shutdown. Either way the next iteration polls
+                // every ring, and its try_recv absorbs connect/disconnect events.
+                let tick = self.idle_tick;
+                let doorbells = std::future::poll_fn(|cx| self.poll_doorbells(cx));
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_micros(POLL_IDLE_US)) => {}
+                    _ = tokio::time::timeout(tick, doorbells) => {}
                     _ = shutdown.changed() => {}
                 }
             }
@@ -228,6 +297,21 @@ impl ShmDispatcher {
             self.clients.retain(|c| !corrupt.contains(&c.client_id));
         }
         any_work
+    }
+
+    /// Ready once any client's doorbell has rung, draining every one that
+    /// did. `&mut self` keeps the awaiting future `Send`: the rings are `Send`
+    /// but not `Sync`.
+    fn poll_doorbells(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut rang = false;
+        for conn in &mut self.clients {
+            rang |= conn.drain_doorbell(cx);
+        }
+        if rang {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 
     fn handle_event(&mut self, ev: ClientEvent) {
@@ -399,6 +483,7 @@ mod tests {
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
     use std::ffi::CString;
+    use std::os::fd::AsRawFd;
     use std::os::unix::io::RawFd;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -445,9 +530,16 @@ mod tests {
     }
 
     /// A server-side connection over raw rings (no `ClientShm`) — the unit-test
-    /// stand-in for what the registration listener builds in production.
-    fn raw_connection(client_id: u64, consumer: RingConsumer, producer: RingProducer) -> ClientConnection {
-        ClientConnection { client_id, consumer, producer, _shm: None }
+    /// stand-in for what the registration listener builds in production — plus
+    /// the client's write end of its doorbell pipe.
+    fn raw_connection(
+        client_id: u64,
+        consumer: RingConsumer,
+        producer: RingProducer,
+    ) -> (ClientConnection, OwnedFd) {
+        let (doorbell, client_doorbell) = new_doorbell().unwrap();
+        let conn = ClientConnection { client_id, consumer, producer, doorbell: Some(doorbell), _shm: None };
+        (conn, client_doorbell)
     }
 
     struct Harness {
@@ -467,7 +559,7 @@ mod tests {
         let (registry, dir) = make_registry().await;
         let (client_tx, server_rx, cd, ch) = ring_ends(ring);
         let (server_tx, client_rx, rd, rh) = ring_ends(ring);
-        let conn = raw_connection(0, server_rx, server_tx);
+        let (conn, _) = raw_connection(0, server_rx, server_tx);
         Harness { registry, conn, client_tx, client_rx, _dir: dir, _segs: [cd, ch, rd, rh] }
     }
 
@@ -743,8 +835,8 @@ mod tests {
         let (a_server_tx, mut a_rx, _ard, _arh) = ring_ends(4096);
         let (_b_tx, b_server_rx, _bcd, bch) = ring_ends(4096);
         let (b_server_tx, _b_rx, _brd, _brh) = ring_ends(4096);
-        dispatcher.clients.push(raw_connection(1, a_server_rx, a_server_tx));
-        dispatcher.clients.push(raw_connection(2, b_server_rx, b_server_tx));
+        dispatcher.clients.push(raw_connection(1, a_server_rx, a_server_tx).0);
+        dispatcher.clients.push(raw_connection(2, b_server_rx, b_server_tx).0);
 
         // A sends a valid Ping; B's cmd write index is corrupted past the ring.
         a_tx.send(ShmCommand::Ping { request_id: 1 }.encode().as_slice()).unwrap();
@@ -766,12 +858,125 @@ mod tests {
         let mut dispatcher = ShmDispatcher::new(Arc::clone(&registry));
         let (_tx, rx, _cd, _ch) = ring_ends(4096);
         let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
-        dispatcher.clients.push(raw_connection(42, rx, tx2));
+        dispatcher.clients.push(raw_connection(42, rx, tx2).0);
 
         dispatcher.handle_event(ClientEvent::Disconnect(99)); // unknown id: no-op
         assert_eq!(dispatcher.clients.len(), 1);
         dispatcher.handle_event(ClientEvent::Disconnect(42));
         assert!(dispatcher.clients.is_empty());
+    }
+
+    // ── Spec perf/014: doorbell wakeup ──────────────────────────────────────
+
+    /// What a doorbell-aware client does after each cmd-ring send.
+    fn ring(doorbell: &OwnedFd) {
+        // Safe: a 1-byte write from a live local to a pipe end we own.
+        let n = unsafe { libc::write(doorbell.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        assert_eq!(n, 1, "doorbell write");
+    }
+
+    async fn await_response(rx: &mut RingConsumer) -> ShmResponse {
+        for _ in 0..2000 {
+            if let Some(raw) = rx.recv().unwrap() {
+                return ShmResponse::decode(&raw).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("no response within timeout");
+    }
+
+    /// One client on a running dispatcher that has answered a first Ping and
+    /// parked again, every ring empty.
+    struct Parked {
+        client_tx: RingProducer,
+        client_rx: RingConsumer,
+        doorbell: OwnedFd,
+        shutdown: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+        _segs: [TestSeg; 4],
+    }
+
+    async fn park(dispatcher: ShmDispatcher) -> Parked {
+        let (client_tx, server_rx, cd, ch) = ring_ends(4096);
+        let (server_tx, client_rx, rd, rh) = ring_ends(4096);
+        let (conn, doorbell) = raw_connection(1, server_rx, server_tx);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        assert!(events_tx.send(ClientEvent::Connect(Box::new(conn))).is_ok());
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(dispatcher.run(events_rx, shutdown_rx));
+        let mut p = Parked { client_tx, client_rx, doorbell, shutdown, task, _segs: [cd, ch, rd, rh] };
+        // Queued before the dispatcher first runs: its first pass answers it.
+        p.client_tx.send(ShmCommand::Ping { request_id: 1 }.encode().as_slice()).unwrap();
+        assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 1 });
+        p
+    }
+
+    impl Parked {
+        async fn stop(self) {
+            self.shutdown.send(true).unwrap();
+            self.task.await.unwrap();
+        }
+    }
+
+    // Test 1: with the fallback tick out of reach, ringing the doorbell alone
+    // wakes the parked dispatcher.
+    #[tokio::test]
+    async fn test_doorbell_wakes_idle_dispatcher() {
+        let (registry, _dir) = make_registry().await;
+        let mut p = park(ShmDispatcher::with_idle_tick(registry, Duration::from_secs(3600))).await;
+
+        p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
+        ring(&p.doorbell);
+        assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 2 });
+
+        p.stop().await;
+    }
+
+    // Test 2: a client that never rings its doorbell (legacy client) is still
+    // served by the production fallback tick.
+    #[tokio::test]
+    async fn test_fallback_tick_serves_client_without_doorbell() {
+        let (registry, _dir) = make_registry().await;
+        let mut p = park(ShmDispatcher::new(registry)).await;
+
+        p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
+        assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 2 });
+
+        p.stop().await;
+    }
+
+    // A client that closes its doorbell is served by the fallback tick from
+    // then on, and the dispatcher keeps running.
+    #[tokio::test]
+    async fn test_closed_doorbell_falls_back_to_tick() {
+        let (registry, _dir) = make_registry().await;
+        let mut p = park(ShmDispatcher::new(registry)).await;
+
+        drop(p.doorbell);
+        for request_id in 2..4 {
+            p.client_tx.send(ShmCommand::Ping { request_id }.encode().as_slice()).unwrap();
+            assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id });
+        }
+
+        p.shutdown.send(true).unwrap();
+        p.task.await.unwrap();
+    }
+
+    // A closed doorbell wakes the dispatcher once and is then retired: its
+    // read end would report EOF forever and spin the idle wait.
+    #[tokio::test]
+    async fn test_closed_doorbell_wakes_once() {
+        let (registry, _dir) = make_registry().await;
+        let mut dispatcher = ShmDispatcher::new(registry);
+        let (_tx, rx, _cd, _ch) = ring_ends(4096);
+        let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
+        let (conn, doorbell) = raw_connection(1, rx, tx2);
+        dispatcher.clients.push(conn);
+
+        drop(doorbell);
+        std::future::poll_fn(|cx| dispatcher.poll_doorbells(cx)).await;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(dispatcher.poll_doorbells(&mut cx).is_pending(), "a retired doorbell must stay silent");
     }
 
     // ── Spec general/007: UTF-8 key invariant ───────────────────────────────

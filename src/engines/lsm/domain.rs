@@ -34,12 +34,12 @@ use tokio::time::{sleep, Duration};
 
 const SYS_DOMAIN_PREFIX: &[u8] = b"__sys:domain:";
 
-/// Keys one post-scan loop processes between two yields (spec perf/017 A2).
+/// Keys the post-scan loops of one method process between two yields; they
+/// share one counter (spec perf/017 A2, perf/033).
 const KEY_LOOP_YIELD_INTERVAL: u32 = 4096;
 
 /// Strips the domain's system prefix off every scanned key.
-async fn strip_domain_prefix(raw_keys: Vec<Vec<u8>>, prefix_len: usize) -> Vec<Vec<u8>> {
-    let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+async fn strip_domain_prefix(raw_keys: Vec<Vec<u8>>, prefix_len: usize, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(raw_keys.len());
     for key in raw_keys {
         coop.tick().await;
@@ -51,8 +51,7 @@ async fn strip_domain_prefix(raw_keys: Vec<Vec<u8>>, prefix_len: usize) -> Vec<V
 /// Keeps the user-keys containing `needle` (case-sensitive, spec kv/023). A
 /// non-UTF-8 key would be an invariant break (general/007 guarantees UTF-8
 /// keys) — skip it rather than fail the request.
-async fn filter_contains(keys: Vec<Vec<u8>>, needle: &str) -> Vec<Vec<u8>> {
-    let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+async fn filter_contains(keys: Vec<Vec<u8>>, needle: &str, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for key in keys {
         coop.tick().await;
@@ -61,6 +60,20 @@ async fn filter_contains(keys: Vec<Vec<u8>>, needle: &str) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// Takes the page `offset..offset + limit` of `keys`; every key it skips or
+/// leaves over ticks `coop`, so dropping them yields too (spec perf/033).
+async fn take_page(keys: Vec<Vec<u8>>, offset: usize, limit: usize, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
+    let mut page = Vec::with_capacity(keys.len().saturating_sub(offset).min(limit));
+    for (i, key) in keys.into_iter().enumerate() {
+        if i >= offset && page.len() < limit {
+            page.push(key);
+        } else {
+            coop.tick().await;
+        }
+    }
+    page
 }
 
 // ── DomainConfig ──────────────────────────────────────────────────────────────
@@ -624,7 +637,8 @@ impl DomainStore {
         }
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys(&full_prefix).await?;
-        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len()).await)
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len(), &mut coop).await)
     }
 
     /// Returns one page of live user-keys whose raw form starts with
@@ -647,13 +661,14 @@ impl DomainStore {
         }
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys(&full_prefix).await?;
-        let matched = strip_domain_prefix(raw_keys, self.domain.system_prefix.len()).await;
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        let matched = strip_domain_prefix(raw_keys, self.domain.system_prefix.len(), &mut coop).await;
         let matched = match contains {
-            Some(needle) => filter_contains(matched, needle).await,
+            Some(needle) => filter_contains(matched, needle, &mut coop).await,
             None => matched,
         };
         let total = matched.len() as u64;
-        let page: Vec<Vec<u8>> = matched.into_iter().skip(offset).take(limit).collect();
+        let page = take_page(matched, offset, limit, &mut coop).await;
         Ok((page, total))
     }
 
@@ -684,8 +699,9 @@ impl DomainStore {
         }
 
         let matched = self.scan_keys(prefix).await?;
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
         let matched = match contains {
-            Some(needle) => filter_contains(matched, needle).await,
+            Some(needle) => filter_contains(matched, needle, &mut coop).await,
             None => matched,
         };
 
@@ -696,7 +712,6 @@ impl DomainStore {
             self.max_bulk_delete_keys
         );
 
-        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
         let mut ops: Vec<BatchOp> = Vec::with_capacity(matched.len());
         for k in &matched {
             coop.tick().await;
@@ -768,7 +783,8 @@ impl DomainStore {
     pub async fn scan_keys_with_snapshot(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys_with_snapshot(&full_prefix, snapshot).await?;
-        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len()).await)
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len(), &mut coop).await)
     }
 
     /// Subscribes to write events for this domain (domain prefix already
@@ -1715,5 +1731,42 @@ mod tests {
         )
         .await;
         assert_eq!(order, ["small", "long"]);
+    }
+
+    // Spec perf/033: dropping the keys a page skips or leaves over hands the
+    // thread back — one key above a yield interval leaves exactly one
+    // interval of keys to drop for `limit = 1`.
+    #[tokio::test]
+    async fn test_take_page_yields_while_dropping_keys() {
+        let keys: Vec<Vec<u8>> = (0..=KEY_LOOP_YIELD_INTERVAL).map(|i| i.to_be_bytes().to_vec()).collect();
+        let order = crate::core::coop::completion_order(
+            async move {
+                let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+                assert_eq!(take_page(keys, 0, 1, &mut coop).await.len(), 1);
+            },
+            async {},
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
+    }
+
+    #[tokio::test]
+    async fn test_take_page_applies_offset_and_limit() {
+        let keys: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i]).collect();
+        let cases: [(usize, usize, &[u8]); 7] = [
+            (0, usize::MAX, &[0, 1, 2, 3, 4]),
+            (1, 2, &[1, 2]),
+            (3, 10, &[3, 4]),
+            (2, usize::MAX, &[2, 3, 4]),
+            (5, 1, &[]),
+            (9, 1, &[]),
+            (0, 0, &[]),
+        ];
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        for (offset, limit, expected) in cases {
+            let expected: Vec<Vec<u8>> = expected.iter().map(|&i| vec![i]).collect();
+            let page = take_page(keys.clone(), offset, limit, &mut coop).await;
+            assert_eq!(page, expected, "offset={offset} limit={limit}");
+        }
     }
 }

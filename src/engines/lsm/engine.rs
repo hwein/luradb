@@ -208,7 +208,8 @@ fn is_live_version(value: &Value, now: u64) -> bool {
 
 /// Ticks between two yield points of a prefix scan (spec perf/017 A2): one
 /// per visited entry, one more per decided key, which copies the key into
-/// the result sets (spec perf/030).
+/// the result sets (spec perf/030); the result's collection and the release
+/// of the decided set tick once per key (spec perf/033).
 const SCAN_KEYS_YIELD_INTERVAL: u32 = 1024;
 
 /// Entries the expiry scan checks between two yield points (spec kv/025 §7).
@@ -1581,11 +1582,21 @@ impl LsmStorageEngine {
             if scan_sstable_for_prefix(sstable, prefix, limit, snapshot, &mut live, &mut decided, &mut coop)
                 .await?
             {
-                return Ok(live.into_iter().collect());
+                break;
             }
         }
 
-        Ok(live.into_iter().collect())
+        // Collecting and releasing are O(keys) too; they tick like the sources
+        // (spec perf/033).
+        let mut keys = Vec::with_capacity(live.len());
+        for key in live {
+            coop.tick().await;
+            keys.push(key);
+        }
+        while decided.pop_first().is_some() {
+            coop.tick().await;
+        }
+        Ok(keys)
     }
 
     // ── Watch ────────────────────────────────────────────────────────────────
@@ -4877,6 +4888,29 @@ mod tests {
         engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
 
         assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
+    }
+
+    // ── Spec perf/033: yields cover the result materialization ───────────────
+
+    // 300 keys only in the active MemTable tick 600 times in the source loop,
+    // under one yield interval: only collecting the result (300) and draining
+    // the decided set (300) reaches it.
+    #[tokio::test]
+    async fn test_scan_keys_yields_while_materializing_the_result() {
+        let (engine, _dir) = make_engine().await;
+        let ops: Vec<BatchOp> = (0..300u32)
+            .map(|i| BatchOp::Put { key: format!("m:{i:03}").into_bytes(), value: b"v".to_vec() })
+            .collect();
+        engine.write_batch(ops).await.unwrap();
+        let engine = Arc::new(engine);
+
+        let reader = Arc::clone(&engine);
+        let order = completion_order(
+            async move { assert_eq!(engine.scan_keys(b"m:").await.unwrap().len(), 300) },
+            async move { assert!(reader.get(b"m:001").await.unwrap().is_some()) },
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
     }
 
     // ── Spec perf/032: SSTable scans seek to the prefix range ────────────────

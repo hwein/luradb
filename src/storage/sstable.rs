@@ -8,9 +8,16 @@ use crate::storage::bloom::BloomFilter as BloomFilterImpl;
 use rkyv::util::AlignedVec;
 use rkyv::{rancor, Archived};
 use anyhow::{Result, bail};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const BLOCK_SIZE_TARGET: usize = 4096; // 4KB target for data blocks
+
+/// True until `key` lies behind the run of keys that start with `prefix`.
+#[inline]
+fn not_behind_prefix_run(key: &[u8], prefix: &[u8]) -> bool {
+    key < prefix || key.starts_with(prefix)
+}
 
 /// Returns the user-key portion of an encoded MVCC key.
 ///
@@ -196,6 +203,8 @@ pub struct SSTableReader {
     /// correct ID from the manifest.
     pub file_id: u64,
     retired: AtomicBool,
+    #[cfg(test)]
+    blocks_read: std::sync::atomic::AtomicUsize,
 }
 
 impl SSTableReader {
@@ -293,6 +302,8 @@ impl SSTableReader {
             bloom_filter,
             file_id: 0,
             retired: AtomicBool::new(false),
+            #[cfg(test)]
+            blocks_read: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -599,6 +610,8 @@ impl SSTableReader {
     }
 
     fn read_data_block(&self, handle: &Archived<BlockHandle>) -> Result<&Archived<DataBlock>> {
+        #[cfg(test)]
+        self.blocks_read.fetch_add(1, Ordering::Relaxed);
         let offset = u64::from(handle.offset) as usize;
         let size = u64::from(handle.size) as usize;
 
@@ -655,7 +668,14 @@ impl SSTableReader {
             .unwrap_or_default()
             .as_secs();
 
-        self.iter().filter_map(move |entry| {
+        // The start block may open before the range: those entries pass here
+        // and fall to the filter below. Behind the range, none match.
+        let range_entries = self.iter_blocks(self.prefix_blocks(prefix)).take_while(move |entry| match entry {
+            Ok((key, _)) => not_behind_prefix_run(key, prefix),
+            Err(_) => true,
+        });
+
+        range_entries.filter_map(move |entry| {
             let (encoded_key, dbv) = match entry {
                 Ok(e) => e,
                 Err(e) => return Some(Err(e)),
@@ -678,11 +698,29 @@ impl SSTableReader {
         })
     }
 
+    /// Blocks that can hold keys with `prefix`. Every such encoded key starts
+    /// with the prefix, so they form one run in key order: it begins in the
+    /// last block whose first key is `<= prefix` (block 0 if none) and ends
+    /// before the first block that opens behind the run.
+    fn prefix_blocks(&self, prefix: &[u8]) -> Range<usize> {
+        let firsts = &self.index.entries;
+        let start = firsts
+            .partition_point(|entry| entry.0.as_slice() <= prefix)
+            .saturating_sub(1);
+        let end = firsts.partition_point(|entry| not_behind_prefix_run(entry.0.as_slice(), prefix));
+        start..end
+    }
+
     /// Returns an iterator over all entries in the SSTable.
     pub fn iter(&self) -> SSTableIterator<'_> {
+        self.iter_blocks(0..self.index.entries.len())
+    }
+
+    fn iter_blocks(&self, blocks: Range<usize>) -> SSTableIterator<'_> {
         SSTableIterator {
             reader: self,
-            block_idx: 0,
+            block_idx: blocks.start,
+            end_block: blocks.end,
             entry_idx: 0,
             current_block: None,
         }
@@ -743,10 +781,11 @@ fn archived_to_owned_dbv(archived: &ArchivedDataBlockValue) -> DataBlockValue {
     }
 }
 
-/// Iterator over all entries in an SSTable.
+/// Iterator over the entries of an SSTable's blocks `block_idx..end_block`.
 pub struct SSTableIterator<'a> {
     reader: &'a SSTableReader,
     block_idx: usize,
+    end_block: usize,
     entry_idx: usize,
     current_block: Option<&'a Archived<DataBlock>>,
 }
@@ -757,7 +796,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.current_block.is_none() {
-                if self.block_idx >= self.reader.index.entries.len() {
+                if self.block_idx >= self.end_block {
                     return None;
                 }
 
@@ -790,6 +829,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::lsm::key::InternalKey;
     use crate::storage::format::ArchivedDataBlockValue;
     use rkyv::Archived;
 
@@ -1264,6 +1304,209 @@ mod tests {
             result.is_ok(),
             "empty bloom bit array with num_hashes == 0 must still be accepted"
         );
+        Ok(())
+    }
+
+    // ── Spec perf/032: prefix scans seek through the block index ─────────────
+
+    /// The builder closes a data block at this many entries.
+    const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE_TARGET / 16 + 1;
+
+    /// One stored version: user key, write timestamp, `false` for a tombstone.
+    type Version = (Vec<u8>, u64, bool);
+
+    fn version(user_key: &str, ts: u64, live: bool) -> Version {
+        (user_key.as_bytes().to_vec(), ts, live)
+    }
+
+    /// `count` live keys `{prefix}0000`, `{prefix}0001`, ... written at ts 10.
+    fn numbered(prefix: &str, count: usize) -> Vec<Version> {
+        (0..count).map(|i| version(&format!("{prefix}{i:04}"), 10, true)).collect()
+    }
+
+    fn encode(user_key: &[u8], ts: u64) -> Vec<u8> {
+        InternalKey::new(user_key.to_vec(), Timestamp::new(ts)).encode()
+    }
+
+    fn build_table(versions: Vec<Version>) -> anyhow::Result<SSTableReader> {
+        let mut stored: Vec<(Vec<u8>, bool)> = versions
+            .into_iter()
+            .map(|(user_key, ts, live)| (encode(&user_key, ts), live))
+            .collect();
+        stored.sort();
+        let mut builder = SSTableBuilder::new();
+        for (key, live) in stored {
+            if live {
+                builder.add_inline(key, b"v".to_vec(), 0);
+            } else {
+                builder.add(
+                    key,
+                    ValuePointer { file_id: 0, value_offset: TOMBSTONE_OFFSET, value_len: 0, expire_at: 0 },
+                );
+            }
+        }
+        SSTableReader::open(builder.finish()?)
+    }
+
+    fn scan(reader: &SSTableReader, prefix: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, bool)>> {
+        reader.keys_with_prefix(prefix).collect()
+    }
+
+    fn live_keys(prefix: &str, count: usize) -> Vec<(Vec<u8>, bool)> {
+        (0..count).map(|i| (format!("{prefix}{i:04}").into_bytes(), true)).collect()
+    }
+
+    /// 600 keys before, 300 inside and 600 behind the range `m:`: the range
+    /// crosses a block boundary, with whole blocks on both sides.
+    fn table_around_range() -> anyhow::Result<SSTableReader> {
+        let mut versions = numbered("a:", 600);
+        versions.extend(numbered("m:", 300));
+        versions.extend(numbered("z:", 600));
+        let reader = build_table(versions)?;
+        assert_eq!(reader.index.entries.len(), 6, "layout precondition");
+        Ok(reader)
+    }
+
+    // Test 1: keys before, inside and behind the range -> exactly the hits.
+    #[test]
+    fn test_prefix_scan_returns_exactly_the_range_across_blocks() -> anyhow::Result<()> {
+        let reader = table_around_range()?;
+        assert_eq!(scan(&reader, b"m:")?, live_keys("m:", 300));
+        Ok(())
+    }
+
+    // Test 2: a prefix that is itself a key, a prefix below the first key, a
+    // prefix above the last key. The stamp's 0xFF sorts a key behind its own
+    // extensions, so the result order is abc, abd, ab.
+    #[test]
+    fn test_prefix_scan_nested_and_out_of_table_prefixes() -> anyhow::Result<()> {
+        let mut versions = numbered("a:", 600);
+        for key in ["ab", "abc", "abd", "ac"] {
+            versions.push(version(key, 10, true));
+        }
+        versions.extend(numbered("z:", 600));
+        let reader = build_table(versions)?;
+
+        let entry = |key: &str| (key.as_bytes().to_vec(), true);
+        assert_eq!(scan(&reader, b"ab")?, [entry("abc"), entry("abd"), entry("ab")]);
+        assert_eq!(scan(&reader, b"ac")?, [entry("ac")]);
+        let mut below_first_key = live_keys("a:", 600);
+        below_first_key.extend(["abc", "abd", "ab", "ac"].map(entry));
+        assert_eq!(scan(&reader, b"a")?, below_first_key);
+        assert!(scan(&reader, b"0")?.is_empty());
+        assert!(scan(&reader, b"zz")?.is_empty());
+        Ok(())
+    }
+
+    // The block holding `ab` starts at that key although `abc` and `abd`,
+    // which sort before it, end the block before: the scan must start there.
+    #[test]
+    fn test_prefix_scan_starts_before_a_block_that_opens_with_the_prefix_key() -> anyhow::Result<()> {
+        let mut versions = numbered("aa", ENTRIES_PER_BLOCK - 2);
+        for key in ["abc", "abd", "ab", "ac"] {
+            versions.push(version(key, 10, true));
+        }
+        versions.extend(numbered("z:", ENTRIES_PER_BLOCK));
+        let reader = build_table(versions)?;
+        assert_eq!(reader.index.entries[1].0.as_slice(), encode(b"ab", 10), "layout precondition");
+
+        let entry = |key: &str| (key.as_bytes().to_vec(), true);
+        assert_eq!(scan(&reader, b"ab")?, [entry("abc"), entry("abd"), entry("ab")]);
+        Ok(())
+    }
+
+    // A shorter user key plus its stamp bytes can start with the prefix: it
+    // must neither be returned nor end the range before a real match.
+    #[test]
+    fn test_prefix_scan_skips_shorter_key_whose_stamp_starts_with_prefix() -> anyhow::Result<()> {
+        let mut prefix = b"k".to_vec();
+        prefix.push(Timestamp::new(10).to_be_bytes()[0]);
+        // All-0xFF tail: sorts behind the encoded "k" plus stamp.
+        let mut matching = prefix.clone();
+        matching.resize(1 + 8, 0xFF);
+        let reader = build_table(vec![
+            version("j", 10, true),
+            version("k", 10, true),
+            (matching.clone(), 10, true),
+        ])?;
+
+        assert_eq!(scan(&reader, &prefix)?, [(matching, true)]);
+        Ok(())
+    }
+
+    // Test 3: versions newer than the snapshot ceiling stay invisible, an older
+    // visible version is delivered.
+    #[test]
+    fn test_prefix_scan_at_snapshot_skips_newer_versions() -> anyhow::Result<()> {
+        let mut versions = numbered("a:", 600);
+        for i in 0..300 {
+            let key = format!("m:{i:04}");
+            match i % 3 {
+                // Newer tombstone over an older live version.
+                0 => versions.extend([version(&key, 30, false), version(&key, 10, true)]),
+                1 => versions.push(version(&key, 10, true)),
+                // Written only after the snapshot.
+                _ => versions.push(version(&key, 30, true)),
+            }
+        }
+        versions.extend(numbered("z:", 600));
+        let reader = build_table(versions)?;
+
+        let ceiling = Timestamp::new(20).inverted();
+        let visible: anyhow::Result<Vec<_>> = reader.keys_with_prefix_at(b"m:", ceiling).collect();
+        let expected: Vec<_> = live_keys("m:", 300)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 != 2)
+            .map(|(_, entry)| entry)
+            .collect();
+        assert_eq!(visible?, expected);
+        Ok(())
+    }
+
+    // Test 4: an empty prefix reads the whole table.
+    #[test]
+    fn test_prefix_scan_with_empty_prefix_returns_every_entry() -> anyhow::Result<()> {
+        let reader = table_around_range()?;
+        let mut expected = live_keys("a:", 600);
+        expected.extend(live_keys("m:", 300));
+        expected.extend(live_keys("z:", 600));
+        assert_eq!(scan(&reader, b"")?, expected);
+        Ok(())
+    }
+
+    // Test 5: the scan reads the blocks of its range, not the table.
+    #[test]
+    fn test_prefix_scan_in_last_block_reads_at_most_two_blocks() -> anyhow::Result<()> {
+        let mut versions = numbered("a:", 1000);
+        versions.extend(numbered("t:", 20));
+        let reader = build_table(versions)?;
+        assert_eq!(reader.index.entries.len(), 4, "layout precondition");
+
+        assert_eq!(scan(&reader, b"t:")?, live_keys("t:", 20));
+        assert!(reader.blocks_read.load(Ordering::Relaxed) <= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_prefix_scan_between_two_blocks_reads_at_most_one_block() -> anyhow::Result<()> {
+        let mut versions = numbered("a:", ENTRIES_PER_BLOCK);
+        versions.extend(numbered("c:", ENTRIES_PER_BLOCK));
+        versions.extend(numbered("e:", ENTRIES_PER_BLOCK));
+        let reader = build_table(versions)?;
+        assert_eq!(reader.index.entries.len(), 3, "layout precondition");
+
+        assert!(scan(&reader, b"b:")?.is_empty());
+        assert!(reader.blocks_read.load(Ordering::Relaxed) <= 1);
+        Ok(())
+    }
+
+    // A block that cannot be read is reported, not skipped.
+    #[test]
+    fn test_prefix_scan_reports_a_corrupt_block() -> anyhow::Result<()> {
+        let reader = SSTableReader::open(build_sstable_with_corrupt_block_handle()?)?;
+        let first = reader.keys_with_prefix(b"key1").next();
+        assert!(first.is_some_and(|entry| entry.is_err()));
         Ok(())
     }
 }

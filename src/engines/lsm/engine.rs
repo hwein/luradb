@@ -4879,6 +4879,65 @@ mod tests {
         assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
     }
 
+    // ── Spec perf/032: SSTable scans seek to the prefix range ────────────────
+
+    /// The plain, limited and snapshot scans of `prefix`.
+    async fn scan_results(
+        engine: &LsmStorageEngine,
+        snapshot: &Snapshot,
+        prefix: &[u8],
+    ) -> [Vec<Vec<u8>>; 3] {
+        [
+            engine.scan_keys(prefix).await.unwrap(),
+            engine.scan_keys_limited(prefix, 50).await.unwrap(),
+            engine.scan_keys_with_snapshot(prefix, snapshot).await.unwrap(),
+        ]
+    }
+
+    // 2 100 keys span several data blocks. Deletes and overwrites before and
+    // after the snapshot leave several versions per key: the flushed table
+    // must answer every scan as the MemTable did.
+    #[tokio::test]
+    async fn test_scan_keys_over_a_flushed_table_matches_the_memtable_scan() {
+        let (engine, _dir) = make_engine().await;
+        let put = |key: String| BatchOp::Put { key: key.into_bytes(), value: b"v".to_vec() };
+        let delete = |key: String| BatchOp::Delete { key: key.into_bytes() };
+        let initial: Vec<BatchOp> = ["a:", "b:", "c:"]
+            .into_iter()
+            .flat_map(|group| (0..700u32).map(move |i| format!("{group}{i:04}")))
+            .map(put)
+            .collect();
+        engine.write_batch(initial).await.unwrap();
+        engine
+            .write_batch((0..700u32).step_by(5).map(|i| delete(format!("b:{i:04}"))).collect())
+            .await
+            .unwrap();
+        let snap = engine.snapshot();
+        let mut later: Vec<BatchOp> = (0..700u32).step_by(3).map(|i| delete(format!("b:{i:04}"))).collect();
+        later.extend((1..700u32).step_by(3).map(|i| put(format!("b:{i:04}"))));
+        later.push(put("b:9999".to_string()));
+        engine.write_batch(later).await.unwrap();
+
+        let prefixes: [&[u8]; 5] = [b"a:", b"b:", b"b:00", b"c:", b""];
+        let mut in_memtable = Vec::new();
+        for prefix in prefixes {
+            in_memtable.push(scan_results(&engine, snap.snapshot(), prefix).await);
+        }
+        assert_eq!(in_memtable[3][0].len(), 700, "an untouched group stays complete");
+        assert!(
+            in_memtable[1][2].len() > in_memtable[1][0].len(),
+            "the snapshot still sees keys deleted after it"
+        );
+
+        engine.freeze_active_memtable();
+        engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
+        let mut in_sstable = Vec::new();
+        for prefix in prefixes {
+            in_sstable.push(scan_results(&engine, snap.snapshot(), prefix).await);
+        }
+        assert_eq!(in_sstable, in_memtable);
+    }
+
     // ── Spec general/029: maintenance against a concurrent flush ─────────────
 
     /// Gives every other task room to run, without ever asserting on

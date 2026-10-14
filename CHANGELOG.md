@@ -45,6 +45,7 @@ All notable changes to LuraDB are documented in this file.
 ### Security
 
 - Upgraded rustls to 0.23.45+, resolving RUSTSEC-2026-0285.
+- Upgraded rustls to 0.23.46+, resolving RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
 
 ## [0.4.0] - 2026-08-29
 

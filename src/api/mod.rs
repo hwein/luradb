@@ -882,13 +882,9 @@ mod router_coverage_tests {
         pairs
     }
 
-    /// The drift gate only guarantees definition == file; a route registered in
-    /// `create_router` without a `paths(...)` entry would be silently missing on
-    /// both sides. Axum offers no router introspection, hence the source-text parse.
-    /// Swagger's runtime routes and the hello route (`server::build_router`) are
-    /// deliberately not part of the contract and live outside `create_router`.
-    #[test]
-    fn every_registered_route_matches_contract_exactly() {
+    /// (method, path) pairs registered in `create_router`, parsed from its
+    /// source text: axum offers no router introspection.
+    fn registered_routes() -> BTreeSet<(String, String)> {
         let body = create_router_source();
 
         // Guard the structural assumptions: fail loudly on a create_router
@@ -915,7 +911,17 @@ mod router_coverage_tests {
         let mut registered = route_pairs(nested, "/store-api");
         registered.extend(route_pairs(root, ""));
         assert!(!registered.is_empty(), "parser found no .route registrations");
+        registered
+    }
 
+    /// The drift gate only guarantees definition == file; a route registered in
+    /// `create_router` without a `paths(...)` entry would be silently missing on
+    /// both sides. Swagger's runtime routes and the hello route
+    /// (`server::build_router`) are deliberately not part of the contract and
+    /// live outside `create_router`.
+    #[test]
+    fn every_registered_route_matches_contract_exactly() {
+        let registered = registered_routes();
         let contract = contract_pairs();
         let not_in_contract: Vec<_> = registered.difference(&contract).collect();
         let not_registered: Vec<_> = contract.difference(&registered).collect();
@@ -925,5 +931,120 @@ mod router_coverage_tests {
              Registered but missing from the contract — add a #[utoipa::path] + paths(...) entry: {not_in_contract:?}\n\
              In the contract but not registered — stale paths(...) entry or missing .route(): {not_registered:?}"
         );
+    }
+
+    /// Routes served by the reader pool (spec perf/018b A2). Each handler was
+    /// checked for engine writes; one that writes belongs in `WRITE_ROUTES`.
+    const READ_ROUTES: &[(&str, &str)] = &[
+        ("get", "/health"),
+        ("get", "/version"),
+        ("get", "/store-api/config"),
+        ("get", "/store-api/metrics"),
+        ("get", "/store-api/metrics/domains/{name}"),
+        ("get", "/store-api/domains"),
+        ("get", "/store-api/domains/{name}"),
+        ("get", "/store-api/kv/{domain}/keys/{key}"),
+        ("get", "/store-api/kv/{domain}/keys/{key}/meta"),
+        ("get", "/store-api/kv/{domain}/keys"),
+        ("get", "/store-api/kv/{domain}/count"),
+        ("get", "/store-api/kv/{domain}/watch"),
+        ("get", "/store-api/json/domains"),
+        ("get", "/store-api/json/domains/{name}"),
+        ("get", "/store-api/json/{domain}/documents"),
+        ("get", "/store-api/json/{domain}/documents/count"),
+        ("get", "/store-api/json/{domain}/documents/{key}"),
+        ("get", "/store-api/json/{domain}/indexes"),
+        ("post", "/store-api/json/{domain}/search"),
+        ("get", "/store-api/json/{domain}/export"),
+        ("get", "/store-api/json/{domain}/reindex/{task_id}"),
+        ("get", "/store-api/backups"),
+        ("get", "/store-api/backups/{id}"),
+        ("get", "/store-api/backups/{id}/download"),
+        ("get", "/store-api/restores/{id}"),
+        ("get", "/store-api/logs"),
+        ("get", "/store-api/logs/files"),
+        ("get", "/store-api/events"),
+        ("get", "/store-api/rel/domains"),
+        ("get", "/store-api/rel/domains/{name}"),
+        ("post", "/store-api/rel/{domain}/sql"),
+        ("get", "/store-api/rel/{domain}/tables"),
+        ("get", "/store-api/rel/{domain}/tables/{table}"),
+        ("get", "/store-api/rel/{domain}/views"),
+        ("get", "/store-api/rel/{domain}/tables/{table}/rows"),
+        ("get", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
+        ("get", "/store-api/rel/{domain}/tables/{table}/count"),
+        ("get", "/store-api/auth/whoami"),
+        ("get", "/store-api/auth/users"),
+    ];
+
+    /// Routes served by the engine thread.
+    const WRITE_ROUTES: &[(&str, &str)] = &[
+        ("post", "/store-api/domains"),
+        ("delete", "/store-api/domains/{name}"),
+        ("put", "/store-api/kv/{domain}/keys/{key}"),
+        ("delete", "/store-api/kv/{domain}/keys/{key}"),
+        ("patch", "/store-api/kv/{domain}/keys/{key}/null"),
+        ("delete", "/store-api/kv/{domain}/keys"),
+        ("post", "/store-api/json/domains"),
+        ("delete", "/store-api/json/domains/{name}"),
+        ("post", "/store-api/json/{domain}/documents"),
+        ("put", "/store-api/json/{domain}/documents/{key}"),
+        ("delete", "/store-api/json/{domain}/documents/{key}"),
+        ("post", "/store-api/json/{domain}/indexes"),
+        ("delete", "/store-api/json/{domain}/indexes/{field}"),
+        ("post", "/store-api/json/{domain}/bulk"),
+        ("post", "/store-api/json/{domain}/reindex"),
+        ("post", "/store-api/backups"),
+        ("post", "/store-api/backups/upload"),
+        ("delete", "/store-api/backups/{id}"),
+        ("post", "/store-api/backups/{id}/restore"),
+        ("post", "/store-api/rel/domains"),
+        ("delete", "/store-api/rel/domains/{name}"),
+        ("post", "/store-api/rel/{domain}/tables/from-file"),
+        ("post", "/store-api/rel/{domain}/tables/{table}/rows"),
+        ("put", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
+        ("delete", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
+        ("post", "/store-api/auth/users"),
+        ("delete", "/store-api/auth/users/{name}"),
+        ("post", "/store-api/auth/users/{name}/permissions"),
+        ("delete", "/store-api/auth/users/{name}/permissions/{domain}"),
+        ("post", "/store-api/auth/users/{name}/rotate-key"),
+    ];
+
+    // Spec perf/018b A2: every registered route sits in exactly one of the
+    // lists above, and `route_class` sends it where its list says — a new
+    // route without a reviewed class fails here.
+    #[test]
+    fn every_registered_route_has_a_reviewed_class() {
+        use crate::bridge::{route_class, RouteClass};
+
+        let listed = |list: &[(&str, &str)]| -> BTreeSet<(String, String)> {
+            list.iter().map(|(method, path)| (method.to_string(), path.to_string())).collect()
+        };
+        let (reads, writes) = (listed(READ_ROUTES), listed(WRITE_ROUTES));
+        assert!(reads.is_disjoint(&writes), "listed as read and write: {:?}", reads.intersection(&writes));
+
+        let registered = registered_routes();
+        let all: BTreeSet<_> = reads.union(&writes).cloned().collect();
+        let unlisted: Vec<_> = registered.difference(&all).collect();
+        let stale: Vec<_> = all.difference(&registered).collect();
+        assert!(
+            unlisted.is_empty() && stale.is_empty(),
+            "Route classes and router diverge.\n\
+             Registered but in neither list — check the handler for engine writes, then list it: {unlisted:?}\n\
+             Listed but not registered: {stale:?}"
+        );
+
+        for (method, path) in &registered {
+            let expected = if reads.contains(&(method.clone(), path.clone())) { RouteClass::Read } else { RouteClass::Write };
+            // A concrete request path: every `{param}` segment gets a sample value.
+            let concrete = path
+                .split('/')
+                .map(|seg| if seg.starts_with('{') { "x" } else { seg })
+                .collect::<Vec<_>>()
+                .join("/");
+            let method = axum::http::Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
+            assert_eq!(route_class(&method, &concrete), expected, "{method} {path}");
+        }
     }
 }

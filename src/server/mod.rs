@@ -1,11 +1,13 @@
-//! Process topology (spec perf/018a A1): the storage engines run on one
-//! engine thread (tokio-uring), HTTP/TLS termination and the frontend layers
-//! on a multi-threaded frontend runtime, with the engine bridge in between.
+//! Process topology (spec perf/018a A1, perf/018b A1): the storage engines
+//! run on one engine thread (tokio-uring) that serves the write requests, the
+//! read requests run on a multi-threaded reader pool against the same engines,
+//! and HTTP/TLS termination and the frontend layers on a multi-threaded
+//! frontend runtime, with the bridge in between.
 
 mod engine;
 
 use crate::{
-    api::{self, middleware::ParsedCidr, ApiDoc},
+    api::{self, middleware::ParsedCidr, ApiDoc, AppState},
     auth::{middleware::docs_auth_layer, AuthCache},
     bridge::{self, EngineDispatch, Job, ShipService},
     config::LuraConfig,
@@ -32,10 +34,11 @@ use tower::ServiceExt;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-/// Handed from the engine thread to the frontend once the engines are up (A1.3).
+/// Handed from the engine thread to the frontend once the engines are up
+/// (perf/018a A1.3); the reader pool builds its router from `state` (perf/018b A1.2).
 struct Ready {
     dispatch: mpsc::Sender<Job>,
-    auth_cache: Arc<AuthCache>,
+    state: AppState,
     trusted_cidrs: Arc<Vec<ParsedCidr>>,
 }
 
@@ -48,12 +51,19 @@ pub struct ServerHandle {
     pub http_addr: Option<SocketAddr>,
     listeners: Listeners,
     frontend: Runtime,
+    reader: Runtime,
+    /// Keeps the engine loop running until the reader pool is down (perf/018b A7).
+    engine_tx: mpsc::Sender<Job>,
     engine: std::thread::JoinHandle<()>,
 }
 
+/// Running read requests get this long to end on shutdown (perf/018b A7).
+const READER_SHUTDOWN: Duration = Duration::from_secs(5);
+
 impl Server {
-    /// Boots the engine thread and, only once it reports ready, the listeners
-    /// on the frontend runtime. A failed step stops what already runs.
+    /// Boots the engine thread and, only once it reports ready, the reader
+    /// pool and the listeners on the frontend runtime. A failed step stops
+    /// what already runs.
     pub fn start(config: Arc<LuraConfig>, config_path: &Path) -> anyhow::Result<ServerHandle> {
         let cores = coop::available_cores();
         let workers = frontend_workers(config.multicore.frontend_workers, cores);
@@ -69,11 +79,39 @@ impl Server {
         );
 
         let (engine, ready) = spawn_engine(Arc::clone(&config), config_path.to_path_buf())?;
-        match frontend.block_on(run_frontend(ready, &config)) {
-            Ok(listeners) => Ok(ServerHandle { http_addr: listeners.http_addr, listeners, frontend, engine }),
+        let readers = reader_threads(config.multicore.reader_threads, cores, workers);
+        let reader = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(readers)
+            .thread_name("luradb-reader")
+            .enable_all()
+            .build()
+        {
+            Ok(reader) => reader,
             Err(e) => {
-                // The failed start dropped the bridge sender: the engine shuts down.
+                // No reader pool yet: dropping the only engine sender shuts
+                // the engine down.
+                drop(ready);
+                let _ = engine.join();
+                return Err(e.into());
+            }
+        };
+        let capacity = config.multicore.reader_queue_capacity;
+        tracing::info!("Reader pool: {readers} workers; queue capacity: {capacity}");
+        let (reader_tx, reader_rx) = mpsc::channel(capacity);
+        let engine_tx = ready.dispatch.clone();
+        let engine_dispatch = EngineDispatch::Engine(engine_tx.clone());
+        reader.spawn(bridge::serve_reader(reader_rx, api::create_router(ready.state.clone()), engine_dispatch));
+
+        match frontend.block_on(run_frontend(ready, reader_tx, &config)) {
+            Ok(listeners) => {
+                Ok(ServerHandle { http_addr: listeners.http_addr, listeners, frontend, reader, engine_tx, engine })
+            }
+            Err(e) => {
+                // The failed start dropped the frontend's bridge senders; the
+                // engine loop ends only once the reader pool is down (A7).
                 drop(frontend);
+                reader.shutdown_timeout(READER_SHUTDOWN);
+                drop(engine_tx);
                 let _ = engine.join();
                 Err(e)
             }
@@ -88,14 +126,17 @@ impl ServerHandle {
         self.shutdown()
     }
 
-    /// Stops and drains the listeners, ends the frontend runtime — which drops
-    /// the last bridge sender and so ends the engine loop — and joins the
-    /// engine thread once it has shut the engines down (A6). Must not be
+    /// Stops and drains the listeners, ends the frontend runtime and then the
+    /// reader pool, and only then drops its engine sender, the last one: the
+    /// engine loop ends after the reads (perf/018a A6, perf/018b A7). Finally
+    /// joins the engine thread once it has shut the engines down. Must not be
     /// called from within an async context.
     pub fn shutdown(self) -> anyhow::Result<()> {
-        let ServerHandle { listeners, frontend, engine, .. } = self;
+        let ServerHandle { listeners, frontend, reader, engine_tx, engine, .. } = self;
         frontend.block_on(listeners.stop());
         drop(frontend);
+        reader.shutdown_timeout(READER_SHUTDOWN);
+        drop(engine_tx);
         engine.join().map_err(|_| anyhow::anyhow!("the engine thread panicked"))
     }
 }
@@ -107,6 +148,17 @@ fn frontend_workers(configured: usize, cores: usize) -> usize {
         configured
     } else {
         (cores / 8).clamp(1, 4)
+    }
+}
+
+/// Worker threads of the reader pool: `configured`, or with `0` the cores
+/// left after the engine thread, one core of headroom and the `frontend`
+/// workers, at least 1 (spec perf/018b A6).
+fn reader_threads(configured: usize, cores: usize, frontend: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        cores.saturating_sub(2 + frontend).max(1)
     }
 }
 
@@ -133,7 +185,8 @@ fn spawn_engine(
 }
 
 /// Body of the engine thread: bootstrap, report, serve the bridge until the
-/// frontend lets go of it, then shut the engines down.
+/// server lets go of it once the reader pool is down (perf/018b A7), then
+/// shut the engines down.
 async fn run_engine(
     config: Arc<LuraConfig>,
     config_path: PathBuf,
@@ -150,13 +203,10 @@ async fn run_engine(
             return;
         }
     };
-    let ready = Ready {
-        dispatch,
-        auth_cache: Arc::clone(&engine.auth_cache),
-        trusted_cidrs: Arc::clone(&engine.trusted_cidrs),
-    };
+    let router = api::create_router(engine.state.clone());
+    let ready = Ready { dispatch, state: engine.state, trusted_cidrs: engine.trusted_cidrs };
     if ready_tx.send(Ok(ready)).is_ok() {
-        bridge::serve_engine(jobs, engine.router).await;
+        bridge::serve_engine(jobs, router).await;
     }
     engine::graceful_shutdown(engine.teardown).await;
 }
@@ -166,13 +216,13 @@ async fn hello_handler(message: String) -> Json<Value> {
 }
 
 /// The frontend router (spec perf/018a A2): Swagger and the hello route are
-/// answered here; everything else passes the frontend layers into the engine
-/// bridge. The frontend knows no single API route.
+/// answered here; everything else passes the frontend layers into the bridge.
+/// The frontend knows no single API route.
 fn build_router(
     cfg: &LuraConfig,
     auth_cache: Arc<AuthCache>,
     trusted_cidrs: Arc<Vec<ParsedCidr>>,
-    dispatch: EngineDispatch,
+    ship: ShipService,
 ) -> Router {
     let mut app = Router::new();
 
@@ -198,9 +248,9 @@ fn build_router(
         app = app.route("/", get(move || hello_handler(msg)));
     }
 
-    let engine = Router::new().fallback_service(ShipService::new(dispatch));
+    let bridge = Router::new().fallback_service(ship);
     let auth = cfg.auth.enabled.then_some(auth_cache);
-    app = app.fallback_service(api::frontend_layers(engine, auth, trusted_cidrs));
+    app = app.fallback_service(api::frontend_layers(bridge, auth, trusted_cidrs));
 
     // Outermost layer (spec general/020 §Platzierung): runs before auth on
     // every request, including Swagger/hello above, which live outside
@@ -288,9 +338,11 @@ impl Listeners {
 }
 
 /// Binds every enabled listener, then serves the frontend router on them
-/// (A1.2, A1.4). Nothing is spawned before all binds succeeded.
-async fn run_frontend(ready: Ready, config: &LuraConfig) -> anyhow::Result<Listeners> {
-    let app = build_router(config, ready.auth_cache, ready.trusted_cidrs, EngineDispatch::Engine(ready.dispatch));
+/// (A1.2, A1.4); `reader_tx` leads to the reader pool. Nothing is spawned
+/// before all binds succeeded.
+async fn run_frontend(ready: Ready, reader_tx: mpsc::Sender<Job>, config: &LuraConfig) -> anyhow::Result<Listeners> {
+    let ship = ShipService::new(EngineDispatch::Engine(ready.dispatch)).with_reader(reader_tx);
+    let app = build_router(config, ready.state.auth_cache, ready.trusted_cidrs, ship);
     let bind: IpAddr = config
         .server
         .bind_address
@@ -395,6 +447,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use futures::FutureExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -469,7 +522,8 @@ mod tests {
 
         let (state, _dir) = make_test_state(true).await;
         let auth_cache = Arc::clone(&state.auth_cache);
-        let app = build_router(&cfg, auth_cache, Arc::new(vec![]), EngineDispatch::Inline(api::create_router(state)));
+        let ship = ShipService::new(EngineDispatch::Inline(api::create_router(state)));
+        let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
 
         // (a) Preflight without Authorization -> 200 with the CORS header,
         // even though this path sits behind docs_auth_layer.
@@ -535,7 +589,7 @@ mod tests {
             &cfg,
             Arc::clone(&auth_cache),
             Arc::new(vec![]),
-            EngineDispatch::Inline(api::create_router(state)),
+            ShipService::new(EngineDispatch::Inline(api::create_router(state))),
         );
 
         let status = |uri: &str, key: Option<&str>| {
@@ -555,7 +609,8 @@ mod tests {
     // ── In-process E2E (Server::start) ───────────────────────────────────────
 
     /// Loopback dev mode (auth off), HTTP on an ephemeral port, backups on,
-    /// JSON and relational engines off, every data path under `dir`.
+    /// JSON and relational engines off, two reader threads, every data path
+    /// under `dir`.
     fn test_config(dir: &Path) -> LuraConfig {
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let mut cfg = LuraConfig::default();
@@ -566,8 +621,12 @@ mod tests {
         cfg.storage.sstable_dir = path("sstables");
         cfg.json.enabled = false;
         cfg.rel.enabled = false;
+        cfg.rel.wal_path = path("rel.wal");
+        cfg.rel.vlog_path = path("rel.vlog");
+        cfg.rel.sstable_dir = path("rel_sstables");
         cfg.backup.enabled = true;
         cfg.backup.dir = path("backups");
+        cfg.multicore.reader_threads = 2;
         cfg
     }
 
@@ -578,8 +637,19 @@ mod tests {
         F: FnOnce(SocketAddr) -> Fut,
         Fut: Future<Output = ()>,
     {
+        with_tuned_server(|_| {}, client);
+    }
+
+    /// [`with_server`] on the test config as changed by `tune`.
+    fn with_tuned_server<F, Fut>(tune: impl FnOnce(&mut LuraConfig), client: F)
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let dir = tempfile::TempDir::new().unwrap();
-        let server = Server::start(Arc::new(test_config(dir.path())), &dir.path().join("luradb.toml")).unwrap();
+        let mut cfg = test_config(dir.path());
+        tune(&mut cfg);
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
         let addr = server.http_addr.expect("HTTP listener enabled");
         tokio::runtime::Runtime::new().unwrap().block_on(client(addr));
         // Returns only after the frontend runtime is gone and the engine
@@ -605,9 +675,14 @@ mod tests {
     /// Splits the first HTTP/1.1 response off `raw`: status, body (chunked or
     /// Content-Length framing, else the rest) and the bytes after it.
     fn next_response(raw: &[u8]) -> (u16, Vec<u8>, &[u8]) {
+        let (head, body, rest) = split_response(raw);
+        (head[9..12].parse().unwrap(), body, rest)
+    }
+
+    /// [`next_response`] with the lower-cased head in place of the status.
+    fn split_response(raw: &[u8]) -> (String, Vec<u8>, &[u8]) {
         let head_end = find(raw, b"\r\n\r\n").expect("response head") + 4;
         let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
-        let status = head[9..12].parse().unwrap();
         let mut rest = &raw[head_end..];
         if head.contains("transfer-encoding: chunked") {
             let mut body = Vec::new();
@@ -616,7 +691,7 @@ mod tests {
                 let size = usize::from_str_radix(std::str::from_utf8(&rest[..line_end]).unwrap(), 16).unwrap();
                 rest = &rest[line_end + 2..];
                 if size == 0 {
-                    return (status, body, &rest[2..]);
+                    return (head, body, &rest[2..]);
                 }
                 body.extend_from_slice(&rest[..size]);
                 rest = &rest[size + 2..];
@@ -626,7 +701,16 @@ mod tests {
             .lines()
             .find_map(|line| line.strip_prefix("content-length: "))
             .map_or(rest.len(), |value| value.trim().parse().unwrap());
-        (status, rest[..len].to_vec(), &rest[len..])
+        (head, rest[..len].to_vec(), &rest[len..])
+    }
+
+    /// The thread that ran the request, from the bridge's test-hook header in
+    /// a lower-cased response head.
+    fn thread_of(head: &str) -> &str {
+        head.lines()
+            .find_map(|line| line.strip_prefix(bridge::test_hook::THREAD)?.strip_prefix(": "))
+            .unwrap_or_else(|| panic!("no thread header in {head}"))
+            .trim()
     }
 
     /// The lower-cased head of the answer to one request on a fresh connection.
@@ -641,12 +725,18 @@ mod tests {
 
     /// One request (with `Connection: close`) on a fresh connection.
     async fn request(addr: SocketAddr, raw: &str) -> (u16, Vec<u8>) {
+        let (status, _, body) = exchange(addr, raw).await;
+        (status, body)
+    }
+
+    /// [`request`], with the lower-cased response head as well.
+    async fn exchange(addr: SocketAddr, raw: &str) -> (u16, String, Vec<u8>) {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(raw.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
-        let (status, body, _) = next_response(&buf);
-        (status, body)
+        let (head, body, _) = split_response(&buf);
+        (head[9..12].parse().unwrap(), head, body)
     }
 
     /// Reads from `stream` into `seen` until `needle` shows up in it.
@@ -866,5 +956,255 @@ mod tests {
             let value = axum::body::to_bytes(Body::new(get.into_body()), usize::MAX).await.unwrap();
             assert_eq!(value, "second");
         });
+    }
+
+    // ── Reader pool (spec perf/018b) ─────────────────────────────────────────
+
+    #[test]
+    fn reader_threads_auto_and_explicit() {
+        assert_eq!(reader_threads(0, 32, 4), 26);
+        assert_eq!(reader_threads(0, 12, 1), 9);
+        assert_eq!(reader_threads(0, 4, 1), 1);
+        assert_eq!(reader_threads(0, 2, 1), 1);
+        assert_eq!(reader_threads(0, 1, 1), 1);
+        assert_eq!(reader_threads(3, 32, 4), 3);
+        assert_eq!(reader_threads(6, 2, 1), 6);
+    }
+
+    // Test 2: with M = 2, a GET runs on a reader thread and a PUT on the
+    // engine thread.
+    #[test]
+    fn reads_run_on_reader_threads_and_writes_on_the_engine_thread() {
+        with_server(|addr| async move {
+            let key = "/store-api/kv/default/keys/where";
+            let (status, head, _) = exchange(addr, &with_body("PUT", key, "v")).await;
+            assert_eq!((status, thread_of(&head)), (200, "luradb-engine"));
+            let (status, head, _) = exchange(addr, &get(key)).await;
+            assert_eq!(status, 200);
+            assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+        });
+    }
+
+    // Test 3: SQL arrives on the pool; write statements answer from the
+    // engine thread, a SELECT and a parse error from the pool.
+    #[test]
+    fn sql_writes_run_on_the_engine_thread_and_selects_on_the_pool() {
+        with_tuned_server(
+            |cfg| cfg.rel.enabled = true,
+            |addr| async move {
+                let steps = [
+                    ("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", 200, true),
+                    ("INSERT INTO t VALUES (1, 'clé')", 200, true),
+                    ("SELECT name FROM t", 200, false),
+                    ("SELEC name FROM t", 400, false),
+                ];
+                for (statement, expected, on_engine) in steps {
+                    let body = format!(r#"{{"sql": "{statement}"}}"#);
+                    let (status, head, answer) =
+                        exchange(addr, &with_body("POST", "/store-api/rel/default/sql", &body)).await;
+                    let answer = String::from_utf8_lossy(&answer).into_owned();
+                    assert_eq!(status, expected, "{statement}: {answer}");
+                    let thread = thread_of(&head);
+                    if on_engine {
+                        assert_eq!(thread, "luradb-engine", "{statement}");
+                    } else {
+                        assert!(thread.starts_with("luradb-reader"), "{statement}: {thread}");
+                    }
+                    if statement.starts_with("SELECT") {
+                        assert!(answer.contains("clé"), "{answer}");
+                    }
+                }
+            },
+        );
+    }
+
+    // Test 4: a GET pipelined right behind a PUT of the same key on one
+    // connection runs on the pool and still sees the PUT's value.
+    #[test]
+    fn a_read_on_the_pool_sees_the_write_before_it_on_the_connection() {
+        with_server(|addr| async move {
+            let put = "PUT /store-api/kv/default/keys/ryw HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\nfirst";
+            let get = get("/store-api/kv/default/keys/ryw");
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(format!("{put}{get}").as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.unwrap();
+            let (put_head, _, rest) = split_response(&raw);
+            let (get_head, value, _) = split_response(rest);
+            assert_eq!(thread_of(&put_head), "luradb-engine");
+            assert!(get_head.starts_with("http/1.1 200"), "{get_head}");
+            assert!(thread_of(&get_head).starts_with("luradb-reader"), "{get_head}");
+            assert_eq!(value, b"first");
+        });
+    }
+
+    /// Blocks every arriving thread until released, and records which
+    /// threads arrived. Waits are bounded only against a hang.
+    #[derive(Default)]
+    struct Rendezvous {
+        state: std::sync::Mutex<(Vec<(String, std::thread::ThreadId)>, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Rendezvous {
+        const HANG: Duration = Duration::from_secs(30);
+
+        fn arrive_and_wait(&self) {
+            let current = std::thread::current();
+            let mut state = self.state.lock().unwrap();
+            state.0.push((current.name().unwrap_or_default().to_string(), current.id()));
+            self.changed.notify_all();
+            drop(self.changed.wait_timeout_while(state, Self::HANG, |(_, released)| !*released).unwrap());
+        }
+
+        fn arrivals_once(&self, count: usize) -> Vec<(String, std::thread::ThreadId)> {
+            let state = self.state.lock().unwrap();
+            let (state, _) =
+                self.changed.wait_timeout_while(state, Self::HANG, |(arrived, _)| arrived.len() < count).unwrap();
+            state.0.clone()
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    // Test 5: four GETs on four connections, once answered, each block their
+    // reader thread in a hold until released — they can only all arrive if
+    // four reader threads run them side by side — while a PUT goes through on
+    // the engine thread.
+    #[test]
+    fn four_reads_run_side_by_side_while_a_write_goes_through() {
+        let gate = Arc::new(Rendezvous::default());
+        let hold_gate = Arc::clone(&gate);
+        bridge::test_hook::register_hold("perf-018b-parallel", move |_| {
+            let gate = Arc::clone(&hold_gate);
+            async move { gate.arrive_and_wait() }.boxed()
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.reader_threads = 4;
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let client = tokio::runtime::Runtime::new().unwrap();
+
+        let key = "/store-api/kv/default/keys/parallel";
+        assert_eq!(client.block_on(request(addr, &with_body("PUT", key, "v"))).0, 200);
+        let held = format!(
+            "GET {key} HTTP/1.1\r\nHost: test\r\n{}: perf-018b-parallel\r\nConnection: close\r\n\r\n",
+            bridge::test_hook::HOLD
+        );
+        let gets: Vec<_> = (0..4).map(|_| client.spawn({
+            let held = held.clone();
+            async move { exchange(addr, &held).await }
+        })).collect();
+        let arrived = gate.arrivals_once(4);
+        assert_eq!(arrived.len(), 4, "the four reads were not in flight at once: {arrived:?}");
+        let threads: std::collections::HashSet<_> = arrived.iter().map(|(_, id)| *id).collect();
+        assert_eq!(threads.len(), 4, "{arrived:?}");
+        assert!(arrived.iter().all(|(name, _)| name.starts_with("luradb-reader")), "{arrived:?}");
+
+        let (status, head, _) = client.block_on(exchange(addr, &with_body("PUT", key, "w")));
+        assert_eq!((status, thread_of(&head)), (200, "luradb-engine"));
+
+        gate.release();
+        // Read before the hold, so before the second PUT.
+        for get in gets {
+            let (status, head, value) = client.block_on(get).unwrap();
+            assert_eq!((status, value.as_slice()), (200, b"v".as_slice()));
+            assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+        }
+        server.shutdown().unwrap();
+    }
+
+    // Test 7: the KV watch and the event stream run on the pool; a PUT
+    // reaches the watcher, a new domain the event stream.
+    #[test]
+    fn watch_and_event_streams_run_on_the_pool() {
+        with_server(|addr| async move {
+            let open = |path: &'static str| async move {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes()).await.unwrap();
+                let mut seen = Vec::new();
+                read_until(&mut stream, &mut seen, b"\r\n\r\n").await;
+                let head_end = find(&seen, b"\r\n\r\n").unwrap();
+                let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
+                assert!(head.starts_with("http/1.1 200"), "{head}");
+                assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+                (stream, seen)
+            };
+
+            // The head arrives once the handler has subscribed, so the
+            // changes below cannot be missed.
+            let (mut watch, mut seen) = open("/store-api/kv/default/watch").await;
+            let (status, _) = request(addr, &with_body("PUT", "/store-api/kv/default/keys/watched", "v")).await;
+            assert_eq!(status, 200);
+            read_until(&mut watch, &mut seen, b"data: watched").await;
+            assert!(find(&seen, b"event: set").is_some(), "{}", String::from_utf8_lossy(&seen));
+
+            let (mut events, mut seen) = open("/store-api/events").await;
+            let (status, _) = request(addr, &with_body("POST", "/store-api/domains", r#"{"name":"pooled"}"#)).await;
+            assert_eq!(status, 201);
+            read_until(&mut events, &mut seen, b"\"domain\":\"pooled\"").await;
+            assert!(find(&seen, b"event: domain_created").is_some(), "{}", String::from_utf8_lossy(&seen));
+        });
+    }
+
+    /// Reports on drop whether the engine loop was still running by then: the
+    /// weak sender upgrades only while some sender keeps the loop alive.
+    struct EngineProbe(mpsc::WeakSender<Job>, std::sync::mpsc::Sender<bool>);
+
+    impl Drop for EngineProbe {
+        fn drop(&mut self) {
+            let _ = self.1.send(self.0.upgrade().is_some());
+        }
+    }
+
+    // Test 8 (A7): a read still running at shutdown — answered, its request
+    // with the engine sender it carried already gone — ends with the reader
+    // pool, and only then does the engine shut down: when the read is
+    // dropped, the engine loop still runs.
+    #[test]
+    fn shutdown_ends_running_reads_before_the_engine() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        bridge::test_hook::register_hold("perf-018b-shutdown", move |engine| {
+            let probe = EngineProbe(engine.expect("a POST on the pool"), dropped_tx.clone());
+            let entered = entered_tx.clone();
+            async move {
+                let _probe = probe;
+                let _ = entered.send(());
+                std::future::pending::<()>().await
+            }
+            .boxed()
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = Server::start(Arc::new(test_config(dir.path())), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let client = tokio::runtime::Runtime::new().unwrap();
+
+        // A POST read: only those carry the way on to the engine thread.
+        let body = r#"{"sql": "SELECT 1"}"#;
+        let held = format!(
+            "POST /store-api/rel/default/sql HTTP/1.1\r\nHost: test\r\n{}: perf-018b-shutdown\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            bridge::test_hook::HOLD,
+            body.len()
+        );
+        let stream = client.block_on(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(held.as_bytes()).await.unwrap();
+            stream
+        });
+        // Upper bounds against hanging only.
+        entered_rx.recv_timeout(Duration::from_secs(30)).expect("the read never started");
+        // The client gives up, so the listener drain need not wait for it.
+        drop(stream);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done_tx.send(server.shutdown().is_ok()));
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(30)), Ok(true), "shutdown did not finish");
+        assert_eq!(dropped_rx.try_recv(), Ok(true), "the engine shut down while a read was still running");
     }
 }

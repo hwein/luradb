@@ -1,10 +1,11 @@
 //! Engine bridge (spec perf/018a A2): ships each request from the frontend
-//! runtime to the engine thread over one bounded channel and relays both
-//! body streams frame by frame.
+//! runtime over a bounded channel — reads to the reader pool, everything else
+//! to the engine thread (spec perf/018b) — and relays both body streams frame
+//! by frame.
 
 use crate::api::middleware::ApiError;
 use axum::body::{Body, BodyDataStream, Bytes, HttpBody};
-use axum::http::{request, response, Request, StatusCode};
+use axum::http::{request, response, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use futures::future::BoxFuture;
@@ -20,7 +21,7 @@ const BODY_FRAMES: usize = 16;
 
 type Frame = Result<Bytes, axum::Error>;
 
-/// One request on its way to the engine thread.
+/// One request on its way to the engine thread or the reader pool.
 pub struct Job {
     parts: request::Parts,
     body: Option<mpsc::Receiver<Frame>>,
@@ -44,7 +45,36 @@ impl Payload {
     }
 }
 
-/// Where [`ShipService`] hands its requests.
+/// Where a request runs: on the reader pool or on the engine thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteClass {
+    Read,
+    Write,
+}
+
+/// Classifies a request by method and path alone (spec perf/018b A2): GET
+/// and HEAD read, as do the JSON search and the SQL route, whose handler
+/// sends write statements on to the engine thread itself.
+/// `auth::middleware::is_write_request` carries the same two POST exceptions;
+/// a new read-only POST route belongs in both.
+pub fn route_class(method: &Method, path: &str) -> RouteClass {
+    let read_post = |engine: &str, action: &str| {
+        path.strip_prefix("/store-api/")
+            .and_then(|rest| rest.strip_prefix(engine))
+            .and_then(|rest| rest.strip_suffix(action))
+            .is_some_and(|domain| !domain.is_empty() && !domain.contains('/'))
+    };
+    if method == Method::GET
+        || method == Method::HEAD
+        || (method == Method::POST && (read_post("json/", "/search") || read_post("rel/", "/sql")))
+    {
+        RouteClass::Read
+    } else {
+        RouteClass::Write
+    }
+}
+
+/// Where [`ShipService`] hands every request the reader pool does not take.
 #[derive(Clone)]
 pub enum EngineDispatch {
     /// Calls the router on the caller's runtime (tests).
@@ -56,12 +86,19 @@ pub enum EngineDispatch {
 /// Frontend end of the bridge, mounted as the frontend router's fallback.
 #[derive(Clone)]
 pub struct ShipService {
-    dispatch: EngineDispatch,
+    engine: EngineDispatch,
+    /// Takes the read requests when set; without it the engine takes all.
+    reader: Option<mpsc::Sender<Job>>,
 }
 
 impl ShipService {
-    pub fn new(dispatch: EngineDispatch) -> Self {
-        Self { dispatch }
+    pub fn new(engine: EngineDispatch) -> Self {
+        Self { engine, reader: None }
+    }
+
+    /// Ships read requests ([`route_class`]) to [`serve_reader`] over `reader`.
+    pub fn with_reader(self, reader: mpsc::Sender<Job>) -> Self {
+        Self { reader: Some(reader), ..self }
     }
 }
 
@@ -75,7 +112,12 @@ impl Service<Request<Body>> for ShipService {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        match &self.dispatch {
+        if let Some(reader) = &self.reader {
+            if route_class(req.method(), req.uri().path()) == RouteClass::Read {
+                return ship(reader.clone(), req).map(Ok).boxed();
+            }
+        }
+        match &self.engine {
             EngineDispatch::Inline(router) => router.clone().oneshot(req).boxed(),
             EngineDispatch::Engine(jobs) => ship(jobs.clone(), req).map(Ok).boxed(),
         }
@@ -87,18 +129,18 @@ async fn ship(jobs: mpsc::Sender<Job>, req: Request<Body>) -> Response {
     let (reply, reply_rx) = oneshot::channel();
     // A full channel makes this wait: backpressure onto the connection.
     let sent = jobs.send(Job { parts, body: relay_request_body(body), reply }).await;
-    // The engine loop ends once the last sender is gone (A6); hold none longer than needed.
+    // Both loops end once their last sender is gone (A6); hold none longer than needed.
     drop(jobs);
     if sent.is_err() {
-        return engine_unavailable();
+        return bridge_unavailable();
     }
     match reply_rx.await {
         Ok((parts, payload)) => Response::from_parts(parts, payload.into_body()),
-        Err(_) => engine_unavailable(),
+        Err(_) => bridge_unavailable(),
     }
 }
 
-fn engine_unavailable() -> Response {
+fn bridge_unavailable() -> Response {
     ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable: the server is shutting down")
         .into_response()
 }
@@ -148,10 +190,52 @@ async fn engine_loop(mut jobs: mpsc::Receiver<Job>, router: Router) {
     in_flight.shutdown().await;
 }
 
+/// Reader end of the bridge (spec perf/018b A1.3): runs every read request in
+/// its own task on the calling multi-threaded runtime, against the same shared
+/// engines as the engine thread. Returns once the last sender is gone; the
+/// requests still in flight end with the runtime (A7). POST requests carry an
+/// [`EngineForward`] to `engine`: the SQL route, the only read that forwards,
+/// is a POST.
+pub async fn serve_reader(mut jobs: mpsc::Receiver<Job>, router: Router, engine: EngineDispatch) {
+    while let Some(mut job) = jobs.recv().await {
+        if job.parts.method == Method::POST {
+            let forward = EngineForward { engine: engine.clone(), head: job.parts.clone() };
+            job.parts.extensions.insert(forward);
+        }
+        tokio::spawn(handle(job, router.clone()));
+    }
+}
+
+/// A read request's way on to the engine thread (spec perf/018b A3), as an
+/// extension of POST requests on the reader pool only. It keeps the request
+/// head as the pool received it: routing strips the URI prefix and adds
+/// extensions of its own, which a second routing pass would misread.
+#[derive(Clone)]
+pub struct EngineForward {
+    engine: EngineDispatch,
+    head: request::Parts,
+}
+
+impl EngineForward {
+    /// Sends the request on to the engine thread with `body` as its body and
+    /// returns the engine's answer unchanged.
+    pub async fn send(self, body: Bytes) -> Response {
+        let req = Request::from_parts(self.head, Body::from(body));
+        let Ok(resp) = ShipService::new(self.engine).oneshot(req).await;
+        resp
+    }
+}
+
 async fn handle(job: Job, router: Router) {
+    #[cfg(test)]
+    let hold = test_hook::hold(&job.parts);
     let body = job.body.map_or_else(Body::empty, |rx| Body::from_stream(frames(rx)));
     let req = Request::from_parts(job.parts, body);
     let Ok(resp) = router.oneshot(req).await;
+    #[cfg(test)]
+    hold.await;
+    #[cfg(test)]
+    let resp = test_hook::tag_thread(resp);
     let (parts, mut body) = resp.into_parts();
 
     // A body that is already complete rides along in the reply. Bodies without
@@ -211,6 +295,58 @@ fn frames(mut rx: mpsc::Receiver<Frame>) -> impl Stream<Item = Frame> {
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
 
+/// Test hooks inside [`handle`], on whichever thread runs the request; the
+/// in-process server tests reach them through headers.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Response header naming the thread that ran the request. Set only where
+    /// it is still missing, so an answer forwarded from the engine thread
+    /// keeps the engine's name.
+    pub(crate) const THREAD: &str = "x-luradb-thread";
+    /// Request header naming a hold from [`register_hold`]; the request waits
+    /// in it once the router has answered it, before the answer goes back.
+    pub(crate) const HOLD: &str = "x-luradb-hold";
+
+    /// Gets a weak sender to the engine thread when the request carries an
+    /// [`EngineForward`]; it does not keep the engine loop running.
+    type Hold = Arc<dyn Fn(Option<mpsc::WeakSender<Job>>) -> BoxFuture<'static, ()> + Send + Sync>;
+
+    fn holds() -> &'static Mutex<HashMap<String, Hold>> {
+        static HOLDS: OnceLock<Mutex<HashMap<String, Hold>>> = OnceLock::new();
+        HOLDS.get_or_init(Default::default)
+    }
+
+    /// Registers `hold` under `name`, unique per test: tests share the process.
+    pub(crate) fn register_hold(
+        name: &str,
+        hold: impl Fn(Option<mpsc::WeakSender<Job>>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) {
+        holds().lock().unwrap().insert(name.to_string(), Arc::new(hold));
+    }
+
+    /// The hold `parts` names, taken before routing consumes the request.
+    pub(super) fn hold(parts: &request::Parts) -> BoxFuture<'static, ()> {
+        let hold = parts.headers.get(HOLD).and_then(|name| holds().lock().unwrap().get(name.to_str().unwrap()).cloned());
+        let engine = parts.extensions.get::<EngineForward>().and_then(|forward| match &forward.engine {
+            EngineDispatch::Engine(jobs) => Some(jobs.downgrade()),
+            EngineDispatch::Inline(_) => None,
+        });
+        hold.map_or_else(|| async {}.boxed(), |hold| hold(engine))
+    }
+
+    pub(super) fn tag_thread(mut resp: Response) -> Response {
+        if !resp.headers().contains_key(THREAD) {
+            let name = std::thread::current().name().unwrap_or("unnamed").to_string();
+            resp.headers_mut().insert(THREAD, name.parse().unwrap());
+        }
+        resp
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +366,22 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(serve_engine(rx, router));
+        });
+        (tx, thread)
+    }
+
+    /// `serve_reader` on its own multi-threaded runtime (workers named
+    /// `test-reader`), like the reader pool in production.
+    fn reader_pool(router: Router, engine: EngineDispatch) -> (mpsc::Sender<Job>, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(8);
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("test-reader")
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(serve_reader(rx, router, engine));
         });
         (tx, thread)
     }
@@ -468,6 +620,166 @@ mod tests {
 
         drop(ship);
         engine.join().unwrap();
+    }
+
+    // Spec perf/018b test 1: GET and HEAD are reads everywhere, and so are
+    // the two POSTs that only read; everything else is a write.
+    #[test]
+    fn route_class_sends_reads_to_the_pool() {
+        use RouteClass::{Read, Write};
+        let cases = [
+            (Method::GET, "/store-api/kv/x/keys/k", Read),
+            (Method::HEAD, "/store-api/kv/x/keys/k", Read),
+            (Method::GET, "/health", Read),
+            (Method::POST, "/store-api/json/x/search", Read),
+            (Method::POST, "/store-api/rel/x/sql", Read),
+            (Method::POST, "/store-api/domains", Write),
+            (Method::PUT, "/store-api/kv/x/keys/k", Write),
+            (Method::POST, "/store-api/json/x/documents", Write),
+            (Method::POST, "/store-api/rel/x/tables/from-file", Write),
+            (Method::POST, "/store-api/json/x/y/search", Write),
+            (Method::OPTIONS, "/store-api/domains", Write),
+        ];
+        for (method, path, class) in cases {
+            assert_eq!(route_class(&method, path), class, "{method} {path}");
+        }
+    }
+
+    async fn text_of(resp: Response) -> String {
+        String::from_utf8(frames_of(resp.into_body()).await.concat()).unwrap()
+    }
+
+    // Spec perf/018b A1.3: with a reader pool, reads run on its workers and
+    // writes still on the engine thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_run_on_the_reader_pool_and_writes_on_the_engine_thread() {
+        let thread = || async {
+            let current = std::thread::current();
+            format!("{} {:?}", current.name().unwrap_or_default(), current.id())
+        };
+        let router = Router::new().route("/where", get(thread).post(thread));
+        let (engine_tx, engine) = engine_thread(router.clone());
+        let engine_id = format!("{:?}", engine.thread().id());
+        let (reader_tx, reader) = reader_pool(router, EngineDispatch::Engine(engine_tx.clone()));
+        let ship = ShipService::new(EngineDispatch::Engine(engine_tx)).with_reader(reader_tx);
+
+        let read = text_of(ship.clone().oneshot(get_req("/where")).await.unwrap()).await;
+        assert!(read.starts_with("test-reader "), "{read}");
+        let write = text_of(ship.clone().oneshot(Request::post("/where").body(Body::empty()).unwrap()).await.unwrap()).await;
+        assert!(write.ends_with(&format!(" {engine_id}")), "{write}");
+
+        drop(ship);
+        reader.join().unwrap();
+        engine.join().unwrap();
+    }
+
+    // Spec perf/018b A3: a pool handler sends its request on to the engine
+    // thread as the pool received it — URI, path parameters, extensions and
+    // body — and relays the answer unchanged; the engine side gets no way
+    // to forward again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pool_handler_forwards_its_request_to_the_engine_thread_unchanged() {
+        use axum::extract::{Extension, OriginalUri, Path};
+
+        #[derive(Clone)]
+        struct Caller(&'static str);
+
+        let engine_router = Router::new().nest(
+            "/store-api",
+            Router::new().route(
+                "/rel/:domain/sql",
+                post(
+                    |Path(domain): Path<String>,
+                     OriginalUri(uri): OriginalUri,
+                     Extension(caller): Extension<Caller>,
+                     forward: Option<Extension<EngineForward>>,
+                     body: Bytes| async move {
+                        let body = String::from_utf8_lossy(&body).into_owned();
+                        let text = format!("{domain} {uri} {} {} {body}", caller.0, forward.is_some());
+                        (StatusCode::CREATED, [("x-engine", "yes")], text)
+                    },
+                ),
+            ),
+        );
+        let reader_router = Router::new().nest(
+            "/store-api",
+            Router::new().route(
+                "/rel/:domain/sql",
+                post(|Extension(forward): Extension<EngineForward>, body: Bytes| forward.send(body)),
+            ),
+        );
+        let (engine_tx, engine) = engine_thread(engine_router);
+        let (reader_tx, reader) = reader_pool(reader_router, EngineDispatch::Engine(engine_tx.clone()));
+        let ship = ShipService::new(EngineDispatch::Engine(engine_tx)).with_reader(reader_tx);
+
+        let mut req = Request::post("/store-api/rel/x/sql").body(Body::from("clé ✓")).unwrap();
+        req.extensions_mut().insert(Caller("alice"));
+        let resp = ship.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.headers()["x-engine"], "yes");
+        assert_eq!(text_of(resp).await, "x /store-api/rel/x/sql alice false clé ✓");
+
+        drop(ship);
+        reader.join().unwrap();
+        engine.join().unwrap();
+    }
+
+    // Spec perf/018b A3: of the reads, only POSTs carry the way on to the
+    // engine thread — the SQL route, the only one that forwards, is a POST.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_post_reads_carry_an_engine_forward() {
+        let has_forward = |forward: Option<axum::extract::Extension<EngineForward>>| async move {
+            forward.is_some().to_string()
+        };
+        let router = Router::new().route("/store-api/rel/x/sql", get(has_forward).post(has_forward));
+        let (engine_tx, _engine_rx) = mpsc::channel(1);
+        let (reader_tx, reader) = reader_pool(router, EngineDispatch::Engine(engine_tx.clone()));
+        let ship = ShipService::new(EngineDispatch::Engine(engine_tx)).with_reader(reader_tx);
+
+        let read = |method: Method| {
+            let req = Request::builder().method(method).uri("/store-api/rel/x/sql").body(Body::empty()).unwrap();
+            ship.clone().oneshot(req)
+        };
+        assert_eq!(text_of(read(Method::GET).await.unwrap()).await, "false");
+        assert_eq!(text_of(read(Method::POST).await.unwrap()).await, "true");
+
+        drop(ship);
+        reader.join().unwrap();
+    }
+
+    // Spec perf/018b test 6: a closed reader channel answers 503 like the
+    // engine channel does.
+    #[tokio::test]
+    async fn closed_reader_channel_answers_503_text_plain() {
+        let (engine_tx, _engine_rx) = mpsc::channel(1);
+        let (reader_tx, reader_rx) = mpsc::channel(1);
+        drop(reader_rx);
+        let ship = ShipService::new(EngineDispatch::Engine(engine_tx)).with_reader(reader_tx);
+        let resp = ship.oneshot(get_req("/any")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let content_type = resp.headers()[header::CONTENT_TYPE].to_str().unwrap().to_string();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        assert!(text_of(resp).await.starts_with("503 Service Unavailable"));
+    }
+
+    // Spec perf/018b test 6: a full reader channel holds the next read back
+    // instead of rejecting it; it goes through once the pool takes the
+    // queued job.
+    #[tokio::test]
+    async fn full_reader_channel_holds_reads_back() {
+        let (engine_tx, _engine_rx) = mpsc::channel(1);
+        let (reader_tx, reader_rx) = mpsc::channel(1);
+        let ship = ShipService::new(EngineDispatch::Engine(engine_tx.clone())).with_reader(reader_tx);
+        let mut first = std::pin::pin!(ship.clone().oneshot(get_req("/a")));
+        let mut second = std::pin::pin!(ship.clone().oneshot(get_req("/b")));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(reader_rx.len(), 1, "the second read must wait for a free slot");
+
+        let router = Router::new().route("/a", get(|| async { "a" })).route("/b", get(|| async { "b" }));
+        tokio::spawn(serve_reader(reader_rx, router, EngineDispatch::Engine(engine_tx)));
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
     }
 
     // Test 2: a closed bridge channel (engine shutting down) answers 503 in

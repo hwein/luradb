@@ -1182,8 +1182,9 @@ fn is_valid_origin_form(origin: &str) -> bool {
 
 // ── Multicore (spec perf/017) ─────────────────────────────────────────────────
 
-/// Sizing of the CPU offload pool behind `core::coop::offload` and of the
-/// frontend runtime in front of the engine thread (spec perf/018a).
+/// Sizing of the CPU offload pool behind `core::coop::offload`, of the
+/// frontend runtime in front of the engine thread (spec perf/018a) and of the
+/// reader pool (spec perf/018b).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MulticoreConfig {
@@ -1196,17 +1197,30 @@ pub struct MulticoreConfig {
     /// Requests the bridge channel to the engine thread holds; a full channel
     /// holds further requests back.
     pub engine_queue_capacity: usize,
+    /// Worker threads of the reader pool that serves read requests. `0` =
+    /// auto = the cores minus the engine thread, one core of headroom and the
+    /// frontend workers, at least 1.
+    pub reader_threads: usize,
+    /// Requests the channel to the reader pool holds; a full channel holds
+    /// further requests back.
+    pub reader_queue_capacity: usize,
 }
 
 impl Default for MulticoreConfig {
     fn default() -> Self {
-        Self { cpu_offload_threads: 0, frontend_workers: 0, engine_queue_capacity: 1024 }
+        Self {
+            cpu_offload_threads: 0,
+            frontend_workers: 0,
+            engine_queue_capacity: 1024,
+            reader_threads: 0,
+            reader_queue_capacity: 4096,
+        }
     }
 }
 
 impl MulticoreConfig {
     /// Startup validation (spec general/030): more permits or workers than
-    /// `cores` would not bound anything; the bridge channel needs a slot.
+    /// `cores` would not bound anything; both bridge channels need a slot.
     pub fn validate(&self, cores: usize) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.cpu_offload_threads <= cores,
@@ -1222,6 +1236,16 @@ impl MulticoreConfig {
             self.engine_queue_capacity >= 1,
             "invalid config: multicore.engine_queue_capacity ({}) must be at least 1",
             self.engine_queue_capacity
+        );
+        anyhow::ensure!(
+            self.reader_threads <= cores,
+            "invalid config: multicore.reader_threads ({}) must be 0 (auto) or 1 to {cores} (available cores)",
+            self.reader_threads
+        );
+        anyhow::ensure!(
+            self.reader_queue_capacity >= 1,
+            "invalid config: multicore.reader_queue_capacity ({}) must be at least 1",
+            self.reader_queue_capacity
         );
         Ok(())
     }
@@ -1543,6 +1567,26 @@ mod tests {
 
         let config: LuraConfig = toml::from_str("[multicore]\nengine_queue_capacity = 0\n").unwrap();
         assert_invalid(config.multicore.validate(8), "multicore.engine_queue_capacity (0)", "at least 1");
+    }
+
+    // Spec perf/018b A6: defaults, then 0 (auto) up to the core count for
+    // the reader threads, and at least one slot in the reader channel.
+    #[test]
+    fn test_multicore_reader_threads_and_reader_queue_capacity() {
+        let config = LuraConfig::default();
+        assert_eq!(config.multicore.reader_threads, 0);
+        assert_eq!(config.multicore.reader_queue_capacity, 4096);
+        assert!(config.multicore.validate(1).is_ok());
+
+        let config: LuraConfig =
+            toml::from_str("[multicore]\nreader_threads = 8\nreader_queue_capacity = 1\n").unwrap();
+        assert!(config.multicore.validate(8).is_ok());
+
+        let config: LuraConfig = toml::from_str("[multicore]\nreader_threads = 9\n").unwrap();
+        assert_invalid(config.multicore.validate(8), "multicore.reader_threads (9)", "1 to 8");
+
+        let config: LuraConfig = toml::from_str("[multicore]\nreader_queue_capacity = 0\n").unwrap();
+        assert_invalid(config.multicore.validate(8), "multicore.reader_queue_capacity (0)", "at least 1");
     }
 
     #[test]

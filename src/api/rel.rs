@@ -6,13 +6,15 @@
 use crate::api::{middleware::ApiError, AppState};
 use crate::auth::middleware::{enforce_sql_level, AuthOutcome, AuthUser};
 use crate::auth::AccessLevel;
+use crate::bridge::EngineForward;
 use crate::engines::rel::{
     scalar_to_json, ColumnType, DmlResult, LinkAuth, RelEngine, RelStoreError, SqlOutcome, StatementClass,
 };
 use axum::{
-    extract::{Extension, Path, State},
-    http::StatusCode,
-    response::Json,
+    body::Bytes,
+    extract::{Extension, FromRequest, Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -252,16 +254,35 @@ pub async fn execute_sql(
     Path(domain): Path<String>,
     auth_outcome: Option<Extension<AuthOutcome>>,
     auth_user: Option<Extension<AuthUser>>,
-    Json(body): Json<SqlRequest>,
-) -> Result<Json<Value>, ApiError> {
+    engine_thread: Option<Extension<EngineForward>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    // The `Json` extractor over a body kept whole: a write statement on the
+    // reader pool travels on to the engine thread as it came (spec perf/018b A3).
+    let mut req = axum::extract::Request::new(axum::body::Body::from(raw.clone()));
+    *req.headers_mut() = headers;
+    let Json(body) = Json::<SqlRequest>::from_request(req, &state)
+        .await
+        .map_err(|rejection| ApiError::new(rejection.status(), rejection.body_text()))?;
     let engine = rel_engine(&state)?;
 
     // rel/011 auth seam: classify (parse-only) then enforce the exact
     // statement-class level *before* execute_sql runs it — this is the real
     // authorization, since the middleware only demanded Read for `/sql`.
-    // Doubles the parse (classify + execute_sql's own); accepted (rel/011 §4/§9).
+    // Doubles the parse (classify + execute_sql's own); accepted (rel/011 §4/§9)
+    // — a write statement from the reader pool is parsed once here and twice
+    // on the engine thread (perf/018b A3).
+    let class = engine.classify(&body.sql)?;
+    // On the reader pool, a write statement runs on the engine thread, which
+    // handles the whole request again.
+    if class != StatementClass::Read {
+        if let Some(Extension(forward)) = engine_thread {
+            return Ok(forward.send(raw).await);
+        }
+    }
     let outcome = auth_outcome.map(|Extension(o)| o);
-    let required = match engine.classify(&body.sql)? {
+    let required = match class {
         StatementClass::Read => AccessLevel::Read,
         StatementClass::Write => AccessLevel::Write,
         StatementClass::Ddl => AccessLevel::Ddl,
@@ -289,7 +310,7 @@ pub async fn execute_sql(
             "413 Payload Too Large: response exceeds max_response_bytes; reduce LIMIT",
         ));
     }
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 #[cfg(test)]
@@ -1315,5 +1336,79 @@ mod tests {
         // The process stays responsive: a follow-up request still goes through.
         let (status, _) = sql(&app, "default", r#"{"sql": "SELECT COUNT(*) FROM t"}"#).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    // Spec perf/018b A3: behind the bridge with a reader pool, a SELECT runs
+    // on the pool and a write statement travels on to the engine thread; every
+    // answer, error paths included, matches the inline router's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_behind_the_reader_pool_answers_like_the_inline_router() {
+        use crate::bridge::{serve_engine, serve_reader, test_hook, EngineDispatch, ShipService};
+
+        let (inline_state, _inline_dir) = make_state(Some(RelStoreConfig::default()), false).await;
+        let inline = crate::api::router_inline(inline_state, Arc::new(vec![]));
+
+        let (state, _dir) = make_state(Some(RelStoreConfig::default()), false).await;
+        let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(8);
+        let engine_router = crate::api::create_router(state.clone());
+        let engine = std::thread::Builder::new()
+            .name("test-engine".to_string())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(serve_engine(engine_rx, engine_router))
+            })
+            .unwrap();
+        let (reader_tx, reader_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(serve_reader(
+            reader_rx,
+            crate::api::create_router(state),
+            EngineDispatch::Engine(engine_tx.clone()),
+        ));
+        let ship = ShipService::new(EngineDispatch::Engine(engine_tx)).with_reader(reader_tx);
+        let pooled = crate::api::frontend_layers(
+            axum::Router::new().fallback_service(ship),
+            None,
+            Arc::new(vec![]),
+        );
+
+        let sql_req = |content_type: Option<&str>, body: &str| {
+            let mut builder = Request::builder().method(Method::POST).uri("/store-api/rel/default/sql");
+            if let Some(content_type) = content_type {
+                builder = builder.header("content-type", content_type);
+            }
+            builder.body(Body::from(body.to_string())).unwrap()
+        };
+        let json = Some("application/json");
+        // (content type, body, thread class: true = engine thread)
+        let steps = [
+            (json, r#"{"sql": "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"}"#, true),
+            (json, r#"{"sql": "INSERT INTO items (name) VALUES (?)", "params": ["clé ✓"]}"#, true),
+            (json, r#"{"sql": "INSERT INTO items (id) VALUES (7)"}"#, true),
+            (json, r#"{"sql": "SELECT id, name FROM items"}"#, false),
+            (json, r#"{"sql": "SELEC id FROM items"}"#, false),
+            (json, r#"{"sql": "#, false),
+            (None, r#"{"sql": "SELECT id FROM items"}"#, false),
+        ];
+        for (content_type, body, on_engine) in steps {
+            let expected = inline.clone().oneshot(sql_req(content_type, body)).await.unwrap();
+            let actual = pooled.clone().oneshot(sql_req(content_type, body)).await.unwrap();
+            assert_eq!(actual.status(), expected.status(), "{body}");
+            assert_eq!(
+                actual.headers().get("content-type"),
+                expected.headers().get("content-type"),
+                "{body}"
+            );
+            let thread = actual.headers()[test_hook::THREAD].to_str().unwrap().to_string();
+            assert_eq!(thread == "test-engine", on_engine, "{body} ran on {thread}");
+            let expected = to_bytes(expected.into_body(), usize::MAX).await.unwrap();
+            let actual = to_bytes(actual.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(actual, expected, "{body}");
+        }
+
+        drop(pooled);
+        engine.join().unwrap();
     }
 }

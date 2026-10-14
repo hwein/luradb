@@ -1,6 +1,6 @@
 //! Engine-thread bootstrap and shutdown (spec perf/018a A1.1): the storage
-//! engines, their background tasks, SHM and the API router all live on the
-//! engine thread's tokio-uring runtime.
+//! engines, their background tasks and SHM live on the engine thread's
+//! tokio-uring runtime.
 
 use crate::{
     api::{self, middleware::ParsedCidr, AppState},
@@ -29,15 +29,13 @@ use crate::{
     storage::vlog::VLog,
     uds,
 };
-use axum::Router;
 use std::path::Path;
 use std::sync::{atomic::AtomicBool, Arc};
 
-/// The booted engine side: the API router the bridge serves, the handles the
-/// frontend layers read, and what [`graceful_shutdown`] stops.
+/// The booted engine side: the state both API routers are built from, the
+/// trusted CIDRs the frontend layers read, and what [`graceful_shutdown`] stops.
 pub(super) struct Engine {
-    pub(super) router: Router,
-    pub(super) auth_cache: Arc<AuthCache>,
+    pub(super) state: AppState,
     pub(super) trusted_cidrs: Arc<Vec<ParsedCidr>>,
     pub(super) teardown: Teardown,
 }
@@ -448,7 +446,7 @@ async fn stop_shm(services: Option<ShmServices>) {
     }
 }
 
-/// Boots the engine side up to the API router and SHM (A1.1); the listeners
+/// Boots the engine side up to the API state and SHM (A1.1); the listeners
 /// are the frontend's.
 pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Path) -> anyhow::Result<Engine> {
     coop::init(config.multicore.cpu_offload_threads);
@@ -567,10 +565,10 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
 
     let (shm_manager, shm_services) = start_shm(config, &registry, &lsm_store).await?;
 
-    // --- Router ---
+    // --- API state ---
     let state = AppState {
         registry,
-        auth_cache: Arc::clone(&auth_cache),
+        auth_cache,
         auth_enabled: config.auth.enabled,
         metrics,
         json_engine: json_engine.clone(),
@@ -585,8 +583,7 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
     };
 
     Ok(Engine {
-        router: api::create_router(state),
-        auth_cache,
+        state,
         trusted_cidrs,
         teardown: Teardown {
             shm_services,

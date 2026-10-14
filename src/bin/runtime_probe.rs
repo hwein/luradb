@@ -76,6 +76,9 @@ fn main() -> Result<()> {
         kernel_release(),
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     );
+    if cfg!(debug_assertions) {
+        println!("WARNING: debug build; measurements need `cargo build --release`");
+    }
     match cli.command {
         Command::K1 => k1(&cli.dir),
         Command::K2 { roundtrips } => k2(roundtrips),
@@ -173,8 +176,8 @@ fn ns(d: Duration) -> u32 {
     u32::try_from(d.as_nanos()).unwrap_or(u32::MAX)
 }
 
-fn micros(ns: u32) -> String {
-    format!("{:.2}", f64::from(ns) / 1000.0)
+fn micros(nanos: u32) -> String {
+    format!("{:.2}", f64::from(nanos) / 1000.0)
 }
 
 fn millis(d: Duration) -> String {
@@ -234,6 +237,7 @@ fn k1(dir: &Path) -> Result<()> {
     );
     println!("tokio_uring today: tokio_uring::start = io_uring::IoUring::builder() defaults, 256 entries, no setup flags");
     println!("effective flags: the io_uring_setup lines of the strace capture");
+    println!("the 2-entry ring with flags=0 in the strace is compio's per-process opcode-support probe, not a shard ring");
 
     let compio_path = dir.join("runtime_probe_k1_compio.dat");
     let rt = compio_runtime(proactor)?;
@@ -409,12 +413,12 @@ fn k2(roundtrips: usize) -> Result<()> {
         }
     );
 
-    let mut compio_rt = compio_task(&rt, hub_roundtrips(roundtrips))??;
+    let mut compio_runs = compio_task(&rt, hub_roundtrips(roundtrips))??;
     drop(rt);
-    let mut tokio_uring_rt = tokio_uring::start(async { tokio_uring::spawn(hub_roundtrips(roundtrips)).await })??;
+    let mut tokio_uring_runs = tokio_uring::start(async { tokio_uring::spawn(hub_roundtrips(roundtrips)).await })??;
     let mut rows = Vec::new();
     let mut summaries = Vec::new();
-    for (name, run) in [("tokio_uring 0.5", &mut tokio_uring_rt), ("compio 0.19.2, shard ring", &mut compio_rt)] {
+    for (name, run) in [("tokio_uring 0.5", &mut tokio_uring_runs), ("compio 0.19.2, shard ring", &mut compio_runs)] {
         let roundtrip = summarize(&mut run.roundtrip);
         let wake = summarize(&mut run.wake);
         rows.push(vec![
@@ -702,7 +706,6 @@ impl OffloadVia {
         matches!(self, Self::CoopTokioHandle | Self::CoopTokioHandleCapped)
     }
 
-    /// Most blocking threads the variant may hold.
     fn pool_bound(self, runtimes: usize, cap: usize) -> usize {
         match self {
             Self::CoopTokioHandle | Self::CoopTokioHandleCapped | Self::CompioShared => cap,
@@ -886,7 +889,7 @@ impl ThreadSampler {
         let handle = std::thread::spawn(move || {
             let mut peak = 0;
             while !stopped.load(Ordering::Relaxed) {
-                peak = peak.max(thread_count().unwrap_or(0));
+                peak = peak.max(thread_count().expect("/proc/self/status is readable"));
                 std::thread::sleep(Duration::from_millis(1));
             }
             peak
@@ -896,7 +899,7 @@ impl ThreadSampler {
 
     fn stop(self) -> usize {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.join().unwrap_or(0)
+        self.handle.join().expect("the sampler thread does not panic")
     }
 }
 
@@ -957,9 +960,6 @@ struct K6Result {
 
 fn k6(dir: &Path, file_mib: u64, ops: usize, rounds: usize, cold: bool) -> Result<()> {
     println!("\n## K6 4-KiB pread, tokio_uring vs compio\n");
-    if cfg!(debug_assertions) {
-        println!("WARNING: debug build; K6 numbers need `cargo build --release`");
-    }
     let path = dir.join("runtime_probe_k6.dat");
     let _cleanup = TempFile(path.clone());
     write_probe_file(&path, file_mib)?;

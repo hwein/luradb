@@ -76,6 +76,17 @@ async fn take_page(keys: Vec<Vec<u8>>, offset: usize, limit: usize, coop: &mut Y
     page
 }
 
+/// Counts `keys`, releasing them one by one; every key ticks `coop`, so
+/// dropping the list yields too (spec perf/034).
+async fn count_and_release(keys: Vec<Vec<u8>>, coop: &mut YieldEvery) -> u64 {
+    let mut count = 0;
+    for _ in keys {
+        coop.tick().await;
+        count += 1;
+    }
+    count
+}
+
 // ── DomainConfig ──────────────────────────────────────────────────────────────
 
 /// Configuration for the domain management layer.
@@ -674,13 +685,16 @@ impl DomainStore {
 
     /// Counts live user-keys whose raw form starts with `prefix` — same scan
     /// as `scan_keys` (spec general/017), without materializing the stripped
-    /// key strings.
+    /// key strings; the scanned list is released key by key with yield points
+    /// (spec perf/034).
     pub async fn count_keys(&self, prefix: &[u8]) -> Result<u64> {
         if !self.runtime.rate_limiter.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let full_prefix = self.prefixed_key(prefix);
-        Ok(self.engine.scan_keys(&full_prefix).await?.len() as u64)
+        let keys = self.engine.scan_keys(&full_prefix).await?;
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        Ok(count_and_release(keys, &mut coop).await)
     }
 
     /// Deletes every live user-key matching `prefix`, optionally narrowed by
@@ -712,15 +726,16 @@ impl DomainStore {
             self.max_bulk_delete_keys
         );
 
-        let mut ops: Vec<BatchOp> = Vec::with_capacity(matched.len());
-        for k in &matched {
+        let count = matched.len();
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(count);
+        for k in matched {
             coop.tick().await;
-            ops.push(BatchOp::Delete { key: self.prefixed_key(k) });
+            ops.push(BatchOp::Delete { key: self.prefixed_key(&k) });
         }
         let start = std::time::Instant::now();
         self.engine.write_batch(ops).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(matched.len())
+        Ok(count)
     }
 
     /// Test-only: drains and locks this domain's read bucket so the next
@@ -1768,5 +1783,21 @@ mod tests {
             let page = take_page(keys.clone(), offset, limit, &mut coop).await;
             assert_eq!(page, expected, "offset={offset} limit={limit}");
         }
+    }
+
+    // Spec perf/034: releasing the counted keys hands the thread back — one
+    // key above a yield interval gives exactly one yield.
+    #[tokio::test]
+    async fn test_count_and_release_yields_while_dropping_keys() {
+        let keys: Vec<Vec<u8>> = (0..=KEY_LOOP_YIELD_INTERVAL).map(|i| i.to_be_bytes().to_vec()).collect();
+        let order = crate::core::coop::completion_order(
+            async move {
+                let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+                assert_eq!(count_and_release(keys, &mut coop).await, KEY_LOOP_YIELD_INTERVAL as u64 + 1);
+            },
+            async {},
+        )
+        .await;
+        assert_eq!(order, ["small", "long"]);
     }
 }

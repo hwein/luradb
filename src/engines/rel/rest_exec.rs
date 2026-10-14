@@ -144,3 +144,85 @@ impl RelEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RelStoreConfig;
+    use crate::metrics::{MetricsConfig, MetricsStore};
+    use serde_json::json;
+
+    async fn make_engine() -> (Arc<RelEngine>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = RelStoreConfig {
+            wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
+            vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
+            sstable_dir: dir.path().join("rel_sstables").to_string_lossy().into_owned(),
+            ..RelStoreConfig::default()
+        };
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let cross_engine = crate::engines::rel::CrossEngineResolver::disabled(Arc::clone(&metrics));
+        let engine = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
+        (engine, dir)
+    }
+
+    async fn make_parent_child() -> (Arc<RelEngine>, tempfile::TempDir) {
+        let (rel, dir) = make_engine().await;
+        for sql in [
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)",
+            "INSERT INTO parent VALUES (7, 'p')",
+            "INSERT INTO child VALUES (1, 7)",
+        ] {
+            rel.execute("default", sql, &[]).await.unwrap();
+        }
+        (rel, dir)
+    }
+
+    /// Runs `sql` through `execute_sql` and returns the registry's active count
+    /// while the SELECT result is alive, then after it is dropped, plus the
+    /// expanded block.
+    async fn active_counts(rel: &RelEngine, sql: &str, expand: &[&str]) -> (usize, usize, Option<ExpandedBlock>) {
+        let expand: Vec<String> = expand.iter().map(|s| s.to_string()).collect();
+        let registry = rel.engine().snapshot_registry();
+        assert_eq!(registry.active_count(), 0, "no snapshot registered before the statement");
+        match rel.execute_sql("default", sql, &[], &expand, LinkAuth::full()).await.unwrap() {
+            SqlOutcome::Select { result, expanded } => {
+                let alive = registry.active_count();
+                drop(result);
+                (alive, registry.active_count(), expanded)
+            }
+            o => panic!("expected SELECT, got {o:?}"),
+        }
+    }
+
+    // rel/021: the guard lives in the result, so the registered stamp covers
+    // the expand lookups and everything the caller does with the result.
+    #[tokio::test]
+    async fn test_select_expand_keeps_snapshot_registered_until_result_dropped() {
+        let (rel, _dir) = make_parent_child().await;
+        let (alive, after_drop, expanded) = active_counts(&rel, "SELECT * FROM child", &["pid"]).await;
+        assert_eq!(alive, 1, "result must hold the registered snapshot");
+        assert_eq!(after_drop, 0, "dropping the result deregisters it");
+        assert_eq!(expanded.unwrap()[0].1, vec![json!({"id": 7, "name": "p"})]);
+    }
+
+    #[tokio::test]
+    async fn test_join_select_expand_keeps_snapshot_registered_until_result_dropped() {
+        let (rel, _dir) = make_parent_child().await;
+        let sql = "SELECT c.id, c.pid FROM child c LEFT JOIN parent p ON c.pid = p.id";
+        let (alive, after_drop, expanded) = active_counts(&rel, sql, &["pid"]).await;
+        assert_eq!(alive, 1, "result must hold the registered snapshot");
+        assert_eq!(after_drop, 0, "dropping the result deregisters it");
+        assert_eq!(expanded.unwrap()[0].1, vec![json!({"id": 7, "name": "p"})]);
+    }
+
+    #[tokio::test]
+    async fn test_count_star_holds_no_snapshot_after_return() {
+        let (rel, _dir) = make_parent_child().await;
+        for sql in ["SELECT COUNT(*) FROM child", "SELECT COUNT(*) FROM child c LEFT JOIN parent p ON c.pid = p.id"] {
+            let (alive, after_drop, _) = active_counts(&rel, sql, &[]).await;
+            assert_eq!((alive, after_drop), (0, 0), "{sql}");
+        }
+    }
+}

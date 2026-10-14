@@ -15,7 +15,7 @@ use super::rest_exec::ExpandedBlock;
 use super::row::decode_row;
 use super::types::{encode_sortable, scalar_to_json, ColumnType};
 use super::RelEngine;
-use crate::engines::lsm::reader::Snapshot;
+use crate::engines::lsm::reader::{RegistrySnapshot, Snapshot};
 use serde_json::{json, Value};
 
 /// How one projected link column resolves (spec §4).
@@ -61,9 +61,10 @@ impl RelEngine {
                     // set a snapshot (it always does for a real SELECT).
                     let snap = result
                         .snapshot
-                        .clone()
+                        .as_ref()
+                        .map(RegistrySnapshot::snapshot)
                         .expect("a REFERENCES column implies a SELECT snapshot");
-                    self.resolve_one_column(domain, &target_table, &prefix, result, pos, &snap).await?
+                    self.resolve_one_column(domain, &target_table, &prefix, result, pos, snap).await?
                 }
                 ExpandKind::Kv => self.resolve_kv_column(domain, result, pos).await?,
                 ExpandKind::Json => self.resolve_json_column(domain, result, pos).await?,

@@ -828,6 +828,7 @@ impl SnapshotRegistry {
 /// RAII guard for a snapshot registered in [].
 ///
 /// Automatically deregisters the snapshot on drop.
+#[derive(Debug)]
 pub struct RegistrySnapshot {
     active: Arc<parking_lot::Mutex<BTreeSet<u64>>>,
     ts_raw: u64,

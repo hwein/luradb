@@ -694,10 +694,7 @@ impl RelEngine {
         let schema = Arc::new(schema);
         let scan = RowScan {
             engine: Arc::clone(&self.engine),
-            // Cloned (not moved): `snap` is carried into the `SelectResult`
-            // below so `expand` (rel/009 §5) can resolve REFERENCES columns
-            // in this exact same snapshot, not a fresh one.
-            snapshot: snap.clone(),
+            snapshot: snap,
             schema: Arc::clone(&schema),
             table_id: schema.table_id,
             alias,
@@ -743,7 +740,7 @@ impl RelEngine {
             limit_applied,
             column_refs,
             joins_used: 0,
-            snapshot: Some(snap),
+            snapshot: Some(snapshot_guard),
         }))
     }
 

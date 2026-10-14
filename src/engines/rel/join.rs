@@ -923,8 +923,9 @@ impl RelEngine {
         self.metrics.record_rel_select_statement();
 
         // One snapshot for the whole statement — base *and* every join fetch
-        // (spec §2 Snapshot & Ghosts). Kept alive for the whole function so
-        // compaction cannot advance past it mid-pipeline.
+        // (spec §2 Snapshot & Ghosts). Kept alive so compaction cannot advance
+        // past it mid-pipeline; moves into the result so `expand` is covered
+        // too (rel/021).
         let snapshot_guard = self.engine.snapshot();
         let snap = snapshot_guard.snapshot().clone();
 
@@ -1045,10 +1046,7 @@ impl RelEngine {
             limit_applied,
             column_refs,
             joins_used: sel.joins.len(),
-            // `snap` was only ever cloned/borrowed above (`base_scan`,
-            // `build_join_probe`), so it's still ours to hand to `expand`
-            // (rel/009 §5) — the same snapshot the join itself read at.
-            snapshot: Some(snap),
+            snapshot: Some(snapshot_guard),
         }))
     }
 }

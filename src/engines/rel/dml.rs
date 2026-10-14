@@ -17,7 +17,7 @@ use super::select::ROW_YIELD_INTERVAL;
 use super::{ExecOutcome, RelEngine};
 use crate::core::coop::YieldEvery;
 use crate::engines::lsm::engine::BatchOp;
-use crate::engines::lsm::reader::Snapshot;
+use crate::engines::lsm::reader::{RegistrySnapshot, Snapshot};
 use crate::metrics::EngineKind;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -72,12 +72,13 @@ pub struct SelectResult {
     /// join.rs). `expand` columns are charged against `max_join_depth` on
     /// top of this count (rel/007 §8, rel/009 §5).
     pub(crate) joins_used: usize,
-    /// The MVCC snapshot the rows were read at (rel/005/006 `snapshot()` +
-    /// `get_with_snapshot`). `expand` resolution (rel/009 §5) reuses it so
-    /// referenced rows are read at the same point in time as the driving
-    /// SELECT, rather than a fresh (later) snapshot. `None` for COUNT(*),
-    /// which is never expand-eligible (`column_refs` is all-`None` there).
-    pub(crate) snapshot: Option<Snapshot>,
+    /// The registered MVCC snapshot the rows were read at (rel/005/006
+    /// `snapshot()` + `get_with_snapshot`). `expand` resolution (rel/009 §5)
+    /// reads through it so referenced rows come from the same point in time as
+    /// the driving SELECT; as a guard it keeps that horizon registered until
+    /// the result drops (rel/021). `None` for COUNT(*), which is never
+    /// expand-eligible (`column_refs` is all-`None` there).
+    pub(crate) snapshot: Option<RegistrySnapshot>,
 }
 
 /// A row selected for UPDATE/DELETE: its ROW key plus decoded values (in

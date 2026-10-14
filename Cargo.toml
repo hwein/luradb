@@ -7,6 +7,8 @@ description = "LuraDB: A Linux-first, REST-native multi-model database"
 license = "FSL-1.1-ALv2"
 repository = "https://github.com/hwein/luradb"
 readme = "README.md"
+# A second binary (runtime_probe) exists; plain `cargo run` stays the server.
+default-run = "luradb"
 # We optimize for Linux
 exclude = ["/.github/**", "/docs/**"]
 
@@ -37,6 +39,10 @@ tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
 tokio-uring = "0.5"
 # Raw io_uring ring for the SQPOLL storage thread (perf/005).
 io-uring = "0.6"
+# Engine-thread runtime candidate, evaluated by src/bin/runtime_probe.rs (spec perf/019).
+compio = { version = "=0.19.2", default-features = false, features = ["runtime", "io-uring", "time", "fs"] }
+# compio-driver's own io-uring version: the probe's READ_FIXED op must build that SQE type.
+io-uring-compio = { package = "io-uring", version = "0.7" }
 # For low-level flags like O_DIRECT and mmap (shared memory)
 libc = "0.2"
 # Efficient byte handling for zero-copy strategies

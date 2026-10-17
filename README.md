@@ -50,7 +50,8 @@ breaking changes are marked **BREAKING**.
 ## Requirements
 
 - Linux, amd64.
-- A modern kernel with io_uring support — kernel ≥ 5.15 recommended.
+- Linux kernel 6.1 or newer (io_uring with `DEFER_TASKRUN`); LuraDB refuses
+  to start on older kernels.
 - systemd, if you install the `.deb` package (LuraDB runs as a systemd
   service).
 

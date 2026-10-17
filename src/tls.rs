@@ -62,6 +62,7 @@ pub fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsA
 /// Accept loop serving the router over TLS until `shutdown` flips, then
 /// drains in-flight connections (5s cap) before returning — mirrors
 /// `uds::serve_uds`.
+#[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 pub async fn serve_tls(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -129,6 +130,7 @@ pub async fn serve_tls(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "the listener runs on a tokio runtime, like the frontend")]
 mod tests {
     use super::*;
     use axum::routing::get;

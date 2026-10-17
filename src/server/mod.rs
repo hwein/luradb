@@ -1,8 +1,8 @@
 //! Process topology (spec perf/018a A1, perf/018b A1): the storage engines
-//! run on one engine thread (tokio-uring) that serves the write requests, the
-//! read requests run on a multi-threaded reader pool against the same engines,
-//! and HTTP/TLS termination and the frontend layers on a multi-threaded
-//! frontend runtime, with the bridge in between.
+//! run on one engine thread (compio, spec perf/020) that serves the write
+//! requests, the read requests run on a multi-threaded reader pool against the
+//! same engines, and HTTP/TLS termination and the frontend layers on a
+//! multi-threaded frontend runtime, with the bridge in between.
 
 mod engine;
 
@@ -11,7 +11,7 @@ use crate::{
     auth::{middleware::docs_auth_layer, AuthCache},
     bridge::{self, EngineDispatch, Job, ShipService},
     config::LuraConfig,
-    core::coop,
+    core::{coop, engine_runtime, storage_thread},
     cors, tls, uds,
 };
 use axum::{
@@ -78,7 +78,8 @@ impl Server {
             config.multicore.engine_queue_capacity
         );
 
-        let (engine, ready) = spawn_engine(Arc::clone(&config), config_path.to_path_buf())?;
+        let (engine, ready) =
+            spawn_engine(Arc::clone(&config), config_path.to_path_buf(), frontend.handle().clone())?;
         let readers = reader_threads(config.multicore.reader_threads, cores, workers);
         let reader = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(readers)
@@ -108,8 +109,9 @@ impl Server {
             }
             Err(e) => {
                 // The failed start dropped the frontend's bridge senders; the
-                // engine loop ends only once the reader pool is down (A7).
-                drop(frontend);
+                // engine loop ends only once the reader pool is down (A7). The
+                // frontend runtime drops after the engine thread, which runs
+                // inside its handle.
                 reader.shutdown_timeout(READER_SHUTDOWN);
                 drop(engine_tx);
                 let _ = engine.join();
@@ -126,18 +128,20 @@ impl ServerHandle {
         self.shutdown()
     }
 
-    /// Stops and drains the listeners, ends the frontend runtime and then the
-    /// reader pool, and only then drops its engine sender, the last one: the
-    /// engine loop ends after the reads (perf/018a A6, perf/018b A7). Finally
-    /// joins the engine thread once it has shut the engines down. Must not be
-    /// called from within an async context.
+    /// Stops and drains the listeners, ends the reader pool, and only then
+    /// drops its engine sender, the last one: the engine loop ends after the
+    /// reads (perf/018a A6, perf/018b A7). Then joins the engine thread once
+    /// it has shut the engines down, and ends the frontend runtime last: the
+    /// engine thread runs inside its handle (perf/020). Must not be called
+    /// from within an async context.
     pub fn shutdown(self) -> anyhow::Result<()> {
         let ServerHandle { listeners, frontend, reader, engine_tx, engine, .. } = self;
         frontend.block_on(listeners.stop());
-        drop(frontend);
         reader.shutdown_timeout(READER_SHUTDOWN);
         drop(engine_tx);
-        engine.join().map_err(|_| anyhow::anyhow!("the engine thread panicked"))
+        let joined = engine.join();
+        drop(frontend);
+        joined.map_err(|_| anyhow::anyhow!("the engine thread panicked"))
     }
 }
 
@@ -162,15 +166,35 @@ fn reader_threads(configured: usize, cores: usize, frontend: usize) -> usize {
     }
 }
 
+/// Wakes from other threads the engine runtime has room for (see
+/// [`engine_runtime::build`]), one slot per engine task: as many as the
+/// storage hub's request channel and the bridge channel hold waiting jobs,
+/// plus compio's default for the background tasks. Running request tasks
+/// have no bound of their own.
+fn remote_wakes(config: &LuraConfig) -> usize {
+    storage_thread::REQUEST_CHANNEL_CAPACITY
+        + config.multicore.engine_queue_capacity
+        + engine_runtime::DEFAULT_REMOTE_WAKES
+}
+
 /// Starts the engine thread and waits until it reports ready (A1.1, A1.3).
+/// The thread enters `frontend`'s handle for its whole life: `coop::offload`,
+/// `tokio::fs` and the IPC sockets need a tokio context (perf/020).
 fn spawn_engine(
     config: Arc<LuraConfig>,
     config_path: PathBuf,
+    frontend: tokio::runtime::Handle,
 ) -> anyhow::Result<(std::thread::JoinHandle<()>, Ready)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let thread = std::thread::Builder::new()
-        .name("luradb-engine".to_string())
-        .spawn(move || tokio_uring::start(run_engine(config, config_path, ready_tx)))?;
+    let thread = std::thread::Builder::new().name("luradb-engine".to_string()).spawn(move || {
+        let _frontend = frontend.enter();
+        match engine_runtime::build(remote_wakes(&config)) {
+            Ok(rt) => engine_runtime::run(&rt, run_engine(config, config_path, ready_tx)),
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+            }
+        }
+    })?;
     match ready_rx.recv() {
         Ok(Ok(ready)) => Ok((thread, ready)),
         Ok(Err(e)) => {
@@ -340,6 +364,7 @@ impl Listeners {
 /// Binds every enabled listener, then serves the frontend router on them
 /// (A1.2, A1.4); `reader_tx` leads to the reader pool. Nothing is spawned
 /// before all binds succeeded.
+#[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 async fn run_frontend(ready: Ready, reader_tx: mpsc::Sender<Job>, config: &LuraConfig) -> anyhow::Result<Listeners> {
     let ship = ShipService::new(EngineDispatch::Engine(ready.dispatch)).with_reader(reader_tx);
     let app = build_router(config, ready.state.auth_cache, ready.trusted_cidrs, ship);
@@ -398,6 +423,7 @@ async fn run_frontend(ready: Ready, reader_tx: mpsc::Sender<Job>, config: &LuraC
 /// Plain HTTP accept loop, same pattern as `tls::serve_tls` minus the
 /// handshake: serves until `shutdown` flips, then drains in-flight
 /// connections (5 s cap) before returning.
+#[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 async fn serve_http(listener: TcpListener, router: Router, mut shutdown: watch::Receiver<bool>) {
     let mut connections = JoinSet::new();
     let connection_shutdown = shutdown.clone();
@@ -512,98 +538,102 @@ mod tests {
     // Regression-critical: if the layer moved inward (e.g. into
     // create_router), a request to the Swagger docs route would never reach
     // it — docs_auth_layer would 401 first, with no CORS header.
-    #[tokio::test]
-    async fn cors_layer_wraps_swagger_and_survives_401() {
-        let mut cfg = LuraConfig::default();
-        cfg.server.swagger_enabled = true;
-        cfg.auth.enabled = true;
-        cfg.cors.enabled = true;
-        cfg.cors.allowed_origins = vec!["https://example.com".to_string()];
+    #[test]
+    fn cors_layer_wraps_swagger_and_survives_401() {
+        crate::core::engine_runtime::block_on(async {
+            let mut cfg = LuraConfig::default();
+            cfg.server.swagger_enabled = true;
+            cfg.auth.enabled = true;
+            cfg.cors.enabled = true;
+            cfg.cors.allowed_origins = vec!["https://example.com".to_string()];
 
-        let (state, _dir) = make_test_state(true).await;
-        let auth_cache = Arc::clone(&state.auth_cache);
-        let ship = ShipService::new(EngineDispatch::Inline(api::create_router(state)));
-        let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
+            let (state, _dir) = make_test_state(true).await;
+            let auth_cache = Arc::clone(&state.auth_cache);
+            let ship = ShipService::new(EngineDispatch::Inline(api::create_router(state)));
+            let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
 
-        // (a) Preflight without Authorization -> 200 with the CORS header,
-        // even though this path sits behind docs_auth_layer.
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("OPTIONS")
-                    .uri("/api-docs/openapi.json")
-                    .header("origin", "https://example.com")
-                    .header("access-control-request-method", "GET")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get("access-control-allow-origin").unwrap(),
-            "https://example.com"
-        );
+            // (a) Preflight without Authorization -> 200 with the CORS header,
+            // even though this path sits behind docs_auth_layer.
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("OPTIONS")
+                        .uri("/api-docs/openapi.json")
+                        .header("origin", "https://example.com")
+                        .header("access-control-request-method", "GET")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("access-control-allow-origin").unwrap(),
+                "https://example.com"
+            );
 
-        // (b) GET with an allowed Origin but no Authorization -> 401 from
-        // docs_auth_layer, but still carrying the CORS header — proof the
-        // layer sits outside that auth check, not inside it.
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api-docs/openapi.json")
-                    .header("origin", "https://example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            resp.headers().get("access-control-allow-origin").unwrap(),
-            "https://example.com"
-        );
+            // (b) GET with an allowed Origin but no Authorization -> 401 from
+            // docs_auth_layer, but still carrying the CORS header — proof the
+            // layer sits outside that auth check, not inside it.
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api-docs/openapi.json")
+                        .header("origin", "https://example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                resp.headers().get("access-control-allow-origin").unwrap(),
+                "https://example.com"
+            );
+        })
     }
 
     // A2/A3: auth runs on the frontend, in front of the bridge — the engine
     // router behind it carries no auth layer of its own, so a 401 here can
     // only come from the frontend router.
-    #[tokio::test]
-    async fn frontend_router_enforces_auth_in_front_of_the_engine() {
-        let mut cfg = LuraConfig::default();
-        cfg.auth.enabled = true;
-        let (state, _dir) = make_test_state(true).await;
-        let auth_cache = Arc::clone(&state.auth_cache);
-        let admin_key = "lura_test_frontend_admin_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "admin".to_string(),
-                api_key_hash: crate::auth::hash_api_key(admin_key),
-                role: crate::auth::UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        let app = build_router(
-            &cfg,
-            Arc::clone(&auth_cache),
-            Arc::new(vec![]),
-            ShipService::new(EngineDispatch::Inline(api::create_router(state))),
-        );
+    #[test]
+    fn frontend_router_enforces_auth_in_front_of_the_engine() {
+        crate::core::engine_runtime::block_on(async {
+            let mut cfg = LuraConfig::default();
+            cfg.auth.enabled = true;
+            let (state, _dir) = make_test_state(true).await;
+            let auth_cache = Arc::clone(&state.auth_cache);
+            let admin_key = "lura_test_frontend_admin_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "admin".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(admin_key),
+                    role: crate::auth::UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            let app = build_router(
+                &cfg,
+                Arc::clone(&auth_cache),
+                Arc::new(vec![]),
+                ShipService::new(EngineDispatch::Inline(api::create_router(state))),
+            );
 
-        let status = |uri: &str, key: Option<&str>| {
-            let mut req = Request::builder().uri(uri);
-            if let Some(key) = key {
-                req = req.header("authorization", format!("Bearer {key}"));
-            }
-            let app = app.clone();
-            let req = req.body(Body::empty()).unwrap();
-            async move { app.oneshot(req).await.unwrap().status() }
-        };
-        assert_eq!(status("/store-api/config", None).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(status("/store-api/config", Some(admin_key)).await, StatusCode::OK);
-        assert_eq!(status("/health", None).await, StatusCode::OK);
+            let status = |uri: &str, key: Option<&str>| {
+                let mut req = Request::builder().uri(uri);
+                if let Some(key) = key {
+                    req = req.header("authorization", format!("Bearer {key}"));
+                }
+                let app = app.clone();
+                let req = req.body(Body::empty()).unwrap();
+                async move { app.oneshot(req).await.unwrap().status() }
+            };
+            assert_eq!(status("/store-api/config", None).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(status("/store-api/config", Some(admin_key)).await, StatusCode::OK);
+            assert_eq!(status("/health", None).await, StatusCode::OK);
+        })
     }
 
     // ── In-process E2E (Server::start) ───────────────────────────────────────
@@ -753,6 +783,7 @@ mod tests {
     // response (SSE) and a streamed request body cross the bridge; the
     // handle's shutdown ends both runtimes.
     #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     fn server_serves_and_streams_both_ways_then_shuts_down() {
         with_server(|addr| async move {
             let (status, _) = request(addr, &get("/health")).await;
@@ -837,6 +868,19 @@ mod tests {
         });
     }
 
+    // perf/020 step 8: a bootstrap that fails once the engines and their
+    // background tasks run still ends the engine thread, with its I/O tasks
+    // run out, and reports the error.
+    #[test]
+    fn a_bootstrap_failing_after_the_engines_started_ends_the_engine_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.proxy.trusted_proxies = vec!["not-a-cidr".to_string()];
+        let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
+        assert!(format!("{err:#}").contains("trusted_proxies"), "{err:#}");
+        assert!(dir.path().join("sstables").exists(), "the engines booted before the failure");
+    }
+
     // A1.5: a bridge capacity the channel cannot take down must fail the
     // in-process start before the engines, SHM and background tasks are up.
     #[test]
@@ -852,6 +896,7 @@ mod tests {
     // A live keep-alive connection learns about the shutdown: hyper closes it
     // instead of the drain having to wait out its 5 s cap.
     #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     fn shutdown_closes_idle_keep_alive_connections() {
         let dir = tempfile::TempDir::new().unwrap();
         let server = Server::start(Arc::new(test_config(dir.path())), &dir.path().join("luradb.toml")).unwrap();
@@ -934,6 +979,7 @@ mod tests {
     // PUT and a GET of the same key, opened as two streams without waiting
     // for the first answer, run one after the other.
     #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     fn http2_streams_on_one_connection_keep_their_order() {
         with_server(|addr| async move {
             assert_eq!(server_max_concurrent_streams(addr).await, Some(1));

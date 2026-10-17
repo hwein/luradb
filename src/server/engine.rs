@@ -1,6 +1,6 @@
 //! Engine-thread bootstrap and shutdown (spec perf/018a A1.1): the storage
 //! engines, their background tasks and SHM live on the engine thread's
-//! tokio-uring runtime.
+//! compio runtime (spec perf/020).
 
 use crate::{
     api::{self, middleware::ParsedCidr, AppState},
@@ -98,7 +98,7 @@ fn build_engine_configs(
 
 // --- Storage thread (perf/005): dedicated OS thread driving a SQPOLL
 // io_uring ring. When io_engine.enabled it owns the WAL/VLog files and
-// performs their I/O; otherwise the tokio::fs paths in `bootstrap_engine`
+// performs their I/O; otherwise the local file paths in `bootstrap_engine`
 // stay in use.
 fn start_storage_thread(
     cfg: &LuraConfig,
@@ -120,7 +120,7 @@ fn start_storage_thread(
                 Some(handle)
             }
             Err(e) => {
-                tracing::warn!("Storage thread disabled: {e}. Falling back to tokio::fs I/O.");
+                tracing::warn!("Storage thread disabled: {e}. Falling back to local file I/O.");
                 None
             }
         }
@@ -231,7 +231,7 @@ fn init_backup(
         &cfg.backup.schedule,
         Arc::clone(shutdown_flag),
     )?);
-    tokio::spawn(async move { scheduler.run().await });
+    compio::runtime::spawn(async move { scheduler.run().await }).detach();
     tracing::info!("Backup manager ready ({} schedule(s)).", cfg.backup.schedule.len());
     Ok(Some(manager))
 }
@@ -270,7 +270,7 @@ fn spawn_background_tasks(
 ) -> Arc<AtomicBool> {
     // --- Metrics ticker (background) ---
     let ticker = MetricsTicker::new(Arc::clone(metrics));
-    tokio::spawn(async move { ticker.run().await });
+    compio::runtime::spawn(async move { ticker.run().await }).detach();
     tracing::info!("Metrics ticker started.");
 
     // --- Domain purger (background) ---
@@ -280,7 +280,7 @@ fn spawn_background_tasks(
     if !cfg.log.path.is_empty() && cfg.log.retention_days > 0 {
         let janitor = logging::LogJanitor::new(&cfg.log.path, cfg.log.retention_days);
         let janitor_shutdown = Arc::clone(&shutdown_flag);
-        tokio::spawn(async move { janitor.run(janitor_shutdown).await });
+        compio::runtime::spawn(async move { janitor.run(janitor_shutdown).await }).detach();
     }
 
     let purger = Arc::new(DomainPurger::new(
@@ -290,7 +290,7 @@ fn spawn_background_tasks(
         purger_batch_size,
         purger_interval_secs,
     ));
-    tokio::spawn(async move { purger.run().await });
+    compio::runtime::spawn(async move { purger.run().await }).detach();
 
     // --- TTL sweeper (background, spec kv/025 §6) ---
     // KV only: JSON and rel never write an `expire_at`.
@@ -301,7 +301,7 @@ fn spawn_background_tasks(
             cfg.ttl_sweeper.batch_size,
             cfg.ttl_sweeper.interval_secs,
         ));
-        tokio::spawn(async move { sweeper.run().await });
+        compio::runtime::spawn(async move { sweeper.run().await }).detach();
     }
 
     // --- JSON domain purger (background) ---
@@ -312,7 +312,7 @@ fn spawn_background_tasks(
             crate::engines::json::purger::PURGER_BATCH_SIZE,
             crate::engines::json::purger::PURGER_INTERVAL_SECS,
         ));
-        tokio::spawn(async move { json_purger.run().await });
+        compio::runtime::spawn(async move { json_purger.run().await }).detach();
     }
 
     // --- Cross-engine sweeper (background, spec rel/012 §5) ---
@@ -324,7 +324,7 @@ fn spawn_background_tasks(
                 crate::engines::rel::cross_engine::SWEEP_BATCH_SIZE,
                 crate::engines::rel::cross_engine::SWEEP_INTERVAL_SECS,
             ));
-            tokio::spawn(async move { sweeper.run().await });
+            compio::runtime::spawn(async move { sweeper.run().await }).detach();
         }
     }
 
@@ -336,7 +336,7 @@ fn spawn_background_tasks(
             crate::engines::rel::purger::PURGER_BATCH_SIZE,
             crate::engines::rel::purger::PURGER_INTERVAL_SECS,
         ));
-        tokio::spawn(async move { rel_purger.run().await });
+        compio::runtime::spawn(async move { rel_purger.run().await }).detach();
     }
 
     shutdown_flag
@@ -345,9 +345,9 @@ fn spawn_background_tasks(
 // Replaces five loose `Option` variables (see `start_shm`/`stop_shm`).
 struct ShmServices {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
-    reg_task: tokio::task::JoinHandle<()>,
-    dispatcher_task: tokio::task::JoinHandle<()>,
-    publisher_task: tokio::task::JoinHandle<()>,
+    reg_task: compio::runtime::JoinHandle<()>,
+    dispatcher_task: compio::runtime::JoinHandle<()>,
+    publisher_task: compio::runtime::JoinHandle<()>,
     reg_socket: String,
 }
 
@@ -383,7 +383,7 @@ async fn start_shm(
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let dispatcher = ipc::ShmDispatcher::new(Arc::clone(registry));
-        let dispatcher_task = tokio::spawn(dispatcher.run(events_rx, shutdown_rx.clone()));
+        let dispatcher_task = compio::runtime::spawn(dispatcher.run(events_rx, shutdown_rx.clone()));
 
         // Reader slots of the registered clients (spec perf/012): the
         // registration listener leases them, the publisher scans them.
@@ -392,7 +392,7 @@ async fn start_shm(
         // RCU read-snapshot publisher (spec perf/009, perf/028): checks on an
         // interval and after every flush, rebuilds the SHM double-buffer
         // snapshot only after a change.
-        // Spawned on the tokio-uring executor since SnapshotWriter is !Send.
+        // A task of the engine thread's own runtime: SnapshotWriter is !Send.
         let publisher = ipc::SnapshotPublisher::new(
             ipc::SnapshotBuilder::new(
                 Arc::clone(registry),
@@ -406,7 +406,7 @@ async fn start_shm(
             lsm_store.flush_notify(),
             shutdown_rx.clone(),
         );
-        let publisher_task = tokio_uring::spawn(publisher.run());
+        let publisher_task = compio::runtime::spawn(publisher.run());
         tracing::info!(
             "SHM snapshot publisher active (interval {} ms)",
             cfg.shm.snapshot_interval_ms
@@ -420,7 +420,7 @@ async fn start_shm(
             trusted_uids: Arc::new(cfg.auth.trusted_uids.clone()),
             readers,
         };
-        let reg_task = tokio::spawn(ipc::serve_registration(listener, reg_config, events_tx, shutdown_rx));
+        let reg_task = compio::runtime::spawn(ipc::serve_registration(listener, reg_config, events_tx, shutdown_rx));
         tracing::info!("SHM registration listener active on {reg_path}");
         Some(ShmServices { shutdown_tx, reg_task, dispatcher_task, publisher_task, reg_socket: reg_path })
     } else {

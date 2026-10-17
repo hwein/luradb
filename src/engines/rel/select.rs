@@ -887,432 +887,478 @@ mod tests {
 
     // 1. PK-point (generalized): identical to the rel/005 behavior, now
     // running through the new access-path executor.
-    #[tokio::test]
-    async fn test_pk_point_regression() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 100)").await;
+    #[test]
+    fn test_pk_point_regression() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 100)").await;
 
-        let s = sel(&rel, "SELECT * FROM t WHERE id = 1").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(1), ScalarValue::Integer(100)]]);
-        assert!(!s.limit_applied);
+            let s = sel(&rel, "SELECT * FROM t WHERE id = 1").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(1), ScalarValue::Integer(100)]]);
+            assert!(!s.limit_applied);
 
-        assert!(sel(&rel, "SELECT * FROM t WHERE id = 2").await.rows.is_empty());
+            assert!(sel(&rel, "SELECT * FROM t WHERE id = 2").await.rows.is_empty());
+        })
     }
 
     // 2. Full scan without WHERE: all rows; `*` and a column list with alias.
-    #[tokio::test]
-    async fn test_full_scan_projection_and_alias() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')").await;
+    #[test]
+    fn test_full_scan_projection_and_alias() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')").await;
 
-        let s = sel(&rel, "SELECT * FROM t").await;
-        assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["id", "a", "b"]);
-        assert_eq!(s.rows.len(), 2);
+            let s = sel(&rel, "SELECT * FROM t").await;
+            assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["id", "a", "b"]);
+            assert_eq!(s.rows.len(), 2);
 
-        let s = sel(&rel, "SELECT b AS label, id FROM t").await;
-        assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["label", "id"]);
-        assert!(s.rows.iter().any(|r| r == &vec![ScalarValue::Text("x".into()), ScalarValue::Integer(1)]));
+            let s = sel(&rel, "SELECT b AS label, id FROM t").await;
+            assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["label", "id"]);
+            assert!(s.rows.iter().any(|r| r == &vec![ScalarValue::Text("x".into()), ScalarValue::Integer(1)]));
+        })
     }
 
     // 3. Full scan with a residual WHERE: AND/OR/NOT/parens, IN, LIKE, IS NULL
     // all filter correctly through the rel/005 evaluator.
-    #[tokio::test]
-    async fn test_full_scan_residual_operators() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, note TEXT)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 1, 'alpha'), (2, 2, 'beta'), (3, NULL, 'gamma')").await;
+    #[test]
+    fn test_full_scan_residual_operators() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, note TEXT)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 1, 'alpha'), (2, 2, 'beta'), (3, NULL, 'gamma')").await;
 
-        let s = sel(&rel, "SELECT id FROM t WHERE NOT (grp = 1) OR note = 'gamma'").await;
-        assert_eq!(ints(&s.rows, 0), vec![2, 3]);
+            let s = sel(&rel, "SELECT id FROM t WHERE NOT (grp = 1) OR note = 'gamma'").await;
+            assert_eq!(ints(&s.rows, 0), vec![2, 3]);
 
-        let s = sel(&rel, "SELECT id FROM t WHERE grp IN (1, 2)").await;
-        assert_eq!(ints(&s.rows, 0), vec![1, 2]);
+            let s = sel(&rel, "SELECT id FROM t WHERE grp IN (1, 2)").await;
+            assert_eq!(ints(&s.rows, 0), vec![1, 2]);
 
-        let s = sel(&rel, "SELECT id FROM t WHERE note LIKE 'al%'").await;
-        assert_eq!(ints(&s.rows, 0), vec![1]);
+            let s = sel(&rel, "SELECT id FROM t WHERE note LIKE 'al%'").await;
+            assert_eq!(ints(&s.rows, 0), vec![1]);
 
-        let s = sel(&rel, "SELECT id FROM t WHERE grp IS NULL").await;
-        assert_eq!(ints(&s.rows, 0), vec![3]);
+            let s = sel(&rel, "SELECT id FROM t WHERE grp IS NULL").await;
+            assert_eq!(ints(&s.rows, 0), vec![3]);
+        })
     }
 
     // 4. Index point: same set as a full-scan reference; scans only the
     // matching IDX entries, not every ROW key.
-    #[tokio::test]
-    async fn test_index_point_scans_fewer_keys_than_full_scan() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 7), (3, 5), (4, 9)").await;
+    #[test]
+    fn test_index_point_scans_fewer_keys_than_full_scan() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 7), (3, 5), (4, 9)").await;
 
-        let before = scanned_keys(&rel);
-        let s = sel(&rel, "SELECT id FROM t WHERE tag = 5").await;
-        let after = scanned_keys(&rel);
-        assert_eq!(ints(&s.rows, 0), vec![1, 3]);
-        assert_eq!(after - before, 2, "index point must visit only the 2 matching IDX entries");
+            let before = scanned_keys(&rel);
+            let s = sel(&rel, "SELECT id FROM t WHERE tag = 5").await;
+            let after = scanned_keys(&rel);
+            assert_eq!(ints(&s.rows, 0), vec![1, 3]);
+            assert_eq!(after - before, 2, "index point must visit only the 2 matching IDX entries");
 
-        let before2 = after;
-        let full = sel(&rel, "SELECT id FROM t").await;
-        let after2 = scanned_keys(&rel);
-        assert_eq!(full.rows.len(), 4);
-        assert_eq!(after2 - before2, 4, "full scan visits all 4 ROW keys");
+            let before2 = after;
+            let full = sel(&rel, "SELECT id FROM t").await;
+            let after2 = scanned_keys(&rel);
+            assert_eq!(full.rows.len(), 4);
+            assert_eq!(after2 - before2, 4, "full scan visits all 4 ROW keys");
+        })
     }
 
     // 5. Unique-index point: 0/1 row.
-    #[tokio::test]
-    async fn test_unique_index_point() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 'a@x.com'), (2, 'b@x.com')").await;
+    #[test]
+    fn test_unique_index_point() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 'a@x.com'), (2, 'b@x.com')").await;
 
-        assert_eq!(ints(&sel(&rel, "SELECT id FROM t WHERE email = 'a@x.com'").await.rows, 0), vec![1]);
-        assert!(sel(&rel, "SELECT id FROM t WHERE email = 'ghost@x.com'").await.rows.is_empty());
+            assert_eq!(ints(&sel(&rel, "SELECT id FROM t WHERE email = 'a@x.com'").await.rows, 0), vec![1]);
+            assert!(sel(&rel, "SELECT id FROM t WHERE email = 'ghost@x.com'").await.rows.is_empty());
+        })
     }
 
     // 6. PK range: correct window including both boundaries; a second
     // same-column range conjunct becomes residual (only one predicate drives).
-    #[tokio::test]
-    async fn test_pk_range_inclusive_bounds() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1), (2), (3), (4), (5)").await;
+    #[test]
+    fn test_pk_range_inclusive_bounds() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1), (2), (3), (4), (5)").await;
 
-        let s = sel(&rel, "SELECT id FROM t WHERE id >= 2 AND id <= 4").await;
-        assert_eq!(ints(&s.rows, 0), vec![2, 3, 4]);
+            let s = sel(&rel, "SELECT id FROM t WHERE id >= 2 AND id <= 4").await;
+            assert_eq!(ints(&s.rows, 0), vec![2, 3, 4]);
+        })
     }
 
     // 7. Index range on a NOT NULL column: correct byte-comparison window,
     // incl. i64 extremes and text ordering.
-    #[tokio::test]
-    async fn test_index_range_not_null_incl_i64_extremes_and_text_order() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL, s TEXT NOT NULL)").await;
-        ok(&rel, "CREATE INDEX idx_v ON t (v)").await;
-        ok(&rel, "CREATE INDEX idx_s ON t (s)").await;
-        ok(
-            &rel,
-            &format!(
-                "INSERT INTO t VALUES (1, {}, 'banana'), (2, -1, 'apple'), (3, 0, 'cherry'), \
+    #[test]
+    fn test_index_range_not_null_incl_i64_extremes_and_text_order() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL, s TEXT NOT NULL)").await;
+            ok(&rel, "CREATE INDEX idx_v ON t (v)").await;
+            ok(&rel, "CREATE INDEX idx_s ON t (s)").await;
+            ok(
+                &rel,
+                &format!(
+                    "INSERT INTO t VALUES (1, {}, 'banana'), (2, -1, 'apple'), (3, 0, 'cherry'), \
                  (4, {}, 'date'), (5, 100, 'fig')",
-                i64::MIN,
-                i64::MAX
-            ),
-        )
-        .await;
+                    i64::MIN,
+                    i64::MAX
+                ),
+            )
+            .await;
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE v > 0").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![4, 5]);
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE v > 0").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![4, 5]);
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE v <= -1").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![1, 2]);
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE v <= -1").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![1, 2]);
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE s > 'cherry'").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![4, 5], "text order: date/fig > cherry");
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE s > 'cherry'").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![4, 5], "text order: date/fig > cherry");
+        })
     }
 
     // 8. LIKE: 'prefix%' drives an index range + residual re-check; a
     // leading-wildcard pattern forces a full scan with a correct result.
-    #[tokio::test]
-    async fn test_like_prefix_and_leading_wildcard() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").await;
-        ok(&rel, "CREATE INDEX idx_name ON t (name)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 'alice'), (2, 'alba'), (3, 'bob'), (4, 'alicia')").await;
+    #[test]
+    fn test_like_prefix_and_leading_wildcard() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").await;
+            ok(&rel, "CREATE INDEX idx_name ON t (name)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 'alice'), (2, 'alba'), (3, 'bob'), (4, 'alicia')").await;
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE name LIKE 'ali%'").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![1, 4], "'alba' shares only 'al', not the 'ali' prefix");
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE name LIKE 'ali%'").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![1, 4], "'alba' shares only 'al', not the 'ali' prefix");
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE name LIKE 'alic_'").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![1], "'_' matches exactly one char: 'alice' fits, 'alicia' doesn't");
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE name LIKE 'alic_'").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![1], "'_' matches exactly one char: 'alice' fits, 'alicia' doesn't");
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE name LIKE '%b%'").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![2, 3], "leading wildcard -> full scan, still correct");
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE name LIKE '%b%'").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![2, 3], "leading wildcard -> full scan, still correct");
+        })
     }
 
     // 9. Access-path determinism: the highest-priority sargable conjunct
     // drives (PK over index); a top-level OR forces a full scan.
-    #[tokio::test]
-    async fn test_access_path_determinism() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 5), (3, 9)").await;
+    #[test]
+    fn test_access_path_determinism() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 5), (3, 9)").await;
 
-        let before = scanned_keys(&rel);
-        let s = sel(&rel, "SELECT id FROM t WHERE id = 1 AND tag = 5").await;
-        let after = scanned_keys(&rel);
-        assert_eq!(ints(&s.rows, 0), vec![1]);
-        assert_eq!(after - before, 1, "PK point must drive (1 ROW key), not the tag index");
+            let before = scanned_keys(&rel);
+            let s = sel(&rel, "SELECT id FROM t WHERE id = 1 AND tag = 5").await;
+            let after = scanned_keys(&rel);
+            assert_eq!(ints(&s.rows, 0), vec![1]);
+            assert_eq!(after - before, 1, "PK point must drive (1 ROW key), not the tag index");
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE id = 1 OR tag = 9").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![1, 3]);
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE id = 1 OR tag = 9").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![1, 3]);
+        })
     }
 
     // 10. ORDER BY pk under a full scan: free ordering, no Sort fallback.
-    #[tokio::test]
-    async fn test_order_by_pk_full_scan_no_sort() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (3), (1), (2)").await;
+    #[test]
+    fn test_order_by_pk_full_scan_no_sort() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (3), (1), (2)").await;
 
-        let before = sort_fallback_total(&rel);
-        let s = sel(&rel, "SELECT id FROM t ORDER BY id").await;
-        assert_eq!(ints(&s.rows, 0), vec![1, 2, 3]);
-        assert_eq!(sort_fallback_total(&rel), before, "PK order is free under a full scan");
+            let before = sort_fallback_total(&rel);
+            let s = sel(&rel, "SELECT id FROM t ORDER BY id").await;
+            assert_eq!(ints(&s.rows, 0), vec![1, 2, 3]);
+            assert_eq!(sort_fallback_total(&rel), before, "PK order is free under a full scan");
 
-        let s = sel(&rel, "SELECT id FROM t ORDER BY id DESC").await;
-        assert_eq!(ints(&s.rows, 0), vec![3, 2, 1]);
+            let s = sel(&rel, "SELECT id FROM t ORDER BY id DESC").await;
+            assert_eq!(ints(&s.rows, 0), vec![3, 2, 1]);
+        })
     }
 
     // 11. ORDER BY on the driven indexed NOT-NULL column: index order, no Sort.
-    #[tokio::test]
-    async fn test_order_by_driven_indexed_column_no_sort() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await;
-        ok(&rel, "CREATE INDEX idx_v ON t (v)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)").await;
+    #[test]
+    fn test_order_by_driven_indexed_column_no_sort() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await;
+            ok(&rel, "CREATE INDEX idx_v ON t (v)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)").await;
 
-        let before = sort_fallback_total(&rel);
-        let s = sel(&rel, "SELECT id FROM t WHERE v >= 10 ORDER BY v").await;
-        assert_eq!(ints(&s.rows, 0), vec![2, 3, 1]);
-        assert_eq!(sort_fallback_total(&rel), before, "index order on the driving column is free");
+            let before = sort_fallback_total(&rel);
+            let s = sel(&rel, "SELECT id FROM t WHERE v >= 10 ORDER BY v").await;
+            assert_eq!(ints(&s.rows, 0), vec![2, 3, 1]);
+            assert_eq!(sort_fallback_total(&rel), before, "index order on the driving column is free");
+        })
     }
 
     // 12. ORDER BY on a nullable column: Sort fallback; NULLS LAST (ASC) and
     // NULLS FIRST (DESC).
-    #[tokio::test]
-    async fn test_order_by_nullable_column_sort_path_nulls_placement() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 20), (2, NULL), (3, 10)").await;
+    #[test]
+    fn test_order_by_nullable_column_sort_path_nulls_placement() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 20), (2, NULL), (3, 10)").await;
 
-        let before = sort_fallback_total(&rel);
-        let s = sel(&rel, "SELECT id FROM t ORDER BY v ASC").await;
-        assert_eq!(ints(&s.rows, 0), vec![3, 1, 2], "NULLS LAST on ASC");
-        assert_eq!(sort_fallback_total(&rel), before + 1);
+            let before = sort_fallback_total(&rel);
+            let s = sel(&rel, "SELECT id FROM t ORDER BY v ASC").await;
+            assert_eq!(ints(&s.rows, 0), vec![3, 1, 2], "NULLS LAST on ASC");
+            assert_eq!(sort_fallback_total(&rel), before + 1);
 
-        let s = sel(&rel, "SELECT id FROM t ORDER BY v DESC").await;
-        assert_eq!(ints(&s.rows, 0), vec![2, 1, 3], "NULLS FIRST on DESC");
+            let s = sel(&rel, "SELECT id FROM t ORDER BY v DESC").await;
+            assert_eq!(ints(&s.rows, 0), vec![2, 1, 3], "NULLS FIRST on DESC");
+        })
     }
 
     // 13. Multi-column ORDER BY: Sort fallback; DESC reverses that column.
-    #[tokio::test]
-    async fn test_multi_column_order_by_sort_path() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 1, 20), (2, 1, 10), (3, 2, 5)").await;
+    #[test]
+    fn test_multi_column_order_by_sort_path() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 1, 20), (2, 1, 10), (3, 2, 5)").await;
 
-        let s = sel(&rel, "SELECT id FROM t ORDER BY grp ASC, v DESC").await;
-        assert_eq!(ints(&s.rows, 0), vec![1, 2, 3]);
+            let s = sel(&rel, "SELECT id FROM t ORDER BY grp ASC, v DESC").await;
+            assert_eq!(ints(&s.rows, 0), vec![1, 2, 3]);
+        })
     }
 
     // 14. ORDER-BY-driven path without WHERE: an indexed NOT-NULL column
     // drives the ordered range scan directly, no Sort.
-    #[tokio::test]
-    async fn test_order_by_driven_path_without_where() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await;
-        ok(&rel, "CREATE INDEX idx_v ON t (v)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)").await;
+    #[test]
+    fn test_order_by_driven_path_without_where() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await;
+            ok(&rel, "CREATE INDEX idx_v ON t (v)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)").await;
 
-        let before = sort_fallback_total(&rel);
-        let s = sel(&rel, "SELECT id FROM t ORDER BY v").await;
-        assert_eq!(ints(&s.rows, 0), vec![2, 3, 1]);
-        assert_eq!(sort_fallback_total(&rel), before, "no WHERE: ORDER BY itself drives the index range");
+            let before = sort_fallback_total(&rel);
+            let s = sel(&rel, "SELECT id FROM t ORDER BY v").await;
+            assert_eq!(ints(&s.rows, 0), vec![2, 3, 1]);
+            assert_eq!(sort_fallback_total(&rel), before, "no WHERE: ORDER BY itself drives the index range");
+        })
     }
 
     // 15. max_sort_rows exceeded -> SortBufferExceeded, no partial/spilled result.
-    #[tokio::test]
-    async fn test_sort_buffer_exceeded() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_sort_rows: 3, ..config_in(dir.path()) }).await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 4), (2, 3), (3, 2), (4, 1)").await;
+    #[test]
+    fn test_sort_buffer_exceeded() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let rel = boot(RelStoreConfig { max_sort_rows: 3, ..config_in(dir.path()) }).await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 4), (2, 3), (3, 2), (4, 1)").await;
 
-        let e = err(&rel, "SELECT id FROM t ORDER BY v").await;
-        assert!(matches!(e, RelStoreError::SortBufferExceeded { rows: 4, max: 3 }), "got: {e}");
+            let e = err(&rel, "SELECT id FROM t ORDER BY v").await;
+            assert!(matches!(e, RelStoreError::SortBufferExceeded { rows: 4, max: 3 }), "got: {e}");
+        })
     }
 
     // 16. LIMIT/OFFSET: default_limit without LIMIT; explicit LIMIT >
     // max_limit capped (limit_applied = true); OFFSET correct; more rows
     // withheld -> limit_applied = true, exact/short fit -> false; negative
     // LIMIT/OFFSET rejected.
-    #[tokio::test]
-    async fn test_limit_offset_semantics() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut rel = boot(RelStoreConfig { max_limit: 5, ..config_in(dir.path()) }).await;
-        Arc::get_mut(&mut rel).unwrap().set_default_limit(3);
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7)").await;
+    #[test]
+    fn test_limit_offset_semantics() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut rel = boot(RelStoreConfig { max_limit: 5, ..config_in(dir.path()) }).await;
+            Arc::get_mut(&mut rel).unwrap().set_default_limit(3);
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7)").await;
 
-        let s = sel(&rel, "SELECT id FROM t ORDER BY id").await;
-        assert_eq!(ints(&s.rows, 0), vec![1, 2, 3]);
-        assert!(s.limit_applied, "more rows exist past default_limit");
+            let s = sel(&rel, "SELECT id FROM t ORDER BY id").await;
+            assert_eq!(ints(&s.rows, 0), vec![1, 2, 3]);
+            assert!(s.limit_applied, "more rows exist past default_limit");
 
-        let s = sel(&rel, "SELECT id FROM t ORDER BY id LIMIT 100").await;
-        assert_eq!(ints(&s.rows, 0), vec![1, 2, 3, 4, 5]);
-        assert!(s.limit_applied, "explicit LIMIT capped by max_limit");
+            let s = sel(&rel, "SELECT id FROM t ORDER BY id LIMIT 100").await;
+            assert_eq!(ints(&s.rows, 0), vec![1, 2, 3, 4, 5]);
+            assert!(s.limit_applied, "explicit LIMIT capped by max_limit");
 
-        let s = sel(&rel, "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 4").await;
-        assert_eq!(ints(&s.rows, 0), vec![5, 6, 7]);
-        assert!(!s.limit_applied, "exactly 3 rows remained after OFFSET 4 of 7");
+            let s = sel(&rel, "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 4").await;
+            assert_eq!(ints(&s.rows, 0), vec![5, 6, 7]);
+            assert!(!s.limit_applied, "exactly 3 rows remained after OFFSET 4 of 7");
 
-        let s = sel(&rel, "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 6").await;
-        assert_eq!(ints(&s.rows, 0), vec![7]);
-        assert!(!s.limit_applied, "fewer than LIMIT remained");
+            let s = sel(&rel, "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 6").await;
+            assert_eq!(ints(&s.rows, 0), vec![7]);
+            assert!(!s.limit_applied, "fewer than LIMIT remained");
 
-        assert!(matches!(err(&rel, "SELECT id FROM t LIMIT -1").await, RelStoreError::InvalidSchema(_)));
-        assert!(matches!(
-            err(&rel, "SELECT id FROM t LIMIT 1 OFFSET -1").await,
-            RelStoreError::InvalidSchema(_)
-        ));
+            assert!(matches!(err(&rel, "SELECT id FROM t LIMIT -1").await, RelStoreError::InvalidSchema(_)));
+            assert!(matches!(
+                err(&rel, "SELECT id FROM t LIMIT 1 OFFSET -1").await,
+                RelStoreError::InvalidSchema(_)
+            ));
+        })
     }
 
     // 17. COUNT(*) without WHERE: pure key count, one row/one column.
-    #[tokio::test]
-    async fn test_count_star_no_where() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1),(2),(3)").await;
+    #[test]
+    fn test_count_star_no_where() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1),(2),(3)").await;
 
-        let s = sel(&rel, "SELECT COUNT(*) FROM t").await;
-        assert_eq!(s.columns, vec![("count".to_string(), ColumnType::Integer)]);
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(3)]]);
-        assert!(!s.limit_applied);
+            let s = sel(&rel, "SELECT COUNT(*) FROM t").await;
+            assert_eq!(s.columns, vec![("count".to_string(), ColumnType::Integer)]);
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(3)]]);
+            assert!(!s.limit_applied);
+        })
     }
 
     // 18. COUNT(*) with WHERE: correct count via residual; an index path
     // without residual is a pure key count.
-    #[tokio::test]
-    async fn test_count_star_with_where_and_index_key_count() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER, note TEXT)").await;
-        ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5, 'x'), (2, 5, 'y'), (3, 9, 'x')").await;
+    #[test]
+    fn test_count_star_with_where_and_index_key_count() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER, note TEXT)").await;
+            ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5, 'x'), (2, 5, 'y'), (3, 9, 'x')").await;
 
-        let s = sel(&rel, "SELECT COUNT(*) FROM t WHERE tag = 5").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(2)]]);
+            let s = sel(&rel, "SELECT COUNT(*) FROM t WHERE tag = 5").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(2)]]);
 
-        let s = sel(&rel, "SELECT COUNT(*) FROM t WHERE tag = 5 AND note = 'x'").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(1)]]);
+            let s = sel(&rel, "SELECT COUNT(*) FROM t WHERE tag = 5 AND note = 'x'").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(1)]]);
+        })
     }
 
     // 19. NULL/Index: IS NULL forces a full scan and finds the NULL rows; an
     // index point on a nullable column simply never matches NULL rows
     // (they're absent from the index).
-    #[tokio::test]
-    async fn test_null_is_null_full_scan_and_index_point_skips_nulls() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5), (2, NULL), (3, NULL), (4, 5)").await;
+    #[test]
+    fn test_null_is_null_full_scan_and_index_point_skips_nulls() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5), (2, NULL), (3, NULL), (4, 5)").await;
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE tag IS NULL").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![2, 3]);
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE tag IS NULL").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![2, 3]);
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE tag = 5").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![1, 4]);
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE tag = 5").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![1, 4]);
+        })
     }
 
     // 21. MVCC/Ghost: a key live at scan time but absent at the (older)
     // snapshot is silently skipped, not surfaced and not an error.
-    #[tokio::test]
-    async fn test_mvcc_ghost_skipped_not_error() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1)").await;
+    #[test]
+    fn test_mvcc_ghost_skipped_not_error() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1)").await;
 
-        let snapshot_guard = rel.engine().snapshot();
-        let snap = snapshot_guard.snapshot().clone();
-        ok(&rel, "INSERT INTO t VALUES (2)").await; // live now, but not in `snap`
+            let snapshot_guard = rel.engine().snapshot();
+            let snap = snapshot_guard.snapshot().clone();
+            ok(&rel, "INSERT INTO t VALUES (2)").await; // live now, but not in `snap`
 
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let schema = match rel.get_object("default", "t").unwrap() {
-            CatalogEntry::Table(t) => t,
-            _ => unreachable!(),
-        };
-        let table_id = schema.table_id;
-        let key1 = keys::row_key(&prefix, table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
-        let key2 = keys::row_key(&prefix, table_id, &encode_sortable(&ScalarValue::Integer(2)).unwrap());
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let schema = match rel.get_object("default", "t").unwrap() {
+                CatalogEntry::Table(t) => t,
+                _ => unreachable!(),
+            };
+            let table_id = schema.table_id;
+            let key1 = keys::row_key(&prefix, table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
+            let key2 = keys::row_key(&prefix, table_id, &encode_sortable(&ScalarValue::Integer(2)).unwrap());
 
-        let mut scan = RowScan {
-            engine: Arc::clone(rel.engine()),
-            snapshot: snap,
-            schema: Arc::new(schema),
-            table_id,
-            alias: "t".to_string(),
-            keys: vec![key1, key2].into_iter(),
-            mask: LinkMask::default(),
-            coop: YieldEvery::new(ROW_YIELD_INTERVAL),
-        };
-        let row1 = scan.next().await.unwrap().expect("key1 exists at snap");
-        assert_eq!(row1.bindings[0].values[0], ScalarValue::Integer(1));
-        assert!(scan.next().await.unwrap().is_none(), "ghost key2 must be skipped silently");
+            let mut scan = RowScan {
+                engine: Arc::clone(rel.engine()),
+                snapshot: snap,
+                schema: Arc::new(schema),
+                table_id,
+                alias: "t".to_string(),
+                keys: vec![key1, key2].into_iter(),
+                mask: LinkMask::default(),
+                coop: YieldEvery::new(ROW_YIELD_INTERVAL),
+            };
+            let row1 = scan.next().await.unwrap().expect("key1 exists at snap");
+            assert_eq!(row1.bindings[0].values[0], ScalarValue::Integer(1));
+            assert!(scan.next().await.unwrap().is_none(), "ghost key2 must be skipped silently");
+        })
     }
 
     // 22. Metrics: statement + scanned-key counters increment as expected.
-    #[tokio::test]
-    async fn test_select_metrics_increment() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1), (2), (3)").await;
+    #[test]
+    fn test_select_metrics_increment() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1), (2), (3)").await;
 
-        let stmts_before = statements_total(&rel);
-        let keys_before = scanned_keys(&rel);
-        sel(&rel, "SELECT * FROM t").await;
-        assert_eq!(statements_total(&rel), stmts_before + 1);
-        assert_eq!(scanned_keys(&rel) - keys_before, 3);
+            let stmts_before = statements_total(&rel);
+            let keys_before = scanned_keys(&rel);
+            sel(&rel, "SELECT * FROM t").await;
+            assert_eq!(statements_total(&rel), stmts_before + 1);
+            assert_eq!(scanned_keys(&rel) - keys_before, 3);
 
-        sel(&rel, "SELECT COUNT(*) FROM t").await;
-        assert_eq!(statements_total(&rel), stmts_before + 2);
+            sel(&rel, "SELECT COUNT(*) FROM t").await;
+            assert_eq!(statements_total(&rel), stmts_before + 2);
+        })
     }
 
     // 23. COUNT(*) via PK-point verifies existence: a missing PK counts 0,
     //     not 1 (the constructed key must not be counted blindly).
-    #[tokio::test]
-    async fn test_count_pk_point_checks_existence() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1)").await;
+    #[test]
+    fn test_count_pk_point_checks_existence() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1)").await;
 
-        let hit = sel(&rel, "SELECT COUNT(*) FROM t WHERE id = 1").await;
-        assert_eq!(hit.rows[0][0], ScalarValue::Integer(1));
+            let hit = sel(&rel, "SELECT COUNT(*) FROM t WHERE id = 1").await;
+            assert_eq!(hit.rows[0][0], ScalarValue::Integer(1));
 
-        let miss = sel(&rel, "SELECT COUNT(*) FROM t WHERE id = 99").await;
-        assert_eq!(miss.rows[0][0], ScalarValue::Integer(0), "missing PK must count 0");
+            let miss = sel(&rel, "SELECT COUNT(*) FROM t WHERE id = 99").await;
+            assert_eq!(miss.rows[0][0], ScalarValue::Integer(0), "missing PK must count 0");
+        })
     }
 
     // 24. flip_op: literal-on-the-left comparisons (`3 = id`, `3 < id`, `3 >=
     // id`) resolve the same as their column-first form (point + range).
-    #[tokio::test]
-    async fn test_flipped_literal_left_point_and_range() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1), (2), (3), (4), (5)").await;
+    #[test]
+    fn test_flipped_literal_left_point_and_range() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1), (2), (3), (4), (5)").await;
 
-        let before = scanned_keys(&rel);
-        let s = sel(&rel, "SELECT id FROM t WHERE 3 = id").await;
-        let after = scanned_keys(&rel);
-        assert_eq!(ints(&s.rows, 0), vec![3]);
-        assert_eq!(after - before, 1, "literal-left point must drive PK point (1 key), not a full scan");
+            let before = scanned_keys(&rel);
+            let s = sel(&rel, "SELECT id FROM t WHERE 3 = id").await;
+            let after = scanned_keys(&rel);
+            assert_eq!(ints(&s.rows, 0), vec![3]);
+            assert_eq!(after - before, 1, "literal-left point must drive PK point (1 key), not a full scan");
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE 3 < id").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![4, 5], "flip_op(Lt)=Gt: '3 < id' means id > 3");
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE 3 < id").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![4, 5], "flip_op(Lt)=Gt: '3 < id' means id > 3");
 
-        let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE 3 >= id").await.rows, 0);
-        got.sort();
-        assert_eq!(got, vec![1, 2, 3], "flip_op(GtEq)=LtEq: '3 >= id' means id <= 3");
+            let mut got = ints(&sel(&rel, "SELECT id FROM t WHERE 3 >= id").await.rows, 0);
+            got.sort();
+            assert_eq!(got, vec![1, 2, 3], "flip_op(GtEq)=LtEq: '3 >= id' means id <= 3");
+        })
     }
 
     // 25. Spec rel/014 §5 (wiring regression): a table with generous headroom
@@ -1323,31 +1369,33 @@ mod tests {
     // regress under real interleaving. Bounded, no tight timing window as
     // the test condition (general/008-line): any short page or `false` here
     // is a genuine bug, not a flake.
-    #[tokio::test]
-    async fn test_fast_limit_snapshot_consistent_under_concurrent_inserts() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
-        // Baseline PKs (1000..1020) sort after every concurrently-inserted
-        // row below, and comfortably exceed limit(10) + 1.
-        for i in 1000..1020 {
-            ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
-        }
-
-        let writer = Arc::clone(&rel);
-        let inserter = tokio::spawn(async move {
-            // Early-sorting PKs: a ghost landing in the capped scan window
-            // must never displace a real row.
-            for i in 0..50 {
-                writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+    #[test]
+    fn test_fast_limit_snapshot_consistent_under_concurrent_inserts() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+            // Baseline PKs (1000..1020) sort after every concurrently-inserted
+            // row below, and comfortably exceed limit(10) + 1.
+            for i in 1000..1020 {
+                ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
             }
-        });
 
-        for _ in 0..50 {
-            let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
-            assert_eq!(s.rows.len(), 10, "a concurrent insert must never shrink a full LIMIT page");
-            assert!(s.limit_applied, "more rows exist past LIMIT -- must stay true under concurrent inserts");
-        }
-        inserter.await.unwrap();
+            let writer = Arc::clone(&rel);
+            let inserter = compio::runtime::spawn(async move {
+                // Early-sorting PKs: a ghost landing in the capped scan window
+                // must never displace a real row.
+                for i in 0..50 {
+                    writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+                }
+            });
+
+            for _ in 0..50 {
+                let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
+                assert_eq!(s.rows.len(), 10, "a concurrent insert must never shrink a full LIMIT page");
+                assert!(s.limit_applied, "more rows exist past LIMIT -- must stay true under concurrent inserts");
+            }
+            inserter.await.unwrap();
+        })
     }
 
     // 26. Spec rel/014 §6 (limit_applied discriminator): exactly `limit + 1`
@@ -1357,28 +1405,30 @@ mod tests {
     // unsnapshotted cap would either lose the "+1 probe" to a ghost slot
     // (limit_applied wrongly false) or lose a real row to one (a short
     // page); the snapshot-capped scan must get both fields right every time.
-    #[tokio::test]
-    async fn test_fast_limit_snapshot_correct_at_minimal_visible_plus_ghosts() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
-        // Exactly limit(10) + 1 committed rows -- zero headroom in the cap.
-        for i in 1000..1011 {
-            ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
-        }
-
-        let writer = Arc::clone(&rel);
-        let inserter = tokio::spawn(async move {
-            for i in 0..50 {
-                writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+    #[test]
+    fn test_fast_limit_snapshot_correct_at_minimal_visible_plus_ghosts() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+            // Exactly limit(10) + 1 committed rows -- zero headroom in the cap.
+            for i in 1000..1011 {
+                ok(&rel, &format!("INSERT INTO t VALUES ({i}, 0)")).await;
             }
-        });
 
-        for _ in 0..50 {
-            let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
-            assert_eq!(s.rows.len(), 10, "the minimal +1 row must never be displaced by a ghost slot");
-            assert!(s.limit_applied, "the +1 probe must never be lost to a ghost slot");
-        }
-        inserter.await.unwrap();
+            let writer = Arc::clone(&rel);
+            let inserter = compio::runtime::spawn(async move {
+                for i in 0..50 {
+                    writer.execute("default", &format!("INSERT INTO t VALUES ({i}, 1)"), &[]).await.unwrap();
+                }
+            });
+
+            for _ in 0..50 {
+                let s = sel(&rel, "SELECT * FROM t LIMIT 10").await;
+                assert_eq!(s.rows.len(), 10, "the minimal +1 row must never be displaced by a ghost slot");
+                assert!(s.limit_applied, "the +1 probe must never be lost to a ghost slot");
+            }
+            inserter.await.unwrap();
+        })
     }
 
     // 27. Spec rel/018 §Test 1 (delete side, Full Scan): a key deleted
@@ -1387,31 +1437,33 @@ mod tests {
     // snapshot registration. Direct unit test against the function, no HTTP
     // (the deterministic engine-level proof is rel/014 engine test 2; this
     // only proves the rel-level wiring passes the snapshot through).
-    #[tokio::test]
-    async fn test_resolve_candidate_keys_full_scan_sees_snapshot_deleted_row() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1), (2)").await;
+    #[test]
+    fn test_resolve_candidate_keys_full_scan_sees_snapshot_deleted_row() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1), (2)").await;
 
-        let snapshot_guard = rel.engine().snapshot();
-        let snap = snapshot_guard.snapshot().clone();
+            let snapshot_guard = rel.engine().snapshot();
+            let snap = snapshot_guard.snapshot().clone();
 
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let schema = match rel.get_object("default", "t").unwrap() {
-            CatalogEntry::Table(t) => t,
-            _ => unreachable!(),
-        };
-        let key1 = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
-        // Engine-level delete (tombstone), bypassing the DML write path --
-        // the same effect a concurrent `DELETE FROM t WHERE id = 1` has on
-        // the live key set.
-        rel.engine().write_batch(vec![BatchOp::Delete { key: key1.clone() }]).await.unwrap();
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let schema = match rel.get_object("default", "t").unwrap() {
+                CatalogEntry::Table(t) => t,
+                _ => unreachable!(),
+            };
+            let key1 = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
+            // Engine-level delete (tombstone), bypassing the DML write path --
+            // the same effect a concurrent `DELETE FROM t WHERE id = 1` has on
+            // the live key set.
+            rel.engine().write_batch(vec![BatchOp::Delete { key: key1.clone() }]).await.unwrap();
 
-        let (row_keys, _scanned) =
-            resolve_candidate_keys(rel.engine(), &schema, &prefix, &AccessPath::FullScan, &snap, None)
-                .await
-                .unwrap();
-        assert!(row_keys.contains(&key1), "a key deleted after the snapshot must remain a candidate");
+            let (row_keys, _scanned) =
+                resolve_candidate_keys(rel.engine(), &schema, &prefix, &AccessPath::FullScan, &snap, None)
+                    .await
+                    .unwrap();
+            assert!(row_keys.contains(&key1), "a key deleted after the snapshot must remain a candidate");
+        })
     }
 
     // 28. Spec rel/018 §Test 2 (delete side, index branches): a concurrent
@@ -1421,98 +1473,100 @@ mod tests {
     // IndexPoint/IndexRange/IndexPrefix must still return it when resolved
     // at the snapshot; a fresh (post-tombstone) snapshot must not (Gegenprobe:
     // proves the difference is the snapshot, not a scan bug).
-    #[tokio::test]
-    async fn test_resolve_candidate_keys_index_paths_see_snapshot_deleted_index_entry() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER, name TEXT)").await;
-        ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
-        ok(&rel, "CREATE INDEX idx_name ON t (name)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5, 'alice')").await;
+    #[test]
+    fn test_resolve_candidate_keys_index_paths_see_snapshot_deleted_index_entry() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, tag INTEGER, name TEXT)").await;
+            ok(&rel, "CREATE INDEX idx_tag ON t (tag)").await;
+            ok(&rel, "CREATE INDEX idx_name ON t (name)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5, 'alice')").await;
 
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let schema = match rel.get_object("default", "t").unwrap() {
-            CatalogEntry::Table(t) => t,
-            _ => unreachable!(),
-        };
-        let idx_tag = schema.indexes.iter().find(|ix| ix.column == "tag").unwrap().clone();
-        let idx_name = schema.indexes.iter().find(|ix| ix.column == "name").unwrap().clone();
-        let row_key = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let schema = match rel.get_object("default", "t").unwrap() {
+                CatalogEntry::Table(t) => t,
+                _ => unreachable!(),
+            };
+            let idx_tag = schema.indexes.iter().find(|ix| ix.column == "tag").unwrap().clone();
+            let idx_name = schema.indexes.iter().find(|ix| ix.column == "name").unwrap().clone();
+            let row_key = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
 
-        // Read back the real on-disk IDX-entry bytes (rather than
-        // re-deriving them) so the tombstone below hits exactly what
-        // INSERT wrote.
-        let tag_scan_prefix = keys::index_value_prefix(&prefix, idx_tag.index_id, &[]);
-        let tag_idx_key = rel.engine().scan_keys(&tag_scan_prefix).await.unwrap().into_iter().next().unwrap();
-        let name_scan_prefix = keys::index_value_prefix(&prefix, idx_name.index_id, &[]);
-        let name_idx_key = rel.engine().scan_keys(&name_scan_prefix).await.unwrap().into_iter().next().unwrap();
+            // Read back the real on-disk IDX-entry bytes (rather than
+            // re-deriving them) so the tombstone below hits exactly what
+            // INSERT wrote.
+            let tag_scan_prefix = keys::index_value_prefix(&prefix, idx_tag.index_id, &[]);
+            let tag_idx_key = rel.engine().scan_keys(&tag_scan_prefix).await.unwrap().into_iter().next().unwrap();
+            let name_scan_prefix = keys::index_value_prefix(&prefix, idx_name.index_id, &[]);
+            let name_idx_key = rel.engine().scan_keys(&name_scan_prefix).await.unwrap().into_iter().next().unwrap();
 
-        let snapshot_guard = rel.engine().snapshot();
-        let snap = snapshot_guard.snapshot().clone();
+            let snapshot_guard = rel.engine().snapshot();
+            let snap = snapshot_guard.snapshot().clone();
 
-        // Simulates a concurrent UPDATE moving `tag`/`name` off their
-        // indexed values: only the IDX entries vanish, the ROW key doesn't.
-        rel.engine()
-            .write_batch(vec![
-                BatchOp::Delete { key: tag_idx_key },
-                BatchOp::Delete { key: name_idx_key },
-            ])
+            // Simulates a concurrent UPDATE moving `tag`/`name` off their
+            // indexed values: only the IDX entries vanish, the ROW key doesn't.
+            rel.engine()
+                .write_batch(vec![
+                    BatchOp::Delete { key: tag_idx_key },
+                    BatchOp::Delete { key: name_idx_key },
+                ])
+                .await
+                .unwrap();
+
+            let (point, _) = resolve_candidate_keys(
+                rel.engine(),
+                &schema,
+                &prefix,
+                &AccessPath::IndexPoint { index: idx_tag.clone(), value: ScalarValue::Integer(5) },
+                &snap,
+                None,
+            )
             .await
             .unwrap();
+            assert_eq!(point, vec![row_key.clone()], "IndexPoint must still see the snapshot-visible entry");
 
-        let (point, _) = resolve_candidate_keys(
-            rel.engine(),
-            &schema,
-            &prefix,
-            &AccessPath::IndexPoint { index: idx_tag.clone(), value: ScalarValue::Integer(5) },
-            &snap,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(point, vec![row_key.clone()], "IndexPoint must still see the snapshot-visible entry");
+            let (range, _) = resolve_candidate_keys(
+                rel.engine(),
+                &schema,
+                &prefix,
+                &AccessPath::IndexRange {
+                    index: idx_tag.clone(),
+                    bounds: RangeBounds { lower: Some((ScalarValue::Integer(0), true)), upper: None },
+                },
+                &snap,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(range, vec![row_key.clone()], "IndexRange must still see the snapshot-visible entry");
 
-        let (range, _) = resolve_candidate_keys(
-            rel.engine(),
-            &schema,
-            &prefix,
-            &AccessPath::IndexRange {
-                index: idx_tag.clone(),
-                bounds: RangeBounds { lower: Some((ScalarValue::Integer(0), true)), upper: None },
-            },
-            &snap,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(range, vec![row_key.clone()], "IndexRange must still see the snapshot-visible entry");
+            let (prefix_hits, _) = resolve_candidate_keys(
+                rel.engine(),
+                &schema,
+                &prefix,
+                &AccessPath::IndexPrefix { index: idx_name, prefix: "ali".to_string() },
+                &snap,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(prefix_hits, vec![row_key], "IndexPrefix must still see the snapshot-visible entry");
 
-        let (prefix_hits, _) = resolve_candidate_keys(
-            rel.engine(),
-            &schema,
-            &prefix,
-            &AccessPath::IndexPrefix { index: idx_name, prefix: "ali".to_string() },
-            &snap,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(prefix_hits, vec![row_key], "IndexPrefix must still see the snapshot-visible entry");
-
-        // Gegenprobe: a fresh snapshot taken after the tombstone must NOT
-        // see the vanished index entry -- proves the assertions above
-        // exercise the snapshot, not a scan that ignores deletes outright.
-        let now_guard = rel.engine().snapshot();
-        let now_snap = now_guard.snapshot().clone();
-        let (point_now, _) = resolve_candidate_keys(
-            rel.engine(),
-            &schema,
-            &prefix,
-            &AccessPath::IndexPoint { index: idx_tag, value: ScalarValue::Integer(5) },
-            &now_snap,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(point_now.is_empty(), "a current snapshot must not see the tombstoned index entry");
+            // Gegenprobe: a fresh snapshot taken after the tombstone must NOT
+            // see the vanished index entry -- proves the assertions above
+            // exercise the snapshot, not a scan that ignores deletes outright.
+            let now_guard = rel.engine().snapshot();
+            let now_snap = now_guard.snapshot().clone();
+            let (point_now, _) = resolve_candidate_keys(
+                rel.engine(),
+                &schema,
+                &prefix,
+                &AccessPath::IndexPoint { index: idx_tag, value: ScalarValue::Integer(5) },
+                &now_snap,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(point_now.is_empty(), "a current snapshot must not see the tombstoned index entry");
+        })
     }
 }

@@ -10,7 +10,8 @@ use super::{JsonEngine, DOC_WRITE_SHARDS};
 use crate::engines::lsm::engine::BatchOp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use compio::time::sleep;
+use std::time::Duration;
 
 /// Keys tombstoned per purger tick and seconds between ticks.
 pub const PURGER_BATCH_SIZE: usize = 100;
@@ -121,243 +122,263 @@ mod tests {
     }
 
     // 1./2. Deleting state blocks CRUD with DomainDeleting (→ 410).
-    #[tokio::test]
-    async fn test_deleting_domain_blocks_crud() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let json = seeded_engine(&dir).await;
-        json.delete_domain("doomed").await.unwrap();
+    #[test]
+    fn test_deleting_domain_blocks_crud() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let json = seeded_engine(&dir).await;
+            json.delete_domain("doomed").await.unwrap();
 
-        let err = json.put_document("doomed", "x", json!({})).await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::DomainDeleting(_)), "got: {err}");
-        let err = json.get_document("doomed", "d0").await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::DomainDeleting(_)), "got: {err}");
-        let err = json
-            .create_index("doomed", "x", IndexFieldType::String)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::DomainDeleting(_)), "got: {err}");
+            let err = json.put_document("doomed", "x", json!({})).await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::DomainDeleting(_)), "got: {err}");
+            let err = json.get_document("doomed", "d0").await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::DomainDeleting(_)), "got: {err}");
+            let err = json
+                .create_index("doomed", "x", IndexFieldType::String)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::DomainDeleting(_)), "got: {err}");
+        })
     }
 
     // 3./4. Purge removes DOC and IDX entries, then the metadata.
-    #[tokio::test]
-    async fn test_purge_removes_all_data() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let json = seeded_engine(&dir).await;
-        let prefix = json.get_domain("doomed").unwrap().system_prefix;
-        json.delete_domain("doomed").await.unwrap();
+    #[test]
+    fn test_purge_removes_all_data() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let json = seeded_engine(&dir).await;
+            let prefix = json.get_domain("doomed").unwrap().system_prefix;
+            json.delete_domain("doomed").await.unwrap();
 
-        let purger = purger(&json, 100);
-        // Tick 1 tombstones data, tick 2 finalizes metadata.
-        purger.purge_tick().await.unwrap();
-        purger.purge_tick().await.unwrap();
+            let purger = purger(&json, 100);
+            // Tick 1 tombstones data, tick 2 finalizes metadata.
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
 
-        assert!(json.engine().scan_keys(&doc_scan_prefix(&prefix)).await.unwrap().is_empty());
-        assert!(json.engine().scan_keys(&index_domain_prefix(&prefix)).await.unwrap().is_empty());
-        assert!(json.engine().scan_keys(b"__sys:index:doomed:").await.unwrap().is_empty());
-        assert!(
-            json.domains.get_domain_any("doomed").is_none(),
-            "metadata must be gone after finalize"
-        );
+            assert!(json.engine().scan_keys(&doc_scan_prefix(&prefix)).await.unwrap().is_empty());
+            assert!(json.engine().scan_keys(&index_domain_prefix(&prefix)).await.unwrap().is_empty());
+            assert!(json.engine().scan_keys(b"__sys:index:doomed:").await.unwrap().is_empty());
+            assert!(
+                json.domains.get_domain_any("doomed").is_none(),
+                "metadata must be gone after finalize"
+            );
+        })
     }
 
     // Small batches need several ticks but converge.
-    #[tokio::test]
-    async fn test_purge_in_small_batches() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let json = seeded_engine(&dir).await;
-        json.delete_domain("doomed").await.unwrap();
-        let purger = purger(&json, 2);
-        for _ in 0..12 {
-            purger.purge_tick().await.unwrap();
-            if json.domains.get_domain_any("doomed").is_none() {
-                return;
+    #[test]
+    fn test_purge_in_small_batches() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let json = seeded_engine(&dir).await;
+            json.delete_domain("doomed").await.unwrap();
+            let purger = purger(&json, 2);
+            for _ in 0..12 {
+                purger.purge_tick().await.unwrap();
+                if json.domains.get_domain_any("doomed").is_none() {
+                    return;
+                }
             }
-        }
-        panic!("purge did not converge with small batches");
+            panic!("purge did not converge with small batches");
+        })
     }
 
     // Regression: purge must converge even when tombstones are flushed to
     // SSTables between ticks (scan_keys used to resurrect purged keys).
-    #[tokio::test]
-    async fn test_purge_converges_across_flushes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let json = seeded_engine(&dir).await; // 5 DOC + 5 IDX keys > batch_size
-        json.delete_domain("doomed").await.unwrap();
-        let purger = purger(&json, 2);
-        for _ in 0..12 {
-            purger.purge_tick().await.unwrap();
-            json.engine().freeze_active_memtable();
-            json.engine().flush_memtable().await.unwrap();
-            if json.domains.get_domain_any("doomed").is_none() {
-                return;
+    #[test]
+    fn test_purge_converges_across_flushes() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let json = seeded_engine(&dir).await; // 5 DOC + 5 IDX keys > batch_size
+            json.delete_domain("doomed").await.unwrap();
+            let purger = purger(&json, 2);
+            for _ in 0..12 {
+                purger.purge_tick().await.unwrap();
+                json.engine().freeze_active_memtable();
+                json.engine().flush_memtable().await.unwrap();
+                if json.domains.get_domain_any("doomed").is_none() {
+                    return;
+                }
             }
-        }
-        panic!("purge did not converge across flushes");
+            panic!("purge did not converge across flushes");
+        })
     }
 
     // 5. A deleting domain survives a restart and the purge resumes.
-    #[tokio::test]
-    async fn test_purge_resumes_after_restart() {
-        let dir = tempfile::TempDir::new().unwrap();
-        {
-            let json = seeded_engine(&dir).await;
-            json.delete_domain("doomed").await.unwrap();
-            json.shutdown().await;
-        }
-        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
-        let deleting = json.domains.list_deleting_domains();
-        assert_eq!(deleting.len(), 1, "deleting domain must survive restart");
+    #[test]
+    fn test_purge_resumes_after_restart() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            {
+                let json = seeded_engine(&dir).await;
+                json.delete_domain("doomed").await.unwrap();
+                json.shutdown().await;
+            }
+            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
+            let deleting = json.domains.list_deleting_domains();
+            assert_eq!(deleting.len(), 1, "deleting domain must survive restart");
 
-        let purger = purger(&json, 100);
-        purger.purge_tick().await.unwrap();
-        purger.purge_tick().await.unwrap();
-        assert!(json.domains.get_domain_any("doomed").is_none());
-        json.shutdown().await;
+            let purger = purger(&json, 100);
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
+            assert!(json.domains.get_domain_any("doomed").is_none());
+            json.shutdown().await;
+        })
     }
 
     // 6. list_domains includes deleting domains with their state.
-    #[tokio::test]
-    async fn test_list_includes_deleting_with_state() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let json = seeded_engine(&dir).await;
-        json.delete_domain("doomed").await.unwrap();
-        let domains = json.list_domains();
-        let doomed = domains.iter().find(|d| d.name == "doomed").unwrap();
-        assert_eq!(doomed.state, super::super::JsonDomainState::Deleting);
+    #[test]
+    fn test_list_includes_deleting_with_state() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let json = seeded_engine(&dir).await;
+            json.delete_domain("doomed").await.unwrap();
+            let domains = json.list_domains();
+            let doomed = domains.iter().find(|d| d.name == "doomed").unwrap();
+            assert_eq!(doomed.state, super::super::JsonDomainState::Deleting);
+        })
     }
 
     // Regression: a default domain still Deleting at restart must not break
     // bootstrap (recover() used to fail with DomainAlreadyExists → boot loop).
-    #[tokio::test]
-    async fn test_bootstrap_survives_deleting_default_domain() {
-        let dir = tempfile::TempDir::new().unwrap();
-        {
+    #[test]
+    fn test_bootstrap_survives_deleting_default_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            {
+                let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
+                json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
+                json.delete_domain("default").await.unwrap();
+                json.shutdown().await;
+            }
+            // Restart before the purge finished: boot must succeed, default stays Deleting.
             let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
-            json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
-            json.delete_domain("default").await.unwrap();
-            json.shutdown().await;
-        }
-        // Restart before the purge finished: boot must succeed, default stays Deleting.
-        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
-        assert!(json.get_domain("default").is_none(), "deleting default must not be active");
+            assert!(json.get_domain("default").is_none(), "deleting default must not be active");
 
-        let purger = purger(&json, 100);
-        purger.purge_tick().await.unwrap();
-        purger.purge_tick().await.unwrap();
-        assert!(json.domains.get_domain_any("default").is_none());
-        json.shutdown().await;
-    }
-
-    // After the purger finalized a deleted default domain, the next bootstrap
-    // recreates it as Active.
-    #[tokio::test]
-    async fn test_default_domain_recreated_after_purge() {
-        let dir = tempfile::TempDir::new().unwrap();
-        {
-            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
-            json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
-            json.delete_domain("default").await.unwrap();
             let purger = purger(&json, 100);
             purger.purge_tick().await.unwrap();
             purger.purge_tick().await.unwrap();
             assert!(json.domains.get_domain_any("default").is_none());
             json.shutdown().await;
-        }
-        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
-        let default = json.domains.get_domain_any("default").expect("default must be recreated");
-        assert_eq!(default.state, super::super::JsonDomainState::Active);
-        json.shutdown().await;
+        })
+    }
+
+    // After the purger finalized a deleted default domain, the next bootstrap
+    // recreates it as Active.
+    #[test]
+    fn test_default_domain_recreated_after_purge() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            {
+                let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
+                json.put_document("default", "d0", json!({"city": "Essen"})).await.unwrap();
+                json.delete_domain("default").await.unwrap();
+                let purger = purger(&json, 100);
+                purger.purge_tick().await.unwrap();
+                purger.purge_tick().await.unwrap();
+                assert!(json.domains.get_domain_any("default").is_none());
+                json.shutdown().await;
+            }
+            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
+            let default = json.domains.get_domain_any("default").expect("default must be recreated");
+            assert_eq!(default.state, super::super::JsonDomainState::Active);
+            json.shutdown().await;
+        })
     }
 
     // Regression (json/013): a writer that passed require_active before the
     // domain was deleted must not land its write after the purger finalized —
     // orphan DOC keys would resurrect in a recreated same-name domain.
-    #[tokio::test]
-    async fn test_inflight_write_cannot_land_after_finalize() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
-        json.create_domain("doomed").await.unwrap();
-        let prefix = json.get_domain("doomed").unwrap().system_prefix;
+    #[test]
+    fn test_inflight_write_cannot_land_after_finalize() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let json = JsonEngine::bootstrap(&config_for(&dir), MetricsStore::new(MetricsConfig::default())).await.unwrap();
+            json.create_domain("doomed").await.unwrap();
+            let prefix = json.get_domain("doomed").unwrap().system_prefix;
 
-        // In-flight writer: parked on its key's write shard, held by the test.
-        let guard = json.doc_write_locks[JsonEngine::shard("doomed", "zombie")].lock().await;
-        let writer = tokio::spawn({
-            let json = Arc::clone(&json);
-            async move { json.put_document("doomed", "zombie", json!({"n": 1})).await }
-        });
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        json.delete_domain("doomed").await.unwrap();
-        // The purger takes all shards, so it must block instead of finalizing.
-        let tick = tokio::spawn({
-            let p = purger(&json, 100);
-            async move { p.purge_tick().await }
-        });
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            json.domains.get_domain_any("doomed").is_some(),
-            "purger must not finalize while a writer is in flight"
-        );
-        drop(guard);
+            // In-flight writer: parked on its key's write shard, held by the test.
+            let guard = json.doc_write_locks[JsonEngine::shard("doomed", "zombie")].lock().await;
+            let writer = compio::runtime::spawn({
+                let json = Arc::clone(&json);
+                async move { json.put_document("doomed", "zombie", json!({"n": 1})).await }
+            });
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            json.delete_domain("doomed").await.unwrap();
+            // The purger takes all shards, so it must block instead of finalizing.
+            let tick = compio::runtime::spawn({
+                let p = purger(&json, 100);
+                async move { p.purge_tick().await }
+            });
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                json.domains.get_domain_any("doomed").is_some(),
+                "purger must not finalize while a writer is in flight"
+            );
+            drop(guard);
 
-        let err = writer.await.unwrap().unwrap_err();
-        assert!(
-            matches!(
-                err,
-                JsonStoreError::DomainDeleting(_) | JsonStoreError::DomainNotFound(_)
-            ),
-            "got: {err}"
-        );
-        tick.await.unwrap().unwrap();
-        assert!(json.domains.get_domain_any("doomed").is_none());
-        assert!(
-            json.engine().scan_keys(&doc_scan_prefix(&prefix)).await.unwrap().is_empty(),
-            "no orphan DOC keys may survive the purge"
-        );
+            let err = writer.await.unwrap().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    JsonStoreError::DomainDeleting(_) | JsonStoreError::DomainNotFound(_)
+                ),
+                "got: {err}"
+            );
+            tick.await.unwrap().unwrap();
+            assert!(json.domains.get_domain_any("doomed").is_none());
+            assert!(
+                json.engine().scan_keys(&doc_scan_prefix(&prefix)).await.unwrap().is_empty(),
+                "no orphan DOC keys may survive the purge"
+            );
+        })
     }
 
     // Regression (json/013): bulk_load re-checks the domain state per batch
     // flush, so no import batch lands after the domain started deleting.
-    #[tokio::test]
-    async fn test_bulk_flush_aborts_when_domain_deleted_mid_import() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let mut json = JsonEngine::bootstrap(&config_for(&dir), metrics).await.unwrap();
-        Arc::get_mut(&mut json).unwrap().bulk_batch_size = 1;
-        json.create_domain("doomed").await.unwrap();
-        let prefix = json.get_domain("doomed").unwrap().system_prefix;
+    #[test]
+    fn test_bulk_flush_aborts_when_domain_deleted_mid_import() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let mut json = JsonEngine::bootstrap(&config_for(&dir), metrics).await.unwrap();
+            Arc::get_mut(&mut json).unwrap().bulk_batch_size = 1;
+            json.create_domain("doomed").await.unwrap();
+            let prefix = json.get_domain("doomed").unwrap().system_prefix;
 
-        // Park the import's first batch flush on the write shard of its key.
-        let guard = json.doc_write_locks[JsonEngine::shard("doomed", "a")].lock().await;
-        let loader = tokio::spawn({
-            let json = Arc::clone(&json);
-            async move {
-                let docs = vec![
-                    (Some("a".to_string()), json!({"n": 1})),
-                    (Some("b".to_string()), json!({"n": 2})),
-                ];
-                json.bulk_load("doomed", docs).await
+            // Park the import's first batch flush on the write shard of its key.
+            let guard = json.doc_write_locks[JsonEngine::shard("doomed", "a")].lock().await;
+            let loader = compio::runtime::spawn({
+                let json = Arc::clone(&json);
+                async move {
+                    let docs = vec![
+                        (Some("a".to_string()), json!({"n": 1})),
+                        (Some("b".to_string()), json!({"n": 2})),
+                    ];
+                    json.bulk_load("doomed", docs).await
+                }
+            });
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
             }
-        });
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        json.delete_domain("doomed").await.unwrap();
-        drop(guard);
-        assert!(
-            loader.await.unwrap().is_err(),
-            "batch flush must fail once the domain is deleting"
-        );
+            json.delete_domain("doomed").await.unwrap();
+            drop(guard);
+            assert!(
+                loader.await.unwrap().is_err(),
+                "batch flush must fail once the domain is deleting"
+            );
 
-        let p = purger(&json, 100);
-        p.purge_tick().await.unwrap();
-        assert!(json.domains.get_domain_any("doomed").is_none());
-        assert!(
-            json.engine().scan_keys(&doc_scan_prefix(&prefix)).await.unwrap().is_empty(),
-            "no orphan DOC keys may survive the purge"
-        );
+            let p = purger(&json, 100);
+            p.purge_tick().await.unwrap();
+            assert!(json.domains.get_domain_any("doomed").is_none());
+            assert!(
+                json.engine().scan_keys(&doc_scan_prefix(&prefix)).await.unwrap().is_empty(),
+                "no orphan DOC keys may survive the purge"
+            );
+        })
     }
 }

@@ -68,6 +68,7 @@ pub fn remove_socket_file(path: &str) {
 /// Trusted-UID detection happens here (not in the auth middleware): the
 /// kernel-provided `UCred` is only available at accept time, and a request
 /// extension cannot be forged by clients.
+#[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 pub async fn serve_uds(
     listener: UnixListener,
     router: Router,
@@ -123,6 +124,7 @@ pub async fn serve_uds(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "the listener runs on a tokio runtime, like the frontend")]
 mod tests {
     use super::*;
     use axum::routing::get;

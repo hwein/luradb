@@ -34,8 +34,9 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use compio::time::sleep;
+use std::time::Duration;
 use tokio::sync::{broadcast, watch, Notify};
-use tokio::time::{sleep, Duration};
 
 // Default limits — kept as constants so tests can reference them directly.
 const MAX_KEY_LENGTH: usize = 256;
@@ -386,7 +387,7 @@ pub struct LsmStorageEngine {
 
     /// Handles of the three background loops; joined by [`Self::shutdown`]
     /// before it touches MemTables/WAL (M1).
-    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    background_tasks: Mutex<Vec<compio::runtime::JoinHandle<()>>>,
 
     /// S3-FIFO block cache shared across all read operations, striped
     /// (spec kv/031 A2).
@@ -585,7 +586,7 @@ impl LsmStorageEngine {
     /// The thread's single fd can back only one generation at a time, so
     /// generation 1 — no longer thread-owned once this swap runs — is
     /// reopened locally afterward; every other generation was already local
-    /// (`discover_vlog_generations` opens ids > 1 via `tokio::fs`).
+    /// (`discover_vlog_generations` opens ids > 1 as local files).
     pub async fn route_active_vlog_to_thread(&self, handle: &StorageHandle) -> Result<()> {
         let active = Arc::clone(&self.version().active_vlog);
         let id = active.id();
@@ -745,16 +746,16 @@ impl LsmStorageEngine {
 
         // Flush loop
         let engine = Arc::clone(self);
-        tasks.push(tokio::spawn(async move { engine.background_flush_loop().await }));
+        tasks.push(compio::runtime::spawn(async move { engine.background_flush_loop().await }));
 
         // Compaction loop
         let engine = Arc::clone(self);
-        tasks.push(tokio::spawn(async move { engine.background_compaction_loop().await }));
+        tasks.push(compio::runtime::spawn(async move { engine.background_compaction_loop().await }));
 
         // Janitor (vLog GC) loop
         let janitor = Arc::new(self.build_janitor(self.janitor_config.clone()));
         let shutdown_rx = self.shutdown_tx.subscribe();
-        tasks.push(tokio::spawn(async move { janitor.run_background(shutdown_rx).await }));
+        tasks.push(compio::runtime::spawn(async move { janitor.run_background(shutdown_rx).await }));
     }
 
     /// Builds a Janitor over this engine's state, wired with the flush barrier
@@ -1771,16 +1772,13 @@ impl LsmStorageEngine {
         }
 
         // With the storage thread active, route the SSTable write through it
-        // (crash-safe temp + fsync + rename); it hands the bytes back so the
-        // non-mmap reader below needs no extra copy.
+        // (crash-safe temp + fsync + rename). Both writers hand the bytes
+        // back, so the non-mmap reader below needs no extra copy.
         let sstable_data = match &self.storage_handle {
             Some(handle) => {
                 handle.sstable_write(self.file_manager.file_path(file_id), sstable_data).await?
             }
-            None => {
-                self.file_manager.write_sstable(file_id, &sstable_data).await?;
-                sstable_data
-            }
+            None => self.file_manager.write_sstable(file_id, sstable_data).await?,
         };
 
         let mut sstable = if self.engine_config.use_mmap {
@@ -1826,9 +1824,9 @@ impl LsmStorageEngine {
     // ── IoEngine registration (spec perf/004 scaffolding) ────────────────────
     //
     // `IoEngine` is not on the hot path yet (see spec perf/004) and cannot be
-    // stored as a field here: `FixedBufPool` is `!Send`/`!Sync` (tokio-uring
-    // resources are confined to their driver thread), while `LsmStorageEngine`
-    // is shared via `Arc` across `tokio::spawn`ed background tasks. These
+    // stored as a field here: it is `!Send`/`!Sync` (its buffers and files
+    // are confined to the engine thread's ring), while `LsmStorageEngine` is
+    // shared via `Arc` with the reader pool. These
     // methods are additive and only run where a caller has direct, unspawned
     // access to both -- startup recovery here, and explicit calls from tests
     // or (in spec 005) the dedicated Storage Thread.
@@ -1967,7 +1965,7 @@ impl LsmStorageEngine {
         for sstable_data in compacted {
             let file_id = self.file_manager.allocate_file_id();
             let file_size = sstable_data.len() as u64;
-            self.file_manager.write_sstable(file_id, &sstable_data).await?;
+            let sstable_data = self.file_manager.write_sstable(file_id, sstable_data).await?;
 
             // Transient reader for the key range only; serving readers are
             // opened in the rebuild below.
@@ -2318,14 +2316,16 @@ mod tests {
     // default 60s sleep would blow this timeout; without M1 nothing here
     // would prove the loops actually stopped. Bound chosen generously on
     // purpose (lesson from general/008: no tight time windows).
-    #[tokio::test]
-    async fn test_shutdown_wakes_and_joins_background_tasks_promptly() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+    #[test]
+    fn test_shutdown_wakes_and_joins_background_tasks_promptly() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
 
-        tokio::time::timeout(Duration::from_secs(10), engine.shutdown())
-            .await
-            .expect("shutdown must be woken, not wait out the 60s Janitor interval");
+            compio::time::timeout(Duration::from_secs(10), engine.shutdown())
+                .await
+                .expect("shutdown must be woken, not wait out the 60s Janitor interval");
+        })
     }
 
     // Spec general/023 test 2 (restart determinism): the test_disabled_smoke
@@ -2333,57 +2333,63 @@ mod tests {
     // shutdown that returns before its tasks fully stop would let the old
     // instance's flush/compaction/GC race the new instance's recovery on the
     // same directory (spec general/023 §A2).
-    #[tokio::test]
-    async fn test_restart_determinism_with_background_tasks() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Short poll intervals raise the odds that a loop is doing real work
-        // (not just sleeping) at the moment shutdown() fires each iteration.
-        let opts = || LsmEngineOptions {
-            engine: LsmEngineConfig {
-                flush_check_interval_ms: 5,
-                compaction_check_interval_ms: 5,
+    #[test]
+    fn test_restart_determinism_with_background_tasks() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            // Short poll intervals raise the odds that a loop is doing real work
+            // (not just sleeping) at the moment shutdown() fires each iteration.
+            let opts = || LsmEngineOptions {
+                engine: LsmEngineConfig {
+                    flush_check_interval_ms: 5,
+                    compaction_check_interval_ms: 5,
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
+            };
 
-        let mut engine = boot_with_tasks(&dir, opts()).await;
-        for i in 0..10u32 {
-            let key = format!("k{i}").into_bytes();
-            let value = format!("v{i}").into_bytes();
-            engine.put(&key, &value).await.unwrap();
+            let mut engine = boot_with_tasks(&dir, opts()).await;
+            for i in 0..10u32 {
+                let key = format!("k{i}").into_bytes();
+                let value = format!("v{i}").into_bytes();
+                engine.put(&key, &value).await.unwrap();
+                engine.shutdown().await;
+
+                engine = boot_with_tasks(&dir, opts()).await;
+                assert_eq!(engine.get(&key).await.unwrap(), Some(value), "iteration {i}");
+            }
             engine.shutdown().await;
-
-            engine = boot_with_tasks(&dir, opts()).await;
-            assert_eq!(engine.get(&key).await.unwrap(), Some(value), "iteration {i}");
-        }
-        engine.shutdown().await;
+        })
     }
 
     // Spec general/023 test 3 (idempotency): a second shutdown() finds an
     // empty handle list and an already-flushed, already-truncated WAL --
     // must not panic or return an error.
-    #[tokio::test]
-    async fn test_shutdown_is_idempotent() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
-        engine.put(b"k", b"v").await.unwrap();
+    #[test]
+    fn test_shutdown_is_idempotent() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+            engine.put(b"k", b"v").await.unwrap();
 
-        engine.shutdown().await;
-        engine.shutdown().await; // must not panic
+            engine.shutdown().await;
+            engine.shutdown().await; // must not panic
+        })
     }
 
     // Spec general/023 test 5 (no task leak): shutdown's mem::take leaves no
     // dangling JoinHandles behind -- checkable directly since the field is
     // private to this module.
-    #[tokio::test]
-    async fn test_shutdown_leaves_no_task_handles() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
+    #[test]
+    fn test_shutdown_leaves_no_task_handles() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = boot_with_tasks(&dir, LsmEngineOptions::default()).await;
 
-        engine.shutdown().await;
+            engine.shutdown().await;
 
-        assert!(engine.background_tasks.lock().is_empty());
+            assert!(engine.background_tasks.lock().is_empty());
+        })
     }
 
     // Spec kv/026 M1: a failed SSTable write persists nothing (the MemTable
@@ -2392,38 +2398,40 @@ mod tests {
     // The SSTable directory is split out from the
     // WAL/manifest one so making it read-only fails only the flush, not the
     // truncate that would otherwise follow it.
-    #[tokio::test]
-    async fn test_shutdown_skips_wal_truncate_after_failed_flush() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sstable_dir = dir.path().join("sstables");
-        std::fs::create_dir_all(&sstable_dir).unwrap();
-        let wal_path = dir.path().join("wal.log");
+    #[test]
+    fn test_shutdown_skips_wal_truncate_after_failed_flush() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sstable_dir = dir.path().join("sstables");
+            std::fs::create_dir_all(&sstable_dir).unwrap();
+            let wal_path = dir.path().join("wal.log");
 
-        let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
-        engine.put(b"crash-key", b"crash-value").await.unwrap();
+            let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+            engine.put(b"crash-key", b"crash-value").await.unwrap();
 
-        // write_sstable creates a new tmp file in sstable_dir -- a read-only
-        // directory rejects that deterministically (verified non-root).
-        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        engine.shutdown().await;
-        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // write_sstable creates a new tmp file in sstable_dir -- a read-only
+            // directory rejects that deterministically (verified non-root).
+            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            engine.shutdown().await;
+            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(
-            !std::fs::read(&wal_path).unwrap().is_empty(),
-            "a failed shutdown flush must leave the WAL in place"
-        );
+            assert!(
+                !std::fs::read(&wal_path).unwrap().is_empty(),
+                "a failed shutdown flush must leave the WAL in place"
+            );
 
-        // Re-open replays the WAL and recovers the data.
-        let engine2 = engine_with_sstable_dir(&dir, &sstable_dir).await;
-        assert_eq!(engine2.get(b"crash-key").await.unwrap(), Some(b"crash-value".to_vec()));
+            // Re-open replays the WAL and recovers the data.
+            let engine2 = engine_with_sstable_dir(&dir, &sstable_dir).await;
+            assert_eq!(engine2.get(b"crash-key").await.unwrap(), Some(b"crash-value".to_vec()));
 
-        // Success case unchanged: a normal shutdown flush still truncates.
-        engine2.put(b"post-recovery", b"v2").await.unwrap();
-        engine2.shutdown().await;
-        assert!(
-            std::fs::read(&wal_path).unwrap().is_empty(),
-            "a successful shutdown flush still truncates the WAL"
-        );
+            // Success case unchanged: a normal shutdown flush still truncates.
+            engine2.put(b"post-recovery", b"v2").await.unwrap();
+            engine2.shutdown().await;
+            assert!(
+                std::fs::read(&wal_path).unwrap().is_empty(),
+                "a successful shutdown flush still truncates the WAL"
+            );
+        })
     }
 
     // A flush whose manifest save fails after its install leaves the table
@@ -2431,185 +2439,198 @@ mod tests {
     // before it truncates the WAL, or the next start loses those writes.
     // With the SSTable directory split out, a read-only `dir` fails only the
     // manifest save (verified non-root).
-    #[tokio::test]
-    async fn test_shutdown_saves_the_manifest_a_failed_flush_left_unsaved() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sstable_dir = dir.path().join("sstables");
-        std::fs::create_dir_all(&sstable_dir).unwrap();
+    #[test]
+    fn test_shutdown_saves_the_manifest_a_failed_flush_left_unsaved() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sstable_dir = dir.path().join("sstables");
+            std::fs::create_dir_all(&sstable_dir).unwrap();
 
-        let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
-        engine.put(b"k", b"v").await.unwrap();
-        engine.freeze_active_memtable();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let flushed = engine.flush_memtable().await;
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(flushed.is_err(), "the manifest save must fail");
-        assert_eq!(engine.version().level(0).len(), 1, "the table was installed before the save");
+            let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+            engine.put(b"k", b"v").await.unwrap();
+            engine.freeze_active_memtable();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let flushed = engine.flush_memtable().await;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(flushed.is_err(), "the manifest save must fail");
+            assert_eq!(engine.version().level(0).len(), 1, "the table was installed before the save");
 
-        engine.shutdown().await;
-        drop(engine);
+            engine.shutdown().await;
+            drop(engine);
 
-        let engine2 = engine_with_sstable_dir(&dir, &sstable_dir).await;
-        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+            let engine2 = engine_with_sstable_dir(&dir, &sstable_dir).await;
+            assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+        })
     }
 
     // Batch: all ops visible after write, and WAL replay (record type 3)
     // restores them all-or-nothing after a restart without flush.
-    #[tokio::test]
-    async fn test_write_batch_atomic_and_recovered() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        engine.put(b"pre", b"old").await.unwrap();
-        engine
-            .write_batch(vec![
-                BatchOp::Put { key: b"batch-a".to_vec(), value: b"1".to_vec() },
-                BatchOp::Put { key: b"batch-b".to_vec(), value: b"2".to_vec() },
-                BatchOp::Delete { key: b"pre".to_vec() },
-            ])
-            .await
-            .unwrap();
-        assert_eq!(engine.get(b"batch-a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"batch-b").await.unwrap(), Some(b"2".to_vec()));
-        assert_eq!(engine.get(b"pre").await.unwrap(), None);
-        drop(engine);
+    #[test]
+    fn test_write_batch_atomic_and_recovered() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            engine.put(b"pre", b"old").await.unwrap();
+            engine
+                .write_batch(vec![
+                    BatchOp::Put { key: b"batch-a".to_vec(), value: b"1".to_vec() },
+                    BatchOp::Put { key: b"batch-b".to_vec(), value: b"2".to_vec() },
+                    BatchOp::Delete { key: b"pre".to_vec() },
+                ])
+                .await
+                .unwrap();
+            assert_eq!(engine.get(b"batch-a").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(engine.get(b"batch-b").await.unwrap(), Some(b"2".to_vec()));
+            assert_eq!(engine.get(b"pre").await.unwrap(), None);
+            drop(engine);
 
-        let engine2 = engine_on(&dir).await;
-        assert_eq!(engine2.get(b"batch-a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine2.get(b"batch-b").await.unwrap(), Some(b"2".to_vec()));
-        assert_eq!(engine2.get(b"pre").await.unwrap(), None);
+            let engine2 = engine_on(&dir).await;
+            assert_eq!(engine2.get(b"batch-a").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(engine2.get(b"batch-b").await.unwrap(), Some(b"2".to_vec()));
+            assert_eq!(engine2.get(b"pre").await.unwrap(), None);
+        })
     }
 
     // Spec kv/032 test 3: a sweeper DELETE record sharing a client write's
     // stamp replays as it applied live — the client value stays.
-    #[tokio::test]
-    async fn test_replayed_sweeper_tombstone_keeps_identical_internal_key() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        engine.put(b"k", b"client").await.unwrap();
-        let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
-        let memtable = engine.pin_memtable();
-        engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
-        drop(engine);
+    #[test]
+    fn test_replayed_sweeper_tombstone_keeps_identical_internal_key() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            engine.put(b"k", b"client").await.unwrap();
+            let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+            let memtable = engine.pin_memtable();
+            engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+            drop(engine);
 
-        let engine2 = engine_on(&dir).await;
-        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+            let engine2 = engine_on(&dir).await;
+            assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+        })
     }
 
     // Spec kv/032 test 4 (regression): a batch Delete still replaces the Put
     // of the same batch (shared stamp) on replay — the later op wins.
-    #[tokio::test]
-    async fn test_replayed_batch_delete_replaces_put_of_same_batch() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        engine
-            .write_batch(vec![
-                BatchOp::Put { key: b"k".to_vec(), value: b"v".to_vec() },
-                BatchOp::Delete { key: b"k".to_vec() },
-            ])
-            .await
-            .unwrap();
-        assert_eq!(engine.get(b"k").await.unwrap(), None);
-        drop(engine);
+    #[test]
+    fn test_replayed_batch_delete_replaces_put_of_same_batch() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            engine
+                .write_batch(vec![
+                    BatchOp::Put { key: b"k".to_vec(), value: b"v".to_vec() },
+                    BatchOp::Delete { key: b"k".to_vec() },
+                ])
+                .await
+                .unwrap();
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+            drop(engine);
 
-        let engine2 = engine_on(&dir).await;
-        assert_eq!(engine2.get(b"k").await.unwrap(), None);
+            let engine2 = engine_on(&dir).await;
+            assert_eq!(engine2.get(b"k").await.unwrap(), None);
+        })
     }
 
     // A vLog failure mid-batch must not leave the batch half-applied to the
     // MemTable; the WAL still holds it, so replay applies it fully on restart.
-    #[tokio::test]
-    async fn test_write_batch_vlog_error_is_atomic() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        engine.put(b"idx", b"old").await.unwrap();
+    #[test]
+    fn test_write_batch_vlog_error_is_atomic() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            engine.put(b"idx", b"old").await.unwrap();
 
-        // Writes to /dev/full fail with ENOSPC. tokio buffers file writes,
-        // so the error surfaces on the NEXT vLog op — hence two large Puts.
-        let full = Arc::new(VLog::new("/dev/full").await.unwrap());
-        engine.install(|v| v.with_active_vlog(full));
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog append
-        let res = engine
-            .write_batch(vec![
-                BatchOp::Delete { key: b"idx".to_vec() },
-                BatchOp::Put { key: b"doc1".to_vec(), value: big.clone() },
-                BatchOp::Put { key: b"doc2".to_vec(), value: big.clone() },
-            ])
-            .await;
-        assert!(res.is_err(), "vLog failure must fail the batch");
+            // Writes to /dev/full fail with ENOSPC: the batch's vLog appends fail.
+            let full = Arc::new(VLog::new("/dev/full").await.unwrap());
+            engine.install(|v| v.with_active_vlog(full));
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog append
+            let res = engine
+                .write_batch(vec![
+                    BatchOp::Delete { key: b"idx".to_vec() },
+                    BatchOp::Put { key: b"doc1".to_vec(), value: big.clone() },
+                    BatchOp::Put { key: b"doc2".to_vec(), value: big.clone() },
+                ])
+                .await;
+            assert!(res.is_err(), "vLog failure must fail the batch");
 
-        // No op of the failed batch may be visible, not even the leading Delete.
-        assert_eq!(engine.get(b"idx").await.unwrap(), Some(b"old".to_vec()));
-        assert_eq!(engine.get(b"doc1").await.unwrap(), None);
-        assert_eq!(engine.get(b"doc2").await.unwrap(), None);
-        drop(engine);
+            // No op of the failed batch may be visible, not even the leading Delete.
+            assert_eq!(engine.get(b"idx").await.unwrap(), Some(b"old".to_vec()));
+            assert_eq!(engine.get(b"doc1").await.unwrap(), None);
+            assert_eq!(engine.get(b"doc2").await.unwrap(), None);
+            drop(engine);
 
-        // WAL replay restores the full batch.
-        let engine2 = engine_on(&dir).await;
-        assert_eq!(engine2.get(b"idx").await.unwrap(), None);
-        assert_eq!(engine2.get(b"doc1").await.unwrap(), Some(big.clone()));
-        assert_eq!(engine2.get(b"doc2").await.unwrap(), Some(big));
+            // WAL replay restores the full batch.
+            let engine2 = engine_on(&dir).await;
+            assert_eq!(engine2.get(b"idx").await.unwrap(), None);
+            assert_eq!(engine2.get(b"doc1").await.unwrap(), Some(big.clone()));
+            assert_eq!(engine2.get(b"doc2").await.unwrap(), Some(big));
+        })
     }
 
     // Recovery must persist WAL data before truncating the WAL: even if the
     // recovering engine never reaches shutdown (startup failure), a later
     // engine on the same paths must still see the data.
-    #[tokio::test]
-    async fn test_recovered_data_survives_without_shutdown() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        engine.put(b"crash-key", b"v1").await.unwrap();
-        drop(engine); // crash: data only in the WAL
+    #[test]
+    fn test_recovered_data_survives_without_shutdown() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            engine.put(b"crash-key", b"v1").await.unwrap();
+            drop(engine); // crash: data only in the WAL
 
-        // Recovers the WAL, then is dropped without shutdown.
-        let engine2 = engine_on(&dir).await;
-        assert_eq!(engine2.get(b"crash-key").await.unwrap(), Some(b"v1".to_vec()));
-        drop(engine2);
+            // Recovers the WAL, then is dropped without shutdown.
+            let engine2 = engine_on(&dir).await;
+            assert_eq!(engine2.get(b"crash-key").await.unwrap(), Some(b"v1".to_vec()));
+            drop(engine2);
 
-        let engine3 = engine_on(&dir).await;
-        assert_eq!(engine3.get(b"crash-key").await.unwrap(), Some(b"v1".to_vec()));
+            let engine3 = engine_on(&dir).await;
+            assert_eq!(engine3.get(b"crash-key").await.unwrap(), Some(b"v1".to_vec()));
+        })
     }
 
     // Spec kv/026 M2: an SSTable the manifest still lists but that can no
     // longer be opened must fail `new()` instead of silently installing a
     // partial level.
-    #[tokio::test]
-    async fn test_new_fails_when_manifest_sstable_is_missing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        engine.put(b"k", b"v").await.unwrap();
-        engine.flush_all_memtables().await.unwrap();
-        drop(engine);
+    #[test]
+    fn test_new_fails_when_manifest_sstable_is_missing() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            engine.put(b"k", b"v").await.unwrap();
+            engine.flush_all_memtables().await.unwrap();
+            drop(engine);
 
-        async fn try_reopen(dir: &tempfile::TempDir) -> Result<LsmStorageEngine> {
-            let wal_path = dir.path().join("wal.log");
-            let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
-            let vlog_path = dir.path().join("vlog.log");
-            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
-            LsmStorageEngine::new(
-                wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
-                LsmEngineOptions::default(),
-            )
-            .await
-        }
+            async fn try_reopen(dir: &tempfile::TempDir) -> Result<LsmStorageEngine> {
+                let wal_path = dir.path().join("wal.log");
+                let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+                let vlog_path = dir.path().join("vlog.log");
+                let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+                let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+                let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+                LsmStorageEngine::new(
+                    wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+                    LsmEngineOptions::default(),
+                )
+                .await
+            }
 
-        // Success case unchanged: the SSTable is intact, re-open succeeds.
-        let engine2 = try_reopen(&dir).await.unwrap();
-        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"v".to_vec()));
-        drop(engine2);
+            // Success case unchanged: the SSTable is intact, re-open succeeds.
+            let engine2 = try_reopen(&dir).await.unwrap();
+            assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+            drop(engine2);
 
-        let sst_path = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("sst"))
-            .expect("flush must have produced an SSTable file");
-        std::fs::remove_file(&sst_path).unwrap();
+            let sst_path = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.extension().and_then(|e| e.to_str()) == Some("sst"))
+                .expect("flush must have produced an SSTable file");
+            std::fs::remove_file(&sst_path).unwrap();
 
-        let result = try_reopen(&dir).await;
-        assert!(result.is_err(), "new() must fail when a manifested SSTable cannot be opened");
+            let result = try_reopen(&dir).await;
+            assert!(result.is_err(), "new() must fail when a manifested SSTable cannot be opened");
+        })
     }
 
     // ── Spec kv/026 M3: HLC seeding from recovered state ─────────────────────
@@ -2643,326 +2664,370 @@ mod tests {
     }
 
     // Test 1: crash variant — the WAL still holds the advanced stamps.
-    #[tokio::test]
-    async fn test_crash_restart_sees_data_written_ahead_of_the_wall_clock() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        advance_hlc(&engine);
-        put_range(&engine, 0..20).await;
-        drop(engine); // crash: the data lives only in the WAL
+    #[test]
+    fn test_crash_restart_sees_data_written_ahead_of_the_wall_clock() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            advance_hlc(&engine);
+            put_range(&engine, 0..20).await;
+            drop(engine); // crash: the data lives only in the WAL
 
-        let engine2 = engine_on(&dir).await;
-        assert_all_readable(&engine2, 0..20).await;
+            let engine2 = engine_on(&dir).await;
+            assert_all_readable(&engine2, 0..20).await;
+        })
     }
 
     // Test 2: clean-shutdown variant — the WAL is empty afterwards, so only
     // the manifest high-water mark can carry the clock across the restart.
-    #[tokio::test]
-    async fn test_clean_shutdown_restart_sees_data_written_ahead_of_the_wall_clock() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        advance_hlc(&engine);
-        put_range(&engine, 0..20).await;
-        engine.shutdown().await;
-        drop(engine);
+    #[test]
+    fn test_clean_shutdown_restart_sees_data_written_ahead_of_the_wall_clock() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            advance_hlc(&engine);
+            put_range(&engine, 0..20).await;
+            engine.shutdown().await;
+            drop(engine);
 
-        assert!(
-            std::fs::read(dir.path().join("wal.log")).unwrap().is_empty(),
-            "a clean shutdown leaves no WAL to seed from"
-        );
+            assert!(
+                std::fs::read(dir.path().join("wal.log")).unwrap().is_empty(),
+                "a clean shutdown leaves no WAL to seed from"
+            );
 
-        let engine2 = engine_on(&dir).await;
-        assert_all_readable(&engine2, 0..20).await;
+            let engine2 = engine_on(&dir).await;
+            assert_all_readable(&engine2, 0..20).await;
+        })
     }
 
     // Test 3: a re-put after the restart must outrank the stored version.
     // The compaction is the discriminator — it keeps only the highest-stamped
     // version of a key, so a re-put stamped below the stored one is not
     // merely invisible for a while, it is dropped for good.
-    #[tokio::test]
-    async fn test_reput_after_restart_outranks_the_stored_version() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        advance_hlc(&engine);
-        engine.put(b"k", b"old").await.unwrap();
-        engine.shutdown().await;
-        drop(engine);
+    #[test]
+    fn test_reput_after_restart_outranks_the_stored_version() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            advance_hlc(&engine);
+            engine.put(b"k", b"old").await.unwrap();
+            engine.shutdown().await;
+            drop(engine);
 
-        let engine2 = engine_on(&dir).await;
-        engine2.put(b"k", b"new").await.unwrap();
-        assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+            let engine2 = engine_on(&dir).await;
+            engine2.put(b"k", b"new").await.unwrap();
+            assert_eq!(engine2.get(b"k").await.unwrap(), Some(b"new".to_vec()));
 
-        // Both versions now meet in one merged SSTable.
-        engine2.flush_all_memtables().await.unwrap();
-        engine2.compact_level(0).await.unwrap();
-        assert_eq!(
-            engine2.get(b"k").await.unwrap(),
-            Some(b"new".to_vec()),
-            "the compaction must keep the re-put value, not the older-stamped one"
-        );
-        engine2.shutdown().await;
-        drop(engine2);
+            // Both versions now meet in one merged SSTable.
+            engine2.flush_all_memtables().await.unwrap();
+            engine2.compact_level(0).await.unwrap();
+            assert_eq!(
+                engine2.get(b"k").await.unwrap(),
+                Some(b"new".to_vec()),
+                "the compaction must keep the re-put value, not the older-stamped one"
+            );
+            engine2.shutdown().await;
+            drop(engine2);
 
-        let engine3 = engine_on(&dir).await;
-        assert_eq!(
-            engine3.get(b"k").await.unwrap(),
-            Some(b"new".to_vec()),
-            "the re-put value must survive a further restart"
-        );
+            let engine3 = engine_on(&dir).await;
+            assert_eq!(
+                engine3.get(b"k").await.unwrap(),
+                Some(b"new".to_vec()),
+                "the re-put value must survive a further restart"
+            );
+        })
     }
 
     // Test 4: a manifest written before M3 has no `max_timestamp` field; it
     // must still load (serde default 0) with the WAL seed doing the work.
-    #[tokio::test]
-    async fn test_manifest_without_max_timestamp_loads_and_wal_seed_applies() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        advance_hlc(&engine);
-        put_range(&engine, 0..5).await;
-        engine.flush_all_memtables().await.unwrap();
-        put_range(&engine, 5..10).await;
-        drop(engine); // crash: the WAL still holds every key
+    #[test]
+    fn test_manifest_without_max_timestamp_loads_and_wal_seed_applies() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            advance_hlc(&engine);
+            put_range(&engine, 0..5).await;
+            engine.flush_all_memtables().await.unwrap();
+            put_range(&engine, 5..10).await;
+            drop(engine); // crash: the WAL still holds every key
 
-        // Rewrite the manifest in the pre-M3 format.
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        for level in json["levels"].as_array_mut().unwrap() {
-            for meta in level.as_array_mut().unwrap() {
-                assert!(meta.as_object_mut().unwrap().remove("max_timestamp").is_some());
+            // Rewrite the manifest in the pre-M3 format.
+            let manifest_path = dir.path().join("MANIFEST");
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            for level in json["levels"].as_array_mut().unwrap() {
+                for meta in level.as_array_mut().unwrap() {
+                    assert!(meta.as_object_mut().unwrap().remove("max_timestamp").is_some());
+                }
             }
-        }
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 
-        let loaded = ManifestManager::new(dir.path()).load().await.unwrap();
-        let meta = loaded.get_level(0).first().expect("the flush must have produced an SSTable");
-        assert_eq!(meta.max_timestamp, 0, "an old manifest reads as 0, without a migration run");
+            let loaded = ManifestManager::new(dir.path()).load().await.unwrap();
+            let meta = loaded.get_level(0).first().expect("the flush must have produced an SSTable");
+            assert_eq!(meta.max_timestamp, 0, "an old manifest reads as 0, without a migration run");
 
-        let engine2 = engine_on(&dir).await;
-        assert_all_readable(&engine2, 0..10).await;
+            let engine2 = engine_on(&dir).await;
+            assert_all_readable(&engine2, 0..10).await;
+        })
     }
 
     // Spec kv/031 A4: point reads peek at the clock, raised to the wall
     // clock. A store whose manifest predates `max_timestamp` and whose WAL
     // is empty seeds nothing, yet once the wall clock has passed its data,
     // reads before the first write see every key, as a drawn stamp did.
-    #[tokio::test]
-    async fn test_reads_before_the_first_write_see_a_store_without_max_timestamp() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        put_range(&engine, 0..5).await;
-        let newest = engine.hlc().peek();
-        engine.shutdown().await;
-        drop(engine);
+    #[test]
+    fn test_reads_before_the_first_write_see_a_store_without_max_timestamp() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            put_range(&engine, 0..5).await;
+            let newest = engine.hlc().peek();
+            engine.shutdown().await;
+            drop(engine);
 
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        for level in json["levels"].as_array_mut().unwrap() {
-            for meta in level.as_array_mut().unwrap() {
-                assert!(meta.as_object_mut().unwrap().remove("max_timestamp").is_some());
+            let manifest_path = dir.path().join("MANIFEST");
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            for level in json["levels"].as_array_mut().unwrap() {
+                for meta in level.as_array_mut().unwrap() {
+                    assert!(meta.as_object_mut().unwrap().remove("max_timestamp").is_some());
+                }
             }
-        }
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 
-        let engine2 = engine_on(&dir).await;
-        assert_eq!(engine2.hlc().peek().as_u64(), 0, "nothing seeds the clock");
-        // The last write may share the current millisecond; the wall clock's
-        // `(ms, 0)` covers it once that millisecond is over.
-        while HybridLogicalClock::physical_time() <= newest.physical() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_all_readable(&engine2, 0..5).await;
+            let engine2 = engine_on(&dir).await;
+            assert_eq!(engine2.hlc().peek().as_u64(), 0, "nothing seeds the clock");
+            // The last write may share the current millisecond; the wall clock's
+            // `(ms, 0)` covers it once that millisecond is over.
+            while HybridLogicalClock::physical_time() <= newest.physical() {
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_all_readable(&engine2, 0..5).await;
+        })
     }
 
     // ── Lifecycle tests ──────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_put_get_basic() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"key1", b"value1").await.unwrap();
-        let result = engine.get(b"key1").await.unwrap();
-        assert_eq!(result, Some(b"value1".to_vec()));
+    #[test]
+    fn test_put_get_basic() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"key1", b"value1").await.unwrap();
+            let result = engine.get(b"key1").await.unwrap();
+            assert_eq!(result, Some(b"value1".to_vec()));
+        })
     }
 
-    #[tokio::test]
-    async fn test_put_upsert() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"key1", b"value1").await.unwrap();
-        engine.put(b"key1", b"value2").await.unwrap();
-        let result = engine.get(b"key1").await.unwrap();
-        assert_eq!(result, Some(b"value2".to_vec()));
+    #[test]
+    fn test_put_upsert() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"key1", b"value1").await.unwrap();
+            engine.put(b"key1", b"value2").await.unwrap();
+            let result = engine.get(b"key1").await.unwrap();
+            assert_eq!(result, Some(b"value2".to_vec()));
+        })
     }
 
-    #[tokio::test]
-    async fn test_delete_returns_none() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"key1", b"value1").await.unwrap();
-        engine.delete(b"key1").await.unwrap();
-        let result = engine.get(b"key1").await.unwrap();
-        assert_eq!(result, None);
+    #[test]
+    fn test_delete_returns_none() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"key1", b"value1").await.unwrap();
+            engine.delete(b"key1").await.unwrap();
+            let result = engine.get(b"key1").await.unwrap();
+            assert_eq!(result, None);
+        })
     }
 
-    #[tokio::test]
-    async fn test_resurrection() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"key1", b"value1").await.unwrap();
-        engine.delete(b"key1").await.unwrap();
-        engine.put(b"key1", b"value3").await.unwrap();
-        let result = engine.get(b"key1").await.unwrap();
-        assert_eq!(result, Some(b"value3".to_vec()));
+    #[test]
+    fn test_resurrection() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"key1", b"value1").await.unwrap();
+            engine.delete(b"key1").await.unwrap();
+            engine.put(b"key1", b"value3").await.unwrap();
+            let result = engine.get(b"key1").await.unwrap();
+            assert_eq!(result, Some(b"value3".to_vec()));
+        })
     }
 
     // ── set_null semantics (spec kv/018 §1): an Update, never a delete ───────
 
-    #[tokio::test]
-    async fn test_set_null_is_update_not_delete() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"key1", b"value1").await.unwrap();
-        engine.set_null(b"key1").await.unwrap();
-        let snap = engine.snapshot();
-        assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Null);
+    #[test]
+    fn test_set_null_is_update_not_delete() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"key1", b"value1").await.unwrap();
+            engine.set_null(b"key1").await.unwrap();
+            let snap = engine.snapshot();
+            assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Null);
+        })
     }
 
-    #[tokio::test]
-    async fn test_put_after_set_null_overwrites() {
-        let (engine, _dir) = make_engine().await;
-        engine.set_null(b"key1").await.unwrap();
-        engine.put(b"key1", b"value1").await.unwrap();
-        assert_eq!(engine.get(b"key1").await.unwrap(), Some(b"value1".to_vec()));
+    #[test]
+    fn test_put_after_set_null_overwrites() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.set_null(b"key1").await.unwrap();
+            engine.put(b"key1", b"value1").await.unwrap();
+            assert_eq!(engine.get(b"key1").await.unwrap(), Some(b"value1".to_vec()));
+        })
     }
 
-    #[tokio::test]
-    async fn test_delete_after_set_null_is_absent() {
-        let (engine, _dir) = make_engine().await;
-        engine.set_null(b"key1").await.unwrap();
-        engine.delete(b"key1").await.unwrap();
-        let snap = engine.snapshot();
-        assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Absent);
+    #[test]
+    fn test_delete_after_set_null_is_absent() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.set_null(b"key1").await.unwrap();
+            engine.delete(b"key1").await.unwrap();
+            let snap = engine.snapshot();
+            assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Absent);
+        })
     }
 
-    #[tokio::test]
-    async fn test_set_null_on_nonexistent_key_creates_it() {
-        let (engine, _dir) = make_engine().await;
-        let snap = engine.snapshot();
-        assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Absent);
+    #[test]
+    fn test_set_null_on_nonexistent_key_creates_it() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let snap = engine.snapshot();
+            assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Absent);
 
-        engine.set_null(b"ghost").await.unwrap();
-        let snap = engine.snapshot();
-        assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Null);
+            engine.set_null(b"ghost").await.unwrap();
+            let snap = engine.snapshot();
+            assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Null);
+        })
     }
 
     // empty (0-byte Put) and NULL are distinct value states.
-    #[tokio::test]
-    async fn test_empty_value_distinct_from_null() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"empty", b"").await.unwrap();
-        engine.set_null(b"null_key").await.unwrap();
+    #[test]
+    fn test_empty_value_distinct_from_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"empty", b"").await.unwrap();
+            engine.set_null(b"null_key").await.unwrap();
 
-        let snap = engine.snapshot();
-        assert_eq!(
-            engine.get_with_snapshot(b"empty", snap.snapshot()).await.unwrap(),
-            GetResult::Present(Vec::new())
-        );
-        assert_eq!(engine.get_with_snapshot(b"null_key", snap.snapshot()).await.unwrap(), GetResult::Null);
+            let snap = engine.snapshot();
+            assert_eq!(
+                engine.get_with_snapshot(b"empty", snap.snapshot()).await.unwrap(),
+                GetResult::Present(Vec::new())
+            );
+            assert_eq!(engine.get_with_snapshot(b"null_key", snap.snapshot()).await.unwrap(), GetResult::Null);
+        })
     }
 
-    #[tokio::test]
-    async fn test_scan_keys_includes_null() {
-        let (engine, _dir) = make_engine().await;
-        engine.set_null(b"user:1").await.unwrap();
-        let keys = engine.scan_keys(b"user:").await.unwrap();
-        assert!(keys.contains(&b"user:1".to_vec()), "NULL keys must appear in scans");
+    #[test]
+    fn test_scan_keys_includes_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.set_null(b"user:1").await.unwrap();
+            let keys = engine.scan_keys(b"user:").await.unwrap();
+            assert!(keys.contains(&b"user:1".to_vec()), "NULL keys must appear in scans");
+        })
     }
 
     // NULL must survive a MemTable flush to SSTable and a subsequent
     // compaction — never garbage-collected like a tombstone.
-    #[tokio::test]
-    async fn test_set_null_survives_flush_and_compaction() {
-        let (engine, _dir) = make_engine().await;
-        engine.set_null(b"n").await.unwrap();
-        freeze_and_flush(&engine).await;
-        let snap = engine.snapshot();
-        assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
+    #[test]
+    fn test_set_null_survives_flush_and_compaction() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.set_null(b"n").await.unwrap();
+            freeze_and_flush(&engine).await;
+            let snap = engine.snapshot();
+            assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
 
-        // A second L0 table forces an L0 -> L1 compaction that must preserve it.
-        engine.put(b"other", b"v").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap();
+            // A second L0 table forces an L0 -> L1 compaction that must preserve it.
+            engine.put(b"other", b"v").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap();
 
-        let snap = engine.snapshot();
-        assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
-        assert!(engine.scan_keys(b"n").await.unwrap().contains(&b"n".to_vec()));
+            let snap = engine.snapshot();
+            assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
+            assert!(engine.scan_keys(b"n").await.unwrap().contains(&b"n".to_vec()));
+        })
     }
 
     // NULL written but never flushed must survive a WAL replay after restart.
-    #[tokio::test]
-    async fn test_set_null_survives_wal_recovery() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_on(&dir).await;
-        engine.set_null(b"n").await.unwrap();
-        drop(engine); // crash: data only in the WAL
+    #[test]
+    fn test_set_null_survives_wal_recovery() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_on(&dir).await;
+            engine.set_null(b"n").await.unwrap();
+            drop(engine); // crash: data only in the WAL
 
-        let engine2 = engine_on(&dir).await;
-        let snap = engine2.snapshot();
-        assert_eq!(engine2.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
+            let engine2 = engine_on(&dir).await;
+            let snap = engine2.snapshot();
+            assert_eq!(engine2.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
+        })
     }
 
     // ── Validation tests ─────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_empty_key_rejected() {
-        let (engine, _dir) = make_engine().await;
-        let err = engine.set(b"", b"value").await;
-        assert!(err.is_err(), "empty key must be rejected");
+    #[test]
+    fn test_empty_key_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let err = engine.set(b"", b"value").await;
+            assert!(err.is_err(), "empty key must be rejected");
+        })
     }
 
-    #[tokio::test]
-    async fn test_key_too_long_rejected() {
-        let (engine, _dir) = make_engine().await;
-        let long_key = vec![b'x'; MAX_KEY_LENGTH + 1];
-        let err = engine.set(&long_key, b"value").await;
-        assert!(err.is_err(), "key exceeding MAX_KEY_LENGTH must be rejected");
+    #[test]
+    fn test_key_too_long_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let long_key = vec![b'x'; MAX_KEY_LENGTH + 1];
+            let err = engine.set(&long_key, b"value").await;
+            assert!(err.is_err(), "key exceeding MAX_KEY_LENGTH must be rejected");
+        })
     }
 
-    #[tokio::test]
-    async fn test_value_too_large_rejected() {
-        let (engine, _dir) = make_engine().await;
-        let large_value = vec![0u8; MAX_VALUE_SIZE_LIMIT + 1];
-        let err = engine.set(b"key", &large_value).await;
-        assert!(err.is_err(), "value exceeding MAX_VALUE_SIZE_LIMIT must be rejected");
+    #[test]
+    fn test_value_too_large_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let large_value = vec![0u8; MAX_VALUE_SIZE_LIMIT + 1];
+            let err = engine.set(b"key", &large_value).await;
+            assert!(err.is_err(), "value exceeding MAX_VALUE_SIZE_LIMIT must be rejected");
+        })
     }
 
     // ── TTL tests ────────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_ttl_key_readable_before_expiry() {
-        let (engine, _dir) = make_engine().await;
-        // Large TTL (1h): this test only checks immediate readability, not
-        // expiry, so the window must stay open regardless of suite load.
-        engine.put_with_ttl(b"ttl_key", b"value", 3600).await.unwrap();
-        let result = engine.get(b"ttl_key").await.unwrap();
-        assert_eq!(result, Some(b"value".to_vec()));
+    #[test]
+    fn test_ttl_key_readable_before_expiry() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            // Large TTL (1h): this test only checks immediate readability, not
+            // expiry, so the window must stay open regardless of suite load.
+            engine.put_with_ttl(b"ttl_key", b"value", 3600).await.unwrap();
+            let result = engine.get(b"ttl_key").await.unwrap();
+            assert_eq!(result, Some(b"value".to_vec()));
+        })
     }
 
-    #[tokio::test]
-    async fn test_ttl_key_expires() {
-        let (engine, _dir) = make_engine().await;
-        // Immediate readability is covered by test_ttl_key_readable_before_expiry.
-        engine.put_with_ttl(b"ttl_key", b"value", 1).await.unwrap();
-        wait_past_ttl(1).await;
-        // Bounded retry instead of a single probe: a backwards wall-clock
-        // step between the wait above and get()'s own now_secs() briefly
-        // un-expires the key (observed on WSL2, spec kv/026 analysis).
-        let mut value = engine.get(b"ttl_key").await.unwrap();
-        for _ in 0..100 {
-            if value.is_none() {
-                break;
+    #[test]
+    fn test_ttl_key_expires() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            // Immediate readability is covered by test_ttl_key_readable_before_expiry.
+            engine.put_with_ttl(b"ttl_key", b"value", 1).await.unwrap();
+            wait_past_ttl(1).await;
+            // Bounded retry instead of a single probe: a backwards wall-clock
+            // step between the wait above and get()'s own now_secs() briefly
+            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            let mut value = engine.get(b"ttl_key").await.unwrap();
+            for _ in 0..100 {
+                if value.is_none() {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(100)).await;
+                value = engine.get(b"ttl_key").await.unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            value = engine.get(b"ttl_key").await.unwrap();
-        }
-        assert!(value.is_none());
+            assert!(value.is_none());
+        })
     }
 
     fn subsec_ms() -> u32 {
@@ -2974,248 +3039,274 @@ mod tests {
     async fn wait_past_ttl(ttl_secs: u64) {
         let deadline = now_secs() + ttl_secs + 1;
         while now_secs() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            compio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
     // Writing just before a second boundary is the worst case for the stamp.
-    #[tokio::test]
-    async fn test_ttl_holds_for_the_full_ttl_span() {
-        let (engine, _dir) = make_engine().await;
-        while subsec_ms() < 950 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        engine.put_with_ttl(b"ttl_key", b"value", 2).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert_eq!(engine.get(b"ttl_key").await.unwrap(), Some(b"value".to_vec()), "a 2s TTL must survive 1.1s");
+    #[test]
+    fn test_ttl_holds_for_the_full_ttl_span() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            while subsec_ms() < 950 {
+                compio::time::sleep(Duration::from_millis(5)).await;
+            }
+            engine.put_with_ttl(b"ttl_key", b"value", 2).await.unwrap();
+            compio::time::sleep(Duration::from_millis(1100)).await;
+            assert_eq!(engine.get(b"ttl_key").await.unwrap(), Some(b"value".to_vec()), "a 2s TTL must survive 1.1s");
+        })
     }
 
     // spec kv/025 §2/§9.11: format::is_expired treats `Some(0)` as "no TTL",
     // not "expired" -- this only stays correct because no write path ever
     // produces it. Covers all three paths named in the spec: `put` (None),
     // `put_with_ttl` (including ttl_secs == 0), and WAL replay.
-    #[tokio::test]
-    async fn test_ttl_paths_never_produce_some_zero_expire_at() {
-        let (engine, dir) = make_engine().await;
-        engine.put(b"no_ttl", b"v").await.unwrap();
-        engine.put_with_ttl(b"expired_now", b"v", 0).await.unwrap();
-        engine.put_with_ttl(b"future", b"v", 60).await.unwrap();
+    #[test]
+    fn test_ttl_paths_never_produce_some_zero_expire_at() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, dir) = make_engine().await;
+            engine.put(b"no_ttl", b"v").await.unwrap();
+            engine.put_with_ttl(b"expired_now", b"v", 0).await.unwrap();
+            engine.put_with_ttl(b"future", b"v", 60).await.unwrap();
 
-        fn assert_no_some_zero(value: &Value) {
-            let expire_at = match value {
-                Value::Inline(_, expire_at) => *expire_at,
-                Value::Pointer { expire_at, .. } => *expire_at,
-                Value::Null | Value::Tombstone => None,
-            };
-            assert_ne!(expire_at, Some(0), "no write path may produce Some(0)");
-        }
+            fn assert_no_some_zero(value: &Value) {
+                let expire_at = match value {
+                    Value::Inline(_, expire_at) => *expire_at,
+                    Value::Pointer { expire_at, .. } => *expire_at,
+                    Value::Null | Value::Tombstone => None,
+                };
+                assert_ne!(expire_at, Some(0), "no write path may produce Some(0)");
+            }
 
-        for (_, value) in engine.version().memtable.iter() {
-            assert_no_some_zero(&value);
-        }
+            for (_, value) in engine.version().memtable.iter() {
+                assert_no_some_zero(&value);
+            }
 
-        // WAL replay: the live engine hasn't truncated its WAL yet, so
-        // recovering it independently reflects exactly what a restart would see.
-        let wal_path = dir.path().join("wal.log");
-        let (recovered, _) = LsmStorageEngine::recover_from_wal(
-            &wal_path,
-            &engine.version().active_vlog,
-            engine.engine_config.vlog_inline_threshold,
-        )
-        .await
-        .unwrap();
-        for (_, value) in recovered.iter() {
-            assert_no_some_zero(&value);
-        }
+            // WAL replay: the live engine hasn't truncated its WAL yet, so
+            // recovering it independently reflects exactly what a restart would see.
+            let wal_path = dir.path().join("wal.log");
+            let (recovered, _) = LsmStorageEngine::recover_from_wal(
+                &wal_path,
+                &engine.version().active_vlog,
+                engine.engine_config.vlog_inline_threshold,
+            )
+            .await
+            .unwrap();
+            for (_, value) in recovered.iter() {
+                assert_no_some_zero(&value);
+            }
+        })
     }
 
     // ── scan_keys tests ──────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_scan_keys_prefix() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"user:1", b"alice").await.unwrap();
-        engine.put(b"user:2", b"bob").await.unwrap();
-        engine.put(b"item:1", b"thing").await.unwrap();
-        let keys = engine.scan_keys(b"user:").await.unwrap();
-        assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&b"user:1".to_vec()));
-        assert!(keys.contains(&b"user:2".to_vec()));
+    #[test]
+    fn test_scan_keys_prefix() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"user:1", b"alice").await.unwrap();
+            engine.put(b"user:2", b"bob").await.unwrap();
+            engine.put(b"item:1", b"thing").await.unwrap();
+            let keys = engine.scan_keys(b"user:").await.unwrap();
+            assert_eq!(keys.len(), 2);
+            assert!(keys.contains(&b"user:1".to_vec()));
+            assert!(keys.contains(&b"user:2".to_vec()));
+        })
     }
 
-    #[tokio::test]
-    async fn test_scan_keys_excludes_tombstoned() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"user:1", b"alice").await.unwrap();
-        engine.put(b"user:2", b"bob").await.unwrap();
-        engine.delete(b"user:1").await.unwrap();
-        let keys = engine.scan_keys(b"user:").await.unwrap();
-        assert!(!keys.contains(&b"user:1".to_vec()));
-        assert!(keys.contains(&b"user:2".to_vec()));
+    #[test]
+    fn test_scan_keys_excludes_tombstoned() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"user:1", b"alice").await.unwrap();
+            engine.put(b"user:2", b"bob").await.unwrap();
+            engine.delete(b"user:1").await.unwrap();
+            let keys = engine.scan_keys(b"user:").await.unwrap();
+            assert!(!keys.contains(&b"user:1".to_vec()));
+            assert!(keys.contains(&b"user:2".to_vec()));
+        })
     }
 
     // Regression: a delete must stay effective once the live version — and
     // later the tombstone itself — reside in SSTables.
-    #[tokio::test]
-    async fn test_scan_keys_excludes_tombstoned_after_flush() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"user:1", b"alice").await.unwrap();
-        engine.put(b"user:2", b"bob").await.unwrap();
-        freeze_and_flush(&engine).await; // live versions now in an SSTable
-        engine.delete(b"user:1").await.unwrap();
+    #[test]
+    fn test_scan_keys_excludes_tombstoned_after_flush() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"user:1", b"alice").await.unwrap();
+            engine.put(b"user:2", b"bob").await.unwrap();
+            freeze_and_flush(&engine).await; // live versions now in an SSTable
+            engine.delete(b"user:1").await.unwrap();
 
-        let keys = engine.scan_keys(b"user:").await.unwrap();
-        assert_eq!(keys, vec![b"user:2".to_vec()]);
+            let keys = engine.scan_keys(b"user:").await.unwrap();
+            assert_eq!(keys, vec![b"user:2".to_vec()]);
 
-        // Tombstone flushed to a second SSTable — still suppressed.
-        freeze_and_flush(&engine).await;
-        let keys = engine.scan_keys(b"user:").await.unwrap();
-        assert_eq!(keys, vec![b"user:2".to_vec()]);
+            // Tombstone flushed to a second SSTable — still suppressed.
+            freeze_and_flush(&engine).await;
+            let keys = engine.scan_keys(b"user:").await.unwrap();
+            assert_eq!(keys, vec![b"user:2".to_vec()]);
+        })
     }
 
     // Regression: an older tombstone in a frozen MemTable must not hide a
     // newer re-creation of the same key in the active MemTable.
-    #[tokio::test]
-    async fn test_scan_keys_sees_recreation_after_frozen_tombstone() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"user:1", b"alice").await.unwrap();
-        engine.delete(b"user:1").await.unwrap();
-        engine.freeze_active_memtable(); // tombstone now in an immutable MemTable
-        engine.put(b"user:1", b"alice2").await.unwrap();
+    #[test]
+    fn test_scan_keys_sees_recreation_after_frozen_tombstone() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"user:1", b"alice").await.unwrap();
+            engine.delete(b"user:1").await.unwrap();
+            engine.freeze_active_memtable(); // tombstone now in an immutable MemTable
+            engine.put(b"user:1", b"alice2").await.unwrap();
 
-        let keys = engine.scan_keys(b"user:").await.unwrap();
-        assert_eq!(keys, vec![b"user:1".to_vec()]);
+            let keys = engine.scan_keys(b"user:").await.unwrap();
+            assert_eq!(keys, vec![b"user:1".to_vec()]);
+        })
     }
 
-    #[tokio::test]
-    async fn test_scan_keys_limited() {
-        let (engine, _dir) = make_engine().await;
-        for i in 0..10 {
-            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
-        }
-        engine.delete(b"user:3").await.unwrap();
+    #[test]
+    fn test_scan_keys_limited() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            for i in 0..10 {
+                engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+            }
+            engine.delete(b"user:3").await.unwrap();
 
-        let keys = engine.scan_keys_limited(b"user:", 4).await.unwrap();
-        assert_eq!(keys.len(), 4);
-        assert!(!keys.contains(&b"user:3".to_vec()));
+            let keys = engine.scan_keys_limited(b"user:", 4).await.unwrap();
+            assert_eq!(keys.len(), 4);
+            assert!(!keys.contains(&b"user:3".to_vec()));
 
-        let all = engine.scan_keys_limited(b"user:", 100).await.unwrap();
-        assert_eq!(all.len(), 9);
+            let all = engine.scan_keys_limited(b"user:", 100).await.unwrap();
+            assert_eq!(all.len(), 9);
+        })
     }
 
     // Note: the limit break in the SSTable sweep is only reachable once
     // keys live in an SSTable (unflushed keys hit the MemTable path). Flush
     // first, then trip the limit during the sweep.
-    #[tokio::test]
-    async fn test_scan_keys_limited_stops_in_sstable_sweep() {
-        let (engine, _dir) = make_engine().await;
-        for i in 0..10 {
-            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
-        }
-        freeze_and_flush(&engine).await;
-        let keys = engine.scan_keys_limited(b"user:", 4).await.unwrap();
-        assert_eq!(keys.len(), 4);
+    #[test]
+    fn test_scan_keys_limited_stops_in_sstable_sweep() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            for i in 0..10 {
+                engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+            }
+            freeze_and_flush(&engine).await;
+            let keys = engine.scan_keys_limited(b"user:", 4).await.unwrap();
+            assert_eq!(keys.len(), 4);
+        })
     }
 
     // Note: the TTL-expiry branch of scan_memtable_for_prefix is otherwise
     // only covered by `get`. An expired key must not appear in scan_keys.
-    #[tokio::test]
-    async fn test_scan_keys_excludes_ttl_expired() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
-        engine.put(b"user:2", b"bob").await.unwrap();
-        wait_past_ttl(1).await;
-        // Bounded retry instead of a single probe: a backwards wall-clock
-        // step between the wait above and the scan's own now_secs() briefly
-        // un-expires the key (observed on WSL2, spec kv/026 analysis).
-        let mut keys = engine.scan_keys(b"user:").await.unwrap();
-        for _ in 0..100 {
-            if !keys.contains(&b"user:1".to_vec()) {
-                break;
+    #[test]
+    fn test_scan_keys_excludes_ttl_expired() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+            engine.put(b"user:2", b"bob").await.unwrap();
+            wait_past_ttl(1).await;
+            // Bounded retry instead of a single probe: a backwards wall-clock
+            // step between the wait above and the scan's own now_secs() briefly
+            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            let mut keys = engine.scan_keys(b"user:").await.unwrap();
+            for _ in 0..100 {
+                if !keys.contains(&b"user:1".to_vec()) {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(100)).await;
+                keys = engine.scan_keys(b"user:").await.unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            keys = engine.scan_keys(b"user:").await.unwrap();
-        }
-        assert!(!keys.contains(&b"user:1".to_vec()));
-        assert!(keys.contains(&b"user:2".to_vec()));
+            assert!(!keys.contains(&b"user:1".to_vec()));
+            assert!(keys.contains(&b"user:2".to_vec()));
+        })
     }
 
     // ── scan_keys_with_snapshot tests (spec general/006 backup export) ──────
 
     // Writes after the snapshot (put, delete, set_null) must not change what
     // the pinned scan sees, while the unpinned scan_keys sees the new state.
-    #[tokio::test]
-    async fn test_scan_keys_with_snapshot_hides_later_writes() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"user:1", b"alice").await.unwrap();
-        engine.put(b"user:2", b"bob").await.unwrap();
-        let snap = engine.snapshot();
+    #[test]
+    fn test_scan_keys_with_snapshot_hides_later_writes() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"user:1", b"alice").await.unwrap();
+            engine.put(b"user:2", b"bob").await.unwrap();
+            let snap = engine.snapshot();
 
-        engine.put(b"user:3", b"carol").await.unwrap(); // new key after snapshot
-        engine.delete(b"user:1").await.unwrap(); // delete after snapshot
-        engine.set_null(b"user:2").await.unwrap(); // set_null after snapshot
+            engine.put(b"user:3", b"carol").await.unwrap(); // new key after snapshot
+            engine.delete(b"user:1").await.unwrap(); // delete after snapshot
+            engine.set_null(b"user:2").await.unwrap(); // set_null after snapshot
 
-        let pinned = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
-        assert_eq!(pinned, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+            let pinned = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+            assert_eq!(pinned, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
 
-        let live = engine.scan_keys(b"user:").await.unwrap();
-        assert_eq!(live, vec![b"user:2".to_vec(), b"user:3".to_vec()]);
+            let live = engine.scan_keys(b"user:").await.unwrap();
+            assert_eq!(live, vec![b"user:2".to_vec(), b"user:3".to_vec()]);
+        })
     }
 
     // Same guarantee once the pre-snapshot data has been flushed to SSTables
     // and the post-snapshot write lands in a newer SSTable: a key tombstoned
     // as of the snapshot and later resurrected must stay invisible.
-    #[tokio::test]
-    async fn test_scan_keys_with_snapshot_respects_flushed_versions() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"user:1", b"v1").await.unwrap();
-        freeze_and_flush(&engine).await; // SSTable 1: user:1 = v1
-        engine.delete(b"user:1").await.unwrap();
-        freeze_and_flush(&engine).await; // SSTable 2: user:1 tombstoned
+    #[test]
+    fn test_scan_keys_with_snapshot_respects_flushed_versions() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"user:1", b"v1").await.unwrap();
+            freeze_and_flush(&engine).await; // SSTable 1: user:1 = v1
+            engine.delete(b"user:1").await.unwrap();
+            freeze_and_flush(&engine).await; // SSTable 2: user:1 tombstoned
 
-        let snap = engine.snapshot();
+            let snap = engine.snapshot();
 
-        engine.put(b"user:1", b"v2").await.unwrap(); // resurrection after snapshot
-        freeze_and_flush(&engine).await; // SSTable 3: user:1 = v2
+            engine.put(b"user:1", b"v2").await.unwrap(); // resurrection after snapshot
+            freeze_and_flush(&engine).await; // SSTable 3: user:1 = v2
 
-        let pinned = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
-        assert!(pinned.is_empty(), "key tombstoned as of the snapshot must not appear");
+            let pinned = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+            assert!(pinned.is_empty(), "key tombstoned as of the snapshot must not appear");
 
-        let live = engine.scan_keys(b"user:").await.unwrap();
-        assert_eq!(live, vec![b"user:1".to_vec()], "current state must show the resurrection");
+            let live = engine.scan_keys(b"user:").await.unwrap();
+            assert_eq!(live, vec![b"user:1".to_vec()], "current state must show the resurrection");
+        })
     }
 
     // NULL keys count as live under a pinned snapshot too (kv/018).
-    #[tokio::test]
-    async fn test_scan_keys_with_snapshot_includes_null() {
-        let (engine, _dir) = make_engine().await;
-        engine.set_null(b"user:1").await.unwrap();
-        let snap = engine.snapshot();
-        let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
-        assert_eq!(keys, vec![b"user:1".to_vec()]);
+    #[test]
+    fn test_scan_keys_with_snapshot_includes_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.set_null(b"user:1").await.unwrap();
+            let snap = engine.snapshot();
+            let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+            assert_eq!(keys, vec![b"user:1".to_vec()]);
+        })
     }
 
     // Expiry uses wall-clock time, not the snapshot timestamp -- an entry
     // that was live when the snapshot was acquired but has since expired
     // must not appear (matches every other read path).
-    #[tokio::test]
-    async fn test_scan_keys_with_snapshot_excludes_expired() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
-        let snap = engine.snapshot();
-        wait_past_ttl(1).await;
-        // Bounded retry instead of a single probe: a backwards wall-clock
-        // step between the wait above and the scan's own now_secs() briefly
-        // un-expires the key (observed on WSL2, spec kv/026 analysis).
-        let mut keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
-        for _ in 0..100 {
-            if keys.is_empty() {
-                break;
+    #[test]
+    fn test_scan_keys_with_snapshot_excludes_expired() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+            let snap = engine.snapshot();
+            wait_past_ttl(1).await;
+            // Bounded retry instead of a single probe: a backwards wall-clock
+            // step between the wait above and the scan's own now_secs() briefly
+            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            let mut keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
+            for _ in 0..100 {
+                if keys.is_empty() {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(100)).await;
+                keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
-        }
-        assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
+            assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
+        })
     }
 
     // ── scan_keys_limited_with_snapshot tests (spec rel/014 SELECT fast-limit
@@ -3226,40 +3317,44 @@ mod tests {
     // ahead of the pre-snapshot keys. Counterproof alongside: today's
     // unsnapshotted scan_keys_limited IS displaced by such a ghost -- the
     // difference this method fixes.
-    #[tokio::test]
-    async fn test_scan_keys_limited_with_snapshot_excludes_ghosts_from_cap() {
-        let (engine, _dir) = make_engine().await;
-        for i in 0..10 {
-            engine.put(format!("z:m{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let snap = engine.snapshot();
-        // Ghosts: written after the snapshot, and sort ahead of "z:m*".
-        for i in 0..5 {
-            engine.put(format!("z:a{i}").as_bytes(), b"v").await.unwrap();
-        }
+    #[test]
+    fn test_scan_keys_limited_with_snapshot_excludes_ghosts_from_cap() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            for i in 0..10 {
+                engine.put(format!("z:m{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let snap = engine.snapshot();
+            // Ghosts: written after the snapshot, and sort ahead of "z:m*".
+            for i in 0..5 {
+                engine.put(format!("z:a{i}").as_bytes(), b"v").await.unwrap();
+            }
 
-        let keys = engine.scan_keys_limited_with_snapshot(b"z:", 5, snap.snapshot()).await.unwrap();
-        assert_eq!(keys.len(), 5, "cap must be filled entirely by pre-snapshot keys");
-        assert!(keys.iter().all(|k| k.starts_with(b"z:m")), "no ghost key may occupy a cap slot");
+            let keys = engine.scan_keys_limited_with_snapshot(b"z:", 5, snap.snapshot()).await.unwrap();
+            assert_eq!(keys.len(), 5, "cap must be filled entirely by pre-snapshot keys");
+            assert!(keys.iter().all(|k| k.starts_with(b"z:m")), "no ghost key may occupy a cap slot");
 
-        let unsnapshotted = engine.scan_keys_limited(b"z:", 5).await.unwrap();
-        assert!(
-            unsnapshotted.iter().any(|k| k.starts_with(b"z:a")),
-            "today's unsnapshotted cap must be displaced by ghosts, or this is no longer a counterproof"
-        );
+            let unsnapshotted = engine.scan_keys_limited(b"z:", 5).await.unwrap();
+            assert!(
+                unsnapshotted.iter().any(|k| k.starts_with(b"z:a")),
+                "today's unsnapshotted cap must be displaced by ghosts, or this is no longer a counterproof"
+            );
+        })
     }
 
     // Test 2: a key deleted after the snapshot was taken still counts toward
     // the cap and appears in the result (point-in-time consistency).
-    #[tokio::test]
-    async fn test_scan_keys_limited_with_snapshot_keeps_deleted_after_snapshot() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"user:1", b"v").await.unwrap();
-        let snap = engine.snapshot();
-        engine.delete(b"user:1").await.unwrap();
+    #[test]
+    fn test_scan_keys_limited_with_snapshot_keeps_deleted_after_snapshot() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"user:1", b"v").await.unwrap();
+            let snap = engine.snapshot();
+            engine.delete(b"user:1").await.unwrap();
 
-        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
-        assert_eq!(keys, vec![b"user:1".to_vec()]);
+            let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
+            assert_eq!(keys, vec![b"user:1".to_vec()]);
+        })
     }
 
     // Test 3: once the cap is filled while scanning a newer source, an older
@@ -3267,27 +3362,29 @@ mod tests {
     // correct (if not minimal) subset, exactly `limit` entries (same
     // "subset, not necessarily smallest" semantics as the unsnapshotted
     // test_scan_keys_limited_stops_in_sstable_sweep above).
-    #[tokio::test]
-    async fn test_scan_keys_limited_with_snapshot_stops_at_cap_across_sources() {
-        let (engine, _dir) = make_engine().await;
-        for i in 0..5 {
-            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
-        }
-        freeze_and_flush(&engine).await; // SSTable: user:0..4
-        for i in 5..10 {
-            engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let snap = engine.snapshot(); // all 10 visible: 5 in the SSTable, 5 in the active MemTable
+    #[test]
+    fn test_scan_keys_limited_with_snapshot_stops_at_cap_across_sources() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            for i in 0..5 {
+                engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+            }
+            freeze_and_flush(&engine).await; // SSTable: user:0..4
+            for i in 5..10 {
+                engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let snap = engine.snapshot(); // all 10 visible: 5 in the SSTable, 5 in the active MemTable
 
-        let full = engine.scan_keys_limited_with_snapshot(b"user:", 100, snap.snapshot()).await.unwrap();
-        assert_eq!(full.len(), 10, "sanity: all 10 must be snapshot-visible when uncapped");
+            let full = engine.scan_keys_limited_with_snapshot(b"user:", 100, snap.snapshot()).await.unwrap();
+            assert_eq!(full.len(), 10, "sanity: all 10 must be snapshot-visible when uncapped");
 
-        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 4, snap.snapshot()).await.unwrap();
-        assert_eq!(
-            keys.len(),
-            4,
-            "must stop exactly at the cap even though 6 more visible keys remain in the older SSTable"
-        );
+            let keys = engine.scan_keys_limited_with_snapshot(b"user:", 4, snap.snapshot()).await.unwrap();
+            assert_eq!(
+                keys.len(),
+                4,
+                "must stop exactly at the cap even though 6 more visible keys remain in the older SSTable"
+            );
+        })
     }
 
     // Test 4a: a TTL-expired key must not occupy a cap slot even though it
@@ -3296,328 +3393,368 @@ mod tests {
     // the uncapped scan_keys_with_snapshot. A cap of 1 makes the assertion
     // discriminating: if the expired key ("user:1", sorting first) wrongly
     // held the one slot, the live "user:2" would never appear.
-    #[tokio::test]
-    async fn test_scan_keys_limited_with_snapshot_excludes_expired_from_cap() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
-        engine.put(b"user:2", b"bob").await.unwrap();
-        let snap = engine.snapshot();
-        wait_past_ttl(1).await;
-        // Bounded retry instead of a single probe: a backwards wall-clock
-        // step between the wait above and the scan's own now_secs() briefly
-        // un-expires the key (observed on WSL2, spec kv/026 analysis).
-        let mut keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
-        for _ in 0..100 {
-            if keys == vec![b"user:2".to_vec()] {
-                break;
+    #[test]
+    fn test_scan_keys_limited_with_snapshot_excludes_expired_from_cap() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+            engine.put(b"user:2", b"bob").await.unwrap();
+            let snap = engine.snapshot();
+            wait_past_ttl(1).await;
+            // Bounded retry instead of a single probe: a backwards wall-clock
+            // step between the wait above and the scan's own now_secs() briefly
+            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            let mut keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
+            for _ in 0..100 {
+                if keys == vec![b"user:2".to_vec()] {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(100)).await;
+                keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
-        }
-        assert_eq!(
-            keys,
-            vec![b"user:2".to_vec()],
-            "an expired key must not occupy the cap slot ahead of a live one"
-        );
+            assert_eq!(
+                keys,
+                vec![b"user:2".to_vec()],
+                "an expired key must not occupy the cap slot ahead of a live one"
+            );
+        })
     }
 
     // Test 4b: a NULL key (kv/018 -- present, not deleted) counts as live and
     // does occupy a cap slot.
-    #[tokio::test]
-    async fn test_scan_keys_limited_with_snapshot_includes_null() {
-        let (engine, _dir) = make_engine().await;
-        engine.set_null(b"user:1").await.unwrap();
-        let snap = engine.snapshot();
-        let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
-        assert_eq!(keys, vec![b"user:1".to_vec()]);
+    #[test]
+    fn test_scan_keys_limited_with_snapshot_includes_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.set_null(b"user:1").await.unwrap();
+            let snap = engine.snapshot();
+            let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
+            assert_eq!(keys, vec![b"user:1".to_vec()]);
+        })
     }
 
     // ── Spec perf/029: MemTable prefix scan by range ─────────────────────────
     // All keys stay in the active MemTable (no flush).
 
     // Test 1: keys before, inside and behind the range, one a prefix of others.
-    #[tokio::test]
-    async fn test_scan_keys_memtable_range_returns_exactly_the_prefix_keys() {
-        let (engine, _dir) = make_engine().await;
-        let keys: [&[u8]; 6] = [b"aa", b"ab", b"abc", b"abd", b"ac", b"b"];
-        for key in keys {
-            engine.put(key, b"v").await.unwrap();
-        }
+    #[test]
+    fn test_scan_keys_memtable_range_returns_exactly_the_prefix_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let keys: [&[u8]; 6] = [b"aa", b"ab", b"abc", b"abd", b"ac", b"b"];
+            for key in keys {
+                engine.put(key, b"v").await.unwrap();
+            }
 
-        let scanned = engine.scan_keys(b"ab").await.unwrap();
-        assert_eq!(scanned, vec![b"ab".to_vec(), b"abc".to_vec(), b"abd".to_vec()]);
+            let scanned = engine.scan_keys(b"ab").await.unwrap();
+            assert_eq!(scanned, vec![b"ab".to_vec(), b"abc".to_vec(), b"abd".to_vec()]);
+        })
     }
 
     // Test 2: several versions per key in the range — the newest decides.
-    #[tokio::test]
-    async fn test_scan_keys_memtable_range_newest_version_decides() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"ab:1", b"v1").await.unwrap();
-        engine.put(b"ab:1", b"v2").await.unwrap();
-        engine.delete(b"ab:1").await.unwrap();
-        engine.put(b"ab:2", b"v1").await.unwrap();
-        engine.delete(b"ab:2").await.unwrap();
-        engine.put(b"ab:2", b"v2").await.unwrap();
-        engine.put(b"ac", b"v").await.unwrap();
+    #[test]
+    fn test_scan_keys_memtable_range_newest_version_decides() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"ab:1", b"v1").await.unwrap();
+            engine.put(b"ab:1", b"v2").await.unwrap();
+            engine.delete(b"ab:1").await.unwrap();
+            engine.put(b"ab:2", b"v1").await.unwrap();
+            engine.delete(b"ab:2").await.unwrap();
+            engine.put(b"ab:2", b"v2").await.unwrap();
+            engine.put(b"ac", b"v").await.unwrap();
 
-        let scanned = engine.scan_keys(b"ab").await.unwrap();
-        assert_eq!(scanned, vec![b"ab:2".to_vec()]);
+            let scanned = engine.scan_keys(b"ab").await.unwrap();
+            assert_eq!(scanned, vec![b"ab:2".to_vec()]);
+        })
     }
 
     // Test 3: `limit` stops after exactly `limit` hits; keys around the range
     // never count.
-    #[tokio::test]
-    async fn test_scan_keys_limited_memtable_range_stops_at_limit() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"aa", b"v").await.unwrap();
-        for i in 0..10 {
-            engine.put(format!("ab:{i}").as_bytes(), b"v").await.unwrap();
-        }
-        engine.put(b"ac", b"v").await.unwrap();
+    #[test]
+    fn test_scan_keys_limited_memtable_range_stops_at_limit() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"aa", b"v").await.unwrap();
+            for i in 0..10 {
+                engine.put(format!("ab:{i}").as_bytes(), b"v").await.unwrap();
+            }
+            engine.put(b"ac", b"v").await.unwrap();
 
-        let scanned = engine.scan_keys_limited(b"ab", 3).await.unwrap();
-        assert_eq!(scanned.len(), 3);
-        assert!(scanned.iter().all(|k| k.starts_with(b"ab:")));
+            let scanned = engine.scan_keys_limited(b"ab", 3).await.unwrap();
+            assert_eq!(scanned.len(), 3);
+            assert!(scanned.iter().all(|k| k.starts_with(b"ab:")));
+        })
     }
 
     // Test 4: an empty prefix still reads the whole MemTable.
-    #[tokio::test]
-    async fn test_scan_keys_empty_prefix_returns_all_live_keys() {
-        let (engine, _dir) = make_engine().await;
-        let keys: [&[u8]; 5] = [b"\x00k", b"ab", b"b", b"zz", b"\xffk"];
-        for key in keys {
-            engine.put(key, b"v").await.unwrap();
-        }
-        engine.delete(b"b").await.unwrap();
+    #[test]
+    fn test_scan_keys_empty_prefix_returns_all_live_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let keys: [&[u8]; 5] = [b"\x00k", b"ab", b"b", b"zz", b"\xffk"];
+            for key in keys {
+                engine.put(key, b"v").await.unwrap();
+            }
+            engine.delete(b"b").await.unwrap();
 
-        let scanned = engine.scan_keys(b"").await.unwrap();
-        assert_eq!(scanned, vec![b"\x00k".to_vec(), b"ab".to_vec(), b"zz".to_vec(), b"\xffk".to_vec()]);
+            let scanned = engine.scan_keys(b"").await.unwrap();
+            assert_eq!(scanned, vec![b"\x00k".to_vec(), b"ab".to_vec(), b"zz".to_vec(), b"\xffk".to_vec()]);
+        })
     }
 
     // Test 5: under a snapshot, newer versions in the range stay invisible and
     // the older visible version decides.
-    #[tokio::test]
-    async fn test_scan_keys_with_snapshot_memtable_range_older_version_decides() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"ab:1", b"v1").await.unwrap();
-        engine.put(b"ab:2", b"v1").await.unwrap();
-        engine.delete(b"ab:2").await.unwrap();
-        engine.put(b"ac", b"v1").await.unwrap();
-        let snap = engine.snapshot();
-        engine.delete(b"ab:1").await.unwrap();
-        engine.put(b"ab:2", b"v2").await.unwrap();
-        engine.put(b"ab:3", b"v1").await.unwrap();
+    #[test]
+    fn test_scan_keys_with_snapshot_memtable_range_older_version_decides() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"ab:1", b"v1").await.unwrap();
+            engine.put(b"ab:2", b"v1").await.unwrap();
+            engine.delete(b"ab:2").await.unwrap();
+            engine.put(b"ac", b"v1").await.unwrap();
+            let snap = engine.snapshot();
+            engine.delete(b"ab:1").await.unwrap();
+            engine.put(b"ab:2", b"v2").await.unwrap();
+            engine.put(b"ab:3", b"v1").await.unwrap();
 
-        let scanned = engine.scan_keys_with_snapshot(b"ab", snap.snapshot()).await.unwrap();
-        assert_eq!(scanned, vec![b"ab:1".to_vec()]);
+            let scanned = engine.scan_keys_with_snapshot(b"ab", snap.snapshot()).await.unwrap();
+            assert_eq!(scanned, vec![b"ab:1".to_vec()]);
+        })
     }
 
     // A shorter user key plus its stamp bytes can start with the prefix: it
     // must neither be returned nor end the range before a real match.
-    #[tokio::test]
-    async fn test_scan_keys_skips_shorter_key_whose_stamp_starts_with_prefix() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"k", b"v").await.unwrap();
-        let (ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
-        let mut prefix = b"k".to_vec();
-        prefix.push(ts.to_be_bytes()[0]);
-        // All-0xFF tail: sorts behind the encoded "k" plus stamp.
-        let mut matching = prefix.clone();
-        matching.resize(1 + 8, 0xFF);
-        engine.put(&matching, b"v").await.unwrap();
+    #[test]
+    fn test_scan_keys_skips_shorter_key_whose_stamp_starts_with_prefix() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"v").await.unwrap();
+            let (ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+            let mut prefix = b"k".to_vec();
+            prefix.push(ts.to_be_bytes()[0]);
+            // All-0xFF tail: sorts behind the encoded "k" plus stamp.
+            let mut matching = prefix.clone();
+            matching.resize(1 + 8, 0xFF);
+            engine.put(&matching, b"v").await.unwrap();
 
-        let scanned = engine.scan_keys(&prefix).await.unwrap();
-        assert_eq!(scanned, vec![matching]);
+            let scanned = engine.scan_keys(&prefix).await.unwrap();
+            assert_eq!(scanned, vec![matching]);
+        })
     }
 
     // ── Point-read MVCC ordering tests (overlapping L0 / frozen MemTables) ───
 
     // Regression: with two overlapping L0 tables, get must return the newest
     // version, not the one in the oldest (first-flushed) table.
-    #[tokio::test]
-    async fn test_get_newest_version_across_l0_tables() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"k", b"v1").await.unwrap();
-        freeze_and_flush(&engine).await; // L0 table 1: k=v1
-        engine.put(b"k", b"v2").await.unwrap();
-        freeze_and_flush(&engine).await; // L0 table 2: k=v2
+    #[test]
+    fn test_get_newest_version_across_l0_tables() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"v1").await.unwrap();
+            freeze_and_flush(&engine).await; // L0 table 1: k=v1
+            engine.put(b"k", b"v2").await.unwrap();
+            freeze_and_flush(&engine).await; // L0 table 2: k=v2
 
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+        })
     }
 
     // Regression: a tombstone in a newer L0 table must suppress the live
     // version in an older L0 table (no resurrection).
-    #[tokio::test]
-    async fn test_get_tombstone_in_newer_l0_table_wins() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"k", b"v1").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.delete(b"k").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_get_tombstone_in_newer_l0_table_wins() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"v1").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.delete(b"k").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+        })
     }
 
     // A snapshot taken between the two versions must skip the (invisible)
     // newer L0 table and still find the old version in the older one.
-    #[tokio::test]
-    async fn test_get_snapshot_between_l0_versions_sees_old() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"k", b"v1").await.unwrap();
-        freeze_and_flush(&engine).await;
-        let snap = engine.snapshot();
-        engine.put(b"k", b"v2").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_get_snapshot_between_l0_versions_sees_old() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"v1").await.unwrap();
+            freeze_and_flush(&engine).await;
+            let snap = engine.snapshot();
+            engine.put(b"k", b"v2").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        assert_eq!(
-            engine.get_with_snapshot(b"k", snap.snapshot()).await.unwrap(),
-            GetResult::Present(b"v1".to_vec())
-        );
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+            assert_eq!(
+                engine.get_with_snapshot(b"k", snap.snapshot()).await.unwrap(),
+                GetResult::Present(b"v1".to_vec())
+            );
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+        })
     }
 
     // Regression: with two frozen (unflushed) MemTables, get must serve the
     // newest version — frozen tables are pushed to the back of the list.
-    #[tokio::test]
-    async fn test_get_newest_version_across_immutable_memtables() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"k", b"v1").await.unwrap();
-        engine.freeze_active_memtable();
-        engine.put(b"k", b"v2").await.unwrap();
-        engine.freeze_active_memtable();
+    #[test]
+    fn test_get_newest_version_across_immutable_memtables() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"v1").await.unwrap();
+            engine.freeze_active_memtable();
+            engine.put(b"k", b"v2").await.unwrap();
+            engine.freeze_active_memtable();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+        })
     }
 
     // ── get_with_expiry tests (spec general/006 backup export) ──────────────
 
     // expire_at is 0 for a plain put, and the absolute TTL deadline for
     // put_with_ttl -- both against an externally acquired snapshot.
-    #[tokio::test]
-    async fn test_get_with_expiry_reports_ttl_and_zero() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"plain", b"v").await.unwrap();
-        engine.put_with_ttl(b"ttl", b"v", 3600).await.unwrap();
-        let snap = engine.snapshot();
+    #[test]
+    fn test_get_with_expiry_reports_ttl_and_zero() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"plain", b"v").await.unwrap();
+            engine.put_with_ttl(b"ttl", b"v", 3600).await.unwrap();
+            let snap = engine.snapshot();
 
-        let (result, expire_at) = engine.get_with_expiry(b"plain", snap.snapshot()).await.unwrap();
-        assert_eq!(result, GetResult::Present(b"v".to_vec()));
-        assert_eq!(expire_at, 0);
+            let (result, expire_at) = engine.get_with_expiry(b"plain", snap.snapshot()).await.unwrap();
+            assert_eq!(result, GetResult::Present(b"v".to_vec()));
+            assert_eq!(expire_at, 0);
 
-        let (result, expire_at) = engine.get_with_expiry(b"ttl", snap.snapshot()).await.unwrap();
-        assert_eq!(result, GetResult::Present(b"v".to_vec()));
-        assert!(expire_at > now_secs(), "expire_at must be an absolute future timestamp");
+            let (result, expire_at) = engine.get_with_expiry(b"ttl", snap.snapshot()).await.unwrap();
+            assert_eq!(result, GetResult::Present(b"v".to_vec()));
+            assert!(expire_at > now_secs(), "expire_at must be an absolute future timestamp");
+        })
     }
 
     // A NULL entry is reported distinctly, with expire_at 0 (set_null never
     // carries a TTL).
-    #[tokio::test]
-    async fn test_get_with_expiry_distinguishes_null() {
-        let (engine, _dir) = make_engine().await;
-        engine.set_null(b"n").await.unwrap();
-        let snap = engine.snapshot();
-        assert_eq!(
-            engine.get_with_expiry(b"n", snap.snapshot()).await.unwrap(),
-            (GetResult::Null, 0)
-        );
+    #[test]
+    fn test_get_with_expiry_distinguishes_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.set_null(b"n").await.unwrap();
+            let snap = engine.snapshot();
+            assert_eq!(
+                engine.get_with_expiry(b"n", snap.snapshot()).await.unwrap(),
+                (GetResult::Null, 0)
+            );
+        })
     }
 
     // A missing key reports Absent with expire_at 0.
-    #[tokio::test]
-    async fn test_get_with_expiry_absent_for_missing_key() {
-        let (engine, _dir) = make_engine().await;
-        let snap = engine.snapshot();
-        assert_eq!(
-            engine.get_with_expiry(b"ghost", snap.snapshot()).await.unwrap(),
-            (GetResult::Absent, 0)
-        );
+    #[test]
+    fn test_get_with_expiry_absent_for_missing_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let snap = engine.snapshot();
+            assert_eq!(
+                engine.get_with_expiry(b"ghost", snap.snapshot()).await.unwrap(),
+                (GetResult::Absent, 0)
+            );
+        })
     }
 
     // Snapshot isolation holds for the expiry-carrying read too, including
     // across a flush to SSTable and a VLog-backed (large) value.
-    #[tokio::test]
-    async fn test_get_with_expiry_snapshot_consistency_across_flush() {
-        let (engine, _dir) = make_engine().await;
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold -> VLog pointer
-        engine.put(b"k", &big).await.unwrap();
-        freeze_and_flush(&engine).await;
-        let snap = engine.snapshot();
+    #[test]
+    fn test_get_with_expiry_snapshot_consistency_across_flush() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold -> VLog pointer
+            engine.put(b"k", &big).await.unwrap();
+            freeze_and_flush(&engine).await;
+            let snap = engine.snapshot();
 
-        engine.put(b"k", b"newer").await.unwrap();
-        freeze_and_flush(&engine).await;
+            engine.put(b"k", b"newer").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        let (result, expire_at) = engine.get_with_expiry(b"k", snap.snapshot()).await.unwrap();
-        assert_eq!(result, GetResult::Present(big));
-        assert_eq!(expire_at, 0);
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"newer".to_vec()));
+            let (result, expire_at) = engine.get_with_expiry(b"k", snap.snapshot()).await.unwrap();
+            assert_eq!(result, GetResult::Present(big));
+            assert_eq!(expire_at, 0);
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"newer".to_vec()));
+        })
     }
 
     // ── Watcher tests ─────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_watcher_receives_set_event() {
-        let (engine, _dir) = make_engine().await;
-        let mut rx = engine.watch_subscribe();
-        engine.put(b"watch_key", b"val").await.unwrap();
-        let event = rx.recv().await.unwrap();
-        assert_eq!(event.key, b"watch_key");
-        assert!(matches!(event.op, OpType::Set));
+    #[test]
+    fn test_watcher_receives_set_event() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let mut rx = engine.watch_subscribe();
+            engine.put(b"watch_key", b"val").await.unwrap();
+            let event = rx.recv().await.unwrap();
+            assert_eq!(event.key, b"watch_key");
+            assert!(matches!(event.op, OpType::Set));
+        })
     }
 
     // kv/018 §2: set_null is an update — watchers receive a Set event.
-    #[tokio::test]
-    async fn test_watcher_receives_set_event_on_set_null() {
-        let (engine, _dir) = make_engine().await;
-        let mut rx = engine.watch_subscribe();
-        engine.set_null(b"null_key").await.unwrap();
-        let event = rx.recv().await.unwrap();
-        assert_eq!(event.key, b"null_key");
-        assert!(matches!(event.op, OpType::Set));
+    #[test]
+    fn test_watcher_receives_set_event_on_set_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let mut rx = engine.watch_subscribe();
+            engine.set_null(b"null_key").await.unwrap();
+            let event = rx.recv().await.unwrap();
+            assert_eq!(event.key, b"null_key");
+            assert!(matches!(event.op, OpType::Set));
+        })
     }
 
-    #[tokio::test]
-    async fn test_watcher_receives_delete_event() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"del_key", b"v").await.unwrap();
-        let mut rx = engine.watch_subscribe();
-        engine.delete(b"del_key").await.unwrap();
-        let event = rx.recv().await.unwrap();
-        assert_eq!(event.key, b"del_key");
-        assert!(matches!(event.op, OpType::Delete));
+    #[test]
+    fn test_watcher_receives_delete_event() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"del_key", b"v").await.unwrap();
+            let mut rx = engine.watch_subscribe();
+            engine.delete(b"del_key").await.unwrap();
+            let event = rx.recv().await.unwrap();
+            assert_eq!(event.key, b"del_key");
+            assert!(matches!(event.op, OpType::Delete));
+        })
     }
 
     // ── Inline-value flush test ───────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_small_value_flush_no_vlog_growth() {
-        let (engine, dir) = make_engine().await;
-        let vlog_path = dir.path().join("vlog.log");
+    #[test]
+    fn test_small_value_flush_no_vlog_growth() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, dir) = make_engine().await;
+            let vlog_path = dir.path().join("vlog.log");
 
-        // Write a small value (< MAX_VALUE_LENGTH = 1024 bytes)
-        engine.put(b"small_key", b"tiny_value").await.unwrap();
+            // Write a small value (< MAX_VALUE_LENGTH = 1024 bytes)
+            engine.put(b"small_key", b"tiny_value").await.unwrap();
 
-        // Small values are stored inline in the MemTable — VLog must still be empty.
-        let vlog_size_before = std::fs::metadata(&vlog_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+            // Small values are stored inline in the MemTable — VLog must still be empty.
+            let vlog_size_before = std::fs::metadata(&vlog_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
 
-        // Freeze the active MemTable and flush it to an SSTable.
-        engine.freeze_active_memtable();
-        engine.flush_memtable().await.unwrap();
+            // Freeze the active MemTable and flush it to an SSTable.
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap();
 
-        // VLog must not have grown — inline values go directly into the SSTable DataBlock.
-        let vlog_size_after = std::fs::metadata(&vlog_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        assert_eq!(
-            vlog_size_before,
-            vlog_size_after,
-            "VLog must not grow when flushing small (inline) values"
-        );
+            // VLog must not have grown — inline values go directly into the SSTable DataBlock.
+            let vlog_size_after = std::fs::metadata(&vlog_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert_eq!(
+                vlog_size_before,
+                vlog_size_after,
+                "VLog must not grow when flushing small (inline) values"
+            );
 
-        // The value must still be readable from the SSTable.
-        let result = engine.get(b"small_key").await.unwrap();
-        assert_eq!(result, Some(b"tiny_value".to_vec()));
+            // The value must still be readable from the SSTable.
+            let result = engine.get(b"small_key").await.unwrap();
+            assert_eq!(result, Some(b"tiny_value".to_vec()));
+        })
     }
 
     // ── Block-cache file-id stamping (compaction / Janitor rebuild) ──────────
@@ -3644,112 +3781,122 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_compaction_rebuild_stamps_reader_file_ids() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"a", b"1").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"b", b"2").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_compaction_rebuild_stamps_reader_file_ids() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"a", b"1").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"b", b"2").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        // Compacts both L0 tables (ids 0, 1) into a new L1 table (id 2).
-        engine.compact_level(0).await.unwrap();
+            // Compacts both L0 tables (ids 0, 1) into a new L1 table (id 2).
+            engine.compact_level(0).await.unwrap();
 
-        assert_readers_match_manifest(&engine);
-        let l1_ids: Vec<u64> = engine
-            .manifest
-            .read()
-            .get_level(1)
-            .iter()
-            .map(|m| m.file_id)
-            .collect();
-        assert!(!l1_ids.is_empty() && l1_ids.iter().all(|id| *id != 0));
+            assert_readers_match_manifest(&engine);
+            let l1_ids: Vec<u64> = engine
+                .manifest
+                .read()
+                .get_level(1)
+                .iter()
+                .map(|m| m.file_id)
+                .collect();
+            assert!(!l1_ids.is_empty() && l1_ids.iter().all(|id| *id != 0));
 
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+        })
     }
 
     // Regression (perf/004 finding 3): flush_memtable returns the flushed
     // SSTable's own file_id (not a positional guess into L0), and None when
     // there is nothing to flush -- so registration can't pick the wrong table.
-    #[tokio::test]
-    async fn test_flush_memtable_returns_flushed_file_id() {
-        let (engine, _dir) = make_engine().await;
-        assert_eq!(engine.flush_memtable().await.unwrap(), None, "nothing to flush");
+    #[test]
+    fn test_flush_memtable_returns_flushed_file_id() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            assert_eq!(engine.flush_memtable().await.unwrap(), None, "nothing to flush");
 
-        engine.put(b"k", b"v").await.unwrap();
-        engine.freeze_active_memtable();
-        let id = engine.flush_memtable().await.unwrap().expect("a table was flushed");
+            engine.put(b"k", b"v").await.unwrap();
+            engine.freeze_active_memtable();
+            let id = engine.flush_memtable().await.unwrap().expect("a table was flushed");
 
-        let version = engine.version();
-        let l0 = version.level(0);
-        assert_eq!(l0.len(), 1);
-        assert_eq!(l0[0].file_id, id, "returned id must be the flushed table's id");
+            let version = engine.version();
+            let l0 = version.level(0);
+            assert_eq!(l0.len(), 1);
+            assert_eq!(l0[0].file_id, id, "returned id must be the flushed table's id");
+        })
     }
 
     // Regression (perf/004 finding 2): compact_level returns exactly the file
     // ids it deleted (merged source + target), so deregistration deregisters
     // the real deletions instead of a separately-selected, racy guess.
-    #[tokio::test]
-    async fn test_compact_level_returns_deleted_file_ids() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"a", b"1").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"b", b"2").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_compact_level_returns_deleted_file_ids() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"a", b"1").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"b", b"2").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        // Two L0 tables, L1 empty -> both source tables are deleted, no targets.
-        let mut expected: Vec<u64> =
-            engine.version().level(0).iter().map(|r| r.file_id).collect();
-        expected.sort_unstable();
+            // Two L0 tables, L1 empty -> both source tables are deleted, no targets.
+            let mut expected: Vec<u64> =
+                engine.version().level(0).iter().map(|r| r.file_id).collect();
+            expected.sort_unstable();
 
-        let mut deleted = engine.compact_level(0).await.unwrap();
-        deleted.sort_unstable();
-        assert_eq!(deleted, expected, "must report exactly the compacted-away ids");
+            let mut deleted = engine.compact_level(0).await.unwrap();
+            deleted.sort_unstable();
+            assert_eq!(deleted, expected, "must report exactly the compacted-away ids");
+        })
     }
 
     // Note: every other compaction test targets an empty L1; this drives
     // the non-empty-target branch (open, drop from manifest, delete). A key
     // inside the existing L1 range forces overlapping-target selection.
-    #[tokio::test]
-    async fn test_compaction_into_nonempty_target_level() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"a", b"1").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"z", b"26").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap(); // L1 now spans [a, z]
+    #[test]
+    fn test_compaction_into_nonempty_target_level() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"a", b"1").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"z", b"26").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap(); // L1 now spans [a, z]
 
-        engine.put(b"m", b"13").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap(); // compacts [m] into non-empty L1
+            engine.put(b"m", b"13").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap(); // compacts [m] into non-empty L1
 
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"m").await.unwrap(), Some(b"13".to_vec()));
-        assert_eq!(engine.get(b"z").await.unwrap(), Some(b"26".to_vec()));
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(engine.get(b"m").await.unwrap(), Some(b"13".to_vec()));
+            assert_eq!(engine.get(b"z").await.unwrap(), Some(b"26".to_vec()));
+        })
     }
 
     // Test 1 (spec general/024): compaction_runs counts successfully
     // completed compact_next_level calls -- 0 before any compaction runs,
     // >= 1 once should_compact's own trigger condition (L0 at the default
     // threshold of 4) has actually been acted on.
-    #[tokio::test]
-    async fn test_compaction_runs_counter_increments_on_real_compaction() {
-        let (engine, _dir) = make_engine().await;
-        assert_eq!(engine.compaction_runs(), 0);
+    #[test]
+    fn test_compaction_runs_counter_increments_on_real_compaction() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            assert_eq!(engine.compaction_runs(), 0);
 
-        engine.put(b"a", b"1").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"b", b"2").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"c", b"3").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"d", b"4").await.unwrap();
-        freeze_and_flush(&engine).await;
-        assert!(should_compact(&engine.manifest.read(), &engine.compaction_config));
+            engine.put(b"a", b"1").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"b", b"2").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"c", b"3").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"d", b"4").await.unwrap();
+            freeze_and_flush(&engine).await;
+            assert!(should_compact(&engine.manifest.read(), &engine.compaction_config));
 
-        engine.compact_next_level().await.unwrap();
-        assert_eq!(engine.compaction_runs(), 1, "a real compaction must increment compaction_runs");
+            engine.compact_next_level().await.unwrap();
+            assert_eq!(engine.compaction_runs(), 1, "a real compaction must increment compaction_runs");
+        })
     }
 
     /// GC config that fires on any non-empty vLog.
@@ -3761,34 +3908,36 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_janitor_gc_stamps_reader_file_ids_and_invalidates_cache() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
-        engine.put(b"big", &big).await.unwrap();
-        engine.put(b"small", b"v").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_janitor_gc_stamps_reader_file_ids_and_invalidates_cache() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+            engine.put(b"big", &big).await.unwrap();
+            engine.put(b"small", b"v").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        // Populate the block cache under the pre-GC file id (first table = 0).
-        assert_eq!(engine.get(b"small").await.unwrap(), Some(b"v".to_vec()));
-        let pre_gc_key = BlockCacheKey { file_id: 0, block_offset: 0 };
-        assert!(engine.block_cache.stripe(&pre_gc_key).get(&pre_gc_key).is_some());
+            // Populate the block cache under the pre-GC file id (first table = 0).
+            assert_eq!(engine.get(b"small").await.unwrap(), Some(b"v".to_vec()));
+            let pre_gc_key = BlockCacheKey { file_id: 0, block_offset: 0 };
+            assert!(engine.block_cache.stripe(&pre_gc_key).get(&pre_gc_key).is_some());
 
-        let stats = engine.build_janitor(gc_always()).run_gc().await.unwrap();
-        assert!(stats.ran);
+            let stats = engine.build_janitor(gc_always()).run_gc().await.unwrap();
+            assert!(stats.ran);
 
-        assert_readers_match_manifest(&engine);
-        assert!(
-            engine.version().levels.iter().flatten().all(|r| r.file_id != 0),
-            "rebuilt readers must carry the new (non-zero) file ids"
-        );
-        // Cached blocks of the deleted pre-GC table must be invalidated.
-        assert!(engine.block_cache.stripe(&pre_gc_key).get(&pre_gc_key).is_none());
+            assert_readers_match_manifest(&engine);
+            assert!(
+                engine.version().levels.iter().flatten().all(|r| r.file_id != 0),
+                "rebuilt readers must carry the new (non-zero) file ids"
+            );
+            // Cached blocks of the deleted pre-GC table must be invalidated.
+            assert!(engine.block_cache.stripe(&pre_gc_key).get(&pre_gc_key).is_none());
 
-        // Data reads correctly through rebuilt readers and the new vLog.
-        assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
-        assert_eq!(engine.get(b"small").await.unwrap(), Some(b"v".to_vec()));
+            // Data reads correctly through rebuilt readers and the new vLog.
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+            assert_eq!(engine.get(b"small").await.unwrap(), Some(b"v".to_vec()));
+        })
     }
 
     /// vLog generation ids stamped into the pointers of all L0 SSTables.
@@ -3840,81 +3989,88 @@ mod tests {
 
     // Spec kv/017 test 1 (window A): a large value whose pointer lives only in
     // the active MemTable — no flush ran — must survive a GC cycle.
-    #[tokio::test]
-    async fn test_gc_preserves_memtable_resident_vlog_value() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
-        engine.put(b"big", &big).await.unwrap();
-        // Deliberately no flush: the pointer exists only in the MemTable.
+    #[test]
+    fn test_gc_preserves_memtable_resident_vlog_value() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+            engine.put(b"big", &big).await.unwrap();
+            // Deliberately no flush: the pointer exists only in the MemTable.
 
-        let stats = engine.build_janitor(gc_always()).run_gc().await.unwrap();
-        assert!(stats.ran);
-        assert_eq!(stats.live_bytes, 4096, "the MemTable pointer counts as live");
+            let stats = engine.build_janitor(gc_always()).run_gc().await.unwrap();
+            assert!(stats.ran);
+            assert_eq!(stats.live_bytes, 4096, "the MemTable pointer counts as live");
 
-        assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+        })
     }
 
     // Spec kv/017 test 2 (write path): with the old generation sealed and a
     // new one published, a write lands in — and is stamped with — the new one.
-    #[tokio::test]
-    async fn test_write_after_generation_swap_uses_new_generation() {
-        let (engine, _dir) = make_engine().await;
-        let gen1 = Arc::clone(&engine.version().active_vlog);
-        let gen2 =
-            Arc::new(VLog::open(generation_path(&engine.vlog_path, 2), 2).await.unwrap());
-        engine.install(|v| v.with_active_vlog(gen2));
-        gen1.seal();
+    #[test]
+    fn test_write_after_generation_swap_uses_new_generation() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let gen1 = Arc::clone(&engine.version().active_vlog);
+            let gen2 =
+                Arc::new(VLog::open(generation_path(&engine.vlog_path, 2), 2).await.unwrap());
+            engine.install(|v| v.with_active_vlog(gen2));
+            gen1.seal();
 
-        let big = vec![b'y'; 4096];
-        engine.put(b"big", &big).await.unwrap();
+            let big = vec![b'y'; 4096];
+            engine.put(b"big", &big).await.unwrap();
 
-        assert_eq!(gen1.size(), 0, "the sealed generation must not grow");
-        assert_eq!(engine.version().active_vlog.size(), 4096);
-        assert_eq!(engine.get(b"big").await.unwrap(), Some(big.clone()));
+            assert_eq!(gen1.size(), 0, "the sealed generation must not grow");
+            assert_eq!(engine.version().active_vlog.size(), 4096);
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big.clone()));
 
-        freeze_and_flush(&engine).await;
-        assert_eq!(l0_pointer_generations(&engine), vec![2]);
-        assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+            freeze_and_flush(&engine).await;
+            assert_eq!(l0_pointer_generations(&engine), vec![2]);
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+        })
     }
 
     // Spec kv/017 test 3 (window B): values written while the GC runs must all
     // survive — the seal makes racing appends retry against the new generation.
-    // Multi-threaded on purpose: the seal/append race needs real parallelism.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_gc_keeps_values_written_concurrently() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'w'; 2048];
-        engine.put(b"pre", &big).await.unwrap();
+    // The writers interleave with the GC at their await points, as they do on
+    // the engine thread.
+    #[test]
+    fn test_gc_keeps_values_written_concurrently() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'w'; 2048];
+            engine.put(b"pre", &big).await.unwrap();
 
-        let writers: Vec<_> = (0..4u32)
-            .map(|w| {
-                let engine = Arc::clone(&engine);
-                let value = big.clone();
-                tokio::spawn(async move {
-                    for i in 0..25u32 {
-                        engine.put(format!("k{w}-{i:02}").as_bytes(), &value).await.unwrap();
-                    }
+            let writers: Vec<_> = (0..4u32)
+                .map(|w| {
+                    let engine = Arc::clone(&engine);
+                    let value = big.clone();
+                    compio::runtime::spawn(async move {
+                        for i in 0..25u32 {
+                            engine.put(format!("k{w}-{i:02}").as_bytes(), &value).await.unwrap();
+                        }
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        engine.build_janitor(gc_always()).run_gc().await.unwrap();
-        for writer in writers {
-            writer.await.unwrap();
-        }
-
-        assert_eq!(engine.get(b"pre").await.unwrap(), Some(big.clone()));
-        for w in 0..4u32 {
-            for i in 0..25u32 {
-                assert_eq!(
-                    engine.get(format!("k{w}-{i:02}").as_bytes()).await.unwrap(),
-                    Some(big.clone()),
-                    "value k{w}-{i:02} written during the GC must survive"
-                );
+            engine.build_janitor(gc_always()).run_gc().await.unwrap();
+            for writer in writers {
+                writer.await.unwrap();
             }
-        }
+
+            assert_eq!(engine.get(b"pre").await.unwrap(), Some(big.clone()));
+            for w in 0..4u32 {
+                for i in 0..25u32 {
+                    assert_eq!(
+                        engine.get(format!("k{w}-{i:02}").as_bytes()).await.unwrap(),
+                        Some(big.clone()),
+                        "value k{w}-{i:02} written during the GC must survive"
+                    );
+                }
+            }
+        })
     }
 
     // Spec kv/020 test 1: a held writer guard blocks the barrier's drain step;
@@ -3922,23 +4078,25 @@ mod tests {
     // (not the public write path) since the real race window is instruction-
     // width and cannot be hit deterministically. Timeout-guarded so a bug that
     // makes the drain hang fails the test instead of the suite.
-    #[tokio::test]
-    async fn test_drain_waits_for_held_writer_guard_then_proceeds() {
-        let (engine, _dir) = make_engine().await;
+    #[test]
+    fn test_drain_waits_for_held_writer_guard_then_proceeds() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
 
-        // Simulates a write in flight: it has fetched the active generation
-        // and is somewhere before its `memtable.set`.
-        let guard = engine.in_flight_writes.read().await;
+            // Simulates a write in flight: it has fetched the active generation
+            // and is somewhere before its `memtable.set`.
+            let guard = engine.in_flight_writes.read().await;
 
-        let blocked = tokio::time::timeout(Duration::from_millis(200), engine.flush_all_memtables()).await;
-        assert!(blocked.is_err(), "drain must block while a writer guard is held");
+            let blocked = compio::time::timeout(Duration::from_millis(200), engine.flush_all_memtables()).await;
+            assert!(blocked.is_err(), "drain must block while a writer guard is held");
 
-        drop(guard);
+            drop(guard);
 
-        tokio::time::timeout(Duration::from_millis(200), engine.flush_all_memtables())
-            .await
-            .expect("drain must complete promptly once the guard is released")
-            .unwrap();
+            compio::time::timeout(Duration::from_millis(200), engine.flush_all_memtables())
+                .await
+                .expect("drain must complete promptly once the guard is released")
+                .unwrap();
+        })
     }
 
     /// Highest-stamped version of `user_key` across the active and all
@@ -3976,217 +4134,239 @@ mod tests {
     // version below it. Built with the test-only rotation lever (the one
     // rotation without a drain) because no production path can produce this
     // state any more -- it pins down exactly what the write barrier prevents.
-    #[tokio::test]
-    async fn test_older_stamp_in_newer_memtable_wins_by_source_order() {
-        let (engine, _dir) = make_engine().await;
+    #[test]
+    fn test_older_stamp_in_newer_memtable_wins_by_source_order() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
 
-        // Writer B: newer stamp, applied into the MemTable that is frozen next.
-        let newer = engine.next_timestamp();
-        engine.version().memtable.set(b"k".to_vec(), newer, Value::Inline(b"newer".to_vec(), None));
+            // Writer B: newer stamp, applied into the MemTable that is frozen next.
+            let newer = engine.next_timestamp();
+            engine.version().memtable.set(b"k".to_vec(), newer, Value::Inline(b"newer".to_vec(), None));
 
-        engine.freeze_active_memtable();
+            engine.freeze_active_memtable();
 
-        // Writer A: stamp drawn before the rotation, applied after it.
-        let older = Timestamp::new(newer.as_u64() - 1);
-        engine.version().memtable.set(b"k".to_vec(), older, Value::Inline(b"older".to_vec(), None));
+            // Writer A: stamp drawn before the rotation, applied after it.
+            let older = Timestamp::new(newer.as_u64() - 1);
+            engine.version().memtable.set(b"k".to_vec(), older, Value::Inline(b"older".to_vec(), None));
 
-        assert_eq!(
-            engine.get(b"k").await.unwrap(),
-            Some(b"older".to_vec()),
-            "first hit decides: the newer source wins even with the older stamp"
-        );
+            assert_eq!(
+                engine.get(b"k").await.unwrap(),
+                Some(b"older".to_vec()),
+                "first hit decides: the newer source wins even with the older stamp"
+            );
+        })
     }
 
     // Spec kv/029 test 1, after-state: concurrent writers on one key with a
     // threshold that rotates on nearly every write. The read must always
     // resolve to the newest stamp the engine holds -- what the source-ordered
     // read path can only deliver while the freeze barrier holds.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_concurrent_writes_across_freezes_never_strand_an_older_stamp() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(engine_with_threshold(&dir, 1).await);
+    #[test]
+    fn test_concurrent_writes_across_freezes_never_strand_an_older_stamp() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = Arc::new(engine_with_threshold(&dir, 1).await);
 
-        for round in 0..20u32 {
-            let key = format!("k{round}");
-            let writers: Vec<_> = (0..4u32)
-                .map(|w| {
-                    let engine = Arc::clone(&engine);
-                    let key = key.clone();
-                    tokio::spawn(async move {
-                        engine.put(key.as_bytes(), format!("v{w}").as_bytes()).await.unwrap();
+            for round in 0..20u32 {
+                let key = format!("k{round}");
+                let writers: Vec<_> = (0..4u32)
+                    .map(|w| {
+                        let engine = Arc::clone(&engine);
+                        let key = key.clone();
+                        compio::runtime::spawn(async move {
+                            engine.put(key.as_bytes(), format!("v{w}").as_bytes()).await.unwrap();
+                        })
                     })
-                })
-                .collect();
-            for writer in writers {
-                writer.await.unwrap();
-            }
+                    .collect();
+                for writer in writers {
+                    writer.await.unwrap();
+                }
 
-            let (stamp, newest) = newest_memtable_version(&engine, key.as_bytes())
-                .expect("every round writes its key into a MemTable");
-            assert_eq!(
-                engine.get(key.as_bytes()).await.unwrap(),
-                Some(newest),
-                "round {round}: the read must return the version stamped {stamp}"
-            );
-        }
+                let (stamp, newest) = newest_memtable_version(&engine, key.as_bytes())
+                    .expect("every round writes its key into a MemTable");
+                assert_eq!(
+                    engine.get(key.as_bytes()).await.unwrap(),
+                    Some(newest),
+                    "round {round}: the read must return the version stamped {stamp}"
+                );
+            }
+        })
     }
 
     // Spec kv/029 test 2: a held writer guard blocks the freeze until the
     // in-flight apply is through; afterwards the rotation goes ahead. Same
     // shape as the kv/020 drain test, now for the regular freeze path.
-    #[tokio::test]
-    async fn test_freeze_waits_for_held_writer_guard_then_rotates() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_with_threshold(&dir, 1).await;
-        engine.put(b"k", b"v").await.unwrap();
-        assert!(engine.version().immutables.is_empty(), "the first write does not rotate");
+    #[test]
+    fn test_freeze_waits_for_held_writer_guard_then_rotates() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_with_threshold(&dir, 1).await;
+            engine.put(b"k", b"v").await.unwrap();
+            assert!(engine.version().immutables.is_empty(), "the first write does not rotate");
 
-        // Simulates a write that has drawn its stamp and not applied it yet.
-        let guard = engine.in_flight_writes.read().await;
+            // Simulates a write that has drawn its stamp and not applied it yet.
+            let guard = engine.in_flight_writes.read().await;
 
-        let blocked = tokio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable()).await;
-        assert!(blocked.is_err(), "the freeze must wait while a writer guard is held");
-        assert!(engine.version().immutables.is_empty(), "nothing rotated under the held guard");
+            let blocked = compio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable()).await;
+            assert!(blocked.is_err(), "the freeze must wait while a writer guard is held");
+            assert!(engine.version().immutables.is_empty(), "nothing rotated under the held guard");
 
-        drop(guard);
+            drop(guard);
 
-        tokio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable())
-            .await
-            .expect("the freeze must proceed once the guard is released")
-            .unwrap();
-        assert_eq!(engine.version().immutables.len(), 1, "the rotation happened after the drain");
-        assert!(engine.version().memtable.is_empty(), "the active MemTable is fresh");
+            compio::time::timeout(Duration::from_millis(200), engine.maybe_freeze_memtable())
+                .await
+                .expect("the freeze must proceed once the guard is released")
+                .unwrap();
+            assert_eq!(engine.version().immutables.len(), 1, "the rotation happened after the drain");
+            assert!(engine.version().memtable.is_empty(), "the active MemTable is fresh");
+        })
     }
 
     // Spec general/032 test 1: each entry contributes its encoded internal key
     // (user key + 8-byte stamp) plus its stored value bytes; TTL is not counted.
-    #[tokio::test]
-    async fn test_memtable_size_is_the_sum_of_entry_bytes() {
-        let (engine, _dir) = make_engine().await;
-        assert_eq!(engine.stats().memtable_size, 0, "a fresh MemTable holds no bytes");
+    #[test]
+    fn test_memtable_size_is_the_sum_of_entry_bytes() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            assert_eq!(engine.stats().memtable_size, 0, "a fresh MemTable holds no bytes");
 
-        engine.put(b"alpha", b"12345").await.unwrap(); // 5 + 8 + 5 = 18
-        engine.put("clé".as_bytes(), "clé".as_bytes()).await.unwrap(); // 4 + 8 + 4 = 16
-        engine.put_with_ttl(b"beta", b"xyz", 3600).await.unwrap(); // 4 + 8 + 3 = 15
-        engine.set_null(b"gamma").await.unwrap(); // 5 + 8 + 0 = 13
-        engine
-            .write_batch(vec![BatchOp::Put { key: b"delta".to_vec(), value: b"batched".to_vec() }])
-            .await
-            .unwrap(); // 5 + 8 + 7 = 20
+            engine.put(b"alpha", b"12345").await.unwrap(); // 5 + 8 + 5 = 18
+            engine.put("clé".as_bytes(), "clé".as_bytes()).await.unwrap(); // 4 + 8 + 4 = 16
+            engine.put_with_ttl(b"beta", b"xyz", 3600).await.unwrap(); // 4 + 8 + 3 = 15
+            engine.set_null(b"gamma").await.unwrap(); // 5 + 8 + 0 = 13
+            engine
+                .write_batch(vec![BatchOp::Put { key: b"delta".to_vec(), value: b"batched".to_vec() }])
+                .await
+                .unwrap(); // 5 + 8 + 7 = 20
 
-        assert_eq!(engine.stats().memtable_size, 18 + 16 + 15 + 13 + 20);
+            assert_eq!(engine.stats().memtable_size, 18 + 16 + 15 + 13 + 20);
+        })
     }
 
     // Spec general/032 test 2: every write is its own version, and each one
     // counts on its own.
-    #[tokio::test]
-    async fn test_memtable_size_counts_every_version_of_a_key() {
-        let (engine, _dir) = make_engine().await;
+    #[test]
+    fn test_memtable_size_counts_every_version_of_a_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
 
-        engine.put(b"k", b"v1").await.unwrap(); // 1 + 8 + 2 = 11
-        engine.put(b"k", b"v22").await.unwrap(); // 1 + 8 + 3 = 12
-        engine.put(b"k", b"v333").await.unwrap(); // 1 + 8 + 4 = 13
+            engine.put(b"k", b"v1").await.unwrap(); // 1 + 8 + 2 = 11
+            engine.put(b"k", b"v22").await.unwrap(); // 1 + 8 + 3 = 12
+            engine.put(b"k", b"v333").await.unwrap(); // 1 + 8 + 4 = 13
 
-        assert_eq!(engine.stats().memtable_size, 11 + 12 + 13);
+            assert_eq!(engine.stats().memtable_size, 11 + 12 + 13);
+        })
     }
 
     // Spec general/032 test 3: a tombstone contributes only its internal key.
-    #[tokio::test]
-    async fn test_memtable_size_counts_a_tombstone_by_its_internal_key() {
-        let (engine, _dir) = make_engine().await;
+    #[test]
+    fn test_memtable_size_counts_a_tombstone_by_its_internal_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
 
-        engine.delete(b"gone").await.unwrap(); // 4 + 8 + 0
+            engine.delete(b"gone").await.unwrap(); // 4 + 8 + 0
 
-        assert_eq!(engine.stats().memtable_size, 12);
+            assert_eq!(engine.stats().memtable_size, 12);
+        })
     }
 
     // Spec general/032 test 4: the freeze trigger compares real bytes, not an
     // entry count. The check runs before each write (kv/029), so the write
     // that crosses the threshold still lands in the active MemTable and the
     // next write rotates it.
-    #[tokio::test]
-    async fn test_memtable_freezes_on_the_write_after_its_bytes_cross_the_threshold() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_with_threshold(&dir, 1000).await;
-        let value = [b'x'; 20]; // 2-byte keys: 2 + 8 + 20 = 30 bytes per entry
+    #[test]
+    fn test_memtable_freezes_on_the_write_after_its_bytes_cross_the_threshold() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_with_threshold(&dir, 1000).await;
+            let value = [b'x'; 20]; // 2-byte keys: 2 + 8 + 20 = 30 bytes per entry
 
-        for i in 0..33 {
-            engine.put(format!("{i:02}").as_bytes(), &value).await.unwrap();
-        }
-        let stats = engine.stats();
-        assert_eq!(stats.memtable_size, 990);
-        assert_eq!(stats.num_immutable_memtables, 0, "33 small entries stay below 1000 bytes");
+            for i in 0..33 {
+                engine.put(format!("{i:02}").as_bytes(), &value).await.unwrap();
+            }
+            let stats = engine.stats();
+            assert_eq!(stats.memtable_size, 990);
+            assert_eq!(stats.num_immutable_memtables, 0, "33 small entries stay below 1000 bytes");
 
-        engine.put(b"33", &value).await.unwrap();
-        let stats = engine.stats();
-        assert_eq!(stats.memtable_size, 1020, "the crossing write lands in the active MemTable");
-        assert_eq!(stats.num_immutable_memtables, 0, "the check ran before that write");
+            engine.put(b"33", &value).await.unwrap();
+            let stats = engine.stats();
+            assert_eq!(stats.memtable_size, 1020, "the crossing write lands in the active MemTable");
+            assert_eq!(stats.num_immutable_memtables, 0, "the check ran before that write");
 
-        engine.put(b"34", &value).await.unwrap();
-        let stats = engine.stats();
-        assert_eq!(stats.num_immutable_memtables, 1, "the next write rotates first");
-        assert_eq!(stats.memtable_size, 30, "and lands in the fresh MemTable");
+            engine.put(b"34", &value).await.unwrap();
+            let stats = engine.stats();
+            assert_eq!(stats.num_immutable_memtables, 1, "the next write rotates first");
+            assert_eq!(stats.memtable_size, 30, "and lands in the fresh MemTable");
+        })
     }
 
     // Spec general/032 test 4, large values: the same threshold is crossed
     // after a few entries. 600 bytes stay inline (below vlog_inline_threshold).
-    #[tokio::test]
-    async fn test_large_inline_values_freeze_after_fewer_entries() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_with_threshold(&dir, 1000).await;
-        let value = vec![b'x'; 600]; // 1 + 8 + 600 = 609 bytes per entry
+    #[test]
+    fn test_large_inline_values_freeze_after_fewer_entries() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_with_threshold(&dir, 1000).await;
+            let value = vec![b'x'; 600]; // 1 + 8 + 600 = 609 bytes per entry
 
-        engine.put(b"a", &value).await.unwrap(); // 609
-        engine.put(b"b", &value).await.unwrap(); // 1218: crosses, no rotation yet
-        assert_eq!(engine.stats().num_immutable_memtables, 0);
+            engine.put(b"a", &value).await.unwrap(); // 609
+            engine.put(b"b", &value).await.unwrap(); // 1218: crosses, no rotation yet
+            assert_eq!(engine.stats().num_immutable_memtables, 0);
 
-        engine.put(b"c", &value).await.unwrap();
-        assert_eq!(engine.stats().num_immutable_memtables, 1, "the third write rotates");
+            engine.put(b"c", &value).await.unwrap();
+            assert_eq!(engine.stats().num_immutable_memtables, 1, "the third write rotates");
+        })
     }
 
     // Spec general/032 test 5: an offloaded value counts with its vLog pointer,
     // the only part of it held in memory.
-    #[tokio::test]
-    async fn test_memtable_size_counts_an_offloaded_value_by_its_pointer() {
-        let (engine, _dir) = make_engine().await;
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+    #[test]
+    fn test_memtable_size_counts_an_offloaded_value_by_its_pointer() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
 
-        engine.put(b"big", &big).await.unwrap();
+            engine.put(b"big", &big).await.unwrap();
 
-        let pointer = std::mem::size_of::<crate::storage::format::ValuePointer>();
-        assert_eq!(engine.stats().memtable_size, 3 + 8 + pointer);
+            let pointer = std::mem::size_of::<crate::storage::format::ValuePointer>();
+            assert_eq!(engine.stats().memtable_size, 3 + 8 + pointer);
+        })
     }
 
     // Spec general/032 test 6: the MemTable created by a freeze starts at 0,
     // so it reports only the writes that land in it.
-    #[tokio::test]
-    async fn test_memtable_size_starts_at_zero_after_a_freeze() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = engine_with_threshold(&dir, 1).await;
-        engine.put(b"k", b"v").await.unwrap(); // 1 + 8 + 1 = 10
+    #[test]
+    fn test_memtable_size_starts_at_zero_after_a_freeze() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_with_threshold(&dir, 1).await;
+            engine.put(b"k", b"v").await.unwrap(); // 1 + 8 + 1 = 10
 
-        engine.put(b"k2", b"v22").await.unwrap(); // rotates first; 2 + 8 + 3 = 13
+            engine.put(b"k2", b"v22").await.unwrap(); // rotates first; 2 + 8 + 3 = 13
 
-        let stats = engine.stats();
-        assert_eq!(stats.num_immutable_memtables, 1);
-        assert_eq!(stats.memtable_size, 13, "the fresh MemTable counts only the new write");
+            let stats = engine.stats();
+            assert_eq!(stats.num_immutable_memtables, 1);
+            assert_eq!(stats.memtable_size, 13, "the fresh MemTable counts only the new write");
+        })
     }
 
     // Spec general/032: a batch shares one stamp, so [Delete k, Put k v]
     // resolves to one insert of the Put (spec kv/034), which counts once.
-    #[tokio::test]
-    async fn test_memtable_size_counts_a_key_written_twice_in_a_batch_once() {
-        let (engine, _dir) = make_engine().await;
+    #[test]
+    fn test_memtable_size_counts_a_key_written_twice_in_a_batch_once() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
 
-        engine
-            .write_batch(vec![
-                BatchOp::Delete { key: b"k".to_vec() },
-                BatchOp::Put { key: b"k".to_vec(), value: b"val".to_vec() },
-            ])
-            .await
-            .unwrap();
+            engine
+                .write_batch(vec![
+                    BatchOp::Delete { key: b"k".to_vec() },
+                    BatchOp::Put { key: b"k".to_vec(), value: b"val".to_vec() },
+                ])
+                .await
+                .unwrap();
 
-        assert_eq!(engine.stats().memtable_size, 1 + 8 + 3);
+            assert_eq!(engine.stats().memtable_size, 1 + 8 + 3);
+        })
     }
 
     // Spec kv/020 tests 2+3: sharpens test_gc_keeps_values_written_concurrently
@@ -4196,191 +4376,199 @@ mod tests {
     // instead of deadlocking against the drain, and (3) once everything has
     // settled, no stored pointer names a generation the GC retired -- checked
     // via a full MemTable/SSTable scan, not just successful reads.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_gc_drain_no_deadlock_and_no_dangling_pointers_under_load() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'w'; 2048];
-        engine.put(b"pre", &big).await.unwrap();
+    #[test]
+    fn test_gc_drain_no_deadlock_and_no_dangling_pointers_under_load() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'w'; 2048];
+            engine.put(b"pre", &big).await.unwrap();
 
-        let writers: Vec<_> = (0..4u32)
-            .map(|w| {
-                let engine = Arc::clone(&engine);
-                let value = big.clone();
-                tokio::spawn(async move {
-                    for i in 0..25u32 {
-                        engine.put(format!("k{w}-{i:02}").as_bytes(), &value).await.unwrap();
-                    }
+            let writers: Vec<_> = (0..4u32)
+                .map(|w| {
+                    let engine = Arc::clone(&engine);
+                    let value = big.clone();
+                    compio::runtime::spawn(async move {
+                        for i in 0..25u32 {
+                            engine.put(format!("k{w}-{i:02}").as_bytes(), &value).await.unwrap();
+                        }
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        // A stuck drain (guard never released, or a deadlock against the
-        // writers) fails the test instead of hanging the suite.
-        tokio::time::timeout(Duration::from_secs(10), engine.build_janitor(gc_always()).run_gc())
-            .await
-            .expect("GC must not deadlock against concurrent writers")
-            .unwrap();
+            // A stuck drain (guard never released, or a deadlock against the
+            // writers) fails the test instead of hanging the suite.
+            compio::time::timeout(Duration::from_secs(10), engine.build_janitor(gc_always()).run_gc())
+                .await
+                .expect("GC must not deadlock against concurrent writers")
+                .unwrap();
 
-        for writer in writers {
-            writer.await.unwrap();
-        }
+            for writer in writers {
+                writer.await.unwrap();
+            }
 
-        assert_eq!(engine.get(b"pre").await.unwrap(), Some(big.clone()));
-        for w in 0..4u32 {
-            for i in 0..25u32 {
-                assert_eq!(
-                    engine.get(format!("k{w}-{i:02}").as_bytes()).await.unwrap(),
-                    Some(big.clone()),
-                    "value k{w}-{i:02} written during the GC must survive"
+            assert_eq!(engine.get(b"pre").await.unwrap(), Some(big.clone()));
+            for w in 0..4u32 {
+                for i in 0..25u32 {
+                    assert_eq!(
+                        engine.get(format!("k{w}-{i:02}").as_bytes()).await.unwrap(),
+                        Some(big.clone()),
+                        "value k{w}-{i:02} written during the GC must survive"
+                    );
+                }
+            }
+
+            let live_ids = engine.version().vlog_ids();
+            for id in all_pointer_generations(&engine) {
+                assert!(
+                    live_ids.contains(&id),
+                    "pointer references retired generation {id}, live={live_ids:?}"
                 );
             }
-        }
-
-        let live_ids = engine.version().vlog_ids();
-        for id in all_pointer_generations(&engine) {
-            assert!(
-                live_ids.contains(&id),
-                "pointer references retired generation {id}, live={live_ids:?}"
-            );
-        }
+        })
     }
 
     // A generation that stays sealed (no swap) must fail the write cleanly
     // instead of spinning in the retry loop.
-    #[tokio::test]
-    async fn test_append_to_permanently_sealed_generation_fails() {
-        let (engine, _dir) = make_engine().await;
-        engine.version().active_vlog.seal();
+    #[test]
+    fn test_append_to_permanently_sealed_generation_fails() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.version().active_vlog.seal();
 
-        let err = engine.put(b"big", &vec![b'x'; 4096]).await.unwrap_err();
-        assert!(err.to_string().contains("sealed"), "unexpected error: {err}");
+            let err = engine.put(b"big", &vec![b'x'; 4096]).await.unwrap_err();
+            assert!(err.to_string().contains("sealed"), "unexpected error: {err}");
+        })
     }
 
     // Spec kv/017 test 4: values from before and after a GC are both readable,
     // and a reference to the retired generation taken before the GC keeps
     // reading correctly from its already-open descriptor.
-    #[tokio::test]
-    async fn test_reads_span_vlog_generations() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let before = vec![b'1'; 4096];
-        engine.put(b"before", &before).await.unwrap();
-        let gen1 = Arc::clone(&engine.version().active_vlog);
+    #[test]
+    fn test_reads_span_vlog_generations() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let before = vec![b'1'; 4096];
+            engine.put(b"before", &before).await.unwrap();
+            let gen1 = Arc::clone(&engine.version().active_vlog);
 
-        engine.build_janitor(gc_always()).run_gc().await.unwrap();
-        assert_eq!(engine.version().active_vlog.id(), 2);
-        assert_eq!(engine.version().vlog_ids(), vec![2], "generation 1 is retired");
+            engine.build_janitor(gc_always()).run_gc().await.unwrap();
+            assert_eq!(engine.version().active_vlog.id(), 2);
+            assert_eq!(engine.version().vlog_ids(), vec![2], "generation 1 is retired");
 
-        let after = vec![b'2'; 4096];
-        engine.put(b"after", &after).await.unwrap();
+            let after = vec![b'2'; 4096];
+            engine.put(b"after", &after).await.unwrap();
 
-        assert_eq!(engine.get(b"before").await.unwrap(), Some(before.clone()));
-        assert_eq!(engine.get(b"after").await.unwrap(), Some(after));
-        assert_eq!(gen1.read(0, 4096).unwrap(), before);
+            assert_eq!(engine.get(b"before").await.unwrap(), Some(before.clone()));
+            assert_eq!(engine.get(b"after").await.unwrap(), Some(after));
+            assert_eq!(gen1.read(0, 4096).unwrap(), before);
+        })
     }
 
     // Spec kv/017 test 5: startup registers every generation found on disk and
     // activates the highest id; a store with only the canonical file starts as
     // generation 1, and an orphaned empty generation does not disturb it.
-    #[tokio::test]
-    async fn test_startup_registers_all_generations() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let vlog_path = dir.path().join("vlog.log");
+    #[test]
+    fn test_startup_registers_all_generations() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog_path = dir.path().join("vlog.log");
 
-        let engine = engine_on(&dir).await;
-        assert_eq!(engine.version().vlog_ids(), vec![1], "legacy store is generation 1");
-        assert_eq!(engine.version().active_vlog.id(), 1);
-        drop(engine);
+            let engine = engine_on(&dir).await;
+            assert_eq!(engine.version().vlog_ids(), vec![1], "legacy store is generation 1");
+            assert_eq!(engine.version().active_vlog.id(), 1);
+            drop(engine);
 
-        std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
-        let engine = engine_on(&dir).await;
-        assert_eq!(engine.version().vlog_ids(), vec![1, 2]);
-        assert_eq!(engine.version().active_vlog.id(), 2);
-        assert_eq!(engine.version().vlog[&2].read(0, 12).unwrap(), b"generation-2");
-        drop(engine);
+            std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
+            let engine = engine_on(&dir).await;
+            assert_eq!(engine.version().vlog_ids(), vec![1, 2]);
+            assert_eq!(engine.version().active_vlog.id(), 2);
+            assert_eq!(engine.version().vlog[&2].read(0, 12).unwrap(), b"generation-2");
+            drop(engine);
 
-        std::fs::write(generation_path(&vlog_path, 3), b"").unwrap(); // orphan
-        let engine = engine_on(&dir).await;
-        assert_eq!(engine.version().vlog_ids(), vec![1, 2, 3]);
-        assert_eq!(engine.version().active_vlog.id(), 3);
-        let big = vec![b'o'; 4096];
-        engine.put(b"k", &big).await.unwrap();
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(big));
+            std::fs::write(generation_path(&vlog_path, 3), b"").unwrap(); // orphan
+            let engine = engine_on(&dir).await;
+            assert_eq!(engine.version().vlog_ids(), vec![1, 2, 3]);
+            assert_eq!(engine.version().active_vlog.id(), 3);
+            let big = vec![b'o'; 4096];
+            engine.put(b"k", &big).await.unwrap();
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(big));
+        })
     }
 
     // Spec perf/013 test 3: startup with an active generation > 1 and a live
     // storage thread repoints the thread at that generation instead of
     // leaving it on the canonical file until the next GC. Generation 1 (no
     // longer thread-owned) stays correctly readable through a local handle.
-    #[tokio::test]
-    async fn test_startup_routes_active_generation_through_thread() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let wal_path = dir.path().join("wal.log");
-        let vlog_path = dir.path().join("vlog.log");
-        std::fs::write(&vlog_path, b"generation-1").unwrap();
-        std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
+    #[test]
+    fn test_startup_routes_active_generation_through_thread() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal.log");
+            let vlog_path = dir.path().join("vlog.log");
+            std::fs::write(&vlog_path, b"generation-1").unwrap();
+            std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
 
-        let st_config = StorageThreadConfig {
-            sqpoll_enabled: false,
-            sqpoll_idle_ms: 500,
-            ring_depth: 64,
-            channel_capacity: 64,
-            cpu: -1,
-        };
-        let (mut st, handle) =
-            StorageThread::new(st_config, wal_path.clone(), vlog_path.clone()).unwrap();
+            let st_config = StorageThreadConfig {
+                sqpoll_enabled: false,
+                sqpoll_idle_ms: 500,
+                ring_depth: 64,
+                channel_capacity: 64,
+                cpu: -1,
+            };
+            let (mut st, handle) =
+                StorageThread::new(st_config, wal_path.clone(), vlog_path.clone()).unwrap();
 
-        let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
-        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
-        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
-        let engine = LsmStorageEngine::new(
-            wal,
-            wal_path,
-            vlog,
-            vlog_path,
-            file_manager,
-            manifest_manager,
-            LsmEngineOptions::default(),
-        )
-        .await
-        .unwrap();
+            let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
+            let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+            let engine = LsmStorageEngine::new(
+                wal,
+                wal_path,
+                vlog,
+                vlog_path,
+                file_manager,
+                manifest_manager,
+                LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap();
 
-        // Before the repoint: version-only bookkeeping, thread still on gen 1.
-        assert_eq!(engine.version().active_vlog.id(), 2, "generation 2 is the highest on disk");
+            // Before the repoint: version-only bookkeeping, thread still on gen 1.
+            assert_eq!(engine.version().active_vlog.id(), 2, "generation 2 is the highest on disk");
 
-        engine.route_active_vlog_to_thread(&handle).await.unwrap();
+            engine.route_active_vlog_to_thread(&handle).await.unwrap();
 
-        let active = Arc::clone(&engine.version().active_vlog);
-        assert_eq!(active.id(), 2, "active reference is handle-backed generation 2");
-        let off = active.append(b"-added").await.unwrap();
-        assert_eq!(off, 12, "cursor seeded from generation 2's on-disk length");
-        assert_eq!(
-            std::fs::read(generation_path(&engine.vlog_path, 2)).unwrap(),
-            b"generation-2-added",
-            "the append routed through the thread into generation 2's file"
-        );
-        assert_eq!(active.read(off, 6).unwrap(), b"-added");
+            let active = Arc::clone(&engine.version().active_vlog);
+            assert_eq!(active.id(), 2, "active reference is handle-backed generation 2");
+            let off = active.append(b"-added").await.unwrap();
+            assert_eq!(off, 12, "cursor seeded from generation 2's on-disk length");
+            assert_eq!(
+                std::fs::read(generation_path(&engine.vlog_path, 2)).unwrap(),
+                b"generation-2-added",
+                "the append routed through the thread into generation 2's file"
+            );
+            assert_eq!(active.read(off, 6).unwrap(), b"-added");
 
-        // Generation 1 is no longer thread-owned but stays correctly readable.
-        assert_eq!(engine.version().vlog[&1].read(0, 12).unwrap(), b"generation-1");
+            // Generation 1 is no longer thread-owned but stays correctly readable.
+            assert_eq!(engine.version().vlog[&1].read(0, 12).unwrap(), b"generation-1");
 
-        st.shutdown();
+            st.shutdown();
+        })
     }
 
     // ── IoEngine integration (spec perf/004) ─────────────────────────────────
     //
-    // Runs inside `tokio_uring::start` (not `#[tokio::test]`): registering
-    // files with `IoEngine` requires a tokio-uring runtime context, and the
-    // engine's own WAL/VLog/SSTable I/O (plain `tokio::fs`) works fine inside
-    // one too (this is exactly how `main.rs` already runs the whole server).
+    // Runs on the engine runtime's test harness: `IoEngine` registers its
+    // buffers with that runtime's ring.
 
     // 8. Integration: SSTable flush -> file is automatically registered.
     // Compaction deletion -> file is deregistered.
     #[test]
     fn test_flush_registers_and_compaction_deregisters_sstable() {
-        tokio_uring::start(async {
+        crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let engine = engine_on(&dir).await;
             let mut io_engine = IoEngine::new(4, 4096).unwrap();
@@ -4410,7 +4598,7 @@ mod tests {
     // Recovery must register every already-existing SSTable with the IoEngine.
     #[test]
     fn test_recovery_registers_existing_sstables() {
-        tokio_uring::start(async {
+        crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             {
                 let engine = engine_on(&dir).await;
@@ -4433,71 +4621,75 @@ mod tests {
     // Test 7: put, delete, set_null (-> Set, kv/018) and write_batch all
     // publish through the same choke point (`publish_change`/`publish_many`)
     // -> sequences are gapless and non-decreasing across every write path.
-    #[tokio::test]
-    async fn test_watch_seq_monotonic_across_all_write_paths() {
-        let (engine, _dir) = make_engine().await;
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_watch_seq_monotonic_across_all_write_paths() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let mut rx = engine.watch_subscribe();
 
-        engine.put(b"a", b"1").await.unwrap(); // Set
-        engine.delete(b"a").await.unwrap(); // Delete
-        engine.set_null(b"b").await.unwrap(); // Set (kv/018: an update, not a delete)
-        engine
-            .write_batch(vec![
-                BatchOp::Put { key: b"c".to_vec(), value: b"1".to_vec() },
-                BatchOp::Put { key: b"d".to_vec(), value: b"2".to_vec() },
-            ])
-            .await
-            .unwrap();
+            engine.put(b"a", b"1").await.unwrap(); // Set
+            engine.delete(b"a").await.unwrap(); // Delete
+            engine.set_null(b"b").await.unwrap(); // Set (kv/018: an update, not a delete)
+            engine
+                .write_batch(vec![
+                    BatchOp::Put { key: b"c".to_vec(), value: b"1".to_vec() },
+                    BatchOp::Put { key: b"d".to_vec(), value: b"2".to_vec() },
+                ])
+                .await
+                .unwrap();
 
-        let mut seqs = Vec::new();
-        for _ in 0..5 {
-            seqs.push(rx.recv().await.unwrap().seq);
-        }
-        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "sequences must be gapless and in write order: {seqs:?}");
+            let mut seqs = Vec::new();
+            for _ in 0..5 {
+                seqs.push(rx.recv().await.unwrap().seq);
+            }
+            assert_eq!(seqs, vec![1, 2, 3, 4, 5], "sequences must be gapless and in write order: {seqs:?}");
+        })
     }
 
     // Test 8: a batch's N ops get N consecutive sequences (`publish_many`),
     // and a concurrent single-op write lands fully before or after the
     // batch's slice, never interleaved into it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_watch_batch_is_contiguous_against_concurrent_single_write() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_watch_batch_is_contiguous_against_concurrent_single_write() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let mut rx = engine.watch_subscribe();
 
-        let batch_ops: Vec<BatchOp> = (0..20)
-            .map(|i| BatchOp::Put { key: format!("batch{i}").into_bytes(), value: b"v".to_vec() })
-            .collect();
+            let batch_ops: Vec<BatchOp> = (0..20)
+                .map(|i| BatchOp::Put { key: format!("batch{i}").into_bytes(), value: b"v".to_vec() })
+                .collect();
 
-        let e1 = Arc::clone(&engine);
-        let batch_handle = tokio::spawn(async move { e1.write_batch(batch_ops).await.unwrap() });
-        let e2 = Arc::clone(&engine);
-        let single_handle = tokio::spawn(async move { e2.put(b"single", b"v").await.unwrap() });
-        batch_handle.await.unwrap();
-        single_handle.await.unwrap();
+            let e1 = Arc::clone(&engine);
+            let batch_handle = compio::runtime::spawn(async move { e1.write_batch(batch_ops).await.unwrap() });
+            let e2 = Arc::clone(&engine);
+            let single_handle = compio::runtime::spawn(async move { e2.put(b"single", b"v").await.unwrap() });
+            batch_handle.await.unwrap();
+            single_handle.await.unwrap();
 
-        let mut batch_seqs = Vec::new();
-        let mut single_seq = None;
-        for _ in 0..21 {
-            let event = rx.recv().await.unwrap();
-            if event.key == b"single" {
-                single_seq = Some(event.seq);
-            } else {
-                batch_seqs.push(event.seq);
+            let mut batch_seqs = Vec::new();
+            let mut single_seq = None;
+            for _ in 0..21 {
+                let event = rx.recv().await.unwrap();
+                if event.key == b"single" {
+                    single_seq = Some(event.seq);
+                } else {
+                    batch_seqs.push(event.seq);
+                }
             }
-        }
-        batch_seqs.sort_unstable();
-        let (min, max) = (*batch_seqs.first().unwrap(), *batch_seqs.last().unwrap());
-        assert_eq!(
-            max - min + 1,
-            batch_seqs.len() as u64,
-            "batch sequences must be contiguous: {batch_seqs:?}"
-        );
-        let single_seq = single_seq.expect("the concurrent single write must have published an event");
-        assert!(
-            single_seq < min || single_seq > max,
-            "the concurrent single write must land fully before or after the batch: {single_seq} vs [{min},{max}]"
-        );
+            batch_seqs.sort_unstable();
+            let (min, max) = (*batch_seqs.first().unwrap(), *batch_seqs.last().unwrap());
+            assert_eq!(
+                max - min + 1,
+                batch_seqs.len() as u64,
+                "batch sequences must be contiguous: {batch_seqs:?}"
+            );
+            let single_seq = single_seq.expect("the concurrent single write must have published an event");
+            assert!(
+                single_seq < min || single_seq > max,
+                "the concurrent single write must land fully before or after the batch: {single_seq} vs [{min},{max}]"
+            );
+        })
     }
 
     // ── Spec kv/030 test 1: watch events after MemTable apply ────────────────
@@ -4514,38 +4706,40 @@ mod tests {
     // unconditional, unlike the residual stream-vs-timestamp ordering gap
     // between two different writers that stays open (spec kv/030 §2) and is
     // not exercised here.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_watch_event_is_never_seen_before_its_own_apply() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_watch_event_is_never_seen_before_its_own_apply() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
 
-        for round in 0..50u32 {
-            let key = format!("race{round}");
-            engine.put(key.as_bytes(), b"baseline").await.unwrap();
-            let (baseline_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
-            let mut rx = engine.watch_subscribe();
+            for round in 0..50u32 {
+                let key = format!("race{round}");
+                engine.put(key.as_bytes(), b"baseline").await.unwrap();
+                let (baseline_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
+                let mut rx = engine.watch_subscribe();
 
-            let e1 = Arc::clone(&engine);
-            let k1 = key.clone();
-            let set_handle = tokio::spawn(async move { e1.put(k1.as_bytes(), b"updated").await.unwrap() });
-            let e2 = Arc::clone(&engine);
-            let k2 = key.clone();
-            let del_handle = tokio::spawn(async move { e2.delete(k2.as_bytes()).await.unwrap() });
+                let e1 = Arc::clone(&engine);
+                let k1 = key.clone();
+                let set_handle = compio::runtime::spawn(async move { e1.put(k1.as_bytes(), b"updated").await.unwrap() });
+                let e2 = Arc::clone(&engine);
+                let k2 = key.clone();
+                let del_handle = compio::runtime::spawn(async move { e2.delete(k2.as_bytes()).await.unwrap() });
 
-            for _ in 0..2 {
-                let event = rx.recv().await.unwrap();
-                assert_eq!(event.key, key.as_bytes());
-                let (seen_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
-                assert!(
-                    seen_ts.as_u64() > baseline_ts.as_u64(),
-                    "round {round}: {:?} event observed before its own apply became visible",
-                    event.op
-                );
+                for _ in 0..2 {
+                    let event = rx.recv().await.unwrap();
+                    assert_eq!(event.key, key.as_bytes());
+                    let (seen_ts, _) = engine.newest_version(key.as_bytes()).await.unwrap().unwrap();
+                    assert!(
+                        seen_ts.as_u64() > baseline_ts.as_u64(),
+                        "round {round}: {:?} event observed before its own apply became visible",
+                        event.op
+                    );
+                }
+
+                set_handle.await.unwrap();
+                del_handle.await.unwrap();
             }
-
-            set_handle.await.unwrap();
-            del_handle.await.unwrap();
-        }
+        })
     }
 
     // ── Spec general/028: atomic install at flush and compaction ─────────────
@@ -4561,43 +4755,45 @@ mod tests {
     // readable. Task B reads while the flush is parked between its claim and
     // the SSTable write -- before the fix the MemTable was in neither the
     // immutables nor L0, so every key read as absent.
-    #[tokio::test]
-    async fn test_reads_see_flushing_memtable_during_the_install_window() {
-        let (mut engine, _dir) = make_engine().await;
-        let hook = hook_flush_write(&mut engine);
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_reads_see_flushing_memtable_during_the_install_window() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
+            let hook = hook_flush_write(&mut engine);
+            let engine = Arc::new(engine);
 
-        for i in 0..1000u32 {
-            engine.put(format!("k{i:04}").as_bytes(), b"v").await.unwrap();
-        }
-        engine.freeze_active_memtable();
+            for i in 0..1000u32 {
+                engine.put(format!("k{i:04}").as_bytes(), b"v").await.unwrap();
+            }
+            engine.freeze_active_memtable();
 
-        let flusher = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        hook.reached.notified().await;
-        assert!(engine.version().immutables.is_empty(), "the claim removed it");
-        assert_eq!(engine.version().flushing.len(), 1, "the claim parked it in the slot");
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            hook.reached.notified().await;
+            assert!(engine.version().immutables.is_empty(), "the claim removed it");
+            assert_eq!(engine.version().flushing.len(), 1, "the claim parked it in the slot");
 
-        for i in 0..1000u32 {
-            assert_eq!(
-                engine.get(format!("k{i:04}").as_bytes()).await.unwrap(),
-                Some(b"v".to_vec()),
-                "k{i:04} must stay readable while its MemTable is being flushed"
-            );
-        }
-        assert_eq!(engine.scan_keys(b"k").await.unwrap().len(), 1000);
+            for i in 0..1000u32 {
+                assert_eq!(
+                    engine.get(format!("k{i:04}").as_bytes()).await.unwrap(),
+                    Some(b"v".to_vec()),
+                    "k{i:04} must stay readable while its MemTable is being flushed"
+                );
+            }
+            assert_eq!(engine.scan_keys(b"k").await.unwrap().len(), 1000);
 
-        hook.release.notify_one();
-        let file_id = flusher.await.unwrap().unwrap();
-        assert!(file_id.is_some(), "the flush must have produced an SSTable");
+            hook.release.notify_one();
+            let file_id = flusher.await.unwrap().unwrap();
+            assert!(file_id.is_some(), "the flush must have produced an SSTable");
 
-        assert!(engine.version().flushing.is_empty());
-        assert!(engine.version().immutables.is_empty());
-        assert_eq!(engine.version().level(0).len(), 1);
-        assert_eq!(engine.get(b"k0000").await.unwrap(), Some(b"v".to_vec()));
-        assert_eq!(engine.scan_keys(b"k").await.unwrap().len(), 1000);
+            assert!(engine.version().flushing.is_empty());
+            assert!(engine.version().immutables.is_empty());
+            assert_eq!(engine.version().level(0).len(), 1);
+            assert_eq!(engine.get(b"k0000").await.unwrap(), Some(b"v".to_vec()));
+            assert_eq!(engine.scan_keys(b"k").await.unwrap().len(), 1000);
+        })
     }
 
     // Spec general/028 test 2: a failed flush hands its MemTable back to the
@@ -4605,161 +4801,169 @@ mod tests {
     // is its retry -- the keys stay readable throughout and end up in exactly
     // one L0 file. The fault is a read-only SSTable directory (same lever as
     // the kv/026 M1 test above), which fails the write before the install.
-    #[tokio::test]
-    async fn test_failed_flush_returns_its_memtable_for_the_retry() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sstable_dir = dir.path().join("sstables");
-        std::fs::create_dir_all(&sstable_dir).unwrap();
-        let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
-        engine.put(b"a", b"1").await.unwrap();
-        engine.put(b"b", b"2").await.unwrap();
-        engine.freeze_active_memtable();
+    #[test]
+    fn test_failed_flush_returns_its_memtable_for_the_retry() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sstable_dir = dir.path().join("sstables");
+            std::fs::create_dir_all(&sstable_dir).unwrap();
+            let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+            engine.put(b"a", b"1").await.unwrap();
+            engine.put(b"b", b"2").await.unwrap();
+            engine.freeze_active_memtable();
 
-        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        assert!(engine.flush_memtable().await.is_err(), "the SSTable write must fail");
-        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            assert!(engine.flush_memtable().await.is_err(), "the SSTable write must fail");
+            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(engine.version().flushing.is_empty(), "a failed flush claims nothing");
-        assert_eq!(engine.version().immutables.len(), 1, "its MemTable is back");
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+            assert!(engine.version().flushing.is_empty(), "a failed flush claims nothing");
+            assert_eq!(engine.version().immutables.len(), 1, "its MemTable is back");
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
 
-        assert!(engine.flush_memtable().await.unwrap().is_some(), "the retry succeeds");
-        assert_eq!(engine.version().level(0).len(), 1, "exactly one L0 file");
-        assert!(engine.version().immutables.is_empty());
-        assert!(engine.version().flushing.is_empty());
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+            assert!(engine.flush_memtable().await.unwrap().is_some(), "the retry succeeds");
+            assert_eq!(engine.version().level(0).len(), 1, "exactly one L0 file");
+            assert!(engine.version().immutables.is_empty());
+            assert!(engine.version().flushing.is_empty());
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+        })
     }
 
     // Spec general/028 test 3: the claim stays exclusive -- a second call
     // never flushes the same MemTable, and only one L0 file results. Since
     // spec general/029 it waits for the flush lock instead of returning right
     // away, so it runs as its own task.
-    #[tokio::test]
-    async fn test_concurrent_flush_calls_claim_the_memtable_once() {
-        let (mut engine, _dir) = make_engine().await;
-        let hook = hook_flush_write(&mut engine);
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_concurrent_flush_calls_claim_the_memtable_once() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
+            let hook = hook_flush_write(&mut engine);
+            let engine = Arc::new(engine);
 
-        engine.put(b"a", b"1").await.unwrap();
-        engine.freeze_active_memtable();
+            engine.put(b"a", b"1").await.unwrap();
+            engine.freeze_active_memtable();
 
-        let flusher = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        hook.reached.notified().await;
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            hook.reached.notified().await;
 
-        let second = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        yield_repeatedly().await;
-        assert!(!second.is_finished(), "the second call waits for the flush in flight");
+            let second = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            yield_repeatedly().await;
+            assert!(!second.is_finished(), "the second call waits for the flush in flight");
 
-        hook.release.notify_one();
-        assert!(flusher.await.unwrap().unwrap().is_some());
-        assert!(
-            second.await.unwrap().unwrap().is_none(),
-            "the second call must find the MemTable already flushed"
-        );
-        assert_eq!(engine.version().level(0).len(), 1, "exactly one L0 file");
-        assert!(engine.version().flushing.is_empty());
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+            hook.release.notify_one();
+            assert!(flusher.await.unwrap().unwrap().is_some());
+            assert!(
+                second.await.unwrap().unwrap().is_none(),
+                "the second call must find the MemTable already flushed"
+            );
+            assert_eq!(engine.version().level(0).len(), 1, "exactly one L0 file");
+            assert!(engine.version().flushing.is_empty());
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+        })
     }
 
     // Spec general/028 test 4: a compaction installs both levels at once. Task
     // B reads while the compaction is parked after opening its new readers --
     // before the fix the source level was already emptied while the target
     // level still carried the old versions, so `a` and `b` read as `old`.
-    #[tokio::test]
-    async fn test_reads_see_newest_versions_while_a_compaction_installs() {
-        let (mut engine, _dir) = make_engine().await;
+    #[test]
+    fn test_reads_see_newest_versions_while_a_compaction_installs() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
 
-        // L1 keeps the old versions, L0 two files with the newer ones.
-        engine.put(b"a", b"old").await.unwrap();
-        engine.put(b"b", b"old").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap();
-        assert_eq!(engine.version().level(1).len(), 1);
-        engine.put(b"a", b"new").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"b", b"new").await.unwrap();
-        freeze_and_flush(&engine).await;
-        assert_eq!(engine.version().level(0).len(), 2);
+            // L1 keeps the old versions, L0 two files with the newer ones.
+            engine.put(b"a", b"old").await.unwrap();
+            engine.put(b"b", b"old").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap();
+            assert_eq!(engine.version().level(1).len(), 1);
+            engine.put(b"a", b"new").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"b", b"new").await.unwrap();
+            freeze_and_flush(&engine).await;
+            assert_eq!(engine.version().level(0).len(), 2);
 
-        // Armed only now: the setup compaction above must not park.
-        let hook = Arc::new(TestHook::default());
-        engine.hooks.before_level_install = Some(Arc::clone(&hook));
-        let engine = Arc::new(engine);
+            // Armed only now: the setup compaction above must not park.
+            let hook = Arc::new(TestHook::default());
+            engine.hooks.before_level_install = Some(Arc::clone(&hook));
+            let engine = Arc::new(engine);
 
-        let compactor = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.compact_level(0).await })
-        };
-        hook.reached.notified().await;
+            let compactor = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.compact_level(0).await })
+            };
+            hook.reached.notified().await;
 
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"new".to_vec()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"new".to_vec()));
-        assert_eq!(
-            engine.scan_keys(b"").await.unwrap(),
-            vec![b"a".to_vec(), b"b".to_vec()],
-            "no key may disappear while the compaction installs"
-        );
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"new".to_vec()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(b"new".to_vec()));
+            assert_eq!(
+                engine.scan_keys(b"").await.unwrap(),
+                vec![b"a".to_vec(), b"b".to_vec()],
+                "no key may disappear while the compaction installs"
+            );
 
-        hook.release.notify_one();
-        compactor.await.unwrap().unwrap();
+            hook.release.notify_one();
+            compactor.await.unwrap().unwrap();
 
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"new".to_vec()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"new".to_vec()));
-        assert!(engine.version().level(0).is_empty());
-        assert_readers_match_manifest(&engine);
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"new".to_vec()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(b"new".to_vec()));
+            assert!(engine.version().level(0).is_empty());
+            assert_readers_match_manifest(&engine);
+        })
     }
 
     // Spec general/028 test 5: the Janitor installs every rebuilt level at
     // once. Task B reads across both levels while the GC is parked after
     // opening its new readers -- level by level, a reader could otherwise
     // catch a mix of rebuilt and retired ones.
-    #[tokio::test]
-    async fn test_reads_see_every_key_while_the_janitor_installs() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+    #[test]
+    fn test_reads_see_every_key_while_the_janitor_installs() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
 
-        engine.put(b"a", &big).await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap(); // "a" moves down to L1
-        engine.put(b"b", &big).await.unwrap();
-        freeze_and_flush(&engine).await;
-        assert_eq!(engine.version().level(0).len(), 1);
-        assert_eq!(engine.version().level(1).len(), 1);
+            engine.put(b"a", &big).await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap(); // "a" moves down to L1
+            engine.put(b"b", &big).await.unwrap();
+            freeze_and_flush(&engine).await;
+            assert_eq!(engine.version().level(0).len(), 1);
+            assert_eq!(engine.version().level(1).len(), 1);
 
-        let hook = Arc::new(TestHook::default());
-        let mut janitor = engine.build_janitor(gc_always());
-        janitor.set_install_hook(Arc::clone(&hook));
-        let janitor = Arc::new(janitor);
+            let hook = Arc::new(TestHook::default());
+            let mut janitor = engine.build_janitor(gc_always());
+            janitor.set_install_hook(Arc::clone(&hook));
+            let janitor = Arc::new(janitor);
 
-        let gc = {
-            let janitor = Arc::clone(&janitor);
-            tokio::spawn(async move { janitor.run_gc().await })
-        };
-        hook.reached.notified().await;
+            let gc = {
+                let janitor = Arc::clone(&janitor);
+                compio::runtime::spawn(async move { janitor.run_gc().await })
+            };
+            hook.reached.notified().await;
 
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(big.clone()));
-        assert_eq!(
-            engine.scan_keys(b"").await.unwrap(),
-            vec![b"a".to_vec(), b"b".to_vec()],
-            "no key may disappear while the GC installs its rebuilt levels"
-        );
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(big.clone()));
+            assert_eq!(
+                engine.scan_keys(b"").await.unwrap(),
+                vec![b"a".to_vec(), b"b".to_vec()],
+                "no key may disappear while the GC installs its rebuilt levels"
+            );
 
-        hook.release.notify_one();
-        assert!(gc.await.unwrap().unwrap().ran);
+            hook.release.notify_one();
+            assert!(gc.await.unwrap().unwrap().ran);
 
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(big));
-        assert_readers_match_manifest(&engine);
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(big.clone()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(big));
+            assert_readers_match_manifest(&engine);
+        })
     }
 
     // ── Spec perf/017: cooperative yields in the scan path ──────────────────
@@ -4777,40 +4981,44 @@ mod tests {
 
     // Spec perf/017 test 3 (MemTable branch): a 20 000-key `scan_keys` hands
     // the thread back, so a point `get` spawned after it answers first.
-    #[tokio::test]
-    async fn test_scan_keys_interleaves_with_get_in_memtable() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        fill_scan_keys(&engine).await;
+    #[test]
+    fn test_scan_keys_interleaves_with_get_in_memtable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            fill_scan_keys(&engine).await;
 
-        let scanner = Arc::clone(&engine);
-        let reader = Arc::clone(&engine);
-        let order = completion_order(
-            async move { assert_eq!(scanner.scan_keys(b"k:").await.unwrap().len(), 20_000) },
-            async move { assert!(reader.get(b"k:00001").await.unwrap().is_some()) },
-        )
-        .await;
-        assert_eq!(order, ["small", "long"]);
+            let scanner = Arc::clone(&engine);
+            let reader = Arc::clone(&engine);
+            let order = completion_order(
+                async move { assert_eq!(scanner.scan_keys(b"k:").await.unwrap().len(), 20_000) },
+                async move { assert!(reader.get(b"k:00001").await.unwrap().is_some()) },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
     }
 
     // Spec perf/017 test 3 (SSTable branch): same, with the keys flushed to
     // L0 so the scan runs through `scan_sstable_for_prefix`.
-    #[tokio::test]
-    async fn test_scan_keys_interleaves_with_get_in_sstable() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        fill_scan_keys(&engine).await;
-        engine.freeze_active_memtable();
-        engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
+    #[test]
+    fn test_scan_keys_interleaves_with_get_in_sstable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            fill_scan_keys(&engine).await;
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
 
-        let scanner = Arc::clone(&engine);
-        let reader = Arc::clone(&engine);
-        let order = completion_order(
-            async move { assert_eq!(scanner.scan_keys(b"k:").await.unwrap().len(), 20_000) },
-            async move { assert!(reader.get(b"k:00001").await.unwrap().is_some()) },
-        )
-        .await;
-        assert_eq!(order, ["small", "long"]);
+            let scanner = Arc::clone(&engine);
+            let reader = Arc::clone(&engine);
+            let order = completion_order(
+                async move { assert_eq!(scanner.scan_keys(b"k:").await.unwrap().len(), 20_000) },
+                async move { assert!(reader.get(b"k:00001").await.unwrap().is_some()) },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
     }
 
     // Spec perf/017 test 8 (A3): a MemTable rotation runs while the scan sits
@@ -4818,32 +5026,34 @@ mod tests {
     // the frozen list used to be held. No `parking_lot` guard survives a
     // yield, so the rotation gets its write lock instead of deadlocking the
     // one thread, and the scan still returns every key it started with.
-    #[tokio::test]
-    async fn test_scan_keys_survives_memtable_rotation_mid_scan() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        // The bulk goes to the frozen list without a flush; the active
-        // MemTable keeps far fewer keys than one yield interval, so the scan's
-        // first yield can only fall into the frozen-list iteration.
-        fill_scan_keys(&engine).await;
-        engine.freeze_active_memtable();
-        for i in 0..4u32 {
-            let key = format!("k:9000{i}");
-            engine.set(key.as_bytes(), b"v").await.unwrap();
-        }
+    #[test]
+    fn test_scan_keys_survives_memtable_rotation_mid_scan() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            // The bulk goes to the frozen list without a flush; the active
+            // MemTable keeps far fewer keys than one yield interval, so the scan's
+            // first yield can only fall into the frozen-list iteration.
+            fill_scan_keys(&engine).await;
+            engine.freeze_active_memtable();
+            for i in 0..4u32 {
+                let key = format!("k:9000{i}");
+                engine.set(key.as_bytes(), b"v").await.unwrap();
+            }
 
-        let scanner = Arc::clone(&engine);
-        let scan = tokio::spawn(async move { scanner.scan_keys(b"k:").await.unwrap() });
-        let rotator = Arc::clone(&engine);
-        let rotate = tokio::spawn(async move {
-            rotator.freeze_active_memtable();
-            rotator.set(b"k:99999", b"v").await.unwrap();
-        });
+            let scanner = Arc::clone(&engine);
+            let scan = compio::runtime::spawn(async move { scanner.scan_keys(b"k:").await.unwrap() });
+            let rotator = Arc::clone(&engine);
+            let rotate = compio::runtime::spawn(async move {
+                rotator.freeze_active_memtable();
+                rotator.set(b"k:99999", b"v").await.unwrap();
+            });
 
-        let scanned = scan.await.unwrap();
-        rotate.await.unwrap();
-        assert_eq!(scanned.len(), 20_004, "the rotation must not cost the scan a key");
-        assert_eq!(engine.scan_keys(b"k:").await.unwrap().len(), 20_005);
+            let scanned = scan.await.unwrap();
+            rotate.await.unwrap();
+            assert_eq!(scanned.len(), 20_004, "the rotation must not cost the scan a key");
+            assert_eq!(engine.scan_keys(b"k:").await.unwrap().len(), 20_005);
+        })
     }
 
     // ── Spec perf/030: yields follow the scan's work ─────────────────────────
@@ -4871,23 +5081,27 @@ mod tests {
 
     // MemTable branch: the range seek (perf/029) skips the foreign keys, so
     // every visited entry but the last is a decided key and ticks twice.
-    #[tokio::test]
-    async fn test_scan_keys_yields_within_a_dense_range_in_memtable() {
-        let (engine, _dir) = make_engine().await;
-        fill_dense_range_among_foreign_keys(&engine).await;
+    #[test]
+    fn test_scan_keys_yields_within_a_dense_range_in_memtable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            fill_dense_range_among_foreign_keys(&engine).await;
 
-        assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
+            assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
+        })
     }
 
     // SSTable branch: the same keys flushed to L0, decided by the sweep.
-    #[tokio::test]
-    async fn test_scan_keys_yields_within_a_dense_range_in_sstable() {
-        let (engine, _dir) = make_engine().await;
-        fill_dense_range_among_foreign_keys(&engine).await;
-        engine.freeze_active_memtable();
-        engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
+    #[test]
+    fn test_scan_keys_yields_within_a_dense_range_in_sstable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            fill_dense_range_among_foreign_keys(&engine).await;
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
 
-        assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
+            assert_eq!(dense_range_scan_order(Arc::new(engine)).await, ["small", "long"]);
+        })
     }
 
     // ── Spec perf/033: yields cover the result materialization ───────────────
@@ -4895,22 +5109,24 @@ mod tests {
     // 300 keys only in the active MemTable tick 600 times in the source loop,
     // under one yield interval: only collecting the result (300) and draining
     // the decided set (300) reaches it.
-    #[tokio::test]
-    async fn test_scan_keys_yields_while_materializing_the_result() {
-        let (engine, _dir) = make_engine().await;
-        let ops: Vec<BatchOp> = (0..300u32)
-            .map(|i| BatchOp::Put { key: format!("m:{i:03}").into_bytes(), value: b"v".to_vec() })
-            .collect();
-        engine.write_batch(ops).await.unwrap();
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_scan_keys_yields_while_materializing_the_result() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let ops: Vec<BatchOp> = (0..300u32)
+                .map(|i| BatchOp::Put { key: format!("m:{i:03}").into_bytes(), value: b"v".to_vec() })
+                .collect();
+            engine.write_batch(ops).await.unwrap();
+            let engine = Arc::new(engine);
 
-        let reader = Arc::clone(&engine);
-        let order = completion_order(
-            async move { assert_eq!(engine.scan_keys(b"m:").await.unwrap().len(), 300) },
-            async move { assert!(reader.get(b"m:001").await.unwrap().is_some()) },
-        )
-        .await;
-        assert_eq!(order, ["small", "long"]);
+            let reader = Arc::clone(&engine);
+            let order = completion_order(
+                async move { assert_eq!(engine.scan_keys(b"m:").await.unwrap().len(), 300) },
+                async move { assert!(reader.get(b"m:001").await.unwrap().is_some()) },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
     }
 
     // ── Spec perf/032: SSTable scans seek to the prefix range ────────────────
@@ -4931,45 +5147,47 @@ mod tests {
     // 2 100 keys span several data blocks. Deletes and overwrites before and
     // after the snapshot leave several versions per key: the flushed table
     // must answer every scan as the MemTable did.
-    #[tokio::test]
-    async fn test_scan_keys_over_a_flushed_table_matches_the_memtable_scan() {
-        let (engine, _dir) = make_engine().await;
-        let put = |key: String| BatchOp::Put { key: key.into_bytes(), value: b"v".to_vec() };
-        let delete = |key: String| BatchOp::Delete { key: key.into_bytes() };
-        let initial: Vec<BatchOp> = ["a:", "b:", "c:"]
-            .into_iter()
-            .flat_map(|group| (0..700u32).map(move |i| format!("{group}{i:04}")))
-            .map(put)
-            .collect();
-        engine.write_batch(initial).await.unwrap();
-        engine
-            .write_batch((0..700u32).step_by(5).map(|i| delete(format!("b:{i:04}"))).collect())
-            .await
-            .unwrap();
-        let snap = engine.snapshot();
-        let mut later: Vec<BatchOp> = (0..700u32).step_by(3).map(|i| delete(format!("b:{i:04}"))).collect();
-        later.extend((1..700u32).step_by(3).map(|i| put(format!("b:{i:04}"))));
-        later.push(put("b:9999".to_string()));
-        engine.write_batch(later).await.unwrap();
+    #[test]
+    fn test_scan_keys_over_a_flushed_table_matches_the_memtable_scan() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let put = |key: String| BatchOp::Put { key: key.into_bytes(), value: b"v".to_vec() };
+            let delete = |key: String| BatchOp::Delete { key: key.into_bytes() };
+            let initial: Vec<BatchOp> = ["a:", "b:", "c:"]
+                .into_iter()
+                .flat_map(|group| (0..700u32).map(move |i| format!("{group}{i:04}")))
+                .map(put)
+                .collect();
+            engine.write_batch(initial).await.unwrap();
+            engine
+                .write_batch((0..700u32).step_by(5).map(|i| delete(format!("b:{i:04}"))).collect())
+                .await
+                .unwrap();
+            let snap = engine.snapshot();
+            let mut later: Vec<BatchOp> = (0..700u32).step_by(3).map(|i| delete(format!("b:{i:04}"))).collect();
+            later.extend((1..700u32).step_by(3).map(|i| put(format!("b:{i:04}"))));
+            later.push(put("b:9999".to_string()));
+            engine.write_batch(later).await.unwrap();
 
-        let prefixes: [&[u8]; 5] = [b"a:", b"b:", b"b:00", b"c:", b""];
-        let mut in_memtable = Vec::new();
-        for prefix in prefixes {
-            in_memtable.push(scan_results(&engine, snap.snapshot(), prefix).await);
-        }
-        assert_eq!(in_memtable[3][0].len(), 700, "an untouched group stays complete");
-        assert!(
-            in_memtable[1][2].len() > in_memtable[1][0].len(),
-            "the snapshot still sees keys deleted after it"
-        );
+            let prefixes: [&[u8]; 5] = [b"a:", b"b:", b"b:00", b"c:", b""];
+            let mut in_memtable = Vec::new();
+            for prefix in prefixes {
+                in_memtable.push(scan_results(&engine, snap.snapshot(), prefix).await);
+            }
+            assert_eq!(in_memtable[3][0].len(), 700, "an untouched group stays complete");
+            assert!(
+                in_memtable[1][2].len() > in_memtable[1][0].len(),
+                "the snapshot still sees keys deleted after it"
+            );
 
-        engine.freeze_active_memtable();
-        engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
-        let mut in_sstable = Vec::new();
-        for prefix in prefixes {
-            in_sstable.push(scan_results(&engine, snap.snapshot(), prefix).await);
-        }
-        assert_eq!(in_sstable, in_memtable);
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap().expect("a MemTable was frozen");
+            let mut in_sstable = Vec::new();
+            for prefix in prefixes {
+                in_sstable.push(scan_results(&engine, snap.snapshot(), prefix).await);
+            }
+            assert_eq!(in_sstable, in_memtable);
+        })
     }
 
     // ── Spec general/029: maintenance against a concurrent flush ─────────────
@@ -4985,76 +5203,80 @@ mod tests {
     // Spec general/029 test 1 (B1): the flush barrier must not return while a
     // flush claimed before it is still in flight -- the GC behind it would
     // otherwise scan a manifest that is missing that MemTable's SSTable.
-    #[tokio::test]
-    async fn test_barrier_waits_for_a_flush_in_flight() {
-        let (mut engine, _dir) = make_engine().await;
-        let hook = hook_flush_write(&mut engine);
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_barrier_waits_for_a_flush_in_flight() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
+            let hook = hook_flush_write(&mut engine);
+            let engine = Arc::new(engine);
 
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
-        engine.put(b"parked", &big).await.unwrap();
-        engine.freeze_active_memtable();
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+            engine.put(b"parked", &big).await.unwrap();
+            engine.freeze_active_memtable();
 
-        let flusher = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        hook.reached.notified().await;
-        assert_eq!(engine.version().flushing.len(), 1, "the flush claimed the MemTable");
-        assert!(
-            engine.version().immutables.is_empty(),
-            "the barrier finds an empty queue and must still wait"
-        );
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            hook.reached.notified().await;
+            assert_eq!(engine.version().flushing.len(), 1, "the flush claimed the MemTable");
+            assert!(
+                engine.version().immutables.is_empty(),
+                "the barrier finds an empty queue and must still wait"
+            );
 
-        let barrier = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_all_memtables().await })
-        };
-        yield_repeatedly().await;
-        assert!(!barrier.is_finished(), "the barrier must wait for the flush in flight");
+            let barrier = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_all_memtables().await })
+            };
+            yield_repeatedly().await;
+            assert!(!barrier.is_finished(), "the barrier must wait for the flush in flight");
 
-        hook.release.notify_one();
-        barrier.await.unwrap().unwrap();
-        assert!(flusher.await.unwrap().unwrap().is_some());
-        assert!(engine.version().flushing.is_empty(), "no flush is left in flight");
-        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
+            hook.release.notify_one();
+            barrier.await.unwrap().unwrap();
+            assert!(flusher.await.unwrap().unwrap().is_some());
+            assert!(engine.version().flushing.is_empty(), "no flush is left in flight");
+            assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
+        })
     }
 
     // Spec general/029 test 2 (B1): a GC cycle must not retire the generation
     // a flush in flight still points into -- before the fix its barrier
     // returned early, the live scan missed that SSTable, and the key came back
     // as a pointer into a deleted generation.
-    #[tokio::test]
-    async fn test_gc_waits_for_a_flush_in_flight_before_it_scans() {
-        let (mut engine, _dir) = make_engine().await;
-        let hook = hook_flush_write(&mut engine);
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_gc_waits_for_a_flush_in_flight_before_it_scans() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
+            let hook = hook_flush_write(&mut engine);
+            let engine = Arc::new(engine);
 
-        let big = vec![b'x'; 4096];
-        engine.put(b"parked", &big).await.unwrap();
-        engine.freeze_active_memtable();
+            let big = vec![b'x'; 4096];
+            engine.put(b"parked", &big).await.unwrap();
+            engine.freeze_active_memtable();
 
-        let flusher = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        hook.reached.notified().await;
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            hook.reached.notified().await;
 
-        let janitor = Arc::new(engine.build_janitor(gc_always()));
-        let gc = {
-            let janitor = Arc::clone(&janitor);
-            tokio::spawn(async move { janitor.run_gc().await })
-        };
-        yield_repeatedly().await;
-        assert!(!gc.is_finished(), "the GC must not scan past a flush in flight");
-        assert!(engine.version().vlog.contains_key(&1), "its source generation is still live");
+            let janitor = Arc::new(engine.build_janitor(gc_always()));
+            let gc = {
+                let janitor = Arc::clone(&janitor);
+                compio::runtime::spawn(async move { janitor.run_gc().await })
+            };
+            yield_repeatedly().await;
+            assert!(!gc.is_finished(), "the GC must not scan past a flush in flight");
+            assert!(engine.version().vlog.contains_key(&1), "its source generation is still live");
 
-        hook.release.notify_one();
-        assert!(flusher.await.unwrap().unwrap().is_some());
-        assert!(gc.await.unwrap().unwrap().ran);
+            hook.release.notify_one();
+            assert!(flusher.await.unwrap().unwrap().is_some());
+            assert!(gc.await.unwrap().unwrap().ran);
 
-        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
-        assert_readers_match_manifest(&engine);
+            assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
+            assert_readers_match_manifest(&engine);
+        })
     }
 
     // Same wait, but the parked flush fails and hands its MemTable back to
@@ -5062,156 +5284,162 @@ mod tests {
     // MemTable still points into the generation the GC is about to retire:
     // the cycle fails instead, generation 1 stays, and the next cycle, with
     // the SSTable directory writable again, carries the value over.
-    #[tokio::test]
-    async fn test_gc_keeps_the_generation_a_failed_flush_hands_back() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sstable_dir = dir.path().join("sstables");
-        std::fs::create_dir_all(&sstable_dir).unwrap();
-        let mut engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
-        let hook = hook_flush_write(&mut engine);
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_gc_keeps_the_generation_a_failed_flush_hands_back() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sstable_dir = dir.path().join("sstables");
+            std::fs::create_dir_all(&sstable_dir).unwrap();
+            let mut engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
+            let hook = hook_flush_write(&mut engine);
+            let engine = Arc::new(engine);
 
-        let big = vec![b'x'; 4096];
-        engine.put(b"parked", &big).await.unwrap();
-        engine.freeze_active_memtable();
+            let big = vec![b'x'; 4096];
+            engine.put(b"parked", &big).await.unwrap();
+            engine.freeze_active_memtable();
 
-        let flusher = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        hook.reached.notified().await;
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            hook.reached.notified().await;
 
-        let janitor = Arc::new(engine.build_janitor(gc_always()));
-        let gc = {
-            let janitor = Arc::clone(&janitor);
-            tokio::spawn(async move { janitor.run_gc().await })
-        };
-        // Generation 2 is active once the GC is past its switch; from there
-        // to the barrier's wait on the flush lock nothing yields.
-        while engine.version().active_vlog.id() != 2 {
-            assert!(!gc.is_finished(), "the GC ended before its switch");
-            tokio::task::yield_now().await;
-        }
+            let janitor = Arc::new(engine.build_janitor(gc_always()));
+            let gc = {
+                let janitor = Arc::clone(&janitor);
+                compio::runtime::spawn(async move { janitor.run_gc().await })
+            };
+            // Generation 2 is active once the GC is past its switch; from there
+            // to the barrier's wait on the flush lock nothing yields.
+            while engine.version().active_vlog.id() != 2 {
+                assert!(!gc.is_finished(), "the GC ended before its switch");
+                tokio::task::yield_now().await;
+            }
 
-        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Lets the parked flush go on, and every later one that parks.
-        let releaser = {
-            let hook = Arc::clone(&hook);
-            tokio::spawn(async move {
-                loop {
-                    hook.release.notify_one();
-                    hook.reached.notified().await;
-                }
-            })
-        };
-        assert!(flusher.await.unwrap().is_err(), "the parked SSTable write must fail");
-        let cycle = gc.await.unwrap();
-        std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // Lets the parked flush go on, and every later one that parks.
+            let releaser = {
+                let hook = Arc::clone(&hook);
+                compio::runtime::spawn(async move {
+                    loop {
+                        hook.release.notify_one();
+                        hook.reached.notified().await;
+                    }
+                })
+            };
+            assert!(flusher.await.unwrap().is_err(), "the parked SSTable write must fail");
+            let cycle = gc.await.unwrap();
+            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(cycle.is_err(), "the GC must not go on past a MemTable its barrier left behind");
-        assert!(engine.version().vlog.contains_key(&1), "generation 1 stays live");
-        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big.clone()));
+            assert!(cycle.is_err(), "the GC must not go on past a MemTable its barrier left behind");
+            assert!(engine.version().vlog.contains_key(&1), "generation 1 stays live");
+            assert_eq!(engine.get(b"parked").await.unwrap(), Some(big.clone()));
 
-        assert!(janitor.run_gc().await.unwrap().ran);
-        assert!(!engine.version().vlog.contains_key(&1));
-        assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
-        releaser.abort();
+            assert!(janitor.run_gc().await.unwrap().ran);
+            assert!(!engine.version().vlog.contains_key(&1));
+            assert_eq!(engine.get(b"parked").await.unwrap(), Some(big));
+            drop(releaser);
+        })
     }
 
     // Spec general/029 test 3 (B2): L0 follows claim order, not completion
     // order. A second flush cannot claim while the first is in flight, so the
     // older MemTable's SSTable always lands first -- before the fix both ran
     // at once and whoever finished last counted as the newest source.
-    #[tokio::test]
-    async fn test_l0_follows_claim_order_not_completion_order() {
-        let (mut engine, _dir) = make_engine().await;
-        let hook = hook_flush_write(&mut engine);
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_l0_follows_claim_order_not_completion_order() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
+            let hook = hook_flush_write(&mut engine);
+            let engine = Arc::new(engine);
 
-        engine.put(b"k", b"old").await.unwrap();
-        engine.freeze_active_memtable();
-        engine.put(b"k", b"new").await.unwrap();
-        engine.freeze_active_memtable();
-        assert_eq!(engine.version().immutables.len(), 2);
+            engine.put(b"k", b"old").await.unwrap();
+            engine.freeze_active_memtable();
+            engine.put(b"k", b"new").await.unwrap();
+            engine.freeze_active_memtable();
+            assert_eq!(engine.version().immutables.len(), 2);
 
-        let older = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        hook.reached.notified().await;
+            let older = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            hook.reached.notified().await;
 
-        let newer = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        yield_repeatedly().await;
-        assert_eq!(engine.version().flushing.len(), 1, "only one flush may be in flight");
-        assert_eq!(
-            engine.version().immutables.len(),
-            1,
-            "the younger MemTable stays queued until the older one is installed"
-        );
-        assert!(!newer.is_finished(), "it waits for the flush lock instead of claiming");
+            let newer = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            yield_repeatedly().await;
+            assert_eq!(engine.version().flushing.len(), 1, "only one flush may be in flight");
+            assert_eq!(
+                engine.version().immutables.len(),
+                1,
+                "the younger MemTable stays queued until the older one is installed"
+            );
+            assert!(!newer.is_finished(), "it waits for the flush lock instead of claiming");
 
-        hook.release.notify_one();
-        let older_id = older.await.unwrap().unwrap().unwrap();
-        hook.reached.notified().await;
-        hook.release.notify_one();
-        let newer_id = newer.await.unwrap().unwrap().unwrap();
+            hook.release.notify_one();
+            let older_id = older.await.unwrap().unwrap().unwrap();
+            hook.reached.notified().await;
+            hook.release.notify_one();
+            let newer_id = newer.await.unwrap().unwrap().unwrap();
 
-        let l0: Vec<u64> = engine.version().level(0).iter().map(|r| r.file_id).collect();
-        assert_eq!(l0, vec![older_id, newer_id], "L0 lists the SSTables oldest first");
-        let manifest_l0: Vec<u64> =
-            engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
-        assert_eq!(manifest_l0, l0, "the manifest keeps that order across a restart");
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+            let l0: Vec<u64> = engine.version().level(0).iter().map(|r| r.file_id).collect();
+            assert_eq!(l0, vec![older_id, newer_id], "L0 lists the SSTables oldest first");
+            let manifest_l0: Vec<u64> =
+                engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
+            assert_eq!(manifest_l0, l0, "the manifest keeps that order across a restart");
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+        })
     }
 
     // Spec general/029 test 4 (B3): no flush may install while the GC swaps
     // manifest and levels -- before the fix one could, and the GC then rebuilt
     // every level from its own snapshot, so that SSTable kept its manifest
     // entry but lost its reader and every key with it.
-    #[tokio::test]
-    async fn test_gc_install_keeps_a_concurrently_flushed_sstable() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+    #[test]
+    fn test_gc_install_keeps_a_concurrently_flushed_sstable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
 
-        engine.put(b"a", &big).await.unwrap();
-        freeze_and_flush(&engine).await;
+            engine.put(b"a", &big).await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        let hook = Arc::new(TestHook::default());
-        let mut janitor = engine.build_janitor(gc_always());
-        janitor.set_install_hook(Arc::clone(&hook));
-        let janitor = Arc::new(janitor);
+            let hook = Arc::new(TestHook::default());
+            let mut janitor = engine.build_janitor(gc_always());
+            janitor.set_install_hook(Arc::clone(&hook));
+            let janitor = Arc::new(janitor);
 
-        let gc = {
-            let janitor = Arc::clone(&janitor);
-            tokio::spawn(async move { janitor.run_gc().await })
-        };
-        hook.reached.notified().await;
+            let gc = {
+                let janitor = Arc::clone(&janitor);
+                compio::runtime::spawn(async move { janitor.run_gc().await })
+            };
+            hook.reached.notified().await;
 
-        engine.put(b"b", b"2").await.unwrap();
-        engine.freeze_active_memtable();
-        let flusher = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        yield_repeatedly().await;
-        assert!(engine.version().flushing.is_empty(), "the GC install holds the flush lock");
-        assert_eq!(
-            engine.version().immutables.len(),
-            1,
-            "the flush waits for the install instead of landing inside it"
-        );
+            engine.put(b"b", b"2").await.unwrap();
+            engine.freeze_active_memtable();
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            yield_repeatedly().await;
+            assert!(engine.version().flushing.is_empty(), "the GC install holds the flush lock");
+            assert_eq!(
+                engine.version().immutables.len(),
+                1,
+                "the flush waits for the install instead of landing inside it"
+            );
 
-        hook.release.notify_one();
-        assert!(gc.await.unwrap().unwrap().ran);
-        assert!(flusher.await.unwrap().unwrap().is_some());
+            hook.release.notify_one();
+            assert!(gc.await.unwrap().unwrap().ran);
+            assert!(flusher.await.unwrap().unwrap().is_some());
 
-        assert_readers_match_manifest(&engine);
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(big));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+            assert_readers_match_manifest(&engine);
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(big));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+        })
     }
 
     // Spec general/029 test 4, the wider window (A3): a flush that completes
@@ -5219,97 +5447,101 @@ mod tests {
     // install -- with its reader, because the reload reads the current
     // manifest and not the snapshot, and as the newest L0 source, because
     // every rebuild carries snapshot content and belongs in front of it.
-    #[tokio::test]
-    async fn test_gc_install_adopts_an_sstable_flushed_since_its_snapshot() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let old = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
-        let new = vec![b'y'; 4096];
+    #[test]
+    fn test_gc_install_adopts_an_sstable_flushed_since_its_snapshot() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let old = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+            let new = vec![b'y'; 4096];
 
-        engine.put(b"shared", &old).await.unwrap();
-        freeze_and_flush(&engine).await;
+            engine.put(b"shared", &old).await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        let hook = Arc::new(TestHook::default());
-        let mut janitor = engine.build_janitor(gc_always());
-        janitor.set_before_manifest_swap_hook(Arc::clone(&hook));
-        let janitor = Arc::new(janitor);
+            let hook = Arc::new(TestHook::default());
+            let mut janitor = engine.build_janitor(gc_always());
+            janitor.set_before_manifest_swap_hook(Arc::clone(&hook));
+            let janitor = Arc::new(janitor);
 
-        let gc = {
-            let janitor = Arc::clone(&janitor);
-            tokio::spawn(async move { janitor.run_gc().await })
-        };
-        hook.reached.notified().await;
+            let gc = {
+                let janitor = Arc::clone(&janitor);
+                compio::runtime::spawn(async move { janitor.run_gc().await })
+            };
+            hook.reached.notified().await;
 
-        // The whole flush fits into the window: it overwrites a key the
-        // snapshot table carries and enters the manifest the GC never saw.
-        engine.put(b"shared", &new).await.unwrap();
-        engine.put(b"late", &new).await.unwrap();
-        engine.freeze_active_memtable();
-        let flushed_id = engine.flush_memtable().await.unwrap().unwrap();
+            // The whole flush fits into the window: it overwrites a key the
+            // snapshot table carries and enters the manifest the GC never saw.
+            engine.put(b"shared", &new).await.unwrap();
+            engine.put(b"late", &new).await.unwrap();
+            engine.freeze_active_memtable();
+            let flushed_id = engine.flush_memtable().await.unwrap().unwrap();
 
-        hook.release.notify_one();
-        let stats = gc.await.unwrap().unwrap();
-        assert_eq!(stats.sstables_rebuilt, 1, "only the snapshot table was rebuilt");
+            hook.release.notify_one();
+            let stats = gc.await.unwrap().unwrap();
+            assert_eq!(stats.sstables_rebuilt, 1, "only the snapshot table was rebuilt");
 
-        assert_readers_match_manifest(&engine);
-        assert_eq!(engine.get(b"late").await.unwrap(), Some(new.clone()));
-        assert_eq!(
-            engine.get(b"shared").await.unwrap(),
-            Some(new),
-            "the rebuild carries the version the flush replaced"
-        );
+            assert_readers_match_manifest(&engine);
+            assert_eq!(engine.get(b"late").await.unwrap(), Some(new.clone()));
+            assert_eq!(
+                engine.get(b"shared").await.unwrap(),
+                Some(new),
+                "the rebuild carries the version the flush replaced"
+            );
 
-        let l0: Vec<u64> = engine.version().level(0).iter().map(|r| r.file_id).collect();
-        assert_eq!(l0.len(), 2);
-        assert_eq!(l0[1], flushed_id, "the rebuild is older and goes in front of the flush");
-        let manifest_l0: Vec<u64> =
-            engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
-        assert_eq!(manifest_l0, l0, "the manifest keeps that order across a restart");
+            let l0: Vec<u64> = engine.version().level(0).iter().map(|r| r.file_id).collect();
+            assert_eq!(l0.len(), 2);
+            assert_eq!(l0[1], flushed_id, "the rebuild is older and goes in front of the flush");
+            let manifest_l0: Vec<u64> =
+                engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
+            assert_eq!(manifest_l0, l0, "the manifest keeps that order across a restart");
+        })
     }
 
     // Spec general/029 test 5 (A4): the same for a compaction install -- it
     // reads its levels from the manifest, so a flush landing in L0 between
     // that read and the swap would be replaced away.
-    #[tokio::test]
-    async fn test_compaction_install_keeps_a_concurrently_flushed_sstable() {
-        let (mut engine, _dir) = make_engine().await;
-        engine.put(b"a", b"1").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.put(b"b", b"2").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_compaction_install_keeps_a_concurrently_flushed_sstable() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
+            engine.put(b"a", b"1").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.put(b"b", b"2").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        let hook = Arc::new(TestHook::default());
-        engine.hooks.before_level_install = Some(Arc::clone(&hook));
-        let engine = Arc::new(engine);
+            let hook = Arc::new(TestHook::default());
+            engine.hooks.before_level_install = Some(Arc::clone(&hook));
+            let engine = Arc::new(engine);
 
-        let compactor = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.compact_level(0).await })
-        };
-        hook.reached.notified().await;
+            let compactor = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.compact_level(0).await })
+            };
+            hook.reached.notified().await;
 
-        engine.put(b"c", b"3").await.unwrap();
-        engine.freeze_active_memtable();
-        let flusher = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.flush_memtable().await })
-        };
-        yield_repeatedly().await;
-        assert!(engine.version().flushing.is_empty(), "the compaction install holds the flush lock");
-        assert_eq!(
-            engine.version().immutables.len(),
-            1,
-            "the flush waits for the install instead of landing inside it"
-        );
+            engine.put(b"c", b"3").await.unwrap();
+            engine.freeze_active_memtable();
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            yield_repeatedly().await;
+            assert!(engine.version().flushing.is_empty(), "the compaction install holds the flush lock");
+            assert_eq!(
+                engine.version().immutables.len(),
+                1,
+                "the flush waits for the install instead of landing inside it"
+            );
 
-        hook.release.notify_one();
-        compactor.await.unwrap().unwrap();
-        assert!(flusher.await.unwrap().unwrap().is_some());
+            hook.release.notify_one();
+            compactor.await.unwrap().unwrap();
+            assert!(flusher.await.unwrap().unwrap().is_some());
 
-        assert_readers_match_manifest(&engine);
-        assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
-        assert_eq!(engine.get(b"c").await.unwrap(), Some(b"3".to_vec()));
+            assert_readers_match_manifest(&engine);
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+            assert_eq!(engine.get(b"c").await.unwrap(), Some(b"3".to_vec()));
+        })
     }
 
     /// A level below L0 must be free of overlaps: the read path iterates it in
@@ -5341,64 +5573,66 @@ mod tests {
     // cycle -- it would copy vLog pointers into the generations the cycle is
     // about to delete, and its manifest swap would make the GC re-enter the
     // very SSTables the compaction merged away.
-    #[tokio::test]
-    async fn test_compaction_waits_for_the_gc_cycle() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
-        let keys: [&[u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
+    #[test]
+    fn test_compaction_waits_for_the_gc_cycle() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'x'; 4096]; // >= vlog_inline_threshold → vLog pointer
+            let keys: [&[u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
 
-        engine.put(keys[0], &big).await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap(); // "a" moves down to L1
-        for key in &keys[1..] {
-            engine.put(key, &big).await.unwrap();
+            engine.put(keys[0], &big).await.unwrap();
             freeze_and_flush(&engine).await;
-        }
-        assert_eq!(engine.version().level(0).len(), 4);
-        assert_eq!(engine.version().level(1).len(), 1);
+            engine.compact_level(0).await.unwrap(); // "a" moves down to L1
+            for key in &keys[1..] {
+                engine.put(key, &big).await.unwrap();
+                freeze_and_flush(&engine).await;
+            }
+            assert_eq!(engine.version().level(0).len(), 4);
+            assert_eq!(engine.version().level(1).len(), 1);
 
-        let hook = Arc::new(TestHook::default());
-        let mut janitor = engine.build_janitor(gc_always());
-        janitor.set_install_hook(Arc::clone(&hook));
-        let janitor = Arc::new(janitor);
+            let hook = Arc::new(TestHook::default());
+            let mut janitor = engine.build_janitor(gc_always());
+            janitor.set_install_hook(Arc::clone(&hook));
+            let janitor = Arc::new(janitor);
 
-        let gc = {
-            let janitor = Arc::clone(&janitor);
-            tokio::spawn(async move { janitor.run_gc().await })
-        };
-        hook.reached.notified().await;
+            let gc = {
+                let janitor = Arc::clone(&janitor);
+                compio::runtime::spawn(async move { janitor.run_gc().await })
+            };
+            hook.reached.notified().await;
 
-        let compactor = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.compact_level(0).await })
-        };
-        // The second one would find L2 empty and return without touching a
-        // file, so its "not finished" says the lock spans the whole run and
-        // not merely the I/O the first one happens to be busy with.
-        let idle = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move { engine.compact_level(2).await })
-        };
-        yield_repeatedly().await;
-        assert!(!compactor.is_finished(), "a compaction must not run inside a GC cycle");
-        assert!(!idle.is_finished(), "not even one that has nothing to compact");
-        assert_eq!(
-            engine.manifest.read().get_level(0).len(),
-            4,
-            "and none of them may swap the GC's tables out of the manifest"
-        );
+            let compactor = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.compact_level(0).await })
+            };
+            // The second one would find L2 empty and return without touching a
+            // file, so its "not finished" says the lock spans the whole run and
+            // not merely the I/O the first one happens to be busy with.
+            let idle = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.compact_level(2).await })
+            };
+            yield_repeatedly().await;
+            assert!(!compactor.is_finished(), "a compaction must not run inside a GC cycle");
+            assert!(!idle.is_finished(), "not even one that has nothing to compact");
+            assert_eq!(
+                engine.manifest.read().get_level(0).len(),
+                4,
+                "and none of them may swap the GC's tables out of the manifest"
+            );
 
-        hook.release.notify_one();
-        assert!(gc.await.unwrap().unwrap().ran);
-        compactor.await.unwrap().unwrap();
-        assert!(idle.await.unwrap().unwrap().is_empty());
+            hook.release.notify_one();
+            assert!(gc.await.unwrap().unwrap().ran);
+            compactor.await.unwrap().unwrap();
+            assert!(idle.await.unwrap().unwrap().is_empty());
 
-        assert_readers_match_manifest(&engine);
-        assert_levels_below_l0_are_disjoint(&engine);
-        for key in keys {
-            assert_eq!(engine.get(key).await.unwrap(), Some(big.clone()), "key must survive");
-        }
+            assert_readers_match_manifest(&engine);
+            assert_levels_below_l0_are_disjoint(&engine);
+            for key in keys {
+                assert_eq!(engine.get(key).await.unwrap(), Some(big.clone()), "key must survive");
+            }
+        })
     }
 
     // ── Spec perf/028 test 7: every write path raises the change epoch ──────
@@ -5412,40 +5646,50 @@ mod tests {
         assert!(engine.change_epoch() > before, "the write must raise the change epoch");
     }
 
-    #[tokio::test]
-    async fn test_write_kv_pair_raises_change_epoch() {
-        let (engine, _dir) = make_engine().await;
-        assert_raises_change_epoch(&engine, engine.write_kv_pair(b"k", b"v", None)).await;
+    #[test]
+    fn test_write_kv_pair_raises_change_epoch() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            assert_raises_change_epoch(&engine, engine.write_kv_pair(b"k", b"v", None)).await;
+        })
     }
 
-    #[tokio::test]
-    async fn test_write_tombstone_raises_change_epoch() {
-        let (engine, _dir) = make_engine().await;
-        assert_raises_change_epoch(&engine, engine.write_tombstone(b"k")).await;
+    #[test]
+    fn test_write_tombstone_raises_change_epoch() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            assert_raises_change_epoch(&engine, engine.write_tombstone(b"k")).await;
+        })
     }
 
-    #[tokio::test]
-    async fn test_write_tombstone_at_raises_change_epoch() {
-        let (engine, _dir) = make_engine().await;
-        let memtable = engine.pin_memtable();
-        let stamp = engine.next_timestamp();
-        assert_raises_change_epoch(&engine, engine.write_tombstone_at(&memtable, b"k", stamp)).await;
+    #[test]
+    fn test_write_tombstone_at_raises_change_epoch() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let memtable = engine.pin_memtable();
+            let stamp = engine.next_timestamp();
+            assert_raises_change_epoch(&engine, engine.write_tombstone_at(&memtable, b"k", stamp)).await;
+        })
     }
 
-    #[tokio::test]
-    async fn test_write_null_raises_change_epoch() {
-        let (engine, _dir) = make_engine().await;
-        assert_raises_change_epoch(&engine, engine.write_null(b"k")).await;
+    #[test]
+    fn test_write_null_raises_change_epoch() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            assert_raises_change_epoch(&engine, engine.write_null(b"k")).await;
+        })
     }
 
-    #[tokio::test]
-    async fn test_write_batch_raises_change_epoch() {
-        let (engine, _dir) = make_engine().await;
-        let ops = vec![
-            BatchOp::Put { key: b"a".to_vec(), value: b"v".to_vec() },
-            BatchOp::Delete { key: b"b".to_vec() },
-        ];
-        assert_raises_change_epoch(&engine, engine.write_batch(ops)).await;
+    #[test]
+    fn test_write_batch_raises_change_epoch() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let ops = vec![
+                BatchOp::Put { key: b"a".to_vec(), value: b"v".to_vec() },
+                BatchOp::Delete { key: b"b".to_vec() },
+            ];
+            assert_raises_change_epoch(&engine, engine.write_batch(ops)).await;
+        })
     }
 
     // ── Spec kv/031: thread-safe read path ───────────────────────────────────
@@ -5460,146 +5704,152 @@ mod tests {
     // yet in the flush slot -- a reader holding the old version still reads
     // it whole; after the swap the new version is whole. No reader can meet
     // the mix the builder holds.
-    #[tokio::test]
-    async fn test_install_swaps_the_whole_version_at_once() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        for i in 0..100u32 {
-            engine.put(format!("k{i:03}").as_bytes(), b"v").await.unwrap();
-        }
-        engine.freeze_active_memtable();
-        let before = engine.version();
-        assert_eq!((before.immutables.len(), before.flushing.len()), (1, 0));
-        assert_eq!(source_count(&before), 2);
+    #[test]
+    fn test_install_swaps_the_whole_version_at_once() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            for i in 0..100u32 {
+                engine.put(format!("k{i:03}").as_bytes(), b"v").await.unwrap();
+            }
+            engine.freeze_active_memtable();
+            let before = engine.version();
+            assert_eq!((before.immutables.len(), before.flushing.len()), (1, 0));
+            assert_eq!(source_count(&before), 2);
 
-        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let installer = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                engine.install(|v| {
-                    let mut next = v.clone();
-                    let claimed = next.immutables.remove(0);
-                    reached_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    next.flushing.push(claimed);
-                    next
-                });
-            })
-        };
-        reached_rx.recv().unwrap();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let installer = {
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    engine.install(|v| {
+                        let mut next = v.clone();
+                        let claimed = next.immutables.remove(0);
+                        reached_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        next.flushing.push(claimed);
+                        next
+                    });
+                })
+            };
+            reached_rx.recv().unwrap();
 
-        assert_eq!(source_count(&before), 2, "the old version is untouched mid-install");
-        let reader = LsmReader::new(Arc::clone(&before), Arc::clone(&engine.block_cache), &engine.applying_batch);
-        let snapshot = Snapshot::new(engine.next_timestamp());
-        for i in 0..100u32 {
-            assert_eq!(
-                reader.get(format!("k{i:03}").as_bytes(), &snapshot).await.unwrap(),
-                GetResult::Present(b"v".to_vec()),
-                "k{i:03} reads from the old version while the install is parked"
-            );
-        }
+            assert_eq!(source_count(&before), 2, "the old version is untouched mid-install");
+            let reader = LsmReader::new(Arc::clone(&before), Arc::clone(&engine.block_cache), &engine.applying_batch);
+            let snapshot = Snapshot::new(engine.next_timestamp());
+            for i in 0..100u32 {
+                assert_eq!(
+                    reader.get(format!("k{i:03}").as_bytes(), &snapshot).await.unwrap(),
+                    GetResult::Present(b"v".to_vec()),
+                    "k{i:03} reads from the old version while the install is parked"
+                );
+            }
 
-        release_tx.send(()).unwrap();
-        installer.join().unwrap();
-        let after = engine.version();
-        assert_eq!((after.immutables.len(), after.flushing.len()), (0, 1));
-        assert_eq!(source_count(&after), 2);
+            release_tx.send(()).unwrap();
+            installer.join().unwrap();
+            let after = engine.version();
+            assert_eq!((after.immutables.len(), after.flushing.len()), (0, 1));
+            assert_eq!(source_count(&after), 2);
+        })
     }
 
     // Spec kv/031 test 5: point reads peek at the clock instead of advancing
     // it -- a thousand of them leave it where it was -- while each registered
     // snapshot draws a stamp of its own; a write confirmed on one thread is
     // visible to a read that follows on another.
-    #[tokio::test]
-    async fn test_reads_peek_at_the_clock_and_see_confirmed_writes() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        engine.put(b"k", b"v").await.unwrap();
+    #[test]
+    fn test_reads_peek_at_the_clock_and_see_confirmed_writes() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            engine.put(b"k", b"v").await.unwrap();
 
-        let before = engine.hlc().peek();
-        for _ in 0..1_000 {
-            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
-            assert!(engine.get_latest_with_metadata(b"k").await.unwrap().is_some());
-        }
-        assert_eq!(engine.hlc().peek(), before, "point reads must not draw stamps");
+            let before = engine.hlc().peek();
+            for _ in 0..1_000 {
+                assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+                assert!(engine.get_latest_with_metadata(b"k").await.unwrap().is_some());
+            }
+            assert_eq!(engine.hlc().peek(), before, "point reads must not draw stamps");
 
-        let first = engine.snapshot();
-        let second = engine.snapshot();
-        assert!(first.snapshot().timestamp().as_u64() > before.as_u64());
-        assert!(
-            second.snapshot().timestamp().as_u64() > first.snapshot().timestamp().as_u64(),
-            "every registered snapshot has a stamp of its own"
-        );
-        assert_eq!(engine.get_with_snapshot(b"k", second.snapshot()).await.unwrap(), GetResult::Present(b"v".to_vec()));
+            let first = engine.snapshot();
+            let second = engine.snapshot();
+            assert!(first.snapshot().timestamp().as_u64() > before.as_u64());
+            assert!(
+                second.snapshot().timestamp().as_u64() > first.snapshot().timestamp().as_u64(),
+                "every registered snapshot has a stamp of its own"
+            );
+            assert_eq!(engine.get_with_snapshot(b"k", second.snapshot()).await.unwrap(), GetResult::Present(b"v".to_vec()));
 
-        // Thread A writes, then hands over to thread B, which reads.
-        let (confirmed_tx, confirmed_rx) = std::sync::mpsc::channel();
-        let writer = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-                rt.block_on(engine.put(b"handover", b"from-a")).unwrap();
-                confirmed_tx.send(()).unwrap();
+            // Thread A writes, then hands over to thread B, which reads.
+            let (confirmed_tx, confirmed_rx) = std::sync::mpsc::channel();
+            let writer = {
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    rt.block_on(engine.put(b"handover", b"from-a")).unwrap();
+                    confirmed_tx.send(()).unwrap();
+                })
+            };
+            let reader = {
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    confirmed_rx.recv().unwrap();
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    rt.block_on(engine.get(b"handover")).unwrap()
+                })
+            };
+            // Joined off the test runtime: the WAL committer runs on it.
+            let read = tokio::task::spawn_blocking(move || {
+                writer.join().unwrap();
+                reader.join().unwrap()
             })
-        };
-        let reader = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                confirmed_rx.recv().unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-                rt.block_on(engine.get(b"handover")).unwrap()
-            })
-        };
-        // Joined off the test runtime: the WAL committer runs on it.
-        let read = tokio::task::spawn_blocking(move || {
-            writer.join().unwrap();
-            reader.join().unwrap()
+            .await
+            .unwrap();
+            assert_eq!(read, Some(b"from-a".to_vec()));
         })
-        .await
-        .unwrap();
-        assert_eq!(read, Some(b"from-a".to_vec()));
     }
 
     // Spec kv/031 test 6: point reads leave the snapshot registry alone; a
     // scan pinned to a registered snapshot keeps exactly that one entry while
     // it yields, a point read in between adds none, and the entry leaves with
     // the guard.
-    #[tokio::test]
-    async fn test_point_reads_register_nothing_and_a_scan_holds_one_snapshot() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        fill_scan_keys(&engine).await;
-        let registry = Arc::clone(&engine.snapshot_registry);
-        let acquired = registry.acquire_count();
+    #[test]
+    fn test_point_reads_register_nothing_and_a_scan_holds_one_snapshot() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            fill_scan_keys(&engine).await;
+            let registry = Arc::clone(&engine.snapshot_registry);
+            let acquired = registry.acquire_count();
 
-        assert!(engine.get(b"k:00001").await.unwrap().is_some());
-        assert!(engine.get_latest_with_expiry(b"k:00001").await.unwrap().0 != GetResult::Absent);
-        assert!(engine.get_latest_with_metadata(b"k:00001").await.unwrap().is_some());
-        assert_eq!(registry.acquire_count(), acquired, "point reads must not register");
-        assert_eq!(registry.active_count(), 0);
+            assert!(engine.get(b"k:00001").await.unwrap().is_some());
+            assert!(engine.get_latest_with_expiry(b"k:00001").await.unwrap().0 != GetResult::Absent);
+            assert!(engine.get_latest_with_metadata(b"k:00001").await.unwrap().is_some());
+            assert_eq!(registry.acquire_count(), acquired, "point reads must not register");
+            assert_eq!(registry.active_count(), 0);
 
-        let scanner = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(async move {
-                let guard = engine.snapshot();
-                engine.scan_keys_with_snapshot(b"k:", guard.snapshot()).await.unwrap().len()
-            })
-        };
-        let mut checks = 0;
-        loop {
-            tokio::task::yield_now().await;
-            if scanner.is_finished() {
-                break;
+            let scanner = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move {
+                    let guard = engine.snapshot();
+                    engine.scan_keys_with_snapshot(b"k:", guard.snapshot()).await.unwrap().len()
+                })
+            };
+            let mut checks = 0;
+            loop {
+                tokio::task::yield_now().await;
+                if scanner.is_finished() {
+                    break;
+                }
+                assert_eq!(registry.active_count(), 1, "exactly the scan's snapshot is registered");
+                assert!(engine.get(b"k:00002").await.unwrap().is_some());
+                assert_eq!(registry.active_count(), 1, "a point read mid-scan registers nothing");
+                checks += 1;
             }
-            assert_eq!(registry.active_count(), 1, "exactly the scan's snapshot is registered");
-            assert!(engine.get(b"k:00002").await.unwrap().is_some());
-            assert_eq!(registry.active_count(), 1, "a point read mid-scan registers nothing");
-            checks += 1;
-        }
-        assert!(checks > 0, "the scan must have yielded at least once");
-        assert_eq!(scanner.await.unwrap(), 20_000);
-        assert_eq!(registry.active_count(), 0, "the guard deregisters on drop");
+            assert!(checks > 0, "the scan must have yielded at least once");
+            assert_eq!(scanner.await.unwrap(), 20_000);
+            assert_eq!(registry.active_count(), 0, "the guard deregisters on drop");
+        })
     }
 
     // A registered snapshot draws its stamp under the lock a compaction's
@@ -5607,127 +5857,135 @@ mod tests {
     // the reader still holds it, so no compaction can choose its inputs
     // between the stamp and its registration. The version the stamp sees
     // then survives an overwrite and the compaction that merges both.
-    #[tokio::test]
-    async fn test_registered_snapshot_reads_the_key_a_compaction_rewrote_meanwhile() {
-        let (mut engine, _dir) = make_engine().await;
-        let (hook, reached, release) = ThreadHook::new();
-        engine.hooks.snapshot_stamp_drawn = Some(hook);
-        let engine = Arc::new(engine);
-        // `a` and `z` widen the L1 table's range, so the later compaction
-        // merges the new L0 table with it.
-        for key in [b"a", b"k", b"z"] {
-            engine.put(key, b"old").await.unwrap();
-        }
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap();
+    #[test]
+    fn test_registered_snapshot_reads_the_key_a_compaction_rewrote_meanwhile() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut engine, _dir) = make_engine().await;
+            let (hook, reached, release) = ThreadHook::new();
+            engine.hooks.snapshot_stamp_drawn = Some(hook);
+            let engine = Arc::new(engine);
+            // `a` and `z` widen the L1 table's range, so the later compaction
+            // merges the new L0 table with it.
+            for key in [b"a", b"k", b"z"] {
+                engine.put(key, b"old").await.unwrap();
+            }
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap();
 
-        let reader = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || engine.snapshot())
-        };
-        reached.recv().unwrap();
-        assert!(engine.snapshot_registry().is_locked(), "the stamp is drawn under the registry lock");
-        engine.put(b"k", b"new").await.unwrap();
-        freeze_and_flush(&engine).await;
-        release.send(()).unwrap();
-        let registered = tokio::task::spawn_blocking(move || reader.join().unwrap()).await.unwrap();
+            let reader = {
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || engine.snapshot())
+            };
+            reached.recv().unwrap();
+            assert!(engine.snapshot_registry().is_locked(), "the stamp is drawn under the registry lock");
+            engine.put(b"k", b"new").await.unwrap();
+            freeze_and_flush(&engine).await;
+            release.send(()).unwrap();
+            let registered = tokio::task::spawn_blocking(move || reader.join().unwrap()).await.unwrap();
 
-        engine.compact_level(0).await.unwrap();
-        assert_eq!(engine.version().level(1).len(), 1, "the compaction merged both versions");
-        assert_eq!(
-            engine.get_with_snapshot(b"k", registered.snapshot()).await.unwrap(),
-            GetResult::Present(b"old".to_vec()),
-            "the compaction keeps the version the snapshot reads"
-        );
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+            engine.compact_level(0).await.unwrap();
+            assert_eq!(engine.version().level(1).len(), 1, "the compaction merged both versions");
+            assert_eq!(
+                engine.get_with_snapshot(b"k", registered.snapshot()).await.unwrap(),
+                GetResult::Present(b"old".to_vec()),
+                "the compaction keeps the version the snapshot reads"
+            );
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"new".to_vec()));
+        })
     }
 
     // Spec kv/031 test 7: a version holding a retired generation keeps its
     // file -- a reader on it still gets the value -- until the version is
     // dropped; the Janitor's next run deletes the file.
-    #[tokio::test]
-    async fn test_retired_generation_lives_until_the_last_version_drops() {
-        let (engine, dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        let big = vec![b'r'; 4096]; // >= vlog_inline_threshold → vLog pointer
-        engine.put(b"held", &big).await.unwrap();
-        let held = engine.version();
-        let gen1_path = dir.path().join("vlog.log");
-        let janitor = engine.build_janitor(gc_always());
+    #[test]
+    fn test_retired_generation_lives_until_the_last_version_drops() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let big = vec![b'r'; 4096]; // >= vlog_inline_threshold → vLog pointer
+            engine.put(b"held", &big).await.unwrap();
+            let held = engine.version();
+            let gen1_path = dir.path().join("vlog.log");
+            let janitor = engine.build_janitor(gc_always());
 
-        assert!(janitor.run_gc().await.unwrap().ran);
-        assert!(!engine.version().vlog.contains_key(&1), "generation 1 is retired");
-        assert!(gen1_path.exists(), "a version still holds generation 1");
-        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache), &engine.applying_batch);
-        let snapshot = Snapshot::new(engine.read_timestamp());
-        assert_eq!(reader.get(b"held", &snapshot).await.unwrap(), GetResult::Present(big.clone()));
+            assert!(janitor.run_gc().await.unwrap().ran);
+            assert!(!engine.version().vlog.contains_key(&1), "generation 1 is retired");
+            assert!(gen1_path.exists(), "a version still holds generation 1");
+            let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache), &engine.applying_batch);
+            let snapshot = Snapshot::new(engine.read_timestamp());
+            assert_eq!(reader.get(b"held", &snapshot).await.unwrap(), GetResult::Present(big.clone()));
 
-        drop(reader);
-        drop(held);
-        assert!(gen1_path.exists(), "the Janitor deletes it, not the drop");
-        janitor.run_gc().await.unwrap();
-        assert!(!gen1_path.exists(), "the next run deletes the released generation");
-        assert_eq!(engine.get(b"held").await.unwrap(), Some(big));
+            drop(reader);
+            drop(held);
+            assert!(gen1_path.exists(), "the Janitor deletes it, not the drop");
+            janitor.run_gc().await.unwrap();
+            assert!(!gen1_path.exists(), "the next run deletes the released generation");
+            assert_eq!(engine.get(b"held").await.unwrap(), Some(big));
+        })
     }
 
     // A reader still on the version from before a compaction or a GC probes
     // a table that job retired: it reads through the table's own mapping, but
     // no block of it goes back into the cache, where it would keep the deleted
     // file allocated.
-    #[tokio::test]
-    async fn test_reads_on_an_old_version_cache_no_block_of_a_retired_sstable() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        engine.put(b"k", b"v").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_reads_on_an_old_version_cache_no_block_of_a_retired_sstable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            engine.put(b"k", b"v").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        let before_compaction = engine.version();
-        engine.compact_level(0).await.unwrap();
-        let before_gc = engine.version();
-        assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
+            let before_compaction = engine.version();
+            engine.compact_level(0).await.unwrap();
+            let before_gc = engine.version();
+            assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
 
-        for (version, job) in [(before_compaction, "compaction"), (before_gc, "GC")] {
-            let retired = version.sstables_newest_first().next().unwrap().file_id;
-            let reader = LsmReader::new(Arc::clone(&version), Arc::clone(&engine.block_cache), &engine.applying_batch);
-            let snapshot = Snapshot::new(engine.read_timestamp());
-            assert_eq!(reader.get(b"k", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
-            let block = BlockCacheKey { file_id: retired, block_offset: 0 };
-            assert!(
-                engine.block_cache.stripe(&block).get(&block).is_none(),
-                "no block of the table the {job} retired may be cached again"
-            );
-        }
+            for (version, job) in [(before_compaction, "compaction"), (before_gc, "GC")] {
+                let retired = version.sstables_newest_first().next().unwrap().file_id;
+                let reader = LsmReader::new(Arc::clone(&version), Arc::clone(&engine.block_cache), &engine.applying_batch);
+                let snapshot = Snapshot::new(engine.read_timestamp());
+                assert_eq!(reader.get(b"k", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
+                let block = BlockCacheKey { file_id: retired, block_offset: 0 };
+                assert!(
+                    engine.block_cache.stripe(&block).get(&block).is_none(),
+                    "no block of the table the {job} retired may be cached again"
+                );
+            }
+        })
     }
 
     // The same for a reader two maintenance installs behind: the compaction
     // in between keeps the reader's table, and the GC after it retires the
     // table for that reader's version too.
-    #[tokio::test]
-    async fn test_reads_two_installs_behind_cache_no_block_of_a_retired_sstable() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
-        engine.put(b"a", b"v").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap();
-        let held = engine.version();
-        let table = held.level(1)[0].file_id;
+    #[test]
+    fn test_reads_two_installs_behind_cache_no_block_of_a_retired_sstable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            engine.put(b"a", b"v").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap();
+            let held = engine.version();
+            let table = held.level(1)[0].file_id;
 
-        // `z` lies beyond the L1 table's range, so the compaction keeps it.
-        engine.put(b"z", b"v").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap();
-        assert!(engine.version().level(1).iter().any(|t| t.file_id == table), "the compaction kept the table");
-        assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
-        assert!(engine.version().level(1).iter().all(|t| t.file_id != table), "the GC retired the table");
+            // `z` lies beyond the L1 table's range, so the compaction keeps it.
+            engine.put(b"z", b"v").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap();
+            assert!(engine.version().level(1).iter().any(|t| t.file_id == table), "the compaction kept the table");
+            assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
+            assert!(engine.version().level(1).iter().all(|t| t.file_id != table), "the GC retired the table");
 
-        let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache), &engine.applying_batch);
-        let snapshot = Snapshot::new(engine.read_timestamp());
-        assert_eq!(reader.get(b"a", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
-        let block = BlockCacheKey { file_id: table, block_offset: 0 };
-        assert!(
-            engine.block_cache.stripe(&block).get(&block).is_none(),
-            "no block of the retired table may be cached again"
-        );
+            let reader = LsmReader::new(Arc::clone(&held), Arc::clone(&engine.block_cache), &engine.applying_batch);
+            let snapshot = Snapshot::new(engine.read_timestamp());
+            assert_eq!(reader.get(b"a", &snapshot).await.unwrap(), GetResult::Present(b"v".to_vec()));
+            let block = BlockCacheKey { file_id: table, block_offset: 0 };
+            assert!(
+                engine.block_cache.stripe(&block).get(&block).is_none(),
+                "no block of the retired table may be cached again"
+            );
+        })
     }
 
     const STRESS_KEYS: u64 = 20_000;
@@ -5903,7 +6161,7 @@ mod tests {
     }
 
     // Spec kv/031 test 3: four reader threads, each on its own runtime, read
-    // while this current-thread runtime writes 20 000 vLog-sized keys, then
+    // while the engine runtime writes 20 000 vLog-sized keys, then
     // overwrites the first 5 000 in two more phases, through forced rotations,
     // flushes, compactions and a vLog GC. A read of a confirmed key always
     // returns a value of at least the phase confirmed for it -- never absent,
@@ -5911,104 +6169,110 @@ mod tests {
     // every confirmed key. A fifth reader holds registered snapshots across
     // the writer's progress, so compactions meet a watermark, and checks that
     // each stays consistent. A fixed amount of writes, no clock.
-    #[tokio::test]
-    async fn test_readers_on_other_threads_never_miss_a_confirmed_key() {
-        const PHASES: u64 = 3;
-        const BATCH: u64 = 100;
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(engine_with_threshold(&dir, 64 * 1024).await);
-        let janitor = engine.build_janitor(gc_always());
-        let mark = Arc::new(AtomicU64::new(0));
-        let done = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(std::sync::Barrier::new(6));
+    #[test]
+    fn test_readers_on_other_threads_never_miss_a_confirmed_key() {
+        crate::core::engine_runtime::block_on(async {
+            const PHASES: u64 = 3;
+            const BATCH: u64 = 100;
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = Arc::new(engine_with_threshold(&dir, 64 * 1024).await);
+            let janitor = engine.build_janitor(gc_always());
+            let mark = Arc::new(AtomicU64::new(0));
+            let done = Arc::new(AtomicBool::new(false));
+            let started = Arc::new(std::sync::Barrier::new(6));
 
-        let mut readers: Vec<_> = (0..4)
-            .map(|t| {
-                spawn_stress_reader(
-                    Arc::clone(&engine),
-                    Arc::clone(&mark),
-                    Arc::clone(&done),
-                    Arc::clone(&started),
-                    t + 1,
-                )
-            })
-            .collect();
-        readers.push(spawn_pinned_stress_reader(
-            Arc::clone(&engine),
-            Arc::clone(&mark),
-            Arc::clone(&done),
-            Arc::clone(&started),
-        ));
-        let stop_readers = SetOnDrop(Arc::clone(&done));
-        started.wait();
+            let mut readers: Vec<_> = (0..4)
+                .map(|t| {
+                    spawn_stress_reader(
+                        Arc::clone(&engine),
+                        Arc::clone(&mark),
+                        Arc::clone(&done),
+                        Arc::clone(&started),
+                        t + 1,
+                    )
+                })
+                .collect();
+            readers.push(spawn_pinned_stress_reader(
+                Arc::clone(&engine),
+                Arc::clone(&mark),
+                Arc::clone(&done),
+                Arc::clone(&started),
+            ));
+            let stop_readers = SetOnDrop(Arc::clone(&done));
+            started.wait();
 
-        for phase in 0..PHASES {
-            let batches = if phase == 0 { STRESS_KEYS } else { STRESS_OVERWRITES } / BATCH;
-            for batch in 0..batches {
-                let first = batch * BATCH;
-                let ops = (first..first + BATCH)
-                    .map(|i| BatchOp::Put { key: stress_key(i), value: stress_value(i, phase) })
-                    .collect();
-                engine.write_batch(ops).await.unwrap();
-                mark.store(phase << 32 | (first + BATCH), Ordering::Release);
+            for phase in 0..PHASES {
+                let batches = if phase == 0 { STRESS_KEYS } else { STRESS_OVERWRITES } / BATCH;
+                for batch in 0..batches {
+                    let first = batch * BATCH;
+                    let ops = (first..first + BATCH)
+                        .map(|i| BatchOp::Put { key: stress_key(i), value: stress_value(i, phase) })
+                        .collect();
+                    engine.write_batch(ops).await.unwrap();
+                    mark.store(phase << 32 | (first + BATCH), Ordering::Release);
 
-                let written = batch + 1;
-                if written % 25 == 0 {
-                    engine.flush_all_memtables().await.unwrap();
+                    let written = batch + 1;
+                    if written % 25 == 0 {
+                        engine.flush_all_memtables().await.unwrap();
+                    }
+                    if written == batches / 2 {
+                        engine.compact_level(0).await.unwrap();
+                    }
+                    if phase == 0 && written == batches * 3 / 4 {
+                        assert!(janitor.run_gc().await.unwrap().ran);
+                    }
                 }
-                if written == batches / 2 {
-                    engine.compact_level(0).await.unwrap();
-                }
-                if phase == 0 && written == batches * 3 / 4 {
-                    assert!(janitor.run_gc().await.unwrap().ran);
-                }
+                engine.compact_level(0).await.unwrap();
             }
-            engine.compact_level(0).await.unwrap();
-        }
-        drop(stop_readers);
+            drop(stop_readers);
 
-        for reader in readers {
-            reader.join().unwrap();
-        }
-        assert!(engine.version().vlog.keys().all(|id| *id > 1), "the GC retired generation 1");
-        assert_eq!(engine.scan_keys(b"s").await.unwrap().len() as u64, STRESS_KEYS);
-        for i in 0..STRESS_KEYS {
-            let phase = if i < STRESS_OVERWRITES { PHASES - 1 } else { 0 };
-            assert_eq!(engine.get(&stress_key(i)).await.unwrap(), Some(stress_value(i, phase)));
-        }
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            assert!(engine.version().vlog.keys().all(|id| *id > 1), "the GC retired generation 1");
+            assert_eq!(engine.scan_keys(b"s").await.unwrap().len() as u64, STRESS_KEYS);
+            for i in 0..STRESS_KEYS {
+                let phase = if i < STRESS_OVERWRITES { PHASES - 1 } else { 0 };
+                assert_eq!(engine.get(&stress_key(i)).await.unwrap(), Some(stress_value(i, phase)));
+            }
+        })
     }
 
     // Spec kv/031 A5: a new active generation comes with a fresh MemTable, so
     // a version taken before the switch never meets a pointer into the new
     // generation -- the write after it lands in a MemTable that version does
     // not hold.
-    #[tokio::test]
-    async fn test_version_before_a_generation_switch_never_sees_its_pointers() {
-        let (engine, _dir) = make_engine().await;
-        let big = vec![b'n'; 4096]; // >= vlog_inline_threshold → vLog pointer
-        let before = engine.version();
-        let gen2 = Arc::new(VLog::open(generation_path(&engine.vlog_path, 2), 2).await.unwrap());
-        engine.install(|v| v.with_active_vlog(gen2));
-        engine.put(b"late", &big).await.unwrap();
+    #[test]
+    fn test_version_before_a_generation_switch_never_sees_its_pointers() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let big = vec![b'n'; 4096]; // >= vlog_inline_threshold → vLog pointer
+            let before = engine.version();
+            let gen2 = Arc::new(VLog::open(generation_path(&engine.vlog_path, 2), 2).await.unwrap());
+            engine.install(|v| v.with_active_vlog(gen2));
+            engine.put(b"late", &big).await.unwrap();
 
-        let reader = LsmReader::new(before, Arc::clone(&engine.block_cache), &engine.applying_batch);
-        let snapshot = Snapshot::new(engine.read_timestamp());
-        assert_eq!(reader.get(b"late", &snapshot).await.unwrap(), GetResult::Absent);
-        assert_eq!(engine.get(b"late").await.unwrap(), Some(big));
+            let reader = LsmReader::new(before, Arc::clone(&engine.block_cache), &engine.applying_batch);
+            let snapshot = Snapshot::new(engine.read_timestamp());
+            assert_eq!(reader.get(b"late", &snapshot).await.unwrap(), GetResult::Absent);
+            assert_eq!(engine.get(b"late").await.unwrap(), Some(big));
+        })
     }
 
     // A pointer is resolved through the reader's own version only: a
     // generation the version does not know is a clean error, never a read
     // from some other file.
-    #[tokio::test]
-    async fn test_pointer_into_an_unknown_generation_is_a_clean_error() {
-        let (engine, _dir) = make_engine().await;
-        let stamp = engine.next_timestamp();
-        let dangling = Value::Pointer { file_id: 7, offset: 0, len: 4, expire_at: None };
-        engine.version().memtable.set(b"k".to_vec(), stamp, dangling);
+    #[test]
+    fn test_pointer_into_an_unknown_generation_is_a_clean_error() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let stamp = engine.next_timestamp();
+            let dangling = Value::Pointer { file_id: 7, offset: 0, len: 4, expire_at: None };
+            engine.version().memtable.set(b"k".to_vec(), stamp, dangling);
 
-        let err = engine.get(b"k").await.unwrap_err();
-        assert!(err.to_string().contains("Unknown value log generation 7"), "{err}");
+            let err = engine.get(b"k").await.unwrap_err();
+            assert!(err.to_string().contains("Unknown value log generation 7"), "{err}");
+        })
     }
 
     // ── Spec kv/033: drops only on the bottommost level ──────────────────────
@@ -6025,68 +6289,76 @@ mod tests {
 
     // Spec kv/033 test 1: dropping the expired version on its way to L1
     // would bring back the older one in L2.
-    #[tokio::test]
-    async fn test_compaction_keeps_expired_value_over_an_older_one_below() {
-        let (engine, _dir) = make_engine().await;
-        put_into_l2(&engine, b"k", b"v1").await;
-        engine.put_expired_for_test(b"k", b"v2").await.unwrap();
-        freeze_and_flush(&engine).await;
+    #[test]
+    fn test_compaction_keeps_expired_value_over_an_older_one_below() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            put_into_l2(&engine, b"k", b"v1").await;
+            engine.put_expired_for_test(b"k", b"v2").await.unwrap();
+            freeze_and_flush(&engine).await;
 
-        engine.compact_level(0).await.unwrap();
+            engine.compact_level(0).await.unwrap();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+        })
     }
 
     // Spec kv/033 test 2: the same for a tombstone below the watermark of a
     // registered snapshot.
-    #[tokio::test]
-    async fn test_compaction_keeps_tombstone_over_an_older_version_below() {
-        let (engine, _dir) = make_engine().await;
-        put_into_l2(&engine, b"k", b"v1").await;
-        engine.delete(b"k").await.unwrap();
-        freeze_and_flush(&engine).await;
-        let snap = engine.snapshot(); // stamped above the tombstone
+    #[test]
+    fn test_compaction_keeps_tombstone_over_an_older_version_below() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            put_into_l2(&engine, b"k", b"v1").await;
+            engine.delete(b"k").await.unwrap();
+            freeze_and_flush(&engine).await;
+            let snap = engine.snapshot(); // stamped above the tombstone
 
-        engine.compact_level(0).await.unwrap();
+            engine.compact_level(0).await.unwrap();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), None);
-        assert_eq!(engine.get_with_snapshot(b"k", snap.snapshot()).await.unwrap(), GetResult::Absent);
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(engine.get_with_snapshot(b"k", snap.snapshot()).await.unwrap(), GetResult::Absent);
+        })
     }
 
     // Spec kv/033 test 4: with no level below the target, both still go.
-    #[tokio::test]
-    async fn test_bottommost_compaction_drops_tombstone_and_expired_value() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_expired_for_test(b"e", b"v").await.unwrap();
-        engine.delete(b"d").await.unwrap();
-        freeze_and_flush(&engine).await;
-        let _snap = engine.snapshot(); // stamped above the tombstone
+    #[test]
+    fn test_bottommost_compaction_drops_tombstone_and_expired_value() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"e", b"v").await.unwrap();
+            engine.delete(b"d").await.unwrap();
+            freeze_and_flush(&engine).await;
+            let _snap = engine.snapshot(); // stamped above the tombstone
 
-        engine.compact_level(0).await.unwrap();
+            engine.compact_level(0).await.unwrap();
 
-        assert!(engine.version().level(0).is_empty(), "L0 was compacted away");
-        assert!(engine.version().level(1).is_empty(), "nothing is left to write to L1");
+            assert!(engine.version().level(0).is_empty(), "L0 was compacted away");
+            assert!(engine.version().level(1).is_empty(), "nothing is left to write to L1");
+        })
     }
 
     // Spec kv/033 test 3: the L1 table starts with an older version of the
     // L0 selection's largest user key, which sorts behind the selection's
     // largest internal key; it must join the job all the same.
-    #[tokio::test]
-    async fn test_compaction_merges_target_table_starting_with_older_version_of_largest_key() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"k", b"v1").await.unwrap();
-        engine.put(b"z", b"26").await.unwrap();
-        freeze_and_flush(&engine).await;
-        engine.compact_level(0).await.unwrap(); // L1 spans [k@t1, z]
+    #[test]
+    fn test_compaction_merges_target_table_starting_with_older_version_of_largest_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"v1").await.unwrap();
+            engine.put(b"z", b"26").await.unwrap();
+            freeze_and_flush(&engine).await;
+            engine.compact_level(0).await.unwrap(); // L1 spans [k@t1, z]
 
-        engine.put(b"a", b"1").await.unwrap();
-        engine.put(b"k", b"v2").await.unwrap();
-        freeze_and_flush(&engine).await; // L0 spans [a, k@t2]
+            engine.put(b"a", b"1").await.unwrap();
+            engine.put(b"k", b"v2").await.unwrap();
+            freeze_and_flush(&engine).await; // L0 spans [a, k@t2]
 
-        engine.compact_level(0).await.unwrap();
+            engine.compact_level(0).await.unwrap();
 
-        assert_levels_below_l0_are_disjoint(&engine);
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+            assert_levels_below_l0_are_disjoint(&engine);
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+        })
     }
 
     // ── Spec kv/034: a batch whole or not at all for other threads ───────────
@@ -6136,161 +6408,171 @@ mod tests {
     // thread reads `a` and `b` old through the point-read entries, although a
     // reader blind to the batch slot already meets the new `a`; once the
     // batch is through, both are new.
-    #[tokio::test]
-    async fn test_point_reads_on_another_thread_see_a_batch_whole_or_not_at_all() {
-        let (engine, hook, _dir) = engine_with_batch_hook().await;
-        for key in [b"a", b"b"] {
-            engine.put(key, b"old").await.unwrap();
-        }
-
-        let ops = vec![put_op(b"a", b"new"), put_op(b"b", b"new")];
-        let seen = read_mid_batch(&engine, hook, ops, |engine| async move {
-            let no_batch = AtomicU64::new(0);
-            let blind = LsmReader::new(engine.version(), Arc::clone(&engine.block_cache), &no_batch);
-            let registered = engine.snapshot();
-            let mut seen = Vec::new();
+    #[test]
+    fn test_point_reads_on_another_thread_see_a_batch_whole_or_not_at_all() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, hook, _dir) = engine_with_batch_hook().await;
             for key in [b"a", b"b"] {
-                seen.push((
-                    engine.get_latest_with_expiry(key).await.unwrap().0,
-                    engine.get_latest_with_metadata(key).await.unwrap().map(|m| m.data),
-                    engine.get_with_snapshot(key, registered.snapshot()).await.unwrap(),
-                    blind.get(key, registered.snapshot()).await.unwrap(),
-                ));
+                engine.put(key, b"old").await.unwrap();
             }
-            seen
-        })
-        .await;
 
-        let old = || GetResult::Present(b"old".to_vec());
-        let new = || GetResult::Present(b"new".to_vec());
-        assert_eq!(
-            seen,
-            vec![(old(), Some(b"old".to_vec()), old(), new()), (old(), Some(b"old".to_vec()), old(), old())]
-        );
-        for key in [b"a", b"b"] {
-            assert_eq!(engine.get(key).await.unwrap(), Some(b"new".to_vec()));
-        }
+            let ops = vec![put_op(b"a", b"new"), put_op(b"b", b"new")];
+            let seen = read_mid_batch(&engine, hook, ops, |engine| async move {
+                let no_batch = AtomicU64::new(0);
+                let blind = LsmReader::new(engine.version(), Arc::clone(&engine.block_cache), &no_batch);
+                let registered = engine.snapshot();
+                let mut seen = Vec::new();
+                for key in [b"a", b"b"] {
+                    seen.push((
+                        engine.get_latest_with_expiry(key).await.unwrap().0,
+                        engine.get_latest_with_metadata(key).await.unwrap().map(|m| m.data),
+                        engine.get_with_snapshot(key, registered.snapshot()).await.unwrap(),
+                        blind.get(key, registered.snapshot()).await.unwrap(),
+                    ));
+                }
+                seen
+            })
+            .await;
+
+            let old = || GetResult::Present(b"old".to_vec());
+            let new = || GetResult::Present(b"new".to_vec());
+            assert_eq!(
+                seen,
+                vec![(old(), Some(b"old".to_vec()), old(), new()), (old(), Some(b"old".to_vec()), old(), old())]
+            );
+            for key in [b"a", b"b"] {
+                assert_eq!(engine.get(key).await.unwrap(), Some(b"new".to_vec()));
+            }
+        })
     }
 
     // Spec kv/034 test 2: the batch of a prefix delete -- three tombstones,
     // parked after the first -- leaves all three keys present for a reader
     // on another thread; once it is through, all three are gone.
-    #[tokio::test]
-    async fn test_a_prefix_delete_batch_is_whole_or_not_at_all_for_another_thread() {
-        let (engine, hook, _dir) = engine_with_batch_hook().await;
-        let keys = [b"p:1", b"p:2", b"p:3"];
-        for key in keys {
-            engine.put(key, b"v").await.unwrap();
-        }
-
-        let ops = keys.iter().map(|key| BatchOp::Delete { key: key.to_vec() }).collect();
-        let seen = read_mid_batch(&engine, hook, ops, move |engine| async move {
-            let mut seen = Vec::new();
+    #[test]
+    fn test_a_prefix_delete_batch_is_whole_or_not_at_all_for_another_thread() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, hook, _dir) = engine_with_batch_hook().await;
+            let keys = [b"p:1", b"p:2", b"p:3"];
             for key in keys {
-                seen.push(engine.get_latest_with_expiry(key).await.unwrap().0);
+                engine.put(key, b"v").await.unwrap();
             }
-            seen
-        })
-        .await;
 
-        assert_eq!(seen, vec![GetResult::Present(b"v".to_vec()); 3]);
-        for key in keys {
-            assert_eq!(engine.get_latest_with_expiry(key).await.unwrap().0, GetResult::Absent);
-        }
+            let ops = keys.iter().map(|key| BatchOp::Delete { key: key.to_vec() }).collect();
+            let seen = read_mid_batch(&engine, hook, ops, move |engine| async move {
+                let mut seen = Vec::new();
+                for key in keys {
+                    seen.push(engine.get_latest_with_expiry(key).await.unwrap().0);
+                }
+                seen
+            })
+            .await;
+
+            assert_eq!(seen, vec![GetResult::Present(b"v".to_vec()); 3]);
+            for key in keys {
+                assert_eq!(engine.get_latest_with_expiry(key).await.unwrap().0, GetResult::Absent);
+            }
+        })
     }
 
     // Spec kv/034 test 3: a key the batch writes twice never shows its first
     // value -- neither to a reader while Phase 2 is parked nor to one blind
     // to the slot, which stands for a reader that found the key mid-batch but
     // loaded the slot only after the batch.
-    #[tokio::test]
-    async fn test_a_key_written_twice_in_a_batch_never_shows_its_first_value() {
-        let (engine, hook, _dir) = engine_with_batch_hook().await;
-        engine.put(b"k", b"old").await.unwrap();
+    #[test]
+    fn test_a_key_written_twice_in_a_batch_never_shows_its_first_value() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, hook, _dir) = engine_with_batch_hook().await;
+            engine.put(b"k", b"old").await.unwrap();
 
-        let ops = vec![put_op(b"k", b"first"), put_op(b"k", b"last")];
-        let seen = read_mid_batch(&engine, hook, ops, |engine| async move {
-            let no_batch = AtomicU64::new(0);
-            let blind = LsmReader::new(engine.version(), Arc::clone(&engine.block_cache), &no_batch);
-            (
-                engine.get_latest_with_expiry(b"k").await.unwrap().0,
-                blind.get(b"k", &Snapshot::new(engine.read_timestamp())).await.unwrap(),
-            )
+            let ops = vec![put_op(b"k", b"first"), put_op(b"k", b"last")];
+            let seen = read_mid_batch(&engine, hook, ops, |engine| async move {
+                let no_batch = AtomicU64::new(0);
+                let blind = LsmReader::new(engine.version(), Arc::clone(&engine.block_cache), &no_batch);
+                (
+                    engine.get_latest_with_expiry(b"k").await.unwrap().0,
+                    blind.get(b"k", &Snapshot::new(engine.read_timestamp())).await.unwrap(),
+                )
+            })
+            .await;
+
+            assert_eq!(seen, (GetResult::Present(b"old".to_vec()), GetResult::Present(b"last".to_vec())));
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"last".to_vec()));
         })
-        .await;
-
-        assert_eq!(seen, (GetResult::Present(b"old".to_vec()), GetResult::Present(b"last".to_vec())));
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"last".to_vec()));
     }
 
     // Spec kv/034 test 4: a scan on another thread while Phase 2 is parked
     // after its first insert -- `p:new`, or the tombstone of `p:old` -- lists
     // `p:old` and not `p:new`, with and without a snapshot; once the batch is
     // through, it lists only `p:new`.
-    #[tokio::test]
-    async fn test_scans_on_another_thread_skip_a_batch_being_applied() {
-        let put_new = || put_op(b"p:new", b"v");
-        let delete_old = || BatchOp::Delete { key: b"p:old".to_vec() };
-        let mut seen = Vec::new();
-        for ops in [vec![put_new(), delete_old()], vec![delete_old(), put_new()]] {
-            // The hook parks only once: one engine per order.
-            let (engine, hook, _dir) = engine_with_batch_hook().await;
-            engine.put(b"p:old", b"v").await.unwrap();
+    #[test]
+    fn test_scans_on_another_thread_skip_a_batch_being_applied() {
+        crate::core::engine_runtime::block_on(async {
+            let put_new = || put_op(b"p:new", b"v");
+            let delete_old = || BatchOp::Delete { key: b"p:old".to_vec() };
+            let mut seen = Vec::new();
+            for ops in [vec![put_new(), delete_old()], vec![delete_old(), put_new()]] {
+                // The hook parks only once: one engine per order.
+                let (engine, hook, _dir) = engine_with_batch_hook().await;
+                engine.put(b"p:old", b"v").await.unwrap();
 
-            let (unregistered, registered) = read_mid_batch(&engine, hook, ops, |engine| async move {
-                let registered = engine.snapshot();
-                (
-                    engine.scan_keys(b"p:").await.unwrap(),
-                    engine.scan_keys_with_snapshot(b"p:", registered.snapshot()).await.unwrap(),
-                )
-            })
-            .await;
-            seen.push((unregistered, registered, engine.scan_keys(b"p:").await.unwrap()));
-        }
+                let (unregistered, registered) = read_mid_batch(&engine, hook, ops, |engine| async move {
+                    let registered = engine.snapshot();
+                    (
+                        engine.scan_keys(b"p:").await.unwrap(),
+                        engine.scan_keys_with_snapshot(b"p:", registered.snapshot()).await.unwrap(),
+                    )
+                })
+                .await;
+                seen.push((unregistered, registered, engine.scan_keys(b"p:").await.unwrap()));
+            }
 
-        let (old, new) = (vec![b"p:old".to_vec()], vec![b"p:new".to_vec()]);
-        assert_eq!(seen, vec![(old.clone(), old, new); 2], "per order: scans mid-batch, scan after");
+            let (old, new) = (vec![b"p:old".to_vec()], vec![b"p:new".to_vec()]);
+            assert_eq!(seen, vec![(old.clone(), old, new); 2], "per order: scans mid-batch, scan after");
+        })
     }
 
     // Spec kv/034 test 5: a batch confirmed on thread A is whole for the
     // point reads and the scan that follow on thread B -- the slot no longer
     // names it once the batch is confirmed.
-    #[tokio::test]
-    async fn test_a_batch_confirmed_on_one_thread_is_whole_for_reads_on_another() {
-        let (engine, _dir) = make_engine().await;
-        let engine = Arc::new(engine);
+    #[test]
+    fn test_a_batch_confirmed_on_one_thread_is_whole_for_reads_on_another() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let engine = Arc::new(engine);
 
-        let (confirmed_tx, confirmed_rx) = std::sync::mpsc::channel();
-        let writer = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-                rt.block_on(engine.write_batch(vec![put_op(b"a", b"v"), put_op(b"b", b"v")])).unwrap();
-                confirmed_tx.send(()).unwrap();
-            })
-        };
-        let reader = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                confirmed_rx.recv().unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-                rt.block_on(async {
-                    (
-                        engine.get(b"a").await.unwrap(),
-                        engine.get(b"b").await.unwrap(),
-                        engine.scan_keys(b"").await.unwrap(),
-                    )
+            let (confirmed_tx, confirmed_rx) = std::sync::mpsc::channel();
+            let writer = {
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    rt.block_on(engine.write_batch(vec![put_op(b"a", b"v"), put_op(b"b", b"v")])).unwrap();
+                    confirmed_tx.send(()).unwrap();
                 })
+            };
+            let reader = {
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    confirmed_rx.recv().unwrap();
+                    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                    rt.block_on(async {
+                        (
+                            engine.get(b"a").await.unwrap(),
+                            engine.get(b"b").await.unwrap(),
+                            engine.scan_keys(b"").await.unwrap(),
+                        )
+                    })
+                })
+            };
+            // Joined off the test runtime: the WAL committer runs on it.
+            let read = tokio::task::spawn_blocking(move || {
+                writer.join().unwrap();
+                reader.join().unwrap()
             })
-        };
-        // Joined off the test runtime: the WAL committer runs on it.
-        let read = tokio::task::spawn_blocking(move || {
-            writer.join().unwrap();
-            reader.join().unwrap()
-        })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
-        assert_eq!(read, (Some(b"v".to_vec()), Some(b"v".to_vec()), vec![b"a".to_vec(), b"b".to_vec()]));
+            assert_eq!(read, (Some(b"v".to_vec()), Some(b"v".to_vec()), vec![b"a".to_vec(), b"b".to_vec()]));
+        })
     }
 }

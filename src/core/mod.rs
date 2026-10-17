@@ -2,6 +2,7 @@
 pub mod coop;
 pub mod disk_manager;
 pub mod buffer_pool;
+pub mod engine_runtime;
 pub mod events;
 pub mod io_engine;
 pub mod page;

@@ -270,9 +270,10 @@ const SCAN_PAUSE_MS: u64 = 10;
 /// backup listing/retention, and the RAM restore-status registry.
 ///
 /// Job-starting methods take `self: &Arc<Self>`: they validate synchronously
-/// (job slot, and for backups the scope) and spawn the actual work via
-/// `tokio::spawn`, returning the id and a `JoinHandle` immediately — the
-/// handle lets tests (and later, the scheduler) await completion.
+/// (job slot, and for backups the scope) and spawn the actual work as a task
+/// of the engine runtime, returning the id and a `JoinHandle` immediately —
+/// the handle lets tests and the scheduler await completion. Dropping it
+/// cancels the job; callers that do not wait detach it.
 pub struct BackupManager {
     dir: PathBuf,
     scan_batch_size: usize,
@@ -348,7 +349,7 @@ impl BackupManager {
         scope: BackupScope,
         include_auth: bool,
         schedule: Option<String>,
-    ) -> Result<(String, tokio::task::JoinHandle<()>), BackupError> {
+    ) -> Result<(String, compio::runtime::JoinHandle<()>), BackupError> {
         let resolved = writer::resolve_scope(&scope, &self.kv_registry, &self.json_engine).await?;
 
         let id = {
@@ -369,7 +370,7 @@ impl BackupManager {
 
         let manager = Arc::clone(self);
         let job_id = id.clone();
-        let handle = tokio::spawn(async move {
+        let handle = compio::runtime::spawn(async move {
             let _guard = SlotGuard(Arc::clone(&manager));
             let started = std::time::Instant::now();
             let params = writer::BackupParams {
@@ -432,7 +433,7 @@ impl BackupManager {
         mode: restore::RestoreMode,
         into_domain: Option<String>,
         include_auth: bool,
-    ) -> Result<(String, tokio::task::JoinHandle<()>), BackupError> {
+    ) -> Result<(String, compio::runtime::JoinHandle<()>), BackupError> {
         validate_backup_id(backup_id)?;
         if !self.dir.join(format!("{backup_id}.ndjson")).exists() {
             return Err(BackupError::NotFound);
@@ -476,7 +477,7 @@ impl BackupManager {
         let manager = Arc::clone(self);
         let job_restore_id = restore_id.clone();
         let job_backup_id = backup_id.to_string();
-        let handle = tokio::spawn(async move {
+        let handle = compio::runtime::spawn(async move {
             let _guard = SlotGuard(Arc::clone(&manager));
             let params = restore::RestoreParams {
                 dir: &manager.dir,
@@ -944,275 +945,303 @@ mod manager_tests {
     }
 
     // 1. Job slot: a second backup while one is running -> Busy.
-    #[tokio::test]
-    async fn test_start_backup_busy_while_running() {
-        let (manager, _e, _b) = make_manager().await;
-        let (_id1, handle1) =
-            manager.start_backup(BackupScope::All, false, None).await.expect("first backup must start");
-        let err = manager.start_backup(BackupScope::All, false, None).await.unwrap_err();
-        assert!(matches!(err, BackupError::Busy));
-        handle1.await.unwrap();
-        // Slot freed after completion -> a new backup can start.
-        let (_id2, handle2) = manager.start_backup(BackupScope::All, false, None).await.unwrap();
-        handle2.await.unwrap();
+    #[test]
+    fn test_start_backup_busy_while_running() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let (_id1, handle1) =
+                manager.start_backup(BackupScope::All, false, None).await.expect("first backup must start");
+            let err = manager.start_backup(BackupScope::All, false, None).await.unwrap_err();
+            assert!(matches!(err, BackupError::Busy));
+            handle1.await.unwrap();
+            // Slot freed after completion -> a new backup can start.
+            let (_id2, handle2) = manager.start_backup(BackupScope::All, false, None).await.unwrap();
+            handle2.await.unwrap();
+        })
     }
 
     // 2. The slot is shared between backup and restore.
-    #[tokio::test]
-    async fn test_backup_and_restore_share_one_slot() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_shared", "all", now_secs(), None, true);
-        // Manually mark the slot busy (as if a backup were running) instead
-        // of racing a real one -- deterministic and instant.
-        *manager.slot.lock() = Some(RunningJobInfo {
-            id: "bk_shared".to_string(),
-            kind: JobKind::Backup,
-            scope: "all".to_string(),
-            started_at: now_secs(),
-        });
-        let err = manager
-            .start_restore("bk_shared", restore::RestoreMode::FailIfExists, None, false)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BackupError::Busy));
+    #[test]
+    fn test_backup_and_restore_share_one_slot() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_shared", "all", now_secs(), None, true);
+            // Manually mark the slot busy (as if a backup were running) instead
+            // of racing a real one -- deterministic and instant.
+            *manager.slot.lock() = Some(RunningJobInfo {
+                id: "bk_shared".to_string(),
+                kind: JobKind::Backup,
+                scope: "all".to_string(),
+                started_at: now_secs(),
+            });
+            let err = manager
+                .start_restore("bk_shared", restore::RestoreMode::FailIfExists, None, false)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BackupError::Busy));
+        })
     }
 
     // 3. ID collision -> "_2" suffix.
-    #[tokio::test]
-    async fn test_backup_id_collision_gets_suffix() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        // Occupy the base id for this second AND the next, so the assertion
-        // holds even when the wall clock rolls over between this now_secs()
-        // call and the one inside allocate_backup_id (spec general/008:
-        // no time-flaky tests).
-        let now = now_secs();
-        for ts in [now, now + 1] {
-            let base_id = format!("bk_{}_kv", cron::format_utc_timestamp(ts));
-            write_fake_backup(backup_dir.path(), &base_id, "kv", ts, None, true);
-        }
+    #[test]
+    fn test_backup_id_collision_gets_suffix() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            // Occupy the base id for this second AND the next, so the assertion
+            // holds even when the wall clock rolls over between this now_secs()
+            // call and the one inside allocate_backup_id (spec general/008:
+            // no time-flaky tests).
+            let now = now_secs();
+            for ts in [now, now + 1] {
+                let base_id = format!("bk_{}_kv", cron::format_utc_timestamp(ts));
+                write_fake_backup(backup_dir.path(), &base_id, "kv", ts, None, true);
+            }
 
-        let (id, handle) = manager.start_backup(BackupScope::Kv, false, None).await.unwrap();
-        assert!(id.ends_with("_2"), "colliding id must get a _2 suffix, got '{id}'");
-        handle.await.unwrap();
+            let (id, handle) = manager.start_backup(BackupScope::Kv, false, None).await.unwrap();
+            assert!(id.ends_with("_2"), "colliding id must get a _2 suffix, got '{id}'");
+            handle.await.unwrap();
+        })
     }
 
     // 4. Restore id collision also gets a suffix.
-    #[tokio::test]
-    async fn test_restore_id_collision_gets_suffix() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_x", "all", now_secs(), None, true);
-        let ts = cron::format_utc_timestamp(now_secs());
-        let base_id = format!("rs_{ts}");
-        manager.restores.write().insert(
-            base_id.clone(),
-            RestoreStatus {
-                restore_id: base_id.clone(),
-                backup_id: "bk_x".to_string(),
-                state: RestoreState::Running,
-                imported: 0,
-                skipped: 0,
-                failed: 0,
-                errors: Vec::new(),
-                started_at: now_secs(),
-                finished_at: None,
-            },
-        );
+    #[test]
+    fn test_restore_id_collision_gets_suffix() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_x", "all", now_secs(), None, true);
+            let ts = cron::format_utc_timestamp(now_secs());
+            let base_id = format!("rs_{ts}");
+            manager.restores.write().insert(
+                base_id.clone(),
+                RestoreStatus {
+                    restore_id: base_id.clone(),
+                    backup_id: "bk_x".to_string(),
+                    state: RestoreState::Running,
+                    imported: 0,
+                    skipped: 0,
+                    failed: 0,
+                    errors: Vec::new(),
+                    started_at: now_secs(),
+                    finished_at: None,
+                },
+            );
 
-        let (id, handle) =
-            manager.start_restore("bk_x", restore::RestoreMode::FailIfExists, None, false).await.unwrap();
-        assert_eq!(id, format!("{base_id}_2"));
-        handle.await.unwrap();
+            let (id, handle) =
+                manager.start_restore("bk_x", restore::RestoreMode::FailIfExists, None, false).await.unwrap();
+            assert_eq!(id, format!("{base_id}_2"));
+            handle.await.unwrap();
+        })
     }
 
     // 5. start_backup on an invalid/missing domain scope fails synchronously
     //    (no job slot ever gets taken).
-    #[tokio::test]
-    async fn test_start_backup_domain_not_found_is_synchronous() {
-        let (manager, _e, _b) = make_manager().await;
-        let err = manager
-            .start_backup(BackupScope::KvDomain("nope".to_string()), false, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BackupError::DomainNotFound(_)));
-        assert!(manager.running_job().is_none(), "a rejected backup must never take the slot");
+    #[test]
+    fn test_start_backup_domain_not_found_is_synchronous() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let err = manager
+                .start_backup(BackupScope::KvDomain("nope".to_string()), false, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BackupError::DomainNotFound(_)));
+            assert!(manager.running_job().is_none(), "a rejected backup must never take the slot");
+        })
     }
 
     // 6. start_restore on an unknown backup id -> NotFound, synchronously.
-    #[tokio::test]
-    async fn test_start_restore_missing_backup_not_found() {
-        let (manager, _e, _b) = make_manager().await;
-        let err = manager
-            .start_restore("bk_does_not_exist", restore::RestoreMode::FailIfExists, None, false)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BackupError::NotFound));
+    #[test]
+    fn test_start_restore_missing_backup_not_found() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let err = manager
+                .start_restore("bk_does_not_exist", restore::RestoreMode::FailIfExists, None, false)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BackupError::NotFound));
+        })
     }
 
     // 7. get_restore_status reflects the completed job's outcome.
-    #[tokio::test]
-    async fn test_restore_status_reflects_completion() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_status", "all", now_secs(), None, true);
-        let (id, handle) =
-            manager.start_restore("bk_status", restore::RestoreMode::FailIfExists, None, false).await.unwrap();
-        // The fake file's checksum won't verify -> the job fails, but the
-        // status registry must still observe a terminal state.
-        handle.await.unwrap();
-        let status = manager.get_restore_status(&id).unwrap();
-        assert_eq!(status.state, RestoreState::Failed);
-        assert!(status.finished_at.is_some());
-        assert!(!status.errors.is_empty());
+    #[test]
+    fn test_restore_status_reflects_completion() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_status", "all", now_secs(), None, true);
+            let (id, handle) =
+                manager.start_restore("bk_status", restore::RestoreMode::FailIfExists, None, false).await.unwrap();
+            // The fake file's checksum won't verify -> the job fails, but the
+            // status registry must still observe a terminal state.
+            handle.await.unwrap();
+            let status = manager.get_restore_status(&id).unwrap();
+            assert_eq!(status.state, RestoreState::Failed);
+            assert!(status.finished_at.is_some());
+            assert!(!status.errors.is_empty());
+        })
     }
 
     // 8. list_backups: only `*.ndjson` files are listed (never `.part`), and
     //    complete vs incomplete is detected from the checksum tail-peek.
-    #[tokio::test]
-    async fn test_list_backups_complete_vs_incomplete() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_ok", "all", 1000, None, true);
-        write_fake_backup(backup_dir.path(), "bk_bad", "all", 2000, None, false);
-        std::fs::write(backup_dir.path().join("bk_running.ndjson.part"), "{}\n").unwrap();
+    #[test]
+    fn test_list_backups_complete_vs_incomplete() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_ok", "all", 1000, None, true);
+            write_fake_backup(backup_dir.path(), "bk_bad", "all", 2000, None, false);
+            std::fs::write(backup_dir.path().join("bk_running.ndjson.part"), "{}\n").unwrap();
 
-        let mut list = manager.list_backups().unwrap();
-        list.sort_by(|a, b| a.id.cmp(&b.id));
-        assert_eq!(list.len(), 2, ".part files must never appear in the list");
-        assert_eq!(list[0].id, "bk_bad");
-        assert_eq!(list[0].state, BackupState::Incomplete);
-        assert_eq!(list[1].id, "bk_ok");
-        assert_eq!(list[1].state, BackupState::Complete);
+            let mut list = manager.list_backups().unwrap();
+            list.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(list.len(), 2, ".part files must never appear in the list");
+            assert_eq!(list[0].id, "bk_bad");
+            assert_eq!(list[0].state, BackupState::Incomplete);
+            assert_eq!(list[1].id, "bk_ok");
+            assert_eq!(list[1].state, BackupState::Complete);
+        })
     }
 
     // 9. get_backup / delete_backup basics: not-found, id validation, and
     //    busy-while-running.
-    #[tokio::test]
-    async fn test_get_and_delete_backup() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_del", "all", 1000, None, true);
+    #[test]
+    fn test_get_and_delete_backup() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_del", "all", 1000, None, true);
 
-        let summary = manager.get_backup("bk_del").unwrap();
-        assert_eq!(summary.state, BackupState::Complete);
+            let summary = manager.get_backup("bk_del").unwrap();
+            assert_eq!(summary.state, BackupState::Complete);
 
-        assert!(matches!(manager.get_backup("bk_missing").unwrap_err(), BackupError::NotFound));
-        assert!(matches!(manager.get_backup("../etc/passwd").unwrap_err(), BackupError::InvalidId(_)));
+            assert!(matches!(manager.get_backup("bk_missing").unwrap_err(), BackupError::NotFound));
+            assert!(matches!(manager.get_backup("../etc/passwd").unwrap_err(), BackupError::InvalidId(_)));
 
-        *manager.slot.lock() = Some(RunningJobInfo {
-            id: "bk_del".to_string(),
-            kind: JobKind::Backup,
-            scope: "all".to_string(),
-            started_at: now_secs(),
-        });
-        assert!(matches!(manager.delete_backup("bk_del").unwrap_err(), BackupError::BackupRunning));
-        *manager.slot.lock() = None;
+            *manager.slot.lock() = Some(RunningJobInfo {
+                id: "bk_del".to_string(),
+                kind: JobKind::Backup,
+                scope: "all".to_string(),
+                started_at: now_secs(),
+            });
+            assert!(matches!(manager.delete_backup("bk_del").unwrap_err(), BackupError::BackupRunning));
+            *manager.slot.lock() = None;
 
-        manager.delete_backup("bk_del").unwrap();
-        assert!(matches!(manager.delete_backup("bk_del").unwrap_err(), BackupError::NotFound));
+            manager.delete_backup("bk_del").unwrap();
+            assert!(matches!(manager.delete_backup("bk_del").unwrap_err(), BackupError::NotFound));
+        })
     }
 
     // 9b. The file name wins over the manifest id (upload case: the server
     //     assigns a fresh name; the archive keeps its original manifest id).
-    #[tokio::test]
-    async fn test_backup_identity_is_the_file_name_not_the_manifest_id() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_original", "all", 1000, None, true);
-        std::fs::rename(
-            backup_dir.path().join("bk_original.ndjson"),
-            backup_dir.path().join("bk_uploaded.ndjson"),
-        )
-        .unwrap();
+    #[test]
+    fn test_backup_identity_is_the_file_name_not_the_manifest_id() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_original", "all", 1000, None, true);
+            std::fs::rename(
+                backup_dir.path().join("bk_original.ndjson"),
+                backup_dir.path().join("bk_uploaded.ndjson"),
+            )
+            .unwrap();
 
-        let summary = manager.get_backup("bk_uploaded").unwrap();
-        assert_eq!(summary.id, "bk_uploaded");
-        let list = manager.list_backups().unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].id, "bk_uploaded");
-        assert!(matches!(manager.get_backup("bk_original").unwrap_err(), BackupError::NotFound));
+            let summary = manager.get_backup("bk_uploaded").unwrap();
+            assert_eq!(summary.id, "bk_uploaded");
+            let list = manager.list_backups().unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].id, "bk_uploaded");
+            assert!(matches!(manager.get_backup("bk_original").unwrap_err(), BackupError::NotFound));
+        })
     }
 
     // 10. delete_backup refuses a backup whose id only has a lingering
     //     `.part` file (e.g. after a crash) even with a free slot.
-    #[tokio::test]
-    async fn test_delete_backup_refuses_lingering_part_file() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_p", "all", 1000, None, true);
-        std::fs::write(backup_dir.path().join("bk_p.ndjson.part"), "{}\n").unwrap();
-        assert!(matches!(manager.delete_backup("bk_p").unwrap_err(), BackupError::BackupRunning));
+    #[test]
+    fn test_delete_backup_refuses_lingering_part_file() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_p", "all", 1000, None, true);
+            std::fs::write(backup_dir.path().join("bk_p.ndjson.part"), "{}\n").unwrap();
+            assert!(matches!(manager.delete_backup("bk_p").unwrap_err(), BackupError::BackupRunning));
+        })
     }
 
     // 10b. delete_backup refuses the archive a running restore reads: the
     //      slot's id is the restore id, the archive id sits in `scope`.
-    #[tokio::test]
-    async fn test_delete_backup_refuses_source_of_running_restore() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_src", "all", 1000, None, true);
-        *manager.slot.lock() = Some(RunningJobInfo {
-            id: "rs_20260712T030000Z".to_string(),
-            kind: JobKind::Restore,
-            scope: "bk_src".to_string(),
-            started_at: now_secs(),
-        });
-        assert!(matches!(manager.delete_backup("bk_src").unwrap_err(), BackupError::BackupRunning));
+    #[test]
+    fn test_delete_backup_refuses_source_of_running_restore() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_src", "all", 1000, None, true);
+            *manager.slot.lock() = Some(RunningJobInfo {
+                id: "rs_20260712T030000Z".to_string(),
+                kind: JobKind::Restore,
+                scope: "bk_src".to_string(),
+                started_at: now_secs(),
+            });
+            assert!(matches!(manager.delete_backup("bk_src").unwrap_err(), BackupError::BackupRunning));
 
-        *manager.slot.lock() = None;
-        manager.delete_backup("bk_src").unwrap();
+            *manager.slot.lock() = None;
+            manager.delete_backup("bk_src").unwrap();
+        })
     }
 
     // 11. Retention keeps only the newest `keep_last` COMPLETE backups of one
     //     schedule; on-demand (`schedule = null`) backups are never touched,
     //     regardless of count, and other schedules are untouched.
-    #[tokio::test]
-    async fn test_retention_keeps_newest_per_schedule_only() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        for (i, ts) in [1000u64, 2000, 3000, 4000].into_iter().enumerate() {
-            write_fake_backup(backup_dir.path(), &format!("bk_nightly_{i}"), "all", ts, Some("nightly"), true);
-        }
-        write_fake_backup(backup_dir.path(), "bk_other_1", "all", 5000, Some("other-schedule"), true);
-        write_fake_backup(backup_dir.path(), "bk_ondemand_1", "all", 6000, None, true);
-        write_fake_backup(backup_dir.path(), "bk_ondemand_2", "all", 7000, None, true);
-        // An incomplete "nightly" backup must not count toward keep_last nor be deleted by retention.
-        write_fake_backup(backup_dir.path(), "bk_nightly_incomplete", "all", 8000, Some("nightly"), false);
+    #[test]
+    fn test_retention_keeps_newest_per_schedule_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            for (i, ts) in [1000u64, 2000, 3000, 4000].into_iter().enumerate() {
+                write_fake_backup(backup_dir.path(), &format!("bk_nightly_{i}"), "all", ts, Some("nightly"), true);
+            }
+            write_fake_backup(backup_dir.path(), "bk_other_1", "all", 5000, Some("other-schedule"), true);
+            write_fake_backup(backup_dir.path(), "bk_ondemand_1", "all", 6000, None, true);
+            write_fake_backup(backup_dir.path(), "bk_ondemand_2", "all", 7000, None, true);
+            // An incomplete "nightly" backup must not count toward keep_last nor be deleted by retention.
+            write_fake_backup(backup_dir.path(), "bk_nightly_incomplete", "all", 8000, Some("nightly"), false);
 
-        let deleted = manager.apply_retention("nightly", 2).unwrap();
-        assert_eq!(deleted, 2, "must delete the two oldest complete 'nightly' backups");
+            let deleted = manager.apply_retention("nightly", 2).unwrap();
+            assert_eq!(deleted, 2, "must delete the two oldest complete 'nightly' backups");
 
-        let remaining: std::collections::HashSet<String> =
-            manager.list_backups().unwrap().into_iter().map(|b| b.id).collect();
-        assert!(remaining.contains("bk_nightly_2"));
-        assert!(remaining.contains("bk_nightly_3"));
-        assert!(!remaining.contains("bk_nightly_0"));
-        assert!(!remaining.contains("bk_nightly_1"));
-        assert!(remaining.contains("bk_nightly_incomplete"), "incomplete backups are never touched by retention");
-        assert!(remaining.contains("bk_other_1"), "other schedules must be untouched");
-        assert!(remaining.contains("bk_ondemand_1"), "on-demand backups (schedule=null) are never touched");
-        assert!(remaining.contains("bk_ondemand_2"));
+            let remaining: std::collections::HashSet<String> =
+                manager.list_backups().unwrap().into_iter().map(|b| b.id).collect();
+            assert!(remaining.contains("bk_nightly_2"));
+            assert!(remaining.contains("bk_nightly_3"));
+            assert!(!remaining.contains("bk_nightly_0"));
+            assert!(!remaining.contains("bk_nightly_1"));
+            assert!(remaining.contains("bk_nightly_incomplete"), "incomplete backups are never touched by retention");
+            assert!(remaining.contains("bk_other_1"), "other schedules must be untouched");
+            assert!(remaining.contains("bk_ondemand_1"), "on-demand backups (schedule=null) are never touched");
+            assert!(remaining.contains("bk_ondemand_2"));
+        })
     }
 
     // 11b. An uploaded archive keeps its source manifest verbatim, so its
     //      `schedule` may name a schedule of this server — retention must
     //      still never prune it.
-    #[tokio::test]
-    async fn test_retention_never_touches_uploaded_backups() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_nightly_0", "all", 1000, Some("nightly"), true);
-        write_fake_backup(backup_dir.path(), "bk_nightly_1", "all", 2000, Some("nightly"), true);
-        // Upload: only the file is renamed, the manifest (id + schedule) stays.
-        write_fake_backup(backup_dir.path(), "bk_foreign", "all", 500, Some("nightly"), true);
-        std::fs::rename(
-            backup_dir.path().join("bk_foreign.ndjson"),
-            backup_dir.path().join("bk_20260712T030000Z_upload.ndjson"),
-        )
-        .unwrap();
+    #[test]
+    fn test_retention_never_touches_uploaded_backups() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_nightly_0", "all", 1000, Some("nightly"), true);
+            write_fake_backup(backup_dir.path(), "bk_nightly_1", "all", 2000, Some("nightly"), true);
+            // Upload: only the file is renamed, the manifest (id + schedule) stays.
+            write_fake_backup(backup_dir.path(), "bk_foreign", "all", 500, Some("nightly"), true);
+            std::fs::rename(
+                backup_dir.path().join("bk_foreign.ndjson"),
+                backup_dir.path().join("bk_20260712T030000Z_upload.ndjson"),
+            )
+            .unwrap();
 
-        assert!(manager.get_backup("bk_20260712T030000Z_upload").unwrap().uploaded);
-        assert!(!manager.get_backup("bk_nightly_1").unwrap().uploaded);
+            assert!(manager.get_backup("bk_20260712T030000Z_upload").unwrap().uploaded);
+            assert!(!manager.get_backup("bk_nightly_1").unwrap().uploaded);
 
-        let deleted = manager.apply_retention("nightly", 1).unwrap();
-        assert_eq!(deleted, 1, "only the older scheduled backup is pruned");
+            let deleted = manager.apply_retention("nightly", 1).unwrap();
+            assert_eq!(deleted, 1, "only the older scheduled backup is pruned");
 
-        let remaining: std::collections::HashSet<String> =
-            manager.list_backups().unwrap().into_iter().map(|b| b.id).collect();
-        assert!(remaining.contains("bk_20260712T030000Z_upload"), "uploads are never pruned by retention");
-        assert!(remaining.contains("bk_nightly_1"));
-        assert!(!remaining.contains("bk_nightly_0"));
+            let remaining: std::collections::HashSet<String> =
+                manager.list_backups().unwrap().into_iter().map(|b| b.id).collect();
+            assert!(remaining.contains("bk_20260712T030000Z_upload"), "uploads are never pruned by retention");
+            assert!(remaining.contains("bk_nightly_1"));
+            assert!(!remaining.contains("bk_nightly_0"));
+        })
     }
 
     /// Second manager over the same backup dir (restart simulation), reusing
@@ -1228,59 +1257,63 @@ mod manager_tests {
 
     // 12. Startup sweeps `.part` leftovers (crashed export, abandoned upload
     //     stream) and leaves finished archives alone.
-    #[tokio::test]
-    async fn test_new_sweeps_leftover_part_files() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_keep", "all", 1000, None, true);
-        std::fs::write(backup_dir.path().join("upload-00000000deadbeef.part"), "x").unwrap();
-        std::fs::write(backup_dir.path().join("bk_crashed.ndjson.part"), "x").unwrap();
+    #[test]
+    fn test_new_sweeps_leftover_part_files() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_keep", "all", 1000, None, true);
+            std::fs::write(backup_dir.path().join("upload-00000000deadbeef.part"), "x").unwrap();
+            std::fs::write(backup_dir.path().join("bk_crashed.ndjson.part"), "x").unwrap();
 
-        let restarted = restart_manager(&manager, backup_dir.path());
+            let restarted = restart_manager(&manager, backup_dir.path());
 
-        assert!(!backup_dir.path().join("upload-00000000deadbeef.part").exists());
-        assert!(!backup_dir.path().join("bk_crashed.ndjson.part").exists());
-        let list = restarted.list_backups().unwrap();
-        assert_eq!(list.len(), 1, "finished archives survive the sweep");
-        assert_eq!(list[0].id, "bk_keep");
-        // The crashed job's id no longer answers `backup_running` forever.
-        assert!(matches!(restarted.delete_backup("bk_crashed").unwrap_err(), BackupError::NotFound));
+            assert!(!backup_dir.path().join("upload-00000000deadbeef.part").exists());
+            assert!(!backup_dir.path().join("bk_crashed.ndjson.part").exists());
+            let list = restarted.list_backups().unwrap();
+            assert_eq!(list.len(), 1, "finished archives survive the sweep");
+            assert_eq!(list[0].id, "bk_keep");
+            // The crashed job's id no longer answers `backup_running` forever.
+            assert!(matches!(restarted.delete_backup("bk_crashed").unwrap_err(), BackupError::NotFound));
+        })
     }
 
     // 13. The restore registry is capped: a new restore evicts the oldest
     //     finished statuses, never a running one.
-    #[tokio::test]
-    async fn test_restore_registry_evicts_oldest_finished() {
-        let (manager, _e, backup_dir) = make_manager().await;
-        write_fake_backup(backup_dir.path(), "bk_cap", "all", now_secs(), None, true);
-        {
-            let mut restores = manager.restores.write();
-            for i in 0..MAX_RESTORE_STATUSES + 5 {
-                let id = format!("rs_old_{i}");
-                restores.insert(
-                    id.clone(),
-                    RestoreStatus {
-                        restore_id: id,
-                        backup_id: "bk_cap".to_string(),
-                        state: RestoreState::Complete,
-                        imported: 0,
-                        skipped: 0,
-                        failed: 0,
-                        errors: Vec::new(),
-                        started_at: i as u64,
-                        finished_at: Some(i as u64),
-                    },
-                );
+    #[test]
+    fn test_restore_registry_evicts_oldest_finished() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, backup_dir) = make_manager().await;
+            write_fake_backup(backup_dir.path(), "bk_cap", "all", now_secs(), None, true);
+            {
+                let mut restores = manager.restores.write();
+                for i in 0..MAX_RESTORE_STATUSES + 5 {
+                    let id = format!("rs_old_{i}");
+                    restores.insert(
+                        id.clone(),
+                        RestoreStatus {
+                            restore_id: id,
+                            backup_id: "bk_cap".to_string(),
+                            state: RestoreState::Complete,
+                            imported: 0,
+                            skipped: 0,
+                            failed: 0,
+                            errors: Vec::new(),
+                            started_at: i as u64,
+                            finished_at: Some(i as u64),
+                        },
+                    );
+                }
             }
-        }
 
-        let (id, handle) =
-            manager.start_restore("bk_cap", restore::RestoreMode::FailIfExists, None, false).await.unwrap();
-        handle.await.unwrap();
+            let (id, handle) =
+                manager.start_restore("bk_cap", restore::RestoreMode::FailIfExists, None, false).await.unwrap();
+            handle.await.unwrap();
 
-        let restores = manager.restores.read();
-        assert_eq!(restores.len(), MAX_RESTORE_STATUSES);
-        assert!(restores.contains_key(&id), "the new restore must never evict itself");
-        assert!(!restores.contains_key("rs_old_0"), "the oldest finished status goes first");
-        assert!(restores.contains_key(&format!("rs_old_{}", MAX_RESTORE_STATUSES + 4)));
+            let restores = manager.restores.read();
+            assert_eq!(restores.len(), MAX_RESTORE_STATUSES);
+            assert!(restores.contains_key(&id), "the new restore must never evict itself");
+            assert!(!restores.contains_key("rs_old_0"), "the oldest finished status goes first");
+            assert!(restores.contains_key(&format!("rs_old_{}", MAX_RESTORE_STATUSES + 4)));
+        })
     }
 }

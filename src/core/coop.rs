@@ -75,22 +75,22 @@ async fn run_bounded<T: Send + 'static>(
 }
 
 /// Test-only interleaving harness (spec perf/017 §Tests): spawns `long` and
-/// then `small` onto the current-thread runtime and returns their completion
-/// order. `small` can only finish first if `long` hands the thread back.
+/// then `small` onto the engine runtime and returns their completion order.
+/// `small` can only finish first if `long` hands the thread back.
 #[cfg(test)]
 pub(crate) async fn completion_order<L, S>(long: L, small: S) -> Vec<&'static str>
 where
-    L: std::future::Future<Output = ()> + Send + 'static,
-    S: std::future::Future<Output = ()> + Send + 'static,
+    L: std::future::Future<Output = ()> + 'static,
+    S: std::future::Future<Output = ()> + 'static,
 {
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let long_order = Arc::clone(&order);
-    let long = tokio::spawn(async move {
+    let long = compio::runtime::spawn(async move {
         long.await;
         long_order.lock().unwrap().push("long");
     });
     let small_order = Arc::clone(&order);
-    let small = tokio::spawn(async move {
+    let small = compio::runtime::spawn(async move {
         small.await;
         small_order.lock().unwrap().push("small");
     });
@@ -108,6 +108,7 @@ mod tests {
     // 1. `tick` hands the thread back on exactly every `every`-th call: a task
     // spawned before the ticking can only set its flag while we are yielded.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods, reason = "a tokio runtime, like the reader pool")]
     async fn test_yield_every_yields_on_every_nth_tick() {
         let flag = Arc::new(AtomicBool::new(false));
         let observer = Arc::clone(&flag);
@@ -143,6 +144,7 @@ mod tests {
     // 2b. One permit serializes: the second offload starts only after the
     // first released its permit. Observed via `is_finished`, not timing.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods, reason = "a tokio runtime, like the reader pool")]
     async fn test_offload_waits_for_a_free_permit() {
         let permits = Arc::new(Semaphore::new(1));
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();

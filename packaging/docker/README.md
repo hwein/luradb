@@ -12,6 +12,10 @@ toolchain, no package install on the host.
 
 - Docker with Linux containers (Docker Engine on Linux, or Docker Desktop on
   Windows/macOS/Linux).
+- A Linux kernel 6.1 or newer underneath: containers share the host's kernel
+  (with Docker Desktop, the kernel of its VM). On an older one LuraDB stops
+  at startup with "LuraDB requires Linux kernel 6.1 or newer (io_uring
+  DEFER_TASKRUN)"; `docker run --rm ubuntu:24.04 uname -r` shows the version.
 - git.
 
 ## Quickstart

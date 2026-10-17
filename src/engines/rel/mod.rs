@@ -524,378 +524,414 @@ mod tests {
     }
 
     // 5. Bootstrap creates a working third LSM instance (put/get roundtrip).
-    #[tokio::test]
-    async fn test_bootstrap_put_get_roundtrip() {
-        let (rel, _dir) = make_engine().await;
-        rel.engine().put(b"row:1", b"{}").await.unwrap();
-        let snap = rel.engine().snapshot();
-        let got = rel
-            .engine()
-            .get_with_snapshot(b"row:1", snap.snapshot())
-            .await
-            .unwrap()
-            .into_option();
-        assert_eq!(got, Some(b"{}".to_vec()));
-        rel.shutdown().await;
+    #[test]
+    fn test_bootstrap_put_get_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.engine().put(b"row:1", b"{}").await.unwrap();
+            let snap = rel.engine().snapshot();
+            let got = rel
+                .engine()
+                .get_with_snapshot(b"row:1", snap.snapshot())
+                .await
+                .unwrap()
+                .into_option();
+            assert_eq!(got, Some(b"{}".to_vec()));
+            rel.shutdown().await;
+        })
     }
 
     // 6. Bootstrap creates the sstable directory if it does not exist (nested).
-    #[tokio::test]
-    async fn test_bootstrap_creates_sstable_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sstable_dir = dir.path().join("nested").join("sstables");
-        let config = RelStoreConfig {
-            wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
-            sstable_dir: sstable_dir.to_string_lossy().into_owned(),
-            ..RelStoreConfig::default()
-        };
-        let metrics = MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
-        let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
-        assert!(sstable_dir.is_dir());
-        rel.shutdown().await;
+    #[test]
+    fn test_bootstrap_creates_sstable_dir() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sstable_dir = dir.path().join("nested").join("sstables");
+            let config = RelStoreConfig {
+                wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
+                sstable_dir: sstable_dir.to_string_lossy().into_owned(),
+                ..RelStoreConfig::default()
+            };
+            let metrics = MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
+            let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
+            assert!(sstable_dir.is_dir());
+            rel.shutdown().await;
+        })
     }
 
     // 7. shutdown() after bootstrap runs cleanly.
-    #[tokio::test]
-    async fn test_shutdown_after_bootstrap() {
-        let (rel, _dir) = make_engine().await;
-        rel.shutdown().await;
+    #[test]
+    fn test_shutdown_after_bootstrap() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.shutdown().await;
+        })
     }
 
     // Spec general/030 test 6: with rel.lsm.max_key_length at its startup
     // lower bound, a domain with a maximal name, a table and a row with a
     // 1-byte key work.
-    #[tokio::test]
-    async fn test_key_limit_at_lower_bound_still_works() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = RelStoreConfig {
-            wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("rel_sstables").to_string_lossy().into_owned(),
-            lsm: crate::config::RelLsmConfig { max_key_length: catalog::MIN_LSM_KEY_LENGTH },
-            ..RelStoreConfig::default()
-        };
-        config.validate().unwrap();
-        let metrics = MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
-        let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
+    #[test]
+    fn test_key_limit_at_lower_bound_still_works() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = RelStoreConfig {
+                wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("rel_sstables").to_string_lossy().into_owned(),
+                lsm: crate::config::RelLsmConfig { max_key_length: catalog::MIN_LSM_KEY_LENGTH },
+                ..RelStoreConfig::default()
+            };
+            config.validate().unwrap();
+            let metrics = MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
+            let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
 
-        let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
-        rel.create_domain(&domain).await.unwrap();
-        rel.execute(&domain, "CREATE TABLE t (k TEXT PRIMARY KEY)", &[]).await.unwrap();
-        rel.execute(&domain, "INSERT INTO t VALUES ('a')", &[]).await.unwrap();
-        match rel.execute(&domain, "SELECT k FROM t", &[]).await.unwrap() {
-            ExecOutcome::Select(s) => assert_eq!(s.rows, vec![vec![ScalarValue::Text("a".to_string())]]),
-            o => panic!("expected SELECT, got {o:?}"),
-        }
-        rel.shutdown().await;
+            let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
+            rel.create_domain(&domain).await.unwrap();
+            rel.execute(&domain, "CREATE TABLE t (k TEXT PRIMARY KEY)", &[]).await.unwrap();
+            rel.execute(&domain, "INSERT INTO t VALUES ('a')", &[]).await.unwrap();
+            match rel.execute(&domain, "SELECT k FROM t", &[]).await.unwrap() {
+                ExecOutcome::Select(s) => assert_eq!(s.rows, vec![vec![ScalarValue::Text("a".to_string())]]),
+                o => panic!("expected SELECT, got {o:?}"),
+            }
+            rel.shutdown().await;
+        })
     }
 
     // 8. Domain management (rel/002) wires through RelEngine's public API:
     //    the default domain exists right after bootstrap, and
     //    create/get/list/delete all delegate to the registry.
-    #[tokio::test]
-    async fn test_engine_delegates_domain_management() {
-        let (rel, _dir) = make_engine().await;
-        assert!(rel.get_domain("default").is_some());
+    #[test]
+    fn test_engine_delegates_domain_management() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            assert!(rel.get_domain("default").is_some());
 
-        let created = rel.create_domain("tenant-a").await.unwrap();
-        assert_eq!(created.system_prefix.len(), 16);
-        assert!(rel.list_domains().iter().any(|d| d.name == "tenant-a"));
+            let created = rel.create_domain("tenant-a").await.unwrap();
+            assert_eq!(created.system_prefix.len(), 16);
+            assert!(rel.list_domains().iter().any(|d| d.name == "tenant-a"));
 
-        rel.delete_domain("tenant-a").await.unwrap();
-        assert!(rel.get_domain("tenant-a").is_none());
-        rel.shutdown().await;
+            rel.delete_domain("tenant-a").await.unwrap();
+            assert!(rel.get_domain("tenant-a").is_none());
+            rel.shutdown().await;
+        })
     }
 
     // 9. Catalog (rel/003) wires through RelEngine's public API.
-    #[tokio::test]
-    async fn test_engine_delegates_catalog() {
-        let (rel, _dir) = make_engine().await;
-        let mut pk = ColumnInput::new("id", ColumnType::Integer);
-        pk.primary_key = true;
-        let input = TableInput {
-            name: "items".to_string(),
-            columns: vec![pk],
-        };
-        let schema = rel.create_table("default", input).await.unwrap();
-        assert_eq!(schema.table_id, 1);
+    #[test]
+    fn test_engine_delegates_catalog() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let mut pk = ColumnInput::new("id", ColumnType::Integer);
+            pk.primary_key = true;
+            let input = TableInput {
+                name: "items".to_string(),
+                columns: vec![pk],
+            };
+            let schema = rel.create_table("default", input).await.unwrap();
+            assert_eq!(schema.table_id, 1);
 
-        rel.create_view("default", "v", "SELECT * FROM items").await.unwrap();
-        assert_eq!(rel.list_objects("default").unwrap().len(), 2);
-        assert!(matches!(rel.get_object("default", "items").unwrap(), CatalogEntry::Table(_)));
+            rel.create_view("default", "v", "SELECT * FROM items").await.unwrap();
+            assert_eq!(rel.list_objects("default").unwrap().len(), 2);
+            assert!(matches!(rel.get_object("default", "items").unwrap(), CatalogEntry::Table(_)));
 
-        rel.drop_object("default", "items").await.unwrap();
-        assert!(rel.get_object("default", "items").is_err());
-        rel.shutdown().await;
+            rel.drop_object("default", "items").await.unwrap();
+            assert!(rel.get_object("default", "items").is_err());
+            rel.shutdown().await;
+        })
     }
 
     // ── SQL frontend & DDL end-to-end (spec rel/004) ────────────────────────────
 
     // 2. max_statement_len guard fires end-to-end, before lexing.
-    #[tokio::test]
-    async fn test_execute_statement_too_long() {
-        let (rel, _dir) = make_engine().await;
-        let sql = format!("SELECT * FROM t{}", " ".repeat(64 * 1024));
-        let err = rel.execute("default", &sql, &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::StatementTooLong { max: 65_536, .. }), "got: {err}");
-        rel.shutdown().await;
+    #[test]
+    fn test_execute_statement_too_long() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let sql = format!("SELECT * FROM t{}", " ".repeat(64 * 1024));
+            let err = rel.execute("default", &sql, &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::StatementTooLong { max: 65_536, .. }), "got: {err}");
+            rel.shutdown().await;
+        })
     }
 
     // 3. Empty input -> EmptyStatement; two statements -> MultipleStatements;
     //    a single trailing ';' is fine.
-    #[tokio::test]
-    async fn test_execute_statement_boundaries() {
-        let (rel, _dir) = make_engine().await;
-        let err = rel.execute("default", "", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::EmptyStatement), "got: {err}");
+    #[test]
+    fn test_execute_statement_boundaries() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let err = rel.execute("default", "", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::EmptyStatement), "got: {err}");
 
-        let err = rel
-            .execute(
-                "default",
-                "CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY)",
-                &[],
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::MultipleStatements), "got: {err}");
+            let err = rel
+                .execute(
+                    "default",
+                    "CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY)",
+                    &[],
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::MultipleStatements), "got: {err}");
 
-        rel.execute("default", "CREATE TABLE a (id INTEGER PRIMARY KEY);", &[])
-            .await
-            .unwrap();
-        rel.shutdown().await;
+            rel.execute("default", "CREATE TABLE a (id INTEGER PRIMARY KEY);", &[])
+                .await
+                .unwrap();
+            rel.shutdown().await;
+        })
     }
 
     // 8+9+10 (wiring sanity): the NULL-bind guard and parameter-count check
     // fire through the real `execute` entry point, before dispatch ever picks
     // an execution path (SELECT itself is never executed).
-    #[tokio::test]
-    async fn test_execute_null_guard_and_param_count_wiring() {
-        let (rel, _dir) = make_engine().await;
+    #[test]
+    fn test_execute_null_guard_and_param_count_wiring() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
 
-        let err = rel.execute("default", "SELECT * FROM t WHERE id = NULL", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::NullComparison { .. }), "got: {err}");
+            let err = rel.execute("default", "SELECT * FROM t WHERE id = NULL", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::NullComparison { .. }), "got: {err}");
 
-        let err = rel
-            .execute("default", "SELECT * FROM t WHERE id = ?", &[serde_json::Value::Null])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::NullComparison { .. }), "got: {err}");
+            let err = rel
+                .execute("default", "SELECT * FROM t WHERE id = ?", &[serde_json::Value::Null])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::NullComparison { .. }), "got: {err}");
 
-        let err = rel.execute("default", "SELECT * FROM t WHERE id = ?", &[]).await.unwrap_err();
-        assert!(
-            matches!(err, RelStoreError::ParameterCountMismatch { expected: 1, actual: 0 }),
-            "got: {err}"
-        );
-        rel.shutdown().await;
+            let err = rel.execute("default", "SELECT * FROM t WHERE id = ?", &[]).await.unwrap_err();
+            assert!(
+                matches!(err, RelStoreError::ParameterCountMismatch { expected: 1, actual: 0 }),
+                "got: {err}"
+            );
+            rel.shutdown().await;
+        })
     }
 
     // 11. CREATE TABLE without a PK, or with two -> InvalidSchema.
-    #[tokio::test]
-    async fn test_execute_create_table_pk_rules() {
-        let (rel, _dir) = make_engine().await;
-        let err = rel.execute("default", "CREATE TABLE t (a INTEGER)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+    #[test]
+    fn test_execute_create_table_pk_rules() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let err = rel.execute("default", "CREATE TABLE t (a INTEGER)", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        let err = rel
-            .execute("default", "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)", &[])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
-        rel.shutdown().await;
+            let err = rel
+                .execute("default", "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)", &[])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            rel.shutdown().await;
+        })
     }
 
     // 12. AUTOINCREMENT on a TEXT PK -> InvalidSchema; on an INTEGER PK -> ok.
-    #[tokio::test]
-    async fn test_execute_autoincrement_rules() {
-        let (rel, _dir) = make_engine().await;
-        let err = rel
-            .execute("default", "CREATE TABLE t (a TEXT PRIMARY KEY AUTOINCREMENT)", &[])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+    #[test]
+    fn test_execute_autoincrement_rules() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let err = rel
+                .execute("default", "CREATE TABLE t (a TEXT PRIMARY KEY AUTOINCREMENT)", &[])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        rel.execute("default", "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)", &[])
-            .await
-            .unwrap();
-        rel.shutdown().await;
+            rel.execute("default", "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)", &[])
+                .await
+                .unwrap();
+            rel.shutdown().await;
+        })
     }
 
     // 13. REFERENCES: matching PK type ok; mismatch -> TypeMismatch; missing
     //     target table -> TableNotFound.
-    #[tokio::test]
-    async fn test_execute_references_rules() {
-        let (rel, _dir) = make_engine().await;
-        rel.execute("default", "CREATE TABLE parent (id INTEGER PRIMARY KEY)", &[])
-            .await
-            .unwrap();
-        rel.execute(
-            "default",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent)",
-            &[],
-        )
-        .await
-        .unwrap();
-
-        let err = rel
-            .execute(
+    #[test]
+    fn test_execute_references_rules() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.execute("default", "CREATE TABLE parent (id INTEGER PRIMARY KEY)", &[])
+                .await
+                .unwrap();
+            rel.execute(
                 "default",
-                "CREATE TABLE bad (id INTEGER PRIMARY KEY, parent_id TEXT REFERENCES parent)",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent)",
                 &[],
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TypeMismatch { .. }), "got: {err}");
+            .unwrap();
 
-        let err = rel
-            .execute("default", "CREATE TABLE bad2 (id INTEGER PRIMARY KEY, x INTEGER REFERENCES ghost)", &[])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
-        rel.shutdown().await;
+            let err = rel
+                .execute(
+                    "default",
+                    "CREATE TABLE bad (id INTEGER PRIMARY KEY, parent_id TEXT REFERENCES parent)",
+                    &[],
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TypeMismatch { .. }), "got: {err}");
+
+            let err = rel
+                .execute("default", "CREATE TABLE bad2 (id INTEGER PRIMARY KEY, x INTEGER REFERENCES ghost)", &[])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            rel.shutdown().await;
+        })
     }
 
     // 14. CREATE TABLE on a name already used by a table or a view ->
     //     TableAlreadyExists; more than max_columns columns -> LimitExceeded.
-    #[tokio::test]
-    async fn test_execute_create_table_collision_and_column_limit() {
-        let (rel, _dir) = make_engine().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        let err = rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
+    #[test]
+    fn test_execute_create_table_collision_and_column_limit() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            let err = rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
 
-        rel.create_view("default", "v", "SELECT 1").await.unwrap();
-        let err = rel.execute("default", "CREATE TABLE v (id INTEGER PRIMARY KEY)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
-        rel.shutdown().await;
+            rel.create_view("default", "v", "SELECT 1").await.unwrap();
+            let err = rel.execute("default", "CREATE TABLE v (id INTEGER PRIMARY KEY)", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
+            rel.shutdown().await;
 
-        let (rel2, _dir2) = make_engine().await;
-        let columns: Vec<String> = (0..128).map(|i| format!("c{i} INTEGER")).collect();
-        let sql = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "));
-        let err = rel2.execute("default", &sql, &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { max: 128, .. }), "got: {err}");
-        rel2.shutdown().await;
+            let (rel2, _dir2) = make_engine().await;
+            let columns: Vec<String> = (0..128).map(|i| format!("c{i} INTEGER")).collect();
+            let sql = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "));
+            let err = rel2.execute("default", &sql, &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { max: 128, .. }), "got: {err}");
+            rel2.shutdown().await;
+        })
     }
 
     // 15. ADD COLUMN ... NOT NULL without DEFAULT -> InvalidSchema; with a
     //     literal DEFAULT -> ok.
-    #[tokio::test]
-    async fn test_execute_add_column_not_null_requires_default() {
-        let (rel, _dir) = make_engine().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+    #[test]
+    fn test_execute_add_column_not_null_requires_default() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
 
-        let err = rel
-            .execute("default", "ALTER TABLE t ADD COLUMN name TEXT NOT NULL", &[])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let err = rel
+                .execute("default", "ALTER TABLE t ADD COLUMN name TEXT NOT NULL", &[])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        rel.execute("default", "ALTER TABLE t ADD COLUMN name TEXT NOT NULL DEFAULT 'x'", &[])
-            .await
-            .unwrap();
-        rel.shutdown().await;
+            rel.execute("default", "ALTER TABLE t ADD COLUMN name TEXT NOT NULL DEFAULT 'x'", &[])
+                .await
+                .unwrap();
+            rel.shutdown().await;
+        })
     }
 
     // 16. DROP COLUMN on the PK or an indexed column -> ColumnIndexedOrPrimaryKey
     //     (409); a plain column drops fine.
-    #[tokio::test]
-    async fn test_execute_drop_column_pk_or_indexed() {
-        let (rel, _dir) = make_engine().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT, note TEXT)", &[])
-            .await
-            .unwrap();
-        rel.execute("default", "CREATE INDEX t_tag_idx ON t (tag)", &[]).await.unwrap();
+    #[test]
+    fn test_execute_drop_column_pk_or_indexed() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT, note TEXT)", &[])
+                .await
+                .unwrap();
+            rel.execute("default", "CREATE INDEX t_tag_idx ON t (tag)", &[]).await.unwrap();
 
-        let err = rel.execute("default", "ALTER TABLE t DROP COLUMN id", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
-        let err = rel.execute("default", "ALTER TABLE t DROP COLUMN tag", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
+            let err = rel.execute("default", "ALTER TABLE t DROP COLUMN id", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
+            let err = rel.execute("default", "ALTER TABLE t DROP COLUMN tag", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
 
-        rel.execute("default", "ALTER TABLE t DROP COLUMN note", &[]).await.unwrap();
-        rel.shutdown().await;
+            rel.execute("default", "ALTER TABLE t DROP COLUMN note", &[]).await.unwrap();
+            rel.shutdown().await;
+        })
     }
 
     // 17. RENAME COLUMN / RENAME TO; name collisions -> 409; PK/indexed
     //     columns may be renamed.
-    #[tokio::test]
-    async fn test_execute_rename_column_and_table() {
-        let (rel, _dir) = make_engine().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT, other TEXT)", &[])
-            .await
-            .unwrap();
-        rel.execute("default", "CREATE INDEX t_tag_idx ON t (tag)", &[]).await.unwrap();
+    #[test]
+    fn test_execute_rename_column_and_table() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, tag TEXT, other TEXT)", &[])
+                .await
+                .unwrap();
+            rel.execute("default", "CREATE INDEX t_tag_idx ON t (tag)", &[]).await.unwrap();
 
-        rel.execute("default", "ALTER TABLE t RENAME COLUMN id TO pk", &[]).await.unwrap();
-        rel.execute("default", "ALTER TABLE t RENAME COLUMN tag TO label", &[]).await.unwrap();
+            rel.execute("default", "ALTER TABLE t RENAME COLUMN id TO pk", &[]).await.unwrap();
+            rel.execute("default", "ALTER TABLE t RENAME COLUMN tag TO label", &[]).await.unwrap();
 
-        let err = rel
-            .execute("default", "ALTER TABLE t RENAME COLUMN other TO label", &[])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnAlreadyExists { .. }), "got: {err}");
+            let err = rel
+                .execute("default", "ALTER TABLE t RENAME COLUMN other TO label", &[])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnAlreadyExists { .. }), "got: {err}");
 
-        rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        let err = rel.execute("default", "ALTER TABLE t RENAME TO u", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
+            rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            let err = rel.execute("default", "ALTER TABLE t RENAME TO u", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
 
-        rel.execute("default", "ALTER TABLE t RENAME TO t2", &[]).await.unwrap();
-        rel.shutdown().await;
+            rel.execute("default", "ALTER TABLE t RENAME TO t2", &[]).await.unwrap();
+            rel.shutdown().await;
+        })
     }
 
     // 18. CREATE INDEX over max_indexes_per_table -> LimitExceeded; duplicate
     //     name -> IndexAlreadyExists; missing column -> ColumnNotFound; DROP
     //     INDEX on a missing name -> IndexNotFound.
-    #[tokio::test]
-    async fn test_execute_index_limits_and_errors() {
-        let (rel, _dir) = make_engine().await;
-        let columns: Vec<String> = (0..17).map(|i| format!("c{i} INTEGER")).collect();
-        let sql = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "));
-        rel.execute("default", &sql, &[]).await.unwrap();
-        for i in 0..16 {
-            rel.execute("default", &format!("CREATE INDEX idx_{i} ON t (c{i})"), &[]).await.unwrap();
-        }
+    #[test]
+    fn test_execute_index_limits_and_errors() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let columns: Vec<String> = (0..17).map(|i| format!("c{i} INTEGER")).collect();
+            let sql = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "));
+            rel.execute("default", &sql, &[]).await.unwrap();
+            for i in 0..16 {
+                rel.execute("default", &format!("CREATE INDEX idx_{i} ON t (c{i})"), &[]).await.unwrap();
+            }
 
-        let err = rel.execute("default", "CREATE INDEX idx_16 ON t (c16)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { max: 16, .. }), "got: {err}");
+            let err = rel.execute("default", "CREATE INDEX idx_16 ON t (c16)", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { max: 16, .. }), "got: {err}");
 
-        let err = rel.execute("default", "CREATE INDEX idx_0 ON t (c16)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::IndexAlreadyExists { .. }), "got: {err}");
+            let err = rel.execute("default", "CREATE INDEX idx_0 ON t (c16)", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::IndexAlreadyExists { .. }), "got: {err}");
 
-        let err = rel.execute("default", "CREATE INDEX idx_c ON t (ghost)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
+            let err = rel.execute("default", "CREATE INDEX idx_c ON t (ghost)", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
 
-        let err = rel.execute("default", "DROP INDEX ghost_idx", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::IndexNotFound { .. }), "got: {err}");
+            let err = rel.execute("default", "DROP INDEX ghost_idx", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::IndexNotFound { .. }), "got: {err}");
 
-        rel.execute("default", "DROP INDEX idx_0", &[]).await.unwrap();
-        rel.shutdown().await;
+            rel.execute("default", "DROP INDEX idx_0", &[]).await.unwrap();
+            rel.shutdown().await;
+        })
     }
 
     // 19 (superseded by rel/006-008): full-table scan/COUNT(*)/ORDER BY/non-PK
     // WHERE, LEFT JOIN, and now CREATE/DROP VIEW + SELECT-through-a-view all
     // execute for real (see select.rs/join.rs/view.rs for dedicated coverage);
     // this is just a wiring smoke test through the real `execute()` entry point.
-    #[tokio::test]
-    async fn test_execute_join_and_view_now_execute() {
-        let (rel, _dir) = make_engine().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+    #[test]
+    fn test_execute_join_and_view_now_execute() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
 
-        // LEFT JOIN on a PK executes for real (rel/007).
-        rel.execute("default", "SELECT * FROM t LEFT JOIN u ON t.id = u.id", &[]).await.unwrap();
+            // LEFT JOIN on a PK executes for real (rel/007).
+            rel.execute("default", "SELECT * FROM t LEFT JOIN u ON t.id = u.id", &[]).await.unwrap();
 
-        // CREATE VIEW binds/validates and stores the raw text (rel/008).
-        rel.execute("default", "CREATE VIEW v AS SELECT * FROM t", &[]).await.unwrap();
+            // CREATE VIEW binds/validates and stores the raw text (rel/008).
+            rel.execute("default", "CREATE VIEW v AS SELECT * FROM t", &[]).await.unwrap();
 
-        // SELECT through a view inlines to the base table (rel/008).
-        rel.execute("default", "SELECT * FROM v", &[]).await.unwrap();
+            // SELECT through a view inlines to the base table (rel/008).
+            rel.execute("default", "SELECT * FROM v", &[]).await.unwrap();
 
-        // DROP VIEW removes it (rel/008).
-        rel.execute("default", "DROP VIEW v", &[]).await.unwrap();
-        assert!(rel.get_object("default", "v").is_err());
-        rel.shutdown().await;
+            // DROP VIEW removes it (rel/008).
+            rel.execute("default", "DROP VIEW v", &[]).await.unwrap();
+            assert!(rel.get_object("default", "v").is_err());
+            rel.shutdown().await;
+        })
     }
 
     // ── Spec general/018: global lifecycle event bus ────────────────────────
@@ -910,114 +946,124 @@ mod tests {
     // Test 3: CREATE TABLE, ALTER TABLE (add/rename column), CREATE INDEX,
     // DROP INDEX, CREATE VIEW, DROP VIEW, DROP TABLE -> one event each with
     // the right kind/object.
-    #[tokio::test]
-    async fn test_rel_ddl_publishes_one_event_per_statement_with_matching_kind_and_object() {
-        let (rel, bus, _dir) = make_engine_with_bus().await;
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_rel_ddl_publishes_one_event_per_statement_with_matching_kind_and_object() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, bus, _dir) = make_engine_with_bus().await;
+            let mut rx = bus.subscribe();
 
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", &[]).await.unwrap();
-        rel.execute("default", "ALTER TABLE t ADD COLUMN b INTEGER", &[]).await.unwrap();
-        rel.execute("default", "ALTER TABLE t RENAME COLUMN b TO c", &[]).await.unwrap();
-        rel.execute("default", "CREATE INDEX t_a_idx ON t (a)", &[]).await.unwrap();
-        rel.execute("default", "DROP INDEX t_a_idx", &[]).await.unwrap();
-        rel.execute("default", "CREATE VIEW v AS SELECT * FROM t", &[]).await.unwrap();
-        rel.execute("default", "DROP VIEW v", &[]).await.unwrap();
-        rel.execute("default", "DROP TABLE t", &[]).await.unwrap();
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", &[]).await.unwrap();
+            rel.execute("default", "ALTER TABLE t ADD COLUMN b INTEGER", &[]).await.unwrap();
+            rel.execute("default", "ALTER TABLE t RENAME COLUMN b TO c", &[]).await.unwrap();
+            rel.execute("default", "CREATE INDEX t_a_idx ON t (a)", &[]).await.unwrap();
+            rel.execute("default", "DROP INDEX t_a_idx", &[]).await.unwrap();
+            rel.execute("default", "CREATE VIEW v AS SELECT * FROM t", &[]).await.unwrap();
+            rel.execute("default", "DROP VIEW v", &[]).await.unwrap();
+            rel.execute("default", "DROP TABLE t", &[]).await.unwrap();
 
-        let expected = [
-            ("table_created", Some("t")),
-            ("table_altered", Some("t")),
-            ("table_altered", Some("t")),
-            ("index_created", Some("t_a_idx")),
-            ("index_dropped", Some("t_a_idx")),
-            ("view_created", Some("v")),
-            ("view_dropped", Some("v")),
-            ("table_dropped", Some("t")),
-        ];
-        for (kind, object) in expected {
-            let event = rx.try_recv().unwrap();
-            assert_eq!(event.engine, "rel");
-            assert_eq!(event.kind, kind);
-            assert_eq!(event.object.as_deref(), object, "kind {kind}");
-            assert_eq!(event.domain, "default");
-        }
-        assert!(rx.try_recv().is_err(), "no extra events expected");
+            let expected = [
+                ("table_created", Some("t")),
+                ("table_altered", Some("t")),
+                ("table_altered", Some("t")),
+                ("index_created", Some("t_a_idx")),
+                ("index_dropped", Some("t_a_idx")),
+                ("view_created", Some("v")),
+                ("view_dropped", Some("v")),
+                ("table_dropped", Some("t")),
+            ];
+            for (kind, object) in expected {
+                let event = rx.try_recv().unwrap();
+                assert_eq!(event.engine, "rel");
+                assert_eq!(event.kind, kind);
+                assert_eq!(event.object.as_deref(), object, "kind {kind}");
+                assert_eq!(event.domain, "default");
+            }
+            assert!(rx.try_recv().is_err(), "no extra events expected");
+        })
     }
 
     // Test 3a: RENAME TABLE publishes exactly two events -- table_dropped
     // (old name) immediately followed by table_created (new name), with
     // consecutive sequences (spec §2.1).
-    #[tokio::test]
-    async fn test_rename_table_publishes_two_consecutive_events() {
-        let (rel, bus, _dir) = make_engine_with_bus().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_rename_table_publishes_two_consecutive_events() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, bus, _dir) = make_engine_with_bus().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            let mut rx = bus.subscribe();
 
-        rel.execute("default", "ALTER TABLE t RENAME TO t2", &[]).await.unwrap();
+            rel.execute("default", "ALTER TABLE t RENAME TO t2", &[]).await.unwrap();
 
-        let dropped = rx.try_recv().unwrap();
-        let created = rx.try_recv().unwrap();
-        assert_eq!(dropped.kind, "table_dropped");
-        assert_eq!(dropped.object.as_deref(), Some("t"));
-        assert_eq!(created.kind, "table_created");
-        assert_eq!(created.object.as_deref(), Some("t2"));
-        assert_eq!(created.seq, dropped.seq + 1, "must be consecutive sequences");
-        assert!(rx.try_recv().is_err(), "exactly two events, nothing else");
+            let dropped = rx.try_recv().unwrap();
+            let created = rx.try_recv().unwrap();
+            assert_eq!(dropped.kind, "table_dropped");
+            assert_eq!(dropped.object.as_deref(), Some("t"));
+            assert_eq!(created.kind, "table_created");
+            assert_eq!(created.object.as_deref(), Some("t2"));
+            assert_eq!(created.seq, dropped.seq + 1, "must be consecutive sequences");
+            assert!(rx.try_recv().is_err(), "exactly two events, nothing else");
+        })
     }
 
     // Test 4: a failed DDL (table already exists, view with a dependency,
     // duplicate domain name) publishes no event; a following successful
     // statement still publishes normally.
-    #[tokio::test]
-    async fn test_failed_ddl_publishes_no_event() {
-        let (rel, bus, _dir) = make_engine_with_bus().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", &[]).await.unwrap();
-        rel.execute("default", "CREATE VIEW v AS SELECT a FROM t", &[]).await.unwrap();
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_failed_ddl_publishes_no_event() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, bus, _dir) = make_engine_with_bus().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", &[]).await.unwrap();
+            rel.execute("default", "CREATE VIEW v AS SELECT a FROM t", &[]).await.unwrap();
+            let mut rx = bus.subscribe();
 
-        // Table already exists.
-        assert!(rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.is_err());
-        // DROP COLUMN on a column `v` explicitly depends on.
-        assert!(rel.execute("default", "ALTER TABLE t DROP COLUMN a", &[]).await.is_err());
-        // Duplicate domain name.
-        assert!(rel.create_domain("default").await.is_err());
+            // Table already exists.
+            assert!(rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.is_err());
+            // DROP COLUMN on a column `v` explicitly depends on.
+            assert!(rel.execute("default", "ALTER TABLE t DROP COLUMN a", &[]).await.is_err());
+            // Duplicate domain name.
+            assert!(rel.create_domain("default").await.is_err());
 
-        assert!(rx.try_recv().is_err(), "a failed DDL must publish nothing");
+            assert!(rx.try_recv().is_err(), "a failed DDL must publish nothing");
 
-        // A subsequent successful statement still works and publishes normally.
-        rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        let event = rx.try_recv().unwrap();
-        assert_eq!(event.kind, "table_created");
-        assert_eq!(event.object.as_deref(), Some("u"));
+            // A subsequent successful statement still works and publishes normally.
+            rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event.kind, "table_created");
+            assert_eq!(event.object.as_deref(), Some("u"));
+        })
     }
 
     // Test 2 (rel slice): after a purge run, domain_purged appears, after
     // domain_deleted.
-    #[tokio::test]
-    async fn test_domain_purge_event_published_after_domain_deleted() {
-        let (rel, bus, _dir) = make_engine_with_bus().await;
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_domain_purge_event_published_after_domain_deleted() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, bus, _dir) = make_engine_with_bus().await;
+            let mut rx = bus.subscribe();
 
-        rel.create_domain("purge-ev").await.unwrap();
-        rx.try_recv().unwrap(); // domain_created, not under test here
-        rel.delete_domain("purge-ev").await.unwrap();
+            rel.create_domain("purge-ev").await.unwrap();
+            rx.try_recv().unwrap(); // domain_created, not under test here
+            rel.delete_domain("purge-ev").await.unwrap();
 
-        let purger = RelDomainPurger::new(Arc::clone(&rel), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
-        purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
+            let purger = RelDomainPurger::new(Arc::clone(&rel), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
+            purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
 
-        let deleted = rx.try_recv().unwrap();
-        assert_eq!(deleted.kind, "domain_deleted");
-        let purged = rx.try_recv().unwrap();
-        assert_eq!(purged.kind, "domain_purged");
-        assert_eq!(purged.domain, "purge-ev");
+            let deleted = rx.try_recv().unwrap();
+            assert_eq!(deleted.kind, "domain_deleted");
+            let purged = rx.try_recv().unwrap();
+            assert_eq!(purged.kind, "domain_purged");
+            assert_eq!(purged.domain, "purge-ev");
+        })
     }
 
     // Test 12 (rel slice): DDL without a bus attached succeeds unchanged, no panic.
-    #[tokio::test]
-    async fn test_rel_ddl_without_event_bus_attached_succeeds_without_panic() {
-        let (rel, _dir) = make_engine().await; // no attach_event_bus call
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        rel.execute("default", "ALTER TABLE t ADD COLUMN a INTEGER", &[]).await.unwrap();
-        rel.execute("default", "DROP TABLE t", &[]).await.unwrap();
+    #[test]
+    fn test_rel_ddl_without_event_bus_attached_succeeds_without_panic() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await; // no attach_event_bus call
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            rel.execute("default", "ALTER TABLE t ADD COLUMN a INTEGER", &[]).await.unwrap();
+            rel.execute("default", "DROP TABLE t", &[]).await.unwrap();
+        })
     }
 }

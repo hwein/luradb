@@ -51,86 +51,88 @@ const SNAPSHOT_BLOCKED: &[u8] = b"snapshot-3: wants the pinned buffer";
 
 // ── Parent ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn shm_reader_liveness_across_processes() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let sock = dir.path().join("reg.sock");
-    let ready = dir.path().join("child-ready");
-    let instance_id = format!("shm012-{}", std::process::id());
+#[test]
+fn shm_reader_liveness_across_processes() {
+    luradb::core::engine_runtime::block_on(async {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("reg.sock");
+        let ready = dir.path().join("child-ready");
+        let instance_id = format!("shm012-{}", std::process::id());
 
-    let manager = ShmManager::new(shm_config(&instance_id, &sock)).expect("shm manager");
-    let state = manager.get_segment("state").expect("state segment");
-    let data_a = manager.get_segment("data_a").expect("data_a segment");
-    let data_b = manager.get_segment("data_b").expect("data_b segment");
-    // Safe: the segments outlive `manager`'s use here and are only touched
-    // through `StateHeader` / the writer's raw pointers.
-    let header = unsafe { StateHeader::from_ptr(state.as_ptr(), state.len()) };
-    header.init();
+        let manager = ShmManager::new(shm_config(&instance_id, &sock)).expect("shm manager");
+        let state = manager.get_segment("state").expect("state segment");
+        let data_a = manager.get_segment("data_a").expect("data_a segment");
+        let data_b = manager.get_segment("data_b").expect("data_b segment");
+        // Safe: the segments outlive `manager`'s use here and are only touched
+        // through `StateHeader` / the writer's raw pointers.
+        let header = unsafe { StateHeader::from_ptr(state.as_ptr(), state.len()) };
+        header.init();
 
-    let readers = Arc::new(ReaderRegistry::new());
-    let buf_len = data_a.len();
-    // Safe: this test is the single writer; the two data buffers are distinct
-    // mappings of `buf_len` bytes.
-    let writer = unsafe {
-        SnapshotWriter::new(
-            header,
-            data_a.as_ptr() as *mut u8,
-            data_b.as_ptr() as *mut u8,
-            buf_len,
-            PUBLISH_WAIT_TIMEOUT_US,
-            Arc::clone(&readers),
-        )
-    };
+        let readers = Arc::new(ReaderRegistry::new());
+        let buf_len = data_a.len();
+        // Safe: this test is the single writer; the two data buffers are distinct
+        // mappings of `buf_len` bytes.
+        let writer = unsafe {
+            SnapshotWriter::new(
+                header,
+                data_a.as_ptr() as *mut u8,
+                data_b.as_ptr() as *mut u8,
+                buf_len,
+                PUBLISH_WAIT_TIMEOUT_US,
+                Arc::clone(&readers),
+            )
+        };
 
-    let (registry, _db_dir) = make_registry().await;
-    let listener = prepare_registration_socket(&sock.to_string_lossy()).expect("registration socket");
-    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let dispatcher = tokio::spawn(ShmDispatcher::new(registry).run(events_rx, shutdown_rx.clone()));
-    let registration = tokio::spawn(serve_registration(
-        listener,
-        RegistrationConfig {
-            instance_id: instance_id.clone(),
-            ring_size: 4096,
-            segment_mode: 0o600,
-            auth_enabled: false,
-            trusted_uids: Arc::new(Vec::new()),
-            readers: Arc::clone(&readers),
-        },
-        events_tx,
-        shutdown_rx,
-    ));
+        let (registry, _db_dir) = make_registry().await;
+        let listener = prepare_registration_socket(&sock.to_string_lossy()).expect("registration socket");
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let dispatcher = compio::runtime::spawn(ShmDispatcher::new(registry).run(events_rx, shutdown_rx.clone()));
+        let registration = compio::runtime::spawn(serve_registration(
+            listener,
+            RegistrationConfig {
+                instance_id: instance_id.clone(),
+                ring_size: 4096,
+                segment_mode: 0o600,
+                auth_enabled: false,
+                trusted_uids: Arc::new(Vec::new()),
+                readers: Arc::clone(&readers),
+            },
+            events_tx,
+            shutdown_rx,
+        ));
 
-    // Buffer A is active after init, so this lands in buffer B — the one the
-    // child will pin.
-    assert_eq!(writer.publish(SNAPSHOT_PINNED).unwrap(), PublishOutcome::Published);
+        // Buffer A is active after init, so this lands in buffer B — the one the
+        // child will pin.
+        assert_eq!(writer.publish(SNAPSHOT_PINNED).unwrap(), PublishOutcome::Published);
 
-    let mut child = ChildGuard(spawn_child(&sock, &instance_id, &ready));
+        let mut child = ChildGuard(spawn_child(&sock, &instance_id, &ready));
 
-    // (c) The child read the published snapshot byte for byte.
-    let seen = wait_for_ready(&ready).await.expect("child never reported a pinned snapshot");
-    assert_eq!(seen, SNAPSHOT_PINNED, "child read different bytes than were published");
+        // (c) The child read the published snapshot byte for byte.
+        let seen = wait_for_ready(&ready).await.expect("child never reported a pinned snapshot");
+        assert_eq!(seen, SNAPSHOT_PINNED, "child read different bytes than were published");
 
-    // (a) The free buffer still takes a publish; the pinned one is skipped.
-    assert_eq!(writer.publish(SNAPSHOT_FREE).unwrap(), PublishOutcome::Published);
-    assert_eq!(
-        writer.publish(SNAPSHOT_BLOCKED).unwrap(),
-        PublishOutcome::SkippedBusy { buffer: 1 },
-        "a buffer pinned by a foreign process must never be overwritten"
-    );
-    assert_eq!(readers.blockers(1), vec![(1, 1)], "the child is the single blocker");
+        // (a) The free buffer still takes a publish; the pinned one is skipped.
+        assert_eq!(writer.publish(SNAPSHOT_FREE).unwrap(), PublishOutcome::Published);
+        assert_eq!(
+            writer.publish(SNAPSHOT_BLOCKED).unwrap(),
+            PublishOutcome::SkippedBusy { buffer: 1 },
+            "a buffer pinned by a foreign process must never be overwritten"
+        );
+        assert_eq!(readers.blockers(1), vec![(1, 1)], "the child is the single blocker");
 
-    // (b) SIGKILL: the EOF path deregisters the slot and publishing resumes.
-    child.kill_and_reap();
-    assert!(
-        publish_until_published(&writer, SNAPSHOT_BLOCKED).await,
-        "reader slot was never reclaimed after the client process was killed"
-    );
+        // (b) SIGKILL: the EOF path deregisters the slot and publishing resumes.
+        child.kill_and_reap();
+        assert!(
+            publish_until_published(&writer, SNAPSHOT_BLOCKED).await,
+            "reader slot was never reclaimed after the client process was killed"
+        );
 
-    let _ = shutdown_tx.send(true);
-    let _ = registration.await;
-    let _ = dispatcher.await;
-    manager.shutdown();
+        let _ = shutdown_tx.send(true);
+        let _ = registration.await;
+        let _ = dispatcher.await;
+        manager.shutdown();
+    })
 }
 
 fn shm_config(instance_id: &str, sock: &Path) -> ShmConfig {
@@ -213,7 +215,7 @@ async fn wait_for_ready(ready: &Path) -> Option<Vec<u8>> {
         if Instant::now() >= deadline {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        compio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -229,7 +231,7 @@ async fn publish_until_published(writer: &SnapshotWriter<'_>, data: &[u8]) -> bo
         if Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        compio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

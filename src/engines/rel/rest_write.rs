@@ -175,86 +175,96 @@ mod tests {
     // 010-F1(a): a mixed-case body key ("Amount") must bind to catalog column
     // `amount`, same as `INSERT INTO orders (Amount) ...` would via /sql.
     // Pre-fix: the raw key "Amount" reached the binder unchanged -> ColumnNotFound.
-    #[tokio::test]
-    async fn test_insert_row_normalizes_mixed_case_column() {
-        let (rel, _dir) = make_engine().await;
-        make_orders_table(&rel).await;
+    #[test]
+    fn test_insert_row_normalizes_mixed_case_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            make_orders_table(&rel).await;
 
-        let result = rel
-            .insert_row("default", "orders", &mk_body(json!({"id": 1, "Amount": 42})), LinkAuth::full())
-            .await
-            .unwrap();
-        assert_eq!(result.affected, 1);
+            let result = rel
+                .insert_row("default", "orders", &mk_body(json!({"id": 1, "Amount": 42})), LinkAuth::full())
+                .await
+                .unwrap();
+            assert_eq!(result.affected, 1);
 
-        let (row, _) = rel.get_row("default", "orders", "1", &[], LinkAuth::full()).await.unwrap().unwrap();
-        let idx = row.columns.iter().position(|(n, _)| n.as_str() == "amount").unwrap();
-        assert_eq!(row.rows[0][idx], ScalarValue::Integer(42));
+            let (row, _) = rel.get_row("default", "orders", "1", &[], LinkAuth::full()).await.unwrap().unwrap();
+            let idx = row.columns.iter().position(|(n, _)| n.as_str() == "amount").unwrap();
+            assert_eq!(row.rows[0][idx], ScalarValue::Integer(42));
+        })
     }
 
     // 010-F1(d): body keys colliding after normalization ("Amount"/"amount")
     // must not silently drop a value on INSERT.
-    #[tokio::test]
-    async fn test_insert_row_rejects_colliding_keys() {
-        let (rel, _dir) = make_engine().await;
-        make_orders_table(&rel).await;
+    #[test]
+    fn test_insert_row_rejects_colliding_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            make_orders_table(&rel).await;
 
-        let body = mk_body(json!({"id": 1, "Amount": 1, "amount": 2}));
-        let err = rel.insert_row("default", "orders", &body, LinkAuth::full()).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let body = mk_body(json!({"id": 1, "Amount": 1, "amount": 2}));
+            let err = rel.insert_row("default", "orders", &body, LinkAuth::full()).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+        })
     }
 
     // 010-F1(b): a mixed-case body PK key ("Id") equal to the path PK must be
     // recognized as the PK, not fall through to a SET assignment on a
     // nonexistent "Id" column.
-    #[tokio::test]
-    async fn test_update_row_recognizes_mixed_case_body_pk_match() {
-        let (rel, _dir) = make_engine().await;
-        make_orders_table(&rel).await;
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
+    #[test]
+    fn test_update_row_recognizes_mixed_case_body_pk_match() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            make_orders_table(&rel).await;
+            rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
 
-        let result = rel
-            .update_row("default", "orders", "1", &mk_body(json!({"Id": 1, "amount": 9})), LinkAuth::full())
-            .await
-            .unwrap();
-        assert_eq!(result.affected, 1);
+            let result = rel
+                .update_row("default", "orders", "1", &mk_body(json!({"Id": 1, "amount": 9})), LinkAuth::full())
+                .await
+                .unwrap();
+            assert_eq!(result.affected, 1);
 
-        let (row, _) = rel.get_row("default", "orders", "1", &[], LinkAuth::full()).await.unwrap().unwrap();
-        let idx = row.columns.iter().position(|(n, _)| n.as_str() == "amount").unwrap();
-        assert_eq!(row.rows[0][idx], ScalarValue::Integer(9));
+            let (row, _) = rel.get_row("default", "orders", "1", &[], LinkAuth::full()).await.unwrap().unwrap();
+            let idx = row.columns.iter().position(|(n, _)| n.as_str() == "amount").unwrap();
+            assert_eq!(row.rows[0][idx], ScalarValue::Integer(9));
+        })
     }
 
     // 010-F1(b): a mixed-case body PK key that disagrees with the path PK
     // must hit the body/path PK mismatch check, not ColumnNotFound("Id").
-    #[tokio::test]
-    async fn test_update_row_rejects_mismatched_mixed_case_body_pk() {
-        let (rel, _dir) = make_engine().await;
-        make_orders_table(&rel).await;
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
+    #[test]
+    fn test_update_row_rejects_mismatched_mixed_case_body_pk() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            make_orders_table(&rel).await;
+            rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
 
-        let err = rel
-            .update_row("default", "orders", "1", &mk_body(json!({"Id": 2})), LinkAuth::full())
-            .await
-            .unwrap_err();
-        match err {
-            RelStoreError::InvalidSchema(msg) => {
-                assert!(msg.contains("does not match path primary key"), "got: {msg}")
+            let err = rel
+                .update_row("default", "orders", "1", &mk_body(json!({"Id": 2})), LinkAuth::full())
+                .await
+                .unwrap_err();
+            match err {
+                RelStoreError::InvalidSchema(msg) => {
+                    assert!(msg.contains("does not match path primary key"), "got: {msg}")
+                }
+                other => panic!("expected InvalidSchema body-PK mismatch, got: {other}"),
             }
-            other => panic!("expected InvalidSchema body-PK mismatch, got: {other}"),
-        }
+        })
     }
 
     // 010-F1(d): body keys colliding after normalization must not silently
     // drop a value on UPDATE either — the shared UPDATE binder
     // (bind_update_assignments, dml.rs) applies every assignment
     // independently and has no duplicate-column guard of its own.
-    #[tokio::test]
-    async fn test_update_row_rejects_colliding_keys() {
-        let (rel, _dir) = make_engine().await;
-        make_orders_table(&rel).await;
-        rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
+    #[test]
+    fn test_update_row_rejects_colliding_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            make_orders_table(&rel).await;
+            rel.insert_row("default", "orders", &mk_body(json!({"id": 1, "amount": 5})), LinkAuth::full()).await.unwrap();
 
-        let body = mk_body(json!({"Amount": 1, "amount": 2}));
-        let err = rel.update_row("default", "orders", "1", &body, LinkAuth::full()).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let body = mk_body(json!({"Amount": 1, "amount": 2}));
+            let err = rel.update_row("default", "orders", "1", &body, LinkAuth::full()).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+        })
     }
 }

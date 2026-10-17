@@ -520,9 +520,9 @@ impl MetricsTicker {
     }
 
     pub async fn run(self) {
-        let interval = tokio::time::Duration::from_millis(self.interval_ms);
+        let interval = std::time::Duration::from_millis(self.interval_ms);
         loop {
-            tokio::time::sleep(interval).await;
+            compio::time::sleep(interval).await;
             self.store.tick_all();
         }
     }

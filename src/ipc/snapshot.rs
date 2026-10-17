@@ -324,9 +324,9 @@ impl<'w> PublishLoop<'w> {
 
 /// Background task that publishes snapshots into the SHM double buffer.
 ///
-/// Runs via `tokio_uring::spawn`: it holds a `!Send` [`SnapshotWriter`] (raw
-/// pointers into the mapped buffers) across `.await` points, which the
-/// tokio-uring local executor permits.
+/// Runs as a task of the engine thread's compio runtime: it holds a `!Send`
+/// [`SnapshotWriter`] (raw pointers into the mapped buffers) across `.await`
+/// points, which the thread-local executor permits.
 pub struct SnapshotPublisher {
     builder: SnapshotBuilder,
     manager: Arc<ShmManager>,
@@ -400,7 +400,7 @@ impl SnapshotPublisher {
             publish.step(now_secs()).await;
 
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = compio::time::sleep(interval) => {}
                 _ = flush_notify.notified() => {}
                 _ = shutdown.changed() => break,
             }
@@ -471,36 +471,38 @@ mod tests {
 
     // Spec perf/017 test 7: a 20 000-key snapshot build hands the thread
     // back, so a point `get` spawned after it answers first.
-    #[tokio::test]
-    async fn test_snapshot_build_interleaves_with_get() {
-        use crate::engines::lsm::engine::BatchOp;
-        use crate::engines::StorageEngine;
+    #[test]
+    fn test_snapshot_build_interleaves_with_get() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::engine::BatchOp;
+            use crate::engines::StorageEngine;
 
-        let (engine, registry, _dir) = make_setup().await;
-        let domain = registry.create_domain("shm").await.unwrap();
-        let ops: Vec<BatchOp> = (0..20_000u32)
-            .map(|i| BatchOp::Put {
-                key: [domain.system_prefix.as_slice(), format!("k:{i:05}").as_bytes()].concat(),
-                value: b"v".to_vec(),
-            })
-            .collect();
-        engine.write_batch(ops).await.unwrap();
+            let (engine, registry, _dir) = make_setup().await;
+            let domain = registry.create_domain("shm").await.unwrap();
+            let ops: Vec<BatchOp> = (0..20_000u32)
+                .map(|i| BatchOp::Put {
+                    key: [domain.system_prefix.as_slice(), format!("k:{i:05}").as_bytes()].concat(),
+                    value: b"v".to_vec(),
+                })
+                .collect();
+            engine.write_batch(ops).await.unwrap();
 
-        let builder = builder(&registry, &engine, 32 * 1024 * 1024);
-        let reader = Arc::clone(&engine);
-        let probe_key = [domain.system_prefix.as_slice(), b"k:00001".as_slice()].concat();
-        let order = crate::core::coop::completion_order(
-            async move {
-                let bytes = builder.build().await.unwrap().bytes;
-                let snapshot = decode(bytes.as_slice());
-                assert_eq!(find(&snapshot, "shm").unwrap().entries.len(), 20_000);
-            },
-            async move {
-                assert!(reader.get(&probe_key).await.unwrap().is_some());
-            },
-        )
-        .await;
-        assert_eq!(order, ["small", "long"]);
+            let builder = builder(&registry, &engine, 32 * 1024 * 1024);
+            let reader = Arc::clone(&engine);
+            let probe_key = [domain.system_prefix.as_slice(), b"k:00001".as_slice()].concat();
+            let order = crate::core::coop::completion_order(
+                async move {
+                    let bytes = builder.build().await.unwrap().bytes;
+                    let snapshot = decode(bytes.as_slice());
+                    assert_eq!(find(&snapshot, "shm").unwrap().entries.len(), 20_000);
+                },
+                async move {
+                    assert!(reader.get(&probe_key).await.unwrap().is_some());
+                },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
     }
 
     // 1. ShmSnapshot serialize/deserialize roundtrip.
@@ -523,177 +525,193 @@ mod tests {
     }
 
     // 2. Empty database → snapshot has the (empty) default domain.
-    #[tokio::test]
-    async fn test_build_empty_db() {
-        let (engine, registry, _dir) = make_setup().await;
-        let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes;
-        let snap = decode(&bytes);
-        let default = find(&snap, "default").expect("default domain present");
-        assert!(default.entries.is_empty(), "no user keys written");
+    #[test]
+    fn test_build_empty_db() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes;
+            let snap = decode(&bytes);
+            let default = find(&snap, "default").expect("default domain present");
+            assert!(default.entries.is_empty(), "no user keys written");
+        })
     }
 
     // 3. 100 keys across 2 domains → all present, sorted per domain.
-    #[tokio::test]
-    async fn test_build_many_keys_sorted() {
-        let (engine, registry, _dir) = make_setup().await;
-        registry.create_domain("alpha").await.unwrap();
-        registry.create_domain("beta").await.unwrap();
-        let a = registry.store("alpha").await.unwrap();
-        let b = registry.store("beta").await.unwrap();
-        for i in 0..50u32 {
-            a.put(format!("key{i:03}").as_bytes(), format!("va{i}").as_bytes()).await.unwrap();
-            b.put(format!("key{i:03}").as_bytes(), format!("vb{i}").as_bytes()).await.unwrap();
-        }
+    #[test]
+    fn test_build_many_keys_sorted() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.create_domain("alpha").await.unwrap();
+            registry.create_domain("beta").await.unwrap();
+            let a = registry.store("alpha").await.unwrap();
+            let b = registry.store("beta").await.unwrap();
+            for i in 0..50u32 {
+                a.put(format!("key{i:03}").as_bytes(), format!("va{i}").as_bytes()).await.unwrap();
+                b.put(format!("key{i:03}").as_bytes(), format!("vb{i}").as_bytes()).await.unwrap();
+            }
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
-        for name in ["alpha", "beta"] {
-            let dom = find(&snap, name).unwrap();
-            assert_eq!(dom.entries.len(), 50, "{name} entry count");
-            assert!(dom.entries.windows(2).all(|w| w[0].key <= w[1].key), "{name} sorted");
-        }
-        // Domains themselves are name-sorted.
-        assert!(snap.domains.windows(2).all(|w| w[0].name <= w[1].name));
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            for name in ["alpha", "beta"] {
+                let dom = find(&snap, name).unwrap();
+                assert_eq!(dom.entries.len(), 50, "{name} entry count");
+                assert!(dom.entries.windows(2).all(|w| w[0].key <= w[1].key), "{name} sorted");
+            }
+            // Domains themselves are name-sorted.
+            assert!(snap.domains.windows(2).all(|w| w[0].name <= w[1].name));
+        })
     }
 
     // 4. VLog-backed value → is_vlog_pointer = true, value empty.
-    #[tokio::test]
-    async fn test_build_vlog_pointer() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        let big = vec![b'x'; 2048]; // >= vlog_inline_threshold (1024)
-        store.put(b"large", &big).await.unwrap();
+    #[test]
+    fn test_build_vlog_pointer() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            let big = vec![b'x'; 2048]; // >= vlog_inline_threshold (1024)
+            store.put(b"large", &big).await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
-        let dom = find(&snap, "default").unwrap();
-        let entry = dom.entries.iter().find(|e| e.key == b"large").unwrap();
-        assert!(entry.is_vlog_pointer);
-        assert!(entry.value.is_empty(), "VLog value must not be embedded");
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            let dom = find(&snap, "default").unwrap();
+            let entry = dom.entries.iter().find(|e| e.key == b"large").unwrap();
+            assert!(entry.is_vlog_pointer);
+            assert!(entry.value.is_empty(), "VLog value must not be embedded");
+        })
     }
 
     // 5. Inline value → is_vlog_pointer = false, value carries the data.
-    #[tokio::test]
-    async fn test_build_inline_value() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        store.put(b"small", b"hello").await.unwrap();
+    #[test]
+    fn test_build_inline_value() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"small", b"hello").await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
-        let dom = find(&snap, "default").unwrap();
-        let entry = dom.entries.iter().find(|e| e.key == b"small").unwrap();
-        assert!(!entry.is_vlog_pointer);
-        assert!(!entry.is_null);
-        assert_eq!(entry.value, b"hello");
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            let dom = find(&snap, "default").unwrap();
+            let entry = dom.entries.iter().find(|e| e.key == b"small").unwrap();
+            assert!(!entry.is_vlog_pointer);
+            assert!(!entry.is_null);
+            assert_eq!(entry.value, b"hello");
+        })
     }
 
     // kv/018: a NULL key exists in the snapshot, marked is_null, empty value.
-    #[tokio::test]
-    async fn test_build_null_key_included_and_flagged() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        store.set_null(b"nulled").await.unwrap();
+    #[test]
+    fn test_build_null_key_included_and_flagged() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            store.set_null(b"nulled").await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
-        let dom = find(&snap, "default").unwrap();
-        let entry = dom.entries.iter().find(|e| e.key == b"nulled").expect("NULL key present");
-        assert!(entry.is_null);
-        assert!(!entry.is_vlog_pointer);
-        assert!(entry.value.is_empty());
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            let dom = find(&snap, "default").unwrap();
+            let entry = dom.entries.iter().find(|e| e.key == b"nulled").expect("NULL key present");
+            assert!(entry.is_null);
+            assert!(!entry.is_vlog_pointer);
+            assert!(entry.value.is_empty());
+        })
     }
 
     // 6. Over-budget snapshot is truncated (fewer entries than written).
-    #[tokio::test]
-    async fn test_build_truncates_over_budget() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        for i in 0..200u32 {
-            store.put(format!("key{i:04}").as_bytes(), b"val").await.unwrap();
-        }
-        // Tiny budget forces truncation.
-        let snap = decode(&builder(&registry, &engine, 2048).build().await.unwrap().bytes);
-        let total: usize = snap.domains.iter().map(|d| d.entries.len()).sum();
-        assert!(total > 0, "at least one entry fits");
-        assert!(total < 200, "snapshot must be truncated, got {total}");
+    #[test]
+    fn test_build_truncates_over_budget() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            for i in 0..200u32 {
+                store.put(format!("key{i:04}").as_bytes(), b"val").await.unwrap();
+            }
+            // Tiny budget forces truncation.
+            let snap = decode(&builder(&registry, &engine, 2048).build().await.unwrap().bytes);
+            let total: usize = snap.domains.iter().map(|d| d.entries.len()).sum();
+            assert!(total > 0, "at least one entry fits");
+            assert!(total < 200, "snapshot must be truncated, got {total}");
+        })
     }
 
     // 7 & 8. End-to-end: build → publish into an SHM arena → client reads via
     // SnapshotGuard + rkyv::access, incl. the zero-copy value view and a
     // binary search over the sorted entries.
-    #[tokio::test]
-    async fn test_publisher_end_to_end_client_read() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        store.put(b"alpha", b"1").await.unwrap();
-        store.put(b"beta", b"2").await.unwrap();
+    #[test]
+    fn test_publisher_end_to_end_client_read() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"alpha", b"1").await.unwrap();
+            store.put(b"beta", b"2").await.unwrap();
 
-        let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes;
+            let bytes = builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes;
 
-        // Arena models the SHM state header + two data buffers (page-aligned in
-        // production; here we copy into an AlignedVec before validating), plus
-        // the registered client's reader slot.
-        let header = Box::new(StateHeader::zeroed());
-        header.init();
-        let slot = Arc::new(ReaderSlot::zeroed());
-        let readers = Arc::new(ReaderRegistry::new());
-        // Safe: the pointer targets the slot inside `slot`, whose `Arc` clone the
-        // handle keeps alive.
-        let handle = unsafe {
-            ReaderSlotHandle::new(
-                1,
-                Arc::as_ptr(&slot),
-                Arc::clone(&slot) as Arc<dyn std::any::Any + Send + Sync>,
-            )
-        };
-        let _lease = readers.register(handle);
+            // Arena models the SHM state header + two data buffers (page-aligned in
+            // production; here we copy into an AlignedVec before validating), plus
+            // the registered client's reader slot.
+            let header = Box::new(StateHeader::zeroed());
+            header.init();
+            let slot = Arc::new(ReaderSlot::zeroed());
+            let readers = Arc::new(ReaderRegistry::new());
+            // Safe: the pointer targets the slot inside `slot`, whose `Arc` clone the
+            // handle keeps alive.
+            let handle = unsafe {
+                ReaderSlotHandle::new(
+                    1,
+                    Arc::as_ptr(&slot),
+                    Arc::clone(&slot) as Arc<dyn std::any::Any + Send + Sync>,
+                )
+            };
+            let _lease = readers.register(handle);
 
-        let len = 1 << 20;
-        let mut buf_a = vec![0u8; len];
-        let mut buf_b = vec![0u8; len];
-        // Safe: single writer, two distinct buffers of `len` bytes, header valid.
-        let writer = unsafe {
-            SnapshotWriter::new(
-                &*header,
-                buf_a.as_mut_ptr(),
-                buf_b.as_mut_ptr(),
-                len,
-                PUBLISH_WAIT_TIMEOUT_US,
-                Arc::clone(&readers),
-            )
-        };
-        assert_eq!(writer.publish(&bytes).unwrap(), PublishOutcome::Published);
-        drop(writer);
+            let len = 1 << 20;
+            let mut buf_a = vec![0u8; len];
+            let mut buf_b = vec![0u8; len];
+            // Safe: single writer, two distinct buffers of `len` bytes, header valid.
+            let writer = unsafe {
+                SnapshotWriter::new(
+                    &*header,
+                    buf_a.as_mut_ptr(),
+                    buf_b.as_mut_ptr(),
+                    len,
+                    PUBLISH_WAIT_TIMEOUT_US,
+                    Arc::clone(&readers),
+                )
+            };
+            assert_eq!(writer.publish(&bytes).unwrap(), PublishOutcome::Published);
+            drop(writer);
 
-        let guard = SnapshotGuard::acquire(&*header, &slot, &buf_a, &buf_b).expect("snapshot available");
+            let guard = SnapshotGuard::acquire(&*header, &slot, &buf_a, &buf_b).expect("snapshot available");
 
-        // Client side: validate, then read zero-copy from the mapped bytes.
-        let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
-        aligned.extend_from_slice(guard.data());
-        let archived =
-            rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).unwrap();
-        let dom = archived.domains.iter().find(|d| d.name == "default").unwrap();
-        // entries are sorted → binary search, then a zero-copy value slice.
-        let idx = dom.entries.binary_search_by(|e| e.key.as_slice().cmp(b"alpha".as_ref())).unwrap();
-        assert_eq!(dom.entries[idx].value.as_slice(), b"1");
-        assert!(!dom.entries[idx].is_vlog_pointer);
+            // Client side: validate, then read zero-copy from the mapped bytes.
+            let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());
+            aligned.extend_from_slice(guard.data());
+            let archived =
+                rkyv::access::<Archived<ShmSnapshot>, rancor::Error>(aligned.as_slice()).unwrap();
+            let dom = archived.domains.iter().find(|d| d.name == "default").unwrap();
+            // entries are sorted → binary search, then a zero-copy value slice.
+            let idx = dom.entries.binary_search_by(|e| e.key.as_slice().cmp(b"alpha".as_ref())).unwrap();
+            assert_eq!(dom.entries[idx].value.as_slice(), b"1");
+            assert!(!dom.entries[idx].is_vlog_pointer);
 
-        // Full owned view for the remaining assertions.
-        let snap = rkyv::deserialize::<ShmSnapshot, rancor::Error>(archived).unwrap();
-        let dom = find(&snap, "default").unwrap();
-        assert_eq!(dom.entries.iter().find(|e| e.key == b"beta").unwrap().value, b"2");
+            // Full owned view for the remaining assertions.
+            let snap = rkyv::deserialize::<ShmSnapshot, rancor::Error>(archived).unwrap();
+            let dom = find(&snap, "default").unwrap();
+            assert_eq!(dom.entries.iter().find(|e| e.key == b"beta").unwrap().value, b"2");
+        })
     }
 
     // 9. Expired-TTL key does not appear in the snapshot.
-    #[tokio::test]
-    async fn test_expired_ttl_absent() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        store.put(b"stays", b"v").await.unwrap();
-        // Already expired regardless of the wall clock (spec general/033).
-        store.put_expired_for_test(b"gone", b"v").await.unwrap();
+    #[test]
+    fn test_expired_ttl_absent() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"stays", b"v").await.unwrap();
+            // Already expired regardless of the wall clock (spec general/033).
+            store.put_expired_for_test(b"gone", b"v").await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
-        let dom = find(&snap, "default").unwrap();
-        assert!(dom.entries.iter().any(|e| e.key == b"stays"));
-        assert!(!dom.entries.iter().any(|e| e.key == b"gone"), "expired key must be absent");
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            let dom = find(&snap, "default").unwrap();
+            assert!(dom.entries.iter().any(|e| e.key == b"stays"));
+            assert!(!dom.entries.iter().any(|e| e.key == b"gone"), "expired key must be absent");
+        })
     }
 
     // Spec perf/012 test 10: the livelock guard's counting logic — warn on every
@@ -713,16 +731,18 @@ mod tests {
     }
 
     // 10. A domain in Deleting state does not appear in the snapshot.
-    #[tokio::test]
-    async fn test_deleting_domain_absent() {
-        let (engine, registry, _dir) = make_setup().await;
-        registry.create_domain("temp").await.unwrap();
-        registry.store("temp").await.unwrap().put(b"k", b"v").await.unwrap();
-        registry.delete_domain("temp").await.unwrap();
+    #[test]
+    fn test_deleting_domain_absent() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.create_domain("temp").await.unwrap();
+            registry.store("temp").await.unwrap().put(b"k", b"v").await.unwrap();
+            registry.delete_domain("temp").await.unwrap();
 
-        let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
-        assert!(find(&snap, "temp").is_none(), "deleting domain must be absent");
-        assert!(find(&snap, "default").is_some(), "active domain still present");
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            assert!(find(&snap, "temp").is_none(), "deleting domain must be absent");
+            assert!(find(&snap, "default").is_some(), "active domain still present");
+        })
     }
 
     // ── Spec perf/028: publisher step ─────────────────────────────────────────────
@@ -806,47 +826,53 @@ mod tests {
 
     // Spec perf/028 test 1: without a write, the next step is idle — no build,
     // no flip.
-    #[tokio::test]
-    async fn test_step_without_write_is_idle() {
-        let (engine, registry, _dir) = make_setup().await;
-        let arena = Arena::new();
-        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
-        let version = arena.version();
+    #[test]
+    fn test_step_without_write_is_idle() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            let version = arena.version();
 
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
-        assert_eq!(arena.version(), version, "an idle step must not flip");
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
+            assert_eq!(arena.version(), version, "an idle step must not flip");
+        })
     }
 
     // Spec perf/028 test 6: an idle step confirms the unchanged snapshot by
     // refreshing `last_update_ns`; `version` stays.
-    #[tokio::test]
-    async fn test_idle_step_refreshes_last_update_ns() {
-        let (engine, registry, _dir) = make_setup().await;
-        let arena = Arena::new();
-        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-        publish.step(BEFORE_ANY_EXPIRY).await;
-        let version = arena.version();
-        arena.header.last_update_ns.store(0, Ordering::Relaxed);
+    #[test]
+    fn test_idle_step_refreshes_last_update_ns() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            publish.step(BEFORE_ANY_EXPIRY).await;
+            let version = arena.version();
+            arena.header.last_update_ns.store(0, Ordering::Relaxed);
 
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
-        assert_ne!(arena.header.last_update_ns.load(Ordering::Relaxed), 0, "idle step must refresh it");
-        assert_eq!(arena.version(), version);
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
+            assert_ne!(arena.header.last_update_ns.load(Ordering::Relaxed), 0, "idle step must refresh it");
+            assert_eq!(arena.version(), version);
+        })
     }
 
     // Spec perf/028 test 2: a write between two steps makes the second one
     // rebuild, and the new value is in the snapshot.
-    #[tokio::test]
-    async fn test_step_after_write_rebuilds_with_new_value() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        let arena = Arena::new();
-        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-        publish.step(BEFORE_ANY_EXPIRY).await;
+    #[test]
+    fn test_step_after_write_rebuilds_with_new_value() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            publish.step(BEFORE_ANY_EXPIRY).await;
 
-        store.put(b"k", b"new").await.unwrap();
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
-        assert_eq!(default_entry(&arena.read(), b"k").expect("written key published").value, b"new");
+            store.put(b"k", b"new").await.unwrap();
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(default_entry(&arena.read(), b"k").expect("written key published").value, b"new");
+        })
     }
 
     fn domain_names(snap: &ShmSnapshot) -> Vec<&str> {
@@ -855,85 +881,93 @@ mod tests {
 
     // Spec perf/028 test 3: creating and then deleting a domain each make the
     // next step rebuild with the matching domain list.
-    #[tokio::test]
-    async fn test_step_after_domain_create_and_delete_rebuilds() {
-        let (engine, registry, _dir) = make_setup().await;
-        let arena = Arena::new();
-        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-        publish.step(BEFORE_ANY_EXPIRY).await;
+    #[test]
+    fn test_step_after_domain_create_and_delete_rebuilds() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            publish.step(BEFORE_ANY_EXPIRY).await;
 
-        registry.create_domain("fresh").await.unwrap();
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
-        assert_eq!(domain_names(&arena.read()), ["default", "fresh"]);
+            registry.create_domain("fresh").await.unwrap();
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(domain_names(&arena.read()), ["default", "fresh"]);
 
-        registry.delete_domain("fresh").await.unwrap();
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
-        assert_eq!(domain_names(&arena.read()), ["default"]);
+            registry.delete_domain("fresh").await.unwrap();
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(domain_names(&arena.read()), ["default"]);
+        })
     }
 
     // Spec perf/028 test 5: a skipped publish keeps the comparison state, so
     // the next step rebuilds without a write and publishes once the pin is gone.
-    #[tokio::test]
-    async fn test_step_after_skipped_publish_rebuilds_without_write() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        let arena = Arena::new();
-        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-        publish.step(BEFORE_ANY_EXPIRY).await;
-        // Pins buffer B, the target of the publish after next.
-        let guard = arena.pin();
-        store.put(b"k", b"1").await.unwrap();
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
-        store.put(b"k", b"2").await.unwrap();
-        assert_eq!(
-            publish.step(BEFORE_ANY_EXPIRY).await,
-            Tick::Rebuilt(PublishOutcome::SkippedBusy { buffer: 1 })
-        );
+    #[test]
+    fn test_step_after_skipped_publish_rebuilds_without_write() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            publish.step(BEFORE_ANY_EXPIRY).await;
+            // Pins buffer B, the target of the publish after next.
+            let guard = arena.pin();
+            store.put(b"k", b"1").await.unwrap();
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            store.put(b"k", b"2").await.unwrap();
+            assert_eq!(
+                publish.step(BEFORE_ANY_EXPIRY).await,
+                Tick::Rebuilt(PublishOutcome::SkippedBusy { buffer: 1 })
+            );
 
-        drop(guard);
-        assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
-        assert_eq!(default_entry(&arena.read(), b"k").expect("key published").value, b"2");
+            drop(guard);
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(default_entry(&arena.read(), b"k").expect("key published").value, b"2");
+        })
     }
 
     // Spec perf/028 test 4, trigger: the step idles before the earliest
     // published `expire_at` and rebuilds from it on. Stamps an hour out keep
     // every entry published, so only the step time decides.
-    #[tokio::test]
-    async fn test_step_rebuilds_from_earliest_expiry_on() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        let soon = now_secs() + 3600;
-        store.put(b"plain", b"v").await.unwrap();
-        store.put_unthrottled(b"late", b"v", Some(soon + 3600)).await.unwrap();
-        store.put_unthrottled(b"soon", b"v", Some(soon)).await.unwrap();
-        let arena = Arena::new();
-        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-        publish.step(BEFORE_ANY_EXPIRY).await;
+    #[test]
+    fn test_step_rebuilds_from_earliest_expiry_on() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            let soon = now_secs() + 3600;
+            store.put(b"plain", b"v").await.unwrap();
+            store.put_unthrottled(b"late", b"v", Some(soon + 3600)).await.unwrap();
+            store.put_unthrottled(b"soon", b"v", Some(soon)).await.unwrap();
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            publish.step(BEFORE_ANY_EXPIRY).await;
 
-        assert_eq!(publish.step(soon - 1).await, Tick::Idle);
-        assert_eq!(publish.step(soon).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(soon - 1).await, Tick::Idle);
+            assert_eq!(publish.step(soon).await, Tick::Rebuilt(PublishOutcome::Published));
+        })
     }
 
     // Spec perf/028 test 4, removal: once the wall clock reached the stamp, the
     // step at that time drops the expired entry.
-    #[tokio::test]
-    async fn test_step_at_expiry_drops_the_expired_entry() {
-        let (engine, registry, _dir) = make_setup().await;
-        let store = registry.default_store().await.unwrap();
-        let expire_at = now_secs() + 2;
-        store.put_unthrottled(b"ttl", b"v", Some(expire_at)).await.unwrap();
-        let arena = Arena::new();
-        let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-        publish.step(BEFORE_ANY_EXPIRY).await;
+    #[test]
+    fn test_step_at_expiry_drops_the_expired_entry() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            let expire_at = now_secs() + 2;
+            store.put_unthrottled(b"ttl", b"v", Some(expire_at)).await.unwrap();
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            publish.step(BEFORE_ANY_EXPIRY).await;
 
-        // The engine hides expired entries by wall clock: poll it, a fixed
-        // sleep could be cut short by a backwards clock step.
-        while now_secs() < expire_at {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        publish.step(expire_at).await;
-        // Absence only: whether the first build still saw the entry depends
-        // on scheduling; the trigger itself is the test above.
-        assert!(default_entry(&arena.read(), b"ttl").is_none(), "expired entry must be gone");
+            // The engine hides expired entries by wall clock: poll it, a fixed
+            // sleep could be cut short by a backwards clock step.
+            while now_secs() < expire_at {
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+            publish.step(expire_at).await;
+            // Absence only: whether the first build still saw the entry depends
+            // on scheduling; the trigger itself is the test above.
+            assert!(default_entry(&arena.read(), b"ttl").is_none(), "expired entry must be gone");
+        })
     }
 }

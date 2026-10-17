@@ -1,5 +1,9 @@
 # Installing LuraDB (Debian package)
 
+## Requirements
+
+Linux kernel 6.1 or newer: LuraDB's io_uring rings use `DEFER_TASKRUN`. On an older kernel the service does not start and logs `LuraDB requires Linux kernel 6.1 or newer (io_uring DEFER_TASKRUN)`. Check with `uname -r`.
+
 ## Building the package
 
 ```sh

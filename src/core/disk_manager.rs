@@ -2,20 +2,24 @@
 //!
 //! This module is responsible for all direct file I/O operations. It provides
 //! an abstraction for reading and writing page-sized chunks of data from the
-//! main database file, using `tokio-uring` for high-performance async I/O.
+//! main database file, using the engine thread's io_uring runtime (compio).
 //!
-//! To bridge the single-threaded nature of `tokio-uring` with a multi-threaded
+//! To bridge the single-threaded nature of that runtime with a multi-threaded
 //! application (like an Axum server), this DiskManager uses a channel-based
 //! message passing approach. A dedicated background task owns the `File` handle
 //! and performs all I/O, while the `DiskManager` struct itself is `Send + Sync`
 //! and can be shared across threads.
 
+use crate::core::engine_runtime;
 use crate::core::page::{Page, PageId, PAGE_SIZE};
 use anyhow::{bail, Result};
+use compio::buf::BufResult;
+use compio::fs::File;
+use compio::io::{AsyncReadAt, AsyncWriteAt};
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
-use tokio_uring::fs::File;
 
 // --- I/O Commands ---
 
@@ -61,23 +65,28 @@ impl DiskManager {
             .open(&path)?;
         let metadata = std_file.metadata()?;
         let num_pages = metadata.len() / PAGE_SIZE as u64;
-        let db_file = File::from_std(std_file);
+        // SAFETY: the descriptor is `std_file`'s, whose ownership moves here.
+        let db_file = unsafe { File::from_raw_fd(std_file.into_raw_fd()) };
 
-        // --- Spawn I/O Task ---
-        tokio_uring::spawn(async move {
+        // --- Spawn I/O Task --- one command at a time, each as an I/O task
+        // that runs to its end.
+        compio::runtime::spawn(async move {
             while let Some(command) = receiver.recv().await {
-                match command {
-                    IoCommand::Read { page_id, responder } => {
-                        let result = Self::perform_read(&db_file, page_id).await;
-                        let _ = responder.send(result);
+                let db_file = db_file.clone();
+                engine_runtime::spawn_io(async move {
+                    match command {
+                        IoCommand::Read { page_id, responder } => {
+                            let _ = responder.send(Self::perform_read(&db_file, page_id).await);
+                        }
+                        IoCommand::Write { page_id, page, responder } => {
+                            let _ = responder.send(Self::perform_write(&db_file, page_id, &page).await);
+                        }
                     }
-                    IoCommand::Write { page_id, page, responder } => {
-                        let result = Self::perform_write(&db_file, page_id, &page).await;
-                        let _ = responder.send(result);
-                    }
-                }
+                })
+                .await;
             }
-        });
+        })
+        .detach();
 
         Ok(Self {
             sender,
@@ -121,7 +130,7 @@ impl DiskManager {
         let offset = page_id.0 * PAGE_SIZE as u64;
         let buf = vec![0u8; PAGE_SIZE];
 
-        let (res, buf) = db_file.read_at(buf, offset).await;
+        let BufResult(res, buf) = db_file.read_at(buf, offset).await;
         let bytes_read = res?;
 
         if bytes_read > 0 && bytes_read < PAGE_SIZE {
@@ -137,7 +146,7 @@ impl DiskManager {
         let offset = page_id.0 * PAGE_SIZE as u64;
         let data = page_data.as_bytes().to_vec();
 
-        let (res, _) = db_file.write_at(data, offset).submit().await;
+        let BufResult(res, _) = (&mut &*db_file).write_at(data, offset).await;
         let bytes_written = res?;
 
         if bytes_written != PAGE_SIZE {

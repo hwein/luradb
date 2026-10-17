@@ -829,255 +829,281 @@ mod tests {
     }
 
     // 1. POST document → 201 with generated _key, GET roundtrip.
-    #[tokio::test]
-    async fn test_post_document_roundtrip() {
-        let (app, _dir) = make_app(true).await;
-        let (status, body) = request(
-            &app, Method::POST, "/store-api/json/default/documents",
-            Some(r#"{"city": "Essen"}"#),
-        ).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let created: Value = serde_json::from_str(&body).unwrap();
-        let key = created["_key"].as_str().unwrap();
-        assert_eq!(key.len(), 36);
-        assert_eq!(created["_version"], json!(1));
+    #[test]
+    fn test_post_document_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let (status, body) = request(
+                &app, Method::POST, "/store-api/json/default/documents",
+                Some(r#"{"city": "Essen"}"#),
+            ).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let created: Value = serde_json::from_str(&body).unwrap();
+            let key = created["_key"].as_str().unwrap();
+            assert_eq!(key.len(), 36);
+            assert_eq!(created["_version"], json!(1));
 
-        let (status, body) = request(
-            &app, Method::GET, &format!("/store-api/json/default/documents/{key}"), None,
-        ).await;
-        assert_eq!(status, StatusCode::OK);
-        let fetched: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(fetched["city"], json!("Essen"));
+            let (status, body) = request(
+                &app, Method::GET, &format!("/store-api/json/default/documents/{key}"), None,
+            ).await;
+            assert_eq!(status, StatusCode::OK);
+            let fetched: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(fetched["city"], json!("Essen"));
+        })
     }
 
     // 2. PUT → 201 on create, 200 on update, version increments.
-    #[tokio::test]
-    async fn test_put_document_upsert() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/k1";
-        let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
-        assert_eq!(status, StatusCode::CREATED);
-        let (status, body) = request(&app, Method::PUT, uri, Some(r#"{"n": 2}"#)).await;
-        assert_eq!(status, StatusCode::OK);
-        let doc: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(doc["_version"], json!(2));
+    #[test]
+    fn test_put_document_upsert() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/k1";
+            let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            let (status, body) = request(&app, Method::PUT, uri, Some(r#"{"n": 2}"#)).await;
+            assert_eq!(status, StatusCode::OK);
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(doc["_version"], json!(2));
+        })
     }
 
     // 3. DELETE → 204, then GET/DELETE → 404.
-    #[tokio::test]
-    async fn test_delete_document() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/gone";
-        request(&app, Method::PUT, uri, Some("{}")).await;
-        let (status, _) = request(&app, Method::DELETE, uri, None).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = request(&app, Method::DELETE, uri, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+    #[test]
+    fn test_delete_document() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/gone";
+            request(&app, Method::PUT, uri, Some("{}")).await;
+            let (status, _) = request(&app, Method::DELETE, uri, None).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let (status, _) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _) = request(&app, Method::DELETE, uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        })
     }
 
     // 4. Index create → 201, duplicate → 409, bad type → 400.
-    #[tokio::test]
-    async fn test_index_endpoints() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/indexes";
-        let body = r#"{"field": "city", "type": "string"}"#;
-        let (status, _) = request(&app, Method::POST, uri, Some(body)).await;
-        assert_eq!(status, StatusCode::CREATED);
-        let (status, _) = request(&app, Method::POST, uri, Some(body)).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        let (status, _) = request(&app, Method::POST, uri, Some(r#"{"field": "x", "type": "uuid"}"#)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let (status, body) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::OK);
-        let list: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 1);
-        let (status, _) = request(&app, Method::DELETE, "/store-api/json/default/indexes/city", None).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _) = request(&app, Method::DELETE, "/store-api/json/default/indexes/city", None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+    #[test]
+    fn test_index_endpoints() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/indexes";
+            let body = r#"{"field": "city", "type": "string"}"#;
+            let (status, _) = request(&app, Method::POST, uri, Some(body)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            let (status, _) = request(&app, Method::POST, uri, Some(body)).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            let (status, _) = request(&app, Method::POST, uri, Some(r#"{"field": "x", "type": "uuid"}"#)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, body) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::OK);
+            let list: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(list.as_array().unwrap().len(), 1);
+            let (status, _) = request(&app, Method::DELETE, "/store-api/json/default/indexes/city", None).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let (status, _) = request(&app, Method::DELETE, "/store-api/json/default/indexes/city", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        })
     }
 
     // 5. Search over an indexed field; unindexed filter → 400.
-    #[tokio::test]
-    async fn test_search_endpoint() {
-        let (app, _dir) = make_app(true).await;
-        request(&app, Method::POST, "/store-api/json/default/indexes",
-            Some(r#"{"field": "city", "type": "string"}"#)).await;
-        request(&app, Method::PUT, "/store-api/json/default/documents/a",
-            Some(r#"{"city": "Essen"}"#)).await;
-        request(&app, Method::PUT, "/store-api/json/default/documents/b",
-            Some(r#"{"city": "Berlin"}"#)).await;
-        let (status, body) = request(&app, Method::POST, "/store-api/json/default/search",
-            Some(r#"{"filter": {"city": "Essen"}}"#)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let result: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(result["total"], json!(1));
-        assert_eq!(result["documents"][0]["_key"], json!("a"));
-        let (status, _) = request(&app, Method::POST, "/store-api/json/default/search",
-            Some(r#"{"filter": {"nope": 1}}"#)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+    #[test]
+    fn test_search_endpoint() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            request(&app, Method::POST, "/store-api/json/default/indexes",
+                Some(r#"{"field": "city", "type": "string"}"#)).await;
+            request(&app, Method::PUT, "/store-api/json/default/documents/a",
+                Some(r#"{"city": "Essen"}"#)).await;
+            request(&app, Method::PUT, "/store-api/json/default/documents/b",
+                Some(r#"{"city": "Berlin"}"#)).await;
+            let (status, body) = request(&app, Method::POST, "/store-api/json/default/search",
+                Some(r#"{"filter": {"city": "Essen"}}"#)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let result: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(result["total"], json!(1));
+            assert_eq!(result["documents"][0]["_key"], json!("a"));
+            let (status, _) = request(&app, Method::POST, "/store-api/json/default/search",
+                Some(r#"{"filter": {"nope": 1}}"#)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        })
     }
 
     // 6. Bulk load returns the import summary.
-    #[tokio::test]
-    async fn test_bulk_endpoint() {
-        let (app, _dir) = make_app(true).await;
-        let ndjson = "{\"_key\": \"b1\", \"n\": 1}\n{\"_key\": \"b2\", \"n\": 2}\nnot-json\n";
-        let (status, body) = request(&app, Method::POST, "/store-api/json/default/bulk", Some(ndjson)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let result: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(result["imported"], json!(2));
-        assert_eq!(result["failed"], json!(1));
+    #[test]
+    fn test_bulk_endpoint() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let ndjson = "{\"_key\": \"b1\", \"n\": 1}\n{\"_key\": \"b2\", \"n\": 2}\nnot-json\n";
+            let (status, body) = request(&app, Method::POST, "/store-api/json/default/bulk", Some(ndjson)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let result: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(result["imported"], json!(2));
+            assert_eq!(result["failed"], json!(1));
+        })
     }
 
     // 7. Export streams NDJSON.
-    #[tokio::test]
-    async fn test_export_endpoint() {
-        let (app, _dir) = make_app(true).await;
-        request(&app, Method::PUT, "/store-api/json/default/documents/e1", Some(r#"{"n": 1}"#)).await;
-        request(&app, Method::PUT, "/store-api/json/default/documents/e2", Some(r#"{"n": 2}"#)).await;
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/store-api/json/default/export")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/x-ndjson"
-        );
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        assert_eq!(text.lines().count(), 2);
-        assert!(text.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()));
+    #[test]
+    fn test_export_endpoint() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            request(&app, Method::PUT, "/store-api/json/default/documents/e1", Some(r#"{"n": 1}"#)).await;
+            request(&app, Method::PUT, "/store-api/json/default/documents/e2", Some(r#"{"n": 2}"#)).await;
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/store-api/json/default/export")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/x-ndjson"
+            );
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert_eq!(text.lines().count(), 2);
+            assert!(text.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()));
+        })
     }
 
     // 8. Re-index: 202 with task id, status reaches completed.
-    #[tokio::test]
-    async fn test_reindex_endpoint() {
-        let (app, _dir) = make_app(true).await;
-        request(&app, Method::PUT, "/store-api/json/default/documents/r1", Some(r#"{"city": "Essen"}"#)).await;
-        request(&app, Method::POST, "/store-api/json/default/indexes",
-            Some(r#"{"field": "city", "type": "string"}"#)).await;
-        let (status, body) = request(&app, Method::POST, "/store-api/json/default/reindex", None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let accepted: Value = serde_json::from_str(&body).unwrap();
-        let task_id = accepted["task_id"].as_str().unwrap().to_string();
+    #[test]
+    fn test_reindex_endpoint() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            request(&app, Method::PUT, "/store-api/json/default/documents/r1", Some(r#"{"city": "Essen"}"#)).await;
+            request(&app, Method::POST, "/store-api/json/default/indexes",
+                Some(r#"{"field": "city", "type": "string"}"#)).await;
+            let (status, body) = request(&app, Method::POST, "/store-api/json/default/reindex", None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let accepted: Value = serde_json::from_str(&body).unwrap();
+            let task_id = accepted["task_id"].as_str().unwrap().to_string();
 
-        let uri = format!("/store-api/json/default/reindex/{task_id}");
-        for _ in 0..200 {
-            let (status, body) = request(&app, Method::GET, &uri, None).await;
-            assert_eq!(status, StatusCode::OK);
-            let s: Value = serde_json::from_str(&body).unwrap();
-            if s["state"] == json!("completed") {
-                return;
+            let uri = format!("/store-api/json/default/reindex/{task_id}");
+            for _ in 0..200 {
+                let (status, body) = request(&app, Method::GET, &uri, None).await;
+                assert_eq!(status, StatusCode::OK);
+                let s: Value = serde_json::from_str(&body).unwrap();
+                if s["state"] == json!("completed") {
+                    return;
+                }
+                compio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        panic!("re-index did not complete");
+            panic!("re-index did not complete");
+        })
     }
 
     // 8b. Malformed re-index bodies → 400 instead of silently starting a
     //     full re-index; whitespace-only bodies still mean "all indexes".
-    #[tokio::test]
-    async fn test_reindex_invalid_body_rejected() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/reindex";
-        let (status, body) = request(&app, Method::POST, uri, Some(r#"{"field": 123}"#)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        let (status, body) = request(&app, Method::POST, uri, Some("not-json")).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        let (status, body) = request(&app, Method::POST, uri, Some(" \n\t")).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    #[test]
+    fn test_reindex_invalid_body_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/reindex";
+            let (status, body) = request(&app, Method::POST, uri, Some(r#"{"field": 123}"#)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let (status, body) = request(&app, Method::POST, uri, Some("not-json")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let (status, body) = request(&app, Method::POST, uri, Some(" \n\t")).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        })
     }
 
     // 8c. Re-index status is domain-scoped: a task id queried under another
     //     domain answers 404 (tenant isolation), under its own domain 200.
-    #[tokio::test]
-    async fn test_reindex_status_scoped_to_domain() {
-        let (app, _dir) = make_app(true).await;
-        request(&app, Method::POST, "/store-api/json/domains", Some(r#"{"name": "other"}"#)).await;
-        let (status, body) = request(&app, Method::POST, "/store-api/json/default/reindex", None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let task_id = serde_json::from_str::<Value>(&body).unwrap()["task_id"]
-            .as_str().unwrap().to_string();
-        let (status, _) = request(
-            &app, Method::GET, &format!("/store-api/json/other/reindex/{task_id}"), None,
-        ).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = request(
-            &app, Method::GET, &format!("/store-api/json/default/reindex/{task_id}"), None,
-        ).await;
-        assert_eq!(status, StatusCode::OK);
+    #[test]
+    fn test_reindex_status_scoped_to_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            request(&app, Method::POST, "/store-api/json/domains", Some(r#"{"name": "other"}"#)).await;
+            let (status, body) = request(&app, Method::POST, "/store-api/json/default/reindex", None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let task_id = serde_json::from_str::<Value>(&body).unwrap()["task_id"]
+                .as_str().unwrap().to_string();
+            let (status, _) = request(
+                &app, Method::GET, &format!("/store-api/json/other/reindex/{task_id}"), None,
+            ).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _) = request(
+                &app, Method::GET, &format!("/store-api/json/default/reindex/{task_id}"), None,
+            ).await;
+            assert_eq!(status, StatusCode::OK);
+        })
     }
 
     // 6b. Bulk bodies beyond axum's 2 MB default pass (bulk_body_limit_bytes).
     //     Lines fail per-document validation, so no big engine writes happen —
     //     the point is that the request is not cut off with 413.
-    #[tokio::test]
-    async fn test_bulk_body_over_default_limit_accepted() {
-        let (app, _dir) = make_app(true).await;
-        let line = format!("{{\"pad\": \"{}\"}}\n", "x".repeat(600 * 1024));
-        let body = line.repeat(5); // ~3 MB
-        let (status, resp) =
-            request(&app, Method::POST, "/store-api/json/default/bulk", Some(&body)).await;
-        assert_eq!(status, StatusCode::OK, "{resp}");
-        let result: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(result["imported"], json!(0));
-        assert_eq!(result["failed"], json!(5));
+    #[test]
+    fn test_bulk_body_over_default_limit_accepted() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let line = format!("{{\"pad\": \"{}\"}}\n", "x".repeat(600 * 1024));
+            let body = line.repeat(5); // ~3 MB
+            let (status, resp) =
+                request(&app, Method::POST, "/store-api/json/default/bulk", Some(&body)).await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            let result: Value = serde_json::from_str(&resp).unwrap();
+            assert_eq!(result["imported"], json!(0));
+            assert_eq!(result["failed"], json!(5));
+        })
     }
 
     // 9. Disabled engine → 503 on every JSON route.
-    #[tokio::test]
-    async fn test_disabled_engine_returns_503() {
-        let (app, _dir) = make_app(false).await;
-        let (status, body) = request(&app, Method::GET, "/store-api/json/domains", None).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body.contains("disabled"), "{body}");
-        let (status, _) = request(&app, Method::GET, "/store-api/json/default/documents/x", None).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    #[test]
+    fn test_disabled_engine_returns_503() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(false).await;
+            let (status, body) = request(&app, Method::GET, "/store-api/json/domains", None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(body.contains("disabled"), "{body}");
+            let (status, _) = request(&app, Method::GET, "/store-api/json/default/documents/x", None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        })
     }
 
     // 11. Listing and counting endpoints (spec json/010).
-    #[tokio::test]
-    async fn test_listing_and_count_endpoints() {
-        let (app, _dir) = make_app(true).await;
-        for i in 0..5 {
-            request(&app, Method::PUT, &format!("/store-api/json/default/documents/x{i}"),
-                Some(r#"{"a": 1}"#)).await;
-        }
-        let (status, body) = request(
-            &app, Method::GET,
-            "/store-api/json/default/documents?limit=2&offset=1", None,
-        ).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let list: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(list["total"], json!(5));
-        assert_eq!(list["keys"].as_array().unwrap().len(), 2);
-        assert_eq!(list["documents"].as_array().unwrap().len(), 2);
+    #[test]
+    fn test_listing_and_count_endpoints() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            for i in 0..5 {
+                request(&app, Method::PUT, &format!("/store-api/json/default/documents/x{i}"),
+                    Some(r#"{"a": 1}"#)).await;
+            }
+            let (status, body) = request(
+                &app, Method::GET,
+                "/store-api/json/default/documents?limit=2&offset=1", None,
+            ).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let list: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(list["total"], json!(5));
+            assert_eq!(list["keys"].as_array().unwrap().len(), 2);
+            assert_eq!(list["documents"].as_array().unwrap().len(), 2);
 
-        let (status, body) = request(
-            &app, Method::GET,
-            "/store-api/json/default/documents?keys_only=true", None,
-        ).await;
-        assert_eq!(status, StatusCode::OK);
-        let list: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(list["keys"].as_array().unwrap().len(), 5);
-        assert!(list["documents"].as_array().unwrap().is_empty());
+            let (status, body) = request(
+                &app, Method::GET,
+                "/store-api/json/default/documents?keys_only=true", None,
+            ).await;
+            assert_eq!(status, StatusCode::OK);
+            let list: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(list["keys"].as_array().unwrap().len(), 5);
+            assert!(list["documents"].as_array().unwrap().is_empty());
 
-        let (status, body) = request(
-            &app, Method::GET, "/store-api/json/default/documents/count", None,
-        ).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["count"], json!(5));
+            let (status, body) = request(
+                &app, Method::GET, "/store-api/json/default/documents/count", None,
+            ).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["count"], json!(5));
 
-        // Domain detail includes the document count.
-        let (status, body) = request(&app, Method::GET, "/store-api/json/domains/default", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["document_count"], json!(5));
+            // Domain detail includes the document count.
+            let (status, body) = request(&app, Method::GET, "/store-api/json/domains/default", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["document_count"], json!(5));
+        })
     }
 
     /// GET the document and return its ETag header value (with quotes).
@@ -1089,617 +1115,653 @@ mod tests {
     }
 
     // 12. ETag/If-Match: conditional update and delete (spec json/011).
-    #[tokio::test]
-    async fn test_etag_if_match_flow() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/occ";
-        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+    #[test]
+    fn test_etag_if_match_flow() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/occ";
+            request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
 
-        // ETag is the opaque "{generation:x}-{version}" value.
-        let etag_v1 = fetch_etag(&app, uri).await;
-        assert!(
-            etag_v1.starts_with('"') && etag_v1.ends_with("-1\""),
-            "unexpected ETag format: {etag_v1}"
-        );
-        let generation = etag_v1.trim_matches('"').split_once('-').unwrap().0.to_string();
+            // ETag is the opaque "{generation:x}-{version}" value.
+            let etag_v1 = fetch_etag(&app, uri).await;
+            assert!(
+                etag_v1.starts_with('"') && etag_v1.ends_with("-1\""),
+                "unexpected ETag format: {etag_v1}"
+            );
+            let generation = etag_v1.trim_matches('"').split_once('-').unwrap().0.to_string();
 
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("if-match", etag_v1.clone())
-            .body(Body::from(r#"{"n": 2}"#))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-match", etag_v1.clone())
+                .body(Body::from(r#"{"n": 2}"#))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        // Stale If-Match → 409 with the actual ETag value in the body.
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("if-match", etag_v1.clone())
-            .body(Body::from(r#"{"n": 3}"#))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains(&format!("actual \"{generation}-2\"")), "{body}");
+            // Stale If-Match → 409 with the actual ETag value in the body.
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-match", etag_v1.clone())
+                .body(Body::from(r#"{"n": 3}"#))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains(&format!("actual \"{generation}-2\"")), "{body}");
 
-        // Legacy bare-version If-Match values are rejected as 400.
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("if-match", "\"2\"")
-            .body(Body::from(r#"{"n": 3}"#))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            // Legacy bare-version If-Match values are rejected as 400.
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-match", "\"2\"")
+                .body(Body::from(r#"{"n": 3}"#))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let req = Request::builder()
-            .method(Method::DELETE)
-            .uri(uri)
-            .header("if-match", etag_v1)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let req = Request::builder()
+                .method(Method::DELETE)
+                .uri(uri)
+                .header("if-match", etag_v1)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
 
-        let req = Request::builder()
-            .method(Method::DELETE)
-            .uri(uri)
-            .header("if-match", format!("\"{generation}-2\""))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            let req = Request::builder()
+                .method(Method::DELETE)
+                .uri(uri)
+                .header("if-match", format!("\"{generation}-2\""))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        })
     }
 
     // 15. ABA guard (json/011): a stale ETag of a deleted incarnation must
     //     not match after delete + recreate of the same key.
-    #[tokio::test]
-    async fn test_stale_etag_across_recreate_rejected() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/aba";
-        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
-        let stale_etag = fetch_etag(&app, uri).await;
+    #[test]
+    fn test_stale_etag_across_recreate_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/aba";
+            request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+            let stale_etag = fetch_etag(&app, uri).await;
 
-        let (status, _) = request(&app, Method::DELETE, uri, None).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"n": 2}"#)).await;
-        assert_eq!(status, StatusCode::CREATED, "recreate starts at version 1 again");
+            let (status, _) = request(&app, Method::DELETE, uri, None).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"n": 2}"#)).await;
+            assert_eq!(status, StatusCode::CREATED, "recreate starts at version 1 again");
 
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("if-match", stale_etag.clone())
-            .body(Body::from(r#"{"n": 3}"#))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::CONFLICT,
-            "stale ETag must not match the new incarnation"
-        );
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-match", stale_etag.clone())
+                .body(Body::from(r#"{"n": 3}"#))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::CONFLICT,
+                "stale ETag must not match the new incarnation"
+            );
 
-        let req = Request::builder()
-            .method(Method::DELETE)
-            .uri(uri)
-            .header("if-match", stale_etag)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let req = Request::builder()
+                .method(Method::DELETE)
+                .uri(uri)
+                .header("if-match", stale_etag)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
 
-        let (status, body) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains(r#""n":2"#), "lost update must not happen: {body}");
+            let (status, body) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains(r#""n":2"#), "lost update must not happen: {body}");
+        })
     }
 
     // ── Create-only precondition (spec json/014) ─────────────────────────────
 
     // 18. If-None-Match: * on a free key succeeds (201, fresh document).
-    #[tokio::test]
-    async fn test_create_only_put_free_key_returns_201() {
-        let (app, _dir) = make_app(true).await;
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri("/store-api/json/default/documents/fresh")
-            .header("content-type", "application/json")
-            .header("if-none-match", "*")
-            .body(Body::from(r#"{"n": 1}"#))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
-        assert_eq!(body["_version"], json!(1));
+    #[test]
+    fn test_create_only_put_free_key_returns_201() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri("/store-api/json/default/documents/fresh")
+                .header("content-type", "application/json")
+                .header("if-none-match", "*")
+                .body(Body::from(r#"{"n": 1}"#))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
+            assert_eq!(body["_version"], json!(1));
+        })
     }
 
     // 19. If-None-Match: * on an occupied key → 412, document unchanged.
-    #[tokio::test]
-    async fn test_create_only_put_occupied_key_returns_412() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/taken";
-        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+    #[test]
+    fn test_create_only_put_occupied_key_returns_412() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/taken";
+            request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
 
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("if-none-match", "*")
-            .body(Body::from(r#"{"n": 2}"#))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
-
-        let (status, body) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains(r#""n":1"#), "document must stay unchanged: {body}");
-    }
-
-    // 20. If-None-Match values other than the literal '*' are rejected — no
-    //     ETag-list support (§1), including the weak-validator form.
-    #[tokio::test]
-    async fn test_if_none_match_non_wildcard_rejected() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/x";
-        for value in ["\"abc-1\"", "W/\"*\""] {
             let req = Request::builder()
                 .method(Method::PUT)
                 .uri(uri)
                 .header("content-type", "application/json")
-                .header("if-none-match", value)
-                .body(Body::from("{}"))
+                .header("if-none-match", "*")
+                .body(Body::from(r#"{"n": 2}"#))
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "value: {value}");
-        }
-        let (status, _) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "a rejected precondition must not write");
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+
+            let (status, body) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains(r#""n":1"#), "document must stay unchanged: {body}");
+        })
+    }
+
+    // 20. If-None-Match values other than the literal '*' are rejected — no
+    //     ETag-list support (§1), including the weak-validator form.
+    #[test]
+    fn test_if_none_match_non_wildcard_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/x";
+            for value in ["\"abc-1\"", "W/\"*\""] {
+                let req = Request::builder()
+                    .method(Method::PUT)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("if-none-match", value)
+                    .body(Body::from("{}"))
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "value: {value}");
+            }
+            let (status, _) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "a rejected precondition must not write");
+        })
     }
 
     // 21. If-Match and If-None-Match together are mutually exclusive (§1).
-    #[tokio::test]
-    async fn test_if_match_and_if_none_match_together_rejected() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/both";
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("if-match", "\"0-1\"")
-            .header("if-none-match", "*")
-            .body(Body::from("{}"))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    #[test]
+    fn test_if_match_and_if_none_match_together_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/both";
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-match", "\"0-1\"")
+                .header("if-none-match", "*")
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let (status, _) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "conflicting preconditions must not write");
+            let (status, _) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "conflicting preconditions must not write");
+        })
     }
 
     // 22. Recreate after delete is a legitimate create-only write (§5): the
     //     new ETag carries a different generation than before the delete.
-    #[tokio::test]
-    async fn test_create_only_put_after_delete_recreate() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/reborn";
-        request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
-        let old_etag = fetch_etag(&app, uri).await;
-        let old_generation = old_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
+    #[test]
+    fn test_create_only_put_after_delete_recreate() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/reborn";
+            request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+            let old_etag = fetch_etag(&app, uri).await;
+            let old_generation = old_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
 
-        let (status, _) = request(&app, Method::DELETE, uri, None).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+            let (status, _) = request(&app, Method::DELETE, uri, None).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("if-none-match", "*")
-            .body(Body::from(r#"{"n": 2}"#))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
-        assert_eq!(body["_version"], json!(1));
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("if-none-match", "*")
+                .body(Body::from(r#"{"n": 2}"#))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_str(&String::from_utf8_lossy(&bytes)).unwrap();
+            assert_eq!(body["_version"], json!(1));
 
-        let new_etag = fetch_etag(&app, uri).await;
-        let new_generation = new_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
-        assert_ne!(new_generation, old_generation, "recreate must roll a fresh generation");
+            let new_etag = fetch_etag(&app, uri).await;
+            let new_generation = new_etag.trim_matches('"').split_once('-').unwrap().0.to_string();
+            assert_ne!(new_generation, old_generation, "recreate must roll a fresh generation");
+        })
     }
 
     // 13. Auth scoping: KV permissions do not grant JSON access (spec json/012).
-    #[tokio::test]
-    async fn test_auth_scoping_kv_vs_json() {
-        use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
+    #[test]
+    fn test_auth_scoping_kv_vs_json() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
 
-        let (state, _dir) = make_state(true, true).await;
-        let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+            let (state, _dir) = make_state(true, true).await;
+            let cache = Arc::clone(&state.auth_cache);
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let user_key = "lura_test_user_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: hash_api_key(user_key),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        // KV write permission on "default" — but NO JSON permission.
-        cache
-            .set_permission(DomainPermission {
-                username: "worker".to_string(),
-                domain: "default".to_string(),
-                access: AccessLevel::Write,
-            })
-            .await
-            .unwrap();
+            let user_key = "lura_test_user_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: hash_api_key(user_key),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            // KV write permission on "default" — but NO JSON permission.
+            cache
+                .set_permission(DomainPermission {
+                    username: "worker".to_string(),
+                    domain: "default".to_string(),
+                    access: AccessLevel::Write,
+                })
+                .await
+                .unwrap();
 
-        let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
-            let mut builder = Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("authorization", format!("Bearer {bearer}"));
-            let req = if let Some(b) = body {
-                builder = builder.header("content-type", "application/json");
-                builder.body(Body::from(b.to_string())).unwrap()
-            } else {
-                builder.body(Body::empty()).unwrap()
+            let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {bearer}"));
+                let req = if let Some(b) = body {
+                    builder = builder.header("content-type", "application/json");
+                    builder.body(Body::from(b.to_string())).unwrap()
+                } else {
+                    builder.body(Body::empty()).unwrap()
+                };
+                app.clone().oneshot(req)
             };
-            app.clone().oneshot(req)
-        };
 
-        // KV path resolves the permission (extract_domain fix): 404, not 403.
-        let resp = send(Method::GET, "/store-api/kv/default/keys/nope", None, user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            // KV path resolves the permission (extract_domain fix): 404, not 403.
+            let resp = send(Method::GET, "/store-api/kv/default/keys/nope", None, user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // Same domain name in the JSON store is NOT covered by the KV permission.
-        let resp = send(Method::GET, "/store-api/json/default/documents", None, user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            // Same domain name in the JSON store is NOT covered by the KV permission.
+            let resp = send(Method::GET, "/store-api/json/default/documents", None, user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        // Read permission on the JSON namespace: search works, bulk does not.
-        cache
-            .set_permission(DomainPermission {
-                username: "worker".to_string(),
-                domain: "json:default".to_string(),
-                access: AccessLevel::Read,
-            })
-            .await
-            .unwrap();
-        let resp = send(Method::POST, "/store-api/json/default/search",
-            Some(r#"{"filter": {}}"#), user_key).await.unwrap();
-        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "search must pass with read permission");
-        let resp = send(Method::POST, "/store-api/json/default/bulk", Some("{}"), user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "bulk needs write permission");
+            // Read permission on the JSON namespace: search works, bulk does not.
+            cache
+                .set_permission(DomainPermission {
+                    username: "worker".to_string(),
+                    domain: "json:default".to_string(),
+                    access: AccessLevel::Read,
+                })
+                .await
+                .unwrap();
+            let resp = send(Method::POST, "/store-api/json/default/search",
+                Some(r#"{"filter": {}}"#), user_key).await.unwrap();
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN, "search must pass with read permission");
+            let resp = send(Method::POST, "/store-api/json/default/bulk", Some("{}"), user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "bulk needs write permission");
 
-        // Write permission unlocks bulk; domain management stays admin-only.
-        cache
-            .set_permission(DomainPermission {
-                username: "worker".to_string(),
-                domain: "json:default".to_string(),
-                access: AccessLevel::Write,
-            })
-            .await
-            .unwrap();
-        let resp = send(Method::POST, "/store-api/json/default/bulk",
-            Some(r#"{"_key": "a", "n": 1}"#), user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let resp = send(Method::GET, "/store-api/json/domains", None, user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            // Write permission unlocks bulk; domain management stays admin-only.
+            cache
+                .set_permission(DomainPermission {
+                    username: "worker".to_string(),
+                    domain: "json:default".to_string(),
+                    access: AccessLevel::Write,
+                })
+                .await
+                .unwrap();
+            let resp = send(Method::POST, "/store-api/json/default/bulk",
+                Some(r#"{"_key": "a", "n": 1}"#), user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let resp = send(Method::GET, "/store-api/json/domains", None, user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        // Admin has full access everywhere.
-        let admin_key = "lura_test_admin_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "boss".to_string(),
-                api_key_hash: hash_api_key(admin_key),
-                role: UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        let resp = send(Method::GET, "/store-api/json/domains", None, admin_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            // Admin has full access everywhere.
+            let admin_key = "lura_test_admin_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "boss".to_string(),
+                    api_key_hash: hash_api_key(admin_key),
+                    role: UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            let resp = send(Method::GET, "/store-api/json/domains", None, admin_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
     }
 
     // 16. Domain management is admin-only for write methods (spec kv/012):
     //     a write permission on a domain must not allow purging it.
-    #[tokio::test]
-    async fn test_auth_scoping_domain_management_admin_only() {
-        use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
+    #[test]
+    fn test_auth_scoping_domain_management_admin_only() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
 
-        let (state, _dir) = make_state(false, true).await;
-        let cache = Arc::clone(&state.auth_cache);
-        let registry = Arc::clone(&state.registry);
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+            let (state, _dir) = make_state(false, true).await;
+            let cache = Arc::clone(&state.auth_cache);
+            let registry = Arc::clone(&state.registry);
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        registry.create_domain("orders").await.unwrap();
+            registry.create_domain("orders").await.unwrap();
 
-        let user_key = "lura_test_user_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: hash_api_key(user_key),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        cache
-            .set_permission(DomainPermission {
-                username: "worker".to_string(),
-                domain: "orders".to_string(),
-                access: AccessLevel::Write,
-            })
-            .await
-            .unwrap();
+            let user_key = "lura_test_user_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: hash_api_key(user_key),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            cache
+                .set_permission(DomainPermission {
+                    username: "worker".to_string(),
+                    domain: "orders".to_string(),
+                    access: AccessLevel::Write,
+                })
+                .await
+                .unwrap();
 
-        let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
-            let mut builder = Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("authorization", format!("Bearer {bearer}"));
-            let req = if let Some(b) = body {
-                builder = builder.header("content-type", "application/json");
-                builder.body(Body::from(b.to_string())).unwrap()
-            } else {
-                builder.body(Body::empty()).unwrap()
+            let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {bearer}"));
+                let req = if let Some(b) = body {
+                    builder = builder.header("content-type", "application/json");
+                    builder.body(Body::from(b.to_string())).unwrap()
+                } else {
+                    builder.body(Body::empty()).unwrap()
+                };
+                app.clone().oneshot(req)
             };
-            app.clone().oneshot(req)
-        };
 
-        // Reading domain metadata stays open to permission holders …
-        let resp = send(Method::GET, "/store-api/domains/orders", None, user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            // Reading domain metadata stays open to permission holders …
+            let resp = send(Method::GET, "/store-api/domains/orders", None, user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        // … but the destructive purge is admin-only despite write permission.
-        let resp = send(Method::DELETE, "/store-api/domains/orders", None, user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            // … but the destructive purge is admin-only despite write permission.
+            let resp = send(Method::DELETE, "/store-api/domains/orders", None, user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        // Creating domains stays admin-only too.
-        let resp = send(Method::POST, "/store-api/domains",
-            Some(r#"{"name": "own"}"#), user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            // Creating domains stays admin-only too.
+            let resp = send(Method::POST, "/store-api/domains",
+                Some(r#"{"name": "own"}"#), user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        // The domain must still exist (no purge was started).
-        let resp = send(Method::GET, "/store-api/domains/orders", None, user_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            // The domain must still exist (no purge was started).
+            let resp = send(Method::GET, "/store-api/domains/orders", None, user_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        // Admins keep full domain-lifecycle access.
-        let admin_key = "lura_test_admin_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "boss".to_string(),
-                api_key_hash: hash_api_key(admin_key),
-                role: UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        let resp = send(Method::DELETE, "/store-api/domains/orders", None, admin_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            // Admins keep full domain-lifecycle access.
+            let admin_key = "lura_test_admin_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "boss".to_string(),
+                    api_key_hash: hash_api_key(admin_key),
+                    role: UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            let resp = send(Method::DELETE, "/store-api/domains/orders", None, admin_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        })
     }
 
     // 17. Usernames and JSON permission domains share the domain charset:
     //     ':' in a username would make the persisted perm key ambiguous,
     //     invalid JSON domain names would create dead permissions.
-    #[tokio::test]
-    async fn test_auth_name_and_permission_domain_validation() {
-        use crate::auth::{hash_api_key, UserRecord, UserRole};
+    #[test]
+    fn test_auth_name_and_permission_domain_validation() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::auth::{hash_api_key, UserRecord, UserRole};
 
-        let (state, _dir) = make_state(false, true).await;
-        let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+            let (state, _dir) = make_state(false, true).await;
+            let cache = Arc::clone(&state.auth_cache);
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let admin_key = "lura_test_admin_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "boss".to_string(),
-                api_key_hash: hash_api_key(admin_key),
-                role: UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
+            let admin_key = "lura_test_admin_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "boss".to_string(),
+                    api_key_hash: hash_api_key(admin_key),
+                    role: UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
 
-        let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
-            let mut builder = Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("authorization", format!("Bearer {bearer}"));
-            let req = if let Some(b) = body {
-                builder = builder.header("content-type", "application/json");
-                builder.body(Body::from(b.to_string())).unwrap()
-            } else {
-                builder.body(Body::empty()).unwrap()
+            let send = |method: Method, uri: &str, body: Option<&str>, bearer: &str| {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {bearer}"));
+                let req = if let Some(b) = body {
+                    builder = builder.header("content-type", "application/json");
+                    builder.body(Body::from(b.to_string())).unwrap()
+                } else {
+                    builder.body(Body::empty()).unwrap()
+                };
+                app.clone().oneshot(req)
             };
-            app.clone().oneshot(req)
-        };
 
-        // ':' in a username collides with the perm-key separator → 400.
-        let resp = send(Method::POST, "/store-api/auth/users",
-            Some(r#"{"name": "svc:json"}"#), admin_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            // ':' in a username collides with the perm-key separator → 400.
+            let resp = send(Method::POST, "/store-api/auth/users",
+                Some(r#"{"name": "svc:json"}"#), admin_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // The full allowed charset is accepted.
-        let resp = send(Method::POST, "/store-api/auth/users",
-            Some(r#"{"name": "svc-json_1"}"#), admin_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
+            // The full allowed charset is accepted.
+            let resp = send(Method::POST, "/store-api/auth/users",
+                Some(r#"{"name": "svc-json_1"}"#), admin_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
 
-        // JSON permissions skip the existence check but not the name rules.
-        let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions",
-            Some(r#"{"domain": "my data", "access": "read", "store_type": "json"}"#),
-            admin_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            // JSON permissions skip the existence check but not the name rules.
+            let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions",
+                Some(r#"{"domain": "my data", "access": "read", "store_type": "json"}"#),
+                admin_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions",
-            Some(r#"{"domain": "data", "access": "read", "store_type": "json"}"#),
-            admin_key).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions",
+                Some(r#"{"domain": "data", "access": "read", "store_type": "json"}"#),
+                admin_key).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
     }
 
     // 14. TrustedPeer extension (UDS UCred bypass, perf/001) skips bearer auth.
-    #[tokio::test]
-    async fn test_trusted_peer_bypasses_auth() {
-        let (state, _dir) = make_state(true, true).await;
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_trusted_peer_bypasses_auth() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(true, true).await;
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/store-api/json/domains")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/store-api/json/domains")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let mut req = Request::builder()
-            .method(Method::GET)
-            .uri("/store-api/json/domains")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(crate::auth::middleware::TrustedPeer);
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri("/store-api/json/domains")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(crate::auth::middleware::TrustedPeer);
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
     }
 
     // 10. JSON domain endpoints.
-    #[tokio::test]
-    async fn test_json_domain_endpoints() {
-        let (app, _dir) = make_app(true).await;
-        let (status, _) = request(&app, Method::POST, "/store-api/json/domains",
-            Some(r#"{"name": "api-dom"}"#)).await;
-        assert_eq!(status, StatusCode::CREATED);
-        let (status, body) = request(&app, Method::GET, "/store-api/json/domains", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("api-dom"));
-        let (status, _) = request(&app, Method::GET, "/store-api/json/domains/api-dom", None).await;
-        assert_eq!(status, StatusCode::OK);
-        let (status, _) = request(&app, Method::DELETE, "/store-api/json/domains/api-dom", None).await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-        // While the purge runs, the domain answers 410 Gone (spec json/013).
-        let (status, body) = request(&app, Method::GET, "/store-api/json/domains/api-dom", None).await;
-        assert_eq!(status, StatusCode::GONE, "{body}");
-        let (status, _) = request(&app, Method::PUT, "/store-api/json/api-dom/documents/x", Some("{}")).await;
-        assert_eq!(status, StatusCode::GONE);
+    #[test]
+    fn test_json_domain_endpoints() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let (status, _) = request(&app, Method::POST, "/store-api/json/domains",
+                Some(r#"{"name": "api-dom"}"#)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            let (status, body) = request(&app, Method::GET, "/store-api/json/domains", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("api-dom"));
+            let (status, _) = request(&app, Method::GET, "/store-api/json/domains/api-dom", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = request(&app, Method::DELETE, "/store-api/json/domains/api-dom", None).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            // While the purge runs, the domain answers 410 Gone (spec json/013).
+            let (status, body) = request(&app, Method::GET, "/store-api/json/domains/api-dom", None).await;
+            assert_eq!(status, StatusCode::GONE, "{body}");
+            let (status, _) = request(&app, Method::PUT, "/store-api/json/api-dom/documents/x", Some("{}")).await;
+            assert_eq!(status, StatusCode::GONE);
+        })
     }
 
     // 23. DocumentResponse schema sample (spec json/015): a written document's
     //     _key/_version/user-field shape matches what the contract now declares.
-    #[tokio::test]
-    async fn test_document_response_matches_schema_shape() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/shape";
-        let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"city": "Lyon", "pop": 42}"#)).await;
-        assert_eq!(status, StatusCode::CREATED);
+    #[test]
+    fn test_document_response_matches_schema_shape() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/shape";
+            let (status, _) = request(&app, Method::PUT, uri, Some(r#"{"city": "Lyon", "pop": 42}"#)).await;
+            assert_eq!(status, StatusCode::CREATED);
 
-        let (status, body) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let doc: Value = serde_json::from_str(&body).unwrap();
-        assert!(doc["_key"].is_string(), "{body}");
-        assert!(doc["_version"].is_u64(), "{body}");
-        assert_eq!(doc["city"], json!("Lyon"), "{body}");
-        assert_eq!(doc["pop"], json!(42), "{body}");
+            let (status, body) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            assert!(doc["_key"].is_string(), "{body}");
+            assert!(doc["_version"].is_u64(), "{body}");
+            assert_eq!(doc["city"], json!("Lyon"), "{body}");
+            assert_eq!(doc["pop"], json!(42), "{body}");
+        })
     }
 
     // 24. _content regression (spec json/015 §2): a non-object document still
     //     wraps under `_content`, unchanged by the new DocumentResponse schema.
-    #[tokio::test]
-    async fn test_non_object_document_wraps_in_content_field() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/scalar";
-        let (status, body) = request(&app, Method::PUT, uri, Some("42")).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let doc: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(doc["_content"], json!(42), "{body}");
-        assert!(doc["_key"].is_string(), "{body}");
-        assert!(doc["_version"].is_u64(), "{body}");
+    #[test]
+    fn test_non_object_document_wraps_in_content_field() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/scalar";
+            let (status, body) = request(&app, Method::PUT, uri, Some("42")).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(doc["_content"], json!(42), "{body}");
+            assert!(doc["_key"].is_string(), "{body}");
+            assert!(doc["_version"].is_u64(), "{body}");
+        })
     }
 
     // 25. Error-body reality check (spec json/016 §D2 test 5): the contract's
     //     text/plain schema on 404 matches what the server actually sends — a
     //     real GET on a missing document returns a non-empty plaintext body
     //     with a text/plain content type, not JSON.
-    #[tokio::test]
-    async fn test_missing_document_404_has_nonempty_plaintext_body() {
-        let (app, _dir) = make_app(true).await;
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/store-api/json/default/documents/does-not-exist")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let content_type = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
-        assert!(content_type.starts_with("text/plain"), "{content_type}");
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(!body.is_empty(), "404 body must not be empty");
-        assert!(serde_json::from_str::<Value>(&body).is_err(), "body must be plain text, not JSON: {body}");
+    #[test]
+    fn test_missing_document_404_has_nonempty_plaintext_body() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/store-api/json/default/documents/does-not-exist")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let content_type = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+            assert!(content_type.starts_with("text/plain"), "{content_type}");
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(!body.is_empty(), "404 body must not be empty");
+            assert!(serde_json::from_str::<Value>(&body).is_err(), "body must be plain text, not JSON: {body}");
+        })
     }
 
     // 26. Reserved top-level fields (_key/_version/_content) are rejected
     //     with 400 naming the field, for both POST and PUT; nothing ends up
     //     stored (spec json/017 test 1).
-    #[tokio::test]
-    async fn test_reserved_top_level_field_rejected_on_write() {
-        let (app, _dir) = make_app(true).await;
-        for field in ["_key", "_version", "_content"] {
-            let body = format!(r#"{{"{field}": 1, "x": 2}}"#);
+    #[test]
+    fn test_reserved_top_level_field_rejected_on_write() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            for field in ["_key", "_version", "_content"] {
+                let body = format!(r#"{{"{field}": 1, "x": 2}}"#);
 
-            let (status, resp) =
-                request(&app, Method::POST, "/store-api/json/default/documents", Some(&body)).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
-            assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
+                let (status, resp) =
+                    request(&app, Method::POST, "/store-api/json/default/documents", Some(&body)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
+                assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
 
-            let uri = format!("/store-api/json/default/documents/reserved{field}");
-            let (status, resp) = request(&app, Method::PUT, &uri, Some(&body)).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
-            assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
-            let (status, _) = request(&app, Method::GET, &uri, None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{field}: rejected PUT must not store anything");
-        }
+                let uri = format!("/store-api/json/default/documents/reserved{field}");
+                let (status, resp) = request(&app, Method::PUT, &uri, Some(&body)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {resp}");
+                assert!(resp.contains(&format!("field '{field}'")), "{field}: error must name the field: {resp}");
+                let (status, _) = request(&app, Method::GET, &uri, None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{field}: rejected PUT must not store anything");
+            }
 
-        let (status, body) = request(&app, Method::GET, "/store-api/json/default/documents/count", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_str::<Value>(&body).unwrap()["count"],
-            json!(0),
-            "no rejected POST must have stored anything either"
-        );
+            let (status, body) = request(&app, Method::GET, "/store-api/json/default/documents/count", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap()["count"],
+                json!(0),
+                "no rejected POST must have stored anything either"
+            );
+        })
     }
 
     // 27. A reserved name nested under a user field collides with nothing
     //     and stays allowed (spec json/017 §Entscheid: top-level only).
-    #[tokio::test]
-    async fn test_nested_reserved_field_name_allowed() {
-        let (app, _dir) = make_app(true).await;
-        let uri = "/store-api/json/default/documents/nested";
-        let (status, body) = request(&app, Method::PUT, uri, Some(r#"{"a": {"_key": 1}}"#)).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let (status, body) = request(&app, Method::GET, uri, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let doc: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(doc["a"], json!({"_key": 1}), "{body}");
+    #[test]
+    fn test_nested_reserved_field_name_allowed() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/nested";
+            let (status, body) = request(&app, Method::PUT, uri, Some(r#"{"a": {"_key": 1}}"#)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let (status, body) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(doc["a"], json!({"_key": 1}), "{body}");
+        })
     }
 
     // 28. Non-object documents stay accepted unchanged -- the new
     //     reserved-field check only looks at top-level object keys (spec
     //     json/017 test 3; the `42` case is already covered by test 24's
     //     json/015 _content-wrap regression).
-    #[tokio::test]
-    async fn test_non_object_documents_still_accepted() {
-        let (app, _dir) = make_app(true).await;
-        for (i, body) in [r#""text""#, "[1,2]"].into_iter().enumerate() {
-            let uri = format!("/store-api/json/default/documents/scalar{i}");
-            let (status, resp) = request(&app, Method::PUT, &uri, Some(body)).await;
-            assert_eq!(status, StatusCode::CREATED, "{body}: {resp}");
-        }
+    #[test]
+    fn test_non_object_documents_still_accepted() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            for (i, body) in [r#""text""#, "[1,2]"].into_iter().enumerate() {
+                let uri = format!("/store-api/json/default/documents/scalar{i}");
+                let (status, resp) = request(&app, Method::PUT, &uri, Some(body)).await;
+                assert_eq!(status, StatusCode::CREATED, "{body}: {resp}");
+            }
+        })
     }
 }

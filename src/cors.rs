@@ -154,172 +154,186 @@ mod tests {
 
     // Test 3: preflight bypasses auth entirely, even with no Authorization —
     // it never reaches auth_layer because the CORS layer is outside it.
-    #[tokio::test]
-    async fn preflight_bypasses_auth() {
-        let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), true).await;
+    #[test]
+    fn preflight_bypasses_auth() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), true).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("OPTIONS")
-                    .uri("/store-api/kv/testdom/keys/foo")
-                    .header("origin", "https://console.example.com")
-                    .header("access-control-request-method", "DELETE")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("OPTIONS")
+                        .uri("/store-api/kv/testdom/keys/foo")
+                        .header("origin", "https://console.example.com")
+                        .header("access-control-request-method", "DELETE")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(acao(&resp), Some("https://console.example.com"));
-        let allow_methods = resp.headers().get("access-control-allow-methods").unwrap().to_str().unwrap();
-        assert!(allow_methods.contains("DELETE") && allow_methods.contains("PATCH"), "{allow_methods}");
-        let allow_headers = resp.headers().get("access-control-allow-headers").unwrap().to_str().unwrap();
-        assert!(allow_headers.contains("authorization"), "{allow_headers}");
-        assert!(resp.headers().get("access-control-max-age").is_some());
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(acao(&resp), Some("https://console.example.com"));
+            let allow_methods = resp.headers().get("access-control-allow-methods").unwrap().to_str().unwrap();
+            assert!(allow_methods.contains("DELETE") && allow_methods.contains("PATCH"), "{allow_methods}");
+            let allow_headers = resp.headers().get("access-control-allow-headers").unwrap().to_str().unwrap();
+            assert!(allow_headers.contains("authorization"), "{allow_headers}");
+            assert!(resp.headers().get("access-control-max-age").is_some());
+        })
     }
 
     // Test 4: an origin not on the list gets no ACAO — the browser blocks
     // the response itself once it sees that.
-    #[tokio::test]
-    async fn disallowed_origin_gets_no_header() {
-        let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
+    #[test]
+    fn disallowed_origin_gets_no_header() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("origin", "https://evil.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header("origin", "https://evil.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert!(acao(&resp).is_none());
+            assert!(acao(&resp).is_none());
+        })
     }
 
     // Test 5: no Origin header (curl, server-to-server) -> no ACAO, but the
     // request-independent Expose-Headers/Vary headers still ride along.
-    #[tokio::test]
-    async fn no_origin_header_gets_no_acao_but_keeps_static_headers() {
-        let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
+    #[test]
+    fn no_origin_header_gets_no_acao_but_keeps_static_headers() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
 
-        let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+            let resp = app
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
 
-        assert!(acao(&resp).is_none());
-        assert!(resp.headers().get("access-control-expose-headers").is_some());
-        assert!(resp.headers().get("vary").is_some());
+            assert!(acao(&resp).is_none());
+            assert!(resp.headers().get("access-control-expose-headers").is_some());
+            assert!(resp.headers().get("vary").is_some());
+        })
     }
 
     // Test 6: an error response (401, no API key) still carries the CORS
     // header — otherwise the browser hides the real status behind a CORS error.
-    #[tokio::test]
-    async fn error_response_carries_cors_header() {
-        let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), true).await;
+    #[test]
+    fn error_response_carries_cors_header() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), true).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/kv/testdom/keys")
-                    .header("origin", "https://console.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/kv/testdom/keys")
+                        .header("origin", "https://console.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(acao(&resp), Some("https://console.example.com"));
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(acao(&resp), Some("https://console.example.com"));
+        })
     }
 
     // Test 7: Expose-Headers carries `etag` on a normal response, but is
     // absent from a preflight response (which only gets
     // allow_methods/allow_headers/max_age).
-    #[tokio::test]
-    async fn expose_headers_only_on_normal_responses() {
-        let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
+    #[test]
+    fn expose_headers_only_on_normal_responses() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
 
-        let normal = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("origin", "https://console.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let expose = normal.headers().get("access-control-expose-headers").unwrap().to_str().unwrap();
-        assert!(expose.contains("etag"), "{expose}");
+            let normal = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header("origin", "https://console.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let expose = normal.headers().get("access-control-expose-headers").unwrap().to_str().unwrap();
+            assert!(expose.contains("etag"), "{expose}");
 
-        let preflight = app
-            .oneshot(
-                Request::builder()
-                    .method("OPTIONS")
-                    .uri("/health")
-                    .header("origin", "https://console.example.com")
-                    .header("access-control-request-method", "GET")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(preflight.headers().get("access-control-expose-headers").is_none());
+            let preflight = app
+                .oneshot(
+                    Request::builder()
+                        .method("OPTIONS")
+                        .uri("/health")
+                        .header("origin", "https://console.example.com")
+                        .header("access-control-request-method", "GET")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(preflight.headers().get("access-control-expose-headers").is_none());
+        })
     }
 
     // Test 8: the SSE watch response carries the CORS header too —
     // EventSource can't send an Authorization header, and fetch-based
     // browser clients reading the stream need it just the same.
-    #[tokio::test]
-    async fn watch_sse_response_carries_cors_header() {
-        let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
+    #[test]
+    fn watch_sse_response_carries_cors_header() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(cors_cfg(&["https://console.example.com"]), false).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/kv/testdom/watch")
-                    .header("origin", "https://console.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/kv/testdom/watch")
+                        .header("origin", "https://console.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(acao(&resp), Some("https://console.example.com"));
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(acao(&resp), Some("https://console.example.com"));
+        })
     }
 
     // Test 9: wildcard operation — ACAO: * regardless of the request's
     // Origin, including when there is none; Allow-Credentials never sent.
-    #[tokio::test]
-    async fn wildcard_allows_any_origin_and_no_origin_without_credentials() {
-        let (app, _auth_cache, _dir) = make_app(cors_cfg(&["*"]), false).await;
+    #[test]
+    fn wildcard_allows_any_origin_and_no_origin_without_credentials() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(cors_cfg(&["*"]), false).await;
 
-        let with_origin = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("origin", "https://anything.example")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(acao(&with_origin), Some("*"));
-        assert!(with_origin.headers().get("access-control-allow-credentials").is_none());
+            let with_origin = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header("origin", "https://anything.example")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(acao(&with_origin), Some("*"));
+            assert!(with_origin.headers().get("access-control-allow-credentials").is_none());
 
-        let without_origin = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(acao(&without_origin), Some("*"));
-        assert!(without_origin.headers().get("access-control-allow-credentials").is_none());
+            let without_origin = app
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(acao(&without_origin), Some("*"));
+            assert!(without_origin.headers().get("access-control-allow-credentials").is_none());
+        })
     }
 }

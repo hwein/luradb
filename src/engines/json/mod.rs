@@ -586,125 +586,145 @@ mod tests {
     }
 
     // 1. Bootstrap creates a working second LSM instance (put/get roundtrip).
-    #[tokio::test]
-    async fn test_bootstrap_put_get_roundtrip() {
-        let (json, _dir) = make_engine().await;
-        json.engine().put(b"doc:1", b"{}").await.unwrap();
-        let snap = json.engine().snapshot();
-        let got = json
-            .engine()
-            .get_with_snapshot(b"doc:1", snap.snapshot())
-            .await
-            .unwrap()
-            .into_option();
-        assert_eq!(got, Some(b"{}".to_vec()));
-        json.shutdown().await;
+    #[test]
+    fn test_bootstrap_put_get_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.engine().put(b"doc:1", b"{}").await.unwrap();
+            let snap = json.engine().snapshot();
+            let got = json
+                .engine()
+                .get_with_snapshot(b"doc:1", snap.snapshot())
+                .await
+                .unwrap()
+                .into_option();
+            assert_eq!(got, Some(b"{}".to_vec()));
+            json.shutdown().await;
+        })
     }
 
     // 2. Bootstrap creates the sstable directory if it does not exist.
-    #[tokio::test]
-    async fn test_bootstrap_creates_sstable_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sstable_dir = dir.path().join("nested").join("sstables");
-        let config = JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: sstable_dir.to_string_lossy().into_owned(),
-            ..JsonStoreConfig::default()
-        };
-        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
-        assert!(sstable_dir.is_dir());
-        json.shutdown().await;
+    #[test]
+    fn test_bootstrap_creates_sstable_dir() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sstable_dir = dir.path().join("nested").join("sstables");
+            let config = JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: sstable_dir.to_string_lossy().into_owned(),
+                ..JsonStoreConfig::default()
+            };
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+            assert!(sstable_dir.is_dir());
+            json.shutdown().await;
+        })
     }
 
     // 3. create_document → get_document returns identical content.
-    #[tokio::test]
-    async fn test_create_then_get_roundtrip() {
-        let (json, _dir) = make_engine().await;
-        json.create_domain("people").await.unwrap();
-        let content = json!({"name": "Ada", "tags": ["a", "b"], "age": 42});
-        let doc = json.create_document("people", content.clone()).await.unwrap();
-        assert_eq!(doc.version, 1);
-        let fetched = json.get_document("people", &doc.key).await.unwrap().unwrap();
-        assert_eq!(fetched.content, content);
-        assert_eq!(fetched.version, 1);
-        assert_eq!(fetched.domain, "people");
+    #[test]
+    fn test_create_then_get_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_domain("people").await.unwrap();
+            let content = json!({"name": "Ada", "tags": ["a", "b"], "age": 42});
+            let doc = json.create_document("people", content.clone()).await.unwrap();
+            assert_eq!(doc.version, 1);
+            let fetched = json.get_document("people", &doc.key).await.unwrap().unwrap();
+            assert_eq!(fetched.content, content);
+            assert_eq!(fetched.version, 1);
+            assert_eq!(fetched.domain, "people");
+        })
     }
 
     // 4. create_document generates a valid UUIDv4 key.
-    #[tokio::test]
-    async fn test_create_generates_uuid_v4() {
-        let (json, _dir) = make_engine().await;
-        let doc = json.create_document("default", json!({})).await.unwrap();
-        let k = &doc.key;
-        assert_eq!(k.len(), 36);
-        let bytes: Vec<char> = k.chars().collect();
-        for &pos in &[8, 13, 18, 23] {
-            assert_eq!(bytes[pos], '-', "dash expected at {pos} in {k}");
-        }
-        assert_eq!(bytes[14], '4', "version nibble must be 4 in {k}");
-        assert!(matches!(bytes[19], '8' | '9' | 'a' | 'b'), "invalid variant in {k}");
-        assert!(k
-            .chars()
-            .all(|c| c == '-' || c.is_ascii_hexdigit()));
+    #[test]
+    fn test_create_generates_uuid_v4() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let doc = json.create_document("default", json!({})).await.unwrap();
+            let k = &doc.key;
+            assert_eq!(k.len(), 36);
+            let bytes: Vec<char> = k.chars().collect();
+            for &pos in &[8, 13, 18, 23] {
+                assert_eq!(bytes[pos], '-', "dash expected at {pos} in {k}");
+            }
+            assert_eq!(bytes[14], '4', "version nibble must be 4 in {k}");
+            assert!(matches!(bytes[19], '8' | '9' | 'a' | 'b'), "invalid variant in {k}");
+            assert!(k
+                .chars()
+                .all(|c| c == '-' || c.is_ascii_hexdigit()));
+        })
     }
 
     // 5. put_document → get_document returns identical content.
-    #[tokio::test]
-    async fn test_put_then_get_roundtrip() {
-        let (json, _dir) = make_engine().await;
-        json.create_domain("catalog").await.unwrap();
-        let content = json!({"sku": "X-1", "price": 9.99});
-        json.put_document("catalog", "item-1", content.clone()).await.unwrap();
-        let fetched = json.get_document("catalog", "item-1").await.unwrap().unwrap();
-        assert_eq!(fetched.content, content);
-        assert_eq!(fetched.key, "item-1");
+    #[test]
+    fn test_put_then_get_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_domain("catalog").await.unwrap();
+            let content = json!({"sku": "X-1", "price": 9.99});
+            json.put_document("catalog", "item-1", content.clone()).await.unwrap();
+            let fetched = json.get_document("catalog", "item-1").await.unwrap().unwrap();
+            assert_eq!(fetched.content, content);
+            assert_eq!(fetched.key, "item-1");
+        })
     }
 
     // 6. put_document twice increments the version.
-    #[tokio::test]
-    async fn test_put_twice_increments_version() {
-        let (json, _dir) = make_engine().await;
-        let v1 = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
-        assert_eq!(v1.version, 1);
-        let v2 = json.put_document("default", "k", json!({"n": 2})).await.unwrap();
-        assert_eq!(v2.version, 2);
-        let fetched = json.get_document("default", "k").await.unwrap().unwrap();
-        assert_eq!(fetched.version, 2);
-        assert_eq!(fetched.content, json!({"n": 2}));
+    #[test]
+    fn test_put_twice_increments_version() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let v1 = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+            assert_eq!(v1.version, 1);
+            let v2 = json.put_document("default", "k", json!({"n": 2})).await.unwrap();
+            assert_eq!(v2.version, 2);
+            let fetched = json.get_document("default", "k").await.unwrap().unwrap();
+            assert_eq!(fetched.version, 2);
+            assert_eq!(fetched.content, json!({"n": 2}));
+        })
     }
 
     // 7. delete_document → get_document returns None.
-    #[tokio::test]
-    async fn test_delete_then_get_none() {
-        let (json, _dir) = make_engine().await;
-        json.put_document("default", "gone", json!({})).await.unwrap();
-        assert!(json.delete_document("default", "gone").await.unwrap());
-        assert!(json.get_document("default", "gone").await.unwrap().is_none());
+    #[test]
+    fn test_delete_then_get_none() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.put_document("default", "gone", json!({})).await.unwrap();
+            assert!(json.delete_document("default", "gone").await.unwrap());
+            assert!(json.get_document("default", "gone").await.unwrap().is_none());
+        })
     }
 
     // 8. delete_document on a missing key returns false.
-    #[tokio::test]
-    async fn test_delete_missing_returns_false() {
-        let (json, _dir) = make_engine().await;
-        assert!(!json.delete_document("default", "never-existed").await.unwrap());
+    #[test]
+    fn test_delete_missing_returns_false() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            assert!(!json.delete_document("default", "never-existed").await.unwrap());
+        })
     }
 
     // 9. Empty key is rejected with InvalidKey.
-    #[tokio::test]
-    async fn test_empty_key_rejected() {
-        let (json, _dir) = make_engine().await;
-        let err = json.put_document("default", "", json!({})).await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+    #[test]
+    fn test_empty_key_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let err = json.put_document("default", "", json!({})).await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+        })
     }
 
     // 10. Key containing a colon is rejected with InvalidKey.
-    #[tokio::test]
-    async fn test_colon_key_rejected() {
-        let (json, _dir) = make_engine().await;
-        let err = json.put_document("default", "a:b", json!({})).await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+    #[test]
+    fn test_colon_key_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let err = json.put_document("default", "a:b", json!({})).await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+        })
     }
 
     // 10b. A document with a reserved top-level field smuggled in before
@@ -712,341 +732,381 @@ mod tests {
     //      create_document/put_document_with_version) stays readable via
     //      get_document -- overshadowed, no new read error (spec json/017
     //      §3 test 6; no migration/scan step for existing data).
-    #[tokio::test]
-    async fn test_legacy_document_with_reserved_field_stays_readable() {
-        let (json, _dir) = make_engine().await;
-        let dom = json.get_domain("default").unwrap();
-        let stored = StoredDocument {
-            version: 1,
-            generation: new_generation(),
-            content: json!({"_key": "smuggled", "x": 1}),
-        };
-        let payload = serde_json::to_vec(&stored).unwrap();
-        json.engine()
-            .write_batch(vec![BatchOp::Put { key: doc_key(&dom.system_prefix, "legacy"), value: payload }])
-            .await
-            .unwrap();
+    #[test]
+    fn test_legacy_document_with_reserved_field_stays_readable() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let dom = json.get_domain("default").unwrap();
+            let stored = StoredDocument {
+                version: 1,
+                generation: new_generation(),
+                content: json!({"_key": "smuggled", "x": 1}),
+            };
+            let payload = serde_json::to_vec(&stored).unwrap();
+            json.engine()
+                .write_batch(vec![BatchOp::Put { key: doc_key(&dom.system_prefix, "legacy"), value: payload }])
+                .await
+                .unwrap();
 
-        let fetched = json.get_document("default", "legacy").await.unwrap().unwrap();
-        assert_eq!(fetched.content, json!({"_key": "smuggled", "x": 1}));
+            let fetched = json.get_document("default", "legacy").await.unwrap().unwrap();
+            assert_eq!(fetched.content, json!({"_key": "smuggled", "x": 1}));
+        })
     }
 
     // 11. Domain create → get_domain returns it.
-    #[tokio::test]
-    async fn test_create_and_get_domain() {
-        let (json, _dir) = make_engine().await;
-        let created = json.create_domain("alpha").await.unwrap();
-        assert_eq!(created.system_prefix.len(), 16);
-        let fetched = json.get_domain("alpha").unwrap();
-        assert_eq!(fetched.name, "alpha");
-        assert_eq!(fetched.system_prefix, created.system_prefix);
+    #[test]
+    fn test_create_and_get_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let created = json.create_domain("alpha").await.unwrap();
+            assert_eq!(created.system_prefix.len(), 16);
+            let fetched = json.get_domain("alpha").unwrap();
+            assert_eq!(fetched.name, "alpha");
+            assert_eq!(fetched.system_prefix, created.system_prefix);
+        })
     }
 
     // 12. Duplicate domain → DomainAlreadyExists.
-    #[tokio::test]
-    async fn test_duplicate_domain_rejected() {
-        let (json, _dir) = make_engine().await;
-        json.create_domain("beta").await.unwrap();
-        let err = json.create_domain("beta").await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::DomainAlreadyExists(_)), "got: {err}");
+    #[test]
+    fn test_duplicate_domain_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_domain("beta").await.unwrap();
+            let err = json.create_domain("beta").await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::DomainAlreadyExists(_)), "got: {err}");
+        })
     }
 
     // 13. Invalid domain names → InvalidDomainName. "domains" is reserved:
     //     the static /json/domains admin routes shadow such a domain.
-    #[tokio::test]
-    async fn test_invalid_domain_name_rejected() {
-        let (json, _dir) = make_engine().await;
-        for bad in ["", "bad name!", "bad/slash", "domains", &"x".repeat(51)] {
-            let err = json.create_domain(bad).await.unwrap_err();
-            assert!(
-                matches!(err, JsonStoreError::InvalidDomainName(_)),
-                "'{bad}' got: {err}"
-            );
-        }
+    #[test]
+    fn test_invalid_domain_name_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            for bad in ["", "bad name!", "bad/slash", "domains", &"x".repeat(51)] {
+                let err = json.create_domain(bad).await.unwrap_err();
+                assert!(
+                    matches!(err, JsonStoreError::InvalidDomainName(_)),
+                    "'{bad}' got: {err}"
+                );
+            }
+        })
     }
 
     // 14. Same key in two domains is isolated.
-    #[tokio::test]
-    async fn test_domain_isolation() {
-        let (json, _dir) = make_engine().await;
-        json.create_domain("tenant-a").await.unwrap();
-        json.create_domain("tenant-b").await.unwrap();
-        json.put_document("tenant-a", "secret", json!({"of": "a"})).await.unwrap();
-        assert!(json.get_document("tenant-b", "secret").await.unwrap().is_none());
+    #[test]
+    fn test_domain_isolation() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_domain("tenant-a").await.unwrap();
+            json.create_domain("tenant-b").await.unwrap();
+            json.put_document("tenant-a", "secret", json!({"of": "a"})).await.unwrap();
+            assert!(json.get_document("tenant-b", "secret").await.unwrap().is_none());
+        })
     }
 
     // 15. put_document into an unknown domain → DomainNotFound.
-    #[tokio::test]
-    async fn test_put_into_unknown_domain_rejected() {
-        let (json, _dir) = make_engine().await;
-        let err = json.put_document("nope", "k", json!({})).await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::DomainNotFound(_)), "got: {err}");
+    #[test]
+    fn test_put_into_unknown_domain_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let err = json.put_document("nope", "k", json!({})).await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::DomainNotFound(_)), "got: {err}");
+        })
     }
 
     // 16. Default domain exists after bootstrap/recovery.
-    #[tokio::test]
-    async fn test_default_domain_exists() {
-        let (json, _dir) = make_engine().await;
-        assert!(json.get_domain("default").is_some());
+    #[test]
+    fn test_default_domain_exists() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            assert!(json.get_domain("default").is_some());
+        })
     }
 
     // 17. list_domains contains all domains; deleting ones carry their state
     //     (spec json/013 supersedes the json/003 hide-behaviour).
-    #[tokio::test]
-    async fn test_list_domains() {
-        let (json, _dir) = make_engine().await;
-        json.create_domain("one").await.unwrap();
-        json.create_domain("two").await.unwrap();
-        json.delete_domain("two").await.unwrap();
-        let domains = json.list_domains();
-        let state_of = |n: &str| domains.iter().find(|d| d.name == n).map(|d| d.state.clone());
-        assert_eq!(state_of("default"), Some(JsonDomainState::Active));
-        assert_eq!(state_of("one"), Some(JsonDomainState::Active));
-        assert_eq!(state_of("two"), Some(JsonDomainState::Deleting));
-        assert!(json.get_domain("two").is_none(), "deleting domain is not resolvable for CRUD");
+    #[test]
+    fn test_list_domains() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_domain("one").await.unwrap();
+            json.create_domain("two").await.unwrap();
+            json.delete_domain("two").await.unwrap();
+            let domains = json.list_domains();
+            let state_of = |n: &str| domains.iter().find(|d| d.name == n).map(|d| d.state.clone());
+            assert_eq!(state_of("default"), Some(JsonDomainState::Active));
+            assert_eq!(state_of("one"), Some(JsonDomainState::Active));
+            assert_eq!(state_of("two"), Some(JsonDomainState::Deleting));
+            assert!(json.get_domain("two").is_none(), "deleting domain is not resolvable for CRUD");
+        })
     }
 
     // 18. create_index → get_indexes returns it.
-    #[tokio::test]
-    async fn test_create_and_get_index() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let defs = json.get_indexes("default").unwrap();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].field, "city");
-        assert_eq!(defs[0].field_type, IndexFieldType::String);
+    #[test]
+    fn test_create_and_get_index() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let defs = json.get_indexes("default").unwrap();
+            assert_eq!(defs.len(), 1);
+            assert_eq!(defs[0].field, "city");
+            assert_eq!(defs[0].field_type, IndexFieldType::String);
+        })
     }
 
     // 19. Duplicate index on the same field → IndexAlreadyExists.
-    #[tokio::test]
-    async fn test_duplicate_index_rejected() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let err = json
-            .create_index("default", "city", IndexFieldType::Number)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::IndexAlreadyExists { .. }), "got: {err}");
+    #[test]
+    fn test_duplicate_index_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let err = json
+                .create_index("default", "city", IndexFieldType::Number)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::IndexAlreadyExists { .. }), "got: {err}");
+        })
     }
 
     // 20. Index on an unknown domain → DomainNotFound.
-    #[tokio::test]
-    async fn test_index_on_unknown_domain_rejected() {
-        let (json, _dir) = make_engine().await;
-        let err = json
-            .create_index("nope", "city", IndexFieldType::String)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::DomainNotFound(_)), "got: {err}");
+    #[test]
+    fn test_index_on_unknown_domain_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let err = json
+                .create_index("nope", "city", IndexFieldType::String)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::DomainNotFound(_)), "got: {err}");
+        })
     }
 
     // 21. delete_index removes the definition.
-    #[tokio::test]
-    async fn test_delete_index() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
-        json.delete_index("default", "age").await.unwrap();
-        assert!(json.get_indexes("default").unwrap().is_empty());
-        let err = json.delete_index("default", "age").await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::IndexNotFound { .. }), "got: {err}");
+    #[test]
+    fn test_delete_index() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
+            json.delete_index("default", "age").await.unwrap();
+            assert!(json.get_indexes("default").unwrap().is_empty());
+            let err = json.delete_index("default", "age").await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::IndexNotFound { .. }), "got: {err}");
+        })
     }
 
     // 22. Index definitions survive an engine restart (recovery).
-    #[tokio::test]
-    async fn test_index_recovery_after_restart() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            ..JsonStoreConfig::default()
-        };
-        {
+    #[test]
+    fn test_index_recovery_after_restart() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+                ..JsonStoreConfig::default()
+            };
+            {
+                let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+                let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+                json.create_domain("persistent").await.unwrap();
+                json.create_index("persistent", "city", IndexFieldType::String).await.unwrap();
+                json.shutdown().await;
+            }
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
             let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
-            json.create_domain("persistent").await.unwrap();
-            json.create_index("persistent", "city", IndexFieldType::String).await.unwrap();
+            assert!(json.get_domain("persistent").is_some(), "domain must survive restart");
+            let defs = json.get_indexes("persistent").unwrap();
+            assert_eq!(defs.len(), 1);
+            assert_eq!(defs[0].field, "city");
             json.shutdown().await;
-        }
-        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
-        assert!(json.get_domain("persistent").is_some(), "domain must survive restart");
-        let defs = json.get_indexes("persistent").unwrap();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].field, "city");
-        json.shutdown().await;
+        })
     }
 
     // 22b. get_indexes_with_snapshot serves the definitions pinned by the
     //      snapshot, so index DDL during a backup export cannot leak into an
     //      archive whose documents come from an earlier point in time.
-    #[tokio::test]
-    async fn test_get_indexes_with_snapshot_ignores_later_ddl() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let snap = json.engine().snapshot();
-        json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
+    #[test]
+    fn test_get_indexes_with_snapshot_ignores_later_ddl() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let snap = json.engine().snapshot();
+            json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
 
-        let defs = json.get_indexes_with_snapshot("default", snap.snapshot()).await.unwrap();
-        assert_eq!(defs.len(), 1, "the index created after the snapshot must not appear");
-        assert_eq!(defs[0].field, "city");
-        assert_eq!(defs[0].field_type, IndexFieldType::String);
-        assert_eq!(json.get_indexes("default").unwrap().len(), 2, "live view sees both");
+            let defs = json.get_indexes_with_snapshot("default", snap.snapshot()).await.unwrap();
+            assert_eq!(defs.len(), 1, "the index created after the snapshot must not appear");
+            assert_eq!(defs[0].field, "city");
+            assert_eq!(defs[0].field_type, IndexFieldType::String);
+            assert_eq!(json.get_indexes("default").unwrap().len(), 2, "live view sees both");
+        })
     }
 
     // ── Optimistic concurrency (spec json/011) ───────────────────────────────
 
     // 30. Conditional update with the correct version succeeds; the
     //     generation stays stable across updates.
-    #[tokio::test]
-    async fn test_occ_correct_version_succeeds() {
-        let (json, _dir) = make_engine().await;
-        let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
-        let doc = json
-            .put_document_with_version(
-                "default",
-                "k",
-                json!({"n": 2}),
-                Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
-            )
-            .await
-            .unwrap();
-        assert_eq!(doc.version, 2);
-        assert_eq!(doc.generation, created.generation);
+    #[test]
+    fn test_occ_correct_version_succeeds() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+            let doc = json
+                .put_document_with_version(
+                    "default",
+                    "k",
+                    json!({"n": 2}),
+                    Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
+                )
+                .await
+                .unwrap();
+            assert_eq!(doc.version, 2);
+            assert_eq!(doc.generation, created.generation);
+        })
     }
 
     // 31. Wrong expected version → VersionConflict with actual ETag value.
-    #[tokio::test]
-    async fn test_occ_wrong_version_conflicts() {
-        let (json, _dir) = make_engine().await;
-        let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
-        json.put_document("default", "k", json!({"n": 2})).await.unwrap();
-        let err = json
-            .put_document_with_version(
-                "default",
-                "k",
-                json!({"n": 3}),
-                Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
-            )
-            .await
-            .unwrap_err();
-        match err {
-            JsonStoreError::VersionConflict { expected, actual } => {
-                assert_eq!(expected, etag_value(created.generation, 1));
-                assert_eq!(actual, etag_value(created.generation, 2));
+    #[test]
+    fn test_occ_wrong_version_conflicts() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+            json.put_document("default", "k", json!({"n": 2})).await.unwrap();
+            let err = json
+                .put_document_with_version(
+                    "default",
+                    "k",
+                    json!({"n": 3}),
+                    Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
+                )
+                .await
+                .unwrap_err();
+            match err {
+                JsonStoreError::VersionConflict { expected, actual } => {
+                    assert_eq!(expected, etag_value(created.generation, 1));
+                    assert_eq!(actual, etag_value(created.generation, 2));
+                }
+                other => panic!("got: {other}"),
             }
-            other => panic!("got: {other}"),
-        }
-        let unchanged = json.get_document("default", "k").await.unwrap().unwrap();
-        assert_eq!(unchanged.content, json!({"n": 2}));
+            let unchanged = json.get_document("default", "k").await.unwrap().unwrap();
+            assert_eq!(unchanged.content, json!({"n": 2}));
+        })
     }
 
     // 32. Conditional update on a missing document → DocumentNotFound.
-    #[tokio::test]
-    async fn test_occ_missing_document() {
-        let (json, _dir) = make_engine().await;
-        let err = json
-            .put_document_with_version(
-                "default",
-                "nope",
-                json!({}),
-                Some(Precondition::IfMatch(ExpectedVersion { generation: 0, version: 1 })),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::DocumentNotFound { .. }), "got: {err}");
+    #[test]
+    fn test_occ_missing_document() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let err = json
+                .put_document_with_version(
+                    "default",
+                    "nope",
+                    json!({}),
+                    Some(Precondition::IfMatch(ExpectedVersion { generation: 0, version: 1 })),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::DocumentNotFound { .. }), "got: {err}");
+        })
     }
 
     // 33. Two parallel conditional updates → exactly one wins.
-    #[tokio::test]
-    async fn test_occ_parallel_updates_single_winner() {
-        let (json, _dir) = make_engine().await;
-        let created = json.put_document("default", "k", json!({"n": 0})).await.unwrap();
-        let expected = ExpectedVersion { generation: created.generation, version: 1 };
-        let tasks: Vec<_> = (0..2)
-            .map(|i| {
-                let engine = Arc::clone(&json);
-                tokio::spawn(async move {
-                    engine
-                        .put_document_with_version(
-                            "default",
-                            "k",
-                            json!({"winner": i}),
-                            Some(Precondition::IfMatch(expected)),
-                        )
-                        .await
+    #[test]
+    fn test_occ_parallel_updates_single_winner() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let created = json.put_document("default", "k", json!({"n": 0})).await.unwrap();
+            let expected = ExpectedVersion { generation: created.generation, version: 1 };
+            let tasks: Vec<_> = (0..2)
+                .map(|i| {
+                    let engine = Arc::clone(&json);
+                    compio::runtime::spawn(async move {
+                        engine
+                            .put_document_with_version(
+                                "default",
+                                "k",
+                                json!({"winner": i}),
+                                Some(Precondition::IfMatch(expected)),
+                            )
+                            .await
+                    })
                 })
-            })
-            .collect();
-        let mut ok = 0;
-        let mut conflicts = 0;
-        for t in tasks {
-            match t.await.unwrap() {
-                Ok(_) => ok += 1,
-                Err(JsonStoreError::VersionConflict { .. }) => conflicts += 1,
-                Err(e) => panic!("unexpected error: {e}"),
+                .collect();
+            let mut ok = 0;
+            let mut conflicts = 0;
+            for t in tasks {
+                match t.await.unwrap() {
+                    Ok(_) => ok += 1,
+                    Err(JsonStoreError::VersionConflict { .. }) => conflicts += 1,
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
             }
-        }
-        assert_eq!(ok, 1);
-        assert_eq!(conflicts, 1);
+            assert_eq!(ok, 1);
+            assert_eq!(conflicts, 1);
+        })
     }
 
     // 34. Conditional delete: correct version succeeds, wrong version conflicts.
-    #[tokio::test]
-    async fn test_occ_conditional_delete() {
-        let (json, _dir) = make_engine().await;
-        let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
-        json.put_document("default", "k", json!({"n": 2})).await.unwrap();
-        let generation = created.generation;
-        let err = json
-            .delete_document_with_version(
-                "default",
-                "k",
-                Some(ExpectedVersion { generation, version: 1 }),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
-        assert!(json
-            .delete_document_with_version(
-                "default",
-                "k",
-                Some(ExpectedVersion { generation, version: 2 }),
-            )
-            .await
-            .unwrap());
-        assert!(json.get_document("default", "k").await.unwrap().is_none());
+    #[test]
+    fn test_occ_conditional_delete() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+            json.put_document("default", "k", json!({"n": 2})).await.unwrap();
+            let generation = created.generation;
+            let err = json
+                .delete_document_with_version(
+                    "default",
+                    "k",
+                    Some(ExpectedVersion { generation, version: 1 }),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
+            assert!(json
+                .delete_document_with_version(
+                    "default",
+                    "k",
+                    Some(ExpectedVersion { generation, version: 2 }),
+                )
+                .await
+                .unwrap());
+            assert!(json.get_document("default", "k").await.unwrap().is_none());
+        })
     }
 
     // 38. ABA guard: a stale ExpectedVersion of a deleted incarnation must
     //     not match the recreated document, even though both are version 1.
-    #[tokio::test]
-    async fn test_occ_stale_version_after_delete_recreate() {
-        let (json, _dir) = make_engine().await;
-        let old_doc = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
-        let stale =
-            ExpectedVersion { generation: old_doc.generation, version: old_doc.version };
-        assert!(json.delete_document("default", "k").await.unwrap());
+    #[test]
+    fn test_occ_stale_version_after_delete_recreate() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let old_doc = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+            let stale =
+                ExpectedVersion { generation: old_doc.generation, version: old_doc.version };
+            assert!(json.delete_document("default", "k").await.unwrap());
 
-        let new_doc = json.put_document("default", "k", json!({"n": 2})).await.unwrap();
-        assert_eq!(new_doc.version, 1);
-        assert_ne!(
-            new_doc.generation, old_doc.generation,
-            "recreate must roll a fresh generation"
-        );
+            let new_doc = json.put_document("default", "k", json!({"n": 2})).await.unwrap();
+            assert_eq!(new_doc.version, 1);
+            assert_ne!(
+                new_doc.generation, old_doc.generation,
+                "recreate must roll a fresh generation"
+            );
 
-        let err = json
-            .put_document_with_version("default", "k", json!({"n": 3}), Some(Precondition::IfMatch(stale)))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
-        let err = json
-            .delete_document_with_version("default", "k", Some(stale))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
-        let unchanged = json.get_document("default", "k").await.unwrap().unwrap();
-        assert_eq!(unchanged.content, json!({"n": 2}), "lost update must not happen");
+            let err = json
+                .put_document_with_version("default", "k", json!({"n": 3}), Some(Precondition::IfMatch(stale)))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
+            let err = json
+                .delete_document_with_version("default", "k", Some(stale))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
+            let unchanged = json.get_document("default", "k").await.unwrap().unwrap();
+            assert_eq!(unchanged.content, json!({"n": 2}), "lost update must not happen");
+        })
     }
 
     // ── Create-only precondition (spec json/014) ─────────────────────────────
@@ -1054,92 +1114,98 @@ mod tests {
     // 39. Two parallel create-only-PUTs on the same free key → exactly one
     //     creates, the other sees DocumentAlreadyExists; the key's write
     //     shard serializes the race (pattern: test 33 for json/011).
-    #[tokio::test]
-    async fn test_create_only_parallel_puts_single_winner() {
-        let (json, _dir) = make_engine().await;
-        let tasks: Vec<_> = (0..2)
-            .map(|i| {
-                let engine = Arc::clone(&json);
-                tokio::spawn(async move {
-                    engine
-                        .put_document_with_version(
-                            "default",
-                            "k",
-                            json!({"winner": i}),
-                            Some(Precondition::MustNotExist),
-                        )
-                        .await
+    #[test]
+    fn test_create_only_parallel_puts_single_winner() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let tasks: Vec<_> = (0..2)
+                .map(|i| {
+                    let engine = Arc::clone(&json);
+                    compio::runtime::spawn(async move {
+                        engine
+                            .put_document_with_version(
+                                "default",
+                                "k",
+                                json!({"winner": i}),
+                                Some(Precondition::MustNotExist),
+                            )
+                            .await
+                    })
                 })
-            })
-            .collect();
-        let mut created = 0;
-        let mut exists = 0;
-        for t in tasks {
-            match t.await.unwrap() {
-                Ok(doc) => {
-                    assert_eq!(doc.version, 1);
-                    created += 1;
+                .collect();
+            let mut created = 0;
+            let mut exists = 0;
+            for t in tasks {
+                match t.await.unwrap() {
+                    Ok(doc) => {
+                        assert_eq!(doc.version, 1);
+                        created += 1;
+                    }
+                    Err(JsonStoreError::DocumentAlreadyExists { .. }) => exists += 1,
+                    Err(e) => panic!("unexpected error: {e}"),
                 }
-                Err(JsonStoreError::DocumentAlreadyExists { .. }) => exists += 1,
-                Err(e) => panic!("unexpected error: {e}"),
             }
-        }
-        assert_eq!(created, 1);
-        assert_eq!(exists, 1);
+            assert_eq!(created, 1);
+            assert_eq!(exists, 1);
+        })
     }
 
     // ── Sharded document-write locks (spec json/018) ─────────────────────────
 
     // 40. A held write shard blocks only keys of that shard: a put on a key
     //     of another shard runs through, one on the same shard waits.
-    #[tokio::test]
-    async fn test_writes_serialize_per_shard_only() {
-        let (json, _dir) = make_engine().await;
-        let held = JsonEngine::shard("default", "anchor");
-        let other_shard_key = (0..)
-            .map(|i| format!("o{i}"))
-            .find(|k| JsonEngine::shard("default", k) != held)
-            .unwrap();
-        let same_shard_key = (0..)
-            .map(|i| format!("s{i}"))
-            .find(|k| JsonEngine::shard("default", k) == held)
-            .unwrap();
+    #[test]
+    fn test_writes_serialize_per_shard_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let held = JsonEngine::shard("default", "anchor");
+            let other_shard_key = (0..)
+                .map(|i| format!("o{i}"))
+                .find(|k| JsonEngine::shard("default", k) != held)
+                .unwrap();
+            let same_shard_key = (0..)
+                .map(|i| format!("s{i}"))
+                .find(|k| JsonEngine::shard("default", k) == held)
+                .unwrap();
 
-        let guard = json.doc_write_locks[held].lock().await;
+            let guard = json.doc_write_locks[held].lock().await;
 
-        let free = tokio::spawn({
-            let json = Arc::clone(&json);
-            async move { json.put_document("default", &other_shard_key, json!({"n": 1})).await }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(5), free)
-            .await
-            .expect("a key of another shard must not wait")
-            .unwrap()
-            .unwrap();
+            let free = compio::runtime::spawn({
+                let json = Arc::clone(&json);
+                async move { json.put_document("default", &other_shard_key, json!({"n": 1})).await }
+            });
+            compio::time::timeout(std::time::Duration::from_secs(5), free)
+                .await
+                .expect("a key of another shard must not wait")
+                .unwrap()
+                .unwrap();
 
-        let parked = tokio::spawn({
-            let json = Arc::clone(&json);
-            async move { json.put_document("default", &same_shard_key, json!({"n": 2})).await }
-        });
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!parked.is_finished(), "a key of the held shard must wait");
-        drop(guard);
-        parked.await.unwrap().unwrap();
+            let parked = compio::runtime::spawn({
+                let json = Arc::clone(&json);
+                async move { json.put_document("default", &same_shard_key, json!({"n": 2})).await }
+            });
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!parked.is_finished(), "a key of the held shard must wait");
+            drop(guard);
+            parked.await.unwrap().unwrap();
+        })
     }
 
     // 41. The same document reference always maps to the same shard, and the
     //     domain is part of the hash (no forced collision across domains).
-    #[tokio::test]
-    async fn test_shard_is_stable_and_domain_aware() {
-        assert_eq!(JsonEngine::shard("a", "k"), JsonEngine::shard("a", "k"));
-        assert!((0..DOC_WRITE_SHARDS).contains(&JsonEngine::shard("a", "k")));
-        let differs = (0..64).any(|i| {
-            let key = format!("k{i}");
-            JsonEngine::shard("a", &key) != JsonEngine::shard("b", &key)
-        });
-        assert!(differs, "domain must feed the hash");
+    #[test]
+    fn test_shard_is_stable_and_domain_aware() {
+        crate::core::engine_runtime::block_on(async {
+            assert_eq!(JsonEngine::shard("a", "k"), JsonEngine::shard("a", "k"));
+            assert!((0..DOC_WRITE_SHARDS).contains(&JsonEngine::shard("a", "k")));
+            let differs = (0..64).any(|i| {
+                let key = format!("k{i}");
+                JsonEngine::shard("a", &key) != JsonEngine::shard("b", &key)
+            });
+            assert!(differs, "domain must feed the hash");
+        })
     }
 
     // ── Synchronous indexing (spec json/005) ─────────────────────────────────
@@ -1156,296 +1222,328 @@ mod tests {
     }
 
     // 23. put_document writes an IDX entry (verified via raw LSM lookup).
-    #[tokio::test]
-    async fn test_put_creates_index_entry() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
-        let prefix = default_prefix(&json).await;
-        let idx = index::index_key(&prefix, "city", b"Essen", "u1");
-        assert!(json.engine().get(&idx).await.unwrap().is_some());
+    #[test]
+    fn test_put_creates_index_entry() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
+            let prefix = default_prefix(&json).await;
+            let idx = index::index_key(&prefix, "city", b"Essen", "u1");
+            assert!(json.engine().get(&idx).await.unwrap().is_some());
+        })
     }
 
     // 24. Update replaces the stale index entry with the new one.
-    #[tokio::test]
-    async fn test_update_swaps_index_entry() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
-        json.put_document("default", "u1", json!({"city": "Berlin"})).await.unwrap();
-        let prefix = default_prefix(&json).await;
-        let old_idx = index::index_key(&prefix, "city", b"Essen", "u1");
-        let new_idx = index::index_key(&prefix, "city", b"Berlin", "u1");
-        assert!(json.engine().get(&old_idx).await.unwrap().is_none(), "stale entry must be gone");
-        assert!(json.engine().get(&new_idx).await.unwrap().is_some());
+    #[test]
+    fn test_update_swaps_index_entry() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
+            json.put_document("default", "u1", json!({"city": "Berlin"})).await.unwrap();
+            let prefix = default_prefix(&json).await;
+            let old_idx = index::index_key(&prefix, "city", b"Essen", "u1");
+            let new_idx = index::index_key(&prefix, "city", b"Berlin", "u1");
+            assert!(json.engine().get(&old_idx).await.unwrap().is_none(), "stale entry must be gone");
+            assert!(json.engine().get(&new_idx).await.unwrap().is_some());
+        })
     }
 
     // 25. delete_document removes the index entry.
-    #[tokio::test]
-    async fn test_delete_removes_index_entry() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
-        json.delete_document("default", "u1").await.unwrap();
-        let prefix = default_prefix(&json).await;
-        assert!(scan_field(&json, &prefix, "city").await.is_empty());
-        assert!(json.get_document("default", "u1").await.unwrap().is_none());
+    #[test]
+    fn test_delete_removes_index_entry() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
+            json.delete_document("default", "u1").await.unwrap();
+            let prefix = default_prefix(&json).await;
+            assert!(scan_field(&json, &prefix, "city").await.is_empty());
+            assert!(json.get_document("default", "u1").await.unwrap().is_none());
+        })
     }
 
     // 26. Missing indexed field → no entry, no error.
-    #[tokio::test]
-    async fn test_missing_field_not_indexed() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("default", "u1", json!({"name": "Ada"})).await.unwrap();
-        let prefix = default_prefix(&json).await;
-        assert!(scan_field(&json, &prefix, "city").await.is_empty());
+    #[test]
+    fn test_missing_field_not_indexed() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("default", "u1", json!({"name": "Ada"})).await.unwrap();
+            let prefix = default_prefix(&json).await;
+            assert!(scan_field(&json, &prefix, "city").await.is_empty());
+        })
     }
 
     // 27. null in the indexed field → no entry.
-    #[tokio::test]
-    async fn test_null_field_not_indexed() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("default", "u1", json!({"city": null})).await.unwrap();
-        let prefix = default_prefix(&json).await;
-        assert!(scan_field(&json, &prefix, "city").await.is_empty());
+    #[test]
+    fn test_null_field_not_indexed() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("default", "u1", json!({"city": null})).await.unwrap();
+            let prefix = default_prefix(&json).await;
+            assert!(scan_field(&json, &prefix, "city").await.is_empty());
+        })
     }
 
     // 28. Empty string is a valid indexed value.
-    #[tokio::test]
-    async fn test_empty_string_indexed() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("default", "u1", json!({"city": ""})).await.unwrap();
-        let prefix = default_prefix(&json).await;
-        let idx = index::index_key(&prefix, "city", b"", "u1");
-        assert!(json.engine().get(&idx).await.unwrap().is_some());
+    #[test]
+    fn test_empty_string_indexed() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("default", "u1", json!({"city": ""})).await.unwrap();
+            let prefix = default_prefix(&json).await;
+            let idx = index::index_key(&prefix, "city", b"", "u1");
+            assert!(json.engine().get(&idx).await.unwrap().is_some());
+        })
     }
 
     // 29. Multiple indexes per domain are all maintained.
-    #[tokio::test]
-    async fn test_multiple_indexes_maintained() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
-        json.put_document("default", "u1", json!({"city": "Essen", "age": 30})).await.unwrap();
-        let prefix = default_prefix(&json).await;
-        let age30 = index::encode_index_value(&json!(30), IndexFieldType::Number).unwrap();
-        assert!(json.engine().get(&index::index_key(&prefix, "city", b"Essen", "u1")).await.unwrap().is_some());
-        assert!(json.engine().get(&index::index_key(&prefix, "age", &age30, "u1")).await.unwrap().is_some());
+    #[test]
+    fn test_multiple_indexes_maintained() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
+            json.put_document("default", "u1", json!({"city": "Essen", "age": 30})).await.unwrap();
+            let prefix = default_prefix(&json).await;
+            let age30 = index::encode_index_value(&json!(30), IndexFieldType::Number).unwrap();
+            assert!(json.engine().get(&index::index_key(&prefix, "city", b"Essen", "u1")).await.unwrap().is_some());
+            assert!(json.engine().get(&index::index_key(&prefix, "age", &age30, "u1")).await.unwrap().is_some());
 
-        json.put_document("default", "u1", json!({"city": "Essen", "age": 31})).await.unwrap();
-        let age31 = index::encode_index_value(&json!(31), IndexFieldType::Number).unwrap();
-        assert!(json.engine().get(&index::index_key(&prefix, "age", &age30, "u1")).await.unwrap().is_none());
-        assert!(json.engine().get(&index::index_key(&prefix, "age", &age31, "u1")).await.unwrap().is_some());
-        assert!(json.engine().get(&index::index_key(&prefix, "city", b"Essen", "u1")).await.unwrap().is_some(), "unchanged field entry must survive");
+            json.put_document("default", "u1", json!({"city": "Essen", "age": 31})).await.unwrap();
+            let age31 = index::encode_index_value(&json!(31), IndexFieldType::Number).unwrap();
+            assert!(json.engine().get(&index::index_key(&prefix, "age", &age30, "u1")).await.unwrap().is_none());
+            assert!(json.engine().get(&index::index_key(&prefix, "age", &age31, "u1")).await.unwrap().is_some());
+            assert!(json.engine().get(&index::index_key(&prefix, "city", b"Essen", "u1")).await.unwrap().is_some(), "unchanged field entry must survive");
 
-        json.delete_document("default", "u1").await.unwrap();
-        assert!(scan_field(&json, &prefix, "city").await.is_empty());
-        assert!(scan_field(&json, &prefix, "age").await.is_empty());
+            json.delete_document("default", "u1").await.unwrap();
+            assert!(scan_field(&json, &prefix, "city").await.is_empty());
+            assert!(scan_field(&json, &prefix, "age").await.is_empty());
+        })
     }
 
     // 35. delete_index tombstones the field's IDX entries; other fields keep theirs.
-    #[tokio::test]
-    async fn test_delete_index_tombstones_entries() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
-        json.put_document("default", "u1", json!({"city": "Essen", "age": 30})).await.unwrap();
-        json.delete_index("default", "city").await.unwrap();
-        let prefix = default_prefix(&json).await;
-        assert!(scan_field(&json, &prefix, "city").await.is_empty(), "IDX entries must be gone");
-        assert_eq!(scan_field(&json, &prefix, "age").await.len(), 1, "other index untouched");
+    #[test]
+    fn test_delete_index_tombstones_entries() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.create_index("default", "age", IndexFieldType::Number).await.unwrap();
+            json.put_document("default", "u1", json!({"city": "Essen", "age": 30})).await.unwrap();
+            json.delete_index("default", "city").await.unwrap();
+            let prefix = default_prefix(&json).await;
+            assert!(scan_field(&json, &prefix, "city").await.is_empty(), "IDX entries must be gone");
+            assert_eq!(scan_field(&json, &prefix, "age").await.len(), 1, "other index untouched");
+        })
     }
 
     // 36. Keys valid per config but too long for the composite LSM key are
     //     rejected upfront with InvalidKey (400), not StorageError (500);
     //     keys at the effective limit still work.
-    #[tokio::test]
-    async fn test_overlong_key_invalid_key_not_storage_error() {
-        let (json, _dir) = make_engine().await;
-        let err = json
-            .put_document("default", &"x".repeat(240), json!({}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
-        // 235 + 21 bytes overhead = LSM limit 256 → still valid.
-        json.put_document("default", &"x".repeat(235), json!({})).await.unwrap();
+    #[test]
+    fn test_overlong_key_invalid_key_not_storage_error() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let err = json
+                .put_document("default", &"x".repeat(240), json!({}))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+            // 235 + 21 bytes overhead = LSM limit 256 → still valid.
+            json.put_document("default", &"x".repeat(235), json!({})).await.unwrap();
+        })
     }
 
     // 36b. Documents stored under a key that a later config lowers below
     //      stay readable through the snapshot path: the backup export feeds
     //      back keys the engine itself produced, so re-validating them would
     //      abort every export of the domain. The live path keeps validating.
-    #[tokio::test]
-    async fn test_snapshot_read_ignores_lowered_key_limit() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            ..JsonStoreConfig::default()
-        };
-        let long_key = "k".repeat(100);
-        {
+    #[test]
+    fn test_snapshot_read_ignores_lowered_key_limit() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+                ..JsonStoreConfig::default()
+            };
+            let long_key = "k".repeat(100);
+            {
+                let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+                let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+                json.put_document("default", &long_key, json!({"n": 1})).await.unwrap();
+                json.shutdown().await;
+            }
+            let lowered = JsonStoreConfig {
+                lsm: crate::config::JsonLsmConfig { max_key_length: 32 + DOC_KEY_OVERHEAD, ..config.lsm },
+                ..config
+            };
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
-            json.put_document("default", &long_key, json!({"n": 1})).await.unwrap();
+            let json = JsonEngine::bootstrap(&lowered, metrics).await.unwrap();
+            let snap = json.engine().snapshot();
+            let doc = json
+                .get_document_with_snapshot("default", &long_key, snap.snapshot())
+                .await
+                .unwrap()
+                .expect("the stored document must stay exportable");
+            assert_eq!(doc.content, json!({"n": 1}));
+            assert!(
+                matches!(json.get_document("default", &long_key).await, Err(JsonStoreError::InvalidKey(_))),
+                "caller input on the live path is still validated"
+            );
             json.shutdown().await;
-        }
-        let lowered = JsonStoreConfig {
-            lsm: crate::config::JsonLsmConfig { max_key_length: 32 + DOC_KEY_OVERHEAD, ..config.lsm },
-            ..config
-        };
-        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let json = JsonEngine::bootstrap(&lowered, metrics).await.unwrap();
-        let snap = json.engine().snapshot();
-        let doc = json
-            .get_document_with_snapshot("default", &long_key, snap.snapshot())
-            .await
-            .unwrap()
-            .expect("the stored document must stay exportable");
-        assert_eq!(doc.content, json!({"n": 1}));
-        assert!(
-            matches!(json.get_document("default", &long_key).await, Err(JsonStoreError::InvalidKey(_))),
-            "caller input on the live path is still validated"
-        );
-        json.shutdown().await;
+        })
     }
 
     // 37. create_document with an effective key limit below the UUID length
     //     fails with a clear InvalidKey error instead of writing documents
     //     unreachable via get/put/delete.
-    #[tokio::test]
-    async fn test_create_document_rejects_too_small_key_limit() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            lsm: crate::config::JsonLsmConfig { max_key_length: 20 + DOC_KEY_OVERHEAD, ..Default::default() },
-            ..JsonStoreConfig::default()
-        };
-        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
-        let err = json.create_document("default", json!({})).await.unwrap_err();
-        assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
-        json.shutdown().await;
+    #[test]
+    fn test_create_document_rejects_too_small_key_limit() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+                lsm: crate::config::JsonLsmConfig { max_key_length: 20 + DOC_KEY_OVERHEAD, ..Default::default() },
+                ..JsonStoreConfig::default()
+            };
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+            let err = json.create_document("default", json!({})).await.unwrap_err();
+            assert!(matches!(err, JsonStoreError::InvalidKey(_)), "got: {err}");
+            json.shutdown().await;
+        })
     }
 
     // Spec general/030 test 6: with both LSM limits at their startup lower
     // bounds, a domain with a maximal name and a document with a 1-byte key work.
-    #[tokio::test]
-    async fn test_lsm_limits_at_lower_bounds_still_work() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-            lsm: crate::config::JsonLsmConfig {
-                max_key_length: domain::MIN_LSM_KEY_LENGTH,
-                max_value_size: crate::config::JSON_LSM_MIN_VALUE_SIZE,
-            },
-            ..JsonStoreConfig::default()
-        };
-        config.validate().unwrap();
-        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+    #[test]
+    fn test_lsm_limits_at_lower_bounds_still_work() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+                lsm: crate::config::JsonLsmConfig {
+                    max_key_length: domain::MIN_LSM_KEY_LENGTH,
+                    max_value_size: crate::config::JSON_LSM_MIN_VALUE_SIZE,
+                },
+                ..JsonStoreConfig::default()
+            };
+            config.validate().unwrap();
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
 
-        let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
-        json.create_domain(&domain).await.unwrap();
-        json.put_document(&domain, "a", json!({"n": 1})).await.unwrap();
-        let doc = json.get_document(&domain, "a").await.unwrap().expect("document stored");
-        assert_eq!(doc.content, json!({"n": 1}));
-        json.shutdown().await;
+            let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
+            json.create_domain(&domain).await.unwrap();
+            json.put_document(&domain, "a", json!({"n": 1})).await.unwrap();
+            let doc = json.get_document(&domain, "a").await.unwrap().expect("document stored");
+            assert_eq!(doc.content, json!({"n": 1}));
+            json.shutdown().await;
+        })
     }
 
     // ── Spec general/018: global lifecycle event bus ────────────────────────
 
     // Test 1 (json slice): create_domain/delete_domain publish domain_created/
     // domain_deleted with engine "json" and the right domain.
-    #[tokio::test]
-    async fn test_domain_lifecycle_events_published_with_json_engine_tag() {
-        let (json, _dir) = make_engine().await;
-        let bus = Arc::new(GlobalEventBus::new(16, 16));
-        json.attach_event_bus(Arc::clone(&bus));
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_domain_lifecycle_events_published_with_json_engine_tag() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let bus = Arc::new(GlobalEventBus::new(16, 16));
+            json.attach_event_bus(Arc::clone(&bus));
+            let mut rx = bus.subscribe();
 
-        json.create_domain("evdom").await.unwrap();
-        json.delete_domain("evdom").await.unwrap();
+            json.create_domain("evdom").await.unwrap();
+            json.delete_domain("evdom").await.unwrap();
 
-        let created = rx.try_recv().unwrap();
-        assert_eq!(created.engine, "json");
-        assert_eq!(created.kind, "domain_created");
-        assert_eq!(created.domain, "evdom");
-        assert_eq!(created.object, None);
+            let created = rx.try_recv().unwrap();
+            assert_eq!(created.engine, "json");
+            assert_eq!(created.kind, "domain_created");
+            assert_eq!(created.domain, "evdom");
+            assert_eq!(created.object, None);
 
-        let deleted = rx.try_recv().unwrap();
-        assert_eq!(deleted.kind, "domain_deleted");
-        assert_eq!(deleted.domain, "evdom");
+            let deleted = rx.try_recv().unwrap();
+            assert_eq!(deleted.kind, "domain_deleted");
+            assert_eq!(deleted.domain, "evdom");
+        })
     }
 
     // Test 5: create_index/delete_index publish index_created/index_dropped
     // with engine "json" and the field name as `object`.
-    #[tokio::test]
-    async fn test_index_events_published_with_field_as_object() {
-        let (json, _dir) = make_engine().await;
-        let bus = Arc::new(GlobalEventBus::new(16, 16));
-        json.attach_event_bus(Arc::clone(&bus));
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_index_events_published_with_field_as_object() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let bus = Arc::new(GlobalEventBus::new(16, 16));
+            json.attach_event_bus(Arc::clone(&bus));
+            let mut rx = bus.subscribe();
 
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.delete_index("default", "city").await.unwrap();
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.delete_index("default", "city").await.unwrap();
 
-        let created = rx.try_recv().unwrap();
-        assert_eq!(created.engine, "json");
-        assert_eq!(created.kind, "index_created");
-        assert_eq!(created.domain, "default");
-        assert_eq!(created.object.as_deref(), Some("city"));
+            let created = rx.try_recv().unwrap();
+            assert_eq!(created.engine, "json");
+            assert_eq!(created.kind, "index_created");
+            assert_eq!(created.domain, "default");
+            assert_eq!(created.object.as_deref(), Some("city"));
 
-        let dropped = rx.try_recv().unwrap();
-        assert_eq!(dropped.kind, "index_dropped");
-        assert_eq!(dropped.object.as_deref(), Some("city"));
+            let dropped = rx.try_recv().unwrap();
+            assert_eq!(dropped.kind, "index_dropped");
+            assert_eq!(dropped.object.as_deref(), Some("city"));
+        })
     }
 
     // Test 2 (json slice): after a purge run, domain_purged appears, after
     // domain_deleted.
-    #[tokio::test]
-    async fn test_domain_purge_event_published_after_domain_deleted() {
-        let (json, _dir) = make_engine().await;
-        let bus = Arc::new(GlobalEventBus::new(16, 16));
-        json.attach_event_bus(Arc::clone(&bus));
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_domain_purge_event_published_after_domain_deleted() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let bus = Arc::new(GlobalEventBus::new(16, 16));
+            json.attach_event_bus(Arc::clone(&bus));
+            let mut rx = bus.subscribe();
 
-        json.create_domain("purge-ev").await.unwrap();
-        rx.try_recv().unwrap(); // domain_created, not under test here
-        json.delete_domain("purge-ev").await.unwrap();
+            json.create_domain("purge-ev").await.unwrap();
+            rx.try_recv().unwrap(); // domain_created, not under test here
+            json.delete_domain("purge-ev").await.unwrap();
 
-        let purger = JsonDomainPurger::new(Arc::clone(&json), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
-        purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
+            let purger = JsonDomainPurger::new(Arc::clone(&json), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
+            purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
 
-        let deleted = rx.try_recv().unwrap();
-        assert_eq!(deleted.kind, "domain_deleted");
-        let purged = rx.try_recv().unwrap();
-        assert_eq!(purged.kind, "domain_purged");
-        assert_eq!(purged.domain, "purge-ev");
+            let deleted = rx.try_recv().unwrap();
+            assert_eq!(deleted.kind, "domain_deleted");
+            let purged = rx.try_recv().unwrap();
+            assert_eq!(purged.kind, "domain_purged");
+            assert_eq!(purged.domain, "purge-ev");
+        })
     }
 
     // Test 12 (json slice): no bus attached -> domain and index lifecycle ops
     // succeed unchanged, no panic, and nothing is published anywhere.
-    #[tokio::test]
-    async fn test_lifecycle_and_index_ops_without_event_bus_attached_publish_nothing() {
-        let (json, _dir) = make_engine().await;
-        let bus = GlobalEventBus::new(16, 16); // never attached
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_lifecycle_and_index_ops_without_event_bus_attached_publish_nothing() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let bus = GlobalEventBus::new(16, 16); // never attached
+            let mut rx = bus.subscribe();
 
-        json.create_domain("no-bus").await.unwrap();
-        json.create_index("no-bus", "city", IndexFieldType::String).await.unwrap();
-        json.delete_index("no-bus", "city").await.unwrap();
-        json.delete_domain("no-bus").await.unwrap();
+            json.create_domain("no-bus").await.unwrap();
+            json.create_index("no-bus", "city", IndexFieldType::String).await.unwrap();
+            json.delete_index("no-bus", "city").await.unwrap();
+            json.delete_domain("no-bus").await.unwrap();
 
-        assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
+            assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
+        })
     }
 
     // ── Spec general/019: per-engine metrics — no double counting ───────────
@@ -1455,38 +1553,40 @@ mod tests {
     // reads the old version first) is still exactly 1 write_op and 0
     // read_ops -- the read-before-write does not count; delete_document is
     // exactly 1 write_op.
-    #[tokio::test]
-    async fn test_engine_metrics_no_double_counting() {
-        let (json, _dir) = make_engine().await;
+    #[test]
+    fn test_engine_metrics_no_double_counting() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
 
-        // aggregate_engine only sums fully ticked buckets (spec general/019).
-        let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
-        json.metrics.tick_all();
-        let after_put = json.metrics.engine_metrics();
-        assert_eq!(after_put[EngineKind::Json as usize].write_ops, 1);
+            // aggregate_engine only sums fully ticked buckets (spec general/019).
+            let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+            json.metrics.tick_all();
+            let after_put = json.metrics.engine_metrics();
+            assert_eq!(after_put[EngineKind::Json as usize].write_ops, 1);
 
-        json.put_document_with_version(
-            "default",
-            "k",
-            json!({"n": 2}),
-            Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
-        )
-        .await
-        .unwrap();
-        json.metrics.tick_all();
-        let after_conditional_put = json.metrics.engine_metrics();
-        assert_eq!(
-            after_conditional_put[EngineKind::Json as usize].write_ops, 2,
-            "exactly one more write_op, not two"
-        );
-        assert_eq!(
-            after_conditional_put[EngineKind::Json as usize].read_ops, 0,
-            "the read-before-write inside put_document_with_version must not count"
-        );
+            json.put_document_with_version(
+                "default",
+                "k",
+                json!({"n": 2}),
+                Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
+            )
+            .await
+            .unwrap();
+            json.metrics.tick_all();
+            let after_conditional_put = json.metrics.engine_metrics();
+            assert_eq!(
+                after_conditional_put[EngineKind::Json as usize].write_ops, 2,
+                "exactly one more write_op, not two"
+            );
+            assert_eq!(
+                after_conditional_put[EngineKind::Json as usize].read_ops, 0,
+                "the read-before-write inside put_document_with_version must not count"
+            );
 
-        json.delete_document("default", "k").await.unwrap();
-        json.metrics.tick_all();
-        let after_delete = json.metrics.engine_metrics();
-        assert_eq!(after_delete[EngineKind::Json as usize].write_ops, 3);
+            json.delete_document("default", "k").await.unwrap();
+            json.metrics.tick_all();
+            let after_delete = json.metrics.engine_metrics();
+            assert_eq!(after_delete[EngineKind::Json as usize].write_ops, 3);
+        })
     }
 }

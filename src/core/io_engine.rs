@@ -1,20 +1,27 @@
-//! Registered-buffer I/O via tokio-uring 0.5's `FixedBufPool` (spec perf/004).
+//! Registered-buffer I/O on the engine thread's ring (spec perf/004, perf/020).
 //!
-//! `IoEngine` allocates and registers a pool of fixed (kernel-pinned) buffers
-//! and tracks open file handles by logical id (SSTables use their file id, the
-//! WAL and VLog the reserved high ids below). All methods must run inside a
-//! `tokio-uring` runtime.
+//! `IoEngine` allocates a pool of fixed (kernel-pinned) buffers, registers it
+//! with the ring (`IORING_REGISTER_BUFFERS`) and tracks open file handles by
+//! logical id (SSTables use their file id, the WAL and VLog the reserved high
+//! ids below). compio has neither buffer registration nor the fixed-buffer
+//! ops, so both are built here on its public `OpCode`. All methods must run on
+//! the engine runtime ([`crate::core::engine_runtime`]).
 //!
 //! Scaffolding only: nothing here is on the hot path yet. The WAL/VLog/SSTable
 //! I/O paths are unchanged; spec 005 wires `IoEngine` into a dedicated storage
 //! thread that actually uses `read_fixed`/`write_fixed`.
 
+use crate::core::engine_runtime;
 use anyhow::{anyhow, Context, Result};
+use compio::buf::BufResult;
+use compio::driver::{OpCode, OpEntry};
+use compio::fs::{File, OpenOptions};
+use compio::runtime::Runtime;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
-use tokio_uring::buf::fixed::{FixedBuf, FixedBufPool};
-use tokio_uring::buf::{BoundedBuf, Slice};
-use tokio_uring::fs::{File, OpenOptions};
+use std::rc::Rc;
 
 /// Registered-buffer pool of the IoEngine.
 pub const REGISTERED_BUFFER_COUNT: usize = 128;
@@ -26,10 +33,10 @@ pub const REGISTERED_BUFFER_SIZE: usize = 64 * 1024;
 pub const WAL_LOGICAL_ID: u64 = u64::MAX;
 pub const VLOG_LOGICAL_ID: u64 = u64::MAX - 1;
 
-/// Maps a logical file id to an open `tokio-uring` file handle.
+/// Maps a logical file id to an open file handle.
 ///
 /// No Fixed-File registration yet (that is spec 005's raw `io-uring` work) —
-/// these are regular file descriptors opened through `tokio-uring`.
+/// these are regular file descriptors.
 pub struct FileHandleMap {
     handles: HashMap<u64, File>,
 }
@@ -42,21 +49,18 @@ impl FileHandleMap {
     /// Opens `path` read-write (creating it if missing) and tracks the handle
     /// under `logical_id`. Replaces any handle already registered for that id.
     pub async fn register_file(&mut self, logical_id: u64, path: &Path) -> Result<()> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .await
-            .with_context(|| format!("failed to open {} for logical id {logical_id}", path.display()))?;
+        let owned = path.to_path_buf();
+        let file = engine_runtime::spawn_io(async move {
+            OpenOptions::new().read(true).write(true).create(true).open(owned).await
+        })
+        .await
+        .with_context(|| format!("failed to open {} for logical id {logical_id}", path.display()))?;
         self.handles.insert(logical_id, file);
         Ok(())
     }
 
-    /// Drops the tracked handle. tokio-uring 0.5 closes the fd synchronously on
-    /// drop (a blocking `close(2)`), which briefly stalls other tasks on the
-    /// current-thread runtime — relevant once this is used on the hot path.
-    /// No-op if the id was not registered.
+    /// Drops the tracked handle; its descriptor closes once no operation
+    /// holds it any more. No-op if the id was not registered.
     pub fn unregister_file(&mut self, logical_id: u64) -> Result<()> {
         self.handles.remove(&logical_id);
         Ok(())
@@ -77,30 +81,23 @@ impl Default for FileHandleMap {
 /// Registered-buffer pool plus file-handle bookkeeping for the WAL, VLog, and
 /// SSTables. See module docs — not on the hot path in this spec.
 pub struct IoEngine {
-    buf_pool: FixedBufPool<Vec<u8>>,
-    /// Capacity of every slot in `buf_pool`; `FixedBufPool::try_next` is keyed
-    /// by requested capacity, so every checkout needs this.
-    buffer_size: usize,
+    pool: Rc<FixedPool>,
     file_handles: FileHandleMap,
 }
 
 impl IoEngine {
     /// Allocates `buffer_count` buffers of `buffer_size` bytes each and
-    /// registers them with the kernel (`io_uring_register`). Must be called
-    /// from within a `tokio-uring` runtime — the underlying
-    /// `FixedBufPool::register` panics otherwise.
+    /// registers them with the current engine runtime's ring.
     ///
     /// Returns `Err` (rather than panicking) when the kernel rejects the
-    /// registration itself, e.g. on kernels older than 5.4 without
-    /// `IORING_REGISTER_BUFFERS`. Callers should log a warning and continue
+    /// registration itself. Callers should log a warning and continue
     /// without an `IoEngine` in that case.
     pub fn new(buffer_count: usize, buffer_size: usize) -> Result<Self> {
-        let bufs = std::iter::repeat_with(move || Vec::with_capacity(buffer_size)).take(buffer_count);
-        let buf_pool = FixedBufPool::new(bufs);
-        buf_pool
-            .register()
-            .context("kernel rejected registered-buffer setup (needs Linux 5.4+)")?;
-        Ok(Self { buf_pool, buffer_size, file_handles: FileHandleMap::new() })
+        anyhow::ensure!(buffer_count <= usize::from(u16::MAX), "at most {} registered buffers", u16::MAX);
+        let pool = FixedPool::new(buffer_count, buffer_size);
+        let ring = Runtime::with_current(|rt| rt.as_raw_fd());
+        register_buffers(ring, &pool).context("kernel rejected registered-buffer setup")?;
+        Ok(Self { pool: Rc::new(pool), file_handles: FileHandleMap::new() })
     }
 
     /// Opens and tracks the file at `path` under `logical_id` (SSTables:
@@ -119,110 +116,217 @@ impl IoEngine {
         self.file_handles.get_file(logical_id)
     }
 
-    /// Checks out a free registered buffer for the caller to fill (e.g. via
-    /// `FixedBuf::put_slice`) before [`Self::write_fixed`]. `None` means the
+    /// Checks out a free, empty registered buffer for the caller to fill (via
+    /// [`FixedBuf::put_slice`]) before [`Self::write_fixed`]. `None` means the
     /// pool is exhausted — a backpressure signal for the caller.
     pub fn checkout_buffer(&self) -> Option<FixedBuf> {
-        self.buf_pool.try_next(self.buffer_size)
+        let index = self.pool.free.borrow_mut().pop()?;
+        Some(FixedBuf { pool: Rc::clone(&self.pool), index, len: 0 })
     }
 
     /// Reads up to `len` bytes at `offset` from `logical_id` into a registered
-    /// buffer — no kernel-side re-mapping of the memory per call. The returned
-    /// view is bounded to the `n` bytes actually read, not the buffer's raw
-    /// init_len: a reused pool slot keeps a previous (larger) op's init_len, so
-    /// returning the bare `FixedBuf` would expose stale bytes past `n`.
-    pub async fn read_fixed(&self, logical_id: u64, offset: u64, len: u32) -> Result<Slice<FixedBuf>> {
-        let len = len as usize;
+    /// buffer (`IORING_OP_READ_FIXED`). The returned buffer holds exactly the
+    /// bytes read.
+    pub async fn read_fixed(&self, logical_id: u64, offset: u64, len: u32) -> Result<FixedBuf> {
         anyhow::ensure!(
-            len <= self.buffer_size,
+            len as usize <= self.pool.size,
             "requested read of {len} bytes exceeds the registered buffer size of {}",
-            self.buffer_size
+            self.pool.size
         );
-        let file = self
-            .file_handles
-            .get_file(logical_id)
-            .ok_or_else(|| anyhow!("File not registered: {logical_id}"))?;
-        let buf = self
-            .checkout_buffer()
-            .ok_or_else(|| anyhow!("Buffer pool exhausted"))?;
-
-        let (result, slice) = file.read_fixed_at(buf.slice(0..len), offset).await;
-        let n = result?;
-        Ok(slice.slice(0..n))
+        let file = self.registered(logical_id)?;
+        let buf = self.checkout_buffer().ok_or_else(|| anyhow!("Buffer pool exhausted"))?;
+        let op = FixedIo { file, buf, len, offset, write: false };
+        let (n, mut op) = engine_runtime::spawn_io(submit(op)).await;
+        op.buf.len = n?;
+        Ok(op.buf)
     }
 
-    /// Writes the buffer's first `len` bytes into `logical_id` at `offset`.
-    /// `len` is the caller's intent and is enforced explicitly: a reused pool
-    /// slot carries the previous op's (larger) init_len, and `write_fixed_at`
-    /// would otherwise persist that many bytes — leaking stale slot data past
-    /// the real payload. The buffer returns to the pool once it drops.
+    /// Writes the buffer's first `len` bytes into `logical_id` at `offset`
+    /// (`IORING_OP_WRITE_FIXED`). The buffer returns to the pool once the
+    /// write is done.
     pub async fn write_fixed(&self, logical_id: u64, offset: u64, buf: FixedBuf, len: usize) -> Result<()> {
         anyhow::ensure!(
             len <= buf.bytes_init(),
             "write_fixed: requested {len} bytes but only {} are initialized in the buffer",
             buf.bytes_init()
         );
-        let file = self
-            .file_handles
-            .get_file(logical_id)
-            .ok_or_else(|| anyhow!("File not registered: {logical_id}"))?;
-        let (result, _buf) = file.write_fixed_at(buf.slice(0..len), offset).await;
+        let file = self.registered(logical_id)?;
+        let op = FixedIo { file, buf, len: len as u32, offset, write: true };
+        let (result, _) = engine_runtime::spawn_io(submit(op)).await;
         result?;
         Ok(())
     }
 
     /// fdatasync on `logical_id` for durability.
     pub async fn fsync(&self, logical_id: u64) -> Result<()> {
-        let file = self
-            .file_handles
-            .get_file(logical_id)
-            .ok_or_else(|| anyhow!("File not registered: {logical_id}"))?;
-        file.sync_data().await?;
+        let file = self.registered(logical_id)?;
+        engine_runtime::spawn_io(async move { file.sync_data().await }).await?;
         Ok(())
     }
+
+    fn registered(&self, logical_id: u64) -> Result<File> {
+        self.get_file(logical_id).cloned().ok_or_else(|| anyhow!("File not registered: {logical_id}"))
+    }
+}
+
+/// The registered memory: `count` slots of `size` bytes in one allocation,
+/// freed only once every [`FixedBuf`] (and so every op using one) is gone.
+struct FixedPool {
+    memory: *mut u8,
+    size: usize,
+    count: usize,
+    free: RefCell<Vec<u16>>,
+}
+
+impl FixedPool {
+    fn new(count: usize, size: usize) -> Self {
+        let memory = Box::into_raw(vec![0u8; count * size].into_boxed_slice()).cast::<u8>();
+        Self { memory, size, count, free: RefCell::new((0..count as u16).rev().collect()) }
+    }
+
+    fn slot(&self, index: u16) -> *mut u8 {
+        // SAFETY: `index < count`, so the slot lies inside the allocation.
+        unsafe { self.memory.add(usize::from(index) * self.size) }
+    }
+}
+
+impl Drop for FixedPool {
+    fn drop(&mut self) {
+        // SAFETY: `memory` came from `Box::into_raw` of exactly this length.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.memory, self.count * self.size)) });
+    }
+}
+
+/// One registered buffer, checked out of the pool until dropped. Derefs to
+/// its filled bytes.
+pub struct FixedBuf {
+    pool: Rc<FixedPool>,
+    index: u16,
+    len: usize,
+}
+
+impl FixedBuf {
+    /// Appends `data` behind the filled bytes; panics past the buffer size.
+    pub fn put_slice(&mut self, data: &[u8]) {
+        assert!(self.len + data.len() <= self.pool.size, "put_slice past the registered buffer size");
+        // SAFETY: the range lies inside this buffer's slot, which only this
+        // `FixedBuf` writes while it is checked out.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.pool.slot(self.index).add(self.len), data.len()) };
+        self.len += data.len();
+    }
+
+    /// Number of filled bytes.
+    pub fn bytes_init(&self) -> usize {
+        self.len
+    }
+}
+
+impl std::ops::Deref for FixedBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the first `len` bytes of the slot are filled.
+        unsafe { std::slice::from_raw_parts(self.pool.slot(self.index), self.len) }
+    }
+}
+
+impl Drop for FixedBuf {
+    fn drop(&mut self) {
+        self.pool.free.borrow_mut().push(self.index);
+    }
+}
+
+/// `IORING_OP_READ_FIXED` / `WRITE_FIXED` of `len` bytes at `offset`. The op
+/// owns the buffer and the file until its completion; compio keeps an op
+/// whose future was dropped until then.
+struct FixedIo {
+    file: File,
+    buf: FixedBuf,
+    len: u32,
+    offset: u64,
+    write: bool,
+}
+
+// SAFETY: the op's buffer is registered memory that outlives the op (see
+// `FixedBuf`), and `len` never exceeds the buffer size.
+unsafe impl OpCode for FixedIo {
+    type Control = ();
+
+    fn create_entry(&mut self, _: &mut Self::Control) -> OpEntry {
+        use io_uring_compio::{opcode, types::Fd};
+        let fd = Fd(self.file.as_raw_fd());
+        let ptr = self.buf.pool.slot(self.buf.index);
+        let entry = if self.write {
+            opcode::WriteFixed::new(fd, ptr, self.len, self.buf.index).offset(self.offset).build()
+        } else {
+            opcode::ReadFixed::new(fd, ptr, self.len, self.buf.index).offset(self.offset).build()
+        };
+        entry.into()
+    }
+}
+
+async fn submit(op: FixedIo) -> (std::io::Result<usize>, FixedIo) {
+    let BufResult(result, op) = compio::runtime::submit(op).await;
+    (result, op)
+}
+
+/// Registers the pool's memory as fixed buffers on the ring behind
+/// `ring_fd`; must run on the ring's thread (`SINGLE_ISSUER`).
+fn register_buffers(ring_fd: RawFd, pool: &FixedPool) -> std::io::Result<()> {
+    const IORING_REGISTER_BUFFERS: libc::c_long = 0;
+    let iovecs: Vec<libc::iovec> = (0..pool.count as u16)
+        .map(|index| libc::iovec { iov_base: pool.slot(index).cast(), iov_len: pool.size })
+        .collect();
+    // SAFETY: `iovecs` describes the pool's live memory; the kernel copies the array.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            libc::c_long::from(ring_fd),
+            IORING_REGISTER_BUFFERS,
+            iovecs.as_ptr(),
+            iovecs.len() as libc::c_long,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only needed for `FixedBuf::put_slice` in the write-path tests below.
-    use tokio_uring::buf::BoundedBufMut;
+    use crate::core::engine_runtime::block_on;
 
-    fn small_pool(slots: usize, size: usize) -> FixedBufPool<Vec<u8>> {
-        FixedBufPool::new(std::iter::repeat_with(move || Vec::with_capacity(size)).take(slots))
-    }
-
-    // 1. FixedBufPool -- try_next() returns a buffer, Drop returns it to the pool.
+    // 1. Pool -- checkout returns a buffer, Drop returns it to the pool.
     #[test]
     fn test_fixed_buf_pool_checkin_on_drop() {
-        tokio_uring::start(async {
-            let pool = small_pool(1, 64);
-            pool.register().unwrap();
+        block_on(async {
+            let engine = IoEngine::new(1, 64).unwrap();
 
-            let buf = pool.try_next(64).unwrap();
-            assert!(pool.try_next(64).is_none(), "sole slot must be checked out");
+            let buf = engine.checkout_buffer().unwrap();
+            assert!(engine.checkout_buffer().is_none(), "sole slot must be checked out");
             drop(buf);
-            assert!(pool.try_next(64).is_some(), "slot must return to the pool on drop");
+            assert!(engine.checkout_buffer().is_some(), "slot must return to the pool on drop");
         });
     }
 
-    // 2. FixedBufPool -- all slots occupied -> try_next() returns None.
+    // 2. Pool -- all slots occupied -> checkout returns None.
     #[test]
     fn test_fixed_buf_pool_exhausted() {
-        tokio_uring::start(async {
-            let pool = small_pool(2, 64);
-            pool.register().unwrap();
+        block_on(async {
+            let engine = IoEngine::new(2, 64).unwrap();
 
-            let _a = pool.try_next(64).unwrap();
-            let _b = pool.try_next(64).unwrap();
-            assert!(pool.try_next(64).is_none());
+            let _a = engine.checkout_buffer().unwrap();
+            let _b = engine.checkout_buffer().unwrap();
+            assert!(engine.checkout_buffer().is_none());
         });
     }
 
     // 3. FileHandleMap -- register_file() + get_file() -> correct handle.
     #[test]
     fn test_file_handle_map_register_and_get() {
-        tokio_uring::start(async {
+        block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("a.dat");
             let mut map = FileHandleMap::new();
@@ -235,7 +339,7 @@ mod tests {
     // 4. FileHandleMap -- unregister_file() -> handle removed, get_file() -> None.
     #[test]
     fn test_file_handle_map_unregister() {
-        tokio_uring::start(async {
+        block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("b.dat");
             let mut map = FileHandleMap::new();
@@ -248,7 +352,7 @@ mod tests {
     // 5. IoEngine::read_fixed() -- write test data, register, read via registered buffer.
     #[test]
     fn test_io_engine_read_fixed_reads_correct_data() {
-        tokio_uring::start(async {
+        block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("read.dat");
             let data = b"hello registered buffers".to_vec();
@@ -265,7 +369,7 @@ mod tests {
     // 6. IoEngine::write_fixed() -- write via registered buffer, verify with a standard read.
     #[test]
     fn test_io_engine_write_fixed_writes_correct_data() {
-        tokio_uring::start(async {
+        block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("write.dat");
 
@@ -285,7 +389,7 @@ mod tests {
     // 7. IoEngine::fsync() -- no error after write + fsync.
     #[test]
     fn test_io_engine_fsync_after_write() {
-        tokio_uring::start(async {
+        block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("sync.dat");
 
@@ -304,21 +408,21 @@ mod tests {
     // Reading an unregistered logical id must be a clear error, not a panic.
     #[test]
     fn test_io_engine_read_fixed_reports_missing_file() {
-        tokio_uring::start(async {
+        block_on(async {
             let engine = IoEngine::new(1, 4096).unwrap();
             // `.err().unwrap()` rather than `.unwrap_err()`: the Ok type
-            // `Slice<FixedBuf>` is not `Debug`, which `unwrap_err` would require.
+            // `FixedBuf` is not `Debug`, which `unwrap_err` would require.
             let err = engine.read_fixed(99, 0, 10).await.err().unwrap();
             assert!(err.to_string().contains("not registered"));
         });
     }
 
-    // Regression (perf/004 finding 1): a pool slot keeps the previous op's
-    // init_len across check-in. A large write then a smaller one over the SAME
-    // slot must persist only the smaller payload, not the leftover bytes.
+    // Regression (perf/004 finding 1): a large write then a smaller one over
+    // the SAME slot must persist only the smaller payload, not the leftover
+    // bytes.
     #[test]
     fn test_io_engine_write_fixed_reused_slot_no_stale_leak() {
-        tokio_uring::start(async {
+        block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let big_path = dir.path().join("big.dat");
             let small_path = dir.path().join("small.dat");
@@ -327,7 +431,6 @@ mod tests {
             engine.register_file(0, &big_path).await.unwrap();
             engine.register_file(1, &small_path).await.unwrap();
 
-            // Large write bumps the sole slot's init_len to 100.
             let mut buf = engine.checkout_buffer().unwrap();
             buf.put_slice(&vec![b'X'; 100]);
             engine.write_fixed(0, 0, buf, 100).await.unwrap();
@@ -346,11 +449,11 @@ mod tests {
         });
     }
 
-    // Regression (perf/004 finding 1): read must return a view of exactly the
-    // n bytes read, even when the reused slot carries a larger init_len.
+    // Regression (perf/004 finding 1): read must return exactly the n bytes
+    // read, even from a reused slot that held a larger read before.
     #[test]
     fn test_io_engine_read_fixed_reused_slot_exact_len() {
-        tokio_uring::start(async {
+        block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let big_path = dir.path().join("rbig.dat");
             let small_path = dir.path().join("rsmall.dat");
@@ -361,7 +464,6 @@ mod tests {
             engine.register_file(0, &big_path).await.unwrap();
             engine.register_file(1, &small_path).await.unwrap();
 
-            // Large read bumps the sole slot's init_len to 100.
             let big = engine.read_fixed(0, 0, 100).await.unwrap();
             assert_eq!(big.len(), 100);
             drop(big); // return the slot to the pool

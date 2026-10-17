@@ -8,12 +8,14 @@ use axum::body::{Body, BodyDataStream, Bytes, HttpBody};
 use axum::http::{request, response, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use compio::runtime::JoinError;
 use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt};
 use std::convert::Infallible;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
 use tower::{Service, ServiceExt};
 
 /// Body frames buffered per direction and request.
@@ -147,6 +149,7 @@ fn bridge_unavailable() -> Response {
 
 /// Relays the request body from the frontend; an empty body needs neither a
 /// channel nor a task.
+#[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 fn relay_request_body(body: Body) -> Option<mpsc::Receiver<Frame>> {
     if body.is_end_stream() {
         return None;
@@ -157,37 +160,46 @@ fn relay_request_body(body: Body) -> Option<mpsc::Receiver<Frame>> {
 }
 
 /// Engine end of the bridge: runs every shipped request on the calling
-/// (engine) thread, each in its own task so long handlers interleave. Returns
-/// once the last sender is gone, after dropping the requests still in flight,
-/// so none of them runs into the engine shutdown (A6).
+/// (engine) thread's compio runtime, each in its own task so long handlers
+/// interleave. Returns once the last sender is gone, after dropping the
+/// requests still in flight, so none of them runs into the engine shutdown
+/// (A6).
 ///
-/// The loop itself is a runtime task, not this future: a task woken from a
-/// frontend thread runs as soon as the local queue drains, while this future
-/// is polled only after the yielded tasks have been queued again. Dropping
-/// `serve_engine` early therefore detaches the loop instead of ending it.
+/// The loop itself is a runtime task: woken from a frontend thread, it runs
+/// in the runtime's next scheduling round, even while other handlers keep
+/// yielding. Dropping `serve_engine` early cancels the loop.
 pub async fn serve_engine(jobs: mpsc::Receiver<Job>, router: Router) {
-    if let Err(e) = tokio::spawn(engine_loop(jobs, router)).await {
-        if e.is_panic() {
-            std::panic::resume_unwind(e.into_panic());
-        }
+    if let Err(JoinError::Panicked(payload)) = compio::runtime::spawn(engine_loop(jobs, router)).await {
+        std::panic::resume_unwind(payload);
     }
 }
 
 async fn engine_loop(mut jobs: mpsc::Receiver<Job>, router: Router) {
-    let mut in_flight = JoinSet::new();
+    let mut in_flight = FuturesUnordered::new();
+    // One clone per request task, held by its future.
+    let live = Rc::new(());
     loop {
         tokio::select! {
             job = jobs.recv() => match job {
                 Some(job) => {
-                    in_flight.spawn(handle(job, router.clone()));
+                    let (live, router) = (Rc::clone(&live), router.clone());
+                    in_flight.push(compio::runtime::spawn(async move {
+                        let _live = live;
+                        handle(job, router).await
+                    }));
                 }
                 None => break,
             },
             // Reap finished tasks so the set does not grow with request count.
-            Some(_) = in_flight.join_next() => {}
+            Some(_) = in_flight.next() => {}
         }
     }
-    in_flight.shutdown().await;
+    // Dropping a handle cancels its task; the runtime drops a cancelled
+    // task's future on its next round.
+    drop(in_flight);
+    while Rc::strong_count(&live) > 1 {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Reader end of the bridge (spec perf/018b A1.3): runs every read request in
@@ -196,6 +208,7 @@ async fn engine_loop(mut jobs: mpsc::Receiver<Job>, router: Router) {
 /// requests still in flight end with the runtime (A7). POST requests carry an
 /// [`EngineForward`] to `engine`: the SQL route, the only read that forwards,
 /// is a POST.
+#[allow(clippy::disallowed_methods, reason = "runs on the reader pool")]
 pub async fn serve_reader(mut jobs: mpsc::Receiver<Job>, router: Router, engine: EngineDispatch) {
     while let Some(mut job) = jobs.recv().await {
         if job.parts.method == Method::POST {
@@ -350,23 +363,18 @@ pub(crate) mod test_hook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::engine_runtime;
     use axum::http::header;
     use axum::routing::{get, post};
     use futures::stream;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// `serve_engine` on its own current-thread runtime thread, like the
-    /// engine thread in production.
+    /// `serve_engine` on its own engine runtime thread, like the engine
+    /// thread in production.
     fn engine_thread(router: Router) -> (mpsc::Sender<Job>, std::thread::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(8);
-        let thread = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(serve_engine(rx, router));
-        });
+        let thread = std::thread::spawn(move || engine_runtime::block_on(serve_engine(rx, router)));
         (tx, thread)
     }
 
@@ -447,11 +455,14 @@ mod tests {
     }
 
     // The engine loop is a runtime task, so a request that arrives while other
-    // handlers are yielding gets its slice right after the running round. As
-    // the loop's own future, it was polled only after the yielded tasks had
-    // been queued again, which cost every request a full round.
+    // handlers keep yielding starts in the runtime's next scheduling round,
+    // long before they are done. compio queues it behind the tasks that are
+    // ready by then (at most 61 per round), unlike tokio, whose deferred
+    // yields let it run before their next slice (spec perf/020).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_request_arriving_mid_round_runs_before_the_next_yield_round() {
+    #[allow(clippy::disallowed_methods, reason = "the callers play the frontend runtime")]
+    async fn a_request_arriving_mid_round_starts_while_yielding_handlers_run() {
+        const ROUNDS: usize = 200;
         let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         // A sender inside the router would hold the bridge channel open for
         // good; the first handler takes it out and hands it to the thread.
@@ -462,7 +473,7 @@ mod tests {
             get(move |axum::extract::Path(name): axum::extract::Path<String>| {
                 let (log, late) = (Arc::clone(&handler_log), Arc::clone(&handler_late));
                 async move {
-                    for round in 0..2 {
+                    for round in 0..ROUNDS {
                         log.lock().unwrap().push(format!("{name}{round}"));
                         if round == 0 {
                             if let Some(tx) = late.lock().unwrap().take() {
@@ -484,10 +495,10 @@ mod tests {
         drop(ship);
         engine.join().unwrap();
 
-        // Indices, not the exact order: the deferred tasks wake LIFO.
         let log = log.lock().unwrap();
         let at = |step: &str| log.iter().position(|e| e == step).expect(step);
-        assert!(at("c0") < at("a1") && at("c0") < at("b1"), "{log:?}");
+        let last = ROUNDS - 1;
+        assert!(at("c0") < at(&format!("a{last}")) && at("c0") < at(&format!("b{last}")), "{log:?}");
     }
 
     // A request without a body reaches the engine as an empty body, not as a
@@ -766,6 +777,7 @@ mod tests {
     // instead of rejecting it; it goes through once the pool takes the
     // queued job.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods, reason = "the reader end runs on a tokio runtime, like the reader pool")]
     async fn full_reader_channel_holds_reads_back() {
         let (engine_tx, _engine_rx) = mpsc::channel(1);
         let (reader_tx, reader_rx) = mpsc::channel(1);
@@ -845,49 +857,54 @@ mod tests {
 
     // Test 4: a full bridge channel holds the next request back instead of
     // rejecting it; it goes through once the engine takes the queued job.
-    #[tokio::test]
-    async fn full_engine_channel_holds_requests_back() {
-        let (tx, rx) = mpsc::channel(1);
-        let ship = ShipService::new(EngineDispatch::Engine(tx));
-        let mut first = std::pin::pin!(ship.clone().oneshot(get_req("/a")));
-        let mut second = std::pin::pin!(ship.clone().oneshot(get_req("/b")));
-        assert!(futures::poll!(first.as_mut()).is_pending());
-        assert!(futures::poll!(second.as_mut()).is_pending());
-        assert_eq!(rx.len(), 1, "the second request must wait for a free slot");
+    #[test]
+    fn full_engine_channel_holds_requests_back() {
+        engine_runtime::block_on(async {
+            let (tx, rx) = mpsc::channel(1);
+            let ship = ShipService::new(EngineDispatch::Engine(tx));
+            let mut first = std::pin::pin!(ship.clone().oneshot(get_req("/a")));
+            let mut second = std::pin::pin!(ship.clone().oneshot(get_req("/b")));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            assert_eq!(rx.len(), 1, "the second request must wait for a free slot");
 
-        let router = Router::new().route("/a", get(|| async { "a" })).route("/b", get(|| async { "b" }));
-        tokio::spawn(serve_engine(rx, router));
-        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+            let router = Router::new().route("/a", get(|| async { "a" })).route("/b", get(|| async { "b" }));
+            compio::runtime::spawn(serve_engine(rx, router)).detach();
+            assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+            assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        });
     }
 
     // A6: the engine loop ends once the last sender is gone and drops the
     // requests still in flight before it returns, so none of them can reach
     // the engines during their shutdown; their callers get 503.
-    #[tokio::test]
-    async fn engine_loop_drops_in_flight_requests_when_it_ends() {
-        let started = Arc::new(tokio::sync::Notify::new());
-        let alive = Arc::new(());
-        let (handler_started, handler_alive) = (Arc::clone(&started), Arc::clone(&alive));
-        let router = Router::new().route(
-            "/hang",
-            get(move || {
-                let (started, guard) = (Arc::clone(&handler_started), Arc::clone(&handler_alive));
-                async move {
-                    let _guard = guard;
-                    started.notify_one();
-                    std::future::pending::<()>().await
-                }
-            }),
-        );
-        let (tx, rx) = mpsc::channel(1);
-        let engine = tokio::spawn(serve_engine(rx, router));
-        let caller = tokio::spawn(ShipService::new(EngineDispatch::Engine(tx.clone())).oneshot(get_req("/hang")));
-        started.notified().await;
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the caller plays the frontend runtime")]
+    fn engine_loop_drops_in_flight_requests_when_it_ends() {
+        engine_runtime::block_on(async {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let alive = Arc::new(());
+            let (handler_started, handler_alive) = (Arc::clone(&started), Arc::clone(&alive));
+            let router = Router::new().route(
+                "/hang",
+                get(move || {
+                    let (started, guard) = (Arc::clone(&handler_started), Arc::clone(&handler_alive));
+                    async move {
+                        let _guard = guard;
+                        started.notify_one();
+                        std::future::pending::<()>().await
+                    }
+                }),
+            );
+            let (tx, rx) = mpsc::channel(1);
+            let engine = compio::runtime::spawn(serve_engine(rx, router));
+            let caller = tokio::spawn(ShipService::new(EngineDispatch::Engine(tx.clone())).oneshot(get_req("/hang")));
+            started.notified().await;
 
-        drop(tx);
-        engine.await.unwrap();
-        assert_eq!(Arc::strong_count(&alive), 1, "the in-flight handler outlived the engine loop");
-        assert_eq!(caller.await.unwrap().unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+            drop(tx);
+            engine.await.unwrap();
+            assert_eq!(Arc::strong_count(&alive), 1, "the in-flight handler outlived the engine loop");
+            assert_eq!(caller.await.unwrap().unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        });
     }
 }

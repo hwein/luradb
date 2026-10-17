@@ -11,9 +11,9 @@ use crate::engines::lsm::{GetResult, RegistrySnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use crate::core::engine_runtime::{self, spawn_io};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 
 pub(crate) const FORMAT_VERSION: u32 = 1;
 
@@ -197,16 +197,59 @@ pub(crate) async fn run_backup(params: BackupParams<'_>) -> anyhow::Result<()> {
 
     match write_backup_file(&part_path, &params).await {
         Ok(()) => {
-            tokio::fs::rename(&part_path, &final_path).await?;
-            // The rename must be durable too: success here lets retention
-            // delete an older generation right away.
-            tokio::fs::File::open(params.dir).await?.sync_all().await?;
+            let dir = params.dir.to_path_buf();
+            spawn_io(async move {
+                compio::fs::rename(&part_path, &final_path).await?;
+                // The rename must be durable too: success here lets retention
+                // delete an older generation right away.
+                compio::fs::File::open(&dir).await?.sync_all().await
+            })
+            .await?;
             Ok(())
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&part_path).await;
+            let _ = spawn_io(async move { compio::fs::remove_file(part_path).await }).await;
             Err(e)
         }
+    }
+}
+
+/// The `.part` file, appended to through a buffer on the engine ring.
+struct PartFile {
+    file: Arc<std::fs::File>,
+    buf: Vec<u8>,
+    pos: u64,
+}
+
+/// Bytes buffered before they go out as one write.
+const PART_BUFFER: usize = 8 * 1024;
+
+impl PartFile {
+    async fn create(path: &Path) -> std::io::Result<Self> {
+        let mut options = compio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        let file = engine_runtime::open(path.to_path_buf(), options).await?;
+        Ok(Self { file: Arc::new(file), buf: Vec::with_capacity(PART_BUFFER), pos: 0 })
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() >= PART_BUFFER {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        let data = std::mem::replace(&mut self.buf, Vec::with_capacity(PART_BUFFER));
+        let len = data.len() as u64;
+        engine_runtime::write_all_at(&self.file, data, self.pos).await?;
+        self.pos += len;
+        Ok(())
+    }
+
+    async fn sync_all(&self) -> std::io::Result<()> {
+        engine_runtime::sync(&self.file, false).await
     }
 }
 
@@ -233,8 +276,7 @@ async fn write_backup_file(part_path: &PathBuf, params: &BackupParams<'_>) -> an
         None
     };
 
-    let file = tokio::fs::File::create(part_path).await?;
-    let mut out = tokio::io::BufWriter::new(file);
+    let mut out = PartFile::create(part_path).await?;
     let mut hasher = Sha256::new();
     let mut lines: u64 = 0;
 
@@ -270,12 +312,12 @@ async fn write_backup_file(part_path: &PathBuf, params: &BackupParams<'_>) -> an
     out.write_all(b"\n").await?;
 
     out.flush().await?;
-    out.get_ref().sync_all().await?;
+    out.sync_all().await?;
     Ok(())
 }
 
-async fn write_kv_section<W: tokio::io::AsyncWrite + Unpin>(
-    out: &mut W,
+async fn write_kv_section(
+    out: &mut PartFile,
     hasher: &mut Sha256,
     lines: &mut u64,
     params: &BackupParams<'_>,
@@ -318,8 +360,8 @@ async fn write_kv_section<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn write_auth_section<W: tokio::io::AsyncWrite + Unpin>(
-    out: &mut W,
+async fn write_auth_section(
+    out: &mut PartFile,
     hasher: &mut Sha256,
     lines: &mut u64,
     kv_registry: &Arc<DomainRegistry>,
@@ -350,8 +392,8 @@ async fn write_auth_section<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn write_json_section<W: tokio::io::AsyncWrite + Unpin>(
-    out: &mut W,
+async fn write_json_section(
+    out: &mut PartFile,
     hasher: &mut Sha256,
     lines: &mut u64,
     params: &BackupParams<'_>,
@@ -412,8 +454,8 @@ async fn write_json_section<W: tokio::io::AsyncWrite + Unpin>(
 /// Serializes one line, appends `\n`, writes it, and feeds the exact bytes,
 /// including the trailing newline, into the running checksum (spec
 /// general/006 backup format).
-async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
-    out: &mut W,
+async fn write_line(
+    out: &mut PartFile,
     hasher: &mut Sha256,
     lines: &mut u64,
     value: &impl Serialize,
@@ -428,7 +470,7 @@ async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
 
 pub(crate) async fn maybe_pause(i: usize, batch_size: usize, pause_ms: u64) {
     if batch_size > 0 && (i + 1) % batch_size == 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+        compio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
     }
 }
 
@@ -478,121 +520,133 @@ mod tests {
     }
 
     // 1. resolve_scope: `all` picks up every active KV domain.
-    #[tokio::test]
-    async fn test_resolve_all_scope_kv_only() {
-        let (kv, _dir) = make_kv_registry().await;
-        kv.create_domain("shop").await.unwrap();
-        let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
-        let names: Vec<_> = resolved.kv_domains.iter().map(|d| d.name.clone()).collect();
-        assert!(names.contains(&"default".to_string()));
-        assert!(names.contains(&"shop".to_string()));
-        assert!(resolved.json_domains.is_empty(), "no json engine given");
+    #[test]
+    fn test_resolve_all_scope_kv_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir) = make_kv_registry().await;
+            kv.create_domain("shop").await.unwrap();
+            let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
+            let names: Vec<_> = resolved.kv_domains.iter().map(|d| d.name.clone()).collect();
+            assert!(names.contains(&"default".to_string()));
+            assert!(names.contains(&"shop".to_string()));
+            assert!(resolved.json_domains.is_empty(), "no json engine given");
+        })
     }
 
     // 2. resolve_scope: kv:<domain> on a missing domain -> DomainNotFound.
-    #[tokio::test]
-    async fn test_resolve_kv_domain_missing_errors() {
-        let (kv, _dir) = make_kv_registry().await;
-        let err = resolve_scope(&BackupScope::KvDomain("nope".to_string()), &kv, &None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BackupError::DomainNotFound(d) if d == "nope"));
+    #[test]
+    fn test_resolve_kv_domain_missing_errors() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir) = make_kv_registry().await;
+            let err = resolve_scope(&BackupScope::KvDomain("nope".to_string()), &kv, &None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BackupError::DomainNotFound(d) if d == "nope"));
+        })
     }
 
     // 3. resolve_scope: json/json:<domain> with no JSON engine -> JsonEngineDisabled.
-    #[tokio::test]
-    async fn test_resolve_json_scope_without_engine_errors() {
-        let (kv, _dir) = make_kv_registry().await;
-        let err = resolve_scope(&BackupScope::Json, &kv, &None).await.unwrap_err();
-        assert!(matches!(err, BackupError::JsonEngineDisabled));
-        let err = resolve_scope(&BackupScope::JsonDomain("x".to_string()), &kv, &None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BackupError::JsonEngineDisabled));
+    #[test]
+    fn test_resolve_json_scope_without_engine_errors() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir) = make_kv_registry().await;
+            let err = resolve_scope(&BackupScope::Json, &kv, &None).await.unwrap_err();
+            assert!(matches!(err, BackupError::JsonEngineDisabled));
+            let err = resolve_scope(&BackupScope::JsonDomain("x".to_string()), &kv, &None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BackupError::JsonEngineDisabled));
+        })
     }
 
     // 4. resolve_scope: domain:<name> present in only one engine backs up only that one.
-    #[tokio::test]
-    async fn test_resolve_domain_scope_single_engine() {
-        let (kv, _dir1) = make_kv_registry().await;
-        let (json, _dir2) = make_json_engine().await;
-        kv.create_domain("only-kv").await.unwrap();
-        let resolved = resolve_scope(&BackupScope::Domain("only-kv".to_string()), &kv, &Some(Arc::clone(&json)))
-            .await
-            .unwrap();
-        assert_eq!(resolved.kv_domains.len(), 1);
-        assert!(resolved.json_domains.is_empty());
+    #[test]
+    fn test_resolve_domain_scope_single_engine() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            let (json, _dir2) = make_json_engine().await;
+            kv.create_domain("only-kv").await.unwrap();
+            let resolved = resolve_scope(&BackupScope::Domain("only-kv".to_string()), &kv, &Some(Arc::clone(&json)))
+                .await
+                .unwrap();
+            assert_eq!(resolved.kv_domains.len(), 1);
+            assert!(resolved.json_domains.is_empty());
+        })
     }
 
     // 5. resolve_scope: domain:<name> missing in both engines -> DomainNotFound.
-    #[tokio::test]
-    async fn test_resolve_domain_scope_missing_everywhere() {
-        let (kv, _dir1) = make_kv_registry().await;
-        let (json, _dir2) = make_json_engine().await;
-        let err = resolve_scope(&BackupScope::Domain("nope".to_string()), &kv, &Some(json))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BackupError::DomainNotFound(_)));
+    #[test]
+    fn test_resolve_domain_scope_missing_everywhere() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            let (json, _dir2) = make_json_engine().await;
+            let err = resolve_scope(&BackupScope::Domain("nope".to_string()), &kv, &Some(json))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BackupError::DomainNotFound(_)));
+        })
     }
 
     // 6. run_backup: kv-only roundtrip produces a well-formed, checksummed
     //    NDJSON file with the expected line shapes and section order.
-    #[tokio::test]
-    async fn test_run_backup_kv_only_writes_valid_ndjson() {
-        let (kv, _dir1) = make_kv_registry().await;
-        kv.create_domain("shop").await.unwrap();
-        let store = kv.store("shop").await.unwrap();
-        store.put(b"order:1", b"hello").await.unwrap();
-        store.put_with_ttl(b"session", b"tok", 3600).await.unwrap();
-        store.set_null(b"nulled").await.unwrap();
+    #[test]
+    fn test_run_backup_kv_only_writes_valid_ndjson() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            kv.create_domain("shop").await.unwrap();
+            let store = kv.store("shop").await.unwrap();
+            store.put(b"order:1", b"hello").await.unwrap();
+            store.put_with_ttl(b"session", b"tok", 3600).await.unwrap();
+            store.set_null(b"nulled").await.unwrap();
 
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
-        let scope = BackupScope::KvDomain("shop".to_string());
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_test",
-            scope: &scope,
-            include_auth: false,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &None,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        run_backup(params).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
+            let scope = BackupScope::KvDomain("shop".to_string());
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_test",
+                scope: &scope,
+                include_auth: false,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &None,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            run_backup(params).await.unwrap();
 
-        let content = std::fs::read_to_string(out_dir.path().join("bk_test.ndjson")).unwrap();
-        assert!(!out_dir.path().join("bk_test.ndjson.part").exists());
-        let raw_lines: Vec<&str> = content.lines().collect();
-        // manifest + kv-domain + 3 kv pairs (order:1, session, nulled) + checksum.
-        assert_eq!(raw_lines.len(), 6);
+            let content = std::fs::read_to_string(out_dir.path().join("bk_test.ndjson")).unwrap();
+            assert!(!out_dir.path().join("bk_test.ndjson.part").exists());
+            let raw_lines: Vec<&str> = content.lines().collect();
+            // manifest + kv-domain + 3 kv pairs (order:1, session, nulled) + checksum.
+            assert_eq!(raw_lines.len(), 6);
 
-        let manifest: ManifestLine = serde_json::from_str(raw_lines[0]).unwrap();
-        assert_eq!(manifest.t, "manifest");
-        assert_eq!(manifest.scope, "kv:shop");
-        assert_eq!(manifest.encoding, "hex");
+            let manifest: ManifestLine = serde_json::from_str(raw_lines[0]).unwrap();
+            assert_eq!(manifest.t, "manifest");
+            assert_eq!(manifest.scope, "kv:shop");
+            assert_eq!(manifest.encoding, "hex");
 
-        let dom: KvDomainLine = serde_json::from_str(raw_lines[1]).unwrap();
-        assert_eq!(dom.name, "shop");
+            let dom: KvDomainLine = serde_json::from_str(raw_lines[1]).unwrap();
+            assert_eq!(dom.name, "shop");
 
-        let kv_lines: Vec<KvLine> = raw_lines[2..5].iter().map(|l| serde_json::from_str(l).unwrap()).collect();
-        let by_key: std::collections::HashMap<String, KvLine> =
-            kv_lines.into_iter().map(|l| (String::from_utf8(hex::decode(&l.k).unwrap()).unwrap(), l)).collect();
+            let kv_lines: Vec<KvLine> = raw_lines[2..5].iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+            let by_key: std::collections::HashMap<String, KvLine> =
+                kv_lines.into_iter().map(|l| (String::from_utf8(hex::decode(&l.k).unwrap()).unwrap(), l)).collect();
 
-        let order = &by_key["order:1"];
-        assert_eq!(String::from_utf8(hex::decode(order.v.as_ref().unwrap()).unwrap()).unwrap(), "hello");
-        assert_eq!(order.expires_at, 0);
+            let order = &by_key["order:1"];
+            assert_eq!(String::from_utf8(hex::decode(order.v.as_ref().unwrap()).unwrap()).unwrap(), "hello");
+            assert_eq!(order.expires_at, 0);
 
-        let session = &by_key["session"];
-        assert!(session.expires_at > now_secs());
+            let session = &by_key["session"];
+            assert!(session.expires_at > now_secs());
 
-        let nulled = &by_key["nulled"];
-        assert!(nulled.v.is_none(), "set_null must round-trip as v:null");
+            let nulled = &by_key["nulled"];
+            assert!(nulled.v.is_none(), "set_null must round-trip as v:null");
 
-        let checksum: ChecksumLine = serde_json::from_str(raw_lines[5]).unwrap();
-        assert_eq!(checksum.lines, 5);
+            let checksum: ChecksumLine = serde_json::from_str(raw_lines[5]).unwrap();
+            assert_eq!(checksum.lines, 5);
+        })
     }
 
     // 7. Snapshot consistency: a write committed after run_backup has
@@ -600,131 +654,137 @@ mod tests {
     //    appear in the output (spec general/006 consistency guarantee). Uses
     //    scan_batch_size=1 + a real pause to open a window mid-export in
     //    which a concurrent write is injected.
-    #[tokio::test]
-    async fn test_run_backup_snapshot_excludes_writes_during_export() {
-        let (kv, _dir1) = make_kv_registry().await;
-        kv.create_domain("shop").await.unwrap();
-        let store = kv.store("shop").await.unwrap();
-        store.put(b"a1", b"v1").await.unwrap();
-        store.put(b"a2", b"v2").await.unwrap();
+    #[test]
+    fn test_run_backup_snapshot_excludes_writes_during_export() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            kv.create_domain("shop").await.unwrap();
+            let store = kv.store("shop").await.unwrap();
+            store.put(b"a1", b"v1").await.unwrap();
+            store.put(b"a2", b"v2").await.unwrap();
 
-        let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let out_path = out_dir.path().to_path_buf();
-        let kv_for_task = Arc::clone(&kv);
+            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let out_path = out_dir.path().to_path_buf();
+            let kv_for_task = Arc::clone(&kv);
 
-        let backup_task = tokio::spawn(async move {
-            let scope = BackupScope::KvDomain("shop".to_string());
-            let params = BackupParams {
-                dir: &out_path,
-                id: "bk_snap",
-                scope: &scope,
-                include_auth: false,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv_for_task,
-                json_engine: &None,
-                scan_batch_size: 1,
-                scan_pause_ms: 300,
-            };
-            run_backup(params).await.unwrap();
-        });
+            let backup_task = compio::runtime::spawn(async move {
+                let scope = BackupScope::KvDomain("shop".to_string());
+                let params = BackupParams {
+                    dir: &out_path,
+                    id: "bk_snap",
+                    scope: &scope,
+                    include_auth: false,
+                    schedule: None,
+                    resolved: &resolved,
+                    kv_registry: &kv_for_task,
+                    json_engine: &None,
+                    scan_batch_size: 1,
+                    scan_pause_ms: 300,
+                };
+                run_backup(params).await.unwrap();
+            });
 
-        // Let the job acquire its snapshot and enter its first pause window.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        store.put(b"after", b"v3").await.unwrap();
-        backup_task.await.unwrap();
+            // Let the job acquire its snapshot and enter its first pause window.
+            compio::time::sleep(std::time::Duration::from_millis(100)).await;
+            store.put(b"after", b"v3").await.unwrap();
+            backup_task.await.unwrap();
 
-        let content = std::fs::read_to_string(out_dir.path().join("bk_snap.ndjson")).unwrap();
-        let exported_keys: std::collections::HashSet<String> = content
-            .lines()
-            .filter_map(|l| serde_json::from_str::<KvLine>(l).ok())
-            .map(|l| String::from_utf8(hex::decode(&l.k).unwrap()).unwrap())
-            .collect();
-        assert!(exported_keys.contains("a1") && exported_keys.contains("a2"));
-        assert!(!exported_keys.contains("after"), "a write during the export must not leak into the snapshot");
+            let content = std::fs::read_to_string(out_dir.path().join("bk_snap.ndjson")).unwrap();
+            let exported_keys: std::collections::HashSet<String> = content
+                .lines()
+                .filter_map(|l| serde_json::from_str::<KvLine>(l).ok())
+                .map(|l| String::from_utf8(hex::decode(&l.k).unwrap()).unwrap())
+                .collect();
+            assert!(exported_keys.contains("a1") && exported_keys.contains("a2"));
+            assert!(!exported_keys.contains("after"), "a write during the export must not leak into the snapshot");
+        })
     }
 
     // 8. include_auth is only effective for all/kv scopes.
-    #[tokio::test]
-    async fn test_include_auth_ignored_for_domain_scope() {
-        let (kv, _dir1) = make_kv_registry().await;
-        kv.create_domain("shop").await.unwrap();
-        let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let scope = BackupScope::KvDomain("shop".to_string());
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_authflag",
-            scope: &scope,
-            include_auth: true,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &None,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        run_backup(params).await.unwrap();
-        let content = std::fs::read_to_string(out_dir.path().join("bk_authflag.ndjson")).unwrap();
-        let manifest_line = content.lines().next().unwrap();
-        let manifest: ManifestLine = serde_json::from_str(manifest_line).unwrap();
-        assert!(!manifest.include_auth, "kv:<domain> must not export auth even if requested");
+    #[test]
+    fn test_include_auth_ignored_for_domain_scope() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            kv.create_domain("shop").await.unwrap();
+            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let scope = BackupScope::KvDomain("shop".to_string());
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_authflag",
+                scope: &scope,
+                include_auth: true,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &None,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            run_backup(params).await.unwrap();
+            let content = std::fs::read_to_string(out_dir.path().join("bk_authflag.ndjson")).unwrap();
+            let manifest_line = content.lines().next().unwrap();
+            let manifest: ManifestLine = serde_json::from_str(manifest_line).unwrap();
+            assert!(!manifest.include_auth, "kv:<domain> must not export auth even if requested");
+        })
     }
 
     // 8b. include_auth=true on an all/kv scope does export auth-user/auth-perm
     //     lines, with the UserRecord/DomainPermission fields intact.
-    #[tokio::test]
-    async fn test_backup_include_auth_true_exports_auth_lines() {
-        let (kv, _dir1) = make_kv_registry().await;
-        let engine = kv.engine();
-        let record = UserRecord {
-            name: "carol".to_string(),
-            api_key_hash: "abc123".to_string(),
-            role: crate::auth::UserRole::Admin,
-            created_at: 1_700_000_000,
-        };
-        engine.put(b"__sys:auth:user:carol", &serde_json::to_vec(&record).unwrap()).await.unwrap();
-        let perm = DomainPermission {
-            username: "carol".to_string(),
-            domain: "shop".to_string(),
-            access: crate::auth::AccessLevel::Write,
-        };
-        engine
-            .put(format!("{PREFIX_PERM}carol:shop").as_bytes(), &serde_json::to_vec(&perm).unwrap())
-            .await
-            .unwrap();
+    #[test]
+    fn test_backup_include_auth_true_exports_auth_lines() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            let engine = kv.engine();
+            let record = UserRecord {
+                name: "carol".to_string(),
+                api_key_hash: "abc123".to_string(),
+                role: crate::auth::UserRole::Admin,
+                created_at: 1_700_000_000,
+            };
+            engine.put(b"__sys:auth:user:carol", &serde_json::to_vec(&record).unwrap()).await.unwrap();
+            let perm = DomainPermission {
+                username: "carol".to_string(),
+                domain: "shop".to_string(),
+                access: crate::auth::AccessLevel::Write,
+            };
+            engine
+                .put(format!("{PREFIX_PERM}carol:shop").as_bytes(), &serde_json::to_vec(&perm).unwrap())
+                .await
+                .unwrap();
 
-        let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let scope = BackupScope::All;
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_authtrue",
-            scope: &scope,
-            include_auth: true,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &None,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        run_backup(params).await.unwrap();
+            let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let scope = BackupScope::All;
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_authtrue",
+                scope: &scope,
+                include_auth: true,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &None,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            run_backup(params).await.unwrap();
 
-        let content = std::fs::read_to_string(out_dir.path().join("bk_authtrue.ndjson")).unwrap();
-        let manifest: ManifestLine = serde_json::from_str(content.lines().next().unwrap()).unwrap();
-        assert!(manifest.include_auth);
+            let content = std::fs::read_to_string(out_dir.path().join("bk_authtrue.ndjson")).unwrap();
+            let manifest: ManifestLine = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+            assert!(manifest.include_auth);
 
-        let user_line = content.lines().find(|l| l.contains("\"auth-user\"")).expect("auth-user line must be present");
-        let restored: UserRecord = serde_json::from_str(user_line).unwrap();
-        assert_eq!(restored.name, "carol");
-        assert_eq!(restored.api_key_hash, "abc123");
+            let user_line = content.lines().find(|l| l.contains("\"auth-user\"")).expect("auth-user line must be present");
+            let restored: UserRecord = serde_json::from_str(user_line).unwrap();
+            assert_eq!(restored.name, "carol");
+            assert_eq!(restored.api_key_hash, "abc123");
 
-        let perm_line = content.lines().find(|l| l.contains("\"auth-perm\"")).expect("auth-perm line must be present");
-        let restored_perm: DomainPermission = serde_json::from_str(perm_line).unwrap();
-        assert_eq!(restored_perm.username, "carol");
-        assert_eq!(restored_perm.domain, "shop");
+            let perm_line = content.lines().find(|l| l.contains("\"auth-perm\"")).expect("auth-perm line must be present");
+            let restored_perm: DomainPermission = serde_json::from_str(perm_line).unwrap();
+            assert_eq!(restored_perm.username, "carol");
+            assert_eq!(restored_perm.domain, "shop");
+        })
     }
 
     // 8c. Auth records live outside every domain: an `all` backup taken while
@@ -732,200 +792,210 @@ mod tests {
     //     KV snapshot was only acquired for non-empty domain lists, so the
     //     auth section was silently skipped while the manifest still
     //     announced include_auth).
-    #[tokio::test]
-    async fn test_backup_exports_auth_without_any_kv_domain() {
-        let (kv, _dir1) = make_kv_registry().await;
-        kv.delete_domain("default").await.unwrap();
-        let record = UserRecord {
-            name: "erin".to_string(),
-            api_key_hash: "cafe".to_string(),
-            role: crate::auth::UserRole::Admin,
-            created_at: 1_700_000_000,
-        };
-        kv.engine()
-            .put(format!("{PREFIX_USER}erin").as_bytes(), &serde_json::to_vec(&record).unwrap())
-            .await
-            .unwrap();
+    #[test]
+    fn test_backup_exports_auth_without_any_kv_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            kv.delete_domain("default").await.unwrap();
+            let record = UserRecord {
+                name: "erin".to_string(),
+                api_key_hash: "cafe".to_string(),
+                role: crate::auth::UserRole::Admin,
+                created_at: 1_700_000_000,
+            };
+            kv.engine()
+                .put(format!("{PREFIX_USER}erin").as_bytes(), &serde_json::to_vec(&record).unwrap())
+                .await
+                .unwrap();
 
-        let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
-        assert!(resolved.kv_domains.is_empty(), "test setup: no domain must be left");
+            let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
+            assert!(resolved.kv_domains.is_empty(), "test setup: no domain must be left");
 
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let scope = BackupScope::All;
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_authnodomain",
-            scope: &scope,
-            include_auth: true,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &None,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        run_backup(params).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let scope = BackupScope::All;
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_authnodomain",
+                scope: &scope,
+                include_auth: true,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &None,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            run_backup(params).await.unwrap();
 
-        let content = std::fs::read_to_string(out_dir.path().join("bk_authnodomain.ndjson")).unwrap();
-        let user_line = content.lines().find(|l| l.contains("\"auth-user\"")).expect("auth-user line must be present");
-        let restored: UserRecord = serde_json::from_str(user_line).unwrap();
-        assert_eq!(restored.name, "erin");
+            let content = std::fs::read_to_string(out_dir.path().join("bk_authnodomain.ndjson")).unwrap();
+            let user_line = content.lines().find(|l| l.contains("\"auth-user\"")).expect("auth-user line must be present");
+            let restored: UserRecord = serde_json::from_str(user_line).unwrap();
+            assert_eq!(restored.name, "erin");
+        })
     }
 
     // 9. JSON domain export: index definitions and documents are exported
     //    with the expected line shapes.
-    #[tokio::test]
-    async fn test_run_backup_json_domain_with_index_and_docs() {
-        let (kv, _dir1) = make_kv_registry().await;
-        let (json, _dir2) = make_json_engine().await;
-        json.create_domain("catalog").await.unwrap();
-        json.create_index("catalog", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("catalog", "d1", json!({"city": "Essen"})).await.unwrap();
+    #[test]
+    fn test_run_backup_json_domain_with_index_and_docs() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            let (json, _dir2) = make_json_engine().await;
+            json.create_domain("catalog").await.unwrap();
+            json.create_index("catalog", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("catalog", "d1", json!({"city": "Essen"})).await.unwrap();
 
-        let resolved =
-            resolve_scope(&BackupScope::JsonDomain("catalog".to_string()), &kv, &Some(Arc::clone(&json)))
-                .await
-                .unwrap();
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let scope = BackupScope::JsonDomain("catalog".to_string());
-        let json_engine_opt = Some(json);
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_json",
-            scope: &scope,
-            include_auth: false,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &json_engine_opt,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        run_backup(params).await.unwrap();
-        let content = std::fs::read_to_string(out_dir.path().join("bk_json.ndjson")).unwrap();
-        assert!(content.contains("\"t\":\"json-domain\""));
-        assert!(content.contains("\"t\":\"json-index\""));
-        assert!(content.contains("\"t\":\"doc\""));
-        assert!(content.contains("\"field_type\":\"string\""));
+            let resolved =
+                resolve_scope(&BackupScope::JsonDomain("catalog".to_string()), &kv, &Some(Arc::clone(&json)))
+                    .await
+                    .unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let scope = BackupScope::JsonDomain("catalog".to_string());
+            let json_engine_opt = Some(json);
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_json",
+                scope: &scope,
+                include_auth: false,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &json_engine_opt,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            run_backup(params).await.unwrap();
+            let content = std::fs::read_to_string(out_dir.path().join("bk_json.ndjson")).unwrap();
+            assert!(content.contains("\"t\":\"json-domain\""));
+            assert!(content.contains("\"t\":\"json-index\""));
+            assert!(content.contains("\"t\":\"doc\""));
+            assert!(content.contains("\"field_type\":\"string\""));
+        })
     }
 
     // 9b. Binding section order (spec general/006 backup format): kv
     //     sections, then json sections, then auth, then the checksum line.
-    #[tokio::test]
-    async fn test_backup_section_order_kv_json_auth_checksum() {
-        let (kv, _dir1) = make_kv_registry().await;
-        let (json, _dir2) = make_json_engine().await;
-        kv.create_domain("shop").await.unwrap();
-        kv.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
-        json.create_domain("catalog").await.unwrap();
-        json.put_document("catalog", "d1", serde_json::json!({"n": 1})).await.unwrap();
-        let record = UserRecord {
-            name: "dave".to_string(),
-            api_key_hash: "beef".to_string(),
-            role: crate::auth::UserRole::User,
-            created_at: 1,
-        };
-        kv.engine().put(b"__sys:auth:user:dave", &serde_json::to_vec(&record).unwrap()).await.unwrap();
+    #[test]
+    fn test_backup_section_order_kv_json_auth_checksum() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            let (json, _dir2) = make_json_engine().await;
+            kv.create_domain("shop").await.unwrap();
+            kv.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
+            json.create_domain("catalog").await.unwrap();
+            json.put_document("catalog", "d1", serde_json::json!({"n": 1})).await.unwrap();
+            let record = UserRecord {
+                name: "dave".to_string(),
+                api_key_hash: "beef".to_string(),
+                role: crate::auth::UserRole::User,
+                created_at: 1,
+            };
+            kv.engine().put(b"__sys:auth:user:dave", &serde_json::to_vec(&record).unwrap()).await.unwrap();
 
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let json_opt = Some(Arc::clone(&json));
-        let resolved = resolve_scope(&BackupScope::All, &kv, &json_opt).await.unwrap();
-        let scope = BackupScope::All;
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_order",
-            scope: &scope,
-            include_auth: true,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &json_opt,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        run_backup(params).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let json_opt = Some(Arc::clone(&json));
+            let resolved = resolve_scope(&BackupScope::All, &kv, &json_opt).await.unwrap();
+            let scope = BackupScope::All;
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_order",
+                scope: &scope,
+                include_auth: true,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &json_opt,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            run_backup(params).await.unwrap();
 
-        let content = std::fs::read_to_string(out_dir.path().join("bk_order.ndjson")).unwrap();
-        let kinds: Vec<String> = content
-            .lines()
-            .map(|l| serde_json::from_str::<Value>(l).unwrap()["t"].as_str().unwrap().to_string())
-            .collect();
-        let pos = |t: &str| kinds.iter().position(|k| k == t).unwrap_or_else(|| panic!("no '{t}' line"));
-        assert_eq!(kinds.first().map(String::as_str), Some("manifest"));
-        assert!(pos("kv") < pos("json-domain"), "kv sections must precede json sections");
-        assert!(pos("doc") < pos("auth-user"), "auth must come after the documents");
-        assert_eq!(kinds.last().map(String::as_str), Some("checksum"));
+            let content = std::fs::read_to_string(out_dir.path().join("bk_order.ndjson")).unwrap();
+            let kinds: Vec<String> = content
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap()["t"].as_str().unwrap().to_string())
+                .collect();
+            let pos = |t: &str| kinds.iter().position(|k| k == t).unwrap_or_else(|| panic!("no '{t}' line"));
+            assert_eq!(kinds.first().map(String::as_str), Some("manifest"));
+            assert!(pos("kv") < pos("json-domain"), "kv sections must precede json sections");
+            assert!(pos("doc") < pos("auth-user"), "auth must come after the documents");
+            assert_eq!(kinds.last().map(String::as_str), Some("checksum"));
+        })
     }
 
     // 10. Checksum line matches the file's own content and lists the right
     //     line count.
-    #[tokio::test]
-    async fn test_checksum_line_is_valid() {
-        let (kv, _dir1) = make_kv_registry().await;
-        kv.create_domain("shop").await.unwrap();
-        let store = kv.store("shop").await.unwrap();
-        store.put(b"k1", b"v1").await.unwrap();
-        store.put(b"k2", b"v2").await.unwrap();
+    #[test]
+    fn test_checksum_line_is_valid() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            kv.create_domain("shop").await.unwrap();
+            let store = kv.store("shop").await.unwrap();
+            store.put(b"k1", b"v1").await.unwrap();
+            store.put(b"k2", b"v2").await.unwrap();
 
-        let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let scope = BackupScope::KvDomain("shop".to_string());
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_sum",
-            scope: &scope,
-            include_auth: false,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &None,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        run_backup(params).await.unwrap();
+            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let scope = BackupScope::KvDomain("shop".to_string());
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_sum",
+                scope: &scope,
+                include_auth: false,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &None,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            run_backup(params).await.unwrap();
 
-        let bytes = std::fs::read(out_dir.path().join("bk_sum.ndjson")).unwrap();
-        let text = String::from_utf8(bytes.clone()).unwrap();
-        let mut all_lines: Vec<&str> = text.lines().collect();
-        let checksum_line = all_lines.pop().unwrap();
-        let checksum: ChecksumLine = serde_json::from_str(checksum_line).unwrap();
-        assert_eq!(checksum.lines, all_lines.len() as u64);
+            let bytes = std::fs::read(out_dir.path().join("bk_sum.ndjson")).unwrap();
+            let text = String::from_utf8(bytes.clone()).unwrap();
+            let mut all_lines: Vec<&str> = text.lines().collect();
+            let checksum_line = all_lines.pop().unwrap();
+            let checksum: ChecksumLine = serde_json::from_str(checksum_line).unwrap();
+            assert_eq!(checksum.lines, all_lines.len() as u64);
 
-        let mut hasher = Sha256::new();
-        for l in &all_lines {
-            hasher.update(l.as_bytes());
-            hasher.update(b"\n");
-        }
-        assert_eq!(hex::encode(hasher.finalize()), checksum.sha256);
+            let mut hasher = Sha256::new();
+            for l in &all_lines {
+                hasher.update(l.as_bytes());
+                hasher.update(b"\n");
+            }
+            assert_eq!(hex::encode(hasher.finalize()), checksum.sha256);
+        })
     }
 
     // 11. On a write failure the `.part` file is removed, not left behind.
-    #[tokio::test]
-    async fn test_run_backup_cleans_up_part_file_on_error() {
-        let (kv, _dir1) = make_kv_registry().await;
-        // A scope resolving to a KV domain that was deleted right after
-        // resolution simulates a mid-job failure: `store()` on a Deleting/
-        // gone domain errors out inside the writer.
-        kv.create_domain("gone").await.unwrap();
-        let resolved = resolve_scope(&BackupScope::KvDomain("gone".to_string()), &kv, &None).await.unwrap();
-        kv.delete_domain("gone").await.unwrap();
+    #[test]
+    fn test_run_backup_cleans_up_part_file_on_error() {
+        crate::core::engine_runtime::block_on(async {
+            let (kv, _dir1) = make_kv_registry().await;
+            // A scope resolving to a KV domain that was deleted right after
+            // resolution simulates a mid-job failure: `store()` on a Deleting/
+            // gone domain errors out inside the writer.
+            kv.create_domain("gone").await.unwrap();
+            let resolved = resolve_scope(&BackupScope::KvDomain("gone".to_string()), &kv, &None).await.unwrap();
+            kv.delete_domain("gone").await.unwrap();
 
-        let out_dir = tempfile::TempDir::new().unwrap();
-        let scope = BackupScope::KvDomain("gone".to_string());
-        let params = BackupParams {
-            dir: out_dir.path(),
-            id: "bk_fail",
-            scope: &scope,
-            include_auth: false,
-            schedule: None,
-            resolved: &resolved,
-            kv_registry: &kv,
-            json_engine: &None,
-            scan_batch_size: 500,
-            scan_pause_ms: 0,
-        };
-        assert!(run_backup(params).await.is_err());
-        assert!(!out_dir.path().join("bk_fail.ndjson.part").exists());
-        assert!(!out_dir.path().join("bk_fail.ndjson").exists());
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let scope = BackupScope::KvDomain("gone".to_string());
+            let params = BackupParams {
+                dir: out_dir.path(),
+                id: "bk_fail",
+                scope: &scope,
+                include_auth: false,
+                schedule: None,
+                resolved: &resolved,
+                kv_registry: &kv,
+                json_engine: &None,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            };
+            assert!(run_backup(params).await.is_err());
+            assert!(!out_dir.path().join("bk_fail.ndjson.part").exists());
+            assert!(!out_dir.path().join("bk_fail.ndjson").exists());
+        })
     }
 }

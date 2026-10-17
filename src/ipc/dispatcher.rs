@@ -270,7 +270,7 @@ impl ShmDispatcher {
                 let tick = self.idle_tick;
                 let doorbells = std::future::poll_fn(|cx| self.poll_doorbells(cx));
                 tokio::select! {
-                    _ = tokio::time::timeout(tick, doorbells) => {}
+                    _ = compio::time::timeout(tick, doorbells) => {}
                     _ = shutdown.changed() => {}
                 }
             }
@@ -605,265 +605,291 @@ mod tests {
     }
 
     // Ping is answered without touching the registry.
-    #[tokio::test]
-    async fn test_ping_pong() {
-        let mut h = harness().await;
-        let resp = send_and_dispatch(&mut h, ShmCommand::Ping { request_id: 7 }).await;
-        assert_eq!(resp, ShmResponse::Pong { request_id: 7 });
+    #[test]
+    fn test_ping_pong() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            let resp = send_and_dispatch(&mut h, ShmCommand::Ping { request_id: 7 }).await;
+            assert_eq!(resp, ShmResponse::Pong { request_id: 7 });
+        })
     }
 
     // 8. GET command -> GetOk with the stored value on the response ring.
-    #[tokio::test]
-    async fn test_dispatch_get() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
-        h.registry.store("d1").await.unwrap().put(b"k", b"v").await.unwrap();
+    #[test]
+    fn test_dispatch_get() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
+            h.registry.store("d1").await.unwrap().put(b"k", b"v").await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Get { request_id: 1, domain: "d1".into(), key: b"k".to_vec() },
-        )
-        .await;
-        assert_eq!(
-            resp,
-            ShmResponse::GetOk { request_id: 1, value: ShmGetValue::Present(b"v".to_vec()) }
-        );
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Get { request_id: 1, domain: "d1".into(), key: b"k".to_vec() },
+            )
+            .await;
+            assert_eq!(
+                resp,
+                ShmResponse::GetOk { request_id: 1, value: ShmGetValue::Present(b"v".to_vec()) }
+            );
 
-        // Missing key -> GetOk { Absent }, not an error (spec §7).
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Get { request_id: 2, domain: "d1".into(), key: b"absent".to_vec() },
-        )
-        .await;
-        assert_eq!(resp, ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Absent });
+            // Missing key -> GetOk { Absent }, not an error (spec §7).
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Get { request_id: 2, domain: "d1".into(), key: b"absent".to_vec() },
+            )
+            .await;
+            assert_eq!(resp, ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Absent });
+        })
     }
 
     // 9. PUT command -> value lands in the engine, Ok response.
-    #[tokio::test]
-    async fn test_dispatch_put() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
+    #[test]
+    fn test_dispatch_put() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Put {
-                request_id: 5,
-                domain: "d1".into(),
-                key: b"pk".to_vec(),
-                value: b"pv".to_vec(),
-                ttl_secs: 0,
-            },
-        )
-        .await;
-        assert_eq!(resp, ShmResponse::Ok { request_id: 5 });
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Put {
+                    request_id: 5,
+                    domain: "d1".into(),
+                    key: b"pk".to_vec(),
+                    value: b"pv".to_vec(),
+                    ttl_secs: 0,
+                },
+            )
+            .await;
+            assert_eq!(resp, ShmResponse::Ok { request_id: 5 });
 
-        let stored = h.registry.store("d1").await.unwrap().get(b"pk").await.unwrap();
-        assert_eq!(stored, GetResult::Present(b"pv".to_vec()));
+            let stored = h.registry.store("d1").await.unwrap().get(b"pk").await.unwrap();
+            assert_eq!(stored, GetResult::Present(b"pv".to_vec()));
+        })
     }
 
     // DELETE dispatch path: Ok, and the key is gone afterwards (spec quality/003
     // prep work — the Delete arm had no send_and_dispatch test).
-    #[tokio::test]
-    async fn test_dispatch_delete() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
-        h.registry.store("d1").await.unwrap().put(b"dk", b"dv").await.unwrap();
+    #[test]
+    fn test_dispatch_delete() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
+            h.registry.store("d1").await.unwrap().put(b"dk", b"dv").await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Delete { request_id: 3, domain: "d1".into(), key: b"dk".to_vec() },
-        )
-        .await;
-        assert_eq!(resp, ShmResponse::Ok { request_id: 3 });
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Delete { request_id: 3, domain: "d1".into(), key: b"dk".to_vec() },
+            )
+            .await;
+            assert_eq!(resp, ShmResponse::Ok { request_id: 3 });
 
-        let stored = h.registry.store("d1").await.unwrap().get(b"dk").await.unwrap();
-        assert_eq!(stored, GetResult::Absent, "deleted key must be absent");
+            let stored = h.registry.store("d1").await.unwrap().get(b"dk").await.unwrap();
+            assert_eq!(stored, GetResult::Absent, "deleted key must be absent");
+        })
     }
 
     // SETNULL dispatch path (spec kv/018): Ok, and a subsequent GET reports the
     // explicit Null state — distinct from both Present and Absent.
-    #[tokio::test]
-    async fn test_dispatch_set_null_then_get_null() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
-        h.registry.store("d1").await.unwrap().put(b"nk", b"nv").await.unwrap();
+    #[test]
+    fn test_dispatch_set_null_then_get_null() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
+            h.registry.store("d1").await.unwrap().put(b"nk", b"nv").await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::SetNull { request_id: 8, domain: "d1".into(), key: b"nk".to_vec() },
-        )
-        .await;
-        assert_eq!(resp, ShmResponse::Ok { request_id: 8 });
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::SetNull { request_id: 8, domain: "d1".into(), key: b"nk".to_vec() },
+            )
+            .await;
+            assert_eq!(resp, ShmResponse::Ok { request_id: 8 });
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Get { request_id: 9, domain: "d1".into(), key: b"nk".to_vec() },
-        )
-        .await;
-        assert_eq!(resp, ShmResponse::GetOk { request_id: 9, value: ShmGetValue::Null });
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Get { request_id: 9, domain: "d1".into(), key: b"nk".to_vec() },
+            )
+            .await;
+            assert_eq!(resp, ShmResponse::GetOk { request_id: 9, value: ShmGetValue::Null });
+        })
     }
 
     // SCANKEYS dispatch path: ScanResult with the sorted prefix matches (spec
     // quality/003 prep work).
-    #[tokio::test]
-    async fn test_dispatch_scan_keys() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
-        let store = h.registry.store("d1").await.unwrap();
-        store.put(b"user:1", b"a").await.unwrap();
-        store.put(b"user:2", b"b").await.unwrap();
-        store.put(b"other", b"c").await.unwrap();
+    #[test]
+    fn test_dispatch_scan_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
+            let store = h.registry.store("d1").await.unwrap();
+            store.put(b"user:1", b"a").await.unwrap();
+            store.put(b"user:2", b"b").await.unwrap();
+            store.put(b"other", b"c").await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::ScanKeys { request_id: 4, domain: "d1".into(), prefix: b"user:".to_vec() },
-        )
-        .await;
-        match resp {
-            ShmResponse::ScanResult { request_id, keys } => {
-                assert_eq!(request_id, 4);
-                assert_eq!(keys, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::ScanKeys { request_id: 4, domain: "d1".into(), prefix: b"user:".to_vec() },
+            )
+            .await;
+            match resp {
+                ShmResponse::ScanResult { request_id, keys } => {
+                    assert_eq!(request_id, 4);
+                    assert_eq!(keys, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+                }
+                other => panic!("expected ScanResult, got {other:?}"),
             }
-            other => panic!("expected ScanResult, got {other:?}"),
-        }
+        })
     }
 
     // PUT with ttl_secs > 0 takes the put_with_ttl branch and answers Ok; the
     // value is stored (spec quality/003 prep work).
-    #[tokio::test]
-    async fn test_dispatch_put_with_ttl() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
+    #[test]
+    fn test_dispatch_put_with_ttl() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Put {
-                request_id: 6,
-                domain: "d1".into(),
-                key: b"tk".to_vec(),
-                value: b"tv".to_vec(),
-                ttl_secs: 3600,
-            },
-        )
-        .await;
-        assert_eq!(resp, ShmResponse::Ok { request_id: 6 });
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Put {
+                    request_id: 6,
+                    domain: "d1".into(),
+                    key: b"tk".to_vec(),
+                    value: b"tv".to_vec(),
+                    ttl_secs: 3600,
+                },
+            )
+            .await;
+            assert_eq!(resp, ShmResponse::Ok { request_id: 6 });
 
-        let stored = h.registry.store("d1").await.unwrap().get(b"tk").await.unwrap();
-        assert_eq!(stored, GetResult::Present(b"tv".to_vec()));
+            let stored = h.registry.store("d1").await.unwrap().get(b"tk").await.unwrap();
+            assert_eq!(stored, GetResult::Present(b"tv".to_vec()));
+        })
     }
 
     // 10. Unknown domain -> Error with code 404.
-    #[tokio::test]
-    async fn test_dispatch_unknown_domain_is_404() {
-        let mut h = harness().await;
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Get { request_id: 9, domain: "nope".into(), key: b"k".to_vec() },
-        )
-        .await;
-        match resp {
-            ShmResponse::Error { request_id, code, .. } => {
-                assert_eq!(request_id, 9);
-                assert_eq!(code, 404);
+    #[test]
+    fn test_dispatch_unknown_domain_is_404() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Get { request_id: 9, domain: "nope".into(), key: b"k".to_vec() },
+            )
+            .await;
+            match resp {
+                ShmResponse::Error { request_id, code, .. } => {
+                    assert_eq!(request_id, 9);
+                    assert_eq!(code, 404);
+                }
+                other => panic!("expected Error, got {other:?}"),
             }
-            other => panic!("expected Error, got {other:?}"),
-        }
+        })
     }
 
     // Well-framed but non-rkyv payload -> 400, and the ring keeps running.
-    #[tokio::test]
-    async fn test_malformed_payload_is_400() {
-        let mut h = harness().await;
-        h.client_tx.send(&[0xffu8, 0x00, 0x11, 0x22]).unwrap();
-        h.conn.drain(&h.registry).await.unwrap();
-        let raw = h.client_rx.recv().unwrap().expect("a response");
-        match ShmResponse::decode(&raw).unwrap() {
-            ShmResponse::Error { code, .. } => assert_eq!(code, 400),
-            other => panic!("expected Error, got {other:?}"),
-        }
+    #[test]
+    fn test_malformed_payload_is_400() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.client_tx.send(&[0xffu8, 0x00, 0x11, 0x22]).unwrap();
+            h.conn.drain(&h.registry).await.unwrap();
+            let raw = h.client_rx.recv().unwrap().expect("a response");
+            match ShmResponse::decode(&raw).unwrap() {
+                ShmResponse::Error { code, .. } => assert_eq!(code, 400),
+                other => panic!("expected Error, got {other:?}"),
+            }
+        })
     }
 
     // One drain processes at most DRAIN_BATCH commands, then returns so peers get
     // a turn and shutdown is re-checked — a client can't monopolize the runtime
     // thread by keeping its cmd ring full (Finding 1).
-    #[tokio::test]
-    async fn test_drain_is_bounded_per_call() {
-        // A ring wide enough to hold more than one batch of queued pings.
-        let mut h = harness_sized(65536).await;
-        let total = (DRAIN_BATCH + 10) as u64;
-        for i in 0..total {
-            h.client_tx.send(ShmCommand::Ping { request_id: i }.encode().as_slice()).unwrap();
-        }
-        assert_eq!(h.conn.drain(&h.registry).await.unwrap(), DRAIN_BATCH, "first pass is capped");
-        assert_eq!(h.conn.drain(&h.registry).await.unwrap(), 10, "remainder served next pass");
+    #[test]
+    fn test_drain_is_bounded_per_call() {
+        crate::core::engine_runtime::block_on(async {
+            // A ring wide enough to hold more than one batch of queued pings.
+            let mut h = harness_sized(65536).await;
+            let total = (DRAIN_BATCH + 10) as u64;
+            for i in 0..total {
+                h.client_tx.send(ShmCommand::Ping { request_id: i }.encode().as_slice()).unwrap();
+            }
+            assert_eq!(h.conn.drain(&h.registry).await.unwrap(), DRAIN_BATCH, "first pass is capped");
+            assert_eq!(h.conn.drain(&h.registry).await.unwrap(), 10, "remainder served next pass");
+        })
     }
 
     // A response too large for the resp ring becomes a 413 on the same
     // request_id, not a silent drop — the client must fail fast, not block
     // forever waiting for a response that can never fit (Finding 3).
-    #[tokio::test]
-    async fn test_oversized_response_is_413() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
-        // A value far larger than the 4096-byte resp ring: its GetOk can't fit.
-        let big = vec![0xabu8; 8192];
-        h.registry.store("d1").await.unwrap().put(b"k", &big).await.unwrap();
+    #[test]
+    fn test_oversized_response_is_413() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
+            // A value far larger than the 4096-byte resp ring: its GetOk can't fit.
+            let big = vec![0xabu8; 8192];
+            h.registry.store("d1").await.unwrap().put(b"k", &big).await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Get { request_id: 77, domain: "d1".into(), key: b"k".to_vec() },
-        )
-        .await;
-        match resp {
-            ShmResponse::Error { request_id, code, .. } => {
-                assert_eq!(request_id, 77);
-                assert_eq!(code, 413);
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Get { request_id: 77, domain: "d1".into(), key: b"k".to_vec() },
+            )
+            .await;
+            match resp {
+                ShmResponse::Error { request_id, code, .. } => {
+                    assert_eq!(request_id, 77);
+                    assert_eq!(code, 413);
+                }
+                other => panic!("expected 413 Error, got {other:?}"),
             }
-            other => panic!("expected 413 Error, got {other:?}"),
-        }
+        })
     }
 
     // A corrupt cmd ring drops only that client; healthy peers keep serving.
     // Segments held via `_`-prefixed bindings live to scope end; the rings' Drop
     // never dereferences them, so drop order among them is irrelevant.
-    #[tokio::test]
-    async fn test_corrupt_ring_drops_only_that_client() {
-        let (registry, _dir) = make_registry().await;
-        let mut dispatcher = ShmDispatcher::new(Arc::clone(&registry));
+    #[test]
+    fn test_corrupt_ring_drops_only_that_client() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let mut dispatcher = ShmDispatcher::new(Arc::clone(&registry));
 
-        let (mut a_tx, a_server_rx, _acd, _ach) = ring_ends(4096);
-        let (a_server_tx, mut a_rx, _ard, _arh) = ring_ends(4096);
-        let (_b_tx, b_server_rx, _bcd, bch) = ring_ends(4096);
-        let (b_server_tx, _b_rx, _brd, _brh) = ring_ends(4096);
-        dispatcher.clients.push(raw_connection(1, a_server_rx, a_server_tx).0);
-        dispatcher.clients.push(raw_connection(2, b_server_rx, b_server_tx).0);
+            let (mut a_tx, a_server_rx, _acd, _ach) = ring_ends(4096);
+            let (a_server_tx, mut a_rx, _ard, _arh) = ring_ends(4096);
+            let (_b_tx, b_server_rx, _bcd, bch) = ring_ends(4096);
+            let (b_server_tx, _b_rx, _brd, _brh) = ring_ends(4096);
+            dispatcher.clients.push(raw_connection(1, a_server_rx, a_server_tx).0);
+            dispatcher.clients.push(raw_connection(2, b_server_rx, b_server_tx).0);
 
-        // A sends a valid Ping; B's cmd write index is corrupted past the ring.
-        a_tx.send(ShmCommand::Ping { request_id: 1 }.encode().as_slice()).unwrap();
-        let b_header = unsafe { &*(bch.seg.as_ptr() as *const RingbufferHeader) };
-        b_header.write_idx.store(4096 * 2, Ordering::Release);
+            // A sends a valid Ping; B's cmd write index is corrupted past the ring.
+            a_tx.send(ShmCommand::Ping { request_id: 1 }.encode().as_slice()).unwrap();
+            let b_header = unsafe { &*(bch.seg.as_ptr() as *const RingbufferHeader) };
+            b_header.write_idx.store(4096 * 2, Ordering::Release);
 
-        dispatcher.poll_once().await;
+            dispatcher.poll_once().await;
 
-        assert_eq!(dispatcher.clients.len(), 1, "only the corrupt client is removed");
-        assert_eq!(dispatcher.clients[0].client_id, 1);
-        let raw = a_rx.recv().unwrap().expect("A's response");
-        assert_eq!(ShmResponse::decode(&raw).unwrap(), ShmResponse::Pong { request_id: 1 });
+            assert_eq!(dispatcher.clients.len(), 1, "only the corrupt client is removed");
+            assert_eq!(dispatcher.clients[0].client_id, 1);
+            let raw = a_rx.recv().unwrap().expect("A's response");
+            assert_eq!(ShmResponse::decode(&raw).unwrap(), ShmResponse::Pong { request_id: 1 });
+        })
     }
 
     // Disconnect events remove exactly the named client.
-    #[tokio::test]
-    async fn test_disconnect_event_removes_client() {
-        let (registry, _dir) = make_registry().await;
-        let mut dispatcher = ShmDispatcher::new(Arc::clone(&registry));
-        let (_tx, rx, _cd, _ch) = ring_ends(4096);
-        let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
-        dispatcher.clients.push(raw_connection(42, rx, tx2).0);
+    #[test]
+    fn test_disconnect_event_removes_client() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let mut dispatcher = ShmDispatcher::new(Arc::clone(&registry));
+            let (_tx, rx, _cd, _ch) = ring_ends(4096);
+            let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
+            dispatcher.clients.push(raw_connection(42, rx, tx2).0);
 
-        dispatcher.handle_event(ClientEvent::Disconnect(99)); // unknown id: no-op
-        assert_eq!(dispatcher.clients.len(), 1);
-        dispatcher.handle_event(ClientEvent::Disconnect(42));
-        assert!(dispatcher.clients.is_empty());
+            dispatcher.handle_event(ClientEvent::Disconnect(99)); // unknown id: no-op
+            assert_eq!(dispatcher.clients.len(), 1);
+            dispatcher.handle_event(ClientEvent::Disconnect(42));
+            assert!(dispatcher.clients.is_empty());
+        })
     }
 
     // ── Spec perf/014: doorbell wakeup ──────────────────────────────────────
@@ -880,7 +906,7 @@ mod tests {
             if let Some(raw) = rx.recv().unwrap() {
                 return ShmResponse::decode(&raw).unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            compio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("no response within timeout");
     }
@@ -892,7 +918,7 @@ mod tests {
         client_rx: RingConsumer,
         doorbell: OwnedFd,
         shutdown: watch::Sender<bool>,
-        task: tokio::task::JoinHandle<()>,
+        task: compio::runtime::JoinHandle<()>,
         _segs: [TestSeg; 4],
     }
 
@@ -903,7 +929,7 @@ mod tests {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         assert!(events_tx.send(ClientEvent::Connect(Box::new(conn))).is_ok());
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(dispatcher.run(events_rx, shutdown_rx));
+        let task = compio::runtime::spawn(dispatcher.run(events_rx, shutdown_rx));
         let mut p = Parked { client_tx, client_rx, doorbell, shutdown, task, _segs: [cd, ch, rd, rh] };
         // Queued before the dispatcher first runs: its first pass answers it.
         p.client_tx.send(ShmCommand::Ping { request_id: 1 }.encode().as_slice()).unwrap();
@@ -920,63 +946,71 @@ mod tests {
 
     // Test 1: with the fallback tick out of reach, ringing the doorbell alone
     // wakes the parked dispatcher.
-    #[tokio::test]
-    async fn test_doorbell_wakes_idle_dispatcher() {
-        let (registry, _dir) = make_registry().await;
-        let mut p = park(ShmDispatcher::with_idle_tick(registry, Duration::from_secs(3600))).await;
+    #[test]
+    fn test_doorbell_wakes_idle_dispatcher() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let mut p = park(ShmDispatcher::with_idle_tick(registry, Duration::from_secs(3600))).await;
 
-        p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
-        ring(&p.doorbell);
-        assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 2 });
+            p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
+            ring(&p.doorbell);
+            assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 2 });
 
-        p.stop().await;
+            p.stop().await;
+        })
     }
 
     // Test 2: a client that never rings its doorbell (legacy client) is still
     // served by the production fallback tick.
-    #[tokio::test]
-    async fn test_fallback_tick_serves_client_without_doorbell() {
-        let (registry, _dir) = make_registry().await;
-        let mut p = park(ShmDispatcher::new(registry)).await;
+    #[test]
+    fn test_fallback_tick_serves_client_without_doorbell() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let mut p = park(ShmDispatcher::new(registry)).await;
 
-        p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
-        assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 2 });
+            p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
+            assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 2 });
 
-        p.stop().await;
+            p.stop().await;
+        })
     }
 
     // A client that closes its doorbell is served by the fallback tick from
     // then on, and the dispatcher keeps running.
-    #[tokio::test]
-    async fn test_closed_doorbell_falls_back_to_tick() {
-        let (registry, _dir) = make_registry().await;
-        let mut p = park(ShmDispatcher::new(registry)).await;
+    #[test]
+    fn test_closed_doorbell_falls_back_to_tick() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let mut p = park(ShmDispatcher::new(registry)).await;
 
-        drop(p.doorbell);
-        for request_id in 2..4 {
-            p.client_tx.send(ShmCommand::Ping { request_id }.encode().as_slice()).unwrap();
-            assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id });
-        }
+            drop(p.doorbell);
+            for request_id in 2..4 {
+                p.client_tx.send(ShmCommand::Ping { request_id }.encode().as_slice()).unwrap();
+                assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id });
+            }
 
-        p.shutdown.send(true).unwrap();
-        p.task.await.unwrap();
+            p.shutdown.send(true).unwrap();
+            p.task.await.unwrap();
+        })
     }
 
     // A closed doorbell wakes the dispatcher once and is then retired: its
     // read end would report EOF forever and spin the idle wait.
-    #[tokio::test]
-    async fn test_closed_doorbell_wakes_once() {
-        let (registry, _dir) = make_registry().await;
-        let mut dispatcher = ShmDispatcher::new(registry);
-        let (_tx, rx, _cd, _ch) = ring_ends(4096);
-        let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
-        let (conn, doorbell) = raw_connection(1, rx, tx2);
-        dispatcher.clients.push(conn);
+    #[test]
+    fn test_closed_doorbell_wakes_once() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let mut dispatcher = ShmDispatcher::new(registry);
+            let (_tx, rx, _cd, _ch) = ring_ends(4096);
+            let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
+            let (conn, doorbell) = raw_connection(1, rx, tx2);
+            dispatcher.clients.push(conn);
 
-        drop(doorbell);
-        std::future::poll_fn(|cx| dispatcher.poll_doorbells(cx)).await;
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(dispatcher.poll_doorbells(&mut cx).is_pending(), "a retired doorbell must stay silent");
+            drop(doorbell);
+            std::future::poll_fn(|cx| dispatcher.poll_doorbells(cx)).await;
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(dispatcher.poll_doorbells(&mut cx).is_pending(), "a retired doorbell must stay silent");
+        })
     }
 
     // ── Spec general/007: UTF-8 key invariant ───────────────────────────────
@@ -988,28 +1022,30 @@ mod tests {
     }
 
     // Test 2: ShmCommand::Put with a non-UTF-8 key -> ShmResponse::Error { code: 400, .. }.
-    #[tokio::test]
-    async fn test_dispatch_put_non_utf8_key_is_400() {
-        let mut h = harness().await;
-        h.registry.create_domain("d1").await.unwrap();
+    #[test]
+    fn test_dispatch_put_non_utf8_key_is_400() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
 
-        let resp = send_and_dispatch(
-            &mut h,
-            ShmCommand::Put {
-                request_id: 11,
-                domain: "d1".into(),
-                key: vec![0xFF, 0xFE],
-                value: b"v".to_vec(),
-                ttl_secs: 0,
-            },
-        )
-        .await;
-        match resp {
-            ShmResponse::Error { request_id, code, .. } => {
-                assert_eq!(request_id, 11);
-                assert_eq!(code, 400);
+            let resp = send_and_dispatch(
+                &mut h,
+                ShmCommand::Put {
+                    request_id: 11,
+                    domain: "d1".into(),
+                    key: vec![0xFF, 0xFE],
+                    value: b"v".to_vec(),
+                    ttl_secs: 0,
+                },
+            )
+            .await;
+            match resp {
+                ShmResponse::Error { request_id, code, .. } => {
+                    assert_eq!(request_id, 11);
+                    assert_eq!(code, 400);
+                }
+                other => panic!("expected 400 Error, got {other:?}"),
             }
-            other => panic!("expected 400 Error, got {other:?}"),
-        }
+        })
     }
 }

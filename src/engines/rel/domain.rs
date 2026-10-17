@@ -303,213 +303,239 @@ mod tests {
     }
 
     // 1. create_domain -> get_domain returns it; system_prefix is 16 bytes.
-    #[tokio::test]
-    async fn test_create_and_get_domain() {
-        let (registry, _dir) = make_registry().await;
-        let created = registry.create_domain("alpha").await.unwrap();
-        assert_eq!(created.system_prefix.len(), 16);
-        let fetched = registry.get_domain("alpha").unwrap();
-        assert_eq!(fetched.name, "alpha");
-        assert_eq!(fetched.system_prefix, created.system_prefix);
+    #[test]
+    fn test_create_and_get_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let created = registry.create_domain("alpha").await.unwrap();
+            assert_eq!(created.system_prefix.len(), 16);
+            let fetched = registry.get_domain("alpha").unwrap();
+            assert_eq!(fetched.name, "alpha");
+            assert_eq!(fetched.system_prefix, created.system_prefix);
+        })
     }
 
     // 2. Duplicate (active) domain -> DomainAlreadyExists (409).
-    #[tokio::test]
-    async fn test_duplicate_domain_rejected() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("beta").await.unwrap();
-        let err = registry.create_domain("beta").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::DomainAlreadyExists(_)), "got: {err}");
+    #[test]
+    fn test_duplicate_domain_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("beta").await.unwrap();
+            let err = registry.create_domain("beta").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::DomainAlreadyExists(_)), "got: {err}");
+        })
     }
 
     // 3. Create against a Deleting domain of the same name -> still
     //    DomainAlreadyExists (name stays reserved until rel/013 purges it).
-    #[tokio::test]
-    async fn test_create_against_deleting_domain_still_rejected() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("gamma").await.unwrap();
-        registry.delete_domain("gamma").await.unwrap();
-        let err = registry.create_domain("gamma").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::DomainAlreadyExists(_)), "got: {err}");
+    #[test]
+    fn test_create_against_deleting_domain_still_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("gamma").await.unwrap();
+            registry.delete_domain("gamma").await.unwrap();
+            let err = registry.create_domain("gamma").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::DomainAlreadyExists(_)), "got: {err}");
+        })
     }
 
     // 4. Invalid names -> InvalidDomainName. "domains" is reserved: the
     //    static /store-api/rel/domains routes (rel/009) would shadow it.
-    #[tokio::test]
-    async fn test_invalid_domain_name_rejected() {
-        let (registry, _dir) = make_registry().await;
-        for bad in ["", "bad name!", "bad/slash", "domains", &"x".repeat(51)] {
-            let err = registry.create_domain(bad).await.unwrap_err();
-            assert!(
-                matches!(err, RelStoreError::InvalidDomainName(_)),
-                "'{bad}' got: {err}"
-            );
-        }
+    #[test]
+    fn test_invalid_domain_name_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            for bad in ["", "bad name!", "bad/slash", "domains", &"x".repeat(51)] {
+                let err = registry.create_domain(bad).await.unwrap_err();
+                assert!(
+                    matches!(err, RelStoreError::InvalidDomainName(_)),
+                    "'{bad}' got: {err}"
+                );
+            }
+        })
     }
 
     // 5. system_prefix is deterministic, collision-free and colon-free.
-    #[tokio::test]
-    async fn test_system_prefix_deterministic_and_colon_free() {
-        let (registry, _dir) = make_registry().await;
-        let a = registry.create_domain("prefix-a").await.unwrap();
-        let b = registry.create_domain("prefix-b").await.unwrap();
+    #[test]
+    fn test_system_prefix_deterministic_and_colon_free() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let a = registry.create_domain("prefix-a").await.unwrap();
+            let b = registry.create_domain("prefix-b").await.unwrap();
 
-        let expected_a = format!("{:016x}", fnv64(b"prefix-a")).into_bytes();
-        assert_eq!(a.system_prefix, expected_a, "prefix must be a deterministic FNV-64a hash");
-        assert_ne!(a.system_prefix, b.system_prefix, "different names must yield different prefixes");
+            let expected_a = format!("{:016x}", fnv64(b"prefix-a")).into_bytes();
+            assert_eq!(a.system_prefix, expected_a, "prefix must be a deterministic FNV-64a hash");
+            assert_ne!(a.system_prefix, b.system_prefix, "different names must yield different prefixes");
 
-        for prefix in [&a.system_prefix, &b.system_prefix] {
-            assert_eq!(prefix.len(), 16);
-            assert!(!prefix.contains(&0x3a), "prefix must not contain a ':' byte");
-        }
+            for prefix in [&a.system_prefix, &b.system_prefix] {
+                assert_eq!(prefix.len(), 16);
+                assert!(!prefix.contains(&0x3a), "prefix must not contain a ':' byte");
+            }
+        })
     }
 
     // 6. Default domain exists after recover; survives a simulated restart
     //    (second recover on the same engine instance).
-    #[tokio::test]
-    async fn test_default_domain_persists_across_recover() {
-        let (engine, registry, _dir) = make_setup().await;
-        assert!(registry.get_domain(DEFAULT_DOMAIN).is_some());
+    #[test]
+    fn test_default_domain_persists_across_recover() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            assert!(registry.get_domain(DEFAULT_DOMAIN).is_some());
 
-        let registry2 = RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap();
-        assert!(registry2.get_domain(DEFAULT_DOMAIN).is_some());
+            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap();
+            assert!(registry2.get_domain(DEFAULT_DOMAIN).is_some());
+        })
     }
 
     // 7. delete_domain -> get_domain returns None; require_active ->
     //    DomainDeleting (410); the domain still exists internally (no purger).
-    #[tokio::test]
-    async fn test_delete_domain_hides_it_but_keeps_it_internally() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("to-delete").await.unwrap();
-        registry.delete_domain("to-delete").await.unwrap();
+    #[test]
+    fn test_delete_domain_hides_it_but_keeps_it_internally() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("to-delete").await.unwrap();
+            registry.delete_domain("to-delete").await.unwrap();
 
-        assert!(registry.get_domain("to-delete").is_none());
-        let err = registry.require_active("to-delete").unwrap_err();
-        assert!(matches!(err, RelStoreError::DomainDeleting(_)), "got: {err}");
-        assert!(registry.get_domain_any("to-delete").is_some());
+            assert!(registry.get_domain("to-delete").is_none());
+            let err = registry.require_active("to-delete").unwrap_err();
+            assert!(matches!(err, RelStoreError::DomainDeleting(_)), "got: {err}");
+            assert!(registry.get_domain_any("to-delete").is_some());
+        })
     }
 
     // 8. require_active on an unknown domain -> DomainNotFound (404); on an
     //    active one -> Ok.
-    #[tokio::test]
-    async fn test_require_active_unknown_and_active() {
-        let (registry, _dir) = make_registry().await;
-        let err = registry.require_active("nope").unwrap_err();
-        assert!(matches!(err, RelStoreError::DomainNotFound(_)), "got: {err}");
+    #[test]
+    fn test_require_active_unknown_and_active() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let err = registry.require_active("nope").unwrap_err();
+            assert!(matches!(err, RelStoreError::DomainNotFound(_)), "got: {err}");
 
-        registry.create_domain("known").await.unwrap();
-        let ok = registry.require_active("known").unwrap();
-        assert_eq!(ok.name, "known");
+            registry.create_domain("known").await.unwrap();
+            let ok = registry.require_active("known").unwrap();
+            assert_eq!(ok.name, "known");
+        })
     }
 
     // 9. list_domains now lists ALL domains incl. Deleting (with state,
     //    rel/013); get_domain/require_active stay active-only.
-    #[tokio::test]
-    async fn test_list_domains_includes_deleting_with_state() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("one").await.unwrap();
-        registry.create_domain("two").await.unwrap();
-        registry.delete_domain("two").await.unwrap();
+    #[test]
+    fn test_list_domains_includes_deleting_with_state() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("one").await.unwrap();
+            registry.create_domain("two").await.unwrap();
+            registry.delete_domain("two").await.unwrap();
 
-        let listed = registry.list_domains();
-        let names: Vec<&str> = listed.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"default"));
-        assert!(names.contains(&"one"));
-        let two = listed.iter().find(|d| d.name == "two").expect("deleting domain must be listed");
-        assert_eq!(two.state, RelDomainState::Deleting);
-        // Resolution stays active-only.
-        assert!(registry.get_domain("two").is_none());
-        assert!(matches!(registry.require_active("two").unwrap_err(), RelStoreError::DomainDeleting(_)));
-        assert_eq!(registry.list_deleting_domains().len(), 1);
+            let listed = registry.list_domains();
+            let names: Vec<&str> = listed.iter().map(|d| d.name.as_str()).collect();
+            assert!(names.contains(&"default"));
+            assert!(names.contains(&"one"));
+            let two = listed.iter().find(|d| d.name == "two").expect("deleting domain must be listed");
+            assert_eq!(two.state, RelDomainState::Deleting);
+            // Resolution stays active-only.
+            assert!(registry.get_domain("two").is_none());
+            assert!(matches!(registry.require_active("two").unwrap_err(), RelStoreError::DomainDeleting(_)));
+            assert_eq!(registry.list_deleting_domains().len(), 1);
+        })
     }
 
     // 10. 8 parallel create_domain calls for the same name -> exactly one Ok
     //     (create-lock, spec general/003).
-    #[tokio::test]
-    async fn test_concurrent_create_domain_single_winner() {
-        let (registry, _dir) = make_registry().await;
-        let tasks: Vec<_> = (0..8)
-            .map(|_| {
-                let reg = Arc::clone(&registry);
-                tokio::spawn(async move { reg.create_domain("contested").await })
-            })
-            .collect();
-        let mut ok = 0;
-        for t in tasks {
-            if t.await.unwrap().is_ok() {
-                ok += 1;
+    #[test]
+    fn test_concurrent_create_domain_single_winner() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let reg = Arc::clone(&registry);
+                    compio::runtime::spawn(async move { reg.create_domain("contested").await })
+                })
+                .collect();
+            let mut ok = 0;
+            for t in tasks {
+                if t.await.unwrap().is_ok() {
+                    ok += 1;
+                }
             }
-        }
-        assert_eq!(ok, 1, "exactly one concurrent create_domain must succeed");
+            assert_eq!(ok, 1, "exactly one concurrent create_domain must succeed");
+        })
     }
 
     // 11. recover survives a Deleting default domain without a 409 boot loop;
     //     it stays invisible/Deleting (until rel/013 purges it).
-    #[tokio::test]
-    async fn test_recover_survives_deleting_default_domain() {
-        let (engine, registry, _dir) = make_setup().await;
-        registry.delete_domain(DEFAULT_DOMAIN).await.unwrap();
+    #[test]
+    fn test_recover_survives_deleting_default_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.delete_domain(DEFAULT_DOMAIN).await.unwrap();
 
-        let registry2 = RelDomainRegistry::recover(Arc::clone(&engine))
-            .await
-            .expect("recover must survive a Deleting default domain");
-        assert!(registry2.get_domain(DEFAULT_DOMAIN).is_none());
-        assert!(matches!(
-            registry2.require_active(DEFAULT_DOMAIN).unwrap_err(),
-            RelStoreError::DomainDeleting(_)
-        ));
+            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine))
+                .await
+                .expect("recover must survive a Deleting default domain");
+            assert!(registry2.get_domain(DEFAULT_DOMAIN).is_none());
+            assert!(matches!(
+                registry2.require_active(DEFAULT_DOMAIN).unwrap_err(),
+                RelStoreError::DomainDeleting(_)
+            ));
+        })
     }
 
     // 12. 8 parallel delete_domain calls on the same active domain -> exactly
     //     one Ok, the rest DomainDeleting (410): the lifecycle lock serializes
     //     the check-then-act across its await (rel/002 §4). Without the lock all
     //     callers read `Active` and return Ok.
-    #[tokio::test]
-    async fn test_concurrent_delete_domain_single_winner() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("contested").await.unwrap();
-        let tasks: Vec<_> = (0..8)
-            .map(|_| {
-                let reg = Arc::clone(&registry);
-                tokio::spawn(async move { reg.delete_domain("contested").await })
-            })
-            .collect();
-        let mut ok = 0;
-        let mut deleting = 0;
-        for t in tasks {
-            match t.await.unwrap() {
-                Ok(()) => ok += 1,
-                Err(RelStoreError::DomainDeleting(_)) => deleting += 1,
-                Err(e) => panic!("unexpected error: {e}"),
+    #[test]
+    fn test_concurrent_delete_domain_single_winner() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("contested").await.unwrap();
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let reg = Arc::clone(&registry);
+                    compio::runtime::spawn(async move { reg.delete_domain("contested").await })
+                })
+                .collect();
+            let mut ok = 0;
+            let mut deleting = 0;
+            for t in tasks {
+                match t.await.unwrap() {
+                    Ok(()) => ok += 1,
+                    Err(RelStoreError::DomainDeleting(_)) => deleting += 1,
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
             }
-        }
-        assert_eq!(ok, 1, "exactly one concurrent delete_domain must succeed");
-        assert_eq!(deleting, 7, "the losers must see DomainDeleting (410)");
+            assert_eq!(ok, 1, "exactly one concurrent delete_domain must succeed");
+            assert_eq!(deleting, 7, "the losers must see DomainDeleting (410)");
+        })
     }
 
     // ── Spec general/018: global lifecycle event bus ────────────────────────
 
     // Test 1 (rel slice): create_domain/delete_domain publish domain_created/
     // domain_deleted with engine "rel" and the right domain.
-    #[tokio::test]
-    async fn test_domain_lifecycle_events_published_with_rel_engine_tag() {
-        let (registry, _dir) = make_registry().await;
-        let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
-        registry.attach_event_bus(Arc::clone(&bus));
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_domain_lifecycle_events_published_with_rel_engine_tag() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
+            registry.attach_event_bus(Arc::clone(&bus));
+            let mut rx = bus.subscribe();
 
-        registry.create_domain("evdom").await.unwrap();
-        registry.delete_domain("evdom").await.unwrap();
+            registry.create_domain("evdom").await.unwrap();
+            registry.delete_domain("evdom").await.unwrap();
 
-        let created = rx.try_recv().unwrap();
-        assert_eq!(created.engine, "rel");
-        assert_eq!(created.kind, "domain_created");
-        assert_eq!(created.domain, "evdom");
-        assert_eq!(created.object, None);
+            let created = rx.try_recv().unwrap();
+            assert_eq!(created.engine, "rel");
+            assert_eq!(created.kind, "domain_created");
+            assert_eq!(created.domain, "evdom");
+            assert_eq!(created.object, None);
 
-        let deleted = rx.try_recv().unwrap();
-        assert_eq!(deleted.kind, "domain_deleted");
-        assert_eq!(deleted.domain, "evdom");
+            let deleted = rx.try_recv().unwrap();
+            assert_eq!(deleted.kind, "domain_deleted");
+            assert_eq!(deleted.domain, "evdom");
+        })
     }
 
     // Test 2 (rel slice) lives in rel/mod.rs's test module, which already
@@ -518,15 +544,17 @@ mod tests {
 
     // Test 12 (rel slice): no bus attached -> lifecycle ops succeed unchanged,
     // no panic, and nothing is published anywhere.
-    #[tokio::test]
-    async fn test_lifecycle_ops_without_event_bus_attached_publish_nothing() {
-        let (registry, _dir) = make_registry().await;
-        let bus = crate::core::events::GlobalEventBus::new(16, 16); // never attached
-        let mut rx = bus.subscribe();
+    #[test]
+    fn test_lifecycle_ops_without_event_bus_attached_publish_nothing() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let bus = crate::core::events::GlobalEventBus::new(16, 16); // never attached
+            let mut rx = bus.subscribe();
 
-        registry.create_domain("no-bus").await.unwrap();
-        registry.delete_domain("no-bus").await.unwrap();
+            registry.create_domain("no-bus").await.unwrap();
+            registry.delete_domain("no-bus").await.unwrap();
 
-        assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
+            assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
+        })
     }
 }

@@ -1493,307 +1493,329 @@ mod tests {
     }
 
     // 1. create_table -> get returns it; list contains it.
-    #[tokio::test]
-    async fn test_create_get_list() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let schema = c
-            .create_table(&d, "default", table("users", vec![pk_int("id"), col("age")]))
-            .await
-            .unwrap();
-        assert_eq!(schema.name, "users");
-        assert_eq!(schema.table_id, 1);
-        assert_eq!(schema.schema_version, 1);
-        assert_eq!(schema.columns[0].col_id, 1);
-        assert_eq!(schema.columns[1].col_id, 2);
+    #[test]
+    fn test_create_get_list() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let schema = c
+                .create_table(&d, "default", table("users", vec![pk_int("id"), col("age")]))
+                .await
+                .unwrap();
+            assert_eq!(schema.name, "users");
+            assert_eq!(schema.table_id, 1);
+            assert_eq!(schema.schema_version, 1);
+            assert_eq!(schema.columns[0].col_id, 1);
+            assert_eq!(schema.columns[1].col_id, 2);
 
-        let got = c.get(&d, "default", "users").unwrap();
-        assert_eq!(got.name(), "users");
-        assert!(matches!(got, CatalogEntry::Table(_)));
-        assert_eq!(c.list(&d, "default").unwrap().len(), 1);
+            let got = c.get(&d, "default", "users").unwrap();
+            assert_eq!(got.name(), "users");
+            assert!(matches!(got, CatalogEntry::Table(_)));
+            assert_eq!(c.list(&d, "default").unwrap().len(), 1);
+        })
     }
 
     // 2. Name collision -> 409: table vs table (case-insensitive) and table vs view.
-    #[tokio::test]
-    async fn test_name_collision_shared_namespace() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        let err = c
-            .create_table(&d, "default", table("T", vec![pk_int("id")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
-        let err = c.create_view(&d, "default", "t", "SELECT 1").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ObjectAlreadyExists { .. }), "got: {err}");
+    #[test]
+    fn test_name_collision_shared_namespace() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            let err = c
+                .create_table(&d, "default", table("T", vec![pk_int("id")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
+            let err = c.create_view(&d, "default", "t", "SELECT 1").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ObjectAlreadyExists { .. }), "got: {err}");
+        })
     }
 
     // 3. create on unknown domain -> 404; on a Deleting domain -> 410.
-    #[tokio::test]
-    async fn test_create_domain_states() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let err = c
-            .create_table(&d, "ghost", table("t", vec![pk_int("id")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::DomainNotFound(_)), "got: {err}");
+    #[test]
+    fn test_create_domain_states() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let err = c
+                .create_table(&d, "ghost", table("t", vec![pk_int("id")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::DomainNotFound(_)), "got: {err}");
 
-        d.create_domain("temp").await.unwrap();
-        d.delete_domain("temp").await.unwrap();
-        let err = c
-            .create_table(&d, "temp", table("t", vec![pk_int("id")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::DomainDeleting(_)), "got: {err}");
+            d.create_domain("temp").await.unwrap();
+            d.delete_domain("temp").await.unwrap();
+            let err = c
+                .create_table(&d, "temp", table("t", vec![pk_int("id")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::DomainDeleting(_)), "got: {err}");
+        })
     }
 
     // 4. drop -> neither in get nor list.
-    #[tokio::test]
-    async fn test_drop_removes_object() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("gone", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        c.drop_object(&d, "default", "gone").await.unwrap();
-        let err = c.get(&d, "default", "gone").unwrap_err();
-        assert!(matches!(err, RelStoreError::ObjectNotFound { .. }), "got: {err}");
-        assert!(c.list(&d, "default").unwrap().is_empty());
-        let err = c.drop_object(&d, "default", "gone").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ObjectNotFound { .. }), "got: {err}");
+    #[test]
+    fn test_drop_removes_object() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("gone", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            c.drop_object(&d, "default", "gone").await.unwrap();
+            let err = c.get(&d, "default", "gone").unwrap_err();
+            assert!(matches!(err, RelStoreError::ObjectNotFound { .. }), "got: {err}");
+            assert!(c.list(&d, "default").unwrap().is_empty());
+            let err = c.drop_object(&d, "default", "gone").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ObjectNotFound { .. }), "got: {err}");
+        })
     }
 
     // 5. Identifier validation: valid ok; uppercase lowercased; bad names rejected.
-    #[tokio::test]
-    async fn test_identifier_validation() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("valid_name1", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        let s = c
-            .create_table(&d, "default", table("MixedCase", vec![pk_int("ID")]))
-            .await
-            .unwrap();
-        assert_eq!(s.name, "mixedcase");
-        assert_eq!(s.columns[0].name, "id");
-
-        for bad in ["1leading", "has-dash", "has space", "has:colon", &"x".repeat(51)] {
-            let err = c
-                .create_table(&d, "default", table(bad, vec![pk_int("id")]))
+    #[test]
+    fn test_identifier_validation() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("valid_name1", vec![pk_int("id")]))
                 .await
-                .unwrap_err();
-            assert!(matches!(err, RelStoreError::InvalidIdentifier(_)), "'{bad}' got: {err}");
-        }
+                .unwrap();
+            let s = c
+                .create_table(&d, "default", table("MixedCase", vec![pk_int("ID")]))
+                .await
+                .unwrap();
+            assert_eq!(s.name, "mixedcase");
+            assert_eq!(s.columns[0].name, "id");
+
+            for bad in ["1leading", "has-dash", "has space", "has:colon", &"x".repeat(51)] {
+                let err = c
+                    .create_table(&d, "default", table(bad, vec![pk_int("id")]))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, RelStoreError::InvalidIdentifier(_)), "'{bad}' got: {err}");
+            }
+        })
     }
 
     // 7. PK rules: exactly one PK; missing/multiple/wrong-type; AUTOINCREMENT.
-    #[tokio::test]
-    async fn test_primary_key_rules() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let err = c
-            .create_table(&d, "default", table("nopk", vec![col("a")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+    #[test]
+    fn test_primary_key_rules() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let err = c
+                .create_table(&d, "default", table("nopk", vec![col("a")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        let err = c
-            .create_table(&d, "default", table("twopk", vec![pk_int("a"), pk_int("b")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let err = c
+                .create_table(&d, "default", table("twopk", vec![pk_int("a"), pk_int("b")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        let mut real_pk = ColumnInput::new("a", ColumnType::Real);
-        real_pk.primary_key = true;
-        let err = c
-            .create_table(&d, "default", table("realpk", vec![real_pk]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let mut real_pk = ColumnInput::new("a", ColumnType::Real);
+            real_pk.primary_key = true;
+            let err = c
+                .create_table(&d, "default", table("realpk", vec![real_pk]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        let mut ai_text = pk_text("a");
-        ai_text.autoincrement = true;
-        let err = c
-            .create_table(&d, "default", table("aitext", vec![ai_text]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let mut ai_text = pk_text("a");
+            ai_text.autoincrement = true;
+            let err = c
+                .create_table(&d, "default", table("aitext", vec![ai_text]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        let mut ai_ok = pk_int("a");
-        ai_ok.autoincrement = true;
-        let ok = c
-            .create_table(&d, "default", table("aiok", vec![ai_ok]))
-            .await
-            .unwrap();
-        assert!(ok.columns[0].autoincrement);
-        assert!(!ok.columns[0].nullable, "PK is implicitly NOT NULL");
+            let mut ai_ok = pk_int("a");
+            ai_ok.autoincrement = true;
+            let ok = c
+                .create_table(&d, "default", table("aiok", vec![ai_ok]))
+                .await
+                .unwrap();
+            assert!(ok.columns[0].autoincrement);
+            assert!(!ok.columns[0].nullable, "PK is implicitly NOT NULL");
+        })
     }
 
     // 8. REFERENCES: valid + type match ok; unknown target; type mismatch;
     //    KVREF accepted without target validation; reference to a view rejected.
-    #[tokio::test]
-    async fn test_references() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("parent", vec![pk_int("id")]))
+    #[test]
+    fn test_references() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("parent", vec![pk_int("id")]))
+                .await
+                .unwrap();
+
+            let mut fk = ColumnInput::new("parent_id", ColumnType::Integer);
+            fk.references = Some("parent".to_string());
+            c.create_table(&d, "default", table("child", vec![pk_int("id"), fk]))
+                .await
+                .unwrap();
+
+            let mut ghost = ColumnInput::new("x", ColumnType::Integer);
+            ghost.references = Some("ghost".to_string());
+            let err = c
+                .create_table(&d, "default", table("c2", vec![pk_int("id"), ghost]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+
+            let mut mism = ColumnInput::new("x", ColumnType::Text);
+            mism.references = Some("parent".to_string());
+            let err = c
+                .create_table(&d, "default", table("c3", vec![pk_int("id"), mism]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TypeMismatch { .. }), "got: {err}");
+
+            // KVREF column: accepted, no target validation.
+            c.create_table(
+                &d,
+                "default",
+                table("c4", vec![pk_int("id"), ColumnInput::new("blob", ColumnType::KvRef)]),
+            )
             .await
             .unwrap();
 
-        let mut fk = ColumnInput::new("parent_id", ColumnType::Integer);
-        fk.references = Some("parent".to_string());
-        c.create_table(&d, "default", table("child", vec![pk_int("id"), fk]))
-            .await
-            .unwrap();
-
-        let mut ghost = ColumnInput::new("x", ColumnType::Integer);
-        ghost.references = Some("ghost".to_string());
-        let err = c
-            .create_table(&d, "default", table("c2", vec![pk_int("id"), ghost]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
-
-        let mut mism = ColumnInput::new("x", ColumnType::Text);
-        mism.references = Some("parent".to_string());
-        let err = c
-            .create_table(&d, "default", table("c3", vec![pk_int("id"), mism]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TypeMismatch { .. }), "got: {err}");
-
-        // KVREF column: accepted, no target validation.
-        c.create_table(
-            &d,
-            "default",
-            table("c4", vec![pk_int("id"), ColumnInput::new("blob", ColumnType::KvRef)]),
-        )
-        .await
-        .unwrap();
-
-        c.create_view(&d, "default", "v1", "SELECT 1").await.unwrap();
-        let mut ref_view = ColumnInput::new("x", ColumnType::Integer);
-        ref_view.references = Some("v1".to_string());
-        let err = c
-            .create_table(&d, "default", table("c5", vec![pk_int("id"), ref_view]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            c.create_view(&d, "default", "v1", "SELECT 1").await.unwrap();
+            let mut ref_view = ColumnInput::new("x", ColumnType::Integer);
+            ref_view.references = Some("v1".to_string());
+            let err = c
+                .create_table(&d, "default", table("c5", vec![pk_int("id"), ref_view]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+        })
     }
 
     // 9. Limits: max_columns, max_indexes_per_table, max_tables_per_domain.
-    #[tokio::test]
-    async fn test_limits() {
-        let (_e, d, c, _dir) = make_catalog_with(CatalogLimits {
-            max_columns: 2,
-            max_indexes_per_table: 16,
-            max_tables_per_domain: 256,
-        })
-        .await;
-        let err = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), col("a"), col("b")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "columns: {err}");
+    #[test]
+    fn test_limits() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog_with(CatalogLimits {
+                max_columns: 2,
+                max_indexes_per_table: 16,
+                max_tables_per_domain: 256,
+            })
+            .await;
+            let err = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), col("a"), col("b")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "columns: {err}");
 
-        let (_e, d, c, _dir) = make_catalog_with(CatalogLimits {
-            max_columns: 128,
-            max_indexes_per_table: 1,
-            max_tables_per_domain: 256,
-        })
-        .await;
-        let err = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), uniq("a"), uniq("b")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "indexes: {err}");
+            let (_e, d, c, _dir) = make_catalog_with(CatalogLimits {
+                max_columns: 128,
+                max_indexes_per_table: 1,
+                max_tables_per_domain: 256,
+            })
+            .await;
+            let err = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), uniq("a"), uniq("b")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "indexes: {err}");
 
-        let (_e, d, c, _dir) = make_catalog_with(CatalogLimits {
-            max_columns: 128,
-            max_indexes_per_table: 16,
-            max_tables_per_domain: 1,
+            let (_e, d, c, _dir) = make_catalog_with(CatalogLimits {
+                max_columns: 128,
+                max_indexes_per_table: 16,
+                max_tables_per_domain: 1,
+            })
+            .await;
+            c.create_table(&d, "default", table("t1", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            let err = c
+                .create_table(&d, "default", table("t2", vec![pk_int("id")]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "tables: {err}");
+            // A view also counts against the table limit.
+            let err = c.create_view(&d, "default", "v", "SELECT 1").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "views count: {err}");
         })
-        .await;
-        c.create_table(&d, "default", table("t1", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        let err = c
-            .create_table(&d, "default", table("t2", vec![pk_int("id")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "tables: {err}");
-        // A view also counts against the table limit.
-        let err = c.create_view(&d, "default", "v", "SELECT 1").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "views count: {err}");
     }
 
     // 10. Ids are monotonic and never reused; the counter survives recover.
-    #[tokio::test]
-    async fn test_id_monotonic_and_survives_recover() {
-        let (e, d, c, _dir) = make_catalog().await;
-        let t1 = c
-            .create_table(&d, "default", table("t", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        c.drop_object(&d, "default", "t").await.unwrap();
-        let t2 = c
-            .create_table(&d, "default", table("t", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        assert!(t2.table_id > t1.table_id, "re-created table must get a fresh id");
+    #[test]
+    fn test_id_monotonic_and_survives_recover() {
+        crate::core::engine_runtime::block_on(async {
+            let (e, d, c, _dir) = make_catalog().await;
+            let t1 = c
+                .create_table(&d, "default", table("t", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            c.drop_object(&d, "default", "t").await.unwrap();
+            let t2 = c
+                .create_table(&d, "default", table("t", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            assert!(t2.table_id > t1.table_id, "re-created table must get a fresh id");
 
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics)
-            .await
-            .unwrap();
-        let t3 = c2
-            .create_table(&d, "default", table("u", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        assert!(t3.table_id > t2.table_id, "counter must continue past recover");
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics)
+                .await
+                .unwrap();
+            let t3 = c2
+                .create_table(&d, "default", table("u", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            assert!(t3.table_id > t2.table_id, "counter must continue past recover");
+        })
     }
 
     // 17. Recovery: table + view + id counter survive a fresh recover.
-    #[tokio::test]
-    async fn test_recovery_of_entries_and_counter() {
-        let (e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("tbl", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        c.create_view(&d, "default", "vw", "SELECT * FROM tbl")
-            .await
-            .unwrap();
+    #[test]
+    fn test_recovery_of_entries_and_counter() {
+        crate::core::engine_runtime::block_on(async {
+            let (e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("tbl", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            c.create_view(&d, "default", "vw", "SELECT * FROM tbl")
+                .await
+                .unwrap();
 
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics)
-            .await
-            .unwrap();
-        assert!(matches!(c2.get(&d, "default", "tbl").unwrap(), CatalogEntry::Table(_)));
-        match c2.get(&d, "default", "vw").unwrap() {
-            CatalogEntry::View(v) => assert_eq!(v.sql, "SELECT * FROM tbl"),
-            other => panic!("expected view, got {other:?}"),
-        }
-        assert_eq!(c2.list(&d, "default").unwrap().len(), 2);
-        let next = c2
-            .create_table(&d, "default", table("tbl2", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        assert!(next.table_id > 1, "counter must survive recover");
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics)
+                .await
+                .unwrap();
+            assert!(matches!(c2.get(&d, "default", "tbl").unwrap(), CatalogEntry::Table(_)));
+            match c2.get(&d, "default", "vw").unwrap() {
+                CatalogEntry::View(v) => assert_eq!(v.sql, "SELECT * FROM tbl"),
+                other => panic!("expected view, got {other:?}"),
+            }
+            assert_eq!(c2.list(&d, "default").unwrap().len(), 2);
+            let next = c2
+                .create_table(&d, "default", table("tbl2", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            assert!(next.table_id > 1, "counter must survive recover");
+        })
     }
 
     // 18. create_view stores raw SQL; get returns the View; view vs table -> 409.
-    #[tokio::test]
-    async fn test_create_view() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let sql = "SELECT a, b FROM t WHERE x > 1";
-        let v = c.create_view(&d, "default", "myview", sql).await.unwrap();
-        assert_eq!(v.sql, sql);
-        match c.get(&d, "default", "myview").unwrap() {
-            CatalogEntry::View(vw) => assert_eq!(vw.sql, sql),
-            other => panic!("expected view, got {other:?}"),
-        }
+    #[test]
+    fn test_create_view() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let sql = "SELECT a, b FROM t WHERE x > 1";
+            let v = c.create_view(&d, "default", "myview", sql).await.unwrap();
+            assert_eq!(v.sql, sql);
+            match c.get(&d, "default", "myview").unwrap() {
+                CatalogEntry::View(vw) => assert_eq!(vw.sql, sql),
+                other => panic!("expected view, got {other:?}"),
+            }
 
-        c.create_table(&d, "default", table("shared", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        let err = c.create_view(&d, "default", "shared", "SELECT 1").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ObjectAlreadyExists { .. }), "got: {err}");
+            c.create_table(&d, "default", table("shared", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            let err = c.create_view(&d, "default", "shared", "SELECT 1").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ObjectAlreadyExists { .. }), "got: {err}");
+        })
     }
 
     // ── DDL primitives beyond CREATE TABLE (spec rel/004 §8) ────────────────────
@@ -1801,265 +1823,283 @@ mod tests {
     // 19. add_column: col_id is "highest existing + 1", never reused after a
     //     DROP COLUMN + ADD COLUMN cycle; schema_version bumps only on
     //     ADD/DROP COLUMN (not RENAME COLUMN/RENAME TO/CREATE|DROP INDEX).
-    #[tokio::test]
-    async fn test_add_column_col_id_and_schema_version() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let schema = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
-            .await
-            .unwrap();
-        assert_eq!(schema.schema_version, 1);
-        assert_eq!(schema.next_col_id, 3);
+    #[test]
+    fn test_add_column_col_id_and_schema_version() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let schema = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
+                .await
+                .unwrap();
+            assert_eq!(schema.schema_version, 1);
+            assert_eq!(schema.next_col_id, 3);
 
-        let schema = c
-            .add_column(&d, "default", "t", ColumnInput::new("b", ColumnType::Integer))
-            .await
-            .unwrap();
-        assert_eq!(schema.schema_version, 2);
-        assert_eq!(schema.columns.last().unwrap().col_id, 3);
-        assert_eq!(schema.next_col_id, 4);
+            let schema = c
+                .add_column(&d, "default", "t", ColumnInput::new("b", ColumnType::Integer))
+                .await
+                .unwrap();
+            assert_eq!(schema.schema_version, 2);
+            assert_eq!(schema.columns.last().unwrap().col_id, 3);
+            assert_eq!(schema.next_col_id, 4);
 
-        let schema = c.drop_column(&d, "default", "t", "b").await.unwrap();
-        assert_eq!(schema.schema_version, 3);
-        assert!(!schema.columns.iter().any(|col| col.name == "b"));
+            let schema = c.drop_column(&d, "default", "t", "b").await.unwrap();
+            assert_eq!(schema.schema_version, 3);
+            assert!(!schema.columns.iter().any(|col| col.name == "b"));
 
-        // Re-adding a column must not reuse col_id 3 (it belonged to 'b').
-        let schema = c
-            .add_column(&d, "default", "t", ColumnInput::new("c", ColumnType::Integer))
-            .await
-            .unwrap();
-        assert_eq!(schema.schema_version, 4);
-        assert_eq!(
-            schema.columns.last().unwrap().col_id,
-            4,
-            "must not reuse the dropped column's col_id"
-        );
+            // Re-adding a column must not reuse col_id 3 (it belonged to 'b').
+            let schema = c
+                .add_column(&d, "default", "t", ColumnInput::new("c", ColumnType::Integer))
+                .await
+                .unwrap();
+            assert_eq!(schema.schema_version, 4);
+            assert_eq!(
+                schema.columns.last().unwrap().col_id,
+                4,
+                "must not reuse the dropped column's col_id"
+            );
 
-        // RENAME COLUMN/RENAME TO/CREATE INDEX/DROP INDEX must not bump schema_version.
-        let schema = c.rename_column(&d, "default", "t", "c", "c2").await.unwrap();
-        assert_eq!(schema.schema_version, 4);
-        let schema = c.rename_table(&d, "default", "t", "t2").await.unwrap();
-        assert_eq!(schema.schema_version, 4);
-        let (_dom, _schema, meta) = c
-            .create_index_reserve(&d, "default", "t2", "t2_a_idx", "a", false)
-            .await
-            .unwrap();
-        c.create_index_commit(&d, "default", "t2", meta.clone()).await.unwrap();
-        let CatalogEntry::Table(schema) = c.get(&d, "default", "t2").unwrap() else {
-            panic!("expected a table")
-        };
-        assert_eq!(schema.schema_version, 4);
-        c.drop_index(&d, "default", &meta.name).await.unwrap();
-        let CatalogEntry::Table(schema) = c.get(&d, "default", "t2").unwrap() else {
-            panic!("expected a table")
-        };
-        assert_eq!(schema.schema_version, 4);
+            // RENAME COLUMN/RENAME TO/CREATE INDEX/DROP INDEX must not bump schema_version.
+            let schema = c.rename_column(&d, "default", "t", "c", "c2").await.unwrap();
+            assert_eq!(schema.schema_version, 4);
+            let schema = c.rename_table(&d, "default", "t", "t2").await.unwrap();
+            assert_eq!(schema.schema_version, 4);
+            let (_dom, _schema, meta) = c
+                .create_index_reserve(&d, "default", "t2", "t2_a_idx", "a", false)
+                .await
+                .unwrap();
+            c.create_index_commit(&d, "default", "t2", meta.clone()).await.unwrap();
+            let CatalogEntry::Table(schema) = c.get(&d, "default", "t2").unwrap() else {
+                panic!("expected a table")
+            };
+            assert_eq!(schema.schema_version, 4);
+            c.drop_index(&d, "default", &meta.name).await.unwrap();
+            let CatalogEntry::Table(schema) = c.get(&d, "default", "t2").unwrap() else {
+                panic!("expected a table")
+            };
+            assert_eq!(schema.schema_version, 4);
+        })
     }
 
     // 20. next_col_id survives recover().
-    #[tokio::test]
-    async fn test_next_col_id_survives_recover() {
-        let (e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id")])).await.unwrap();
-        c.add_column(&d, "default", "t", ColumnInput::new("a", ColumnType::Integer))
-            .await
-            .unwrap();
+    #[test]
+    fn test_next_col_id_survives_recover() {
+        crate::core::engine_runtime::block_on(async {
+            let (e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id")])).await.unwrap();
+            c.add_column(&d, "default", "t", ColumnInput::new("a", ColumnType::Integer))
+                .await
+                .unwrap();
 
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics).await.unwrap();
-        let schema = c2
-            .add_column(&d, "default", "t", ColumnInput::new("b", ColumnType::Integer))
-            .await
-            .unwrap();
-        // Columns so far: id(1), a(2) -> next_col_id was 3 going into recover.
-        assert_eq!(schema.columns.last().unwrap().col_id, 3, "next_col_id must survive recover");
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics).await.unwrap();
+            let schema = c2
+                .add_column(&d, "default", "t", ColumnInput::new("b", ColumnType::Integer))
+                .await
+                .unwrap();
+            // Columns so far: id(1), a(2) -> next_col_id was 3 going into recover.
+            assert_eq!(schema.columns.last().unwrap().col_id, 3, "next_col_id must survive recover");
+        })
     }
 
     // 21. add_column rejects PRIMARY KEY/AUTOINCREMENT/UNIQUE and a bare
     //     NOT NULL without a literal DEFAULT; table/column existence checks.
-    #[tokio::test]
-    async fn test_add_column_validation() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id")])).await.unwrap();
+    #[test]
+    fn test_add_column_validation() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id")])).await.unwrap();
 
-        let err = c.add_column(&d, "default", "ghost", col("a")).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            let err = c.add_column(&d, "default", "ghost", col("a")).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
 
-        let err = c.add_column(&d, "default", "t", pk_int("id")).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnAlreadyExists { .. }), "got: {err}");
+            let err = c.add_column(&d, "default", "t", pk_int("id")).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnAlreadyExists { .. }), "got: {err}");
 
-        let mut bad_pk = col("x");
-        bad_pk.primary_key = true;
-        let err = c.add_column(&d, "default", "t", bad_pk).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let mut bad_pk = col("x");
+            bad_pk.primary_key = true;
+            let err = c.add_column(&d, "default", "t", bad_pk).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        let mut not_null_no_default = ColumnInput::new("y", ColumnType::Text);
-        not_null_no_default.nullable = false;
-        let err = c
-            .add_column(&d, "default", "t", not_null_no_default)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let mut not_null_no_default = ColumnInput::new("y", ColumnType::Text);
+            not_null_no_default.nullable = false;
+            let err = c
+                .add_column(&d, "default", "t", not_null_no_default)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
 
-        let mut not_null_with_default = ColumnInput::new("z", ColumnType::Text);
-        not_null_with_default.nullable = false;
-        not_null_with_default.default = DefaultValue::Literal(ScalarValue::Text("x".to_string()));
-        c.add_column(&d, "default", "t", not_null_with_default).await.unwrap();
+            let mut not_null_with_default = ColumnInput::new("z", ColumnType::Text);
+            not_null_with_default.nullable = false;
+            not_null_with_default.default = DefaultValue::Literal(ScalarValue::Text("x".to_string()));
+            c.add_column(&d, "default", "t", not_null_with_default).await.unwrap();
+        })
     }
 
     // 22. drop_column: missing column -> ColumnNotFound; PK/indexed -> 409.
-    #[tokio::test]
-    async fn test_drop_column_validation() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id"), uniq("u"), col("a")]))
-            .await
-            .unwrap();
+    #[test]
+    fn test_drop_column_validation() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id"), uniq("u"), col("a")]))
+                .await
+                .unwrap();
 
-        let err = c.drop_column(&d, "default", "t", "ghost").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
+            let err = c.drop_column(&d, "default", "t", "ghost").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
 
-        let err = c.drop_column(&d, "default", "t", "id").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
+            let err = c.drop_column(&d, "default", "t", "id").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
 
-        // 'u' carries an implicit unique index from CREATE TABLE.
-        let err = c.drop_column(&d, "default", "t", "u").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
+            // 'u' carries an implicit unique index from CREATE TABLE.
+            let err = c.drop_column(&d, "default", "t", "u").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnIndexedOrPrimaryKey { .. }), "got: {err}");
 
-        c.drop_column(&d, "default", "t", "a").await.unwrap();
+            c.drop_column(&d, "default", "t", "a").await.unwrap();
+        })
     }
 
     // 23. rename_column/rename_table: collisions -> 409; missing -> 404.
-    #[tokio::test]
-    async fn test_rename_column_and_table_validation() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a"), col("b")]))
-            .await
-            .unwrap();
-        c.create_table(&d, "default", table("u", vec![pk_int("id")])).await.unwrap();
+    #[test]
+    fn test_rename_column_and_table_validation() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a"), col("b")]))
+                .await
+                .unwrap();
+            c.create_table(&d, "default", table("u", vec![pk_int("id")])).await.unwrap();
 
-        let err = c.rename_column(&d, "default", "t", "ghost", "z").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
-        let err = c.rename_column(&d, "default", "t", "a", "b").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnAlreadyExists { .. }), "got: {err}");
-        c.rename_column(&d, "default", "t", "a", "a2").await.unwrap();
+            let err = c.rename_column(&d, "default", "t", "ghost", "z").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
+            let err = c.rename_column(&d, "default", "t", "a", "b").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnAlreadyExists { .. }), "got: {err}");
+            c.rename_column(&d, "default", "t", "a", "a2").await.unwrap();
 
-        let err = c.rename_table(&d, "default", "ghost", "z").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
-        let err = c.rename_table(&d, "default", "t", "u").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
-        let renamed = c.rename_table(&d, "default", "t", "t2").await.unwrap();
-        assert_eq!(renamed.name, "t2");
-        assert!(c.get(&d, "default", "t").is_err());
-        assert!(c.get(&d, "default", "t2").is_ok());
+            let err = c.rename_table(&d, "default", "ghost", "z").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            let err = c.rename_table(&d, "default", "t", "u").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
+            let renamed = c.rename_table(&d, "default", "t", "t2").await.unwrap();
+            assert_eq!(renamed.name, "t2");
+            assert!(c.get(&d, "default", "t").is_err());
+            assert!(c.get(&d, "default", "t2").is_ok());
+        })
     }
 
     // 24. create_index_reserve/commit + drop_index: domain-wide unique names;
     //     missing table/column/index.
-    #[tokio::test]
-    async fn test_create_and_drop_index_validation() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
-            .await
-            .unwrap();
+    #[test]
+    fn test_create_and_drop_index_validation() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
+                .await
+                .unwrap();
 
-        let err = c
-            .create_index_reserve(&d, "default", "ghost", "idx", "a", false)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
-        let err = c
-            .create_index_reserve(&d, "default", "t", "idx", "ghost", false)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
+            let err = c
+                .create_index_reserve(&d, "default", "ghost", "idx", "a", false)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            let err = c
+                .create_index_reserve(&d, "default", "t", "idx", "ghost", false)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::ColumnNotFound { .. }), "got: {err}");
 
-        let (_dom, _schema, meta) = c
-            .create_index_reserve(&d, "default", "t", "t_a_idx", "a", false)
-            .await
-            .unwrap();
-        assert!(!meta.unique);
-        c.create_index_commit(&d, "default", "t", meta).await.unwrap();
+            let (_dom, _schema, meta) = c
+                .create_index_reserve(&d, "default", "t", "t_a_idx", "a", false)
+                .await
+                .unwrap();
+            assert!(!meta.unique);
+            c.create_index_commit(&d, "default", "t", meta).await.unwrap();
 
-        let err = c
-            .create_index_reserve(&d, "default", "t", "t_a_idx", "a", true)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::IndexAlreadyExists { .. }), "got: {err}");
+            let err = c
+                .create_index_reserve(&d, "default", "t", "t_a_idx", "a", true)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::IndexAlreadyExists { .. }), "got: {err}");
 
-        let err = c.drop_index(&d, "default", "ghost_idx").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::IndexNotFound { .. }), "got: {err}");
-        c.drop_index(&d, "default", "t_a_idx").await.unwrap();
-        let err = c.drop_index(&d, "default", "t_a_idx").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::IndexNotFound { .. }), "got: {err}");
+            let err = c.drop_index(&d, "default", "ghost_idx").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::IndexNotFound { .. }), "got: {err}");
+            c.drop_index(&d, "default", "t_a_idx").await.unwrap();
+            let err = c.drop_index(&d, "default", "t_a_idx").await.unwrap_err();
+            assert!(matches!(err, RelStoreError::IndexNotFound { .. }), "got: {err}");
+        })
     }
 
     // 24b. The reserve→commit gap re-checks the name under ddl_lock: a
     //      same-named index committed in between fails at commit instead of
     //      producing a duplicate catalog entry.
-    #[tokio::test]
-    async fn test_create_index_commit_rechecks_name() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
-            .await
-            .unwrap();
+    #[test]
+    fn test_create_index_commit_rechecks_name() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
+                .await
+                .unwrap();
 
-        let (_d1, _s1, m1) =
-            c.create_index_reserve(&d, "default", "t", "dup", "a", false).await.unwrap();
-        let (_d2, _s2, m2) =
-            c.create_index_reserve(&d, "default", "t", "dup", "a", false).await.unwrap();
-        c.create_index_commit(&d, "default", "t", m1).await.unwrap();
+            let (_d1, _s1, m1) =
+                c.create_index_reserve(&d, "default", "t", "dup", "a", false).await.unwrap();
+            let (_d2, _s2, m2) =
+                c.create_index_reserve(&d, "default", "t", "dup", "a", false).await.unwrap();
+            c.create_index_commit(&d, "default", "t", m1).await.unwrap();
 
-        let err = c.create_index_commit(&d, "default", "t", m2).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::IndexAlreadyExists { .. }), "got: {err}");
-        let CatalogEntry::Table(t) = c.get(&d, "default", "t").unwrap() else {
-            panic!("expected a table")
-        };
-        assert_eq!(t.indexes.len(), 1, "no duplicate index entry");
+            let err = c.create_index_commit(&d, "default", "t", m2).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::IndexAlreadyExists { .. }), "got: {err}");
+            let CatalogEntry::Table(t) = c.get(&d, "default", "t").unwrap() else {
+                panic!("expected a table")
+            };
+            assert_eq!(t.indexes.len(), 1, "no duplicate index entry");
+        })
     }
 
     // 25. rename_column must not rewrite REFERENCES entries: they hold *table*
     //     names, and a column may share its name with a referenced table.
-    #[tokio::test]
-    async fn test_rename_column_keeps_references_target() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("parent", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        let mut fk = ColumnInput::new("parent", ColumnType::Integer);
-        fk.references = Some("parent".to_string());
-        c.create_table(&d, "default", table("child", vec![pk_int("id"), fk]))
-            .await
-            .unwrap();
+    #[test]
+    fn test_rename_column_keeps_references_target() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("parent", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            let mut fk = ColumnInput::new("parent", ColumnType::Integer);
+            fk.references = Some("parent".to_string());
+            c.create_table(&d, "default", table("child", vec![pk_int("id"), fk]))
+                .await
+                .unwrap();
 
-        let schema = c
-            .rename_column(&d, "default", "child", "parent", "daddy")
-            .await
-            .unwrap();
-        let col = schema.columns.iter().find(|c| c.name == "daddy").unwrap();
-        assert_eq!(
-            col.references.as_deref(),
-            Some("parent"),
-            "REFERENCES must keep pointing at the table"
-        );
+            let schema = c
+                .rename_column(&d, "default", "child", "parent", "daddy")
+                .await
+                .unwrap();
+            let col = schema.columns.iter().find(|c| c.name == "daddy").unwrap();
+            assert_eq!(
+                col.references.as_deref(),
+                Some("parent"),
+                "REFERENCES must keep pointing at the table"
+            );
+        })
     }
 
     // 26. drop_index refuses the implicit index backing a UNIQUE column
     //     constraint (v1: tied to the constraint, not freestanding).
-    #[tokio::test]
-    async fn test_drop_index_rejects_implicit_unique_index() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let schema = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), uniq("u")]))
-            .await
-            .unwrap();
-        let implicit = schema.indexes[0].name.clone();
+    #[test]
+    fn test_drop_index_rejects_implicit_unique_index() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let schema = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), uniq("u")]))
+                .await
+                .unwrap();
+            let implicit = schema.indexes[0].name.clone();
 
-        let err = c.drop_index(&d, "default", &implicit).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
-        let CatalogEntry::Table(t) = c.get(&d, "default", "t").unwrap() else {
-            panic!("expected a table")
-        };
-        assert_eq!(t.indexes.len(), 1, "the implicit index must still exist");
+            let err = c.drop_index(&d, "default", &implicit).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            let CatalogEntry::Table(t) = c.get(&d, "default", "t").unwrap() else {
+                panic!("expected a table")
+            };
+            assert_eq!(t.indexes.len(), 1, "the implicit index must still exist");
+        })
     }
 
     // ── Prep work (spec quality/008): recover's tolerant skip paths ─────────────
@@ -2067,169 +2107,181 @@ mod tests {
     // 27. A CAT: key with no ':' after the prefix cannot be split into
     //     (system_prefix, name) -> skipped (tracing::warn), other entries
     //     recover normally.
-    #[tokio::test]
-    async fn test_recover_skips_unparseable_cat_key() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = make_engine(dir.path()).await;
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
-            .await
-            .unwrap();
-        catalog
-            .create_table(&domains, "default", table("good", vec![pk_int("id")]))
-            .await
-            .unwrap();
+    #[test]
+    fn test_recover_skips_unparseable_cat_key() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = make_engine(dir.path()).await;
+            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
+                .await
+                .unwrap();
+            catalog
+                .create_table(&domains, "default", table("good", vec![pk_int("id")]))
+                .await
+                .unwrap();
 
-        let mut bad_key = CAT_PREFIX.to_vec();
-        bad_key.extend_from_slice(b"nocolonhere");
-        let entry = CatalogEntry::View(ViewSchema {
-            name: "x".to_string(),
-            sql: "SELECT 1".to_string(),
-            created_at: 0,
-        });
-        engine.put(&bad_key, &serde_json::to_vec(&entry).unwrap()).await.unwrap();
+            let mut bad_key = CAT_PREFIX.to_vec();
+            bad_key.extend_from_slice(b"nocolonhere");
+            let entry = CatalogEntry::View(ViewSchema {
+                name: "x".to_string(),
+                sql: "SELECT 1".to_string(),
+                created_at: 0,
+            });
+            engine.put(&bad_key, &serde_json::to_vec(&entry).unwrap()).await.unwrap();
 
-        let metrics2 = MetricsStore::new(MetricsConfig::default());
-        let recovered = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics2)
-            .await
-            .unwrap();
-        assert!(matches!(
-            recovered.get(&domains, "default", "good").unwrap(),
-            CatalogEntry::Table(_)
-        ));
-        assert_eq!(
-            recovered.list(&domains, "default").unwrap().len(),
-            1,
-            "the unparseable-key entry must not surface anywhere"
-        );
+            let metrics2 = MetricsStore::new(MetricsConfig::default());
+            let recovered = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics2)
+                .await
+                .unwrap();
+            assert!(matches!(
+                recovered.get(&domains, "default", "good").unwrap(),
+                CatalogEntry::Table(_)
+            ));
+            assert_eq!(
+                recovered.list(&domains, "default").unwrap().len(),
+                1,
+                "the unparseable-key entry must not surface anywhere"
+            );
+        })
     }
 
     // 28. A CAT: entry whose key parses fine but whose value is not valid
     //     CatalogEntry JSON -> skipped (tracing::warn), other entries recover
     //     normally.
-    #[tokio::test]
-    async fn test_recover_skips_corrupt_catalog_entry() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = make_engine(dir.path()).await;
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
-            .await
-            .unwrap();
-        catalog
-            .create_table(&domains, "default", table("good", vec![pk_int("id")]))
-            .await
-            .unwrap();
+    #[test]
+    fn test_recover_skips_corrupt_catalog_entry() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = make_engine(dir.path()).await;
+            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
+                .await
+                .unwrap();
+            catalog
+                .create_table(&domains, "default", table("good", vec![pk_int("id")]))
+                .await
+                .unwrap();
 
-        let dom = domains.require_active("default").unwrap();
-        engine
-            .put(&cat_key(&dom.system_prefix, "badentry"), b"not valid json")
-            .await
-            .unwrap();
+            let dom = domains.require_active("default").unwrap();
+            engine
+                .put(&cat_key(&dom.system_prefix, "badentry"), b"not valid json")
+                .await
+                .unwrap();
 
-        let metrics2 = MetricsStore::new(MetricsConfig::default());
-        let recovered = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics2)
-            .await
-            .unwrap();
-        assert!(matches!(
-            recovered.get(&domains, "default", "good").unwrap(),
-            CatalogEntry::Table(_)
-        ));
-        assert_eq!(
-            recovered.list(&domains, "default").unwrap().len(),
-            1,
-            "the corrupt-JSON entry must not surface anywhere"
-        );
+            let metrics2 = MetricsStore::new(MetricsConfig::default());
+            let recovered = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics2)
+                .await
+                .unwrap();
+            assert!(matches!(
+                recovered.get(&domains, "default", "good").unwrap(),
+                CatalogEntry::Table(_)
+            ));
+            assert_eq!(
+                recovered.list(&domains, "default").unwrap().len(),
+                1,
+                "the corrupt-JSON entry must not surface anywhere"
+            );
+        })
     }
 
     // 29. A __sys:rel_catalog_seq: value that is not valid u32 JSON -> skipped,
     //     other domains' counters recover normally, recover() itself never fails.
-    #[tokio::test]
-    async fn test_recover_skips_corrupt_seq_value() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = make_engine(dir.path()).await;
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
-        domains.create_domain("gamma").await.unwrap();
+    #[test]
+    fn test_recover_skips_corrupt_seq_value() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = make_engine(dir.path()).await;
+            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+            domains.create_domain("gamma").await.unwrap();
 
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
-            .await
-            .unwrap();
-        catalog
-            .create_table(&domains, "default", table("t", vec![pk_int("id")]))
-            .await
-            .unwrap();
-        engine.put(&seq_key("gamma"), b"not-a-number").await.unwrap();
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
+                .await
+                .unwrap();
+            catalog
+                .create_table(&domains, "default", table("t", vec![pk_int("id")]))
+                .await
+                .unwrap();
+            engine.put(&seq_key("gamma"), b"not-a-number").await.unwrap();
 
-        let metrics2 = MetricsStore::new(MetricsConfig::default());
-        let recovered = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics2)
-            .await
-            .unwrap();
-        let default_dom = domains.require_active("default").unwrap();
-        let gamma_dom = domains.require_active("gamma").unwrap();
-        assert_eq!(
-            recovered.allocated_id_high_watermark(&default_dom),
-            1,
-            "the valid counter must survive"
-        );
-        assert_eq!(
-            recovered.allocated_id_high_watermark(&gamma_dom),
-            0,
-            "the corrupt seq value must be skipped, not crash recover"
-        );
+            let metrics2 = MetricsStore::new(MetricsConfig::default());
+            let recovered = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics2)
+                .await
+                .unwrap();
+            let default_dom = domains.require_active("default").unwrap();
+            let gamma_dom = domains.require_active("gamma").unwrap();
+            assert_eq!(
+                recovered.allocated_id_high_watermark(&default_dom),
+                1,
+                "the valid counter must survive"
+            );
+            assert_eq!(
+                recovered.allocated_id_high_watermark(&gamma_dom),
+                0,
+                "the corrupt seq value must be skipped, not crash recover"
+            );
+        })
     }
 
     // ── Prep work (spec quality/008): validate_columns/check_default error paths ─
 
     // 30. Two columns normalizing to the same name -> InvalidSchema("duplicate
     //     column ..."), before any other column check runs.
-    #[tokio::test]
-    async fn test_duplicate_column_rejected() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let err = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), col("dup"), col("dup")]))
-            .await
-            .unwrap_err();
-        match &err {
-            RelStoreError::InvalidSchema(msg) => {
-                assert!(msg.contains("duplicate column"), "got: {msg}")
+    #[test]
+    fn test_duplicate_column_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let err = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), col("dup"), col("dup")]))
+                .await
+                .unwrap_err();
+            match &err {
+                RelStoreError::InvalidSchema(msg) => {
+                    assert!(msg.contains("duplicate column"), "got: {msg}")
+                }
+                other => panic!("expected InvalidSchema, got: {other}"),
             }
-            other => panic!("expected InvalidSchema, got: {other}"),
-        }
+        })
     }
 
     // 31. check_default: a literal DEFAULT whose type does not match the
     //     column's type -> TypeMismatch.
-    #[tokio::test]
-    async fn test_default_type_mismatch_rejected() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let mut bad_default = col("a"); // Integer column
-        bad_default.default = DefaultValue::Literal(ScalarValue::Text("x".to_string()));
-        let err = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), bad_default]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TypeMismatch { .. }), "got: {err}");
+    #[test]
+    fn test_default_type_mismatch_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let mut bad_default = col("a"); // Integer column
+            bad_default.default = DefaultValue::Literal(ScalarValue::Text("x".to_string()));
+            let err = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), bad_default]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TypeMismatch { .. }), "got: {err}");
+        })
     }
 
     // 32. check_default: DEFAULT CURRENT_TIMESTAMP on a non-Timestamp column
     //     -> InvalidSchema.
-    #[tokio::test]
-    async fn test_current_timestamp_default_requires_timestamp_column() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let mut bad_default = col("a"); // Integer column
-        bad_default.default = DefaultValue::CurrentTimestamp;
-        let err = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), bad_default]))
-            .await
-            .unwrap_err();
-        match &err {
-            RelStoreError::InvalidSchema(msg) => {
-                assert!(msg.contains("CURRENT_TIMESTAMP"), "got: {msg}")
+    #[test]
+    fn test_current_timestamp_default_requires_timestamp_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let mut bad_default = col("a"); // Integer column
+            bad_default.default = DefaultValue::CurrentTimestamp;
+            let err = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), bad_default]))
+                .await
+                .unwrap_err();
+            match &err {
+                RelStoreError::InvalidSchema(msg) => {
+                    assert!(msg.contains("CURRENT_TIMESTAMP"), "got: {msg}")
+                }
+                other => panic!("expected InvalidSchema, got: {other}"),
             }
-            other => panic!("expected InvalidSchema, got: {other}"),
-        }
+        })
     }
 
     // ── Fixes ───────────────────────────────────────────────────────────────────
@@ -2237,32 +2289,34 @@ mod tests {
     // 33. (013-F1) An index id is reserved across create_index_reserve→commit;
     //     a backfill abort (guard drop) frees it, and so does commit — the
     //     rel/013 orphan sweep queries is_id_reserved to spare the id meanwhile.
-    #[tokio::test]
-    async fn test_index_reservation_lifecycle() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
-            .await
-            .unwrap();
-        let prefix = d.require_active("default").unwrap().system_prefix;
+    #[test]
+    fn test_index_reservation_lifecycle() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_table(&d, "default", table("t", vec![pk_int("id"), col("a")]))
+                .await
+                .unwrap();
+            let prefix = d.require_active("default").unwrap().system_prefix;
 
-        let (_dom, _schema, meta) =
-            c.create_index_reserve(&d, "default", "t", "idx", "a", false).await.unwrap();
-        assert!(c.is_id_reserved(&prefix, meta.index_id), "reserved between reserve and commit");
+            let (_dom, _schema, meta) =
+                c.create_index_reserve(&d, "default", "t", "idx", "a", false).await.unwrap();
+            assert!(c.is_id_reserved(&prefix, meta.index_id), "reserved between reserve and commit");
 
-        // A backfill abort: the ddl.rs guard's Drop frees the reservation.
-        let guard = c.index_reservation_guard(&prefix, meta.index_id);
-        drop(guard);
-        assert!(!c.is_id_reserved(&prefix, meta.index_id), "freed after the guard drops");
+            // A backfill abort: the ddl.rs guard's Drop frees the reservation.
+            let guard = c.index_reservation_guard(&prefix, meta.index_id);
+            drop(guard);
+            assert!(!c.is_id_reserved(&prefix, meta.index_id), "freed after the guard drops");
 
-        // A committed index frees its reservation even while a guard is held.
-        let (_dom2, _s2, meta2) =
-            c.create_index_reserve(&d, "default", "t", "idx2", "a", false).await.unwrap();
-        let guard2 = c.index_reservation_guard(&prefix, meta2.index_id);
-        let id2 = meta2.index_id;
-        assert!(c.is_id_reserved(&prefix, id2));
-        c.create_index_commit(&d, "default", "t", meta2).await.unwrap();
-        assert!(!c.is_id_reserved(&prefix, id2), "commit frees the reservation");
-        guard2.disarm();
+            // A committed index frees its reservation even while a guard is held.
+            let (_dom2, _s2, meta2) =
+                c.create_index_reserve(&d, "default", "t", "idx2", "a", false).await.unwrap();
+            let guard2 = c.index_reservation_guard(&prefix, meta2.index_id);
+            let id2 = meta2.index_id;
+            assert!(c.is_id_reserved(&prefix, id2));
+            c.create_index_commit(&d, "default", "t", meta2).await.unwrap();
+            assert!(!c.is_id_reserved(&prefix, id2), "commit frees the reservation");
+            guard2.disarm();
+        })
     }
 
     // 34. (004 TOCTOU) drop_object_checked hands `check` the removed entry, so a
@@ -2270,88 +2324,96 @@ mod tests {
     //     and the view survives — the check-then-lock race can no longer delete
     //     the wrong kind. (This test cannot compile against the pre-fix
     //     closure, which never saw the removed entry.)
-    #[tokio::test]
-    async fn test_drop_object_checked_guards_kind_atomically() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        c.create_view(&d, "default", "v", "SELECT 1").await.unwrap();
+    #[test]
+    fn test_drop_object_checked_guards_kind_atomically() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            c.create_view(&d, "default", "v", "SELECT 1").await.unwrap();
 
-        let err = c
-            .drop_object_checked(&d, "default", "v", |removed, _| match removed {
-                CatalogEntry::Table(_) => Ok(()),
-                CatalogEntry::View(_) => Err(RelStoreError::TableNotFound {
-                    domain: "default".to_string(),
-                    name: "v".to_string(),
-                }),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
-        assert!(
-            matches!(c.get(&d, "default", "v").unwrap(), CatalogEntry::View(_)),
-            "the view must survive a rejected kind-mismatched drop"
-        );
+            let err = c
+                .drop_object_checked(&d, "default", "v", |removed, _| match removed {
+                    CatalogEntry::Table(_) => Ok(()),
+                    CatalogEntry::View(_) => Err(RelStoreError::TableNotFound {
+                        domain: "default".to_string(),
+                        name: "v".to_string(),
+                    }),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            assert!(
+                matches!(c.get(&d, "default", "v").unwrap(), CatalogEntry::View(_)),
+                "the view must survive a rejected kind-mismatched drop"
+            );
+        })
     }
 
     // 35. (003-F1) A lost/corrupt SEQ value must not let recovery reissue a
     //     live id: recover() floors the counter to the highest live id, so the
     //     next CREATE TABLE gets a fresh id, never colliding with existing rows.
-    #[tokio::test]
-    async fn test_seq_floor_survives_corrupt_seq_after_recover() {
-        let (e, d, c, _dir) = make_catalog().await;
-        let t1 = c.create_table(&d, "default", table("t", vec![pk_int("id")])).await.unwrap();
-        assert_eq!(t1.table_id, 1);
+    #[test]
+    fn test_seq_floor_survives_corrupt_seq_after_recover() {
+        crate::core::engine_runtime::block_on(async {
+            let (e, d, c, _dir) = make_catalog().await;
+            let t1 = c.create_table(&d, "default", table("t", vec![pk_int("id")])).await.unwrap();
+            assert_eq!(t1.table_id, 1);
 
-        // Corrupt the persisted counter: scan_seq_counters skips it, dropping
-        // the domain to 0 while its table_id=1 loads normally.
-        e.put(&seq_key("default"), b"not-a-number").await.unwrap();
+            // Corrupt the persisted counter: scan_seq_counters skips it, dropping
+            // the domain to 0 while its table_id=1 loads normally.
+            e.put(&seq_key("default"), b"not-a-number").await.unwrap();
 
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics).await.unwrap();
-        let t2 = c2.create_table(&d, "default", table("u", vec![pk_int("id")])).await.unwrap();
-        assert!(
-            t2.table_id > t1.table_id,
-            "new table_id {} must exceed the live {} (no id reuse)",
-            t2.table_id,
-            t1.table_id
-        );
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let c2 = RelCatalog::recover(Arc::clone(&e), default_limits(), metrics).await.unwrap();
+            let t2 = c2.create_table(&d, "default", table("u", vec![pk_int("id")])).await.unwrap();
+            assert!(
+                t2.table_id > t1.table_id,
+                "new table_id {} must exceed the live {} (no id reuse)",
+                t2.table_id,
+                t1.table_id
+            );
+        })
     }
 
     // 36. (004-F4) PRIMARY KEY UNIQUE on one column adds no redundant unique
     //     index (the PK is the row key) and consumes no extra index_id.
-    #[tokio::test]
-    async fn test_pk_unique_creates_no_index() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let mut id = pk_int("id");
-        id.unique = true;
-        let schema = c.create_table(&d, "default", table("t", vec![id])).await.unwrap();
-        assert!(schema.indexes.is_empty(), "PRIMARY KEY UNIQUE must not add an implicit index");
-        let dom = d.require_active("default").unwrap();
-        assert_eq!(
-            c.allocated_id_high_watermark(&dom),
-            schema.table_id,
-            "only the table_id is consumed, no index_id"
-        );
+    #[test]
+    fn test_pk_unique_creates_no_index() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let mut id = pk_int("id");
+            id.unique = true;
+            let schema = c.create_table(&d, "default", table("t", vec![id])).await.unwrap();
+            assert!(schema.indexes.is_empty(), "PRIMARY KEY UNIQUE must not add an implicit index");
+            let dom = d.require_active("default").unwrap();
+            assert_eq!(
+                c.allocated_id_high_watermark(&dom),
+                schema.table_id,
+                "only the table_id is consumed, no index_id"
+            );
+        })
     }
 
     // 37. (004-F5) A separately named explicit UNIQUE index on an already-UNIQUE
     //     column is droppable; only the implicit constraint index (t_e_key) is
     //     protected. Pre-fix, drop_index rejected the explicit one too.
-    #[tokio::test]
-    async fn test_drop_explicit_unique_index_on_unique_column() {
-        let (_e, d, c, _dir) = make_catalog().await;
-        let schema = c
-            .create_table(&d, "default", table("t", vec![pk_int("id"), uniq("e")]))
-            .await
-            .unwrap();
-        let implicit = schema.indexes[0].name.clone();
-        assert_eq!(implicit, "t_e_key");
+    #[test]
+    fn test_drop_explicit_unique_index_on_unique_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (_e, d, c, _dir) = make_catalog().await;
+            let schema = c
+                .create_table(&d, "default", table("t", vec![pk_int("id"), uniq("e")]))
+                .await
+                .unwrap();
+            let implicit = schema.indexes[0].name.clone();
+            assert_eq!(implicit, "t_e_key");
 
-        let (_dom, _s, meta) =
-            c.create_index_reserve(&d, "default", "t", "extra", "e", true).await.unwrap();
-        c.create_index_commit(&d, "default", "t", meta).await.unwrap();
+            let (_dom, _s, meta) =
+                c.create_index_reserve(&d, "default", "t", "extra", "e", true).await.unwrap();
+            c.create_index_commit(&d, "default", "t", meta).await.unwrap();
 
-        c.drop_index(&d, "default", "extra").await.unwrap();
-        let err = c.drop_index(&d, "default", &implicit).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "implicit index stays protected: {err}");
+            c.drop_index(&d, "default", "extra").await.unwrap();
+            let err = c.drop_index(&d, "default", &implicit).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "implicit index stays protected: {err}");
+        })
     }
 }

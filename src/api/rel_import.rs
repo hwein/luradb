@@ -257,141 +257,153 @@ mod tests {
 
     // 1. Success response shape: 201 with `table`/`columns`/`imported`/
     //    `failed`/`errors`, matching the spec §5 example.
-    #[tokio::test]
-    async fn test_upload_success_response_shape() {
-        let (app, _dir) = make_default_app().await;
-        let (status, body) = upload(&app, "default", "name=sales&format=csv", b"id,amount\n1,10\n2,20\n", None).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        assert_eq!(body["table"], json!("sales"));
-        assert_eq!(body["imported"], json!(2));
-        assert_eq!(body["failed"], json!(0));
-        assert_eq!(body["errors"], json!([]));
+    #[test]
+    fn test_upload_success_response_shape() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            let (status, body) = upload(&app, "default", "name=sales&format=csv", b"id,amount\n1,10\n2,20\n", None).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(body["table"], json!("sales"));
+            assert_eq!(body["imported"], json!(2));
+            assert_eq!(body["failed"], json!(0));
+            assert_eq!(body["errors"], json!([]));
 
-        let cols = body["columns"].as_array().unwrap();
-        let row_col = cols.iter().find(|c| c["name"] == json!("_row")).unwrap();
-        assert_eq!(row_col["type"], json!("INTEGER"));
-        assert_eq!(row_col["primary_key"], json!(true));
-        assert!(row_col.get("source_header").is_none(), "no source_header for the synthetic column");
-        let amount_col = cols.iter().find(|c| c["name"] == json!("amount")).unwrap();
-        assert_eq!(amount_col["type"], json!("INTEGER"));
-        assert_eq!(amount_col["source_header"], json!("amount"));
+            let cols = body["columns"].as_array().unwrap();
+            let row_col = cols.iter().find(|c| c["name"] == json!("_row")).unwrap();
+            assert_eq!(row_col["type"], json!("INTEGER"));
+            assert_eq!(row_col["primary_key"], json!(true));
+            assert!(row_col.get("source_header").is_none(), "no source_header for the synthetic column");
+            let amount_col = cols.iter().find(|c| c["name"] == json!("amount")).unwrap();
+            assert_eq!(amount_col["type"], json!("INTEGER"));
+            assert_eq!(amount_col["source_header"], json!("amount"));
+        })
     }
 
     // Query validation: missing name/format, and an unknown format/header
     // value, all -> 400.
-    #[tokio::test]
-    async fn test_query_param_validation() {
-        let (app, _dir) = make_default_app().await;
-        let body = b"a,b\n1,2\n";
-        let (status, _) = upload(&app, "default", "format=csv", body, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "missing name");
-        let (status, _) = upload(&app, "default", "name=t", body, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "missing format");
-        let (status, _) = upload(&app, "default", "name=t&format=xml", body, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown format");
-        let (status, _) = upload(&app, "default", "name=t&format=csv&header=nope", body, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "invalid header value");
+    #[test]
+    fn test_query_param_validation() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            let body = b"a,b\n1,2\n";
+            let (status, _) = upload(&app, "default", "format=csv", body, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "missing name");
+            let (status, _) = upload(&app, "default", "name=t", body, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "missing format");
+            let (status, _) = upload(&app, "default", "name=t&format=xml", body, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unknown format");
+            let (status, _) = upload(&app, "default", "name=t&format=csv&header=nope", body, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "invalid header value");
+        })
     }
 
     // 8. Table already exists -> 409 (existing table untouched); unknown
     //    domain -> 404 (spec §7 test 8, HTTP half).
-    #[tokio::test]
-    async fn test_conflict_and_domain_not_found() {
-        let (app, _dir) = make_default_app().await;
-        let (status, body) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let (status, body) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    #[test]
+    fn test_conflict_and_domain_not_found() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            let (status, body) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let (status, body) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
-        let (status, _) = upload(&app, "ghost", "name=t&format=csv", b"a\n1\n", None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _) = upload(&app, "ghost", "name=t&format=csv", b"a\n1\n", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        })
     }
 
     // Body over the configured limit -> 413 (axum's DefaultBodyLimit layer,
     // sized from `rel.import_body_limit_bytes`).
-    #[tokio::test]
-    async fn test_body_over_limit_413() {
-        let (app, _dir) =
-            make_app(Some(crate::config::RelStoreConfig { import_body_limit_bytes: 16, ..Default::default() })).await;
-        let big = format!("a,b\n{}", "1,2\n".repeat(10));
-        let (status, _) = upload(&app, "default", "name=t&format=csv", big.as_bytes(), None).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    #[test]
+    fn test_body_over_limit_413() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) =
+                make_app(Some(crate::config::RelStoreConfig { import_body_limit_bytes: 16, ..Default::default() })).await;
+            let big = format!("a,b\n{}", "1,2\n".repeat(10));
+            let (status, _) = upload(&app, "default", "name=t&format=csv", big.as_bytes(), None).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        })
     }
 
     // 9. Auth: DDL access is required -- a Write-only grant is rejected, a
     //    Ddl grant and Admin both succeed (spec §7 test 9, rel/011 pattern).
-    #[tokio::test]
-    async fn test_auth_requires_ddl() {
-        use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
+    #[test]
+    fn test_auth_requires_ddl() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::auth::{hash_api_key, AccessLevel, DomainPermission, UserRecord, UserRole};
 
-        let (state, _dir) = make_state(Some(crate::config::RelStoreConfig::default()), true).await;
-        let cache = std::sync::Arc::clone(&state.auth_cache);
-        let app = crate::api::router_inline(state, std::sync::Arc::new(vec![]));
+            let (state, _dir) = make_state(Some(crate::config::RelStoreConfig::default()), true).await;
+            let cache = std::sync::Arc::clone(&state.auth_cache);
+            let app = crate::api::router_inline(state, std::sync::Arc::new(vec![]));
 
-        let admin_key = "lura_test_admin_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "boss".to_string(),
-                api_key_hash: hash_api_key(admin_key),
-                role: UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        assert_eq!(create_domain(&app, "shop", admin_key).await, StatusCode::CREATED);
+            let admin_key = "lura_test_admin_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "boss".to_string(),
+                    api_key_hash: hash_api_key(admin_key),
+                    role: UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            assert_eq!(create_domain(&app, "shop", admin_key).await, StatusCode::CREATED);
 
-        let write_key = "lura_test_write_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "writer".to_string(),
-                api_key_hash: hash_api_key(write_key),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        cache
-            .set_permission(DomainPermission {
-                username: "writer".to_string(),
-                domain: "rel:shop".to_string(),
-                access: AccessLevel::Write,
-            })
-            .await
-            .unwrap();
-        let (status, body) = upload(&app, "shop", "name=t&format=csv", b"a\n1\n", Some(write_key)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "Write alone must not allow creating a table: {body}");
+            let write_key = "lura_test_write_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "writer".to_string(),
+                    api_key_hash: hash_api_key(write_key),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            cache
+                .set_permission(DomainPermission {
+                    username: "writer".to_string(),
+                    domain: "rel:shop".to_string(),
+                    access: AccessLevel::Write,
+                })
+                .await
+                .unwrap();
+            let (status, body) = upload(&app, "shop", "name=t&format=csv", b"a\n1\n", Some(write_key)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "Write alone must not allow creating a table: {body}");
 
-        let ddl_key = "lura_test_ddl_key";
-        cache
-            .upsert_user(UserRecord {
-                name: "ddl_user".to_string(),
-                api_key_hash: hash_api_key(ddl_key),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        cache
-            .set_permission(DomainPermission {
-                username: "ddl_user".to_string(),
-                domain: "rel:shop".to_string(),
-                access: AccessLevel::Ddl,
-            })
-            .await
-            .unwrap();
-        let (status, body) = upload(&app, "shop", "name=t&format=csv", b"a\n1\n", Some(ddl_key)).await;
-        assert_eq!(status, StatusCode::CREATED, "a Ddl grant must succeed: {body}");
+            let ddl_key = "lura_test_ddl_key";
+            cache
+                .upsert_user(UserRecord {
+                    name: "ddl_user".to_string(),
+                    api_key_hash: hash_api_key(ddl_key),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            cache
+                .set_permission(DomainPermission {
+                    username: "ddl_user".to_string(),
+                    domain: "rel:shop".to_string(),
+                    access: AccessLevel::Ddl,
+                })
+                .await
+                .unwrap();
+            let (status, body) = upload(&app, "shop", "name=t&format=csv", b"a\n1\n", Some(ddl_key)).await;
+            assert_eq!(status, StatusCode::CREATED, "a Ddl grant must succeed: {body}");
 
-        let (status, body) = upload(&app, "shop", "name=t2&format=csv", b"a\n1\n", Some(admin_key)).await;
-        assert_eq!(status, StatusCode::CREATED, "Admin must succeed: {body}");
+            let (status, body) = upload(&app, "shop", "name=t2&format=csv", b"a\n1\n", Some(admin_key)).await;
+            assert_eq!(status, StatusCode::CREATED, "Admin must succeed: {body}");
+        })
     }
 
     // Disabled engine: the route is not registered at all (404, axum's
     // default for an unmatched route) -- same contract as every other rel route.
-    #[tokio::test]
-    async fn test_disabled_engine_route_absent() {
-        let (app, _dir) = make_app(None).await;
-        let (status, _) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+    #[test]
+    fn test_disabled_engine_route_absent() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(None).await;
+            let (status, _) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        })
     }
 }

@@ -659,345 +659,371 @@ mod tests {
 
     // Spec general/026 test 2 (auth sample): a real 404 (unknown user)
     // carries a non-empty plaintext body — schema and reality agree.
-    #[tokio::test]
-    async fn test_delete_missing_user_404_has_nonempty_plaintext_body() {
-        let (app, _auth_cache, _dir) = make_app(false).await;
-        let resp = send(&app, Method::DELETE, "/store-api/auth/users/ghost", Body::empty()).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let content_type =
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
-        assert!(content_type.starts_with("text/plain"), "{content_type}");
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(!body.is_empty(), "404 body must not be empty");
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&body).is_err(),
-            "body must be plain text, not JSON: {body}"
-        );
+    #[test]
+    fn test_delete_missing_user_404_has_nonempty_plaintext_body() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(false).await;
+            let resp = send(&app, Method::DELETE, "/store-api/auth/users/ghost", Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let content_type =
+                resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+            assert!(content_type.starts_with("text/plain"), "{content_type}");
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(!body.is_empty(), "404 body must not be empty");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&body).is_err(),
+                "body must be plain text, not JSON: {body}"
+            );
+        })
     }
 
     // Test 2: user without any grant -> permissions: [].
-    #[tokio::test]
-    async fn list_users_permissions_empty_for_user_without_grants() {
-        let (app, auth_cache, _dir) = make_app(false).await;
-        add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
+    #[test]
+    fn list_users_permissions_empty_for_user_without_grants() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(false).await;
+            add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
 
-        let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = json_body(resp).await;
-        let alice = body.as_array().unwrap().iter().find(|u| u["name"] == "alice").unwrap();
-        assert_eq!(alice["permissions"], serde_json::json!([]));
+            let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            let alice = body.as_array().unwrap().iter().find(|u| u["name"] == "alice").unwrap();
+            assert_eq!(alice["permissions"], serde_json::json!([]));
+        })
     }
 
     // Tests 3 + 4: set kv/json/rel -> list shows all three with correct
     // store_type/domain (prefix stripped); "ddl" on the rel entry round-trips
     // lowercase despite the PascalCase persisted form.
-    #[tokio::test]
-    async fn list_users_permissions_roundtrip_all_store_types() {
-        let (app, auth_cache, _dir) = make_app(false).await;
-        add_user(&auth_cache, "bob", "lura_bob", UserRole::User).await;
+    #[test]
+    fn list_users_permissions_roundtrip_all_store_types() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(false).await;
+            add_user(&auth_cache, "bob", "lura_bob", UserRole::User).await;
 
-        let resp = send(
-            &app,
-            Method::POST,
-            "/store-api/domains",
-            Body::from(serde_json::json!({"name": "kvdom"}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        for body in [
-            serde_json::json!({"domain": "kvdom", "access": "read"}),
-            serde_json::json!({"domain": "jsondom", "access": "write", "store_type": "json"}),
-            serde_json::json!({"domain": "reldom", "access": "ddl", "store_type": "rel"}),
-        ] {
             let resp = send(
                 &app,
                 Method::POST,
-                "/store-api/auth/users/bob/permissions",
-                Body::from(body.to_string()),
+                "/store-api/domains",
+                Body::from(serde_json::json!({"name": "kvdom"}).to_string()),
             )
             .await;
-            assert_eq!(resp.status(), StatusCode::OK, "{body}");
-        }
+            assert_eq!(resp.status(), StatusCode::CREATED);
 
-        let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
-        let body = json_body(resp).await;
-        let bob = body.as_array().unwrap().iter().find(|u| u["name"] == "bob").unwrap();
-        let perms = bob["permissions"].as_array().unwrap();
-        assert_eq!(perms.len(), 3);
-        assert!(perms
-            .iter()
-            .any(|p| p["domain"] == "kvdom" && p["store_type"] == "kv" && p["access"] == "read"));
-        assert!(perms
-            .iter()
-            .any(|p| p["domain"] == "jsondom" && p["store_type"] == "json" && p["access"] == "write"));
-        assert!(perms
-            .iter()
-            .any(|p| p["domain"] == "reldom" && p["store_type"] == "rel" && p["access"] == "ddl"));
+            for body in [
+                serde_json::json!({"domain": "kvdom", "access": "read"}),
+                serde_json::json!({"domain": "jsondom", "access": "write", "store_type": "json"}),
+                serde_json::json!({"domain": "reldom", "access": "ddl", "store_type": "rel"}),
+            ] {
+                let resp = send(
+                    &app,
+                    Method::POST,
+                    "/store-api/auth/users/bob/permissions",
+                    Body::from(body.to_string()),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK, "{body}");
+            }
+
+            let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
+            let body = json_body(resp).await;
+            let bob = body.as_array().unwrap().iter().find(|u| u["name"] == "bob").unwrap();
+            let perms = bob["permissions"].as_array().unwrap();
+            assert_eq!(perms.len(), 3);
+            assert!(perms
+                .iter()
+                .any(|p| p["domain"] == "kvdom" && p["store_type"] == "kv" && p["access"] == "read"));
+            assert!(perms
+                .iter()
+                .any(|p| p["domain"] == "jsondom" && p["store_type"] == "json" && p["access"] == "write"));
+            assert!(perms
+                .iter()
+                .any(|p| p["domain"] == "reldom" && p["store_type"] == "rel" && p["access"] == "ddl"));
+        })
     }
 
     // Test 5: role == "Admin" doesn't force an empty array, and doesn't force
     // a non-empty one either — the response reflects only the table.
-    #[tokio::test]
-    async fn list_users_permissions_for_admin_reflects_table_not_role() {
-        let (app, auth_cache, _dir) = make_app(false).await;
-        add_user(&auth_cache, "root", "lura_root", UserRole::Admin).await;
+    #[test]
+    fn list_users_permissions_for_admin_reflects_table_not_role() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(false).await;
+            add_user(&auth_cache, "root", "lura_root", UserRole::Admin).await;
 
-        let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
-        let body = json_body(resp).await;
-        let root = body.as_array().unwrap().iter().find(|u| u["name"] == "root").unwrap();
-        assert_eq!(root["permissions"], serde_json::json!([]));
+            let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
+            let body = json_body(resp).await;
+            let root = body.as_array().unwrap().iter().find(|u| u["name"] == "root").unwrap();
+            assert_eq!(root["permissions"], serde_json::json!([]));
 
-        // set_permission never checks the target's role.
-        let resp = send(
-            &app,
-            Method::POST,
-            "/store-api/auth/users/root/permissions",
-            Body::from(serde_json::json!({"domain": "jsondom", "access": "read", "store_type": "json"}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
-        let body = json_body(resp).await;
-        let root = body.as_array().unwrap().iter().find(|u| u["name"] == "root").unwrap();
-        assert_eq!(
-            root["permissions"],
-            serde_json::json!([{"domain": "jsondom", "store_type": "json", "access": "read"}])
-        );
-    }
-
-    // Test 6: multiple permissions come back in a fixed (store_type, domain) order.
-    #[tokio::test]
-    async fn list_users_permissions_sorted_deterministically() {
-        let (app, auth_cache, _dir) = make_app(false).await;
-        add_user(&auth_cache, "carol", "lura_carol", UserRole::User).await;
-
-        for (store_type, domain) in [("rel", "zzz"), ("kv", "bbb"), ("json", "aaa"), ("kv", "aaa")] {
-            if store_type == "kv" {
-                let resp = send(
-                    &app,
-                    Method::POST,
-                    "/store-api/domains",
-                    Body::from(serde_json::json!({"name": domain}).to_string()),
-                )
-                .await;
-                assert_eq!(resp.status(), StatusCode::CREATED);
-            }
+            // set_permission never checks the target's role.
             let resp = send(
                 &app,
                 Method::POST,
-                "/store-api/auth/users/carol/permissions",
-                Body::from(serde_json::json!({"domain": domain, "access": "read", "store_type": store_type}).to_string()),
+                "/store-api/auth/users/root/permissions",
+                Body::from(serde_json::json!({"domain": "jsondom", "access": "read", "store_type": "json"}).to_string()),
             )
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
-        }
 
-        let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
-        let body = json_body(resp).await;
-        let carol = body.as_array().unwrap().iter().find(|u| u["name"] == "carol").unwrap();
-        let actual: Vec<(&str, &str)> = carol["permissions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| (p["store_type"].as_str().unwrap(), p["domain"].as_str().unwrap()))
-            .collect();
-        // (store_type, domain), lexicographic: "json" < "kv" < "rel".
-        assert_eq!(actual, vec![("json", "aaa"), ("kv", "aaa"), ("kv", "bbb"), ("rel", "zzz")]);
+            let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
+            let body = json_body(resp).await;
+            let root = body.as_array().unwrap().iter().find(|u| u["name"] == "root").unwrap();
+            assert_eq!(
+                root["permissions"],
+                serde_json::json!([{"domain": "jsondom", "store_type": "json", "access": "read"}])
+            );
+        })
+    }
+
+    // Test 6: multiple permissions come back in a fixed (store_type, domain) order.
+    #[test]
+    fn list_users_permissions_sorted_deterministically() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(false).await;
+            add_user(&auth_cache, "carol", "lura_carol", UserRole::User).await;
+
+            for (store_type, domain) in [("rel", "zzz"), ("kv", "bbb"), ("json", "aaa"), ("kv", "aaa")] {
+                if store_type == "kv" {
+                    let resp = send(
+                        &app,
+                        Method::POST,
+                        "/store-api/domains",
+                        Body::from(serde_json::json!({"name": domain}).to_string()),
+                    )
+                    .await;
+                    assert_eq!(resp.status(), StatusCode::CREATED);
+                }
+                let resp = send(
+                    &app,
+                    Method::POST,
+                    "/store-api/auth/users/carol/permissions",
+                    Body::from(serde_json::json!({"domain": domain, "access": "read", "store_type": store_type}).to_string()),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+
+            let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
+            let body = json_body(resp).await;
+            let carol = body.as_array().unwrap().iter().find(|u| u["name"] == "carol").unwrap();
+            let actual: Vec<(&str, &str)> = carol["permissions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| (p["store_type"].as_str().unwrap(), p["domain"].as_str().unwrap()))
+                .collect();
+            // (store_type, domain), lexicographic: "json" < "kv" < "rel".
+            assert_eq!(actual, vec![("json", "aaa"), ("kv", "aaa"), ("kv", "bbb"), ("rel", "zzz")]);
+        })
     }
 
     // Test 7: a non-admin key is still forbidden on GET /auth/users (unchanged
     // by this spec -- extract_domain("/store-api/auth/users") stays None).
-    #[tokio::test]
-    async fn list_users_forbidden_for_non_admin_key() {
-        let (app, auth_cache, _dir) = make_app(true).await;
-        let key = "lura_worker_key";
-        add_user(&auth_cache, "worker", key, UserRole::User).await;
+    #[test]
+    fn list_users_forbidden_for_non_admin_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(true).await;
+            let key = "lura_worker_key";
+            add_user(&auth_cache, "worker", key, UserRole::User).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/store-api/auth/users")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/store-api/auth/users")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        })
     }
 
     // Test 8: a permission on a since-deleted KV domain still shows up
     // unchanged -- the read path doesn't cross-check the registry.
-    #[tokio::test]
-    async fn list_users_shows_phantom_permission_after_domain_deleted() {
-        let (app, auth_cache, _dir) = make_app(false).await;
-        add_user(&auth_cache, "dana", "lura_dana", UserRole::User).await;
+    #[test]
+    fn list_users_shows_phantom_permission_after_domain_deleted() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(false).await;
+            add_user(&auth_cache, "dana", "lura_dana", UserRole::User).await;
 
-        let resp = send(
-            &app,
-            Method::POST,
-            "/store-api/domains",
-            Body::from(serde_json::json!({"name": "gonesoon"}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+            let resp = send(
+                &app,
+                Method::POST,
+                "/store-api/domains",
+                Body::from(serde_json::json!({"name": "gonesoon"}).to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
 
-        let resp = send(
-            &app,
-            Method::POST,
-            "/store-api/auth/users/dana/permissions",
-            Body::from(serde_json::json!({"domain": "gonesoon", "access": "write"}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
+            let resp = send(
+                &app,
+                Method::POST,
+                "/store-api/auth/users/dana/permissions",
+                Body::from(serde_json::json!({"domain": "gonesoon", "access": "write"}).to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        let resp = send(&app, Method::DELETE, "/store-api/domains/gonesoon", Body::empty()).await;
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            let resp = send(&app, Method::DELETE, "/store-api/domains/gonesoon", Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
-        let body = json_body(resp).await;
-        let dana = body.as_array().unwrap().iter().find(|u| u["name"] == "dana").unwrap();
-        assert_eq!(
-            dana["permissions"],
-            serde_json::json!([{"domain": "gonesoon", "store_type": "kv", "access": "write"}])
-        );
+            let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
+            let body = json_body(resp).await;
+            let dana = body.as_array().unwrap().iter().find(|u| u["name"] == "dana").unwrap();
+            assert_eq!(
+                dana["permissions"],
+                serde_json::json!([{"domain": "gonesoon", "store_type": "kv", "access": "write"}])
+            );
+        })
     }
 
     // ── whoami (spec general/016) ────────────────────────────────────────────
 
     // Test 1: admin key -> 200 with its own name and role "Admin".
-    #[tokio::test]
-    async fn whoami_admin_key_returns_name_and_role() {
-        let (app, auth_cache, _dir) = make_app(true).await;
-        let key = "lura_whoami_admin";
-        add_user(&auth_cache, "root", key, UserRole::Admin).await;
+    #[test]
+    fn whoami_admin_key_returns_name_and_role() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(true).await;
+            let key = "lura_whoami_admin";
+            add_user(&auth_cache, "root", key, UserRole::Admin).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/auth/whoami")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = json_body(resp).await;
-        assert_eq!(body, serde_json::json!({"name": "root", "role": "Admin"}));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/auth/whoami")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(body, serde_json::json!({"name": "root", "role": "Admin"}));
+        })
     }
 
     // Test 2: scoped user without any domain permission -> 200 with its name
     // and role "User" -- not 403 (the fallback extract_domain would give
     // without the whitelist entry; this is the point of the endpoint).
-    #[tokio::test]
-    async fn whoami_scoped_user_without_permissions_returns_user_role_not_403() {
-        let (app, auth_cache, _dir) = make_app(true).await;
-        let key = "lura_whoami_user";
-        add_user(&auth_cache, "alice", key, UserRole::User).await;
+    #[test]
+    fn whoami_scoped_user_without_permissions_returns_user_role_not_403() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app(true).await;
+            let key = "lura_whoami_user";
+            add_user(&auth_cache, "alice", key, UserRole::User).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/auth/whoami")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = json_body(resp).await;
-        assert_eq!(body, serde_json::json!({"name": "alice", "role": "User"}));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/auth/whoami")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(body, serde_json::json!({"name": "alice", "role": "User"}));
+        })
     }
 
     // Test 3: no header -> 401; invalid key -> 401 (the auth_layer middleware
     // rejects both before the whitelist branch is ever reached).
-    #[tokio::test]
-    async fn whoami_requires_valid_key() {
-        let (app, _auth_cache, _dir) = make_app(true).await;
+    #[test]
+    fn whoami_requires_valid_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(true).await;
 
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/auth/whoami")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/auth/whoami")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/auth/whoami")
-                    .header("authorization", "Bearer lura_does_not_exist")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/auth/whoami")
+                        .header("authorization", "Bearer lura_does_not_exist")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        })
     }
 
     // Test 4: TrustedPeer extension set (as the UDS accept loop would) -> 200,
     // name null, role "TrustedPeer" -- no UserRecord involved at all.
-    #[tokio::test]
-    async fn whoami_trusted_peer_returns_pseudo_role() {
-        let (app, _auth_cache, _dir) = make_app(true).await;
+    #[test]
+    fn whoami_trusted_peer_returns_pseudo_role() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(true).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/auth/whoami")
-                    .extension(TrustedPeer)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = json_body(resp).await;
-        assert_eq!(body, serde_json::json!({"name": null, "role": "TrustedPeer"}));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/auth/whoami")
+                        .extension(TrustedPeer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(body, serde_json::json!({"name": null, "role": "TrustedPeer"}));
+        })
     }
 
     // Test 5: auth.enabled = false -> 200, name null, role "Disabled", no key
     // needed (the auth_layer middleware isn't even in the router).
-    #[tokio::test]
-    async fn whoami_disabled_when_auth_off() {
-        let (app, _auth_cache, _dir) = make_app(false).await;
+    #[test]
+    fn whoami_disabled_when_auth_off() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(false).await;
 
-        let resp = send(&app, Method::GET, "/store-api/auth/whoami", Body::empty()).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = json_body(resp).await;
-        assert_eq!(body, serde_json::json!({"name": null, "role": "Disabled"}));
+            let resp = send(&app, Method::GET, "/store-api/auth/whoami", Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(body, serde_json::json!({"name": null, "role": "Disabled"}));
+        })
     }
 
     // Test 6: auth.enabled = false AND TrustedPeer set -> still "Disabled" --
     // the global switch takes precedence (checked first in the handler).
-    #[tokio::test]
-    async fn whoami_disabled_takes_precedence_over_trusted_peer() {
-        let (app, _auth_cache, _dir) = make_app(false).await;
+    #[test]
+    fn whoami_disabled_takes_precedence_over_trusted_peer() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_app(false).await;
 
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/auth/whoami")
-                    .extension(TrustedPeer)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = json_body(resp).await;
-        assert_eq!(body, serde_json::json!({"name": null, "role": "Disabled"}));
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/auth/whoami")
+                        .extension(TrustedPeer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json_body(resp).await;
+            assert_eq!(body, serde_json::json!({"name": null, "role": "Disabled"}));
+        })
     }
 
     // Test 7 (/version still reachable, whitelist not broken) is covered by
@@ -1043,169 +1069,185 @@ mod tests {
 
     // Test 1: json, engine active -- domain exists -> 200; missing -> 404
     // (new); missing + allow_missing=true -> 200.
-    #[tokio::test]
-    async fn set_permission_json_engine_active_checks_domain_existence() {
-        let (app, auth_cache, json, _rel, _dir) = make_app_with_engines(false, true, false).await;
-        add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
-        json.unwrap().create_domain("jsondom").await.unwrap();
+    #[test]
+    fn set_permission_json_engine_active_checks_domain_existence() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, json, _rel, _dir) = make_app_with_engines(false, true, false).await;
+            add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
+            json.unwrap().create_domain("jsondom").await.unwrap();
 
-        assert_eq!(set_perm(&app, "alice", "jsondom", "json", None).await, StatusCode::OK);
-        assert_eq!(set_perm(&app, "alice", "ghost", "json", None).await, StatusCode::NOT_FOUND);
-        assert_eq!(set_perm(&app, "alice", "ghost", "json", Some(true)).await, StatusCode::OK);
+            assert_eq!(set_perm(&app, "alice", "jsondom", "json", None).await, StatusCode::OK);
+            assert_eq!(set_perm(&app, "alice", "ghost", "json", None).await, StatusCode::NOT_FOUND);
+            assert_eq!(set_perm(&app, "alice", "ghost", "json", Some(true)).await, StatusCode::OK);
+        })
     }
 
     // Test 2: rel, engine active -- same three cases as Test 1.
-    #[tokio::test]
-    async fn set_permission_rel_engine_active_checks_domain_existence() {
-        let (app, auth_cache, _json, rel, _dir) = make_app_with_engines(false, false, true).await;
-        add_user(&auth_cache, "bob", "lura_bob", UserRole::User).await;
-        rel.unwrap().create_domain("reldom").await.unwrap();
+    #[test]
+    fn set_permission_rel_engine_active_checks_domain_existence() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _json, rel, _dir) = make_app_with_engines(false, false, true).await;
+            add_user(&auth_cache, "bob", "lura_bob", UserRole::User).await;
+            rel.unwrap().create_domain("reldom").await.unwrap();
 
-        assert_eq!(set_perm(&app, "bob", "reldom", "rel", None).await, StatusCode::OK);
-        assert_eq!(set_perm(&app, "bob", "ghost", "rel", None).await, StatusCode::NOT_FOUND);
-        assert_eq!(set_perm(&app, "bob", "ghost", "rel", Some(true)).await, StatusCode::OK);
+            assert_eq!(set_perm(&app, "bob", "reldom", "rel", None).await, StatusCode::OK);
+            assert_eq!(set_perm(&app, "bob", "ghost", "rel", None).await, StatusCode::NOT_FOUND);
+            assert_eq!(set_perm(&app, "bob", "ghost", "rel", Some(true)).await, StatusCode::OK);
+        })
     }
 
     // Test 3: json/rel engine disabled (None) -- the check is impossible, not
     // skipped: always 200, with or without allow_missing.
-    #[tokio::test]
-    async fn set_permission_engine_disabled_skips_existence_check() {
-        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
-        add_user(&auth_cache, "carol", "lura_carol", UserRole::User).await;
+    #[test]
+    fn set_permission_engine_disabled_skips_existence_check() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+            add_user(&auth_cache, "carol", "lura_carol", UserRole::User).await;
 
-        for store_type in ["json", "rel"] {
-            assert_eq!(set_perm(&app, "carol", "ghost", store_type, None).await, StatusCode::OK, "{store_type} without allow_missing");
-            assert_eq!(set_perm(&app, "carol", "ghost", store_type, Some(true)).await, StatusCode::OK, "{store_type} with allow_missing");
-        }
+            for store_type in ["json", "rel"] {
+                assert_eq!(set_perm(&app, "carol", "ghost", store_type, None).await, StatusCode::OK, "{store_type} without allow_missing");
+                assert_eq!(set_perm(&app, "carol", "ghost", store_type, Some(true)).await, StatusCode::OK, "{store_type} with allow_missing");
+            }
+        })
     }
 
     // Test 4: kv -- domain exists -> 200 (unchanged); missing -> 404
     // (unchanged); missing + allow_missing=true -> 200 (new: first store type
     // to get pre-provisioning).
-    #[tokio::test]
-    async fn set_permission_kv_allow_missing_enables_pre_provisioning() {
-        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
-        add_user(&auth_cache, "dana", "lura_dana", UserRole::User).await;
-        let resp = send(
-            &app,
-            Method::POST,
-            "/store-api/domains",
-            Body::from(serde_json::json!({"name": "kvdom"}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+    #[test]
+    fn set_permission_kv_allow_missing_enables_pre_provisioning() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+            add_user(&auth_cache, "dana", "lura_dana", UserRole::User).await;
+            let resp = send(
+                &app,
+                Method::POST,
+                "/store-api/domains",
+                Body::from(serde_json::json!({"name": "kvdom"}).to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
 
-        assert_eq!(set_perm(&app, "dana", "kvdom", "kv", None).await, StatusCode::OK);
-        assert_eq!(set_perm(&app, "dana", "ghost", "kv", None).await, StatusCode::NOT_FOUND);
-        assert_eq!(set_perm(&app, "dana", "ghost", "kv", Some(true)).await, StatusCode::OK);
+            assert_eq!(set_perm(&app, "dana", "kvdom", "kv", None).await, StatusCode::OK);
+            assert_eq!(set_perm(&app, "dana", "ghost", "kv", None).await, StatusCode::NOT_FOUND);
+            assert_eq!(set_perm(&app, "dana", "ghost", "kv", Some(true)).await, StatusCode::OK);
+        })
     }
 
     // Test 5: invalid domain name -> 400 for json/rel always; for kv only
     // with allow_missing=true (no lookup there to catch it otherwise); kv
     // without allow_missing keeps answering 404 -- the name is never
     // validated on that branch (spec general/021 §4).
-    #[tokio::test]
-    async fn set_permission_invalid_name_rules_per_store_type() {
-        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
-        add_user(&auth_cache, "erin", "lura_erin", UserRole::User).await;
-        let long_name = "a".repeat(51);
+    #[test]
+    fn set_permission_invalid_name_rules_per_store_type() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+            add_user(&auth_cache, "erin", "lura_erin", UserRole::User).await;
+            let long_name = "a".repeat(51);
 
-        for bad in ["a:b", "", long_name.as_str()] {
-            assert_eq!(set_perm(&app, "erin", bad, "json", None).await, StatusCode::BAD_REQUEST, "json {bad:?}");
-            assert_eq!(set_perm(&app, "erin", bad, "rel", None).await, StatusCode::BAD_REQUEST, "rel {bad:?}");
-            assert_eq!(set_perm(&app, "erin", bad, "kv", Some(true)).await, StatusCode::BAD_REQUEST, "kv allow_missing {bad:?}");
-            assert_eq!(set_perm(&app, "erin", bad, "kv", None).await, StatusCode::NOT_FOUND, "kv no allow_missing {bad:?}");
-        }
+            for bad in ["a:b", "", long_name.as_str()] {
+                assert_eq!(set_perm(&app, "erin", bad, "json", None).await, StatusCode::BAD_REQUEST, "json {bad:?}");
+                assert_eq!(set_perm(&app, "erin", bad, "rel", None).await, StatusCode::BAD_REQUEST, "rel {bad:?}");
+                assert_eq!(set_perm(&app, "erin", bad, "kv", Some(true)).await, StatusCode::BAD_REQUEST, "kv allow_missing {bad:?}");
+                assert_eq!(set_perm(&app, "erin", bad, "kv", None).await, StatusCode::NOT_FOUND, "kv no allow_missing {bad:?}");
+            }
+        })
     }
 
     // Test 6: unknown user -> 404 before any domain check, even with
     // allow_missing=true (order unchanged, handlers.rs user check runs first).
-    #[tokio::test]
-    async fn set_permission_unknown_user_404_even_with_allow_missing() {
-        let (app, _auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
+    #[test]
+    fn set_permission_unknown_user_404_even_with_allow_missing() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
 
-        assert_eq!(set_perm(&app, "ghost_user", "dom", "kv", None).await, StatusCode::NOT_FOUND);
-        assert_eq!(set_perm(&app, "ghost_user", "dom", "json", Some(true)).await, StatusCode::NOT_FOUND);
+            assert_eq!(set_perm(&app, "ghost_user", "dom", "kv", None).await, StatusCode::NOT_FOUND);
+            assert_eq!(set_perm(&app, "ghost_user", "dom", "json", Some(true)).await, StatusCode::NOT_FOUND);
+        })
     }
 
     // Test 7: allow_missing=true pre-provisions a permission that becomes
     // effective once the domain is created -- json/012 §6's workflow keeps
     // working, now as an explicit opt-in instead of a side effect of missing
     // validation.
-    #[tokio::test]
-    async fn set_permission_allow_missing_roundtrip_activates_on_domain_creation() {
-        let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(true, true, false).await;
-        add_user(&auth_cache, "root", "lura_root", UserRole::Admin).await;
-        add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
+    #[test]
+    fn set_permission_allow_missing_roundtrip_activates_on_domain_creation() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(true, true, false).await;
+            add_user(&auth_cache, "root", "lura_root", UserRole::Admin).await;
+            add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
 
-        let resp = authed(
-            &app,
-            "lura_root",
-            Method::POST,
-            "/store-api/auth/users/alice/permissions?allow_missing=true",
-            Some(&serde_json::json!({"domain": "predom", "access": "write", "store_type": "json"}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
+            let resp = authed(
+                &app,
+                "lura_root",
+                Method::POST,
+                "/store-api/auth/users/alice/permissions?allow_missing=true",
+                Some(&serde_json::json!({"domain": "predom", "access": "write", "store_type": "json"}).to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        // Domain doesn't exist yet: the auth layer already lets alice through
-        // on her pre-provisioned grant -- the handler alone answers 404.
-        let resp = authed(
-            &app,
-            "lura_alice",
-            Method::POST,
-            "/store-api/json/predom/documents",
-            Some(&serde_json::json!({"x": 1}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            // Domain doesn't exist yet: the auth layer already lets alice through
+            // on her pre-provisioned grant -- the handler alone answers 404.
+            let resp = authed(
+                &app,
+                "lura_alice",
+                Method::POST,
+                "/store-api/json/predom/documents",
+                Some(&serde_json::json!({"x": 1}).to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let resp = authed(
-            &app,
-            "lura_root",
-            Method::POST,
-            "/store-api/json/domains",
-            Some(&serde_json::json!({"name": "predom"}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+            let resp = authed(
+                &app,
+                "lura_root",
+                Method::POST,
+                "/store-api/json/domains",
+                Some(&serde_json::json!({"name": "predom"}).to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
 
-        let resp = authed(
-            &app,
-            "lura_alice",
-            Method::POST,
-            "/store-api/json/predom/documents",
-            Some(&serde_json::json!({"x": 1}).to_string()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
+            let resp = authed(
+                &app,
+                "lura_alice",
+                Method::POST,
+                "/store-api/json/predom/documents",
+                Some(&serde_json::json!({"x": 1}).to_string()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        })
     }
 
     // Test 8: a domain in Deleting state answers 404 without allow_missing,
     // for both json and rel. Deleted directly through the engine handle --
     // this harness never spawns a purger, so the state can't race the
     // assertion below (spec general/021 Test 8 herstellungsweg).
-    #[tokio::test]
-    async fn set_permission_deleting_domain_answers_404() {
-        let (app, auth_cache, json, rel, _dir) = make_app_with_engines(false, true, true).await;
-        add_user(&auth_cache, "frank", "lura_frank", UserRole::User).await;
-        let json = json.unwrap();
-        let rel = rel.unwrap();
+    #[test]
+    fn set_permission_deleting_domain_answers_404() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, json, rel, _dir) = make_app_with_engines(false, true, true).await;
+            add_user(&auth_cache, "frank", "lura_frank", UserRole::User).await;
+            let json = json.unwrap();
+            let rel = rel.unwrap();
 
-        json.create_domain("doomed").await.unwrap();
-        json.delete_domain("doomed").await.unwrap();
-        assert_eq!(
-            json.get_domain_any("doomed").map(|d| d.state),
-            Some(crate::engines::json::JsonDomainState::Deleting)
-        );
-        assert_eq!(set_perm(&app, "frank", "doomed", "json", None).await, StatusCode::NOT_FOUND);
+            json.create_domain("doomed").await.unwrap();
+            json.delete_domain("doomed").await.unwrap();
+            assert_eq!(
+                json.get_domain_any("doomed").map(|d| d.state),
+                Some(crate::engines::json::JsonDomainState::Deleting)
+            );
+            assert_eq!(set_perm(&app, "frank", "doomed", "json", None).await, StatusCode::NOT_FOUND);
 
-        rel.create_domain("doomed2").await.unwrap();
-        rel.delete_domain("doomed2").await.unwrap();
-        assert_eq!(
-            rel.get_domain_any("doomed2").map(|d| d.state),
-            Some(crate::engines::rel::RelDomainState::Deleting)
-        );
-        assert_eq!(set_perm(&app, "frank", "doomed2", "rel", None).await, StatusCode::NOT_FOUND);
+            rel.create_domain("doomed2").await.unwrap();
+            rel.delete_domain("doomed2").await.unwrap();
+            assert_eq!(
+                rel.get_domain_any("doomed2").map(|d| d.state),
+                Some(crate::engines::rel::RelDomainState::Deleting)
+            );
+            assert_eq!(set_perm(&app, "frank", "doomed2", "rel", None).await, StatusCode::NOT_FOUND);
+        })
     }
 }

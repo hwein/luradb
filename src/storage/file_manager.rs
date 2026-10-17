@@ -3,11 +3,12 @@
 //! This module handles file I/O for SSTables, including file ID generation,
 //! atomic writes, and crash-safe operations.
 
+use crate::core::engine_runtime::spawn_io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, Context};
-use tokio::fs::{File, OpenOptions, rename};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use compio::fs::OpenOptions;
+use compio::io::AsyncWriteAtExt;
 
 /// Manages SSTable files on disk.
 ///
@@ -35,10 +36,11 @@ impl FileManager {
         let base_dir = base_dir.as_ref().to_path_buf();
 
         // Create directory if it doesn't exist
-        tokio::fs::create_dir_all(&base_dir).await?;
+        let dir = base_dir.clone();
+        spawn_io(async move { compio::fs::create_dir_all(dir).await }).await?;
 
         // Find the highest existing file ID
-        let next_file_id = Self::scan_existing_files(&base_dir).await?;
+        let next_file_id = Self::scan_existing_files(&base_dir)?;
 
         Ok(Self {
             base_dir,
@@ -51,12 +53,11 @@ impl FileManager {
     /// Returns 0 when the directory is empty (no existing SSTables), or
     /// `max_existing_id + 1` otherwise.  Using `0` as the base avoids an
     /// off-by-one that would otherwise skip file ID 0 on a fresh database.
-    async fn scan_existing_files(dir: &Path) -> Result<u64> {
+    fn scan_existing_files(dir: &Path) -> Result<u64> {
         let mut max_id: Option<u64> = None;
 
-        let mut entries = tokio::fs::read_dir(dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if let Some(id) = entry.file_name().to_str().and_then(parse_sstable_id) {
+        for entry in std::fs::read_dir(dir)? {
+            if let Some(id) = entry?.file_name().to_str().and_then(parse_sstable_id) {
                 max_id = Some(max_id.map_or(id, |m| m.max(id)));
             }
         }
@@ -88,29 +89,34 @@ impl FileManager {
     /// * `data` - The SSTable data to write
     ///
     /// # Returns
-    /// The path where the file was written
-    pub async fn write_sstable(&self, file_id: u64, data: &[u8]) -> Result<PathBuf> {
+    /// The written bytes, handed back so a caller can keep using them
+    pub async fn write_sstable(&self, file_id: u64, data: Vec<u8>) -> Result<Vec<u8>> {
         let temp_path = self.temp_path(file_id);
         let final_path = self.file_path(file_id);
 
-        // Write to temporary file
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)
-            .await
-            .context("Failed to create temporary file")?;
+        // One I/O task from the temporary file to the rename: it runs to its
+        // end even if the caller is dropped.
+        spawn_io(async move {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)
+                .await
+                .context("Failed to create temporary file")?;
 
-        file.write_all(data).await.context("Failed to write data")?;
-        file.sync_all().await.context("Failed to sync data")?;
+            let compio::BufResult(written, data) = file.write_all_at(data, 0).await;
+            written.context("Failed to write data")?;
+            file.sync_all().await.context("Failed to sync data")?;
 
-        // Atomic rename to final location
-        rename(&temp_path, &final_path)
-            .await
-            .context("Failed to rename file")?;
+            // Atomic rename to final location
+            compio::fs::rename(&temp_path, &final_path)
+                .await
+                .context("Failed to rename file")?;
 
-        Ok(final_path)
+            Ok(data)
+        })
+        .await
     }
 
     /// Reads an SSTable from disk.
@@ -122,16 +128,8 @@ impl FileManager {
     /// The SSTable data as a byte vector
     pub async fn read_sstable(&self, file_id: u64) -> Result<Vec<u8>> {
         let path = self.file_path(file_id);
-
-        let mut file = File::open(&path)
-            .await
-            .context(format!("Failed to open SSTable file: {:?}", path))?;
-
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .await
-            .context("Failed to read SSTable data")?;
-
+        let context = format!("Failed to read SSTable file: {:?}", path);
+        let data = spawn_io(async move { compio::fs::read(path).await }).await.context(context)?;
         Ok(data)
     }
 
@@ -140,10 +138,8 @@ impl FileManager {
     /// Used during compaction when SSTables are merged.
     pub async fn delete_sstable(&self, file_id: u64) -> Result<()> {
         let path = self.file_path(file_id);
-
-        tokio::fs::remove_file(&path)
-            .await
-            .context(format!("Failed to delete SSTable: {:?}", path))?;
+        let context = format!("Failed to delete SSTable: {:?}", path);
+        spawn_io(async move { compio::fs::remove_file(path).await }).await.context(context)?;
 
         Ok(())
     }
@@ -152,9 +148,8 @@ impl FileManager {
     pub async fn list_sstables(&self) -> Result<Vec<u64>> {
         let mut file_ids = Vec::new();
 
-        let mut entries = tokio::fs::read_dir(&self.base_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if let Some(id) = entry.file_name().to_str().and_then(parse_sstable_id) {
+        for entry in std::fs::read_dir(&self.base_dir)? {
+            if let Some(id) = entry?.file_name().to_str().and_then(parse_sstable_id) {
                 file_ids.push(id);
             }
         }
@@ -184,82 +179,91 @@ mod tests {
         assert_eq!(parse_sstable_id("sstable_.sst"), None);
     }
 
-    #[tokio::test]
-    async fn test_file_manager_basic() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let manager = FileManager::new(temp_dir.path()).await?;
-
-        // Allocate file ID
-        let file_id = manager.allocate_file_id();
-        assert_eq!(file_id, 0);
-
-        // Write SSTable
-        let data = b"test sstable data";
-        let path = manager.write_sstable(file_id, data).await?;
-
-        assert!(path.exists());
-
-        // Read back
-        let read_data = manager.read_sstable(file_id).await?;
-        assert_eq!(read_data, data);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_file_manager_multiple_files() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let manager = FileManager::new(temp_dir.path()).await?;
-
-        // Write multiple files
-        for i in 0..5 {
-            let file_id = manager.allocate_file_id();
-            let data = format!("data{}", i);
-            manager.write_sstable(file_id, data.as_bytes()).await?;
-        }
-
-        // List files
-        let file_ids = manager.list_sstables().await?;
-        assert_eq!(file_ids, vec![0, 1, 2, 3, 4]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_file_manager_recovery() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-
-        // Create files with first manager
-        {
+    #[test]
+    fn test_file_manager_basic() -> Result<()> {
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
             let manager = FileManager::new(temp_dir.path()).await?;
-            for _i in 0..3 {
-                let file_id = manager.allocate_file_id();
-                manager.write_sstable(file_id, b"data").await?;
-            }
-        }
 
-        // Create new manager - should recover file IDs
-        let manager = FileManager::new(temp_dir.path()).await?;
-        let next_id = manager.allocate_file_id();
-        assert_eq!(next_id, 3); // Should continue from highest existing ID
+            // Allocate file ID
+            let file_id = manager.allocate_file_id();
+            assert_eq!(file_id, 0);
 
-        Ok(())
+            // Write SSTable
+            let data = b"test sstable data";
+            let written = manager.write_sstable(file_id, data.to_vec()).await?;
+
+            assert_eq!(written, data);
+            assert!(manager.file_path(file_id).exists());
+
+            // Read back
+            let read_data = manager.read_sstable(file_id).await?;
+            assert_eq!(read_data, data);
+
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn test_file_manager_delete() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let manager = FileManager::new(temp_dir.path()).await?;
+    #[test]
+    fn test_file_manager_multiple_files() -> Result<()> {
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let manager = FileManager::new(temp_dir.path()).await?;
 
-        let file_id = manager.allocate_file_id();
-        manager.write_sstable(file_id, b"data").await?;
+            // Write multiple files
+            for i in 0..5 {
+                let file_id = manager.allocate_file_id();
+                let data = format!("data{}", i);
+                manager.write_sstable(file_id, data.into_bytes()).await?;
+            }
 
-        // Delete file
-        manager.delete_sstable(file_id).await?;
+            // List files
+            let file_ids = manager.list_sstables().await?;
+            assert_eq!(file_ids, vec![0, 1, 2, 3, 4]);
 
-        // File should not exist
-        assert!(!manager.file_path(file_id).exists());
+            Ok(())
+        })
+    }
 
-        Ok(())
+    #[test]
+    fn test_file_manager_recovery() -> Result<()> {
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+
+            // Create files with first manager
+            {
+                let manager = FileManager::new(temp_dir.path()).await?;
+                for _i in 0..3 {
+                    let file_id = manager.allocate_file_id();
+                    manager.write_sstable(file_id, b"data".to_vec()).await?;
+                }
+            }
+
+            // Create new manager - should recover file IDs
+            let manager = FileManager::new(temp_dir.path()).await?;
+            let next_id = manager.allocate_file_id();
+            assert_eq!(next_id, 3); // Should continue from highest existing ID
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_file_manager_delete() -> Result<()> {
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let manager = FileManager::new(temp_dir.path()).await?;
+
+            let file_id = manager.allocate_file_id();
+            manager.write_sstable(file_id, b"data".to_vec()).await?;
+
+            // Delete file
+            manager.delete_sstable(file_id).await?;
+
+            // File should not exist
+            assert!(!manager.file_path(file_id).exists());
+
+            Ok(())
+        })
     }
 }

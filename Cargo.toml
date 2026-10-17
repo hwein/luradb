@@ -33,10 +33,12 @@ tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
 
 # --- The "Lura" Power: Linux I/O ---
-# The heart of it: asynchronous I/O via io_uring
-tokio-uring = "0.5"
 # Raw io_uring ring for the SQPOLL storage thread (perf/005).
 io-uring = "0.6"
+# Runtime of the engine thread (perf/020); pinned, minor releases break.
+compio = { version = "=0.19.2", default-features = false, features = ["runtime", "io-uring", "time", "fs"] }
+# compio-driver's own io-uring version: the registered-buffer ops build its SQE type.
+io-uring-compio = { package = "io-uring", version = "0.7" }
 # For low-level flags like O_DIRECT and mmap (shared memory)
 libc = "0.2"
 # Efficient byte handling for zero-copy strategies

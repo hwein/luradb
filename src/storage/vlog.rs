@@ -12,6 +12,7 @@
 //! the generation id (`file_id`) it was written to, and reads resolve it
 //! through the generation map of the reader's own engine version.
 
+use crate::core::engine_runtime;
 use crate::core::storage_thread::StorageHandle;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -19,8 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Error, Debug)]
 pub enum VLogError {
@@ -36,11 +35,12 @@ pub enum VLogError {
     UnknownGeneration { id: u32 },
 }
 
-/// How appends reach the file. `Local` owns a write handle (default).
+/// How appends reach the file. `Local` owns a write handle (default) and
+/// writes positionally on the engine ring.
 /// `Remote` forwards appends to the perf/005 storage thread, which owns the
 /// file; `offset` then tracks the size as a high-water mark for reporting only.
 enum VLogMode {
-    Local(tokio::sync::Mutex<File>),
+    Local(Arc<std::fs::File>),
     Remote(StorageHandle),
 }
 
@@ -76,26 +76,22 @@ impl VLog {
         Self::open(path, 1).await
     }
 
-    /// Opens or creates the generation `id` vLog at `path` (tokio::fs path —
-    /// unchanged when the storage thread is disabled).
+    /// Opens or creates the generation `id` vLog at `path` (local file I/O —
+    /// used when the storage thread is disabled).
     ///
     /// If the file already exists the cursor is positioned at the end so
     /// subsequent appends do not overwrite existing data.
     pub async fn open(path: impl AsRef<Path>, id: u32) -> Result<Self, VLogError> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .read(true)
-            .open(&path)
-            .await?;
+        let mut options = compio::fs::OpenOptions::new();
+        options.write(true).create(true).read(true);
+        let file = engine_runtime::open(path.clone(), options).await?;
 
-        let initial_size = file.metadata().await?.len();
-        file.seek(std::io::SeekFrom::Start(initial_size)).await?;
-        let reader = File::open(&path).await?.into_std().await;
+        let initial_size = file.metadata()?.len();
+        let reader = std::fs::File::open(&path)?;
 
         Ok(Self {
-            inner: VLogMode::Local(tokio::sync::Mutex::new(file)),
+            inner: VLogMode::Local(Arc::new(file)),
             reader,
             id,
             sealed: AtomicBool::new(false),
@@ -153,14 +149,10 @@ impl VLog {
 
         match &self.inner {
             VLogMode::Local(file) => {
-                let mut file = file.lock().await;
                 let offset = self.offset.fetch_add(value.len() as u64, Ordering::SeqCst);
-                file.seek(std::io::SeekFrom::Start(offset)).await?;
-                file.write_all(value).await?;
-                // tokio completes the write in the background; the bytes must
-                // be in the file before the pointer is handed out, since
-                // reads go through `reader`, not this handle.
-                file.flush().await?;
+                // Done before the pointer is handed out: reads go through
+                // `reader`, not this handle.
+                engine_runtime::write_all_at(file, value.to_vec(), offset).await?;
                 Ok(offset)
             }
             VLogMode::Remote(handle) => {
@@ -258,12 +250,12 @@ pub async fn discover_generations(base: &Path) -> Result<Vec<u32>, VLogError> {
         Some(name) => format!("{name}."),
         None => return Ok(ids),
     };
-    let mut entries = match tokio::fs::read_dir(dir).await {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(ids), // no directory yet → only generation 1
     };
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name();
+    for entry in entries {
+        let name = entry?.file_name();
         let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
             continue;
         };
@@ -288,147 +280,157 @@ mod tests {
     use std::sync::Arc;
 
     // Spec kv/017 test 2: a sealed generation rejects appends but stays readable.
-    #[tokio::test]
-    async fn test_sealed_vlog_rejects_append_but_reads() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let vlog = VLog::open(dir.path().join("vlog"), 1).await.unwrap();
-        let offset = vlog.append(b"payload").await.unwrap();
+    #[test]
+    fn test_sealed_vlog_rejects_append_but_reads() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog = VLog::open(dir.path().join("vlog"), 1).await.unwrap();
+            let offset = vlog.append(b"payload").await.unwrap();
 
-        vlog.seal();
-        assert!(vlog.is_sealed());
-        match vlog.append(b"more").await {
-            Err(VLogError::Sealed { id: 1 }) => {}
-            other => panic!("expected Sealed, got {other:?}"),
-        }
-        assert_eq!(vlog.read(offset, 7).unwrap(), b"payload");
-        assert_eq!(vlog.size(), 7, "the rejected append must not move the cursor");
+            vlog.seal();
+            assert!(vlog.is_sealed());
+            match vlog.append(b"more").await {
+                Err(VLogError::Sealed { id: 1 }) => {}
+                other => panic!("expected Sealed, got {other:?}"),
+            }
+            assert_eq!(vlog.read(offset, 7).unwrap(), b"payload");
+            assert_eq!(vlog.size(), 7, "the rejected append must not move the cursor");
+        })
     }
 
     // Generation 1 keeps the canonical path so pre-generation stores open
     // unchanged; later generations get the `.<id>` suffix.
-    #[tokio::test]
-    async fn test_generation_paths_and_discovery() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let base = dir.path().join("luradb.vlog");
-        assert_eq!(generation_path(&base, 1), base);
-        assert_eq!(generation_path(&base, 3), dir.path().join("luradb.vlog.3"));
+    #[test]
+    fn test_generation_paths_and_discovery() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let base = dir.path().join("luradb.vlog");
+            assert_eq!(generation_path(&base, 1), base);
+            assert_eq!(generation_path(&base, 3), dir.path().join("luradb.vlog.3"));
 
-        // Only the canonical file → generation 1 alone.
-        VLog::new(&base).await.unwrap();
-        assert_eq!(discover_generations(&base).await.unwrap(), vec![1]);
+            // Only the canonical file → generation 1 alone.
+            VLog::new(&base).await.unwrap();
+            assert_eq!(discover_generations(&base).await.unwrap(), vec![1]);
 
-        VLog::open(generation_path(&base, 2), 2).await.unwrap();
-        // Neither an unrelated file nor a non-numeric suffix is a generation.
-        VLog::new(dir.path().join("other.vlog")).await.unwrap();
-        VLog::new(dir.path().join("luradb.vlog.tmp")).await.unwrap();
-        assert_eq!(discover_generations(&base).await.unwrap(), vec![1, 2]);
+            VLog::open(generation_path(&base, 2), 2).await.unwrap();
+            // Neither an unrelated file nor a non-numeric suffix is a generation.
+            VLog::new(dir.path().join("other.vlog")).await.unwrap();
+            VLog::new(dir.path().join("luradb.vlog.tmp")).await.unwrap();
+            assert_eq!(discover_generations(&base).await.unwrap(), vec![1, 2]);
+        })
     }
 
     // Spec kv/031 test 7: reads are positional on the generation's own
     // descriptor -- two threads read one generation at once, each gets
     // exactly its bytes, and neither moves the append cursor.
-    #[tokio::test]
-    async fn test_two_threads_read_one_generation_at_once() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
-        let mut entries = Vec::new();
-        for i in 0..64u8 {
-            let value = vec![i; 100 + i as usize];
-            entries.push((vlog.append(&value).await.unwrap(), value));
-        }
-        let entries = Arc::new(entries);
-        let size = vlog.size();
+    #[test]
+    fn test_two_threads_read_one_generation_at_once() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
+            let mut entries = Vec::new();
+            for i in 0..64u8 {
+                let value = vec![i; 100 + i as usize];
+                entries.push((vlog.append(&value).await.unwrap(), value));
+            }
+            let entries = Arc::new(entries);
+            let size = vlog.size();
 
-        let readers: Vec<_> = (0..2)
-            .map(|t| {
-                let vlog = Arc::clone(&vlog);
-                let entries = Arc::clone(&entries);
-                std::thread::spawn(move || {
-                    for round in 0..200 {
-                        let (offset, value) = &entries[(round * 7 + t * 13) % entries.len()];
-                        assert_eq!(&vlog.read(*offset, value.len()).unwrap(), value);
-                    }
+            let readers: Vec<_> = (0..2)
+                .map(|t| {
+                    let vlog = Arc::clone(&vlog);
+                    let entries = Arc::clone(&entries);
+                    std::thread::spawn(move || {
+                        for round in 0..200 {
+                            let (offset, value) = &entries[(round * 7 + t * 13) % entries.len()];
+                            assert_eq!(&vlog.read(*offset, value.len()).unwrap(), value);
+                        }
+                    })
                 })
-            })
-            .collect();
-        for reader in readers {
-            reader.join().unwrap();
-        }
+                .collect();
+            for reader in readers {
+                reader.join().unwrap();
+            }
 
-        assert_eq!(vlog.size(), size);
-        assert_eq!(vlog.append(b"next").await.unwrap(), size, "appends continue at the cursor");
+            assert_eq!(vlog.size(), size);
+            assert_eq!(vlog.append(b"next").await.unwrap(), size, "appends continue at the cursor");
+        })
     }
 
     // `read_async` takes what the page cache holds in place and reads the
     // rest off the calling thread, from where the cached part ends: all,
     // part or none of the value cached, exactly the appended bytes, and a
     // read past the end is an error, never a short value.
-    #[tokio::test]
-    async fn test_read_async_returns_the_bytes_cached_or_not() {
-        // On disk, not in `/tmp`: a tmpfs serves no `RWF_NOWAIT` reads on
-        // some kernels, and this test is about the page cache.
-        let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
-        let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
-        let value: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-        let offset = vlog.append(&value).await.unwrap();
-        assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
-        assert!(vlog.read_async(vlog.size(), 1).await.is_err());
+    #[test]
+    fn test_read_async_returns_the_bytes_cached_or_not() {
+        crate::core::engine_runtime::block_on(async {
+            // On disk, not in `/tmp`: a tmpfs serves no `RWF_NOWAIT` reads on
+            // some kernels, and this test is about the page cache.
+            let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+            let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
+            let value: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+            let offset = vlog.append(&value).await.unwrap();
+            assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+            assert!(vlog.read_async(vlog.size(), 1).await.is_err());
 
-        let file = std::fs::File::open(vlog.path()).unwrap();
-        file.sync_all().unwrap();
-        let advise = |advice| {
-            assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) }, 0);
-        };
-        // Drops the file's clean pages, after a blocking read that waits out
-        // any readahead still in flight (pages under I/O would stay). The
-        // whole file: a large folio reaching below a range start stays too.
-        let drop_pages = || {
-            assert_eq!(vlog.read(offset, value.len()).unwrap(), value);
-            advise(libc::POSIX_FADV_DONTNEED);
-        };
-        // Caches the first half alone: `file` reads without readahead.
-        advise(libc::POSIX_FADV_RANDOM);
-        let half = value.len() / 2;
-        let cache_first_half = || {
-            let mut first = vec![0u8; half];
-            file.read_exact_at(&mut first, offset).unwrap();
-        };
-        let mut buf = vec![0u8; value.len()];
+            let file = std::fs::File::open(vlog.path()).unwrap();
+            file.sync_all().unwrap();
+            let advise = |advice| {
+                assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) }, 0);
+            };
+            // Drops the file's clean pages, after a blocking read that waits out
+            // any readahead still in flight (pages under I/O would stay). The
+            // whole file: a large folio reaching below a range start stays too.
+            let drop_pages = || {
+                assert_eq!(vlog.read(offset, value.len()).unwrap(), value);
+                advise(libc::POSIX_FADV_DONTNEED);
+            };
+            // Caches the first half alone: `file` reads without readahead.
+            advise(libc::POSIX_FADV_RANDOM);
+            let half = value.len() / 2;
+            let cache_first_half = || {
+                let mut first = vec![0u8; half];
+                file.read_exact_at(&mut first, offset).unwrap();
+            };
+            let mut buf = vec![0u8; value.len()];
 
-        drop_pages();
-        let cached = vlog.read_cached(&mut buf, offset);
-        if cached == value.len() {
-            return; // the filesystem keeps its pages regardless of the advice
-        }
-        assert_eq!(cached, 0, "nothing is cached");
-        drop_pages();
-        assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+            drop_pages();
+            let cached = vlog.read_cached(&mut buf, offset);
+            if cached == value.len() {
+                return; // the filesystem keeps its pages regardless of the advice
+            }
+            assert_eq!(cached, 0, "nothing is cached");
+            drop_pages();
+            assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
 
-        drop_pages();
-        cache_first_half();
-        let cached = vlog.read_cached(&mut buf, offset);
-        assert!(0 < cached && cached < value.len(), "only the first half is cached, read {cached}");
-        drop_pages();
-        cache_first_half();
-        assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+            drop_pages();
+            cache_first_half();
+            let cached = vlog.read_cached(&mut buf, offset);
+            assert!(0 < cached && cached < value.len(), "only the first half is cached, read {cached}");
+            drop_pages();
+            cache_first_half();
+            assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+        })
     }
 
     // Past the end nothing is cached, so the read needs the blocking pool.
     // With every permit taken it waits for one without a thread, and a read
     // dropped while it waits never takes one.
-    #[tokio::test]
-    async fn test_a_cold_read_waits_for_a_permit_before_it_takes_a_thread() {
-        use futures::FutureExt;
-        let dir = tempfile::TempDir::new().unwrap();
-        let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
-        vlog.append(b"payload").await.unwrap();
+    #[test]
+    fn test_a_cold_read_waits_for_a_permit_before_it_takes_a_thread() {
+        crate::core::engine_runtime::block_on(async {
+            use futures::FutureExt;
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
+            vlog.append(b"payload").await.unwrap();
 
-        let all = COLD_READS.acquire_many(COLD_READ_LIMIT as u32).await.unwrap();
-        assert!(vlog.read_async(vlog.size(), 1).now_or_never().is_none(), "the read waits for a permit");
-        assert_eq!(vlog.offloaded.load(Ordering::Relaxed), 0, "a read dropped while it waits takes no thread");
+            let all = COLD_READS.acquire_many(COLD_READ_LIMIT as u32).await.unwrap();
+            assert!(vlog.read_async(vlog.size(), 1).now_or_never().is_none(), "the read waits for a permit");
+            assert_eq!(vlog.offloaded.load(Ordering::Relaxed), 0, "a read dropped while it waits takes no thread");
 
-        drop(all);
-        assert!(vlog.read_async(vlog.size(), 1).await.is_err());
-        assert_eq!(vlog.offloaded.load(Ordering::Relaxed), 1);
+            drop(all);
+            assert!(vlog.read_async(vlog.size(), 1).await.is_err());
+            assert_eq!(vlog.offloaded.load(Ordering::Relaxed), 1);
+        })
     }
 }

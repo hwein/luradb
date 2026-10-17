@@ -451,36 +451,38 @@ mod tests {
 
     // End-to-end (rel/015): SELECT ... WHERE txt LIKE '%...' over
     // execute_sql against a table holding a large TEXT row runs through.
-    #[tokio::test]
-    async fn test_like_end_to_end_large_text() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = RelStoreConfig {
-            wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("ss").to_string_lossy().into_owned(),
-            ..RelStoreConfig::default()
-        };
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let cross_engine = CrossEngineResolver::disabled(std::sync::Arc::clone(&metrics));
-        let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
+    #[test]
+    fn test_like_end_to_end_large_text() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = RelStoreConfig {
+                wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("ss").to_string_lossy().into_owned(),
+                ..RelStoreConfig::default()
+            };
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let cross_engine = CrossEngineResolver::disabled(std::sync::Arc::clone(&metrics));
+            let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
 
-        rel.execute_sql("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)", &[], &[], LinkAuth::full())
-            .await
-            .unwrap();
-        let big = format!("{}NEEDLE", "a".repeat(60_000));
-        rel.execute_sql("default", "INSERT INTO t VALUES (1, ?)", &[serde_json::json!(big)], &[], LinkAuth::full())
-            .await
-            .unwrap();
+            rel.execute_sql("default", "CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT)", &[], &[], LinkAuth::full())
+                .await
+                .unwrap();
+            let big = format!("{}NEEDLE", "a".repeat(60_000));
+            rel.execute_sql("default", "INSERT INTO t VALUES (1, ?)", &[serde_json::json!(big)], &[], LinkAuth::full())
+                .await
+                .unwrap();
 
-        let outcome = rel
-            .execute_sql("default", "SELECT id FROM t WHERE txt LIKE '%NEEDLE'", &[], &[], LinkAuth::full())
-            .await
-            .unwrap();
-        match outcome {
-            SqlOutcome::Select { result, .. } => {
-                assert_eq!(result.rows, vec![vec![ScalarValue::Integer(1)]]);
+            let outcome = rel
+                .execute_sql("default", "SELECT id FROM t WHERE txt LIKE '%NEEDLE'", &[], &[], LinkAuth::full())
+                .await
+                .unwrap();
+            match outcome {
+                SqlOutcome::Select { result, .. } => {
+                    assert_eq!(result.rows, vec![vec![ScalarValue::Integer(1)]]);
+                }
+                o => panic!("expected SELECT, got {o:?}"),
             }
-            o => panic!("expected SELECT, got {o:?}"),
-        }
+        })
     }
 }

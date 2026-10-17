@@ -1,14 +1,14 @@
 //! Dedicated OS-thread storage I/O via a raw io_uring ring in SQPOLL mode (spec perf/005).
 //!
 //! Two separate "ring worlds" exist when the IoEngine is enabled: spec 004's
-//! [`crate::core::io_engine::IoEngine`] (tokio-uring `FixedBufPool`, `!Send`,
-//! on the main tokio-uring runtime) and this module's raw [`io_uring::IoUring`]
+//! [`crate::core::io_engine::IoEngine`] (registered buffers, `!Send`, on the
+//! engine thread's ring) and this module's raw [`io_uring::IoUring`]
 //! (SQPOLL, owned exclusively by one `std::thread`). They cannot share buffers
 //! or file handles, so the SQPOLL ring is built and driven entirely here — the
-//! spec's "SQPOLL activation in io_engine.rs" lives here instead, because
-//! `FixedBufPool` exposes no SQPOLL path.
+//! spec's "SQPOLL activation in io_engine.rs" lives here instead, because the
+//! engine thread's ring runs without SQPOLL.
 //!
-//! tokio tasks talk to the thread over a bounded `tokio::sync::mpsc` channel
+//! Engine tasks talk to the thread over a bounded `tokio::sync::mpsc` channel
 //! (async backpressure) and await the result over a tokio `oneshot`.
 
 use anyhow::{anyhow, Context, Result};
@@ -42,7 +42,7 @@ pub struct StorageThreadConfig {
     pub cpu: i32,
 }
 
-/// An I/O request from a tokio task to the storage thread.
+/// An I/O request from an engine task to the storage thread.
 pub enum IoRequest {
     /// Append bytes to the WAL and fdatasync before responding with the offset.
     WalAppend { data: Vec<u8>, response: oneshot::Sender<Result<u64>> },
@@ -171,7 +171,7 @@ impl StorageThread {
     /// Signals shutdown, lets the thread drain pending requests, then joins.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Non-blocking: `shutdown` may run on the tokio runtime thread. If the
+        // Non-blocking: `shutdown` may run on the engine thread. If the
         // channel is full the wake is redundant — the flag above stops the loop
         // after its current batch, then the queue is drained.
         let _ = self.request_tx.try_send(IoRequest::Shutdown);
@@ -527,9 +527,14 @@ fn ring_op(ring: &mut IoUring, entry: squeue::Entry) -> std::io::Result<i32> {
         }
     }
     let mut cq = ring.completion();
-    let result = cq.next().expect("a completion is ready after submit_and_wait(1)").result();
+    // Aborts instead of panicking: this thread wakes engine tasks, and a wake
+    // from an unwinding thread aborts the process anyway (compio #1089).
+    let Some(entry) = cq.next() else {
+        eprintln!("luradb storage ring: no completion after submit_and_wait(1), aborting");
+        std::process::abort();
+    };
     cq.sync();
-    Ok(result)
+    Ok(entry.result())
 }
 
 /// Builds a Write SQE for either a fixed-file slot or a raw fd.
@@ -641,74 +646,83 @@ mod tests {
     }
 
     // 2. wal_append -- data written, offset correct.
-    #[tokio::test]
-    async fn test_wal_append_offsets_and_bytes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
-        let o1 = handle.wal_append(b"hello".to_vec()).await.unwrap();
-        let o2 = handle.wal_append(b"world!".to_vec()).await.unwrap();
-        assert_eq!(o1, 0);
-        assert_eq!(o2, 5);
-        st.shutdown();
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"helloworld!");
+    #[test]
+    fn test_wal_append_offsets_and_bytes() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            let o1 = handle.wal_append(b"hello".to_vec()).await.unwrap();
+            let o2 = handle.wal_append(b"world!".to_vec()).await.unwrap();
+            assert_eq!(o1, 0);
+            assert_eq!(o2, 5);
+            st.shutdown();
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"helloworld!");
+        })
     }
 
     // 3. vlog_append -- data lands at the returned offset.
-    #[tokio::test]
-    async fn test_vlog_append_writes_at_the_returned_offset() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
-        let (off, len) = handle.vlog_append(b"payload-XYZ".to_vec(), 1).await.unwrap();
-        assert_eq!((off, len), (0, 11));
-        st.shutdown();
-        assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"payload-XYZ");
+    #[test]
+    fn test_vlog_append_writes_at_the_returned_offset() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            let (off, len) = handle.vlog_append(b"payload-XYZ".to_vec(), 1).await.unwrap();
+            assert_eq!((off, len), (0, 11));
+            st.shutdown();
+            assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"payload-XYZ");
+        })
     }
 
     // Spec kv/031 test 7 (remote mode): a thread-backed generation reads
     // through its own descriptor -- the thread has no read command left, and
     // the reads keep working after it is gone.
-    #[tokio::test]
-    async fn test_thread_backed_vlog_reads_without_the_thread() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
-        let vlog = VLog::with_storage_handle(dir.path().join("vlog"), handle.clone(), 1).unwrap();
-        let off = vlog.append(b"thread-appended").await.unwrap();
-        assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
+    #[test]
+    fn test_thread_backed_vlog_reads_without_the_thread() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            let vlog = VLog::with_storage_handle(dir.path().join("vlog"), handle.clone(), 1).unwrap();
+            let off = vlog.append(b"thread-appended").await.unwrap();
+            assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
 
-        drop(handle);
-        st.shutdown();
-        assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
+            drop(handle);
+            st.shutdown();
+            assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
+        })
     }
 
     // Spec perf/013 test 1: vlog_append rejects a request whose expected
     // generation does not match the one the thread has open, and
     // vlog_reopen's id becomes the new expectation.
-    #[tokio::test]
-    async fn test_vlog_generation_mismatch_is_rejected() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
+    #[test]
+    fn test_vlog_generation_mismatch_is_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
 
-        // Thread spawns on generation 1; any other id is rejected.
-        let err = handle.vlog_append(b"x".to_vec(), 2).await.unwrap_err();
-        assert!(err.to_string().contains("generation mismatch"), "{err}");
+            // Thread spawns on generation 1; any other id is rejected.
+            let err = handle.vlog_append(b"x".to_vec(), 2).await.unwrap_err();
+            assert!(err.to_string().contains("generation mismatch"), "{err}");
 
-        // The right id still performs unchanged I/O.
-        handle.vlog_append(b"hello".to_vec(), 1).await.unwrap();
+            // The right id still performs unchanged I/O.
+            handle.vlog_append(b"hello".to_vec(), 1).await.unwrap();
 
-        // After a reopen to generation 2, the old id is rejected and the new
-        // one succeeds.
-        let new_path = dir.path().join("vlog.2");
-        handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
-        assert!(handle.vlog_append(b"y".to_vec(), 1).await.is_err());
-        handle.vlog_append(b"world".to_vec(), 2).await.unwrap();
+            // After a reopen to generation 2, the old id is rejected and the new
+            // one succeeds.
+            let new_path = dir.path().join("vlog.2");
+            handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
+            assert!(handle.vlog_append(b"y".to_vec(), 1).await.is_err());
+            handle.vlog_append(b"world".to_vec(), 2).await.unwrap();
 
-        st.shutdown();
-        assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"hello");
-        assert_eq!(std::fs::read(new_path).unwrap(), b"world");
+            st.shutdown();
+            assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"hello");
+            assert_eq!(std::fs::read(new_path).unwrap(), b"world");
+        })
     }
 
     // 4. Batching: 100 concurrent wal_append requests processed correctly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::disallowed_methods, reason = "callers on several threads of a tokio runtime")]
     async fn test_batching_100_concurrent_wal_appends() {
         let dir = tempfile::TempDir::new().unwrap();
         let (mut st, handle) = spawn(dir.path(), false, 1024);
@@ -750,78 +764,88 @@ mod tests {
     }
 
     // 6b. End-to-end in real SQPOLL mode (WSL2 kernel supports it).
-    #[tokio::test]
-    async fn test_wal_append_sqpoll_mode() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), true, 64);
-        handle.wal_append(b"sqpoll".to_vec()).await.unwrap();
-        st.shutdown();
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"sqpoll");
+    #[test]
+    fn test_wal_append_sqpoll_mode() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), true, 64);
+            handle.wal_append(b"sqpoll".to_vec()).await.unwrap();
+            st.shutdown();
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"sqpoll");
+        })
     }
 
     // 7. Shutdown: all pending requests are completed before thread exit.
-    #[tokio::test]
-    async fn test_shutdown_drains_pending_requests() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 1024);
-        // Enqueue directly (same module) without awaiting, so all requests are
-        // in-flight when shutdown is issued.
-        let mut receivers = Vec::new();
-        for _ in 0..50 {
-            let (tx, rx) = oneshot::channel();
-            handle
-                .request_tx
-                .try_send(IoRequest::WalAppend { data: vec![b'a'; 10], response: tx })
-                .unwrap();
-            receivers.push(rx);
-        }
-        drop(handle);
-        st.shutdown();
-        for (i, rx) in receivers.into_iter().enumerate() {
-            let offset = rx.await.unwrap().unwrap();
-            assert_eq!(offset, (i as u64) * 10);
-        }
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 500);
+    #[test]
+    fn test_shutdown_drains_pending_requests() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 1024);
+            // Enqueue directly (same module) without awaiting, so all requests are
+            // in-flight when shutdown is issued.
+            let mut receivers = Vec::new();
+            for _ in 0..50 {
+                let (tx, rx) = oneshot::channel();
+                handle
+                    .request_tx
+                    .try_send(IoRequest::WalAppend { data: vec![b'a'; 10], response: tx })
+                    .unwrap();
+                receivers.push(rx);
+            }
+            drop(handle);
+            st.shutdown();
+            for (i, rx) in receivers.into_iter().enumerate() {
+                let offset = rx.await.unwrap().unwrap();
+                assert_eq!(offset, (i as u64) * 10);
+            }
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 500);
+        })
     }
 
     // WAL truncate resets the write cursor to 0.
-    #[tokio::test]
-    async fn test_wal_truncate_resets_offset() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
-        handle.wal_append(b"abcde".to_vec()).await.unwrap();
-        handle.wal_truncate().await.unwrap();
-        let off = handle.wal_append(b"XY".to_vec()).await.unwrap();
-        assert_eq!(off, 0);
-        st.shutdown();
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+    #[test]
+    fn test_wal_truncate_resets_offset() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            handle.wal_append(b"abcde".to_vec()).await.unwrap();
+            handle.wal_truncate().await.unwrap();
+            let off = handle.wal_append(b"XY".to_vec()).await.unwrap();
+            assert_eq!(off, 0);
+            st.shutdown();
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+        })
     }
 
     // SstableWrite installs the file atomically and cleans up the temp file.
-    #[tokio::test]
-    async fn test_sstable_write_installs_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
-        let path = dir.path().join("sstable_000.sst");
-        handle.sstable_write(path.clone(), b"SSTABLE-DATA".to_vec()).await.unwrap();
-        st.shutdown();
-        assert_eq!(std::fs::read(&path).unwrap(), b"SSTABLE-DATA");
-        assert!(!sstable_tmp_path(&path).exists());
+    #[test]
+    fn test_sstable_write_installs_file() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            let path = dir.path().join("sstable_000.sst");
+            handle.sstable_write(path.clone(), b"SSTABLE-DATA".to_vec()).await.unwrap();
+            st.shutdown();
+            assert_eq!(std::fs::read(&path).unwrap(), b"SSTABLE-DATA");
+            assert!(!sstable_tmp_path(&path).exists());
+        })
     }
 
     // Finding 4: a failed install removes the temp file (no `.tmp` accumulation).
-    #[tokio::test]
-    async fn test_sstable_write_removes_tmp_on_error() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
-        // Destination is an existing directory: temp write + fsync succeed, but
-        // the atomic rename fails, so the temp file must be cleaned up.
-        let path = dir.path().join("dest");
-        std::fs::create_dir(&path).unwrap();
-        let res = handle.sstable_write(path.clone(), b"DATA".to_vec()).await;
-        assert!(res.is_err());
-        assert!(!sstable_tmp_path(&path).exists(), "temp file must be removed on error");
-        st.shutdown();
+    #[test]
+    fn test_sstable_write_removes_tmp_on_error() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            // Destination is an existing directory: temp write + fsync succeed, but
+            // the atomic rename fails, so the temp file must be cleaned up.
+            let path = dir.path().join("dest");
+            std::fs::create_dir(&path).unwrap();
+            let res = handle.sstable_write(path.clone(), b"DATA".to_vec()).await;
+            assert!(res.is_err());
+            assert!(!sstable_tmp_path(&path).exists(), "temp file must be removed on error");
+            st.shutdown();
+        })
     }
 
     // Finding 3: an out-of-range CPU core is rejected with an error, not a panic.
@@ -851,84 +875,90 @@ mod tests {
     }
 
     // Finding 3 (thread level): VlogReopen swaps the file and resets the offset.
-    #[tokio::test]
-    async fn test_vlog_reopen_switches_file_and_offset() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (mut st, handle) = spawn(dir.path(), false, 64);
-        handle.vlog_append(b"old-data".to_vec(), 1).await.unwrap();
+    #[test]
+    fn test_vlog_reopen_switches_file_and_offset() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            handle.vlog_append(b"old-data".to_vec(), 1).await.unwrap();
 
-        let new_path = dir.path().join("vlog.2"); // next vLog generation
-        std::fs::write(&new_path, b"NEW").unwrap();
-        handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
+            let new_path = dir.path().join("vlog.2"); // next vLog generation
+            std::fs::write(&new_path, b"NEW").unwrap();
+            handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
 
-        // Offset now tracks the new file: the append lands after its 3 bytes.
-        let (off, len) = handle.vlog_append(b"XY".to_vec(), 2).await.unwrap();
-        assert_eq!((off, len), (3, 2));
-        st.shutdown();
-        assert_eq!(std::fs::read(&new_path).unwrap(), b"NEWXY");
+            // Offset now tracks the new file: the append lands after its 3 bytes.
+            let (off, len) = handle.vlog_append(b"XY".to_vec(), 2).await.unwrap();
+            assert_eq!((off, len), (3, 2));
+            st.shutdown();
+            assert_eq!(std::fs::read(&new_path).unwrap(), b"NEWXY");
+        })
     }
 
     // 8. Integration: LsmStorageEngine with StorageHandle -> write + read E2E.
-    #[tokio::test]
-    async fn test_lsm_engine_with_storage_handle_end_to_end() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let wal_path = dir.path().join("wal");
-        let vlog_path = dir.path().join("vlog");
-        let (mut st, handle) = spawn(dir.path(), false, 1024);
+    #[test]
+    fn test_lsm_engine_with_storage_handle_end_to_end() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal");
+            let vlog_path = dir.path().join("vlog");
+            let (mut st, handle) = spawn(dir.path(), false, 1024);
 
-        let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
-        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
-        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
-        let engine = LsmStorageEngine::new(
-            wal,
-            wal_path,
-            vlog,
-            vlog_path,
-            file_manager,
-            manifest_manager,
-            LsmEngineOptions::default(),
-        )
-        .await
-        .unwrap();
+            let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
+            let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+            let engine = LsmStorageEngine::new(
+                wal,
+                wal_path,
+                vlog,
+                vlog_path,
+                file_manager,
+                manifest_manager,
+                LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap();
 
-        // Small value: WAL append routes through the storage thread.
-        engine.put(b"k", b"v").await.unwrap();
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+            // Small value: WAL append routes through the storage thread.
+            engine.put(b"k", b"v").await.unwrap();
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
 
-        // Large value: VLog append + read route through the storage thread.
-        let big = vec![b'z'; 4096];
-        engine.put(b"big", &big).await.unwrap();
-        assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+            // Large value: VLog append + read route through the storage thread.
+            let big = vec![b'z'; 4096];
+            engine.put(b"big", &big).await.unwrap();
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
 
-        st.shutdown();
+            st.shutdown();
+        })
     }
 
-    // 9. io_engine disabled -> local (tokio::fs) WAL/VLog path, no regression.
-    #[tokio::test]
-    async fn test_lsm_engine_local_path_no_regression() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let wal_path = dir.path().join("wal");
-        let vlog_path = dir.path().join("vlog");
-        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
-        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
-        let engine = LsmStorageEngine::new(
-            wal,
-            wal_path,
-            vlog,
-            vlog_path,
-            file_manager,
-            manifest_manager,
-            LsmEngineOptions::default(),
-        )
-        .await
-        .unwrap();
-        engine.put(b"k", b"v").await.unwrap();
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
-        let big = vec![b'z'; 4096];
-        engine.put(b"big", &big).await.unwrap();
-        assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+    // 9. io_engine disabled -> local WAL/VLog path, no regression.
+    #[test]
+    fn test_lsm_engine_local_path_no_regression() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal");
+            let vlog_path = dir.path().join("vlog");
+            let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+            let engine = LsmStorageEngine::new(
+                wal,
+                wal_path,
+                vlog,
+                vlog_path,
+                file_manager,
+                manifest_manager,
+                LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap();
+            engine.put(b"k", b"v").await.unwrap();
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+            let big = vec![b'z'; 4096];
+            engine.put(b"big", &big).await.unwrap();
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+        })
     }
 }

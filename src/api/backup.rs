@@ -25,8 +25,8 @@ use axum::{
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use crate::core::engine_runtime;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use utoipa::ToSchema;
@@ -352,7 +352,8 @@ pub async fn create_backup(
     let scope = BackupScope::parse(&body.scope).map_err(|_| {
         ApiError::new(StatusCode::BAD_REQUEST, format!("400 Bad Request: invalid scope '{}'", body.scope))
     })?;
-    let (id, _handle) = manager.start_backup(scope, body.include_auth, None).await?;
+    let (id, handle) = manager.start_backup(scope, body.include_auth, None).await?;
+    handle.detach();
     log_audit(&admin_name(&state, &headers).await, "backup created", &id);
     Ok((StatusCode::ACCEPTED, Json(BackupAcceptedResponse { id, state: "running".to_string() })))
 }
@@ -535,16 +536,20 @@ impl Drop for ScratchGuard {
 /// Writes the request body to `path` as it arrives — no full-body buffering
 /// (spec general/006: no RAM copy).
 async fn stream_body_to_file(path: &std::path::Path, body: Body) -> Result<(), ApiError> {
-    let mut file = tokio::fs::File::create(path).await.map_err(|e| BackupError::Other(e.into()))?;
+    let mut options = compio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    let file = engine_runtime::open(path.to_path_buf(), options).await.map_err(|e| BackupError::Other(e.into()))?;
+    let file = Arc::new(file);
+    let mut pos = 0;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| {
             ApiError::new(StatusCode::BAD_REQUEST, "400 Bad Request: invalid backup file: error reading upload body")
         })?;
-        file.write_all(&chunk).await.map_err(|e| BackupError::Other(e.into()))?;
+        engine_runtime::write_all_at(&file, chunk.to_vec(), pos).await.map_err(|e| BackupError::Other(e.into()))?;
+        pos += chunk.len() as u64;
     }
-    file.flush().await.map_err(|e| BackupError::Other(e.into()))?;
-    file.sync_all().await.map_err(|e| BackupError::Other(e.into()))?;
+    engine_runtime::sync(&file, false).await.map_err(|e| BackupError::Other(e.into()))?;
     Ok(())
 }
 
@@ -604,7 +609,7 @@ pub async fn restore_backup(
         let auth_cache = Arc::clone(&state.auth_cache);
         let manager_for_reload = Arc::clone(manager);
         let reload_restore_id = restore_id.clone();
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             let _ = handle.await;
             let completed = manager_for_reload
                 .get_restore_status(&reload_restore_id)
@@ -617,7 +622,10 @@ pub async fn restore_backup(
                     );
                 }
             }
-        });
+        })
+        .detach();
+    } else {
+        handle.detach();
     }
 
     log_audit(&admin_name(&state, &headers).await, "backup restore started", &id);
@@ -797,194 +805,208 @@ mod tests {
 
     // 9. backup.enabled=false -> every new route answers 503 (spec
     // general/005 decision 1: "feature disabled" is 503 project-wide).
-    #[tokio::test]
-    async fn test_backup_disabled_returns_503_on_all_routes() {
-        let (app, _dir) = make_app(None).await;
-        for (method, uri, body) in all_routes() {
-            let (status, resp_body) = request(&app, method.clone(), uri, body, None).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}: {resp_body}");
-            assert!(resp_body.contains("backup is disabled"), "{method} {uri}: unexpected body {resp_body}");
-        }
+    #[test]
+    fn test_backup_disabled_returns_503_on_all_routes() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(None).await;
+            for (method, uri, body) in all_routes() {
+                let (status, resp_body) = request(&app, method.clone(), uri, body, None).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}: {resp_body}");
+                assert!(resp_body.contains("backup is disabled"), "{method} {uri}: unexpected body {resp_body}");
+            }
+        })
     }
 
     // 9b. Mandatory test (spec general/006 authorization section): every
     // new route rejects non-admins with 403, regardless of method or
     // permissions held elsewhere -- extract_domain has no match arm for
     // backups*/restores*.
-    #[tokio::test]
-    async fn test_all_backup_routes_require_admin() {
-        let (state, _dir) = make_state(Some(enabled_backup_config()), true).await;
-        let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_all_backup_routes_require_admin() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(Some(enabled_backup_config()), true).await;
+            let cache = Arc::clone(&state.auth_cache);
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let worker_key = "lura_test_backup_worker_key";
-        make_user(&cache, "worker", worker_key).await;
+            let worker_key = "lura_test_backup_worker_key";
+            make_user(&cache, "worker", worker_key).await;
 
-        for (method, uri, body) in all_routes() {
-            let (status, resp_body) = request(&app, method.clone(), uri, body, Some(worker_key)).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {resp_body}");
-        }
+            for (method, uri, body) in all_routes() {
+                let (status, resp_body) = request(&app, method.clone(), uri, body, Some(worker_key)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {resp_body}");
+            }
 
-        // No key at all -> 401 (regression guard, not the focus of this test).
-        let (status, _) = request(&app, Method::GET, "/store-api/backups", None, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+            // No key at all -> 401 (regression guard, not the focus of this test).
+            let (status, _) = request(&app, Method::GET, "/store-api/backups", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-        // An admin key passes the auth layer (proves the 403s above are a
-        // real admin-only gate, not an accidental global lockout).
-        let admin_key = "lura_test_backup_admin_key";
-        make_admin(&cache, admin_key).await;
-        let (status, body) = request(&app, Method::GET, "/store-api/backups", None, Some(admin_key)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+            // An admin key passes the auth layer (proves the 403s above are a
+            // real admin-only gate, not an accidental global lockout).
+            let admin_key = "lura_test_backup_admin_key";
+            make_admin(&cache, admin_key).await;
+            let (status, body) = request(&app, Method::GET, "/store-api/backups", None, Some(admin_key)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        })
     }
 
     // 10. ID validation: traversal-flavored / malformed ids -> 400 invalid backup id.
-    #[tokio::test]
-    async fn test_invalid_backup_id_rejected() {
-        let (app, _dir) = make_app(Some(enabled_backup_config())).await;
-        for uri in [
-            "/store-api/backups/not-bk-prefixed",
-            "/store-api/backups/bk_..",
-            "/store-api/backups/bk_has%20space",
-        ] {
-            let (status, body) = request(&app, Method::GET, uri, None, None).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
-            assert!(body.contains("invalid backup id"), "{uri}: {body}");
+    #[test]
+    fn test_invalid_backup_id_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(Some(enabled_backup_config())).await;
+            for uri in [
+                "/store-api/backups/not-bk-prefixed",
+                "/store-api/backups/bk_..",
+                "/store-api/backups/bk_has%20space",
+            ] {
+                let (status, body) = request(&app, Method::GET, uri, None, None).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+                assert!(body.contains("invalid backup id"), "{uri}: {body}");
 
-            let (status, body) = request(&app, Method::DELETE, uri, None, None).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
-        }
+                let (status, body) = request(&app, Method::DELETE, uri, None, None).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+            }
+        })
     }
 
     // 11a. A second POST /backups while one is running -> 409 (job slot busy).
-    #[tokio::test]
-    async fn test_second_backup_conflicts_with_running_job() {
-        let (state, _dir) = make_slow_state().await;
-        let store = state.registry.store("default").await.unwrap();
-        for i in 0..5 {
-            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_second_backup_conflicts_with_running_job() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_slow_state().await;
+            let store = state.registry.store("default").await.unwrap();
+            for i in 0..5 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status1, body1) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
-        assert_eq!(status1, StatusCode::ACCEPTED, "{body1}");
+            let (status1, body1) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
+            assert_eq!(status1, StatusCode::ACCEPTED, "{body1}");
 
-        let (status2, body2) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
-        assert_eq!(status2, StatusCode::CONFLICT, "{body2}");
-        assert!(body2.contains("already running"), "{body2}");
+            let (status2, body2) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
+            assert_eq!(status2, StatusCode::CONFLICT, "{body2}");
+            assert!(body2.contains("already running"), "{body2}");
+        })
     }
 
     // 11b. POST /backups/{id}/restore while a backup job is running -> 409
     // (job slot busy), rejected synchronously before any file is even read.
-    #[tokio::test]
-    async fn test_restore_conflicts_with_running_job() {
-        let (state, dir) = make_slow_state().await;
-        let backup_dir = dir.path().join("backups");
-        write_fake_backup(&backup_dir, "bk_fake", "all", now_secs(), None, true);
-        let store = state.registry.store("default").await.unwrap();
-        for i in 0..5 {
-            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_restore_conflicts_with_running_job() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, dir) = make_slow_state().await;
+            let backup_dir = dir.path().join("backups");
+            write_fake_backup(&backup_dir, "bk_fake", "all", now_secs(), None, true);
+            let store = state.registry.store("default").await.unwrap();
+            for i in 0..5 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 
-        let (status, body) = request(
-            &app,
-            Method::POST,
-            "/store-api/backups/bk_fake/restore",
-            Some(r#"{"mode":"fail_if_exists"}"#),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(body.contains("already running"), "{body}");
+            let (status, body) = request(
+                &app,
+                Method::POST,
+                "/store-api/backups/bk_fake/restore",
+                Some(r#"{"mode":"fail_if_exists"}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert!(body.contains("already running"), "{body}");
+        })
     }
 
     // 11c. Download/DELETE of the currently-running backup's id -> 409 (this
     // backup is still running); GET (detail) of the same id reports
     // state="running" from the job slot instead of 404 (orchestrator hint 3).
-    #[tokio::test]
-    async fn test_download_and_delete_conflict_while_backup_running() {
-        let (state, _dir) = make_slow_state().await;
-        let store = state.registry.store("default").await.unwrap();
-        for i in 0..5 {
-            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_download_and_delete_conflict_while_backup_running() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_slow_state().await;
+            let store = state.registry.store("default").await.unwrap();
+            for i in 0..5 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
 
-        let (detail_status, detail_body) =
-            request(&app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;
-        assert_eq!(detail_status, StatusCode::OK, "{detail_body}");
-        let detail: serde_json::Value = serde_json::from_str(&detail_body).unwrap();
-        assert_eq!(detail["state"], json!("running"));
-        assert_eq!(detail["id"], json!(id));
+            let (detail_status, detail_body) =
+                request(&app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;
+            assert_eq!(detail_status, StatusCode::OK, "{detail_body}");
+            let detail: serde_json::Value = serde_json::from_str(&detail_body).unwrap();
+            assert_eq!(detail["state"], json!("running"));
+            assert_eq!(detail["id"], json!(id));
 
-        let (dl_status, dl_body) =
-            request(&app, Method::GET, &format!("/store-api/backups/{id}/download"), None, None).await;
-        assert_eq!(dl_status, StatusCode::CONFLICT, "{dl_body}");
-        assert!(dl_body.contains("still running"), "{dl_body}");
+            let (dl_status, dl_body) =
+                request(&app, Method::GET, &format!("/store-api/backups/{id}/download"), None, None).await;
+            assert_eq!(dl_status, StatusCode::CONFLICT, "{dl_body}");
+            assert!(dl_body.contains("still running"), "{dl_body}");
 
-        let (del_status, del_body) = request(&app, Method::DELETE, &format!("/store-api/backups/{id}"), None, None).await;
-        assert_eq!(del_status, StatusCode::CONFLICT, "{del_body}");
-        assert!(del_body.contains("still running"), "{del_body}");
+            let (del_status, del_body) = request(&app, Method::DELETE, &format!("/store-api/backups/{id}"), None, None).await;
+            assert_eq!(del_status, StatusCode::CONFLICT, "{del_body}");
+            assert!(del_body.contains("still running"), "{del_body}");
+        })
     }
 
     // 11d. A running *restore* occupies the same job slot but is not a
     // backup: GET /backups/{restore_id} must reject the id like every other
     // route does, and the restored-from backup keeps reporting its own
     // manifest (regression: the slot early-return ignored the job kind).
-    #[tokio::test]
-    async fn test_get_backup_ignores_running_restore_job() {
-        let (state, _dir) = make_slow_state().await;
-        state.registry.create_domain("shop").await.unwrap();
-        let store = state.registry.store("shop").await.unwrap();
-        for i in 0..3 {
-            store.put(format!("order:{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_get_backup_ignores_running_restore_job() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_slow_state().await;
+            state.registry.create_domain("shop").await.unwrap();
+            let store = state.registry.store("shop").await.unwrap();
+            for i in 0..3 {
+                store.put(format!("order:{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status, body) =
-            request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:shop"}"#), None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
-        wait_for_backup_completion(&app, &id).await;
+            let (status, body) =
+                request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:shop"}"#), None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            wait_for_backup_completion(&app, &id).await;
 
-        // The slow config throttles the restore, so it is still running for
-        // every assertion below.
-        let (status, body) = request(
-            &app,
-            Method::POST,
-            &format!("/store-api/backups/{id}/restore"),
-            Some(r#"{"mode":"fail_if_exists","into_domain":"shop-restored"}"#),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let restore_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["restore_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+            // The slow config throttles the restore, so it is still running for
+            // every assertion below.
+            let (status, body) = request(
+                &app,
+                Method::POST,
+                &format!("/store-api/backups/{id}/restore"),
+                Some(r#"{"mode":"fail_if_exists","into_domain":"shop-restored"}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let restore_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["restore_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
-        let (status, body) = request(&app, Method::GET, &format!("/store-api/restores/{restore_id}"), None, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], json!("running"), "{body}");
+            let (status, body) = request(&app, Method::GET, &format!("/store-api/restores/{restore_id}"), None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], json!("running"), "{body}");
 
-        let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{restore_id}"), None, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("invalid backup id"), "{body}");
+            let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{restore_id}"), None, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("invalid backup id"), "{body}");
 
-        let (status, body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["running"], serde_json::Value::Null);
+            let (status, body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["running"], serde_json::Value::Null);
 
-        let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], json!("complete"), "{body}");
+            let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"], json!("complete"), "{body}");
+        })
     }
 
     // Happy-path wiring proof: create -> list -> detail -> download
@@ -992,146 +1014,154 @@ mod tests {
     // *content* correctness (hex/null/ttl/checksum/etc.) is already covered
     // by backup::writer/restore's own test suites; this only proves the
     // HTTP layer forwards things correctly.
-    #[tokio::test]
-    async fn test_create_list_get_download_delete_roundtrip() {
-        let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-        let store = state.registry.store("default").await.unwrap();
-        store.put(b"k1", b"v1").await.unwrap();
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_create_list_get_download_delete_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
+            let store = state.registry.store("default").await.unwrap();
+            store.put(b"k1", b"v1").await.unwrap();
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status, body) =
-            request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:default"}"#), None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            let (status, body) =
+                request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:default"}"#), None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
 
-        let detail = wait_for_backup_completion(&app, &id).await;
-        assert_eq!(detail["state"], json!("complete"), "{detail}");
-        assert_eq!(detail["scope"], json!("kv:default"));
-        assert_eq!(detail["format_version"], json!(1));
+            let detail = wait_for_backup_completion(&app, &id).await;
+            assert_eq!(detail["state"], json!("complete"), "{detail}");
+            assert_eq!(detail["scope"], json!("kv:default"));
+            assert_eq!(detail["format_version"], json!(1));
 
-        let (status, body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
-        assert_eq!(status, StatusCode::OK);
-        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(list["backups"].as_array().unwrap().iter().any(|b| b["id"] == json!(id)));
-        assert_eq!(list["running"], serde_json::Value::Null);
+            let (status, body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(list["backups"].as_array().unwrap().iter().any(|b| b["id"] == json!(id)));
+            assert_eq!(list["running"], serde_json::Value::Null);
 
-        // Content-Type + Range support (spec general/006 download).
-        let req = Request::builder().uri(format!("/store-api/backups/{id}/download")).body(Body::empty()).unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/x-ndjson");
-        let full_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            // Content-Type + Range support (spec general/006 download).
+            let req = Request::builder().uri(format!("/store-api/backups/{id}/download")).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/x-ndjson");
+            let full_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
-        let req = Request::builder()
-            .uri(format!("/store-api/backups/{id}/download"))
-            .header(header::RANGE, "bytes=0-4")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        let partial_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&partial_bytes[..], &full_bytes[0..5]);
+            let req = Request::builder()
+                .uri(format!("/store-api/backups/{id}/download"))
+                .header(header::RANGE, "bytes=0-4")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            let partial_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&partial_bytes[..], &full_bytes[0..5]);
 
-        let (status, _) = request(&app, Method::DELETE, &format!("/store-api/backups/{id}"), None, None).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+            let (status, _) = request(&app, Method::DELETE, &format!("/store-api/backups/{id}"), None, None).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            let (status, body) = request(&app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        })
     }
 
     // Metrics wiring (spec general/006 metrics section): the /store-api/metrics
     // "backup" block is null when disabled, and reflects a completed backup
     // (last_success_at/last_duration_ms/last_size_bytes/failed_total) plus
     // `running` for an in-progress one when enabled.
-    #[tokio::test]
-    async fn test_metrics_backup_block() {
-        let (app, _dir) = make_app(None).await;
-        let (status, body) = request(&app, Method::GET, "/store-api/metrics", None, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["backup"], serde_json::Value::Null, "disabled backup must report a null block");
+    #[test]
+    fn test_metrics_backup_block() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(None).await;
+            let (status, body) = request(&app, Method::GET, "/store-api/metrics", None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["backup"], serde_json::Value::Null, "disabled backup must report a null block");
 
-        let (state, _dir) = make_slow_state().await;
-        let store = state.registry.store("default").await.unwrap();
-        for i in 0..5 {
-            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+            let (state, _dir) = make_slow_state().await;
+            let store = state.registry.store("default").await.unwrap();
+            for i in 0..5 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"all"}"#), None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
 
-        // While running: failed_total/last_success_at still at defaults, but
-        // `running` reflects the in-progress job.
-        let (status, body) = request(&app, Method::GET, "/store-api/metrics", None, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["backup"]["running"]["id"], json!(id));
-        assert_eq!(value["backup"]["failed_total"], json!(0));
+            // While running: failed_total/last_success_at still at defaults, but
+            // `running` reflects the in-progress job.
+            let (status, body) = request(&app, Method::GET, "/store-api/metrics", None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["backup"]["running"]["id"], json!(id));
+            assert_eq!(value["backup"]["failed_total"], json!(0));
 
-        wait_for_backup_completion(&app, &id).await;
+            wait_for_backup_completion(&app, &id).await;
 
-        let (status, body) = request(&app, Method::GET, "/store-api/metrics", None, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(value["backup"]["last_success_at"].as_u64().unwrap() > 0);
-        assert!(value["backup"]["last_size_bytes"].as_u64().unwrap() > 0);
-        assert_eq!(value["backup"]["running"], serde_json::Value::Null);
+            let (status, body) = request(&app, Method::GET, "/store-api/metrics", None, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(value["backup"]["last_success_at"].as_u64().unwrap() > 0);
+            assert!(value["backup"]["last_size_bytes"].as_u64().unwrap() > 0);
+            assert_eq!(value["backup"]["running"], serde_json::Value::Null);
+        })
     }
 
     // Happy-path wiring proof: upload a real archive's exact bytes back in,
     // as a raw streamed body (spec: no multipart, no RAM copy) -> 201 with a
     // fresh server-assigned id, distinct from the archive's own manifest id.
-    #[tokio::test]
-    async fn test_upload_roundtrip() {
-        let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-        let store = state.registry.store("default").await.unwrap();
-        store.put(b"k1", b"v1").await.unwrap();
-        let manager = Arc::clone(state.backup_manager.as_ref().unwrap());
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_upload_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
+            let store = state.registry.store("default").await.unwrap();
+            store.put(b"k1", b"v1").await.unwrap();
+            let manager = Arc::clone(state.backup_manager.as_ref().unwrap());
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (source_id, handle) = manager.start_backup(BackupScope::All, false, None).await.unwrap();
-        handle.await.unwrap();
-        let bytes = tokio::fs::read(manager.ndjson_path(&source_id)).await.unwrap();
+            let (source_id, handle) = manager.start_backup(BackupScope::All, false, None).await.unwrap();
+            handle.await.unwrap();
+            let bytes = tokio::fs::read(manager.ndjson_path(&source_id)).await.unwrap();
 
-        let req =
-            Request::builder().method(Method::POST).uri("/store-api/backups/upload").body(Body::from(bytes)).unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let uploaded_id = value["id"].as_str().unwrap().to_string();
-        assert!(uploaded_id.ends_with("_upload"), "got id '{uploaded_id}'");
-        assert_ne!(uploaded_id, source_id, "the server must assign a fresh id, not adopt the manifest's own id");
-        assert_eq!(value["format_version"], json!(1));
+            let req =
+                Request::builder().method(Method::POST).uri("/store-api/backups/upload").body(Body::from(bytes)).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let uploaded_id = value["id"].as_str().unwrap().to_string();
+            assert!(uploaded_id.ends_with("_upload"), "got id '{uploaded_id}'");
+            assert_ne!(uploaded_id, source_id, "the server must assign a fresh id, not adopt the manifest's own id");
+            assert_eq!(value["format_version"], json!(1));
 
-        let (status, list_body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
-        assert_eq!(status, StatusCode::OK);
-        let list: serde_json::Value = serde_json::from_str(&list_body).unwrap();
-        assert!(list["backups"].as_array().unwrap().iter().any(|b| b["id"] == json!(uploaded_id)));
+            let (status, list_body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            let list: serde_json::Value = serde_json::from_str(&list_body).unwrap();
+            assert!(list["backups"].as_array().unwrap().iter().any(|b| b["id"] == json!(uploaded_id)));
+        })
     }
 
     // Invalid uploads are rejected and leave nothing behind (spec: the file
     // is discarded).
-    #[tokio::test]
-    async fn test_upload_invalid_archive_rejected_and_discarded() {
-        let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_upload_invalid_archive_rejected_and_discarded() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/store-api/backups/upload")
-            .body(Body::from("not a valid backup file\n"))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("invalid backup file"));
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/store-api/backups/upload")
+                .body(Body::from("not a valid backup file\n"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("invalid backup file"));
 
-        let backup_dir = dir.path().join("backups");
-        let leftovers: Vec<_> = std::fs::read_dir(&backup_dir).unwrap().collect();
-        assert!(leftovers.is_empty(), "an invalid upload must not leave any file behind");
+            let backup_dir = dir.path().join("backups");
+            let leftovers: Vec<_> = std::fs::read_dir(&backup_dir).unwrap().collect();
+            assert!(leftovers.is_empty(), "an invalid upload must not leave any file behind");
+        })
     }
 
     // Spec general/006 explicitly calls out that uploads have no body-limit
@@ -1139,153 +1169,163 @@ mod tests {
     // still reach the handler (and get a normal 400, not a framework-level
     // rejection) -- proves `body: Body` (raw, streamed) really does bypass
     // that default rather than just being documented to.
-    #[tokio::test]
-    async fn test_upload_accepts_body_larger_than_default_2mb_limit() {
-        let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_upload_accepts_body_larger_than_default_2mb_limit() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let oversized = vec![b'x'; 3 * 1024 * 1024]; // 3 MiB > axum's 2 MiB Bytes/Json default
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/store-api/backups/upload")
-            .body(Body::from(oversized))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        // Not 413/other framework rejection -- the handler ran its own
-        // checksum/manifest validation and correctly called it invalid.
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("invalid backup file"));
+            let oversized = vec![b'x'; 3 * 1024 * 1024]; // 3 MiB > axum's 2 MiB Bytes/Json default
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/store-api/backups/upload")
+                .body(Body::from(oversized))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            // Not 413/other framework rejection -- the handler ran its own
+            // checksum/manifest validation and correctly called it invalid.
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("invalid backup file"));
+        })
     }
 
     // A client that vanishes mid-upload drops the handler future at the body
     // stream's await -- no error arm ever runs there, so only the scratch
     // guard's Drop can discard the half-written file (regression).
-    #[tokio::test]
-    async fn test_aborted_upload_leaves_no_scratch_file() {
-        let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
-        let backup_dir = dir.path().join("backups");
+    #[test]
+    fn test_aborted_upload_leaves_no_scratch_file() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
+            let backup_dir = dir.path().join("backups");
 
-        // One chunk, then a body that never yields again and never ends.
-        let stream = futures::stream::once(async {
-            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"partial upload"))
+            // One chunk, then a body that never yields again and never ends.
+            let stream = futures::stream::once(async {
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"partial upload"))
+            })
+            .chain(futures::stream::pending());
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/store-api/backups/upload")
+                .body(Body::from_stream(stream))
+                .unwrap();
+            let task = compio::runtime::spawn(async move { app.oneshot(req).await });
+
+            assert!(wait_for_dir_entries(&backup_dir, 1).await, "the handler never streamed into a scratch file");
+            drop(task);
+            assert!(wait_for_dir_entries(&backup_dir, 0).await, "an aborted upload must not leave a scratch file behind");
         })
-        .chain(futures::stream::pending());
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/store-api/backups/upload")
-            .body(Body::from_stream(stream))
-            .unwrap();
-        let task = tokio::spawn(async move { app.oneshot(req).await });
-
-        assert!(wait_for_dir_entries(&backup_dir, 1).await, "the handler never streamed into a scratch file");
-        task.abort();
-        assert!(wait_for_dir_entries(&backup_dir, 0).await, "an aborted upload must not leave a scratch file behind");
     }
 
     // Typed archive failures keep their own status and message instead of
     // collapsing into the generic verification-failed 400 (regression).
-    #[tokio::test]
-    async fn test_upload_unsupported_format_version_keeps_its_message() {
-        let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_upload_unsupported_format_version_keeps_its_message() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let manifest = json!({
-            "t": "manifest", "format_version": 99, "id": "bk_x", "created_at": now_secs(),
-            "luradb_version": "test", "scope": "all", "include_auth": false,
-            "kv_snapshot_ts": 0, "json_snapshot_ts": 0, "encoding": "hex", "schedule": null
-        });
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/store-api/backups/upload")
-            .body(Body::from(format!("{manifest}\n")))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("unsupported backup format version 99"), "{body}");
+            let manifest = json!({
+                "t": "manifest", "format_version": 99, "id": "bk_x", "created_at": now_secs(),
+                "luradb_version": "test", "scope": "all", "include_auth": false,
+                "kv_snapshot_ts": 0, "json_snapshot_ts": 0, "encoding": "hex", "schedule": null
+            });
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/store-api/backups/upload")
+                .body(Body::from(format!("{manifest}\n")))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("unsupported backup format version 99"), "{body}");
+        })
     }
 
     // Happy-path wiring proof: restore with into_domain remap -> status
     // polling reaches "complete" with the expected counts.
-    #[tokio::test]
-    async fn test_restore_roundtrip_with_remap() {
-        let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-        state.registry.create_domain("shop").await.unwrap();
-        let store = state.registry.store("shop").await.unwrap();
-        store.put(b"order:1", b"hello").await.unwrap();
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_restore_roundtrip_with_remap() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
+            state.registry.create_domain("shop").await.unwrap();
+            let store = state.registry.store("shop").await.unwrap();
+            store.put(b"order:1", b"hello").await.unwrap();
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:shop"}"#), None).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
-        wait_for_backup_completion(&app, &id).await;
+            let (status, body) = request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"kv:shop"}"#), None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            wait_for_backup_completion(&app, &id).await;
 
-        let (status, body) = request(
-            &app,
-            Method::POST,
-            &format!("/store-api/backups/{id}/restore"),
-            Some(r#"{"mode":"fail_if_exists","into_domain":"shop-restored"}"#),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let restore_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["restore_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+            let (status, body) = request(
+                &app,
+                Method::POST,
+                &format!("/store-api/backups/{id}/restore"),
+                Some(r#"{"mode":"fail_if_exists","into_domain":"shop-restored"}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let restore_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["restore_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
 
-        let status_value = wait_for_restore_completion(&app, &restore_id).await;
-        assert_eq!(status_value["state"], json!("complete"), "{status_value}");
-        assert_eq!(status_value["backup_id"], json!(id));
-        assert_eq!(status_value["imported"], json!(1));
+            let status_value = wait_for_restore_completion(&app, &restore_id).await;
+            assert_eq!(status_value["state"], json!("complete"), "{status_value}");
+            assert_eq!(status_value["backup_id"], json!(id));
+            assert_eq!(status_value["imported"], json!(1));
+        })
     }
 
     // Synchronous restore pre-checks (orchestrator hint 1): all three must
     // be rejected before any job/slot is ever touched.
-    #[tokio::test]
-    async fn test_restore_synchronous_prechecks() {
-        let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
-        let backup_dir = dir.path().join("backups");
-        write_fake_backup(&backup_dir, "bk_multi", "all", now_secs(), None, true);
-        write_fake_backup(&backup_dir, "bk_incomplete", "kv:shop", now_secs(), None, false);
-        write_fake_backup_bad_version(&backup_dir, "bk_badversion");
-        let app = crate::api::router_inline(state, Arc::new(vec![]));
+    #[test]
+    fn test_restore_synchronous_prechecks() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, dir) = make_state(Some(enabled_backup_config()), false).await;
+            let backup_dir = dir.path().join("backups");
+            write_fake_backup(&backup_dir, "bk_multi", "all", now_secs(), None, true);
+            write_fake_backup(&backup_dir, "bk_incomplete", "kv:shop", now_secs(), None, false);
+            write_fake_backup_bad_version(&backup_dir, "bk_badversion");
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let (status, body) = request(
-            &app,
-            Method::POST,
-            "/store-api/backups/bk_multi/restore",
-            Some(r#"{"mode":"fail_if_exists","into_domain":"x"}"#),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("requires a backup with exactly one domain"), "{body}");
+            let (status, body) = request(
+                &app,
+                Method::POST,
+                "/store-api/backups/bk_multi/restore",
+                Some(r#"{"mode":"fail_if_exists","into_domain":"x"}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("requires a backup with exactly one domain"), "{body}");
 
-        let (status, body) = request(
-            &app,
-            Method::POST,
-            "/store-api/backups/bk_incomplete/restore",
-            Some(r#"{"mode":"fail_if_exists"}"#),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("invalid backup file"), "{body}");
+            let (status, body) = request(
+                &app,
+                Method::POST,
+                "/store-api/backups/bk_incomplete/restore",
+                Some(r#"{"mode":"fail_if_exists"}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("invalid backup file"), "{body}");
 
-        let (status, body) = request(
-            &app,
-            Method::POST,
-            "/store-api/backups/bk_badversion/restore",
-            Some(r#"{"mode":"fail_if_exists"}"#),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("unsupported backup format version"), "{body}");
+            let (status, body) = request(
+                &app,
+                Method::POST,
+                "/store-api/backups/bk_badversion/restore",
+                Some(r#"{"mode":"fail_if_exists"}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("unsupported backup format version"), "{body}");
+        })
     }
 
     /// Polls `GET /backups/{id}` until it is no longer "running" (bounded,
@@ -1298,7 +1338,7 @@ mod tests {
             if value["state"] != json!("running") {
                 return value;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            compio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("backup '{id}' did not finish within the poll budget");
     }
@@ -1312,7 +1352,7 @@ mod tests {
             if value["state"] != json!("running") {
                 return value;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            compio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("restore '{restore_id}' did not finish within the poll budget");
     }
@@ -1325,7 +1365,7 @@ mod tests {
             if std::fs::read_dir(dir).unwrap().count() == count {
                 return true;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            compio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         false
     }

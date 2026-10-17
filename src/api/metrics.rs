@@ -209,11 +209,13 @@ mod tests {
     use std::sync::Arc;
 
     // Spec 004 §Output item 4: handler reports the two constants verbatim.
-    #[tokio::test]
-    async fn version_handler_reports_constants() {
-        let Json(resp) = version().await;
-        assert_eq!(resp.server_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(resp.api_version, crate::api::API_VERSION);
+    #[test]
+    fn version_handler_reports_constants() {
+        crate::core::engine_runtime::block_on(async {
+            let Json(resp) = version().await;
+            assert_eq!(resp.server_version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(resp.api_version, crate::api::API_VERSION);
+        })
     }
 
     // ── Spec general/019: per-engine metrics, HTTP level ─────────────────────
@@ -274,88 +276,94 @@ mod tests {
 
     // Test 9: engines.kv/.json/.rel are present with all nine fields;
     // domains[] keeps exactly its eight known fields, unchanged.
-    #[tokio::test]
-    async fn test_engines_block_present_with_all_fields_domains_unchanged() {
-        let (state, _dir) = make_state().await;
-        state.registry.create_domain("shop").await.unwrap();
-        state.registry.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
-        state.registry.store("shop").await.unwrap().get(b"k").await.unwrap();
-        state.metrics.tick_all();
+    #[test]
+    fn test_engines_block_present_with_all_fields_domains_unchanged() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            state.registry.create_domain("shop").await.unwrap();
+            state.registry.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
+            state.registry.store("shop").await.unwrap().get(b"k").await.unwrap();
+            state.metrics.tick_all();
 
-        let Json(body) = get_metrics(State(state)).await;
-        for engine in ["kv", "json", "rel"] {
-            let block = &body["engines"][engine];
-            for field in [
-                "read_ops", "write_ops",
-                "read_latency_us_p50", "read_latency_us_p95", "read_latency_us_p99",
-                "write_latency_us_p50", "write_latency_us_p95", "write_latency_us_p99",
-                "window_secs",
-            ] {
-                assert!(block.get(field).is_some(), "engines.{engine}.{field} missing");
+            let Json(body) = get_metrics(State(state)).await;
+            for engine in ["kv", "json", "rel"] {
+                let block = &body["engines"][engine];
+                for field in [
+                    "read_ops", "write_ops",
+                    "read_latency_us_p50", "read_latency_us_p95", "read_latency_us_p99",
+                    "write_latency_us_p50", "write_latency_us_p95", "write_latency_us_p99",
+                    "window_secs",
+                ] {
+                    assert!(block.get(field).is_some(), "engines.{engine}.{field} missing");
+                }
+                assert_eq!(block["window_secs"], 60, "engines.{engine}.window_secs");
             }
-            assert_eq!(block["window_secs"], 60, "engines.{engine}.window_secs");
-        }
 
-        let domain = body["domains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|d| d["domain"] == "shop")
-            .expect("shop must appear in domains[]");
-        let mut fields: Vec<&str> = domain.as_object().unwrap().keys().map(|s| s.as_str()).collect();
-        fields.sort();
-        let mut expected = vec![
-            "domain", "read_ops", "write_ops", "read_latency_us_p50", "read_latency_us_p99",
-            "cache_hit_rate", "rate_limit_rejections", "window_secs",
-        ];
-        expected.sort();
-        assert_eq!(fields, expected, "domains[] must keep exactly its eight known fields");
-        assert_eq!(domain["window_secs"], 60);
+            let domain = body["domains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["domain"] == "shop")
+                .expect("shop must appear in domains[]");
+            let mut fields: Vec<&str> = domain.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+            fields.sort();
+            let mut expected = vec![
+                "domain", "read_ops", "write_ops", "read_latency_us_p50", "read_latency_us_p99",
+                "cache_hit_rate", "rate_limit_rejections", "window_secs",
+            ];
+            expected.sort();
+            assert_eq!(fields, expected, "domains[] must keep exactly its eight known fields");
+            assert_eq!(domain["window_secs"], 60);
+        })
     }
 
     // Test 10: a disabled JSON engine (json_engine: None in AppState) still
     // yields a complete, all-zero engines.json block.
-    #[tokio::test]
-    async fn test_disabled_json_engine_yields_zeroed_block() {
-        let (state, _dir) = make_state().await;
-        assert!(state.json_engine.is_none());
+    #[test]
+    fn test_disabled_json_engine_yields_zeroed_block() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            assert!(state.json_engine.is_none());
 
-        let Json(body) = get_metrics(State(state)).await;
-        let json_block = &body["engines"]["json"];
-        assert_eq!(json_block["read_ops"], 0);
-        assert_eq!(json_block["write_ops"], 0);
-        assert_eq!(json_block["read_latency_us_p50"], 0);
-        assert_eq!(json_block["write_latency_us_p50"], 0);
+            let Json(body) = get_metrics(State(state)).await;
+            let json_block = &body["engines"]["json"];
+            assert_eq!(json_block["read_ops"], 0);
+            assert_eq!(json_block["write_ops"], 0);
+            assert_eq!(json_block["read_latency_us_p50"], 0);
+            assert_eq!(json_block["write_latency_us_p50"], 0);
+        })
     }
 
     // Test 11: deleting a domain removes it from domains[], but
     // engines.kv.read_ops (the engine aggregate) stays put.
-    #[tokio::test]
-    async fn test_domain_delete_keeps_engine_aggregate() {
-        let (state, _dir) = make_state().await;
-        state.registry.create_domain("gone").await.unwrap();
-        state.registry.store("gone").await.unwrap().put(b"k", b"v").await.unwrap();
-        state.registry.store("gone").await.unwrap().get(b"k").await.unwrap();
-        state.metrics.tick_all();
-        let before = state.metrics.engine_metrics()[0].read_ops;
-        assert!(before > 0);
+    #[test]
+    fn test_domain_delete_keeps_engine_aggregate() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            state.registry.create_domain("gone").await.unwrap();
+            state.registry.store("gone").await.unwrap().put(b"k", b"v").await.unwrap();
+            state.registry.store("gone").await.unwrap().get(b"k").await.unwrap();
+            state.metrics.tick_all();
+            let before = state.metrics.engine_metrics()[0].read_ops;
+            assert!(before > 0);
 
-        state.registry.delete_domain("gone").await.unwrap();
-        // delete_domain only marks the domain Deleting -- the domain purger
-        // removes its metrics window on finalize (kv/013). Call it directly
-        // rather than spinning up a full purger cycle in this HTTP-level test.
-        state.metrics.remove_domain("gone");
+            state.registry.delete_domain("gone").await.unwrap();
+            // delete_domain only marks the domain Deleting -- the domain purger
+            // removes its metrics window on finalize (kv/013). Call it directly
+            // rather than spinning up a full purger cycle in this HTTP-level test.
+            state.metrics.remove_domain("gone");
 
-        let Json(body) = get_metrics(State(state)).await;
-        assert!(
-            body["domains"].as_array().unwrap().iter().all(|d| d["domain"] != "gone"),
-            "deleted domain must be gone from domains[]"
-        );
-        assert_eq!(
-            body["engines"]["kv"]["read_ops"].as_u64().unwrap(),
-            before,
-            "engine aggregate must survive domain deletion"
-        );
+            let Json(body) = get_metrics(State(state)).await;
+            assert!(
+                body["domains"].as_array().unwrap().iter().all(|d| d["domain"] != "gone"),
+                "deleted domain must be gone from domains[]"
+            );
+            assert_eq!(
+                body["engines"]["kv"]["read_ops"].as_u64().unwrap(),
+                before,
+                "engine aggregate must survive domain deletion"
+            );
+        })
     }
 
     // ── Spec general/024: compaction_runs/janitor_runs/memtable_size_bytes ───
@@ -363,42 +371,46 @@ mod tests {
     // Test 3: memtable_size_bytes is a live gauge read from the engine's
     // active MemTable -- grows after a write, and shrinks back once
     // flush_all_memtables drains it.
-    #[tokio::test]
-    async fn test_memtable_size_bytes_reflects_live_memtable() {
-        let (state, _dir) = make_state().await;
-        state.registry.create_domain("shop").await.unwrap();
-        state.registry.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
+    #[test]
+    fn test_memtable_size_bytes_reflects_live_memtable() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            state.registry.create_domain("shop").await.unwrap();
+            state.registry.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
 
-        let Json(body) = get_metrics(State(state.clone())).await;
-        let before = body["system"]["memtable_size_bytes"].as_u64().unwrap();
-        assert!(before > 0, "memtable_size_bytes must be > 0 after a PUT");
+            let Json(body) = get_metrics(State(state.clone())).await;
+            let before = body["system"]["memtable_size_bytes"].as_u64().unwrap();
+            assert!(before > 0, "memtable_size_bytes must be > 0 after a PUT");
 
-        state.registry.engine().flush_all_memtables().await.unwrap();
+            state.registry.engine().flush_all_memtables().await.unwrap();
 
-        let Json(body) = get_metrics(State(state)).await;
-        let after = body["system"]["memtable_size_bytes"].as_u64().unwrap();
-        assert!(after < before, "memtable_size_bytes must shrink after a full flush");
+            let Json(body) = get_metrics(State(state)).await;
+            let after = body["system"]["memtable_size_bytes"].as_u64().unwrap();
+            assert!(after < before, "memtable_size_bytes must shrink after a full flush");
+        })
     }
 
     // Test 4 (regression): the system block keeps exactly its five known
     // fields, all numeric -- rewiring three of them to the engine must not
     // drop or rename a field.
-    #[tokio::test]
-    async fn test_system_block_keeps_exactly_five_numeric_fields() {
-        let (state, _dir) = make_state().await;
-        let Json(body) = get_metrics(State(state)).await;
-        let system = body["system"].as_object().unwrap();
+    #[test]
+    fn test_system_block_keeps_exactly_five_numeric_fields() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            let Json(body) = get_metrics(State(state)).await;
+            let system = body["system"].as_object().unwrap();
 
-        let mut fields: Vec<&str> = system.keys().map(|s| s.as_str()).collect();
-        fields.sort();
-        let mut expected =
-            vec!["total_reads", "total_writes", "compaction_runs", "janitor_runs", "memtable_size_bytes"];
-        expected.sort();
-        assert_eq!(fields, expected, "system block must keep exactly its five known fields");
+            let mut fields: Vec<&str> = system.keys().map(|s| s.as_str()).collect();
+            fields.sort();
+            let mut expected =
+                vec!["total_reads", "total_writes", "compaction_runs", "janitor_runs", "memtable_size_bytes"];
+            expected.sort();
+            assert_eq!(fields, expected, "system block must keep exactly its five known fields");
 
-        for field in expected {
-            assert!(system[field].is_number(), "system.{field} must be numeric");
-        }
+            for field in expected {
+                assert!(system[field].is_number(), "system.{field} must be numeric");
+            }
+        })
     }
 
     // ── GET /store-api/config (spec general/022) ─────────────────────────────
@@ -424,19 +436,21 @@ mod tests {
     // plain string search over the whole wire body -- stays valid even if the
     // key moves to a nested location later. Redaction is field-exact: the
     // admin name next to it must survive.
-    #[tokio::test]
-    async fn config_endpoint_redacts_admin_api_key_but_keeps_name() {
-        let mut config = crate::config::LuraConfig::default();
-        config.auth.admins = vec![crate::config::AdminEntry {
-            name: "root".to_string(),
-            api_key: "MARKER_SECRET".to_string(),
-        }];
-        let (state, _dir) = make_state_with_config(config, "test.toml".to_string(), false).await;
-        let resp = config_response(state).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_string(resp).await;
-        assert!(!body.contains("MARKER_SECRET"), "admin api_key leaked into the response body");
-        assert!(body.contains("root"), "admin name must stay visible");
+    #[test]
+    fn config_endpoint_redacts_admin_api_key_but_keeps_name() {
+        crate::core::engine_runtime::block_on(async {
+            let mut config = crate::config::LuraConfig::default();
+            config.auth.admins = vec![crate::config::AdminEntry {
+                name: "root".to_string(),
+                api_key: "MARKER_SECRET".to_string(),
+            }];
+            let (state, _dir) = make_state_with_config(config, "test.toml".to_string(), false).await;
+            let resp = config_response(state).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            assert!(!body.contains("MARKER_SECRET"), "admin api_key leaked into the response body");
+            assert!(body.contains("root"), "admin name must stay visible");
+        })
     }
 
     // Test 3 (admin-only enforcement) lives in auth/middleware.rs, next to
@@ -444,96 +458,106 @@ mod tests {
 
     // Test 4: LuraConfig::default() with config_file_loaded: false -> 200,
     // flag false, config_path still set, config fully populated.
-    #[tokio::test]
-    async fn config_endpoint_defaults_operation() {
-        let (state, _dir) = make_state_with_config(
-            crate::config::LuraConfig::default(),
-            "/etc/luradb/luradb.toml".to_string(),
-            false,
-        )
-        .await;
-        let resp = config_response(state).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["config_file_loaded"], false);
-        assert_eq!(body["config_path"], "/etc/luradb/luradb.toml");
-        assert!(body["config"]["server"].is_object());
-        assert!(body["config"]["storage"].is_object());
+    #[test]
+    fn config_endpoint_defaults_operation() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state_with_config(
+                crate::config::LuraConfig::default(),
+                "/etc/luradb/luradb.toml".to_string(),
+                false,
+            )
+            .await;
+            let resp = config_response(state).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["config_file_loaded"], false);
+            assert_eq!(body["config_path"], "/etc/luradb/luradb.toml");
+            assert!(body["config"]["server"].is_object());
+            assert!(body["config"]["storage"].is_object());
+        })
     }
 
     // Test 5: config_path passes through unchanged; config_file_loaded: true
     // distinguishes the "file was loaded" case from test 4's defaults case.
-    #[tokio::test]
-    async fn config_endpoint_path_passthrough_when_loaded() {
-        let (state, _dir) = make_state_with_config(
-            crate::config::LuraConfig::default(),
-            "/etc/luradb/luradb.toml".to_string(),
-            true,
-        )
-        .await;
-        let resp = config_response(state).await;
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["config_path"], "/etc/luradb/luradb.toml");
-        assert_eq!(body["config_file_loaded"], true);
+    #[test]
+    fn config_endpoint_path_passthrough_when_loaded() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state_with_config(
+                crate::config::LuraConfig::default(),
+                "/etc/luradb/luradb.toml".to_string(),
+                true,
+            )
+            .await;
+            let resp = config_response(state).await;
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["config_path"], "/etc/luradb/luradb.toml");
+            assert_eq!(body["config_file_loaded"], true);
+        })
     }
 
     // Test 6: the `config` key-set matches LuraConfig's field names exactly --
     // no fixed count/list here on purpose, so this stays valid as sections
     // are added (the endpoint's own promise: "effective configuration").
-    #[tokio::test]
-    async fn config_endpoint_config_keys_match_luraconfig_fields() {
-        let (state, _dir) =
-            make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await;
-        let resp = config_response(state).await;
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
+    #[test]
+    fn config_endpoint_config_keys_match_luraconfig_fields() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) =
+                make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await;
+            let resp = config_response(state).await;
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
 
-        let mut got: Vec<String> = body["config"].as_object().unwrap().keys().cloned().collect();
-        got.sort();
-        let expected_value = serde_json::to_value(crate::config::LuraConfig::default()).unwrap();
-        let mut expected: Vec<String> = expected_value.as_object().unwrap().keys().cloned().collect();
-        expected.sort();
-        assert_eq!(got, expected);
+            let mut got: Vec<String> = body["config"].as_object().unwrap().keys().cloned().collect();
+            got.sort();
+            let expected_value = serde_json::to_value(crate::config::LuraConfig::default()).unwrap();
+            let mut expected: Vec<String> = expected_value.as_object().unwrap().keys().cloned().collect();
+            expected.sort();
+            assert_eq!(got, expected);
+        })
     }
 
     // Spec general/030 test 9: removed keys and their sections are gone from
     // the response, checked on JSON keys (an explicit `null` still counts).
-    #[tokio::test]
-    async fn config_endpoint_omits_removed_keys() {
-        let (state, _dir) =
-            make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await;
-        let resp = config_response(state).await;
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
+    #[test]
+    fn config_endpoint_omits_removed_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) =
+                make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await;
+            let resp = config_response(state).await;
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
 
-        let sections = [
-            "metrics", "block_cache",
-            "json.compaction", "json.janitor", "json.block_cache",
-            "rel.compaction", "rel.janitor", "rel.block_cache",
-        ];
-        for key in sections.iter().chain(crate::config::REMOVED_KEYS) {
-            let pointer = format!("/config/{}", key.replace('.', "/"));
-            assert!(body.pointer(&pointer).is_none(), "removed key {key} is still reported");
-        }
+            let sections = [
+                "metrics", "block_cache",
+                "json.compaction", "json.janitor", "json.block_cache",
+                "rel.compaction", "rel.janitor", "rel.block_cache",
+            ];
+            for key in sections.iter().chain(crate::config::REMOVED_KEYS) {
+                let pointer = format!("/config/{}", key.replace('.', "/"));
+                assert!(body.pointer(&pointer).is_none(), "removed key {key} is still reported");
+            }
+        })
     }
 
     // Test 7: a TOML-loaded config with a non-default value (server.port)
     // comes back with that exact value -- proof the *loaded* instance is
     // serialized, not a fresh default one.
-    #[tokio::test]
-    async fn config_endpoint_reflects_loaded_values_not_defaults() {
-        let toml_str = r#"
+    #[test]
+    fn config_endpoint_reflects_loaded_values_not_defaults() {
+        crate::core::engine_runtime::block_on(async {
+            let toml_str = r#"
             [server]
             port = 4242
         "#;
-        let config: crate::config::LuraConfig = toml::from_str(toml_str).unwrap();
-        assert_ne!(config.server.port, crate::config::ServerConfig::default().port);
-        let (state, _dir) = make_state_with_config(config, "test.toml".to_string(), true).await;
-        let resp = config_response(state).await;
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["config"]["server"]["port"], 4242);
+            let config: crate::config::LuraConfig = toml::from_str(toml_str).unwrap();
+            assert_ne!(config.server.port, crate::config::ServerConfig::default().port);
+            let (state, _dir) = make_state_with_config(config, "test.toml".to_string(), true).await;
+            let resp = config_response(state).await;
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["config"]["server"]["port"], 4242);
+        })
     }
 }

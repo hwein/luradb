@@ -88,48 +88,50 @@ fn run_round(engine: &Arc<LsmStorageEngine>, keys: &Arc<Vec<Vec<u8>>>, threads: 
     ((threads * READS_PER_THREAD) as f64 / elapsed.as_secs_f64(), p50)
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn read_scaling() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let wal_path = dir.path().join("wal.log");
-    let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
-    let vlog_path = dir.path().join("vlog.log");
-    let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-    let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-    let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
-    let engine = Arc::new(
-        LsmStorageEngine::new(
-            wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
-            LsmEngineOptions::default(),
-        )
-        .await
-        .unwrap(),
-    );
-
-    let keys: Arc<Vec<Vec<u8>>> = Arc::new((0..KEYS).map(|i| format!("key{i:08}").into_bytes()).collect());
-    for chunk in keys.chunks(1_000) {
-        let ops = chunk
-            .iter()
-            .map(|k| BatchOp::Put { key: k.clone(), value: vec![b'v'; VALUE_LEN] })
-            .collect();
-        engine.write_batch(ops).await.unwrap();
-    }
-    engine.flush_all_memtables().await.unwrap();
-    engine.compact_level(0).await.unwrap();
-
-    // Warm the block cache once, so every round reads the same cached state.
-    for key in keys.iter() {
-        assert!(engine.get(key).await.unwrap().is_some());
-    }
-
-    for threads in THREAD_COUNTS {
-        let mut rounds: Vec<(f64, Duration)> = (0..ROUNDS).map(|_| run_round(&engine, &keys, threads)).collect();
-        rounds.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let (ops, p50) = rounds[ROUNDS / 2];
-        println!(
-            "read_scaling: threads={threads} ops/s={ops:.0} p50={}ns (median of {ROUNDS} rounds, {READS_PER_THREAD} reads/thread)",
-            p50.as_nanos()
+fn read_scaling() {
+    luradb::core::engine_runtime::block_on(async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        let engine = Arc::new(
+            LsmStorageEngine::new(
+                wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+                LsmEngineOptions::default(),
+            )
+            .await
+            .unwrap(),
         );
-    }
+
+        let keys: Arc<Vec<Vec<u8>>> = Arc::new((0..KEYS).map(|i| format!("key{i:08}").into_bytes()).collect());
+        for chunk in keys.chunks(1_000) {
+            let ops = chunk
+                .iter()
+                .map(|k| BatchOp::Put { key: k.clone(), value: vec![b'v'; VALUE_LEN] })
+                .collect();
+            engine.write_batch(ops).await.unwrap();
+        }
+        engine.flush_all_memtables().await.unwrap();
+        engine.compact_level(0).await.unwrap();
+
+        // Warm the block cache once, so every round reads the same cached state.
+        for key in keys.iter() {
+            assert!(engine.get(key).await.unwrap().is_some());
+        }
+
+        for threads in THREAD_COUNTS {
+            let mut rounds: Vec<(f64, Duration)> = (0..ROUNDS).map(|_| run_round(&engine, &keys, threads)).collect();
+            rounds.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let (ops, p50) = rounds[ROUNDS / 2];
+            println!(
+                "read_scaling: threads={threads} ops/s={ops:.0} p50={}ns (median of {ROUNDS} rounds, {READS_PER_THREAD} reads/thread)",
+                p50.as_nanos()
+            );
+        }
+    })
 }

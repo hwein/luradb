@@ -456,48 +456,50 @@ mod tests {
         (app, auth_cache, dir)
     }
 
-    #[tokio::test]
-    async fn version_requires_valid_key_any_role() {
-        let (app, auth_cache, _dir) = make_app_with_auth().await;
+    #[test]
+    fn version_requires_valid_key_any_role() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app_with_auth().await;
 
-        // No token -> 401.
-        let resp = app
-            .clone()
-            .oneshot(Request::builder().uri("/version").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            // No token -> 401.
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri("/version").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // Non-admin key, no domain permission at all -> still passes /version.
-        let key = "lura_test_version_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/version")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            // Non-admin key, no domain permission at all -> still passes /version.
+            let key = "lura_test_version_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/version")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        // Regression: /health stays reachable without a token.
-        let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            // Regression: /health stays reachable without a token.
+            let resp = app
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
     }
 
     // ── /store-api/config admin-only (spec general/022) ──────────────────────
@@ -507,168 +509,178 @@ mod tests {
     // extract_domain's None branch above, same as /metrics, /events,
     // /backups*. A future path refactor that accidentally gave it a domain
     // segment would silently open it to any user holding some permission.
-    #[tokio::test]
-    async fn config_endpoint_is_admin_only() {
-        let (app, auth_cache, _dir) = make_app_with_auth().await;
+    #[test]
+    fn config_endpoint_is_admin_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app_with_auth().await;
 
-        // Non-admin key, even with a domain permission -> 403 (no {domain}
-        // segment in this path for that permission to apply to).
-        let key = "lura_test_config_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        auth_cache
-            .set_permission(crate::auth::DomainPermission {
-                username: "worker".to_string(),
-                domain: "shop".to_string(),
-                access: AccessLevel::Ddl,
-            })
-            .await
-            .unwrap();
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/config")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-        // Admin key -> 200.
-        let admin_key = "lura_test_config_admin_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "admin".to_string(),
-                api_key_hash: crate::auth::hash_api_key(admin_key),
-                role: crate::auth::UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/config")
-                    .header("authorization", format!("Bearer {admin_key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ── Docs routes behind auth (spec general/014) ──────────────────────────
-
-    #[tokio::test]
-    async fn docs_routes_require_key_when_auth_enabled() {
-        let (app, _auth_cache, _dir) = make_docs_app(true).await;
-
-        // openapi.json, the bare swagger_url (redirects to .../), and an
-        // asset sub-path under it (spec general/014: asset sub-paths under
-        // swagger_url) — the `*rest` wildcard SwaggerUi registers for its own
-        // static assets is part of the same sub-router, so it's covered by
-        // the same layer too, no path list needed.
-        for uri in ["/api-docs/openapi.json", "/test-ui", "/test-ui/does-not-exist.js"] {
-            let resp = app
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            // Non-admin key, even with a domain permission -> 403 (no {domain}
+            // segment in this path for that permission to apply to).
+            let key = "lura_test_config_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::User,
+                    created_at: 0,
+                })
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
-        }
-
-        // /health is untouched by this change.
-        let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn docs_routes_accept_any_valid_key_no_domain_permission() {
-        let (app, auth_cache, _dir) = make_docs_app(true).await;
-
-        // Non-admin key with no domain permission at all -> still 200, same
-        // "any valid key" rule as /version (not 403 from the extract_domain
-        // fallback that `auth_layer` would otherwise apply).
-        let key = "lura_test_docs_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-
-        for uri in ["/api-docs/openapi.json", "/test-ui/"] {
+            auth_cache
+                .set_permission(crate::auth::DomainPermission {
+                    username: "worker".to_string(),
+                    domain: "shop".to_string(),
+                    access: AccessLevel::Ddl,
+                })
+                .await
+                .unwrap();
             let resp = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(uri)
+                        .uri("/store-api/config")
                         .header("authorization", format!("Bearer {key}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        }
-    }
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    #[tokio::test]
-    async fn docs_routes_accept_admin_key() {
-        let (app, auth_cache, _dir) = make_docs_app(true).await;
-
-        let key = "lura_test_docs_admin_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "admin".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api-docs/openapi.json")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn docs_routes_open_without_key_when_auth_disabled() {
-        let (app, _auth_cache, _dir) = make_docs_app(false).await;
-
-        for uri in ["/api-docs/openapi.json", "/test-ui/"] {
-            let resp = app
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            // Admin key -> 200.
+            let admin_key = "lura_test_config_admin_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "admin".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(admin_key),
+                    role: crate::auth::UserRole::Admin,
+                    created_at: 0,
+                })
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        }
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/config")
+                        .header("authorization", format!("Bearer {admin_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    // ── Docs routes behind auth (spec general/014) ──────────────────────────
+
+    #[test]
+    fn docs_routes_require_key_when_auth_enabled() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_docs_app(true).await;
+
+            // openapi.json, the bare swagger_url (redirects to .../), and an
+            // asset sub-path under it (spec general/014: asset sub-paths under
+            // swagger_url) — the `*rest` wildcard SwaggerUi registers for its own
+            // static assets is part of the same sub-router, so it's covered by
+            // the same layer too, no path list needed.
+            for uri in ["/api-docs/openapi.json", "/test-ui", "/test-ui/does-not-exist.js"] {
+                let resp = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            }
+
+            // /health is untouched by this change.
+            let resp = app
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    #[test]
+    fn docs_routes_accept_any_valid_key_no_domain_permission() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_docs_app(true).await;
+
+            // Non-admin key with no domain permission at all -> still 200, same
+            // "any valid key" rule as /version (not 403 from the extract_domain
+            // fallback that `auth_layer` would otherwise apply).
+            let key = "lura_test_docs_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+
+            for uri in ["/api-docs/openapi.json", "/test-ui/"] {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("authorization", format!("Bearer {key}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+        })
+    }
+
+    #[test]
+    fn docs_routes_accept_admin_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_docs_app(true).await;
+
+            let key = "lura_test_docs_admin_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "admin".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api-docs/openapi.json")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    #[test]
+    fn docs_routes_open_without_key_when_auth_disabled() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_docs_app(false).await;
+
+            for uri in ["/api-docs/openapi.json", "/test-ui/"] {
+                let resp = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+        })
     }
 }

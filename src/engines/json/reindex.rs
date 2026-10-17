@@ -92,7 +92,7 @@ impl JsonEngine {
         let engine = Arc::clone(self);
         let tid = task_id.clone();
         let domain_name = dom.name.clone();
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             let started = std::time::Instant::now();
             let final_status = match engine.run_reindex(&tid, &dom, &defs).await {
                 Ok(processed) => ReindexStatus::Completed {
@@ -109,7 +109,8 @@ impl JsonEngine {
                 .write()
                 .insert(tid, (domain_name.clone(), final_status));
             engine.reindex_running.lock().remove(&domain_name);
-        });
+        })
+        .detach();
         Ok(ReindexResult { task_id, status })
     }
 
@@ -137,7 +138,7 @@ impl JsonEngine {
                 .map_err(|e| (processed, e))?;
             self.set_running_status(task_id, dom, processed, total);
             if self.reindex_pause_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.reindex_pause_ms)).await;
+                compio::time::sleep(std::time::Duration::from_millis(self.reindex_pause_ms)).await;
             }
         }
         Ok(processed)
@@ -250,7 +251,7 @@ mod tests {
                 Some(s @ ReindexStatus::Completed { .. }) | Some(s @ ReindexStatus::Failed { .. }) => {
                     return s;
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                _ => compio::time::sleep(std::time::Duration::from_millis(5)).await,
             }
         }
         panic!("reindex task {task_id} did not finish");
@@ -267,123 +268,139 @@ mod tests {
     }
 
     // 1. Docs written BEFORE index creation become searchable after re-index.
-    #[tokio::test]
-    async fn test_reindex_makes_existing_docs_searchable() {
-        let (json, _dir) = make_engine_cfg(500, 0).await;
-        for i in 0..10 {
-            json.put_document("default", &format!("d{i}"), json!({"city": "Essen"})).await.unwrap();
-        }
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        assert_eq!(
-            json.search_documents("default", city_query("Essen")).await.unwrap().total,
-            0,
-            "before re-index nothing is indexed"
-        );
-        let result = json.reindex_domain("default").unwrap();
-        let status = wait_done(&json, "default", &result.task_id).await;
-        assert!(matches!(status, ReindexStatus::Completed { processed: 10, .. }), "got: {status:?}");
-        assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 10);
+    #[test]
+    fn test_reindex_makes_existing_docs_searchable() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(500, 0).await;
+            for i in 0..10 {
+                json.put_document("default", &format!("d{i}"), json!({"city": "Essen"})).await.unwrap();
+            }
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            assert_eq!(
+                json.search_documents("default", city_query("Essen")).await.unwrap().total,
+                0,
+                "before re-index nothing is indexed"
+            );
+            let result = json.reindex_domain("default").unwrap();
+            let status = wait_done(&json, "default", &result.task_id).await;
+            assert!(matches!(status, ReindexStatus::Completed { processed: 10, .. }), "got: {status:?}");
+            assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 10);
+        })
     }
 
     // 2. Re-index is idempotent.
-    #[tokio::test]
-    async fn test_reindex_idempotent() {
-        let (json, _dir) = make_engine_cfg(500, 0).await;
-        json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let r1 = json.reindex_domain("default").unwrap();
-        wait_done(&json, "default", &r1.task_id).await;
-        let r2 = json.reindex_domain("default").unwrap();
-        wait_done(&json, "default", &r2.task_id).await;
-        assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 1);
+    #[test]
+    fn test_reindex_idempotent() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(500, 0).await;
+            json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let r1 = json.reindex_domain("default").unwrap();
+            wait_done(&json, "default", &r1.task_id).await;
+            let r2 = json.reindex_domain("default").unwrap();
+            wait_done(&json, "default", &r2.task_id).await;
+            assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 1);
+        })
     }
 
     // 3. Documents without the indexed field are skipped without error.
-    #[tokio::test]
-    async fn test_reindex_partial_documents() {
-        let (json, _dir) = make_engine_cfg(500, 0).await;
-        json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
-        json.put_document("default", "b", json!({"name": "no-city"})).await.unwrap();
-        json.put_document("default", "c", json!({"city": "Essen"})).await.unwrap();
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let result = json.reindex_index("default", "city").unwrap();
-        let status = wait_done(&json, "default", &result.task_id).await;
-        assert!(matches!(status, ReindexStatus::Completed { processed: 3, .. }), "got: {status:?}");
-        assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 2);
+    #[test]
+    fn test_reindex_partial_documents() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(500, 0).await;
+            json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
+            json.put_document("default", "b", json!({"name": "no-city"})).await.unwrap();
+            json.put_document("default", "c", json!({"city": "Essen"})).await.unwrap();
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let result = json.reindex_index("default", "city").unwrap();
+            let status = wait_done(&json, "default", &result.task_id).await;
+            assert!(matches!(status, ReindexStatus::Completed { processed: 3, .. }), "got: {status:?}");
+            assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 2);
+        })
     }
 
     // 4. Status transitions from Running to Completed.
-    #[tokio::test]
-    async fn test_status_tracking() {
-        let (json, _dir) = make_engine_cfg(1, 20).await;
-        for i in 0..5 {
-            json.put_document("default", &format!("d{i}"), json!({"city": "X"})).await.unwrap();
-        }
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let result = json.reindex_domain("default").unwrap();
-        assert!(matches!(result.status, ReindexStatus::Running { .. }));
-        let status = wait_done(&json, "default", &result.task_id).await;
-        assert!(matches!(status, ReindexStatus::Completed { processed: 5, .. }), "got: {status:?}");
+    #[test]
+    fn test_status_tracking() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(1, 20).await;
+            for i in 0..5 {
+                json.put_document("default", &format!("d{i}"), json!({"city": "X"})).await.unwrap();
+            }
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let result = json.reindex_domain("default").unwrap();
+            assert!(matches!(result.status, ReindexStatus::Running { .. }));
+            let status = wait_done(&json, "default", &result.task_id).await;
+            assert!(matches!(status, ReindexStatus::Completed { processed: 5, .. }), "got: {status:?}");
+        })
     }
 
     // 5. A second re-index on the same domain is rejected while one runs.
-    #[tokio::test]
-    async fn test_double_reindex_rejected() {
-        let (json, _dir) = make_engine_cfg(1, 50).await;
-        for i in 0..5 {
-            json.put_document("default", &format!("d{i}"), json!({"city": "X"})).await.unwrap();
-        }
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let first = json.reindex_domain("default").unwrap();
-        let err = json.reindex_domain("default").unwrap_err();
-        assert!(matches!(err, JsonStoreError::ReindexInProgress { .. }), "got: {err}");
-        wait_done(&json, "default", &first.task_id).await;
-        // After completion a new run is allowed again.
-        let second = json.reindex_domain("default").unwrap();
-        wait_done(&json, "default", &second.task_id).await;
+    #[test]
+    fn test_double_reindex_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(1, 50).await;
+            for i in 0..5 {
+                json.put_document("default", &format!("d{i}"), json!({"city": "X"})).await.unwrap();
+            }
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let first = json.reindex_domain("default").unwrap();
+            let err = json.reindex_domain("default").unwrap_err();
+            assert!(matches!(err, JsonStoreError::ReindexInProgress { .. }), "got: {err}");
+            wait_done(&json, "default", &first.task_id).await;
+            // After completion a new run is allowed again.
+            let second = json.reindex_domain("default").unwrap();
+            wait_done(&json, "default", &second.task_id).await;
+        })
     }
 
     // 6. Re-index on an unknown domain fails immediately.
-    #[tokio::test]
-    async fn test_reindex_unknown_domain() {
-        let (json, _dir) = make_engine_cfg(500, 0).await;
-        let err = json.reindex_domain("nope").unwrap_err();
-        assert!(matches!(err, JsonStoreError::DomainNotFound(_)), "got: {err}");
+    #[test]
+    fn test_reindex_unknown_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(500, 0).await;
+            let err = json.reindex_domain("nope").unwrap_err();
+            assert!(matches!(err, JsonStoreError::DomainNotFound(_)), "got: {err}");
+        })
     }
 
     // 7. Regression: delete_index tombstones the field's IDX entries — after
     //    recreate + re-index a search must not serve pre-delete values.
-    #[tokio::test]
-    async fn test_recreated_index_serves_no_stale_values() {
-        let (json, _dir) = make_engine_cfg(500, 0).await;
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
-        json.delete_index("default", "city").await.unwrap();
-        // Update while no index exists: nothing maintains the old entry.
-        json.put_document("default", "a", json!({"city": "Berlin"})).await.unwrap();
-        json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-        let result = json.reindex_domain("default").unwrap();
-        wait_done(&json, "default", &result.task_id).await;
-        assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 0);
-        assert_eq!(json.search_documents("default", city_query("Berlin")).await.unwrap().total, 1);
+    #[test]
+    fn test_recreated_index_serves_no_stale_values() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(500, 0).await;
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
+            json.delete_index("default", "city").await.unwrap();
+            // Update while no index exists: nothing maintains the old entry.
+            json.put_document("default", "a", json!({"city": "Berlin"})).await.unwrap();
+            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+            let result = json.reindex_domain("default").unwrap();
+            wait_done(&json, "default", &result.task_id).await;
+            assert_eq!(json.search_documents("default", city_query("Essen")).await.unwrap().total, 0);
+            assert_eq!(json.search_documents("default", city_query("Berlin")).await.unwrap().total, 1);
+        })
     }
 
     // 8. Regression: a domain deleted mid-run ends the re-index as Failed at
     //    the next chunk instead of writing into the deleted domain.
-    #[tokio::test]
-    async fn test_reindex_fails_when_domain_deleted_mid_run() {
-        let (json, _dir) = make_engine_cfg(1, 0).await;
-        json.create_domain("doomed").await.unwrap();
-        json.put_document("doomed", "a", json!({"city": "X"})).await.unwrap();
-        json.put_document("doomed", "b", json!({"city": "Y"})).await.unwrap();
-        json.create_index("doomed", "city", IndexFieldType::String).await.unwrap();
-        // Block the first chunk on one write shard (a chunk takes all of
-        // them); delete the domain meanwhile.
-        let guard = json.doc_write_locks[0].lock().await;
-        let result = json.reindex_domain("doomed").unwrap();
-        json.delete_domain("doomed").await.unwrap();
-        drop(guard);
-        let status = wait_done(&json, "doomed", &result.task_id).await;
-        assert!(matches!(status, ReindexStatus::Failed { .. }), "got: {status:?}");
+    #[test]
+    fn test_reindex_fails_when_domain_deleted_mid_run() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine_cfg(1, 0).await;
+            json.create_domain("doomed").await.unwrap();
+            json.put_document("doomed", "a", json!({"city": "X"})).await.unwrap();
+            json.put_document("doomed", "b", json!({"city": "Y"})).await.unwrap();
+            json.create_index("doomed", "city", IndexFieldType::String).await.unwrap();
+            // Block the first chunk on one write shard (a chunk takes all of
+            // them); delete the domain meanwhile.
+            let guard = json.doc_write_locks[0].lock().await;
+            let result = json.reindex_domain("doomed").unwrap();
+            json.delete_domain("doomed").await.unwrap();
+            drop(guard);
+            let status = wait_done(&json, "doomed", &result.task_id).await;
+            assert!(matches!(status, ReindexStatus::Failed { .. }), "got: {status:?}");
+        })
     }
 }

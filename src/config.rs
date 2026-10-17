@@ -350,7 +350,7 @@ impl Default for StorageConfig {
 
 // ── IO Engine (spec perf/004) ──────────────────────────────────────────────────
 
-/// Registered-buffer I/O via tokio-uring 0.5's `FixedBufPool`.
+/// Registered-buffer I/O on the engine thread's io_uring ring.
 ///
 /// Scaffolding only — not yet wired into the WAL/VLog/SSTable hot paths
 /// (see spec perf/004). Disabled by default.

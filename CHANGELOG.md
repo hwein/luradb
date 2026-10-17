@@ -24,6 +24,7 @@ All notable changes to LuraDB are documented in this file.
 - HTTP and TLS termination run on a multi-threaded frontend runtime; the storage engines stay on a dedicated engine thread.
 - **BREAKING** API: requests on one connection are processed in order, HTTP/2 included — a connection serves one stream at a time, so clients need several connections for parallelism.
 - Read requests run on a multi-threaded reader pool; writes stay on the engine thread.
+- **BREAKING**: Requires Linux kernel 6.1 or newer; the server refuses to start on older kernels.
 
 ### Removed
 

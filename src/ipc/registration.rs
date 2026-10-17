@@ -30,6 +30,7 @@ use super::dispatcher::{ClientConnection, ClientEvent};
 use super::readers::ReaderRegistry;
 use crate::uds;
 use anyhow::{Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,7 +75,7 @@ pub fn prepare_registration_socket(path: &str) -> Result<UnixListener> {
 }
 
 /// Accept loop: one task per connection, until `shutdown` flips. Returning drops
-/// the `JoinSet`, aborting the still-open per-connection liveness waits.
+/// their handles, cancelling the still-open per-connection liveness waits.
 pub async fn serve_registration(
     listener: UnixListener,
     config: RegistrationConfig,
@@ -83,28 +84,28 @@ pub async fn serve_registration(
 ) {
     let config = Arc::new(config);
     let next_id = Arc::new(AtomicU64::new(1));
-    let mut conns = tokio::task::JoinSet::new();
+    let mut conns = FuturesUnordered::new();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
-            Some(_) = conns.join_next() => {} // reap finished handlers
+            Some(_) = conns.next() => {} // reap finished handlers
             accepted = listener.accept() => {
                 let stream = match accepted {
                     Ok((s, _)) => s,
                     Err(e) => {
                         tracing::warn!("[shm-reg] accept error: {e}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        compio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
                 let client_id = next_id.fetch_add(1, Ordering::Relaxed);
-                conns.spawn(handle_connection(
+                conns.push(compio::runtime::spawn(handle_connection(
                     stream,
                     client_id,
                     Arc::clone(&config),
                     events.clone(),
                     shutdown.clone(),
-                ));
+                )));
             }
         }
     }
@@ -320,8 +321,8 @@ mod tests {
         instance_id: String,
         readers: Arc<ReaderRegistry>,
         shutdown: watch::Sender<bool>,
-        reg: tokio::task::JoinHandle<()>,
-        disp: tokio::task::JoinHandle<()>,
+        reg: compio::runtime::JoinHandle<()>,
+        disp: compio::runtime::JoinHandle<()>,
         _sockdir: tempfile::TempDir,
     }
 
@@ -342,8 +343,8 @@ mod tests {
         let (sd_tx, sd_rx) = watch::channel(false);
         let instance_id = unique_instance();
         let readers = Arc::new(ReaderRegistry::new());
-        let disp = tokio::spawn(ShmDispatcher::new(registry).run(events_rx, sd_rx.clone()));
-        let reg = tokio::spawn(serve_registration(
+        let disp = compio::runtime::spawn(ShmDispatcher::new(registry).run(events_rx, sd_rx.clone()));
+        let reg = compio::runtime::spawn(serve_registration(
             listener,
             RegistrationConfig {
                 instance_id: instance_id.clone(),
@@ -384,7 +385,7 @@ mod tests {
             if !std::path::Path::new(&shm_path(name)).exists() {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            compio::time::sleep(Duration::from_millis(1)).await;
         }
         false
     }
@@ -396,7 +397,7 @@ mod tests {
             if readers.snapshot().len() == n {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            compio::time::sleep(Duration::from_millis(10)).await;
         }
         false
     }
@@ -447,7 +448,7 @@ mod tests {
             if let Some(raw) = rx.recv().unwrap() {
                 return ShmResponse::decode(&raw).unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            compio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("no response within timeout");
     }
@@ -535,7 +536,7 @@ mod tests {
             if fds_on_pipe(link) == n {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            compio::time::sleep(Duration::from_millis(1)).await;
         }
         false
     }
@@ -570,289 +571,308 @@ mod tests {
     }
 
     // The reply names a client_id and the four segments, which now exist.
-    #[tokio::test]
-    async fn test_register_wire_format() {
-        let (registry, _dir) = make_registry().await;
-        let server = start_server(Arc::clone(&registry), 4096).await;
+    #[test]
+    fn test_register_wire_format() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let server = start_server(Arc::clone(&registry), 4096).await;
 
-        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-        let reply = register(&mut stream).await;
-        let parts: Vec<&str> = reply.split_whitespace().collect();
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            let reply = register(&mut stream).await;
+            let parts: Vec<&str> = reply.split_whitespace().collect();
 
-        assert_eq!(parts[0], "OK");
-        assert_eq!(parts.len(), 6, "OK <id> + four names: {reply:?}");
-        assert_eq!(parts[1], "1", "first client_id is 1");
-        assert_eq!(parts[2], format!("/luradb_{}_cmd_1", server.instance_id));
-        assert_eq!(parts[3], format!("/luradb_{}_cmd_hdr_1", server.instance_id));
-        assert_eq!(parts[4], format!("/luradb_{}_resp_1", server.instance_id));
-        assert_eq!(parts[5], format!("/luradb_{}_resp_hdr_1", server.instance_id));
-        for name in &parts[2..] {
-            assert!(std::path::Path::new(&shm_path(name)).exists(), "{name} should exist while registered");
-        }
+            assert_eq!(parts[0], "OK");
+            assert_eq!(parts.len(), 6, "OK <id> + four names: {reply:?}");
+            assert_eq!(parts[1], "1", "first client_id is 1");
+            assert_eq!(parts[2], format!("/luradb_{}_cmd_1", server.instance_id));
+            assert_eq!(parts[3], format!("/luradb_{}_cmd_hdr_1", server.instance_id));
+            assert_eq!(parts[4], format!("/luradb_{}_resp_1", server.instance_id));
+            assert_eq!(parts[5], format!("/luradb_{}_resp_hdr_1", server.instance_id));
+            for name in &parts[2..] {
+                assert!(std::path::Path::new(&shm_path(name)).exists(), "{name} should exist while registered");
+            }
 
-        drop(stream);
-        server.stop().await;
+            drop(stream);
+            server.stop().await;
+        })
     }
 
     // An unrecognised request is rejected and mints no segments.
-    #[tokio::test]
-    async fn test_unknown_request_rejected() {
-        let (registry, _dir) = make_registry().await;
-        let server = start_server(Arc::clone(&registry), 4096).await;
+    #[test]
+    fn test_unknown_request_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let server = start_server(Arc::clone(&registry), 4096).await;
 
-        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-        stream.write_all(b"HELLO\n").await.unwrap();
-        let mut reply = String::new();
-        BufReader::new(&mut stream).read_line(&mut reply).await.unwrap();
-        assert!(reply.starts_with("ERR"), "{reply:?}");
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            stream.write_all(b"HELLO\n").await.unwrap();
+            let mut reply = String::new();
+            BufReader::new(&mut stream).read_line(&mut reply).await.unwrap();
+            assert!(reply.starts_with("ERR"), "{reply:?}");
 
-        // No client_1 segment was created.
-        assert!(
-            !std::path::Path::new(&shm_path(&format!("/luradb_{}_cmd_1", server.instance_id))).exists()
-        );
-        drop(stream);
-        server.stop().await;
+            // No client_1 segment was created.
+            assert!(
+                !std::path::Path::new(&shm_path(&format!("/luradb_{}_cmd_1", server.instance_id))).exists()
+            );
+            drop(stream);
+            server.stop().await;
+        })
     }
 
     // With auth on, a trusted UID (this process's own) registers normally.
-    #[tokio::test]
-    async fn test_auth_trusted_uid_registers() {
-        let (registry, _dir) = make_registry().await;
-        let uid = unsafe { libc::getuid() };
-        let server = start_server_with_auth(Arc::clone(&registry), 4096, true, vec![uid]).await;
+    #[test]
+    fn test_auth_trusted_uid_registers() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let uid = unsafe { libc::getuid() };
+            let server = start_server_with_auth(Arc::clone(&registry), 4096, true, vec![uid]).await;
 
-        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-        let reply = register(&mut stream).await;
-        assert!(reply.starts_with("OK"), "trusted uid should register: {reply:?}");
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            let reply = register(&mut stream).await;
+            assert!(reply.starts_with("OK"), "trusted uid should register: {reply:?}");
 
-        drop(stream);
-        server.stop().await;
+            drop(stream);
+            server.stop().await;
+        })
     }
 
     // With auth on, an untrusted UID is refused and no segment is minted.
-    #[tokio::test]
-    async fn test_auth_untrusted_uid_rejected() {
-        let (registry, _dir) = make_registry().await;
-        // Trust only a different uid, so this process's connection is untrusted.
-        let others = vec![unsafe { libc::getuid() }.wrapping_add(1)];
-        let server = start_server_with_auth(Arc::clone(&registry), 4096, true, others).await;
+    #[test]
+    fn test_auth_untrusted_uid_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            // Trust only a different uid, so this process's connection is untrusted.
+            let others = vec![unsafe { libc::getuid() }.wrapping_add(1)];
+            let server = start_server_with_auth(Arc::clone(&registry), 4096, true, others).await;
 
-        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-        let reply = register(&mut stream).await;
-        assert!(reply.starts_with("ERR unauthorized"), "{reply:?}");
-        assert!(
-            !std::path::Path::new(&shm_path(&format!("/luradb_{}_cmd_1", server.instance_id))).exists(),
-            "no segment minted for an unauthorized client"
-        );
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            let reply = register(&mut stream).await;
+            assert!(reply.starts_with("ERR unauthorized"), "{reply:?}");
+            assert!(
+                !std::path::Path::new(&shm_path(&format!("/luradb_{}_cmd_1", server.instance_id))).exists(),
+                "no segment minted for an unauthorized client"
+            );
 
-        drop(stream);
-        server.stop().await;
+            drop(stream);
+            server.stop().await;
+        })
     }
 
     // Spec perf/012 §7: the slot is in the registry before the client can read
     // the `OK` (and therefore before it can pin), and EOF on the registration
     // socket reclaims it — the next publish onto the pinned buffer goes through
     // without the server ever writing into the client's page.
-    #[tokio::test]
-    async fn test_reader_slot_registered_before_reply_and_freed_on_eof() {
-        let (registry, _dir) = make_registry().await;
-        let server = start_server(Arc::clone(&registry), 4096).await;
+    #[test]
+    fn test_reader_slot_registered_before_reply_and_freed_on_eof() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let server = start_server(Arc::clone(&registry), 4096).await;
 
-        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-        let reply = register(&mut stream).await;
-        let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            let reply = register(&mut stream).await;
+            let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
 
-        let slots = server.readers.snapshot();
-        assert_eq!(slots.len(), 1, "slot registered before the OK reply");
-        assert_eq!(slots[0].client_id, 1);
+            let slots = server.readers.snapshot();
+            assert_eq!(slots.len(), 1, "slot registered before the OK reply");
+            assert_eq!(slots[0].client_id, 1);
 
-        // The client pins buffer B through its own cmd_hdr mapping and dies
-        // without releasing it.
-        let cmd_hdr = ShmSegment::open(&names[1]).unwrap();
-        let slot = unsafe { client_slot(&cmd_hdr) };
-        slot.counter(1).fetch_add(1, Ordering::AcqRel);
+            // The client pins buffer B through its own cmd_hdr mapping and dies
+            // without releasing it.
+            let cmd_hdr = ShmSegment::open(&names[1]).unwrap();
+            let slot = unsafe { client_slot(&cmd_hdr) };
+            slot.counter(1).fetch_add(1, Ordering::AcqRel);
 
-        let mut arena = WriterArena::new(Arc::clone(&server.readers));
-        assert_eq!(arena.publish(b"blocked"), PublishOutcome::SkippedBusy { buffer: 1 });
-        assert_eq!(server.readers.blockers(1), vec![(1, 1)]);
+            let mut arena = WriterArena::new(Arc::clone(&server.readers));
+            assert_eq!(arena.publish(b"blocked"), PublishOutcome::SkippedBusy { buffer: 1 });
+            assert_eq!(server.readers.blockers(1), vec![(1, 1)]);
 
-        drop(stream);
-        assert!(poll_registry_len(&server.readers, 0).await, "EOF must release the lease");
-        assert_eq!(arena.publish(b"reclaimed"), PublishOutcome::Published);
-        assert_eq!(slot.counter(1).load(Ordering::SeqCst), 1, "the server never clears the slot");
+            drop(stream);
+            assert!(poll_registry_len(&server.readers, 0).await, "EOF must release the lease");
+            assert_eq!(arena.publish(b"reclaimed"), PublishOutcome::Published);
+            assert_eq!(slot.counter(1).load(Ordering::SeqCst), 1, "the server never clears the slot");
 
-        server.stop().await;
+            server.stop().await;
+        })
     }
 
     // Spec perf/012 test 7: a connection task cancelled at an `.await` (what the
-    // shutdown path does when it drops the listener's JoinSet) never reaches the
-    // code behind its EOF loop — only the lease's Drop frees the slot.
-    #[tokio::test]
-    async fn test_aborted_connection_task_releases_reader_slot() {
-        let (client, server_side) = UnixStream::pair().unwrap();
-        let readers = Arc::new(ReaderRegistry::new());
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (_sd_tx, sd_rx) = watch::channel(false);
-        let config = Arc::new(RegistrationConfig {
-            instance_id: unique_instance(),
-            ring_size: 4096,
-            segment_mode: 0o600,
-            auth_enabled: false,
-            trusted_uids: Arc::new(Vec::new()),
-            readers: Arc::clone(&readers),
-        });
-        let task = tokio::spawn(handle_connection(server_side, 5, config, events_tx, sd_rx));
+    // shutdown path does: the listener drops the compio handles of its
+    // connection tasks) never reaches the code behind its EOF loop — only the
+    // lease's Drop frees the slot.
+    #[test]
+    fn test_aborted_connection_task_releases_reader_slot() {
+        crate::core::engine_runtime::block_on(async {
+            let (client, server_side) = UnixStream::pair().unwrap();
+            let readers = Arc::new(ReaderRegistry::new());
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let (_sd_tx, sd_rx) = watch::channel(false);
+            let config = Arc::new(RegistrationConfig {
+                instance_id: unique_instance(),
+                ring_size: 4096,
+                segment_mode: 0o600,
+                auth_enabled: false,
+                trusted_uids: Arc::new(Vec::new()),
+                readers: Arc::clone(&readers),
+            });
+            let task = compio::runtime::spawn(handle_connection(server_side, 5, config, events_tx, sd_rx));
 
-        let mut client = client;
-        let reply = register(&mut client).await;
-        let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
-        // Hold the connection: dropping it would unlink the segments early.
-        let _conn = events_rx.recv().await.expect("connect event");
+            let mut client = client;
+            let reply = register(&mut client).await;
+            let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
+            // Hold the connection: dropping it would unlink the segments early.
+            let _conn = events_rx.recv().await.expect("connect event");
 
-        let cmd_hdr = ShmSegment::open(&names[1]).unwrap();
-        let slot = unsafe { client_slot(&cmd_hdr) };
-        slot.counter(1).fetch_add(1, Ordering::AcqRel);
+            let cmd_hdr = ShmSegment::open(&names[1]).unwrap();
+            let slot = unsafe { client_slot(&cmd_hdr) };
+            slot.counter(1).fetch_add(1, Ordering::AcqRel);
 
-        let mut arena = WriterArena::new(Arc::clone(&readers));
-        assert_eq!(arena.publish(b"blocked"), PublishOutcome::SkippedBusy { buffer: 1 });
+            let mut arena = WriterArena::new(Arc::clone(&readers));
+            assert_eq!(arena.publish(b"blocked"), PublishOutcome::SkippedBusy { buffer: 1 });
 
-        // The client socket stays open, so nothing but the cancellation can free
-        // the slot. Awaiting the aborted handle resolves once the task's future
-        // — and with it the lease — has been dropped.
-        task.abort();
-        let _ = task.await;
-        assert!(readers.snapshot().is_empty(), "cancelled task must release its lease");
-        assert_eq!(arena.publish(b"reclaimed"), PublishOutcome::Published);
+            // The client socket stays open, so nothing but the cancellation can free
+            // the slot. Dropping the handle cancels the task; the runtime drops its
+            // future — and with it the lease — in its next round.
+            drop(task);
+            tokio::task::yield_now().await;
+            assert!(readers.snapshot().is_empty(), "cancelled task must release its lease");
+            assert_eq!(arena.publish(b"reclaimed"), PublishOutcome::Published);
+        })
     }
 
     // Full loop: register, open the segments, drive Put+Get over the rings, then
     // disconnect and watch the segments get unlinked. A legacy client: it reads
     // the reply with `read_line`, never sees the doorbell fd and is served by
     // the fallback tick (spec perf/014 test 2).
-    #[tokio::test]
-    async fn test_e2e_put_get_roundtrip_and_cleanup() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("d1").await.unwrap();
-        let ring_size = 4096;
-        let server = start_server(Arc::clone(&registry), ring_size).await;
+    #[test]
+    fn test_e2e_put_get_roundtrip_and_cleanup() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("d1").await.unwrap();
+            let ring_size = 4096;
+            let server = start_server(Arc::clone(&registry), ring_size).await;
 
-        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-        let reply = register(&mut stream).await;
-        let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
-        let (cmd_name, cmd_hdr_name, resp_name, resp_hdr_name) =
-            (&names[0], &names[1], &names[2], &names[3]);
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            let reply = register(&mut stream).await;
+            let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
+            let (cmd_name, cmd_hdr_name, resp_name, resp_hdr_name) =
+                (&names[0], &names[1], &names[2], &names[3]);
 
-        // Client opens the four segments and builds its ring ends: producer on
-        // the cmd ring, consumer on the resp ring.
-        let cmd_seg = ShmSegment::open(cmd_name).unwrap();
-        let cmd_hdr_seg = ShmSegment::open(cmd_hdr_name).unwrap();
-        let resp_seg = ShmSegment::open(resp_name).unwrap();
-        let resp_hdr_seg = ShmSegment::open(resp_hdr_name).unwrap();
-        let mut client_tx = unsafe {
-            let h = RingbufferHeader::from_ptr(cmd_hdr_seg.as_ptr(), cmd_hdr_seg.len()) as *const RingbufferHeader;
-            RingProducer::new(h, DoubleMmapRegion::new(cmd_seg.fd(), cmd_seg.len()).unwrap())
-        };
-        let mut client_rx = unsafe {
-            let h = RingbufferHeader::from_ptr(resp_hdr_seg.as_ptr(), resp_hdr_seg.len()) as *const RingbufferHeader;
-            RingConsumer::new(h, DoubleMmapRegion::new(resp_seg.fd(), resp_seg.len()).unwrap())
-        };
+            // Client opens the four segments and builds its ring ends: producer on
+            // the cmd ring, consumer on the resp ring.
+            let cmd_seg = ShmSegment::open(cmd_name).unwrap();
+            let cmd_hdr_seg = ShmSegment::open(cmd_hdr_name).unwrap();
+            let resp_seg = ShmSegment::open(resp_name).unwrap();
+            let resp_hdr_seg = ShmSegment::open(resp_hdr_name).unwrap();
+            let mut client_tx = unsafe {
+                let h = RingbufferHeader::from_ptr(cmd_hdr_seg.as_ptr(), cmd_hdr_seg.len()) as *const RingbufferHeader;
+                RingProducer::new(h, DoubleMmapRegion::new(cmd_seg.fd(), cmd_seg.len()).unwrap())
+            };
+            let mut client_rx = unsafe {
+                let h = RingbufferHeader::from_ptr(resp_hdr_seg.as_ptr(), resp_hdr_seg.len()) as *const RingbufferHeader;
+                RingConsumer::new(h, DoubleMmapRegion::new(resp_seg.fd(), resp_seg.len()).unwrap())
+            };
 
-        // PUT then GET, each verified through the response ring.
-        client_tx
-            .send(
-                ShmCommand::Put {
-                    request_id: 1,
-                    domain: "d1".into(),
-                    key: b"k".to_vec(),
-                    value: b"v".to_vec(),
-                    ttl_secs: 0,
-                }
-                .encode()
-                .as_slice(),
-            )
-            .unwrap();
-        assert_eq!(recv_response(&mut client_rx).await, ShmResponse::Ok { request_id: 1 });
+            // PUT then GET, each verified through the response ring.
+            client_tx
+                .send(
+                    ShmCommand::Put {
+                        request_id: 1,
+                        domain: "d1".into(),
+                        key: b"k".to_vec(),
+                        value: b"v".to_vec(),
+                        ttl_secs: 0,
+                    }
+                    .encode()
+                    .as_slice(),
+                )
+                .unwrap();
+            assert_eq!(recv_response(&mut client_rx).await, ShmResponse::Ok { request_id: 1 });
 
-        client_tx
-            .send(ShmCommand::Get { request_id: 2, domain: "d1".into(), key: b"k".to_vec() }.encode().as_slice())
-            .unwrap();
-        assert_eq!(
-            recv_response(&mut client_rx).await,
-            ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Present(b"v".to_vec()) }
-        );
+            client_tx
+                .send(ShmCommand::Get { request_id: 2, domain: "d1".into(), key: b"k".to_vec() }.encode().as_slice())
+                .unwrap();
+            assert_eq!(
+                recv_response(&mut client_rx).await,
+                ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Present(b"v".to_vec()) }
+            );
 
-        // Disconnect: drop the client mappings, then close the socket.
-        drop(client_tx);
-        drop(client_rx);
-        drop((cmd_seg, cmd_hdr_seg, resp_seg, resp_hdr_seg));
-        drop(stream);
+            // Disconnect: drop the client mappings, then close the socket.
+            drop(client_tx);
+            drop(client_rx);
+            drop((cmd_seg, cmd_hdr_seg, resp_seg, resp_hdr_seg));
+            drop(stream);
 
-        // The dispatcher unlinks all four on the disconnect event.
-        for name in [cmd_name, cmd_hdr_name, resp_name, resp_hdr_name] {
-            assert!(poll_gone(name).await, "{name} should be unlinked after disconnect");
-        }
+            // The dispatcher unlinks all four on the disconnect event.
+            for name in [cmd_name, cmd_hdr_name, resp_name, resp_hdr_name] {
+                assert!(poll_gone(name).await, "{name} should be unlinked after disconnect");
+            }
 
-        server.stop().await;
+            server.stop().await;
+        })
     }
 
     // Spec perf/014: a doorbell-aware client receives the doorbell's write end
     // with the `OK` line and rings it after every cmd-ring send; Put+Get
     // round-trip.
-    #[tokio::test]
-    async fn test_e2e_doorbell_client_put_get_roundtrip() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("d1").await.unwrap();
-        let server = start_server(Arc::clone(&registry), 4096).await;
+    #[test]
+    fn test_e2e_doorbell_client_put_get_roundtrip() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("d1").await.unwrap();
+            let server = start_server(Arc::clone(&registry), 4096).await;
 
-        let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-        let (reply, doorbell) = register_with_doorbell(&mut stream).await;
-        assert!(reply.starts_with("OK "), "{reply:?}");
-        let mut client = ClientRings::open(&reply);
+            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+            let (reply, doorbell) = register_with_doorbell(&mut stream).await;
+            assert!(reply.starts_with("OK "), "{reply:?}");
+            let mut client = ClientRings::open(&reply);
 
-        let put = ShmCommand::Put {
-            request_id: 1,
-            domain: "d1".into(),
-            key: "clé".into(),
-            value: b"v".to_vec(),
-            ttl_secs: 0,
-        };
-        client.tx.send(put.encode().as_slice()).unwrap();
-        ring(&doorbell);
-        assert_eq!(recv_response(&mut client.rx).await, ShmResponse::Ok { request_id: 1 });
+            let put = ShmCommand::Put {
+                request_id: 1,
+                domain: "d1".into(),
+                key: "clé".into(),
+                value: b"v".to_vec(),
+                ttl_secs: 0,
+            };
+            client.tx.send(put.encode().as_slice()).unwrap();
+            ring(&doorbell);
+            assert_eq!(recv_response(&mut client.rx).await, ShmResponse::Ok { request_id: 1 });
 
-        let get = ShmCommand::Get { request_id: 2, domain: "d1".into(), key: "clé".into() };
-        client.tx.send(get.encode().as_slice()).unwrap();
-        ring(&doorbell);
-        assert_eq!(
-            recv_response(&mut client.rx).await,
-            ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Present(b"v".to_vec()) }
-        );
+            let get = ShmCommand::Get { request_id: 2, domain: "d1".into(), key: "clé".into() };
+            client.tx.send(get.encode().as_slice()).unwrap();
+            ring(&doorbell);
+            assert_eq!(
+                recv_response(&mut client.rx).await,
+                ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Present(b"v".to_vec()) }
+            );
 
-        drop(client);
-        drop(stream);
-        server.stop().await;
+            drop(client);
+            drop(stream);
+            server.stop().await;
+        })
     }
 
     // Spec perf/014 test 4: the disconnect teardown closes the server's doorbell
     // fds, cycle after cycle. Counted per pipe: a plain fd count would include
     // the fds of tests running in parallel.
-    #[tokio::test]
-    async fn test_disconnect_closes_doorbell_fd() {
-        let (registry, _dir) = make_registry().await;
-        let server = start_server(Arc::clone(&registry), 4096).await;
+    #[test]
+    fn test_disconnect_closes_doorbell_fd() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let server = start_server(Arc::clone(&registry), 4096).await;
 
-        for cycle in 0..3 {
-            let mut stream = UnixStream::connect(&server.sock).await.unwrap();
-            let (reply, doorbell) = register_with_doorbell(&mut stream).await;
-            assert!(reply.starts_with("OK "), "{reply:?}");
-            let link = pipe_link(&doorbell);
-            assert!(fds_on_pipe(&link) >= 2, "cycle {cycle}: the server holds the doorbell while registered");
+            for cycle in 0..3 {
+                let mut stream = UnixStream::connect(&server.sock).await.unwrap();
+                let (reply, doorbell) = register_with_doorbell(&mut stream).await;
+                assert!(reply.starts_with("OK "), "{reply:?}");
+                let link = pipe_link(&doorbell);
+                assert!(fds_on_pipe(&link) >= 2, "cycle {cycle}: the server holds the doorbell while registered");
 
-            drop(stream);
-            let closed = poll_fds_on_pipe(&link, 1).await;
-            assert!(closed, "cycle {cycle}: server doorbell fd left open after disconnect");
-        }
+                drop(stream);
+                let closed = poll_fds_on_pipe(&link, 1).await;
+                assert!(closed, "cycle {cycle}: server doorbell fd left open after disconnect");
+            }
 
-        server.stop().await;
+            server.stop().await;
+        })
     }
 }

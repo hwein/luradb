@@ -855,434 +855,480 @@ mod tests {
     }
 
     // 1. CREATE VIEW binds/validates, stores the raw text; get()/list() see it.
-    #[tokio::test]
-    async fn test_create_view_binds_and_stores_raw_text() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
-        ok(&rel, "CREATE VIEW v AS SELECT a, b FROM t WHERE a > 1").await;
+    #[test]
+    fn test_create_view_binds_and_stores_raw_text() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
+            ok(&rel, "CREATE VIEW v AS SELECT a, b FROM t WHERE a > 1").await;
 
-        match rel.get_object("default", "v").unwrap() {
-            CatalogEntry::View(vw) => assert_eq!(vw.sql, "SELECT a, b FROM t WHERE a > 1"),
-            other => panic!("expected view, got {other:?}"),
-        }
-        assert_eq!(rel.list_objects("default").unwrap().len(), 2);
+            match rel.get_object("default", "v").unwrap() {
+                CatalogEntry::View(vw) => assert_eq!(vw.sql, "SELECT a, b FROM t WHERE a > 1"),
+                other => panic!("expected view, got {other:?}"),
+            }
+            assert_eq!(rel.list_objects("default").unwrap().len(), 2);
+        })
     }
 
     // 1b. Views count against max_tables_per_domain (rel/003, invariant confirmed
     // through the SQL/execute() path rel/008 adds).
-    #[tokio::test]
-    async fn test_create_view_counts_against_max_tables_per_domain() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_tables_per_domain: 1, ..config_in(dir.path()) }).await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        let e = err(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
-        assert!(matches!(e, RelStoreError::LimitExceeded { .. }), "got: {e}");
+    #[test]
+    fn test_create_view_counts_against_max_tables_per_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let rel = boot(RelStoreConfig { max_tables_per_domain: 1, ..config_in(dir.path()) }).await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            let e = err(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
+            assert!(matches!(e, RelStoreError::LimitExceeded { .. }), "got: {e}");
+        })
     }
 
     // 2. `?` in the view body -> InvalidSchema, even with a matching params list.
-    #[tokio::test]
-    async fn test_create_view_rejects_params_even_with_matching_bind_list() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+    #[test]
+    fn test_create_view_rejects_params_even_with_matching_bind_list() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
 
-        let e = run(&rel, "CREATE VIEW v AS SELECT * FROM t WHERE a = ?", &[json!(1)])
-            .await
-            .unwrap_err();
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+            let e = run(&rel, "CREATE VIEW v AS SELECT * FROM t WHERE a = ?", &[json!(1)])
+                .await
+                .unwrap_err();
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+        })
     }
 
     // 3. ORDER BY / LIMIT / OFFSET / COUNT(*) / duplicate output name -> InvalidSchema.
-    #[tokio::test]
-    async fn test_create_view_subset_violations() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").await;
+    #[test]
+    fn test_create_view_subset_violations() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").await;
 
-        let e = err(&rel, "CREATE VIEW v1 AS SELECT * FROM t ORDER BY a").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "ORDER BY: got {e}");
+            let e = err(&rel, "CREATE VIEW v1 AS SELECT * FROM t ORDER BY a").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "ORDER BY: got {e}");
 
-        let e = err(&rel, "CREATE VIEW v2 AS SELECT * FROM t LIMIT 10").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "LIMIT: got {e}");
+            let e = err(&rel, "CREATE VIEW v2 AS SELECT * FROM t LIMIT 10").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "LIMIT: got {e}");
 
-        let e = err(&rel, "CREATE VIEW v3 AS SELECT * FROM t LIMIT 10 OFFSET 5").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "LIMIT OFFSET: got {e}");
+            let e = err(&rel, "CREATE VIEW v3 AS SELECT * FROM t LIMIT 10 OFFSET 5").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "LIMIT OFFSET: got {e}");
 
-        let e = err(&rel, "CREATE VIEW v4 AS SELECT COUNT(*) FROM t").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "COUNT(*): got {e}");
+            let e = err(&rel, "CREATE VIEW v4 AS SELECT COUNT(*) FROM t").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "COUNT(*): got {e}");
 
-        let e = err(&rel, "CREATE VIEW v5 AS SELECT a, b AS a FROM t").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "duplicate output name: got {e}");
+            let e = err(&rel, "CREATE VIEW v5 AS SELECT a, b AS a FROM t").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "duplicate output name: got {e}");
+        })
     }
 
     // 4. Missing table/column, WHERE type mismatch -> 404/404/400 (full bind at CREATE).
-    #[tokio::test]
-    async fn test_create_view_full_bind_errors() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+    #[test]
+    fn test_create_view_full_bind_errors() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
 
-        let e = err(&rel, "CREATE VIEW v1 AS SELECT * FROM ghost").await;
-        assert!(matches!(e, RelStoreError::TableNotFound { .. }), "got: {e}");
+            let e = err(&rel, "CREATE VIEW v1 AS SELECT * FROM ghost").await;
+            assert!(matches!(e, RelStoreError::TableNotFound { .. }), "got: {e}");
 
-        let e = err(&rel, "CREATE VIEW v2 AS SELECT ghost_col FROM t").await;
-        assert!(matches!(e, RelStoreError::ColumnNotFound { .. }), "got: {e}");
+            let e = err(&rel, "CREATE VIEW v2 AS SELECT ghost_col FROM t").await;
+            assert!(matches!(e, RelStoreError::ColumnNotFound { .. }), "got: {e}");
 
-        let e = err(&rel, "CREATE VIEW v3 AS SELECT * FROM t WHERE a = 'x'").await;
-        assert!(matches!(e, RelStoreError::TypeMismatch { .. }), "got: {e}");
+            let e = err(&rel, "CREATE VIEW v3 AS SELECT * FROM t WHERE a = 'x'").await;
+            assert!(matches!(e, RelStoreError::TypeMismatch { .. }), "got: {e}");
+        })
     }
 
     // 5. Name collision view-vs-table and view-vs-view -> 409 (via create_view).
-    #[tokio::test]
-    async fn test_create_view_name_collisions() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
+    #[test]
+    fn test_create_view_name_collisions() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
 
-        let e = err(&rel, "CREATE VIEW t AS SELECT * FROM t").await;
-        assert!(matches!(e, RelStoreError::ObjectAlreadyExists { .. }), "view vs table: got {e}");
+            let e = err(&rel, "CREATE VIEW t AS SELECT * FROM t").await;
+            assert!(matches!(e, RelStoreError::ObjectAlreadyExists { .. }), "view vs table: got {e}");
 
-        let e = err(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
-        assert!(matches!(e, RelStoreError::ObjectAlreadyExists { .. }), "view vs view: got {e}");
+            let e = err(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
+            assert!(matches!(e, RelStoreError::ObjectAlreadyExists { .. }), "view vs view: got {e}");
+        })
     }
 
     // 6. SELECT * FROM v (simple 1-table view): identical rows to the direct
     // SELECT; output names = the view's own projection names; +1 inlining.
-    #[tokio::test]
-    async fn test_select_star_from_simple_view_matches_direct_select() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')").await;
-        ok(&rel, "CREATE VIEW v AS SELECT id, a AS aa, b FROM t").await;
+    #[test]
+    fn test_select_star_from_simple_view_matches_direct_select() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')").await;
+            ok(&rel, "CREATE VIEW v AS SELECT id, a AS aa, b FROM t").await;
 
-        let direct = sel(&rel, "SELECT id, a AS aa, b FROM t").await;
-        let before = inlinings(&rel);
-        let via_view = sel(&rel, "SELECT * FROM v").await;
-        assert_eq!(inlinings(&rel) - before, 1, "one view reference substituted");
+            let direct = sel(&rel, "SELECT id, a AS aa, b FROM t").await;
+            let before = inlinings(&rel);
+            let via_view = sel(&rel, "SELECT * FROM v").await;
+            assert_eq!(inlinings(&rel) - before, 1, "one view reference substituted");
 
-        assert_eq!(
-            via_view.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
-            vec!["id".to_string(), "aa".to_string(), "b".to_string()]
-        );
-        assert_eq!(via_view.rows, direct.rows);
+            assert_eq!(
+                via_view.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                vec!["id".to_string(), "aa".to_string(), "b".to_string()]
+            );
+            assert_eq!(via_view.rows, direct.rows);
+        })
     }
 
     // 7. Outer WHERE AND-ed with the view's own WHERE; `pk = ?` still reaches
     // the PK-point access path through a view (optimizability preserved).
-    #[tokio::test]
-    async fn test_select_from_view_merges_where_and_keeps_pk_point_path() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25)").await;
-        ok(&rel, "CREATE VIEW v AS SELECT id, a FROM t WHERE a > 10").await;
+    #[test]
+    fn test_select_from_view_merges_where_and_keeps_pk_point_path() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25)").await;
+            ok(&rel, "CREATE VIEW v AS SELECT id, a FROM t WHERE a > 10").await;
 
-        let s = sel(&rel, "SELECT id FROM v WHERE a < 20").await;
-        assert_eq!(ints(&s.rows, 0), vec![2]);
+            let s = sel(&rel, "SELECT id FROM v WHERE a < 20").await;
+            assert_eq!(ints(&s.rows, 0), vec![2]);
 
-        let before = scanned_keys(&rel);
-        let s = sel(&rel, "SELECT id FROM v WHERE id = 2").await;
-        let after = scanned_keys(&rel);
-        assert_eq!(ints(&s.rows, 0), vec![2]);
-        assert_eq!(after - before, 1, "pk = ? through a view must still drive the PK-point access path");
+            let before = scanned_keys(&rel);
+            let s = sel(&rel, "SELECT id FROM v WHERE id = 2").await;
+            let after = scanned_keys(&rel);
+            assert_eq!(ints(&s.rows, 0), vec![2]);
+            assert_eq!(after - before, 1, "pk = ? through a view must still drive the PK-point access path");
+        })
     }
 
     // 8. View with an internal LEFT JOIN in FROM position: an outer filter on
     // the joined (right) column works; a dangling link yields NULL.
-    #[tokio::test]
-    async fn test_view_with_internal_join_in_from_position() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)").await;
-        ok(&rel, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)").await;
-        ok(&rel, "INSERT INTO customers VALUES (1, 'alice')").await;
-        ok(&rel, "INSERT INTO orders VALUES (100, 1), (101, 999)").await;
-        ok(
-            &rel,
-            "CREATE VIEW order_customer AS SELECT orders.id AS order_id, customers.name AS customer_name \
+    #[test]
+    fn test_view_with_internal_join_in_from_position() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)").await;
+            ok(&rel, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)").await;
+            ok(&rel, "INSERT INTO customers VALUES (1, 'alice')").await;
+            ok(&rel, "INSERT INTO orders VALUES (100, 1), (101, 999)").await;
+            ok(
+                &rel,
+                "CREATE VIEW order_customer AS SELECT orders.id AS order_id, customers.name AS customer_name \
              FROM orders LEFT JOIN customers ON orders.customer_id = customers.id",
-        )
-        .await;
+            )
+            .await;
 
-        let s = sel(&rel, "SELECT order_id FROM order_customer WHERE customer_name = 'alice'").await;
-        assert_eq!(ints(&s.rows, 0), vec![100]);
+            let s = sel(&rel, "SELECT order_id FROM order_customer WHERE customer_name = 'alice'").await;
+            assert_eq!(ints(&s.rows, 0), vec![100]);
 
-        let s = sel(&rel, "SELECT order_id, customer_name FROM order_customer ORDER BY order_id").await;
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(100), ScalarValue::Text("alice".into())]);
-        assert_eq!(s.rows[1], vec![ScalarValue::Integer(101), ScalarValue::Null], "dangling link -> NULL");
+            let s = sel(&rel, "SELECT order_id, customer_name FROM order_customer ORDER BY order_id").await;
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(100), ScalarValue::Text("alice".into())]);
+            assert_eq!(s.rows[1], vec![ScalarValue::Integer(101), ScalarValue::Null], "dangling link -> NULL");
+        })
     }
 
     // 9. View in JOIN position (no WHERE): works; the view's own output maps
     // onto the base table's PK, so it is probeable.
-    #[tokio::test]
-    async fn test_view_in_join_position_without_where() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)").await;
-        ok(&rel, "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT)").await;
-        ok(&rel, "INSERT INTO names VALUES (1, 'alice'), (2, 'bob')").await;
-        ok(&rel, "INSERT INTO t VALUES (10, 1), (11, 2), (12, 99)").await;
-        ok(&rel, "CREATE VIEW customer_names AS SELECT id AS pk, name FROM names").await;
+    #[test]
+    fn test_view_in_join_position_without_where() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)").await;
+            ok(&rel, "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT)").await;
+            ok(&rel, "INSERT INTO names VALUES (1, 'alice'), (2, 'bob')").await;
+            ok(&rel, "INSERT INTO t VALUES (10, 1), (11, 2), (12, 99)").await;
+            ok(&rel, "CREATE VIEW customer_names AS SELECT id AS pk, name FROM names").await;
 
-        let s = sel(
-            &rel,
-            "SELECT t.id, customer_names.name FROM t LEFT JOIN customer_names ON t.x = customer_names.pk ORDER BY t.id",
-        )
-        .await;
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Text("alice".into())]);
-        assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Text("bob".into())]);
-        assert_eq!(s.rows[2], vec![ScalarValue::Integer(12), ScalarValue::Null]);
+            let s = sel(
+                &rel,
+                "SELECT t.id, customer_names.name FROM t LEFT JOIN customer_names ON t.x = customer_names.pk ORDER BY t.id",
+            )
+            .await;
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Text("alice".into())]);
+            assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Text("bob".into())]);
+            assert_eq!(s.rows[2], vec![ScalarValue::Integer(12), ScalarValue::Null]);
+        })
     }
 
     // 10. A view with its own WHERE used in JOIN position -> InvalidSchema.
-    #[tokio::test]
-    async fn test_view_with_where_in_join_position_rejected() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)").await;
-        ok(&rel, "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)").await;
-        ok(&rel, "CREATE VIEW active_names AS SELECT id, name FROM names WHERE active = TRUE").await;
+    #[test]
+    fn test_view_with_where_in_join_position_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)").await;
+            ok(&rel, "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)").await;
+            ok(&rel, "CREATE VIEW active_names AS SELECT id, name FROM names WHERE active = TRUE").await;
 
-        let e = err(&rel, "SELECT t.id FROM t LEFT JOIN active_names ON t.x = active_names.id").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+            let e = err(&rel, "SELECT t.id FROM t LEFT JOIN active_names ON t.x = active_names.id").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+        })
     }
 
     // 11. View-over-view depth 3 resolves correctly; depth 4 -> LimitExceeded
     // (view_depth) at CREATE time.
-    #[tokio::test]
-    async fn test_view_over_view_depth_limit() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1), (2)").await;
-        ok(&rel, "CREATE VIEW v1 AS SELECT * FROM t").await;
-        ok(&rel, "CREATE VIEW v2 AS SELECT * FROM v1").await;
-        ok(&rel, "CREATE VIEW v3 AS SELECT * FROM v2").await;
+    #[test]
+    fn test_view_over_view_depth_limit() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1), (2)").await;
+            ok(&rel, "CREATE VIEW v1 AS SELECT * FROM t").await;
+            ok(&rel, "CREATE VIEW v2 AS SELECT * FROM v1").await;
+            ok(&rel, "CREATE VIEW v3 AS SELECT * FROM v2").await;
 
-        let s = sel(&rel, "SELECT * FROM v3").await;
-        assert_eq!(s.rows.len(), 2);
+            let s = sel(&rel, "SELECT * FROM v3").await;
+            assert_eq!(s.rows.len(), 2);
 
-        let e = err(&rel, "CREATE VIEW v4 AS SELECT * FROM v3").await;
-        match &e {
-            RelStoreError::LimitExceeded { which, max } => {
-                assert_eq!(which, "view_depth");
-                assert_eq!(*max, 3);
+            let e = err(&rel, "CREATE VIEW v4 AS SELECT * FROM v3").await;
+            match &e {
+                RelStoreError::LimitExceeded { which, max } => {
+                    assert_eq!(which, "view_depth");
+                    assert_eq!(*max, 3);
+                }
+                other => panic!("expected LimitExceeded(view_depth), got {other}"),
             }
-            other => panic!("expected LimitExceeded(view_depth), got {other}"),
-        }
+        })
     }
 
     // 12. Self-reference -> TableNotFound (documents the cycle-unconstructibility
     // argument: `v` isn't in the catalog yet while its own body is bound).
-    #[tokio::test]
-    async fn test_self_reference_view_fails_as_table_not_found() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+    #[test]
+    fn test_self_reference_view_fails_as_table_not_found() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
 
-        let e = err(&rel, "CREATE VIEW v AS SELECT * FROM v").await;
-        assert!(matches!(e, RelStoreError::TableNotFound { .. }), "got: {e}");
+            let e = err(&rel, "CREATE VIEW v AS SELECT * FROM v").await;
+            assert!(matches!(e, RelStoreError::TableNotFound { .. }), "got: {e}");
+        })
     }
 
     // 13. `max_join_depth` over the *combined* chain: an outer join pushing a
     // view's own chain over the limit fails at execution time; a view whose
     // own expansion alone already exceeds it fails at CREATE time.
-    #[tokio::test]
-    async fn test_max_join_depth_over_combined_chain() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut rel = boot(config_in(dir.path())).await;
-        Arc::get_mut(&mut rel).unwrap().set_max_join_depth(1);
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, c_id INTEGER)").await;
-        ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY)").await;
+    #[test]
+    fn test_max_join_depth_over_combined_chain() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut rel = boot(config_in(dir.path())).await;
+            Arc::get_mut(&mut rel).unwrap().set_max_join_depth(1);
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, c_id INTEGER)").await;
+            ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY)").await;
 
-        let e = err(
-            &rel,
-            "CREATE VIEW v_wide AS SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id LEFT JOIN c ON b.c_id = c.id",
-        )
-        .await;
-        assert!(matches!(e, RelStoreError::JoinDepthExceeded { .. }), "own expansion alone: got {e}");
+            let e = err(
+                &rel,
+                "CREATE VIEW v_wide AS SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id LEFT JOIN c ON b.c_id = c.id",
+            )
+            .await;
+            assert!(matches!(e, RelStoreError::JoinDepthExceeded { .. }), "own expansion alone: got {e}");
 
-        ok(&rel, "CREATE VIEW v1 AS SELECT a.id AS id, b.id AS bid FROM a LEFT JOIN b ON a.b_id = b.id").await;
-        ok(&rel, "CREATE TABLE d (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE VIEW v1 AS SELECT a.id AS id, b.id AS bid FROM a LEFT JOIN b ON a.b_id = b.id").await;
+            ok(&rel, "CREATE TABLE d (id INTEGER PRIMARY KEY)").await;
 
-        let e = err(&rel, "SELECT v1.id FROM v1 LEFT JOIN d ON v1.bid = d.id").await;
-        assert!(matches!(e, RelStoreError::JoinDepthExceeded { .. }), "combined chain at execution time: got {e}");
+            let e = err(&rel, "SELECT v1.id FROM v1 LEFT JOIN d ON v1.bid = d.id").await;
+            assert!(matches!(e, RelStoreError::JoinDepthExceeded { .. }), "combined chain at execution time: got {e}");
+        })
     }
 
     // 14. Dependency — DROP TABLE: a referenced table is blocked with the
     // view list; an unreferenced one drops fine.
-    #[tokio::test]
-    async fn test_dependency_drop_table() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE unrelated (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
+    #[test]
+    fn test_dependency_drop_table() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE unrelated (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
 
-        let e = err(&rel, "DROP TABLE t").await;
-        match &e {
-            RelStoreError::ViewDependencyConflict { object, views } => {
-                assert_eq!(object, "t");
-                assert_eq!(views, &vec!["v".to_string()]);
+            let e = err(&rel, "DROP TABLE t").await;
+            match &e {
+                RelStoreError::ViewDependencyConflict { object, views } => {
+                    assert_eq!(object, "t");
+                    assert_eq!(views, &vec!["v".to_string()]);
+                }
+                other => panic!("expected ViewDependencyConflict, got {other}"),
             }
-            other => panic!("expected ViewDependencyConflict, got {other}"),
-        }
-        assert!(rel.get_object("default", "t").is_ok(), "the drop must have been blocked");
+            assert!(rel.get_object("default", "t").is_ok(), "the drop must have been blocked");
 
-        ok(&rel, "DROP TABLE unrelated").await;
+            ok(&rel, "DROP TABLE unrelated").await;
+        })
     }
 
     // 15. Dependency — DROP COLUMN: an explicitly named referenced column blocks
     // (transitively through a `SELECT *` view too); a column only covered by
     // `SELECT *` (never named) does not block it directly.
-    #[tokio::test]
-    async fn test_dependency_drop_column() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").await;
-        ok(&rel, "CREATE VIEW v_named AS SELECT a FROM t").await;
-        ok(&rel, "CREATE VIEW v_star AS SELECT * FROM t").await;
-        ok(&rel, "CREATE VIEW v_over_star AS SELECT a FROM v_star").await;
+    #[test]
+    fn test_dependency_drop_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").await;
+            ok(&rel, "CREATE VIEW v_named AS SELECT a FROM t").await;
+            ok(&rel, "CREATE VIEW v_star AS SELECT * FROM t").await;
+            ok(&rel, "CREATE VIEW v_over_star AS SELECT a FROM v_star").await;
 
-        let e = err(&rel, "ALTER TABLE t DROP COLUMN a").await;
-        match &e {
-            RelStoreError::ViewDependencyConflict { views, .. } => {
-                let mut v = views.clone();
-                v.sort();
-                assert_eq!(v, vec!["v_named".to_string(), "v_over_star".to_string()]);
+            let e = err(&rel, "ALTER TABLE t DROP COLUMN a").await;
+            match &e {
+                RelStoreError::ViewDependencyConflict { views, .. } => {
+                    let mut v = views.clone();
+                    v.sort();
+                    assert_eq!(v, vec!["v_named".to_string(), "v_over_star".to_string()]);
+                }
+                other => panic!("expected ViewDependencyConflict, got {other}"),
             }
-            other => panic!("expected ViewDependencyConflict, got {other}"),
-        }
 
-        ok(&rel, "ALTER TABLE t DROP COLUMN b").await;
+            ok(&rel, "ALTER TABLE t DROP COLUMN b").await;
+        })
     }
 
     // 16. Dependency — RENAME COLUMN / RENAME TO: referenced -> 409.
-    #[tokio::test]
-    async fn test_dependency_rename_column_and_table() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
-        ok(&rel, "CREATE VIEW v AS SELECT a FROM t").await;
+    #[test]
+    fn test_dependency_rename_column_and_table() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+            ok(&rel, "CREATE VIEW v AS SELECT a FROM t").await;
 
-        let e = err(&rel, "ALTER TABLE t RENAME COLUMN a TO a2").await;
-        assert!(matches!(e, RelStoreError::ViewDependencyConflict { .. }), "rename column: got {e}");
+            let e = err(&rel, "ALTER TABLE t RENAME COLUMN a TO a2").await;
+            assert!(matches!(e, RelStoreError::ViewDependencyConflict { .. }), "rename column: got {e}");
 
-        let e = err(&rel, "ALTER TABLE t RENAME TO t2").await;
-        assert!(matches!(e, RelStoreError::ViewDependencyConflict { .. }), "rename table: got {e}");
+            let e = err(&rel, "ALTER TABLE t RENAME TO t2").await;
+            assert!(matches!(e, RelStoreError::ViewDependencyConflict { .. }), "rename table: got {e}");
+        })
     }
 
     // 17. Dependency — DROP VIEW: referenced by another view -> 409;
     // unreferenced -> ok (then neither get() nor list() see it).
-    #[tokio::test]
-    async fn test_dependency_drop_view() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE VIEW base AS SELECT * FROM t").await;
-        ok(&rel, "CREATE VIEW derived AS SELECT * FROM base").await;
+    #[test]
+    fn test_dependency_drop_view() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE VIEW base AS SELECT * FROM t").await;
+            ok(&rel, "CREATE VIEW derived AS SELECT * FROM base").await;
 
-        let e = err(&rel, "DROP VIEW base").await;
-        match &e {
-            RelStoreError::ViewDependencyConflict { object, views } => {
-                assert_eq!(object, "base");
-                assert_eq!(views, &vec!["derived".to_string()]);
+            let e = err(&rel, "DROP VIEW base").await;
+            match &e {
+                RelStoreError::ViewDependencyConflict { object, views } => {
+                    assert_eq!(object, "base");
+                    assert_eq!(views, &vec!["derived".to_string()]);
+                }
+                other => panic!("expected ViewDependencyConflict, got {other}"),
             }
-            other => panic!("expected ViewDependencyConflict, got {other}"),
-        }
 
-        ok(&rel, "DROP VIEW derived").await;
-        ok(&rel, "DROP VIEW base").await;
-        assert!(rel.get_object("default", "base").is_err());
-        assert!(rel.list_objects("default").unwrap().iter().all(|o| o.name() != "base"));
+            ok(&rel, "DROP VIEW derived").await;
+            ok(&rel, "DROP VIEW base").await;
+            assert!(rel.get_object("default", "base").is_err());
+            assert!(rel.list_objects("default").unwrap().iter().all(|o| o.name() != "base"));
+        })
     }
 
     // 18. DROP INDEX is never blocked by a view; a subsequent SELECT through
     // that view then fails at *execution* time with the rel/007 index
     // requirement message, not at DROP time.
-    #[tokio::test]
-    async fn test_drop_index_not_blocked_but_join_fails_at_execution_time() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_b_k ON b (k)").await;
-        ok(&rel, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k").await;
-        ok(&rel, "INSERT INTO a VALUES (1, 5)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 5)").await;
+    #[test]
+    fn test_drop_index_not_blocked_but_join_fails_at_execution_time() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_b_k ON b (k)").await;
+            ok(&rel, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k").await;
+            ok(&rel, "INSERT INTO a VALUES (1, 5)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 5)").await;
 
-        ok(&rel, "SELECT * FROM v").await;
-        ok(&rel, "DROP INDEX idx_b_k").await;
+            ok(&rel, "SELECT * FROM v").await;
+            ok(&rel, "DROP INDEX idx_b_k").await;
 
-        let e = err(&rel, "SELECT * FROM v").await;
-        assert!(matches!(e, RelStoreError::UnindexedJoin { .. }), "got: {e}");
+            let e = err(&rel, "SELECT * FROM v").await;
+            assert!(matches!(e, RelStoreError::UnindexedJoin { .. }), "got: {e}");
+        })
     }
 
     // 19. DML on a view -> NotWritable (rel/005 guard; test only, per spec §8).
-    #[tokio::test]
-    async fn test_dml_on_view_not_writable() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
+    #[test]
+    fn test_dml_on_view_not_writable() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE VIEW v AS SELECT * FROM t").await;
 
-        let e = err(&rel, "INSERT INTO v VALUES (1)").await;
-        assert!(matches!(e, RelStoreError::NotWritable { .. }), "insert: got {e}");
-        let e = err(&rel, "UPDATE v SET id = 1").await;
-        assert!(matches!(e, RelStoreError::NotWritable { .. }), "update: got {e}");
-        let e = err(&rel, "DELETE FROM v").await;
-        assert!(matches!(e, RelStoreError::NotWritable { .. }), "delete: got {e}");
+            let e = err(&rel, "INSERT INTO v VALUES (1)").await;
+            assert!(matches!(e, RelStoreError::NotWritable { .. }), "insert: got {e}");
+            let e = err(&rel, "UPDATE v SET id = 1").await;
+            assert!(matches!(e, RelStoreError::NotWritable { .. }), "update: got {e}");
+            let e = err(&rel, "DELETE FROM v").await;
+            assert!(matches!(e, RelStoreError::NotWritable { .. }), "delete: got {e}");
+        })
     }
 
     // 20. Raw-text fidelity (incl. a trimmed trailing ';') & re-parse: stored
     // `sql` == the submitted text; repeated execution re-parses consistently.
-    #[tokio::test]
-    async fn test_raw_text_fidelity_and_reparse() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
-        let submitted = "SELECT   id,  a   FROM t   WHERE  a > 1";
-        ok(&rel, &format!("CREATE VIEW v AS {submitted}")).await;
-        match rel.get_object("default", "v").unwrap() {
-            CatalogEntry::View(vw) => assert_eq!(vw.sql, submitted),
-            other => panic!("expected view, got {other:?}"),
-        }
+    #[test]
+    fn test_raw_text_fidelity_and_reparse() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+            let submitted = "SELECT   id,  a   FROM t   WHERE  a > 1";
+            ok(&rel, &format!("CREATE VIEW v AS {submitted}")).await;
+            match rel.get_object("default", "v").unwrap() {
+                CatalogEntry::View(vw) => assert_eq!(vw.sql, submitted),
+                other => panic!("expected view, got {other:?}"),
+            }
 
-        ok(&rel, "CREATE VIEW v2 AS SELECT * FROM t;").await;
-        match rel.get_object("default", "v2").unwrap() {
-            CatalogEntry::View(vw) => assert_eq!(vw.sql, "SELECT * FROM t"),
-            other => panic!("expected view, got {other:?}"),
-        }
+            ok(&rel, "CREATE VIEW v2 AS SELECT * FROM t;").await;
+            match rel.get_object("default", "v2").unwrap() {
+                CatalogEntry::View(vw) => assert_eq!(vw.sql, "SELECT * FROM t"),
+                other => panic!("expected view, got {other:?}"),
+            }
 
-        ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 0)").await;
-        let s1 = sel(&rel, "SELECT id FROM v").await;
-        let s2 = sel(&rel, "SELECT id FROM v").await;
-        assert_eq!(s1.rows, s2.rows);
-        assert_eq!(ints(&s1.rows, 0), vec![1]);
+            ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 0)").await;
+            let s1 = sel(&rel, "SELECT id FROM v").await;
+            let s2 = sel(&rel, "SELECT id FROM v").await;
+            assert_eq!(s1.rows, s2.rows);
+            assert_eq!(ints(&s1.rows, 0), vec![1]);
+        })
     }
 
     // 21. Metrics: `rel_view_inlinings_total` counts every substituted (incl.
     // recursive) view reference; `rel_ddl_view_ops_total{create_view|drop_view}`
     // increments as expected.
-    #[tokio::test]
-    async fn test_view_metrics() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1)").await;
-        ok(&rel, "CREATE VIEW v1 AS SELECT * FROM t").await;
-        ok(&rel, "CREATE VIEW v2 AS SELECT * FROM v1").await;
+    #[test]
+    fn test_view_metrics() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1)").await;
+            ok(&rel, "CREATE VIEW v1 AS SELECT * FROM t").await;
+            ok(&rel, "CREATE VIEW v2 AS SELECT * FROM v1").await;
 
-        let create_before = create_view_ops(&rel);
-        ok(&rel, "CREATE VIEW v3 AS SELECT * FROM v2").await;
-        assert_eq!(create_view_ops(&rel) - create_before, 1);
+            let create_before = create_view_ops(&rel);
+            ok(&rel, "CREATE VIEW v3 AS SELECT * FROM v2").await;
+            assert_eq!(create_view_ops(&rel) - create_before, 1);
 
-        let inlinings_before = inlinings(&rel);
-        ok(&rel, "SELECT * FROM v3").await;
-        assert_eq!(inlinings(&rel) - inlinings_before, 3, "v3 -> v2 -> v1 -> t: 3 substitutions");
+            let inlinings_before = inlinings(&rel);
+            ok(&rel, "SELECT * FROM v3").await;
+            assert_eq!(inlinings(&rel) - inlinings_before, 3, "v3 -> v2 -> v1 -> t: 3 substitutions");
 
-        let drop_before = drop_view_ops(&rel);
-        ok(&rel, "DROP VIEW v3").await;
-        assert_eq!(drop_view_ops(&rel) - drop_before, 1);
+            let drop_before = drop_view_ops(&rel);
+            ok(&rel, "DROP VIEW v3").await;
+            assert_eq!(drop_view_ops(&rel) - drop_before, 1);
+        })
     }
 
     // 22. (004 TOCTOU) DROP VIEW on a table name is rejected — the kind is now
     // checked atomically under the ddl_lock on the removed entry, not by a
     // pre-lock probe a concurrent re-CREATE could race — and the table survives.
-    #[tokio::test]
-    async fn test_drop_view_on_table_rejected_and_table_survives() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+    #[test]
+    fn test_drop_view_on_table_rejected_and_table_survives() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
 
-        let e = err(&rel, "DROP VIEW t").await;
-        assert!(matches!(e, RelStoreError::ObjectNotFound { .. }), "got: {e}");
-        assert!(
-            matches!(rel.get_object("default", "t").unwrap(), CatalogEntry::Table(_)),
-            "the table must survive a rejected DROP VIEW"
-        );
+            let e = err(&rel, "DROP VIEW t").await;
+            assert!(matches!(e, RelStoreError::ObjectNotFound { .. }), "got: {e}");
+            assert!(
+                matches!(rel.get_object("default", "t").unwrap(), CatalogEntry::Table(_)),
+                "the table must survive a rejected DROP VIEW"
+            );
+        })
     }
 }

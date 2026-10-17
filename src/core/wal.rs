@@ -183,7 +183,7 @@ impl WriteAheadLog {
         file.seek(std::io::SeekFrom::Start(initial_size)).await?;
 
         let (sender, receiver) = mpsc::channel(1024);
-        tokio::spawn(run_committer(file, initial_size, receiver));
+        compio::runtime::spawn(run_committer(file, initial_size, receiver)).detach();
 
         Ok(Self { inner: WalMode::Local(sender) })
     }
@@ -358,43 +358,47 @@ mod tests {
 
     // N concurrent appends batch into disjoint, monotone offsets and one
     // contiguous file — the local committer's group-commit path.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_parallel_appends_disjoint_monotone_offsets() {
-        let dir = TempDir::new().unwrap();
-        let wal = Arc::new(WriteAheadLog::new(dir.path().join("wal")).await.unwrap());
+    #[test]
+    fn test_parallel_appends_disjoint_monotone_offsets() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let wal = Arc::new(WriteAheadLog::new(dir.path().join("wal")).await.unwrap());
 
-        let mut tasks = Vec::new();
-        for _ in 0..100u32 {
-            let w = Arc::clone(&wal);
-            tasks.push(tokio::spawn(async move { w.append(&[b'x'; 10]).await.unwrap() }));
-        }
-        let mut offsets = Vec::new();
-        for t in tasks {
-            offsets.push(t.await.unwrap());
-        }
-        offsets.sort_unstable();
+            let mut tasks = Vec::new();
+            for _ in 0..100u32 {
+                let w = Arc::clone(&wal);
+                tasks.push(compio::runtime::spawn(async move { w.append(&[b'x'; 10]).await.unwrap() }));
+            }
+            let mut offsets = Vec::new();
+            for t in tasks {
+                offsets.push(t.await.unwrap());
+            }
+            offsets.sort_unstable();
 
-        assert_eq!(offsets.len(), 100);
-        for (i, off) in offsets.iter().enumerate() {
-            assert_eq!(*off, (i as u64) * 10);
-        }
-        drop(wal);
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 1000);
+            assert_eq!(offsets.len(), 100);
+            for (i, off) in offsets.iter().enumerate() {
+                assert_eq!(*off, (i as u64) * 10);
+            }
+            drop(wal);
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 1000);
+        })
     }
 
     // append → truncate → append: the truncate resets the write cursor to 0.
-    #[tokio::test]
-    async fn test_append_truncate_append_resets_offset() {
-        let dir = TempDir::new().unwrap();
-        let wal = WriteAheadLog::new(dir.path().join("wal")).await.unwrap();
+    #[test]
+    fn test_append_truncate_append_resets_offset() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let wal = WriteAheadLog::new(dir.path().join("wal")).await.unwrap();
 
-        assert_eq!(wal.append(b"abcde").await.unwrap(), 0);
-        assert_eq!(wal.append(b"fgh").await.unwrap(), 5);
-        wal.truncate().await.unwrap();
-        assert_eq!(wal.append(b"XY").await.unwrap(), 0);
+            assert_eq!(wal.append(b"abcde").await.unwrap(), 0);
+            assert_eq!(wal.append(b"fgh").await.unwrap(), 5);
+            wal.truncate().await.unwrap();
+            assert_eq!(wal.append(b"XY").await.unwrap(), 0);
 
-        drop(wal);
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+            drop(wal);
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+        })
     }
 
     // A Truncate arriving mid-group must land in `pending_truncate` (the
@@ -413,26 +417,28 @@ mod tests {
     // The returned offset (5, not 0) is the actual proof: it's only possible
     // if the group committed at the pre-truncate offset before truncation
     // reset it, i.e. exactly the "commit group, then truncate" contract.
-    #[tokio::test]
-    async fn test_truncate_during_append_group_uses_pending_truncate() {
-        let dir = TempDir::new().unwrap();
-        let wal = WriteAheadLog::new(dir.path().join("wal")).await.unwrap();
+    #[test]
+    fn test_truncate_during_append_group_uses_pending_truncate() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let wal = WriteAheadLog::new(dir.path().join("wal")).await.unwrap();
 
-        // Nonzero starting offset so the assertion below can distinguish
-        // "group committed, then truncated" from "truncated, then committed".
-        assert_eq!(wal.append(b"AAAAA").await.unwrap(), 0);
+            // Nonzero starting offset so the assertion below can distinguish
+            // "group committed, then truncated" from "truncated, then committed".
+            assert_eq!(wal.append(b"AAAAA").await.unwrap(), 0);
 
-        let (append_result, truncate_result) =
-            tokio::join!(wal.append(b"BBB"), wal.truncate());
+            let (append_result, truncate_result) =
+                tokio::join!(wal.append(b"BBB"), wal.truncate());
 
-        assert_eq!(append_result.unwrap(), 5);
-        truncate_result.unwrap();
-        assert!(std::fs::read(dir.path().join("wal")).unwrap().is_empty());
+            assert_eq!(append_result.unwrap(), 5);
+            truncate_result.unwrap();
+            assert!(std::fs::read(dir.path().join("wal")).unwrap().is_empty());
 
-        // Offset and file state stay consistent after the mid-group truncate.
-        assert_eq!(wal.append(b"XY").await.unwrap(), 0);
-        drop(wal);
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+            // Offset and file state stay consistent after the mid-group truncate.
+            assert_eq!(wal.append(b"XY").await.unwrap(), 0);
+            drop(wal);
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+        })
     }
 
     // Builds a raw DELETE record: [type=2][ts:u64][key_len:u32][key]. Used
@@ -451,33 +457,37 @@ mod tests {
     // -- not attempt an allocation up to 4 GiB (spec kv/026 Spec-Review F7,
     // kv/027 §B). No key bytes follow; the cap check must reject this before
     // read_exact ever runs.
-    #[tokio::test]
-    async fn test_recover_rejects_wal_field_length_exceeding_cap() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("wal");
-        std::fs::write(&path, raw_delete_record((WAL_MAX_FIELD_LEN + 1) as u32, &[])).unwrap();
+    #[test]
+    fn test_recover_rejects_wal_field_length_exceeding_cap() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            std::fs::write(&path, raw_delete_record((WAL_MAX_FIELD_LEN + 1) as u32, &[])).unwrap();
 
-        let err = recover(&path).await.unwrap_err();
-        assert!(
-            err.to_string().contains("exceeds maximum"),
-            "expected a field-too-long error, got: {err}"
-        );
+            let err = recover(&path).await.unwrap_err();
+            assert!(
+                err.to_string().contains("exceeds maximum"),
+                "expected a field-too-long error, got: {err}"
+            );
+        })
     }
 
     // A field of exactly WAL_MAX_FIELD_LEN must still parse -- the cap
     // rejects lengths *above* it, never at it.
-    #[tokio::test]
-    async fn test_recover_accepts_wal_field_length_exactly_at_cap() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("wal");
-        let key = vec![b'k'; WAL_MAX_FIELD_LEN];
-        std::fs::write(&path, raw_delete_record(WAL_MAX_FIELD_LEN as u32, &key)).unwrap();
+    #[test]
+    fn test_recover_accepts_wal_field_length_exactly_at_cap() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let key = vec![b'k'; WAL_MAX_FIELD_LEN];
+            std::fs::write(&path, raw_delete_record(WAL_MAX_FIELD_LEN as u32, &key)).unwrap();
 
-        let entries = recover(&path).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            WalEntry::Delete { key: k, .. } => assert_eq!(k.len(), WAL_MAX_FIELD_LEN),
-            other => panic!("expected WalEntry::Delete, got {other:?}"),
-        }
+            let entries = recover(&path).await.unwrap();
+            assert_eq!(entries.len(), 1);
+            match &entries[0] {
+                WalEntry::Delete { key: k, .. } => assert_eq!(k.len(), WAL_MAX_FIELD_LEN),
+                other => panic!("expected WalEntry::Delete, got {other:?}"),
+            }
+        })
     }
 }

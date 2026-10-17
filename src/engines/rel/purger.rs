@@ -16,7 +16,8 @@ use super::RelEngine;
 use crate::engines::lsm::engine::BatchOp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use compio::time::sleep;
+use std::time::Duration;
 
 /// Data keys/candidate probes tombstoned per batch and seconds between ticks.
 pub const PURGER_BATCH_SIZE: usize = 100;
@@ -260,350 +261,378 @@ mod tests {
 
     // 1. delete_domain hides the domain from CRUD but keeps it internally
     //    (410 via require_active) — the purge precondition.
-    #[tokio::test]
-    async fn test_delete_marks_deleting() {
-        let (rel, _dir) = make().await;
-        rel.create_domain("doomed").await.unwrap();
-        rel.delete_domain("doomed").await.unwrap();
-        assert!(rel.get_domain("doomed").is_none());
-        assert!(rel.get_domain_any("doomed").is_some());
-        let err = rel.execute("doomed", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap_err();
-        assert!(matches!(err, RelStoreError::DomainDeleting(_)), "got: {err}");
-        rel.shutdown().await;
+    #[test]
+    fn test_delete_marks_deleting() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            rel.create_domain("doomed").await.unwrap();
+            rel.delete_domain("doomed").await.unwrap();
+            assert!(rel.get_domain("doomed").is_none());
+            assert!(rel.get_domain_any("doomed").is_some());
+            let err = rel.execute("doomed", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::DomainDeleting(_)), "got: {err}");
+            rel.shutdown().await;
+        })
     }
 
     // 2. Purge removes ROW/IDX/SEQ, then CAT + catalog seq + domain metadata.
-    #[tokio::test]
-    async fn test_purge_deleting_removes_everything() {
-        let (rel, _dir) = make().await;
-        seed_doomed(&rel).await;
-        let prefix = rel.get_domain("doomed").unwrap().system_prefix;
-        rel.delete_domain("doomed").await.unwrap();
+    #[test]
+    fn test_purge_deleting_removes_everything() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            seed_doomed(&rel).await;
+            let prefix = rel.get_domain("doomed").unwrap().system_prefix;
+            rel.delete_domain("doomed").await.unwrap();
 
-        let p = purger(&rel, 100);
-        p.purge_tick().await.unwrap(); // tombstone data
-        p.purge_tick().await.unwrap(); // finalize
+            let p = purger(&rel, 100);
+            p.purge_tick().await.unwrap(); // tombstone data
+            p.purge_tick().await.unwrap(); // finalize
 
-        let e = rel.engine();
-        assert!(e.scan_keys(&keys::row_domain_prefix(&prefix)).await.unwrap().is_empty());
-        assert!(e.scan_keys(&keys::index_domain_prefix(&prefix)).await.unwrap().is_empty());
-        assert!(e.scan_keys(&keys::seq_domain_prefix(&prefix)).await.unwrap().is_empty());
-        let mut cat = b"CAT:".to_vec();
-        cat.extend_from_slice(&prefix);
-        cat.push(b':');
-        assert!(e.scan_keys(&cat).await.unwrap().is_empty(), "CAT entries gone");
-        assert!(e.scan_keys(b"__sys:rel_catalog_seq:doomed").await.unwrap().is_empty(), "catalog seq gone");
-        assert!(e.scan_keys(b"__sys:rel_domain:doomed").await.unwrap().is_empty(), "metadata gone");
-        assert!(rel.get_domain_any("doomed").is_none());
-        rel.shutdown().await;
+            let e = rel.engine();
+            assert!(e.scan_keys(&keys::row_domain_prefix(&prefix)).await.unwrap().is_empty());
+            assert!(e.scan_keys(&keys::index_domain_prefix(&prefix)).await.unwrap().is_empty());
+            assert!(e.scan_keys(&keys::seq_domain_prefix(&prefix)).await.unwrap().is_empty());
+            let mut cat = b"CAT:".to_vec();
+            cat.extend_from_slice(&prefix);
+            cat.push(b':');
+            assert!(e.scan_keys(&cat).await.unwrap().is_empty(), "CAT entries gone");
+            assert!(e.scan_keys(b"__sys:rel_catalog_seq:doomed").await.unwrap().is_empty(), "catalog seq gone");
+            assert!(e.scan_keys(b"__sys:rel_domain:doomed").await.unwrap().is_empty(), "metadata gone");
+            assert!(rel.get_domain_any("doomed").is_none());
+            rel.shutdown().await;
+        })
     }
 
     // 3. Small batches need several ticks but converge.
-    #[tokio::test]
-    async fn test_purge_converges_in_small_batches() {
-        let (rel, _dir) = make().await;
-        seed_doomed(&rel).await;
-        rel.delete_domain("doomed").await.unwrap();
-        let p = purger(&rel, 2);
-        for _ in 0..20 {
-            p.purge_tick().await.unwrap();
-            if rel.get_domain_any("doomed").is_none() {
-                rel.shutdown().await;
-                return;
+    #[test]
+    fn test_purge_converges_in_small_batches() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            seed_doomed(&rel).await;
+            rel.delete_domain("doomed").await.unwrap();
+            let p = purger(&rel, 2);
+            for _ in 0..20 {
+                p.purge_tick().await.unwrap();
+                if rel.get_domain_any("doomed").is_none() {
+                    rel.shutdown().await;
+                    return;
+                }
             }
-        }
-        panic!("purge did not converge with small batches");
+            panic!("purge did not converge with small batches");
+        })
     }
 
     // 4. Purge converges even when tombstones are flushed to SSTables between
     //    ticks (scan_keys stays MVCC-correct across sources).
-    #[tokio::test]
-    async fn test_purge_converges_across_flushes() {
-        let (rel, _dir) = make().await;
-        seed_doomed(&rel).await;
-        rel.delete_domain("doomed").await.unwrap();
-        let p = purger(&rel, 2);
-        for _ in 0..20 {
-            p.purge_tick().await.unwrap();
-            rel.engine().freeze_active_memtable();
-            rel.engine().flush_memtable().await.unwrap();
-            if rel.get_domain_any("doomed").is_none() {
-                rel.shutdown().await;
-                return;
+    #[test]
+    fn test_purge_converges_across_flushes() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            seed_doomed(&rel).await;
+            rel.delete_domain("doomed").await.unwrap();
+            let p = purger(&rel, 2);
+            for _ in 0..20 {
+                p.purge_tick().await.unwrap();
+                rel.engine().freeze_active_memtable();
+                rel.engine().flush_memtable().await.unwrap();
+                if rel.get_domain_any("doomed").is_none() {
+                    rel.shutdown().await;
+                    return;
+                }
             }
-        }
-        panic!("purge did not converge across flushes");
+            panic!("purge did not converge across flushes");
+        })
     }
 
     // 5. A deleting domain survives a restart and the purge resumes.
-    #[tokio::test]
-    async fn test_purge_resumes_after_restart() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let cfg = config_in(dir.path());
-        {
+    #[test]
+    fn test_purge_resumes_after_restart() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cfg = config_in(dir.path());
+            {
+                let rel = boot(&cfg).await;
+                seed_doomed(&rel).await;
+                rel.delete_domain("doomed").await.unwrap();
+                rel.shutdown().await;
+            }
             let rel = boot(&cfg).await;
-            seed_doomed(&rel).await;
-            rel.delete_domain("doomed").await.unwrap();
+            assert_eq!(rel.domains.list_deleting_domains().len(), 1, "deleting domain survives restart");
+            let p = purger(&rel, 100);
+            p.purge_tick().await.unwrap();
+            p.purge_tick().await.unwrap();
+            assert!(rel.get_domain_any("doomed").is_none());
             rel.shutdown().await;
-        }
-        let rel = boot(&cfg).await;
-        assert_eq!(rel.domains.list_deleting_domains().len(), 1, "deleting domain survives restart");
-        let p = purger(&rel, 100);
-        p.purge_tick().await.unwrap();
-        p.purge_tick().await.unwrap();
-        assert!(rel.get_domain_any("doomed").is_none());
-        rel.shutdown().await;
+        })
     }
 
     // 6. list_domains shows Deleting domains with state; get_domain stays
     //    active-only.
-    #[tokio::test]
-    async fn test_list_shows_deleting_but_resolution_active_only() {
-        let (rel, _dir) = make().await;
-        rel.create_domain("doomed").await.unwrap();
-        rel.delete_domain("doomed").await.unwrap();
-        let listed = rel.list_domains();
-        let d = listed.iter().find(|d| d.name == "doomed").expect("deleting domain listed");
-        assert_eq!(d.state, RelDomainState::Deleting);
-        assert!(rel.get_domain("doomed").is_none(), "get_domain active-only");
-        rel.shutdown().await;
+    #[test]
+    fn test_list_shows_deleting_but_resolution_active_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            rel.create_domain("doomed").await.unwrap();
+            rel.delete_domain("doomed").await.unwrap();
+            let listed = rel.list_domains();
+            let d = listed.iter().find(|d| d.name == "doomed").expect("deleting domain listed");
+            assert_eq!(d.state, RelDomainState::Deleting);
+            assert!(rel.get_domain("doomed").is_none(), "get_domain active-only");
+            rel.shutdown().await;
+        })
     }
 
     // 7. A Deleting default domain survives boot (no 409 loop); after the purge
     //    finalizes it, the next boot recreates it as Active.
-    #[tokio::test]
-    async fn test_deleting_default_survives_boot_and_recreates() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let cfg = config_in(dir.path());
-        {
+    #[test]
+    fn test_deleting_default_survives_boot_and_recreates() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cfg = config_in(dir.path());
+            {
+                let rel = boot(&cfg).await;
+                ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+                ok(&rel, "default", "INSERT INTO t VALUES (1)").await;
+                rel.delete_domain("default").await.unwrap();
+                rel.shutdown().await;
+            }
+            // Reboot before the purge finished: boot must succeed, default Deleting.
             let rel = boot(&cfg).await;
-            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-            ok(&rel, "default", "INSERT INTO t VALUES (1)").await;
-            rel.delete_domain("default").await.unwrap();
+            assert!(rel.get_domain("default").is_none());
+            let p = purger(&rel, 100);
+            p.purge_tick().await.unwrap();
+            p.purge_tick().await.unwrap();
+            assert!(rel.get_domain_any("default").is_none(), "default finalized");
             rel.shutdown().await;
-        }
-        // Reboot before the purge finished: boot must succeed, default Deleting.
-        let rel = boot(&cfg).await;
-        assert!(rel.get_domain("default").is_none());
-        let p = purger(&rel, 100);
-        p.purge_tick().await.unwrap();
-        p.purge_tick().await.unwrap();
-        assert!(rel.get_domain_any("default").is_none(), "default finalized");
-        rel.shutdown().await;
-        // Next boot recreates default as Active.
-        let rel = boot(&cfg).await;
-        let d = rel.get_domain_any("default").expect("default recreated");
-        assert_eq!(d.state, RelDomainState::Active);
-        rel.shutdown().await;
+            // Next boot recreates default as Active.
+            let rel = boot(&cfg).await;
+            let d = rel.get_domain_any("default").expect("default recreated");
+            assert_eq!(d.state, RelDomainState::Active);
+            rel.shutdown().await;
+        })
     }
 
     // 8. Orphan sweep after DROP TABLE: ROW/IDX/SEQ of the dropped table's ids
     //    vanish; a co-resident live table is untouched.
-    #[tokio::test]
-    async fn test_orphan_sweep_drop_table() {
-        let (rel, _dir) = make().await;
-        ok(&rel, "default", "CREATE TABLE keep (id INTEGER PRIMARY KEY, s TEXT)").await;
-        ok(&rel, "default", "INSERT INTO keep VALUES (1, 'live')").await;
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, city TEXT)").await;
-        ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
-        for _ in 0..3 {
-            ok(&rel, "default", "INSERT INTO t (city) VALUES ('E')").await;
-        }
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let t = table_schema(&rel, "default", "t");
-        let t_id = t.table_id;
-        let ix_id = t.indexes.iter().find(|i| i.name == "t_city").unwrap().index_id;
-        let keep_id = table_schema(&rel, "default", "keep").table_id;
+    #[test]
+    fn test_orphan_sweep_drop_table() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            ok(&rel, "default", "CREATE TABLE keep (id INTEGER PRIMARY KEY, s TEXT)").await;
+            ok(&rel, "default", "INSERT INTO keep VALUES (1, 'live')").await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, city TEXT)").await;
+            ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
+            for _ in 0..3 {
+                ok(&rel, "default", "INSERT INTO t (city) VALUES ('E')").await;
+            }
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let t = table_schema(&rel, "default", "t");
+            let t_id = t.table_id;
+            let ix_id = t.indexes.iter().find(|i| i.name == "t_city").unwrap().index_id;
+            let keep_id = table_schema(&rel, "default", "keep").table_id;
 
-        rel.drop_object("default", "t").await.unwrap(); // catalog-only
+            rel.drop_object("default", "t").await.unwrap(); // catalog-only
 
-        let e = rel.engine();
-        assert!(!e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty());
-        assert!(!e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty());
-        assert!(!e.scan_keys(&keys::seq_key(&prefix, t_id)).await.unwrap().is_empty());
+            let e = rel.engine();
+            assert!(!e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty());
+            assert!(!e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty());
+            assert!(!e.scan_keys(&keys::seq_key(&prefix, t_id)).await.unwrap().is_empty());
 
-        purger(&rel, 100).purge_tick().await.unwrap();
+            purger(&rel, 100).purge_tick().await.unwrap();
 
-        assert!(e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty(), "orphan rows swept");
-        assert!(e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty(), "orphan index swept");
-        assert!(e.scan_keys(&keys::seq_key(&prefix, t_id)).await.unwrap().is_empty(), "orphan seq swept");
-        assert!(!e.scan_keys(&keys::row_table_prefix(&prefix, keep_id)).await.unwrap().is_empty(), "live table intact");
-        rel.shutdown().await;
+            assert!(e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty(), "orphan rows swept");
+            assert!(e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty(), "orphan index swept");
+            assert!(e.scan_keys(&keys::seq_key(&prefix, t_id)).await.unwrap().is_empty(), "orphan seq swept");
+            assert!(!e.scan_keys(&keys::row_table_prefix(&prefix, keep_id)).await.unwrap().is_empty(), "live table intact");
+            rel.shutdown().await;
+        })
     }
 
     // 9. Orphan sweep after DROP INDEX: only the dropped index_id's IDX entries
     //    go; the table's rows and other indexes stay.
-    #[tokio::test]
-    async fn test_orphan_sweep_drop_index() {
-        let (rel, _dir) = make().await;
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
-        ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
-        ok(&rel, "default", "INSERT INTO t VALUES (1, 'E'), (2, 'F')").await;
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let t = table_schema(&rel, "default", "t");
-        let t_id = t.table_id;
-        let ix_id = t.indexes.iter().find(|i| i.name == "t_city").unwrap().index_id;
-        assert!(!rel.engine().scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty());
+    #[test]
+    fn test_orphan_sweep_drop_index() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
+            ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
+            ok(&rel, "default", "INSERT INTO t VALUES (1, 'E'), (2, 'F')").await;
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let t = table_schema(&rel, "default", "t");
+            let t_id = t.table_id;
+            let ix_id = t.indexes.iter().find(|i| i.name == "t_city").unwrap().index_id;
+            assert!(!rel.engine().scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty());
 
-        rel.execute("default", "DROP INDEX t_city", &[]).await.unwrap(); // catalog-only
+            rel.execute("default", "DROP INDEX t_city", &[]).await.unwrap(); // catalog-only
 
-        purger(&rel, 100).purge_tick().await.unwrap();
+            purger(&rel, 100).purge_tick().await.unwrap();
 
-        let e = rel.engine();
-        assert!(e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty(), "orphan index entries swept");
-        assert_eq!(e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().len(), 2, "rows intact");
-        rel.shutdown().await;
+            let e = rel.engine();
+            assert!(e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty(), "orphan index entries swept");
+            assert_eq!(e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().len(), 2, "rows intact");
+            rel.shutdown().await;
+        })
     }
 
     // 10. Orphan sweep is idempotent/crash-trivial: a second run after a full
     //     sweep is a no-op (candidates re-derived, all probes empty).
-    #[tokio::test]
-    async fn test_orphan_sweep_idempotent() {
-        let (rel, _dir) = make().await;
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
-        ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
-        ok(&rel, "default", "INSERT INTO t VALUES (1, 'E')").await;
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let t_id = table_schema(&rel, "default", "t").table_id;
-        rel.drop_object("default", "t").await.unwrap();
+    #[test]
+    fn test_orphan_sweep_idempotent() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
+            ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
+            ok(&rel, "default", "INSERT INTO t VALUES (1, 'E')").await;
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let t_id = table_schema(&rel, "default", "t").table_id;
+            rel.drop_object("default", "t").await.unwrap();
 
-        let p = purger(&rel, 100);
-        p.purge_tick().await.unwrap();
-        let before = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
-        p.purge_tick().await.unwrap();
-        let after = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
-        assert_eq!(before, after, "second sweep is a no-op");
-        assert!(rel.engine().scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty());
-        rel.shutdown().await;
+            let p = purger(&rel, 100);
+            p.purge_tick().await.unwrap();
+            let before = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
+            p.purge_tick().await.unwrap();
+            let after = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
+            assert_eq!(before, after, "second sweep is a no-op");
+            assert!(rel.engine().scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty());
+            rel.shutdown().await;
+        })
     }
 
     // 11. Never-reuse: after DROP t + orphan purge, a same-named new table gets
     //     a fresh id (> old); no collision with old data.
-    #[tokio::test]
-    async fn test_never_reuse_after_orphan_purge() {
-        let (rel, _dir) = make().await;
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        let old_id = table_schema(&rel, "default", "t").table_id;
-        ok(&rel, "default", "INSERT INTO t VALUES (1)").await;
-        rel.drop_object("default", "t").await.unwrap();
-        purger(&rel, 100).purge_tick().await.unwrap();
+    #[test]
+    fn test_never_reuse_after_orphan_purge() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            let old_id = table_schema(&rel, "default", "t").table_id;
+            ok(&rel, "default", "INSERT INTO t VALUES (1)").await;
+            rel.drop_object("default", "t").await.unwrap();
+            purger(&rel, 100).purge_tick().await.unwrap();
 
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        let new_id = table_schema(&rel, "default", "t").table_id;
-        assert!(new_id > old_id, "new id {new_id} must exceed old {old_id}");
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        assert!(rel.engine().scan_keys(&keys::row_table_prefix(&prefix, new_id)).await.unwrap().is_empty());
-        rel.shutdown().await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            let new_id = table_schema(&rel, "default", "t").table_id;
+            assert!(new_id > old_id, "new id {new_id} must exceed old {old_id}");
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            assert!(rel.engine().scan_keys(&keys::row_table_prefix(&prefix, new_id)).await.unwrap().is_empty());
+            rel.shutdown().await;
+        })
     }
 
     // 12. Regression (§3): an in-flight writer parked on the write guard before
     //     delete_domain must abort (410/404) instead of landing keys after the
     //     purger finalized — no orphan ROW keys survive.
-    #[tokio::test]
-    async fn test_inflight_write_cannot_land_after_finalize() {
-        let (rel, _dir) = make().await;
-        rel.create_domain("doomed").await.unwrap();
-        ok(&rel, "doomed", "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").await;
-        let prefix = rel.get_domain("doomed").unwrap().system_prefix;
+    #[test]
+    fn test_inflight_write_cannot_land_after_finalize() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            rel.create_domain("doomed").await.unwrap();
+            ok(&rel, "doomed", "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").await;
+            let prefix = rel.get_domain("doomed").unwrap().system_prefix;
 
-        // Park an in-flight writer on the write guard held by the test.
-        let guard = rel.write_guard.lock().await;
-        let writer = tokio::spawn({
-            let rel = Arc::clone(&rel);
-            async move { rel.execute("doomed", "INSERT INTO t VALUES (1, 1)", &[]).await }
-        });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        rel.delete_domain("doomed").await.unwrap();
-        // The purger must block on the same guard instead of finalizing.
-        let tick = tokio::spawn({
+            // Park an in-flight writer on the write guard held by the test.
+            let guard = rel.write_guard.lock().await;
+            let writer = compio::runtime::spawn({
+                let rel = Arc::clone(&rel);
+                async move { rel.execute("doomed", "INSERT INTO t VALUES (1, 1)", &[]).await }
+            });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            rel.delete_domain("doomed").await.unwrap();
+            // The purger must block on the same guard instead of finalizing.
+            let tick = compio::runtime::spawn({
+                let p = purger(&rel, 100);
+                async move { p.purge_tick().await }
+            });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert!(rel.get_domain_any("doomed").is_some(), "purger must not finalize while a writer is in flight");
+            drop(guard);
+
+            let err = writer.await.unwrap().unwrap_err();
+            assert!(
+                matches!(err, RelStoreError::DomainDeleting(_) | RelStoreError::DomainNotFound(_)),
+                "got: {err}"
+            );
+            tick.await.unwrap().unwrap();
+            // Belt and suspenders: make sure it is fully finalized and clean.
             let p = purger(&rel, 100);
-            async move { p.purge_tick().await }
-        });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert!(rel.get_domain_any("doomed").is_some(), "purger must not finalize while a writer is in flight");
-        drop(guard);
-
-        let err = writer.await.unwrap().unwrap_err();
-        assert!(
-            matches!(err, RelStoreError::DomainDeleting(_) | RelStoreError::DomainNotFound(_)),
-            "got: {err}"
-        );
-        tick.await.unwrap().unwrap();
-        // Belt and suspenders: make sure it is fully finalized and clean.
-        let p = purger(&rel, 100);
-        p.purge_tick().await.unwrap();
-        assert!(rel.get_domain_any("doomed").is_none());
-        assert!(
-            rel.engine().scan_keys(&keys::row_domain_prefix(&prefix)).await.unwrap().is_empty(),
-            "no orphan ROW keys may survive the purge"
-        );
-        rel.shutdown().await;
+            p.purge_tick().await.unwrap();
+            assert!(rel.get_domain_any("doomed").is_none());
+            assert!(
+                rel.engine().scan_keys(&keys::row_domain_prefix(&prefix)).await.unwrap().is_empty(),
+                "no orphan ROW keys may survive the purge"
+            );
+            rel.shutdown().await;
+        })
     }
 
     // 13. Metrics: rel_purged_keys_total grows with tombstoned keys;
     //     rel_orphan_ranges_purged_total counts reaped orphan ranges.
-    #[tokio::test]
-    async fn test_metrics_counters() {
-        let (rel, _dir) = make().await;
-        seed_doomed(&rel).await;
-        rel.delete_domain("doomed").await.unwrap();
-        let keys_before = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
-        let p = purger(&rel, 100);
-        p.purge_tick().await.unwrap();
-        let keys_after = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
-        assert!(keys_after > keys_before, "purged-keys counter grew");
+    #[test]
+    fn test_metrics_counters() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            seed_doomed(&rel).await;
+            rel.delete_domain("doomed").await.unwrap();
+            let keys_before = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
+            let p = purger(&rel, 100);
+            p.purge_tick().await.unwrap();
+            let keys_after = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
+            assert!(keys_after > keys_before, "purged-keys counter grew");
 
-        // Orphan ranges via a DROP TABLE in an active domain (rows + index).
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
-        ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
-        ok(&rel, "default", "INSERT INTO t VALUES (1, 'E')").await;
-        rel.drop_object("default", "t").await.unwrap();
-        let ranges_before = rel.metrics.system.rel_orphan_ranges_purged_total.load(Ordering::Relaxed);
-        p.purge_tick().await.unwrap();
-        let ranges_after = rel.metrics.system.rel_orphan_ranges_purged_total.load(Ordering::Relaxed);
-        assert!(ranges_after > ranges_before, "orphan-ranges counter grew");
-        rel.shutdown().await;
+            // Orphan ranges via a DROP TABLE in an active domain (rows + index).
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
+            ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
+            ok(&rel, "default", "INSERT INTO t VALUES (1, 'E')").await;
+            rel.drop_object("default", "t").await.unwrap();
+            let ranges_before = rel.metrics.system.rel_orphan_ranges_purged_total.load(Ordering::Relaxed);
+            p.purge_tick().await.unwrap();
+            let ranges_after = rel.metrics.system.rel_orphan_ranges_purged_total.load(Ordering::Relaxed);
+            assert!(ranges_after > ranges_before, "orphan-ranges counter grew");
+            rel.shutdown().await;
+        })
     }
 
     // 14. Orphan sweep budget: a small batch caps a single tick's deletions
     //     and forces several ticks to fully drain the orphan ranges.
-    #[tokio::test]
-    async fn test_orphan_sweep_converges_in_small_batches() {
-        let (rel, _dir) = make().await;
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
-        ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
-        for i in 1..=5 {
-            ok(&rel, "default", &format!("INSERT INTO t VALUES ({i}, 'c{i}')")).await;
-        }
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let t = table_schema(&rel, "default", "t");
-        let t_id = t.table_id;
-        let ix_id = t.indexes.iter().find(|i| i.name == "t_city").unwrap().index_id;
-
-        rel.drop_object("default", "t").await.unwrap();
-
-        let p = purger(&rel, 2);
-        let mut ticks = 0;
-        loop {
-            let before = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
-            p.purge_tick().await.unwrap();
-            let delta = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed) - before;
-            assert!(delta <= 2, "one tick must not delete more than batch_size keys, got {delta}");
-            ticks += 1;
-            let e = rel.engine();
-            let done = e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty()
-                && e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty();
-            if done {
-                break;
+    #[test]
+    fn test_orphan_sweep_converges_in_small_batches() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
+            ok(&rel, "default", "CREATE INDEX t_city ON t (city)").await;
+            for i in 1..=5 {
+                ok(&rel, "default", &format!("INSERT INTO t VALUES ({i}, 'c{i}')")).await;
             }
-            assert!(ticks < 20, "orphan sweep did not converge with small batches");
-        }
-        assert!(ticks > 1, "10 orphan keys must not fit in a single batch of 2");
-        rel.shutdown().await;
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let t = table_schema(&rel, "default", "t");
+            let t_id = t.table_id;
+            let ix_id = t.indexes.iter().find(|i| i.name == "t_city").unwrap().index_id;
+
+            rel.drop_object("default", "t").await.unwrap();
+
+            let p = purger(&rel, 2);
+            let mut ticks = 0;
+            loop {
+                let before = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed);
+                p.purge_tick().await.unwrap();
+                let delta = rel.metrics.system.rel_purged_keys_total.load(Ordering::Relaxed) - before;
+                assert!(delta <= 2, "one tick must not delete more than batch_size keys, got {delta}");
+                ticks += 1;
+                let e = rel.engine();
+                let done = e.scan_keys(&keys::row_table_prefix(&prefix, t_id)).await.unwrap().is_empty()
+                    && e.scan_keys(&keys::index_value_prefix(&prefix, ix_id, &[])).await.unwrap().is_empty();
+                if done {
+                    break;
+                }
+                assert!(ticks < 20, "orphan sweep did not converge with small batches");
+            }
+            assert!(ticks > 1, "10 orphan keys must not fit in a single batch of 2");
+            rel.shutdown().await;
+        })
     }
 
     // 15. Regression (rel/013 F1): the orphan sweep must spare an index id that
@@ -611,57 +640,61 @@ mod tests {
     //     create_index_reserve→commit window). The reserved id is past the
     //     high-water mark but not yet catalog-live, so without the reservation
     //     guard the sweep would reap its freshly backfilled IDX bytes.
-    #[tokio::test]
-    async fn test_orphan_sweep_spares_reserved_index_id() {
-        let (rel, _dir) = make().await;
-        ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
+    #[test]
+    fn test_orphan_sweep_spares_reserved_index_id() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            ok(&rel, "default", "CREATE TABLE t (id INTEGER PRIMARY KEY, city TEXT)").await;
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
 
-        // Reserve an index id without committing it: the id is now allocated
-        // (hwm bumped) and reserved, but not catalog-live.
-        let (_dom, _schema, meta) = rel
-            .catalog()
-            .create_index_reserve(&rel.domains, "default", "t", "t_city", "city", false)
-            .await
-            .unwrap();
-        // Simulate the backfill that runs inside that window: an IDX entry for
-        // the reserved id (empty value, exactly as the real backfill writes).
-        let idx_key = keys::index_key(&prefix, meta.index_id, b"Essen", b"\x00\x00\x00\x01");
-        rel.engine()
-            .write_batch(vec![BatchOp::Put { key: idx_key, value: Vec::new() }])
-            .await
-            .unwrap();
-
-        purger(&rel, 100).purge_tick().await.unwrap();
-
-        assert!(
-            !rel.engine()
-                .scan_keys(&keys::index_value_prefix(&prefix, meta.index_id, &[]))
+            // Reserve an index id without committing it: the id is now allocated
+            // (hwm bumped) and reserved, but not catalog-live.
+            let (_dom, _schema, meta) = rel
+                .catalog()
+                .create_index_reserve(&rel.domains, "default", "t", "t_city", "city", false)
                 .await
-                .unwrap()
-                .is_empty(),
-            "a reserved index id's IDX bytes must survive the orphan sweep"
-        );
-        rel.shutdown().await;
+                .unwrap();
+            // Simulate the backfill that runs inside that window: an IDX entry for
+            // the reserved id (empty value, exactly as the real backfill writes).
+            let idx_key = keys::index_key(&prefix, meta.index_id, b"Essen", b"\x00\x00\x00\x01");
+            rel.engine()
+                .write_batch(vec![BatchOp::Put { key: idx_key, value: Vec::new() }])
+                .await
+                .unwrap();
+
+            purger(&rel, 100).purge_tick().await.unwrap();
+
+            assert!(
+                !rel.engine()
+                    .scan_keys(&keys::index_value_prefix(&prefix, meta.index_id, &[]))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a reserved index id's IDX bytes must survive the orphan sweep"
+            );
+            rel.shutdown().await;
+        })
     }
 
     // 16. Regression (rel/009 F2): finalizing a deleting domain drops its
     //     rate-limiter bucket, so a recreated same-name domain cannot inherit
     //     the old (possibly drained) bucket state.
-    #[tokio::test]
-    async fn test_finalize_drops_rate_limiter() {
-        let (rel, _dir) = make().await;
-        rel.create_domain("doomed").await.unwrap();
-        // A request lazily creates the per-domain bucket.
-        rel.check_domain_budget("doomed", true);
-        assert!(rel.has_rate_limiter("doomed"), "bucket exists after a request");
+    #[test]
+    fn test_finalize_drops_rate_limiter() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            rel.create_domain("doomed").await.unwrap();
+            // A request lazily creates the per-domain bucket.
+            rel.check_domain_budget("doomed", true);
+            assert!(rel.has_rate_limiter("doomed"), "bucket exists after a request");
 
-        rel.delete_domain("doomed").await.unwrap();
-        // Empty domain: one tick finds no data and finalizes immediately.
-        purger(&rel, 100).purge_tick().await.unwrap();
+            rel.delete_domain("doomed").await.unwrap();
+            // Empty domain: one tick finds no data and finalizes immediately.
+            purger(&rel, 100).purge_tick().await.unwrap();
 
-        assert!(rel.get_domain_any("doomed").is_none(), "domain finalized");
-        assert!(!rel.has_rate_limiter("doomed"), "rate-limiter bucket dropped on finalize");
-        rel.shutdown().await;
+            assert!(rel.get_domain_any("doomed").is_none(), "domain finalized");
+            assert!(!rel.has_rate_limiter("doomed"), "rate-limiter bucket dropped on finalize");
+            rel.shutdown().await;
+        })
     }
 }

@@ -266,131 +266,137 @@ mod tests {
     }
 
     // Dispatch smoke test: every DdlPlan variant reaches its catalog primitive.
-    #[tokio::test]
-    async fn test_dispatch_create_alter_index_drop() {
-        let (domains, catalog, metrics, _dir) = make_ctx().await;
+    #[test]
+    fn test_dispatch_create_alter_index_drop() {
+        crate::core::engine_runtime::block_on(async {
+            let (domains, catalog, metrics, _dir) = make_ctx().await;
 
-        let mut pk = ColumnInput::new("id", ColumnType::Integer);
-        pk.primary_key = true;
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DdlOutcome::TableCreated(_)));
+            let mut pk = ColumnInput::new("id", ColumnType::Integer);
+            pk.primary_key = true;
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, DdlOutcome::TableCreated(_)));
 
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::AddColumn {
-                table: "t".to_string(),
-                column: ColumnInput::new("age", ColumnType::Integer),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DdlOutcome::TableAltered { .. }));
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::AddColumn {
+                    table: "t".to_string(),
+                    column: ColumnInput::new("age", ColumnType::Integer),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, DdlOutcome::TableAltered { .. }));
 
-        // CREATE/DROP INDEX go through RelEngine::execute_create_index (backfill
-        // path) and RelEngine::execute; see mod.rs test 18 and dml.rs test 23.
+            // CREATE/DROP INDEX go through RelEngine::execute_create_index (backfill
+            // path) and RelEngine::execute; see mod.rs test 18 and dml.rs test 23.
 
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::DropTable { table: "t".to_string() },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DdlOutcome::TableDropped { .. }));
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::DropTable { table: "t".to_string() },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, DdlOutcome::TableDropped { .. }));
+        })
     }
 
     // DROP TABLE on a view name (or a missing name) -> TableNotFound, not a
     // silent view delete.
-    #[tokio::test]
-    async fn test_drop_table_rejects_view_and_missing() {
-        let (domains, catalog, metrics, _dir) = make_ctx().await;
-        catalog.create_view(&domains, "default", "v", "SELECT 1").await.unwrap();
+    #[test]
+    fn test_drop_table_rejects_view_and_missing() {
+        crate::core::engine_runtime::block_on(async {
+            let (domains, catalog, metrics, _dir) = make_ctx().await;
+            catalog.create_view(&domains, "default", "v", "SELECT 1").await.unwrap();
 
-        let err = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::DropTable { table: "v".to_string() },
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
-        // The view must still be there.
-        assert!(catalog.get(&domains, "default", "v").is_ok());
+            let err = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::DropTable { table: "v".to_string() },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            // The view must still be there.
+            assert!(catalog.get(&domains, "default", "v").is_ok());
 
-        let err = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::DropTable { table: "ghost".to_string() },
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            let err = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::DropTable { table: "ghost".to_string() },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+        })
     }
 
     // Spec general/018 §2.1: RENAME TABLE fills `renamed_from` with the old
     // name (needed to publish it as a `table_dropped` event); every other
     // ALTER TABLE variant leaves it `None`.
-    #[tokio::test]
-    async fn test_table_altered_renamed_from_only_set_by_rename_table() {
-        let (domains, catalog, metrics, _dir) = make_ctx().await;
-        let mut pk = ColumnInput::new("id", ColumnType::Integer);
-        pk.primary_key = true;
-        execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn test_table_altered_renamed_from_only_set_by_rename_table() {
+        crate::core::engine_runtime::block_on(async {
+            let (domains, catalog, metrics, _dir) = make_ctx().await;
+            let mut pk = ColumnInput::new("id", ColumnType::Integer);
+            pk.primary_key = true;
+            execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
+            )
+            .await
+            .unwrap();
 
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::AddColumn { table: "t".to_string(), column: ColumnInput::new("age", ColumnType::Integer) },
-        )
-        .await
-        .unwrap();
-        match outcome {
-            DdlOutcome::TableAltered { renamed_from, .. } => assert_eq!(renamed_from, None, "ADD COLUMN must not set renamed_from"),
-            other => panic!("expected TableAltered, got {other:?}"),
-        }
-
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::RenameTable { table: "t".to_string(), to: "t2".to_string() },
-        )
-        .await
-        .unwrap();
-        match outcome {
-            DdlOutcome::TableAltered { schema, renamed_from } => {
-                assert_eq!(renamed_from, Some("t".to_string()));
-                assert_eq!(schema.name, "t2");
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::AddColumn { table: "t".to_string(), column: ColumnInput::new("age", ColumnType::Integer) },
+            )
+            .await
+            .unwrap();
+            match outcome {
+                DdlOutcome::TableAltered { renamed_from, .. } => assert_eq!(renamed_from, None, "ADD COLUMN must not set renamed_from"),
+                other => panic!("expected TableAltered, got {other:?}"),
             }
-            other => panic!("expected TableAltered, got {other:?}"),
-        }
+
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::RenameTable { table: "t".to_string(), to: "t2".to_string() },
+            )
+            .await
+            .unwrap();
+            match outcome {
+                DdlOutcome::TableAltered { schema, renamed_from } => {
+                    assert_eq!(renamed_from, Some("t".to_string()));
+                    assert_eq!(schema.name, "t2");
+                }
+                other => panic!("expected TableAltered, got {other:?}"),
+            }
+        })
     }
 }

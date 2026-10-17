@@ -198,31 +198,37 @@ mod tests {
 
     // rel/021: the guard lives in the result, so the registered stamp covers
     // the expand lookups and everything the caller does with the result.
-    #[tokio::test]
-    async fn test_select_expand_keeps_snapshot_registered_until_result_dropped() {
-        let (rel, _dir) = make_parent_child().await;
-        let (alive, after_drop, expanded) = active_counts(&rel, "SELECT * FROM child", &["pid"]).await;
-        assert_eq!(alive, 1, "result must hold the registered snapshot");
-        assert_eq!(after_drop, 0, "dropping the result deregisters it");
-        assert_eq!(expanded.unwrap()[0].1, vec![json!({"id": 7, "name": "p"})]);
+    #[test]
+    fn test_select_expand_keeps_snapshot_registered_until_result_dropped() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_parent_child().await;
+            let (alive, after_drop, expanded) = active_counts(&rel, "SELECT * FROM child", &["pid"]).await;
+            assert_eq!(alive, 1, "result must hold the registered snapshot");
+            assert_eq!(after_drop, 0, "dropping the result deregisters it");
+            assert_eq!(expanded.unwrap()[0].1, vec![json!({"id": 7, "name": "p"})]);
+        })
     }
 
-    #[tokio::test]
-    async fn test_join_select_expand_keeps_snapshot_registered_until_result_dropped() {
-        let (rel, _dir) = make_parent_child().await;
-        let sql = "SELECT c.id, c.pid FROM child c LEFT JOIN parent p ON c.pid = p.id";
-        let (alive, after_drop, expanded) = active_counts(&rel, sql, &["pid"]).await;
-        assert_eq!(alive, 1, "result must hold the registered snapshot");
-        assert_eq!(after_drop, 0, "dropping the result deregisters it");
-        assert_eq!(expanded.unwrap()[0].1, vec![json!({"id": 7, "name": "p"})]);
+    #[test]
+    fn test_join_select_expand_keeps_snapshot_registered_until_result_dropped() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_parent_child().await;
+            let sql = "SELECT c.id, c.pid FROM child c LEFT JOIN parent p ON c.pid = p.id";
+            let (alive, after_drop, expanded) = active_counts(&rel, sql, &["pid"]).await;
+            assert_eq!(alive, 1, "result must hold the registered snapshot");
+            assert_eq!(after_drop, 0, "dropping the result deregisters it");
+            assert_eq!(expanded.unwrap()[0].1, vec![json!({"id": 7, "name": "p"})]);
+        })
     }
 
-    #[tokio::test]
-    async fn test_count_star_holds_no_snapshot_after_return() {
-        let (rel, _dir) = make_parent_child().await;
-        for sql in ["SELECT COUNT(*) FROM child", "SELECT COUNT(*) FROM child c LEFT JOIN parent p ON c.pid = p.id"] {
-            let (alive, after_drop, _) = active_counts(&rel, sql, &[]).await;
-            assert_eq!((alive, after_drop), (0, 0), "{sql}");
-        }
+    #[test]
+    fn test_count_star_holds_no_snapshot_after_return() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_parent_child().await;
+            for sql in ["SELECT COUNT(*) FROM child", "SELECT COUNT(*) FROM child c LEFT JOIN parent p ON c.pid = p.id"] {
+                let (alive, after_drop, _) = active_counts(&rel, sql, &[]).await;
+                assert_eq!((alive, after_drop), (0, 0), "{sql}");
+            }
+        })
     }
 }

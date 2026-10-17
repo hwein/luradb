@@ -270,18 +270,20 @@ mod tests {
     // 010-F1(c): a mixed-case `?col=` filter name must resolve against the
     // (always-lowercase) catalog column, same as the equivalent /sql WHERE.
     // Pre-fix: "Amount" != "amount" -> InvalidSchema("unknown filter column").
-    #[tokio::test]
-    async fn test_browse_rows_filter_normalizes_mixed_case_column() {
-        let (rel, _dir) = make_engine().await;
-        make_orders_with_rows(&rel).await;
+    #[test]
+    fn test_browse_rows_filter_normalizes_mixed_case_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            make_orders_with_rows(&rel).await;
 
-        let mut filters = HashMap::new();
-        filters.insert("Amount".to_string(), "50".to_string());
-        let (result, _, _, _) =
-            rel.browse_rows("default", "orders", &filters, &[], None, None, LinkAuth::full()).await.unwrap();
+            let mut filters = HashMap::new();
+            filters.insert("Amount".to_string(), "50".to_string());
+            let (result, _, _, _) =
+                rel.browse_rows("default", "orders", &filters, &[], None, None, LinkAuth::full()).await.unwrap();
 
-        assert_eq!(result.rows.len(), 1, "exactly the row with amount=50 must match");
-        let idx = result.columns.iter().position(|(n, _)| n.as_str() == "id").unwrap();
-        assert_eq!(result.rows[0][idx], ScalarValue::Integer(1));
+            assert_eq!(result.rows.len(), 1, "exactly the row with amount=50 must match");
+            let idx = result.columns.iter().position(|(n, _)| n.as_str() == "id").unwrap();
+            assert_eq!(result.rows[0][idx], ScalarValue::Integer(1));
+        })
     }
 }

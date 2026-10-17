@@ -4,7 +4,7 @@
 //! bytes that are never reclaimed by the compaction process (which only rewrites
 //! the SSTable index, not the vLog payloads).
 //!
-//! The Janitor runs as a background Tokio task and reclaims dead space by
+//! The Janitor runs as a background engine task and reclaims dead space by
 //! rolling the vLog forward one *generation* per cycle (spec kv/017):
 //!
 //! 1. Gate on the estimated dead-byte ratio; below the threshold, skip.
@@ -24,6 +24,7 @@
 //! All steps are performed without holding any write-path locks for extended
 //! periods, so normal reads and writes are never stalled.
 
+use crate::core::engine_runtime::spawn_io;
 use crate::core::storage_thread::StorageHandle;
 use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::engine::LsmStorageEngine;
@@ -43,8 +44,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use compio::time::sleep;
+use std::time::Duration;
 use tokio::sync::watch;
-use tokio::time::{sleep, Duration};
 
 /// Engine callback that freezes and flushes every MemTable. Injected at
 /// construction because the Janitor knows nothing about MemTables.
@@ -254,7 +256,7 @@ impl Janitor {
 
     /// Runs the Janitor's periodic GC loop.
     ///
-    /// Intended to be spawned as a Tokio task via `tokio::spawn`. `shutdown_rx`
+    /// Intended to be spawned as a task of the engine runtime. `shutdown_rx`
     /// wakes the loop immediately on shutdown (spec general/023 M2) instead of
     /// sleeping out the full `check_interval_secs`, which defaults to 60s.
     pub async fn run_background(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
@@ -563,7 +565,8 @@ impl Janitor {
             doomed
         };
         for vlog in doomed {
-            if let Err(e) = tokio::fs::remove_file(vlog.path()).await {
+            let path = vlog.path().to_path_buf();
+            if let Err(e) = spawn_io(async move { compio::fs::remove_file(path).await }).await {
                 eprintln!("[Janitor] Warning: could not delete vLog generation {}: {e}", vlog.id());
             }
         }
@@ -611,15 +614,16 @@ impl Janitor {
         }
 
         let sstable_data = builder.finish()?;
+        let file_size = sstable_data.len() as u64;
         let new_file_id = self.file_manager.allocate_file_id();
-        self.file_manager.write_sstable(new_file_id, &sstable_data).await?;
+        self.file_manager.write_sstable(new_file_id, sstable_data).await?;
 
         Ok(SSTableMetadata {
             file_id: new_file_id,
             level: level_idx,
             smallest_key: smallest_key.unwrap_or_default(),
             largest_key: largest_key.unwrap_or_default(),
-            file_size: sstable_data.len() as u64,
+            file_size,
             // Same entries, only their vLog pointers move.
             max_timestamp: meta.max_timestamp,
         })
@@ -789,7 +793,7 @@ mod tests {
             ValuePointer { file_id: 1, value_offset: live_off, value_len: 100, expire_at: 0 },
         );
         let sst = builder.finish().unwrap();
-        file_manager.write_sstable(file_id, &sst).await.unwrap();
+        let sst = file_manager.write_sstable(file_id, sst).await.unwrap();
 
         let mut manifest = Manifest::new();
         manifest.add_sstable(SSTableMetadata {
@@ -833,92 +837,98 @@ mod tests {
     // Finding 3: a GC pass with an active storage thread must leave the vLog
     // reachable *through the thread* — remote append/read keep working after the
     // swap and the reclaimed offsets line up.
-    #[tokio::test]
-    async fn test_gc_survives_with_storage_thread() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut fx = storage_thread_fixture(dir.path()).await;
+    #[test]
+    fn test_gc_survives_with_storage_thread() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut fx = storage_thread_fixture(dir.path()).await;
 
-        let stats = fx.janitor.run_gc().await.unwrap();
-        assert!(stats.ran, "900/1000 dead bytes must trigger GC");
-        assert_eq!(stats.reclaimed_bytes, 900);
-        assert_eq!(stats.new_generation, 2, "live values were copied into 2");
+            let stats = fx.janitor.run_gc().await.unwrap();
+            assert!(stats.ran, "900/1000 dead bytes must trigger GC");
+            assert_eq!(stats.reclaimed_bytes, 900);
+            assert_eq!(stats.new_generation, 2, "live values were copied into 2");
 
-        // The thread rolled a further generation instead of taking over the
-        // copy target; both stay registered.
-        let version = fx.version.get();
-        let swapped = Arc::clone(&version.active_vlog);
-        assert_eq!(swapped.id(), 3);
-        assert_eq!(swapped.path(), generation_path(&fx.vlog_path, 3));
-        assert_eq!(version.vlog_ids(), vec![2, 3]);
+            // The thread rolled a further generation instead of taking over the
+            // copy target; both stay registered.
+            let version = fx.version.get();
+            let swapped = Arc::clone(&version.active_vlog);
+            assert_eq!(swapped.id(), 3);
+            assert_eq!(swapped.path(), generation_path(&fx.vlog_path, 3));
+            assert_eq!(version.vlog_ids(), vec![2, 3]);
 
-        // The live value survives at its remapped offset (0 — first value
-        // copied) in the copy generation, which is sealed.
-        assert_eq!(version.vlog[&2].read(0, 100).unwrap(), fx.live_val);
-        assert!(version.vlog[&2].is_sealed());
+            // The live value survives at its remapped offset (0 — first value
+            // copied) in the copy generation, which is sealed.
+            assert_eq!(version.vlog[&2].read(0, 100).unwrap(), fx.live_val);
+            assert!(version.vlog[&2].is_sealed());
 
-        // Remote append still routes through the thread and starts at 0 in the
-        // fresh generation, the thread's own file.
-        let new_off = swapped.append(b"AFTER-GC").await.unwrap();
-        assert_eq!(new_off, 0);
-        assert_eq!(swapped.read(new_off, 8).unwrap(), b"AFTER-GC");
-        assert_eq!(std::fs::read(generation_path(&fx.vlog_path, 3)).unwrap(), b"AFTER-GC");
+            // Remote append still routes through the thread and starts at 0 in the
+            // fresh generation, the thread's own file.
+            let new_off = swapped.append(b"AFTER-GC").await.unwrap();
+            assert_eq!(new_off, 0);
+            assert_eq!(swapped.read(new_off, 8).unwrap(), b"AFTER-GC");
+            assert_eq!(std::fs::read(generation_path(&fx.vlog_path, 3)).unwrap(), b"AFTER-GC");
 
-        fx.st.shutdown();
+            fx.st.shutdown();
+        })
     }
 
     // Spec kv/031 test 7 (storage thread): reads never go through the thread,
     // so a source generation held across the GC still reads its own file,
     // which stays on disk until the holder lets go.
-    #[tokio::test]
-    async fn test_gc_keeps_a_held_source_generation_readable_until_released() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut fx = storage_thread_fixture(dir.path()).await;
-        let held = Arc::clone(&fx.version.get().vlog[&1]);
+    #[test]
+    fn test_gc_keeps_a_held_source_generation_readable_until_released() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut fx = storage_thread_fixture(dir.path()).await;
+            let held = Arc::clone(&fx.version.get().vlog[&1]);
 
-        assert!(fx.janitor.run_gc().await.unwrap().ran);
-        assert!(!fx.version.get().vlog.contains_key(&1), "generation 1 is retired");
-        assert_eq!(held.read(0, 100).unwrap(), fx.live_val, "the thread has moved on to generation 3");
-        assert!(fx.vlog_path.exists(), "a holder keeps the file");
+            assert!(fx.janitor.run_gc().await.unwrap().ran);
+            assert!(!fx.version.get().vlog.contains_key(&1), "generation 1 is retired");
+            assert_eq!(held.read(0, 100).unwrap(), fx.live_val, "the thread has moved on to generation 3");
+            assert!(fx.vlog_path.exists(), "a holder keeps the file");
 
-        drop(held);
-        assert!(!fx.janitor.run_gc().await.unwrap().ran, "nothing left to collect");
-        assert!(!fx.vlog_path.exists(), "the next run deletes the released generation");
+            drop(held);
+            assert!(!fx.janitor.run_gc().await.unwrap().ran, "nothing left to collect");
+            assert!(!fx.vlog_path.exists(), "the next run deletes the released generation");
 
-        fx.st.shutdown();
+            fx.st.shutdown();
+        })
     }
 
     // The two writers of a GC cycle never share a file: the thread owns its own
     // generation, so its appends cannot land on top of the copy target.
-    #[tokio::test]
-    async fn test_gc_storage_thread_generation_is_disjoint_from_copy_target() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut fx = storage_thread_fixture(dir.path()).await;
-        assert!(fx.janitor.run_gc().await.unwrap().ran);
+    #[test]
+    fn test_gc_storage_thread_generation_is_disjoint_from_copy_target() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut fx = storage_thread_fixture(dir.path()).await;
+            assert!(fx.janitor.run_gc().await.unwrap().ran);
 
-        // A late writer still holding the copy generation is bounced to the
-        // active one instead of writing a second cursor into that file.
-        let version = fx.version.get();
-        let copy_gen = Arc::clone(&version.vlog[&2]);
-        let active = Arc::clone(&version.active_vlog);
-        assert_ne!(copy_gen.path(), active.path());
-        assert!(matches!(copy_gen.append(b"late").await, Err(VLogError::Sealed { id: 2 })));
+            // A late writer still holding the copy generation is bounced to the
+            // active one instead of writing a second cursor into that file.
+            let version = fx.version.get();
+            let copy_gen = Arc::clone(&version.vlog[&2]);
+            let active = Arc::clone(&version.active_vlog);
+            assert_ne!(copy_gen.path(), active.path());
+            assert!(matches!(copy_gen.append(b"late").await, Err(VLogError::Sealed { id: 2 })));
 
-        let copy_len = std::fs::metadata(copy_gen.path()).unwrap().len();
-        assert_eq!(copy_len, 100);
+            let copy_len = std::fs::metadata(copy_gen.path()).unwrap().len();
+            assert_eq!(copy_len, 100);
 
-        // Thread appends fill the fresh generation from offset 0 and leave the
-        // copy generation byte-identical.
-        for i in 0..4u64 {
-            assert_eq!(active.append(&[b'T'; 10]).await.unwrap(), i * 10);
-        }
-        assert_eq!(std::fs::metadata(active.path()).unwrap().len(), 40);
-        assert_eq!(std::fs::metadata(copy_gen.path()).unwrap().len(), copy_len);
-        assert_eq!(copy_gen.read(0, 100).unwrap(), fx.live_val);
+            // Thread appends fill the fresh generation from offset 0 and leave the
+            // copy generation byte-identical.
+            for i in 0..4u64 {
+                assert_eq!(active.append(&[b'T'; 10]).await.unwrap(), i * 10);
+            }
+            assert_eq!(std::fs::metadata(active.path()).unwrap().len(), 40);
+            assert_eq!(std::fs::metadata(copy_gen.path()).unwrap().len(), copy_len);
+            assert_eq!(copy_gen.read(0, 100).unwrap(), fx.live_val);
 
-        fx.st.shutdown();
+            fx.st.shutdown();
+        })
     }
 
-    /// Builds a tokio-fs-path Janitor (no storage thread) over the given
+    /// Builds a local-file-path Janitor (no storage thread) over the given
     /// fixtures. No flush barrier: these fixtures have no MemTables.
     /// `janitor_runs` is passed straight through, so a caller that wants to
     /// inspect it keeps its own clone.
@@ -967,7 +977,7 @@ mod tests {
             );
         }
         let sst = builder.finish().unwrap();
-        file_manager.write_sstable(file_id, &sst).await.unwrap();
+        let sst = file_manager.write_sstable(file_id, sst).await.unwrap();
         SSTableMetadata {
             file_id,
             level,
@@ -979,181 +989,187 @@ mod tests {
     }
 
     // Skip gate: below min size OR below dead-ratio threshold → no-op, nothing touched.
-    #[tokio::test]
-    async fn test_gc_skips_below_thresholds() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let vlog_path = dir.path().join("vlog");
-        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-        let live_off = vlog.append(&vec![b'L'; 100]).await.unwrap();
-        vlog.append(&vec![b'D'; 900]).await.unwrap(); // dead_ratio = 0.9
+    #[test]
+    fn test_gc_skips_below_thresholds() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog_path = dir.path().join("vlog");
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            let live_off = vlog.append(&vec![b'L'; 100]).await.unwrap();
+            vlog.append(&vec![b'D'; 900]).await.unwrap(); // dead_ratio = 0.9
 
-        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-        let meta = write_pointer_sstable(&file_manager, &[(b"live-key", live_off, 100)], 0).await;
-        let mut manifest = Manifest::new();
-        manifest.add_sstable(meta.clone());
-        let manifest = Arc::new(RwLock::new(manifest));
-        let reader = LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false).await.unwrap();
-        let version = version_over(vlog, vec![(0, vec![Arc::new(reader)])]);
-        let before = Arc::clone(&version.get().active_vlog);
-        let janitor_runs = Arc::new(AtomicU64::new(0));
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let meta = write_pointer_sstable(&file_manager, &[(b"live-key", live_off, 100)], 0).await;
+            let mut manifest = Manifest::new();
+            manifest.add_sstable(meta.clone());
+            let manifest = Arc::new(RwLock::new(manifest));
+            let reader = LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false).await.unwrap();
+            let version = version_over(vlog, vec![(0, vec![Arc::new(reader)])]);
+            let before = Arc::clone(&version.get().active_vlog);
+            let janitor_runs = Arc::new(AtomicU64::new(0));
 
-        // (a) vLog smaller than min_vlog_size_bytes.
-        let janitor = build_janitor(
-            dir.path(),
-            Arc::clone(&version),
-            vlog_path.clone(),
-            Arc::clone(&manifest),
-            Arc::clone(&file_manager),
-            JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
-            Arc::clone(&janitor_runs),
-        );
-        let stats = janitor.run_gc().await.unwrap();
-        assert!(!stats.ran, "vlog below min size must skip");
+            // (a) vLog smaller than min_vlog_size_bytes.
+            let janitor = build_janitor(
+                dir.path(),
+                Arc::clone(&version),
+                vlog_path.clone(),
+                Arc::clone(&manifest),
+                Arc::clone(&file_manager),
+                JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
+                Arc::clone(&janitor_runs),
+            );
+            let stats = janitor.run_gc().await.unwrap();
+            assert!(!stats.ran, "vlog below min size must skip");
 
-        // (b) dead ratio below threshold.
-        let janitor = build_janitor(
-            dir.path(),
-            Arc::clone(&version),
-            vlog_path.clone(),
-            Arc::clone(&manifest),
-            Arc::clone(&file_manager),
-            JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.95, min_vlog_size_bytes: 1 },
-            Arc::clone(&janitor_runs),
-        );
-        let stats = janitor.run_gc().await.unwrap();
-        assert!(!stats.ran, "dead ratio below threshold must skip");
-        assert_eq!(stats.sstables_rebuilt, 0);
-        assert_eq!(janitor_runs.load(Ordering::Relaxed), 0, "skip cycles (ran == false) must not increment janitor_runs");
+            // (b) dead ratio below threshold.
+            let janitor = build_janitor(
+                dir.path(),
+                Arc::clone(&version),
+                vlog_path.clone(),
+                Arc::clone(&manifest),
+                Arc::clone(&file_manager),
+                JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.95, min_vlog_size_bytes: 1 },
+                Arc::clone(&janitor_runs),
+            );
+            let stats = janitor.run_gc().await.unwrap();
+            assert!(!stats.ran, "dead ratio below threshold must skip");
+            assert_eq!(stats.sstables_rebuilt, 0);
+            assert_eq!(janitor_runs.load(Ordering::Relaxed), 0, "skip cycles (ran == false) must not increment janitor_runs");
 
-        // Nothing was touched: same vLog Arc, no new generation, SSTable intact.
-        let after = Arc::clone(&version.get().active_vlog);
-        assert!(Arc::ptr_eq(&before, &after));
-        assert!(!generation_path(&vlog_path, 2).exists());
-        assert_eq!(manifest.read().get_level(0)[0].file_id, meta.file_id);
-        assert!(file_manager.read_sstable(meta.file_id).await.is_ok());
+            // Nothing was touched: same vLog Arc, no new generation, SSTable intact.
+            let after = Arc::clone(&version.get().active_vlog);
+            assert!(Arc::ptr_eq(&before, &after));
+            assert!(!generation_path(&vlog_path, 2).exists());
+            assert_eq!(manifest.read().get_level(0)[0].file_id, meta.file_id);
+            assert!(file_manager.read_sstable(meta.file_id).await.is_ok());
+        })
     }
 
     // Collect-phase read errors are non-fatal: the table is skipped, the cycle continues.
-    #[tokio::test]
-    async fn test_gc_unreadable_sstable_skipped_not_fatal() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let vlog_path = dir.path().join("vlog");
-        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-        vlog.append(&vec![b'D'; 100]).await.unwrap();
+    #[test]
+    fn test_gc_unreadable_sstable_skipped_not_fatal() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog_path = dir.path().join("vlog");
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            vlog.append(&vec![b'D'; 100]).await.unwrap();
 
-        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-        let mut manifest = Manifest::new();
-        manifest.add_sstable(SSTableMetadata {
-            file_id: 999, // no such file on disk
-            level: 0,
-            smallest_key: b"a".to_vec(),
-            largest_key: b"z".to_vec(),
-            file_size: 1,
-            max_timestamp: 0,
-        });
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let mut manifest = Manifest::new();
+            manifest.add_sstable(SSTableMetadata {
+                file_id: 999, // no such file on disk
+                level: 0,
+                smallest_key: b"a".to_vec(),
+                largest_key: b"z".to_vec(),
+                file_size: 1,
+                max_timestamp: 0,
+            });
 
-        let janitor = build_janitor(
-            dir.path(),
-            version_over(vlog, Vec::new()),
-            vlog_path,
-            Arc::new(RwLock::new(manifest)),
-            file_manager,
-            JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
-            Arc::new(AtomicU64::new(0)),
-        );
+            let janitor = build_janitor(
+                dir.path(),
+                version_over(vlog, Vec::new()),
+                vlog_path,
+                Arc::new(RwLock::new(manifest)),
+                file_manager,
+                JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 10_000 },
+                Arc::new(AtomicU64::new(0)),
+            );
 
-        // With `?` instead of `continue` in the collect phase this would be Err.
-        let stats = janitor.run_gc().await.unwrap();
-        assert!(!stats.ran);
+            // With `?` instead of `continue` in the collect phase this would be Err.
+            let stats = janitor.run_gc().await.unwrap();
+            assert!(!stats.ran);
+        })
     }
 
-    // Full cycle on the tokio-fs path: multi-level rebuild + duplicate-offset dedup.
-    #[tokio::test]
-    async fn test_gc_rebuilds_multiple_levels_and_dedups_offsets() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let vlog_path = dir.path().join("vlog");
-        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-        let val_a = vec![b'A'; 100];
-        let val_b = vec![b'B'; 100];
-        let off_a = vlog.append(&val_a).await.unwrap();
-        let off_b = vlog.append(&val_b).await.unwrap();
-        vlog.append(&vec![b'D'; 800]).await.unwrap(); // dead
-        assert_eq!(vlog.size(), 1000);
+    // Full cycle on the local-file path: multi-level rebuild + duplicate-offset dedup.
+    #[test]
+    fn test_gc_rebuilds_multiple_levels_and_dedups_offsets() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog_path = dir.path().join("vlog");
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            let val_a = vec![b'A'; 100];
+            let val_b = vec![b'B'; 100];
+            let off_a = vlog.append(&val_a).await.unwrap();
+            let off_b = vlog.append(&val_b).await.unwrap();
+            vlog.append(&vec![b'D'; 800]).await.unwrap(); // dead
+            assert_eq!(vlog.size(), 1000);
 
-        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-        let l0 = write_pointer_sstable(&file_manager, &[(b"ka", off_a, 100), (b"kb", off_b, 100)], 0).await;
-        // L1 references the same off_b → dedup must copy it only once.
-        let l1 = write_pointer_sstable(&file_manager, &[(b"kb", off_b, 100)], 1).await;
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let l0 = write_pointer_sstable(&file_manager, &[(b"ka", off_a, 100), (b"kb", off_b, 100)], 0).await;
+            // L1 references the same off_b → dedup must copy it only once.
+            let l1 = write_pointer_sstable(&file_manager, &[(b"kb", off_b, 100)], 1).await;
 
-        let mut manifest = Manifest::new();
-        manifest.add_sstable(l0.clone());
-        manifest.add_sstable(l1.clone());
-        let manifest = Arc::new(RwLock::new(manifest));
+            let mut manifest = Manifest::new();
+            manifest.add_sstable(l0.clone());
+            manifest.add_sstable(l1.clone());
+            let manifest = Arc::new(RwLock::new(manifest));
 
-        let mut levels = Vec::new();
-        for meta in [&l0, &l1] {
-            let reader = LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false).await.unwrap();
-            levels.push((meta.level, vec![Arc::new(reader)]));
-        }
-        let version = version_over(vlog, levels);
-        let janitor_runs = Arc::new(AtomicU64::new(0));
-
-        let janitor = build_janitor(
-            dir.path(),
-            Arc::clone(&version),
-            vlog_path.clone(),
-            Arc::clone(&manifest),
-            Arc::clone(&file_manager),
-            JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 1 },
-            Arc::clone(&janitor_runs),
-        );
-
-        let stats = janitor.run_gc().await.unwrap();
-        assert!(stats.ran);
-        assert_eq!(stats.sstables_rebuilt, 2);
-        assert_eq!(stats.live_bytes_by_generation, vec![(1, 200)]);
-        assert_eq!(janitor_runs.load(Ordering::Relaxed), 1, "a ran == true cycle must increment janitor_runs");
-
-        // Deduped copy: A at 0, B at 100, nothing else.
-        let swapped = Arc::clone(&version.get().active_vlog);
-        assert_eq!(swapped.size(), 200);
-        assert_eq!(swapped.read(0, 100).unwrap(), val_a);
-        assert_eq!(swapped.read(100, 100).unwrap(), val_b);
-
-        // Both levels rebuilt with pointers remapped into generation 2; old
-        // files deleted.
-        let m = manifest.read().clone();
-        let expectations: [(usize, &SSTableMetadata, Vec<(Vec<u8>, u64)>); 2] = [
-            (0, &l0, vec![(b"ka".to_vec(), 0), (b"kb".to_vec(), 100)]),
-            (1, &l1, vec![(b"kb".to_vec(), 100)]),
-        ];
-        for (level, old, expected) in expectations {
-            let metas = m.get_level(level);
-            assert_eq!(metas.len(), 1);
-            assert_ne!(metas[0].file_id, old.file_id);
-            let data = file_manager.read_sstable(metas[0].file_id).await.unwrap();
-            let reader = SSTableReader::open(data).unwrap();
-            let mut got: Vec<(Vec<u8>, u64)> = Vec::new();
-            for entry in reader.iter() {
-                let (key, dbv) = entry.unwrap();
-                match dbv {
-                    DataBlockValue::Pointer(vp) => {
-                        assert_eq!(vp.file_id, 2, "rebuilt pointers name the new generation");
-                        got.push((key.to_vec(), vp.value_offset));
-                    }
-                    _ => panic!("Expected Pointer variant"),
-                }
+            let mut levels = Vec::new();
+            for meta in [&l0, &l1] {
+                let reader = LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false).await.unwrap();
+                levels.push((meta.level, vec![Arc::new(reader)]));
             }
-            assert_eq!(got, expected);
-            assert!(
-                file_manager.read_sstable(old.file_id).await.is_err(),
-                "old SSTable must be deleted"
-            );
-        }
+            let version = version_over(vlog, levels);
+            let janitor_runs = Arc::new(AtomicU64::new(0));
 
-        // The source generation is gone, the new one carries the live values.
-        assert!(!vlog_path.exists());
-        assert!(generation_path(&vlog_path, 2).exists());
-        assert_eq!(version.get().vlog_ids(), vec![2]);
+            let janitor = build_janitor(
+                dir.path(),
+                Arc::clone(&version),
+                vlog_path.clone(),
+                Arc::clone(&manifest),
+                Arc::clone(&file_manager),
+                JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 1 },
+                Arc::clone(&janitor_runs),
+            );
+
+            let stats = janitor.run_gc().await.unwrap();
+            assert!(stats.ran);
+            assert_eq!(stats.sstables_rebuilt, 2);
+            assert_eq!(stats.live_bytes_by_generation, vec![(1, 200)]);
+            assert_eq!(janitor_runs.load(Ordering::Relaxed), 1, "a ran == true cycle must increment janitor_runs");
+
+            // Deduped copy: A at 0, B at 100, nothing else.
+            let swapped = Arc::clone(&version.get().active_vlog);
+            assert_eq!(swapped.size(), 200);
+            assert_eq!(swapped.read(0, 100).unwrap(), val_a);
+            assert_eq!(swapped.read(100, 100).unwrap(), val_b);
+
+            // Both levels rebuilt with pointers remapped into generation 2; old
+            // files deleted.
+            let m = manifest.read().clone();
+            let expectations: [(usize, &SSTableMetadata, Vec<(Vec<u8>, u64)>); 2] = [
+                (0, &l0, vec![(b"ka".to_vec(), 0), (b"kb".to_vec(), 100)]),
+                (1, &l1, vec![(b"kb".to_vec(), 100)]),
+            ];
+            for (level, old, expected) in expectations {
+                let metas = m.get_level(level);
+                assert_eq!(metas.len(), 1);
+                assert_ne!(metas[0].file_id, old.file_id);
+                let data = file_manager.read_sstable(metas[0].file_id).await.unwrap();
+                let reader = SSTableReader::open(data).unwrap();
+                let mut got: Vec<(Vec<u8>, u64)> = Vec::new();
+                for entry in reader.iter() {
+                    let (key, dbv) = entry.unwrap();
+                    match dbv {
+                        DataBlockValue::Pointer(vp) => {
+                            assert_eq!(vp.file_id, 2, "rebuilt pointers name the new generation");
+                            got.push((key.to_vec(), vp.value_offset));
+                        }
+                        _ => panic!("Expected Pointer variant"),
+                    }
+                }
+                assert_eq!(got, expected);
+                assert!(
+                    file_manager.read_sstable(old.file_id).await.is_err(),
+                    "old SSTable must be deleted"
+                );
+            }
+
+            // The source generation is gone, the new one carries the live values.
+            assert!(!vlog_path.exists());
+            assert!(generation_path(&vlog_path, 2).exists());
+            assert_eq!(version.get().vlog_ids(), vec![2]);
+        })
     }
 }

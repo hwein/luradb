@@ -14,7 +14,12 @@ yanked = "deny"
 unmaintained = "all"
 # Exceptions only for advisories without an available fix (or not relevant to
 # our usage profile), each with `reason` and a `# review by YYYY-MM-DD` note.
-ignore = []
+ignore = [
+    # review by 2026-11-17 (or earlier when the axum 0.8 / utoipa-swagger-ui upgrade lands)
+    { id = "RUSTSEC-2026-0367", reason = "zip is a build-only dependency of utoipa-swagger-ui, whose build script extracts the upstream swagger-ui archive; it is not linked into the luradb binary and never extracts untrusted archives" },
+    { id = "RUSTSEC-2026-0368", reason = "zip is a build-only dependency of utoipa-swagger-ui, whose build script extracts the upstream swagger-ui archive; it is not linked into the luradb binary and never extracts untrusted archives" },
+    { id = "RUSTSEC-2026-0369", reason = "zip is a build-only dependency of utoipa-swagger-ui, whose build script extracts the upstream swagger-ui archive; it is not linked into the luradb binary and never extracts untrusted archives" },
+]
 
 [licenses]
 allow = [

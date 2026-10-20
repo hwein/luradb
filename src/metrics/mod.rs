@@ -108,6 +108,13 @@ pub struct SystemMetrics {
     /// purger tasks) and fully-reaped orphan id ranges (orphan sweep).
     pub rel_purged_keys_total: AtomicU64,
     pub rel_orphan_ranges_purged_total: AtomicU64,
+    /// SHM snapshot publisher: publishes, publishes skipped because a client
+    /// still pinned the target buffer, the current run of skips (0 again after
+    /// the next publish), and clients disconnected for blocking a run too long.
+    pub shm_snapshot_publishes_total: AtomicU64,
+    pub shm_snapshot_publish_skips_total: AtomicU64,
+    pub shm_snapshot_consecutive_skips: AtomicU64,
+    pub shm_clients_kicked_total: AtomicU64,
 }
 
 impl Default for SystemMetrics {
@@ -145,6 +152,10 @@ impl Default for SystemMetrics {
             rel_cross_engine_write_validations_json_total: AtomicU64::new(0),
             rel_purged_keys_total: AtomicU64::new(0),
             rel_orphan_ranges_purged_total: AtomicU64::new(0),
+            shm_snapshot_publishes_total: AtomicU64::new(0),
+            shm_snapshot_publish_skips_total: AtomicU64::new(0),
+            shm_snapshot_consecutive_skips: AtomicU64::new(0),
+            shm_clients_kicked_total: AtomicU64::new(0),
         }
     }
 }
@@ -387,6 +398,26 @@ impl MetricsStore {
         self.system.rel_orphan_ranges_purged_total.fetch_add(n, Ordering::Relaxed);
     }
 
+    // ── SHM snapshot publisher metrics ───────────────────────────────────────
+    // The publisher task is the only writer, so the run gauge needs no CAS.
+
+    /// Counts a published snapshot and ends the current skip run.
+    pub fn record_shm_publish(&self) {
+        self.system.shm_snapshot_publishes_total.fetch_add(1, Ordering::Relaxed);
+        self.system.shm_snapshot_consecutive_skips.store(0, Ordering::Relaxed);
+    }
+
+    /// Counts a skipped publish and extends the current skip run.
+    pub fn record_shm_publish_skip(&self) {
+        self.system.shm_snapshot_publish_skips_total.fetch_add(1, Ordering::Relaxed);
+        self.system.shm_snapshot_consecutive_skips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one client disconnected for blocking the snapshot too long.
+    pub fn record_shm_client_kicked(&self) {
+        self.system.shm_clients_kicked_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read access to the domain map, counted in test builds.
     fn domains(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<MetricsWindow>>> {
         #[cfg(test)]
@@ -568,5 +599,32 @@ mod tests {
         store.record_rel_ddl_op("drop_index");
         assert_eq!(store.system.rel_ddl_op_create_table_total.load(Ordering::Relaxed), 1);
         assert_eq!(store.system.rel_ddl_op_drop_index_total.load(Ordering::Relaxed), 2);
+    }
+
+    // A publish counts and ends the skip run; each skip counts and extends it.
+    #[test]
+    fn test_shm_publish_counters_follow_the_skip_run() {
+        let store = MetricsStore::new(MetricsConfig::default());
+        let sys = &store.system;
+        let counters = || {
+            (
+                sys.shm_snapshot_publishes_total.load(Ordering::Relaxed),
+                sys.shm_snapshot_publish_skips_total.load(Ordering::Relaxed),
+                sys.shm_snapshot_consecutive_skips.load(Ordering::Relaxed),
+            )
+        };
+
+        store.record_shm_publish();
+        assert_eq!(counters(), (1, 0, 0));
+        store.record_shm_publish_skip();
+        store.record_shm_publish_skip();
+        assert_eq!(counters(), (1, 2, 2));
+        store.record_shm_publish();
+        assert_eq!(counters(), (2, 2, 0), "a publish resets the run, not the total");
+        store.record_shm_publish_skip();
+        assert_eq!(counters(), (2, 3, 1));
+
+        store.record_shm_client_kicked();
+        assert_eq!(sys.shm_clients_kicked_total.load(Ordering::Relaxed), 1);
     }
 }

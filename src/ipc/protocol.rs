@@ -468,6 +468,7 @@ mod tests {
                     1,
                     Arc::as_ptr(&slot),
                     Arc::clone(&slot) as Arc<dyn Any + Send + Sync>,
+                    Arc::default(),
                 )
             };
             let lease = registry.register(handle);

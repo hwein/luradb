@@ -482,6 +482,7 @@ mod tests {
             data_buffer_size: 8192,
             registration_socket_path: "/run/luradb/{instance_id}.sock".to_string(),
             snapshot_interval_ms: 100,
+            kick_blocking_client_after_secs: 0,
         }
     }
 
@@ -686,6 +687,7 @@ mod tests {
                 1,
                 server_slot as *const ReaderSlot,
                 Arc::clone(&cmd_hdr) as Arc<dyn Any + Send + Sync>,
+                Arc::default(),
             )
         };
         let _lease = registry.register(handle);

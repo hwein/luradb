@@ -12,12 +12,13 @@
 use crate::core::coop::{self, YieldEvery};
 use crate::engines::lsm::domain::now_secs;
 use crate::engines::lsm::{Domain, DomainRegistry, LsmStorageEngine, RegistrySnapshot, ValueWithMetadata};
+use crate::metrics::MetricsStore;
 use crate::storage::format::is_expired;
 use anyhow::Result;
 use rkyv::util::AlignedVec;
 use rkyv::{rancor, Archive, Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
 
 use super::{PublishOutcome, ReaderRegistry, ShmManager, SnapshotWriter, StateHeader};
@@ -233,6 +234,41 @@ impl SkipTracker {
     }
 }
 
+/// Times a run of skipped publishes against the kick threshold. Measured in
+/// time, not skips: skips come from the interval and from flushes alike, so a
+/// skip count would depend on the write load.
+struct KickTracker {
+    /// `Duration::ZERO` = never kick.
+    after: Duration,
+    /// Start of the current run, or of its measurement since the last kick.
+    since: Option<Instant>,
+}
+
+impl KickTracker {
+    fn new(after: Duration) -> Self {
+        Self { after, since: None }
+    }
+
+    /// Records a skip at `now`; true once the run has lasted longer than the
+    /// threshold, which also restarts the measurement — one kick, no storm
+    /// while the disconnects are still being processed.
+    fn on_skipped(&mut self, now: Instant) -> bool {
+        if self.after.is_zero() {
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) <= self.after {
+            return false;
+        }
+        self.since = Some(now);
+        true
+    }
+
+    fn on_published(&mut self) {
+        self.since = None;
+    }
+}
+
 /// What one publisher step did (spec perf/028 A2).
 #[derive(Debug, PartialEq, Eq)]
 enum Tick {
@@ -250,7 +286,9 @@ struct PublishLoop<'w> {
     builder: SnapshotBuilder,
     writer: SnapshotWriter<'w>,
     readers: Arc<ReaderRegistry>,
+    metrics: Arc<MetricsStore>,
     skips: SkipTracker,
+    kicks: KickTracker,
     /// Change epoch of the last publish; `None` before the first.
     published_epoch: Option<u64>,
     /// Earliest `expire_at > 0` among the last published entries.
@@ -258,26 +296,37 @@ struct PublishLoop<'w> {
 }
 
 impl<'w> PublishLoop<'w> {
-    fn new(builder: SnapshotBuilder, writer: SnapshotWriter<'w>, readers: Arc<ReaderRegistry>) -> Self {
+    /// `kick_after`: how long a skip run may last before its blockers are
+    /// disconnected; `Duration::ZERO` = never.
+    fn new(
+        builder: SnapshotBuilder,
+        writer: SnapshotWriter<'w>,
+        readers: Arc<ReaderRegistry>,
+        metrics: Arc<MetricsStore>,
+        kick_after: Duration,
+    ) -> Self {
         Self {
             builder,
             writer,
             readers,
+            metrics,
             skips: SkipTracker::default(),
+            kicks: KickTracker::new(kick_after),
             published_epoch: None,
             earliest_expiry: None,
         }
     }
 
-    /// One tick (spec perf/028 A2): rebuilds and publishes only if the
-    /// snapshot content may have changed since the last publish, else just
-    /// confirms the header timestamp (A3). `now` is the Unix time in seconds
-    /// checked against the earliest published expiry.
-    async fn step(&mut self, now: u64) -> Tick {
+    /// One tick: rebuilds and publishes only if the snapshot content may have
+    /// changed since the last publish, else just confirms the header
+    /// timestamp. `now` is the Unix time in seconds checked against the
+    /// earliest published expiry; `at` times a skipped publish against the
+    /// kick threshold.
+    async fn step(&mut self, now: u64, at: Instant) -> Tick {
         // Read before `build` takes its MVCC snapshot: a write in between
         // leaves the epoch behind and triggers the next rebuild.
         let epoch = self.builder.engine.change_epoch();
-        let expired = self.earliest_expiry.is_some_and(|at| is_expired(at, now));
+        let expired = self.earliest_expiry.is_some_and(|expiry| is_expired(expiry, now));
         if self.published_epoch == Some(epoch) && !expired {
             self.writer.confirm_unchanged();
             return Tick::Idle;
@@ -298,16 +347,20 @@ impl<'w> PublishLoop<'w> {
         };
         match outcome {
             PublishOutcome::Published => {
-                // Only a publish moves the comparison state (A2.4).
+                // Only a publish moves the comparison state.
                 self.published_epoch = Some(epoch);
                 self.earliest_expiry = built.earliest_expiry;
+                self.metrics.record_shm_publish();
+                self.kicks.on_published();
                 if let Some(n) = self.skips.on_published() {
                     tracing::info!("SHM snapshot publishing resumed after {n} skipped publishes");
                 }
             }
-            // No force-flip (spec perf/012 §9): a pinned buffer is never
-            // overwritten, the state is only made visible.
+            // No force-flip: a pinned buffer is never overwritten. The state
+            // is made visible and, past the kick threshold, the clients
+            // pinning it are disconnected.
             PublishOutcome::SkippedBusy { buffer } => {
+                self.metrics.record_shm_publish_skip();
                 if self.skips.on_skipped() {
                     tracing::warn!(
                         "SHM snapshot stale: {} consecutive publishes skipped, buffer {buffer} \
@@ -316,9 +369,29 @@ impl<'w> PublishLoop<'w> {
                         self.readers.blockers(buffer)
                     );
                 }
+                if self.kicks.on_skipped(at) {
+                    self.kick_blockers(buffer);
+                }
             }
         }
         Tick::Rebuilt(outcome)
+    }
+
+    /// Disconnects every client pinning `buffer` the way its own EOF would;
+    /// its reads still in flight may see the buffer overwritten.
+    fn kick_blockers(&self, buffer: u32) {
+        let blockers = self.readers.blockers(buffer);
+        if blockers.is_empty() {
+            return;
+        }
+        for &(client_id, _) in &blockers {
+            self.readers.kick(client_id);
+            self.metrics.record_shm_client_kicked();
+        }
+        tracing::warn!(
+            "SHM snapshot blocked longer than the kick threshold: disconnecting \
+             (client_id, readers) {blockers:?} pinning buffer {buffer}"
+        );
     }
 }
 
@@ -334,13 +407,19 @@ pub struct SnapshotPublisher {
     wait_timeout_us: u64,
     /// Reader slots of the registered clients; scanned before every flip.
     readers: Arc<ReaderRegistry>,
-    /// Notified after each MemTable flush — an extra tick (spec §4b).
+    /// Notified after each MemTable flush — an extra tick.
     flush_notify: Arc<Notify>,
+    /// Receives the publish and kick counters.
+    metrics: Arc<MetricsStore>,
+    /// How long a run of skipped publishes may last before the clients
+    /// blocking it are disconnected; `Duration::ZERO` = never.
+    kick_after: Duration,
     /// Set to true at shutdown to stop the loop.
     shutdown: watch::Receiver<bool>,
 }
 
 impl SnapshotPublisher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         builder: SnapshotBuilder,
         manager: Arc<ShmManager>,
@@ -348,9 +427,11 @@ impl SnapshotPublisher {
         wait_timeout_us: u64,
         readers: Arc<ReaderRegistry>,
         flush_notify: Arc<Notify>,
+        metrics: Arc<MetricsStore>,
+        kick_after: Duration,
         shutdown: watch::Receiver<bool>,
     ) -> Self {
-        Self { builder, manager, interval, wait_timeout_us, readers, flush_notify, shutdown }
+        Self { builder, manager, interval, wait_timeout_us, readers, flush_notify, metrics, kick_after, shutdown }
     }
 
     /// Runs until the shutdown signal fires. The loop always survives build and
@@ -363,6 +444,8 @@ impl SnapshotPublisher {
             wait_timeout_us,
             readers,
             flush_notify,
+            metrics,
+            kick_after,
             mut shutdown,
         } = self;
 
@@ -391,13 +474,13 @@ impl SnapshotPublisher {
                 Arc::clone(&readers),
             )
         };
-        let mut publish = PublishLoop::new(builder, writer, readers);
+        let mut publish = PublishLoop::new(builder, writer, readers, metrics, kick_after);
 
         loop {
             if *shutdown.borrow() {
                 break;
             }
-            publish.step(now_secs()).await;
+            publish.step(now_secs(), Instant::now()).await;
 
             tokio::select! {
                 _ = compio::time::sleep(interval) => {}
@@ -421,6 +504,7 @@ mod tests {
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
+    use futures::FutureExt;
     use rkyv::Archived;
     use std::sync::atomic::Ordering;
 
@@ -656,6 +740,7 @@ mod tests {
                     1,
                     Arc::as_ptr(&slot),
                     Arc::clone(&slot) as Arc<dyn std::any::Any + Send + Sync>,
+                    Arc::default(),
                 )
             };
             let _lease = readers.register(handle);
@@ -730,6 +815,42 @@ mod tests {
         assert!(!t.on_skipped(), "counting restarts after a publish");
     }
 
+    const KICK_AFTER: Duration = Duration::from_secs(30);
+    const SEC: Duration = Duration::from_secs(1);
+
+    // Instants are computed, never awaited: no wall clock decides the outcome.
+    #[test]
+    fn test_kick_tracker_fires_once_past_threshold_then_restarts() {
+        let mut t = KickTracker::new(KICK_AFTER);
+        let t0 = Instant::now();
+        assert!(!t.on_skipped(t0), "the first skip starts the run");
+        assert!(!t.on_skipped(t0 + KICK_AFTER), "at the threshold, not past it");
+        let kicked_at = t0 + KICK_AFTER + SEC;
+        assert!(t.on_skipped(kicked_at), "past the threshold");
+        assert!(!t.on_skipped(kicked_at + SEC), "the measurement restarts at the kick");
+        assert!(t.on_skipped(kicked_at + KICK_AFTER + SEC), "a run still blocked kicks again");
+    }
+
+    #[test]
+    fn test_kick_tracker_resets_on_publish() {
+        let mut t = KickTracker::new(KICK_AFTER);
+        let t0 = Instant::now();
+        assert!(!t.on_skipped(t0));
+        t.on_published();
+        let t1 = t0 + KICK_AFTER + SEC;
+        assert!(!t.on_skipped(t1), "a publish ends the run, this skip starts a new one");
+        assert!(!t.on_skipped(t1 + KICK_AFTER));
+    }
+
+    #[test]
+    fn test_kick_tracker_with_zero_threshold_never_kicks() {
+        let mut t = KickTracker::new(Duration::ZERO);
+        let t0 = Instant::now();
+        for secs in [0, 1, 3600, 365 * 86_400] {
+            assert!(!t.on_skipped(t0 + Duration::from_secs(secs)), "kicked after {secs} s");
+        }
+    }
+
     // 10. A domain in Deleting state does not appear in the snapshot.
     #[test]
     fn test_deleting_domain_absent() {
@@ -752,11 +873,14 @@ mod tests {
     /// Step time for tests without TTL entries.
     const BEFORE_ANY_EXPIRY: u64 = 0;
 
-    /// SHM stand-in for the step tests: state header, two data buffers and one
-    /// registered client slot.
+    /// SHM stand-in for the step tests: state header, two data buffers, one
+    /// registered client slot and the metrics the publisher records into.
     struct Arena {
         header: Box<StateHeader>,
         slot: Arc<ReaderSlot>,
+        /// The registered client's disconnect signal; nobody acts on it here.
+        kick: Arc<Notify>,
+        metrics: Arc<MetricsStore>,
         readers: Arc<ReaderRegistry>,
         _lease: ReaderSlotLease,
         buf_a: Vec<u8>,
@@ -771,6 +895,7 @@ mod tests {
             let header = Box::new(StateHeader::zeroed());
             header.init();
             let slot = Arc::new(ReaderSlot::zeroed());
+            let kick = Arc::new(Notify::new());
             let readers = Arc::new(ReaderRegistry::new());
             // Safe: the pointer targets the slot inside `slot`, whose `Arc`
             // clone the handle keeps alive.
@@ -779,16 +904,23 @@ mod tests {
                     1,
                     Arc::as_ptr(&slot),
                     Arc::clone(&slot) as Arc<dyn std::any::Any + Send + Sync>,
+                    Arc::clone(&kick),
                 )
             };
             let _lease = readers.register(handle);
             let (mut buf_a, mut buf_b) = (vec![0u8; ARENA_LEN], vec![0u8; ARENA_LEN]);
             let (ptr_a, ptr_b) = (buf_a.as_mut_ptr(), buf_b.as_mut_ptr());
-            Self { header, slot, readers, _lease, buf_a, buf_b, ptr_a, ptr_b }
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            Self { header, slot, kick, metrics, readers, _lease, buf_a, buf_b, ptr_a, ptr_b }
         }
 
-        /// Publisher loop writing into this arena — its only writer.
+        /// Publisher loop writing into this arena — its only writer — that
+        /// never kicks.
         fn publish_loop(&self, builder: SnapshotBuilder) -> PublishLoop<'_> {
+            self.kicking_publish_loop(builder, Duration::ZERO)
+        }
+
+        fn kicking_publish_loop(&self, builder: SnapshotBuilder, kick_after: Duration) -> PublishLoop<'_> {
             // Safe: single writer; two distinct buffers of ARENA_LEN bytes that
             // live as long as `self`.
             let writer = unsafe {
@@ -801,7 +933,33 @@ mod tests {
                     Arc::clone(&self.readers),
                 )
             };
-            PublishLoop::new(builder, writer, Arc::clone(&self.readers))
+            PublishLoop::new(builder, writer, Arc::clone(&self.readers), Arc::clone(&self.metrics), kick_after)
+        }
+
+        /// `[publishes, skips, current skip run, kicked clients]`.
+        fn shm_counters(&self) -> [u64; 4] {
+            let sys = &self.metrics.system;
+            [
+                &sys.shm_snapshot_publishes_total,
+                &sys.shm_snapshot_publish_skips_total,
+                &sys.shm_snapshot_consecutive_skips,
+                &sys.shm_clients_kicked_total,
+            ]
+            .map(|c| c.load(Ordering::Relaxed))
+        }
+
+        /// Whether the registered client was kicked since the last call.
+        fn take_kick(&self) -> bool {
+            self.kick.notified().now_or_never().is_some()
+        }
+
+        /// The registered client starts a read of buffer `idx` and holds it.
+        fn hold(&self, idx: usize) {
+            self.slot.counter(idx).fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn release(&self, idx: usize) {
+            self.slot.counter(idx).fetch_sub(1, Ordering::AcqRel);
         }
 
         fn version(&self) -> u64 {
@@ -832,10 +990,10 @@ mod tests {
             let (engine, registry, _dir) = make_setup().await;
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             let version = arena.version();
 
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Idle);
             assert_eq!(arena.version(), version, "an idle step must not flip");
         })
     }
@@ -848,11 +1006,11 @@ mod tests {
             let (engine, registry, _dir) = make_setup().await;
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-            publish.step(BEFORE_ANY_EXPIRY).await;
+            publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await;
             let version = arena.version();
             arena.header.last_update_ns.store(0, Ordering::Relaxed);
 
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Idle);
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Idle);
             assert_ne!(arena.header.last_update_ns.load(Ordering::Relaxed), 0, "idle step must refresh it");
             assert_eq!(arena.version(), version);
         })
@@ -867,10 +1025,10 @@ mod tests {
             let store = registry.default_store().await.unwrap();
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-            publish.step(BEFORE_ANY_EXPIRY).await;
+            publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await;
 
             store.put(b"k", b"new").await.unwrap();
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             assert_eq!(default_entry(&arena.read(), b"k").expect("written key published").value, b"new");
         })
     }
@@ -887,14 +1045,14 @@ mod tests {
             let (engine, registry, _dir) = make_setup().await;
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-            publish.step(BEFORE_ANY_EXPIRY).await;
+            publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await;
 
             registry.create_domain("fresh").await.unwrap();
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             assert_eq!(domain_names(&arena.read()), ["default", "fresh"]);
 
             registry.delete_domain("fresh").await.unwrap();
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             assert_eq!(domain_names(&arena.read()), ["default"]);
         })
     }
@@ -908,19 +1066,19 @@ mod tests {
             let store = registry.default_store().await.unwrap();
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-            publish.step(BEFORE_ANY_EXPIRY).await;
+            publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await;
             // Pins buffer B, the target of the publish after next.
             let guard = arena.pin();
             store.put(b"k", b"1").await.unwrap();
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             store.put(b"k", b"2").await.unwrap();
             assert_eq!(
-                publish.step(BEFORE_ANY_EXPIRY).await,
+                publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await,
                 Tick::Rebuilt(PublishOutcome::SkippedBusy { buffer: 1 })
             );
 
             drop(guard);
-            assert_eq!(publish.step(BEFORE_ANY_EXPIRY).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             assert_eq!(default_entry(&arena.read(), b"k").expect("key published").value, b"2");
         })
     }
@@ -939,10 +1097,10 @@ mod tests {
             store.put_unthrottled(b"soon", b"v", Some(soon)).await.unwrap();
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-            publish.step(BEFORE_ANY_EXPIRY).await;
+            publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await;
 
-            assert_eq!(publish.step(soon - 1).await, Tick::Idle);
-            assert_eq!(publish.step(soon).await, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(publish.step(soon - 1, Instant::now()).await, Tick::Idle);
+            assert_eq!(publish.step(soon, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
         })
     }
 
@@ -957,17 +1115,73 @@ mod tests {
             store.put_unthrottled(b"ttl", b"v", Some(expire_at)).await.unwrap();
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
-            publish.step(BEFORE_ANY_EXPIRY).await;
+            publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await;
 
             // The engine hides expired entries by wall clock: poll it, a fixed
             // sleep could be cut short by a backwards clock step.
             while now_secs() < expire_at {
                 compio::time::sleep(Duration::from_millis(50)).await;
             }
-            publish.step(expire_at).await;
+            publish.step(expire_at, Instant::now()).await;
             // Absence only: whether the first build still saw the entry depends
             // on scheduling; the trigger itself is the test above.
             assert!(default_entry(&arena.read(), b"ttl").is_none(), "expired entry must be gone");
+        })
+    }
+
+    // ── Publish metrics and the kick of blocking clients ─────────────────────────
+
+    const SKIPPED_ON_B: Tick = Tick::Rebuilt(PublishOutcome::SkippedBusy { buffer: 1 });
+
+    // Each step feeds the publish counters; with kicking off (the default) a
+    // year-long skip run disconnects nobody.
+    #[test]
+    fn test_step_records_publish_metrics_and_never_kicks_when_off() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let arena = Arena::new();
+            let mut publish = arena.publish_loop(builder(&registry, &engine, ARENA_LEN));
+            // Buffer B is the first publish's target.
+            arena.hold(1);
+            let t0 = Instant::now();
+
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, t0).await, SKIPPED_ON_B);
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, t0 + 365 * 86_400 * SEC).await, SKIPPED_ON_B);
+            assert_eq!(arena.shm_counters(), [0, 2, 2, 0]);
+            assert!(!arena.take_kick());
+
+            arena.release(1);
+            let published = publish.step(BEFORE_ANY_EXPIRY, t0 + 365 * 86_400 * SEC + SEC).await;
+            assert_eq!(published, Tick::Rebuilt(PublishOutcome::Published));
+            assert_eq!(arena.shm_counters(), [1, 2, 0, 0], "a publish ends the run");
+        })
+    }
+
+    // Past the threshold the clients pinning the blocked buffer are kicked and
+    // counted once; the measurement restarts, so a client still holding on is
+    // not kicked again by the very next skip.
+    #[test]
+    fn test_step_kicks_blockers_once_past_threshold() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let arena = Arena::new();
+            let mut publish = arena.kicking_publish_loop(builder(&registry, &engine, ARENA_LEN), KICK_AFTER);
+            arena.hold(1);
+            let t0 = Instant::now();
+
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, t0).await, SKIPPED_ON_B);
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, t0 + KICK_AFTER).await, SKIPPED_ON_B);
+            assert!(!arena.take_kick(), "not past the threshold yet");
+
+            let kicked_at = t0 + KICK_AFTER + SEC;
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, kicked_at).await, SKIPPED_ON_B);
+            assert!(arena.take_kick(), "the blocking client is kicked");
+            assert_eq!(arena.shm_counters()[3], 1);
+
+            // This stand-in client ignores the kick and keeps its read.
+            assert_eq!(publish.step(BEFORE_ANY_EXPIRY, kicked_at + SEC).await, SKIPPED_ON_B);
+            assert!(!arena.take_kick(), "no second kick right after the first");
+            assert_eq!(arena.shm_counters(), [0, 4, 4, 1]);
         })
     }
 }

@@ -275,6 +275,10 @@ registration_socket_path = "/run/luradb/{instance_id}.sock"
 # rebuilt only after a change.
 # Lower values mean fresher snapshots and more CPU load.
 snapshot_interval_ms = 100
+# Seconds a client may keep the snapshot from being updated, by holding on to
+# a read of the old one, before the server disconnects it; 0 = never.
+# Warning: the disconnected client's reads still in progress may return torn data.
+kick_blocking_client_after_secs = 0
 
 # Backups on demand and by schedule.
 [backup]

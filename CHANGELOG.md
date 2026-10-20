@@ -12,6 +12,8 @@ All notable changes to LuraDB are documented in this file.
 - Startup warns about unknown configuration keys.
 - New `[multicore].frontend_workers` and `[multicore].engine_queue_capacity` config keys.
 - New `[multicore].reader_threads` and `[multicore].reader_queue_capacity` config keys.
+- **BREAKING** API: GET /store-api/metrics reports an `shm` block with snapshot publish, skip and kicked-client counters.
+- New `[shm].kick_blocking_client_after_secs` config key disconnects clients that keep the shared-memory snapshot from being updated (`0` = off).
 
 ### Changed
 

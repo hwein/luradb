@@ -25,7 +25,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 
 /// Longest idle wait without a doorbell: serves clients that never ring theirs
 /// and covers lost wakeups (spec perf/014).
@@ -76,13 +76,14 @@ impl ClientConnection {
     /// Creates the client's shm quartet and wires the server ends — a consumer
     /// on the cmd ring, a producer on the resp ring — returning the four segment
     /// names to hand back over the registration socket, the handle on the
-    /// client's reader slot (spec perf/012 §6) and the doorbell pipe's write
-    /// end to pass to the client (spec perf/014).
+    /// client's reader slot (carrying `kick`, the connection task's disconnect
+    /// signal) and the doorbell pipe's write end to pass to the client.
     pub fn create(
         instance_id: &str,
         client_id: u64,
         ring_size: usize,
         mode: u32,
+        kick: Arc<Notify>,
     ) -> anyhow::Result<(Self, [String; 4], ReaderSlotHandle, OwnedFd)> {
         let shm = ClientShm::create(instance_id, client_id, ring_size, mode)?;
         let names = shm.segment_names();
@@ -111,7 +112,7 @@ impl ClientConnection {
                 cmd_hdr_ptr.add(READER_SLOT_OFFSET),
                 cmd_hdr_len - READER_SLOT_OFFSET,
             ) as *const ReaderSlot;
-            ReaderSlotHandle::new(client_id, slot, shm.cmd_hdr_arc() as Arc<dyn Any + Send + Sync>)
+            ReaderSlotHandle::new(client_id, slot, shm.cmd_hdr_arc() as Arc<dyn Any + Send + Sync>, kick)
         };
         let (doorbell, client_doorbell) = new_doorbell()?;
         let conn = Self { client_id, consumer, producer, doorbell: Some(doorbell), _shm: Some(shm) };

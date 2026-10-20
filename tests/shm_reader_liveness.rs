@@ -142,6 +142,7 @@ fn shm_config(instance_id: &str, sock: &Path) -> ShmConfig {
         data_buffer_size: 8192,
         registration_socket_path: sock.to_string_lossy().to_string(),
         snapshot_interval_ms: 100,
+        kick_blocking_client_after_secs: 0,
     }
 }
 

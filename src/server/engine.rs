@@ -359,6 +359,7 @@ async fn start_shm(
     cfg: &LuraConfig,
     registry: &Arc<DomainRegistry>,
     lsm_store: &Arc<LsmStorageEngine>,
+    metrics: &Arc<MetricsStore>,
 ) -> anyhow::Result<(Option<Arc<ShmManager>>, Option<ShmServices>)> {
     let shm_manager: Option<Arc<ShmManager>> = if cfg.shm.enabled {
         let manager = ShmManager::new(cfg.shm.clone())?;
@@ -389,9 +390,9 @@ async fn start_shm(
         // registration listener leases them, the publisher scans them.
         let readers = Arc::new(ipc::ReaderRegistry::new());
 
-        // RCU read-snapshot publisher (spec perf/009, perf/028): checks on an
-        // interval and after every flush, rebuilds the SHM double-buffer
-        // snapshot only after a change.
+        // RCU read-snapshot publisher: checks on an interval and after every
+        // flush, rebuilds the SHM double-buffer snapshot only after a change,
+        // and disconnects clients that block it longer than the kick threshold.
         // A task of the engine thread's own runtime: SnapshotWriter is !Send.
         let publisher = ipc::SnapshotPublisher::new(
             ipc::SnapshotBuilder::new(
@@ -404,6 +405,8 @@ async fn start_shm(
             ipc::PUBLISH_WAIT_TIMEOUT_US,
             Arc::clone(&readers),
             lsm_store.flush_notify(),
+            Arc::clone(metrics),
+            std::time::Duration::from_secs(cfg.shm.kick_blocking_client_after_secs),
             shutdown_rx.clone(),
         );
         let publisher_task = compio::runtime::spawn(publisher.run());
@@ -563,7 +566,7 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
             .map_err(|e| anyhow::anyhow!("Invalid trusted_proxies config: {}", e))?,
     );
 
-    let (shm_manager, shm_services) = start_shm(config, &registry, &lsm_store).await?;
+    let (shm_manager, shm_services) = start_shm(config, &registry, &lsm_store, &metrics).await?;
 
     // --- API state ---
     let state = AppState {

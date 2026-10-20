@@ -904,9 +904,13 @@ pub struct ShmConfig {
     /// is substituted at runtime (Default: "/run/luradb/{instance_id}.sock").
     pub registration_socket_path: String,
     /// Interval in milliseconds at which the RCU snapshot publisher checks for
-    /// changes (spec perf/009 §4, perf/028; Default: 100). A MemTable flush
+    /// changes (Default: 100). A MemTable flush
     /// also triggers a check; the snapshot is rebuilt only after a change.
     pub snapshot_interval_ms: u64,
+    /// Seconds a run of skipped snapshot publishes may last before the
+    /// clients still pinning the blocked buffer are disconnected; their
+    /// in-flight snapshot reads may then return torn data (Default: 0 = never).
+    pub kick_blocking_client_after_secs: u64,
 }
 
 impl Default for ShmConfig {
@@ -917,6 +921,7 @@ impl Default for ShmConfig {
             data_buffer_size: 268_435_456,
             registration_socket_path: "/run/luradb/{instance_id}.sock".to_string(),
             snapshot_interval_ms: 100,
+            kick_blocking_client_after_secs: 0,
         }
     }
 }
@@ -1802,6 +1807,7 @@ mod tests {
         assert!(!config.shm.enabled);
         assert_eq!(config.shm.instance_id, "0");
         assert_eq!(config.shm.data_buffer_size, 268_435_456);
+        assert_eq!(config.shm.kick_blocking_client_after_secs, 0, "kicking blocking clients is opt-in");
     }
 
     #[test]

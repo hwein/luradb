@@ -1,6 +1,6 @@
-//! Multi-client registration listener (spec perf/008 Multi-Client).
+//! Multi-client registration listener.
 //!
-//! A dedicated UDS (separate from the perf/001 REST socket) hands each client
+//! A dedicated UDS (separate from the REST socket) hands each client
 //! its own cmd/resp ring quartet. Wire format is newline-framed text:
 //!
 //! ```text
@@ -11,12 +11,13 @@
 //!
 //! Segment names never contain spaces, so the reply is a single space-split
 //! line. The success line carries the write end of the client's doorbell pipe
-//! as `SCM_RIGHTS` ancillary data (spec perf/014): after each cmd-ring send
+//! as `SCM_RIGHTS` ancillary data: after each cmd-ring send
 //! the client writes one byte to it to wake the dispatcher. A client that
 //! reads the line without `recvmsg` loses only the fd; the dispatcher's
 //! fallback tick still serves it. After the reply the socket stays open purely for
 //! liveness: a read of 0 bytes (EOF) or an error means the client is gone and
-//! its segments drop.
+//! its segments drop. The server closes it to disconnect a client that keeps
+//! the snapshot publisher blocked longer than `shm.kick_blocking_client_after_secs`.
 //!
 //! ## Trust model
 //!
@@ -39,7 +40,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 
 const REGISTER_REQUEST: &str = "REGISTER";
 
@@ -150,8 +151,15 @@ async fn handle_connection(
     }
 
     // 3. Mint the segment quartet + the server ring ends.
+    let kick = Arc::new(Notify::new());
     let (conn, names, slot_handle, doorbell) =
-        match ClientConnection::create(&config.instance_id, client_id, config.ring_size, config.segment_mode) {
+        match ClientConnection::create(
+            &config.instance_id,
+            client_id,
+            config.ring_size,
+            config.segment_mode,
+            Arc::clone(&kick),
+        ) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("[shm-reg] segment creation failed for client {client_id}: {e}");
@@ -184,11 +192,13 @@ async fn handle_connection(
         return;
     }
 
-    // 7. Keep the socket open; EOF/error = disconnect. Also stop on shutdown.
+    // 7. Keep the socket open; EOF/error = disconnect. Also stop on shutdown,
+    // and on a kick: the publisher disconnects a client that blocks it too long.
     let mut buf = [0u8; 32];
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
+            _ = kick.notified() => break,
             r = reader.read(&mut buf) => match r {
                 Ok(0) | Err(_) => break, // EOF or error → client gone
                 Ok(_) => {} // unexpected extra bytes: ignore
@@ -736,6 +746,50 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(readers.snapshot().is_empty(), "cancelled task must release its lease");
             assert_eq!(arena.publish(b"reclaimed"), PublishOutcome::Published);
+        })
+    }
+
+    // A kicked client is disconnected like one whose socket hit EOF: its
+    // connection task ends, the lease is freed so the blocked buffer can be
+    // published again, the dispatcher is told, and the client reads EOF.
+    #[test]
+    fn test_kick_disconnects_live_client_and_frees_its_pinned_buffer() {
+        crate::core::engine_runtime::block_on(async {
+            let (client, server_side) = UnixStream::pair().unwrap();
+            let readers = Arc::new(ReaderRegistry::new());
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let (_sd_tx, sd_rx) = watch::channel(false);
+            let config = Arc::new(RegistrationConfig {
+                instance_id: unique_instance(),
+                ring_size: 4096,
+                segment_mode: 0o600,
+                auth_enabled: false,
+                trusted_uids: Arc::new(Vec::new()),
+                readers: Arc::clone(&readers),
+            });
+            let task = compio::runtime::spawn(handle_connection(server_side, 5, config, events_tx, sd_rx));
+
+            let mut client = client;
+            let reply = register(&mut client).await;
+            let names: Vec<String> = reply.split_whitespace().skip(2).map(String::from).collect();
+            let Some(ClientEvent::Connect(_conn)) = events_rx.recv().await else { panic!("connect event") };
+
+            // A live client: it pins buffer B, never releases it and keeps its
+            // socket open.
+            let cmd_hdr = ShmSegment::open(&names[1]).unwrap();
+            let slot = unsafe { client_slot(&cmd_hdr) };
+            slot.counter(1).fetch_add(1, Ordering::AcqRel);
+            let mut arena = WriterArena::new(Arc::clone(&readers));
+            assert_eq!(arena.publish(b"blocked"), PublishOutcome::SkippedBusy { buffer: 1 });
+
+            readers.kick(5);
+            let ended = compio::time::timeout(Duration::from_secs(20), task).await;
+            assert!(ended.is_ok(), "the kicked connection task must end");
+            assert!(readers.snapshot().is_empty(), "a kick must release the lease");
+            assert!(matches!(events_rx.recv().await, Some(ClientEvent::Disconnect(5))));
+            assert_eq!(arena.publish(b"unblocked"), PublishOutcome::Published);
+            let mut buf = [0u8; 8];
+            assert_eq!(client.read(&mut buf).await.unwrap(), 0, "the kicked client must read EOF");
         })
     }
 

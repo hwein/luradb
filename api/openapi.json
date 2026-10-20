@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.6.1",
+    "version": "0.6.2",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -3256,7 +3256,7 @@
           "Metrics"
         ],
         "summary": "`GET /metrics` — system + all domain metrics. Admin only.",
-        "description": "`engines` (spec general/019) is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.",
+        "description": "`engines` is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.\n\n`shm` covers the shared-memory snapshot publisher, all zero while SHM is\noff: `snapshot_publishes_total`, `snapshot_publish_skips_total` (a client\nwas still reading the buffer due for overwriting),\n`snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot\nis not being updated) and `clients_kicked_total` (clients disconnected after\n`shm.kick_blocking_client_after_secs`).",
         "operationId": "get_metrics",
         "responses": {
           "200": {

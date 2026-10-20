@@ -1,14 +1,15 @@
-//! Registry of the per-client reader slots the publisher scans (spec perf/012
-//! §6, §7).
+//! Registry of the per-client reader slots the publisher scans.
 //!
 //! The dispatcher's `Vec<ClientConnection>` is task-local and out of reach for
 //! the publisher task, so registration and publisher share this small registry
 //! instead. A client's entry is held by a [`ReaderSlotLease`]: dropping it —
-//! on EOF, on an error path, or when the connection task is aborted at an
-//! `.await` — *is* the reclamation.
+//! on EOF, on a kick, on an error path, or when the connection task is
+//! aborted at an `.await` — *is* the reclamation.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use tokio::sync::Notify;
 
 use super::protocol::ReaderSlot;
 
@@ -21,6 +22,8 @@ pub struct ReaderSlotHandle {
     /// production, a test-owned allocation in unit tests. `shm_unlink` only
     /// removes the name — the mapping lives until the last `Arc` is gone.
     _owner: Arc<dyn Any + Send + Sync>,
+    /// Wakes the client's connection task to disconnect it.
+    kick: Arc<Notify>,
 }
 
 // Safe: `slot` points at atomics inside the mapping `_owner` keeps alive, and
@@ -36,8 +39,9 @@ impl ReaderSlotHandle {
         client_id: u64,
         slot: *const ReaderSlot,
         owner: Arc<dyn Any + Send + Sync>,
+        kick: Arc<Notify>,
     ) -> Self {
-        Self { client_id, slot, _owner: owner }
+        Self { client_id, slot, _owner: owner, kick }
     }
 
     pub fn slot(&self) -> &ReaderSlot {
@@ -70,7 +74,7 @@ impl ReaderRegistry {
         self.lock().clone()
     }
 
-    /// Clients currently pinning `buffer`, with their pin counts (warn path only).
+    /// Clients currently pinning `buffer`, with their pin counts (warn and kick paths).
     pub fn blockers(&self, buffer: u32) -> Vec<(u64, u32)> {
         self.lock()
             .iter()
@@ -79,6 +83,15 @@ impl ReaderRegistry {
                 (n != 0).then_some((h.client_id, n))
             })
             .collect()
+    }
+
+    /// Disconnects `client_id` as if its socket had hit EOF: its connection
+    /// task drops the lease and closes the socket. The signal waits if the task
+    /// is not listening yet; an unknown id is ignored.
+    pub fn kick(&self, client_id: u64) {
+        if let Some(h) = self.lock().iter().find(|h| h.client_id == client_id) {
+            h.kick.notify_one();
+        }
     }
 
     fn remove(&self, client_id: u64) {
@@ -108,9 +121,10 @@ impl Drop for ReaderSlotLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use std::sync::atomic::Ordering;
 
-    fn handle(client_id: u64, slot: &Arc<ReaderSlot>) -> ReaderSlotHandle {
+    fn handle(client_id: u64, slot: &Arc<ReaderSlot>, kick: Arc<Notify>) -> ReaderSlotHandle {
         // Safe: the pointer targets the slot inside `slot`, and the handle keeps
         // its own clone of that allocation alive.
         unsafe {
@@ -118,6 +132,7 @@ mod tests {
                 client_id,
                 Arc::as_ptr(slot),
                 Arc::clone(slot) as Arc<dyn Any + Send + Sync>,
+                kick,
             )
         }
     }
@@ -127,7 +142,7 @@ mod tests {
         let registry = Arc::new(ReaderRegistry::new());
         let slot = Arc::new(ReaderSlot::zeroed());
 
-        let lease = registry.register(handle(7, &slot));
+        let lease = registry.register(handle(7, &slot, Arc::default()));
         let snap = registry.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].client_id, 7);
@@ -144,7 +159,7 @@ mod tests {
         let held = {
             let slot = Arc::new(ReaderSlot::zeroed());
             slot.readers_b.store(3, Ordering::Release);
-            let lease = registry.register(handle(1, &slot));
+            let lease = registry.register(handle(1, &slot, Arc::default()));
             let snap = registry.snapshot();
             drop(lease);
             snap
@@ -159,10 +174,26 @@ mod tests {
         let busy = Arc::new(ReaderSlot::zeroed());
         busy.readers_a.store(2, Ordering::Release);
 
-        let _l1 = registry.register(handle(1, &idle));
-        let _l2 = registry.register(handle(2, &busy));
+        let _l1 = registry.register(handle(1, &idle, Arc::default()));
+        let _l2 = registry.register(handle(2, &busy, Arc::default()));
 
         assert_eq!(registry.blockers(0), vec![(2, 2)]);
         assert!(registry.blockers(1).is_empty());
+    }
+
+    #[test]
+    fn test_kick_signals_only_the_named_client() {
+        let registry = Arc::new(ReaderRegistry::new());
+        let slot = Arc::new(ReaderSlot::zeroed());
+        let (kick_1, kick_2) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let _l1 = registry.register(handle(1, &slot, Arc::clone(&kick_1)));
+        let _l2 = registry.register(handle(2, &slot, Arc::clone(&kick_2)));
+
+        registry.kick(2);
+        registry.kick(99); // not registered: ignored
+
+        // The signal is kept until the connection task next waits for it.
+        assert!(kick_2.notified().now_or_never().is_some(), "client 2 kicked");
+        assert!(kick_1.notified().now_or_never().is_none(), "client 1 untouched");
     }
 }

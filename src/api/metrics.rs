@@ -91,7 +91,7 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 
 /// `GET /metrics` — system + all domain metrics. Admin only.
 ///
-/// `engines` (spec general/019) is an additive block, one entry per storage
+/// `engines` is an additive block, one entry per storage
 /// engine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,
 /// `write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,
 /// `window_secs`. Clients compute `read_ops / window_secs` for ops/s — the
@@ -100,6 +100,13 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 /// second is excluded). A disabled engine still gets its block, all zero —
 /// `0` for a latency percentile means no op landed in the window, not an
 /// unmeasurably fast one.
+///
+/// `shm` covers the shared-memory snapshot publisher, all zero while SHM is
+/// off: `snapshot_publishes_total`, `snapshot_publish_skips_total` (a client
+/// was still reading the buffer due for overwriting),
+/// `snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot
+/// is not being updated) and `clients_kicked_total` (clients disconnected after
+/// `shm.kick_blocking_client_after_secs`).
 //
 // The `system` block is KV-only: `compaction_runs`, `janitor_runs` and
 // `memtable_size_bytes` come from the KV engine's LSM instance — json/rel
@@ -142,6 +149,13 @@ pub async fn get_metrics(State(state): State<AppState>) -> Json<Value> {
         "current_bytes":    bc.current_bytes.load(Ordering::Relaxed),
     });
 
+    let shm = json!({
+        "snapshot_publishes_total":     sys.shm_snapshot_publishes_total.load(Ordering::Relaxed),
+        "snapshot_publish_skips_total": sys.shm_snapshot_publish_skips_total.load(Ordering::Relaxed),
+        "snapshot_consecutive_skips":   sys.shm_snapshot_consecutive_skips.load(Ordering::Relaxed),
+        "clients_kicked_total":         sys.shm_clients_kicked_total.load(Ordering::Relaxed),
+    });
+
     // Backup block (spec general/006 metrics section) — null when backup.enabled = false.
     let backup = state.backup_manager.as_ref().map(|m| {
         let snap = m.metrics_snapshot();
@@ -164,7 +178,8 @@ pub async fn get_metrics(State(state): State<AppState>) -> Json<Value> {
         "domains": domains,
         "engines": engines,
         "block_cache": block_cache,
-        "backup": backup
+        "backup": backup,
+        "shm": shm
     }))
 }
 
@@ -410,6 +425,53 @@ mod tests {
             for field in expected {
                 assert!(system[field].is_number(), "system.{field} must be numeric");
             }
+        })
+    }
+
+    const SHM_FIELDS: [&str; 4] = [
+        "snapshot_publishes_total",
+        "snapshot_publish_skips_total",
+        "snapshot_consecutive_skips",
+        "clients_kicked_total",
+    ];
+
+    // The shm block is always there, with exactly its four fields: zeros
+    // while SHM is off (this state has no SHM manager).
+    #[test]
+    fn test_shm_block_has_exactly_four_fields_zero_without_shm() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            assert!(state.shm_manager.is_none());
+            let Json(body) = get_metrics(State(state)).await;
+            let shm = body["shm"].as_object().expect("shm block present");
+
+            let mut fields: Vec<&str> = shm.keys().map(|s| s.as_str()).collect();
+            fields.sort();
+            let mut expected = SHM_FIELDS.to_vec();
+            expected.sort();
+            assert_eq!(fields, expected, "shm block must have exactly its four fields");
+            for field in SHM_FIELDS {
+                assert_eq!(shm[field], 0, "shm.{field}");
+            }
+        })
+    }
+
+    // The block reports the publisher's counters as recorded.
+    #[test]
+    fn test_shm_block_reports_recorded_counters() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            state.metrics.record_shm_publish();
+            state.metrics.record_shm_publish_skip();
+            state.metrics.record_shm_publish_skip();
+            state.metrics.record_shm_client_kicked();
+
+            let Json(body) = get_metrics(State(state)).await;
+            let shm = &body["shm"];
+            assert_eq!(shm["snapshot_publishes_total"], 1);
+            assert_eq!(shm["snapshot_publish_skips_total"], 2);
+            assert_eq!(shm["snapshot_consecutive_skips"], 2);
+            assert_eq!(shm["clients_kicked_total"], 1);
         })
     }
 

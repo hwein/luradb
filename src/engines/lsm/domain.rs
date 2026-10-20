@@ -128,10 +128,16 @@ pub(crate) fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Absolute expiry stamp for a TTL in seconds. The extra second compensates the
-/// sub-second remainder `now_secs()` drops, which would expire the entry early.
+/// [`expire_at_from`] at the current wall-clock second.
 pub(crate) fn expire_at_from_ttl(ttl_secs: u64) -> u64 {
-    if ttl_secs == 0 { now_secs() } else { now_secs() + ttl_secs + 1 }
+    expire_at_from(now_secs(), ttl_secs)
+}
+
+/// Absolute expiry stamp for a TTL in seconds, `now` in whole seconds. The
+/// extra second compensates the sub-second remainder the truncation drops,
+/// which would expire the entry early.
+pub(crate) fn expire_at_from(now: u64, ttl_secs: u64) -> u64 {
+    if ttl_secs == 0 { now } else { now + ttl_secs + 1 }
 }
 
 pub(crate) fn fnv64(data: &[u8]) -> u64 {

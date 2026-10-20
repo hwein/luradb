@@ -3030,10 +3030,6 @@ mod tests {
         })
     }
 
-    fn subsec_ms() -> u32 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis()
-    }
-
     /// Polls the expiry clock instead of sleeping a fixed span, which a
     /// backwards clock correction would cut short.
     async fn wait_past_ttl(ttl_secs: u64) {
@@ -3043,18 +3039,14 @@ mod tests {
         }
     }
 
-    // Writing just before a second boundary is the worst case for the stamp.
+    // Worst case for the stamp: written at second W.95, read 1.1 s later in
+    // second W + 2.
     #[test]
     fn test_ttl_holds_for_the_full_ttl_span() {
-        crate::core::engine_runtime::block_on(async {
-            let (engine, _dir) = make_engine().await;
-            while subsec_ms() < 950 {
-                compio::time::sleep(Duration::from_millis(5)).await;
-            }
-            engine.put_with_ttl(b"ttl_key", b"value", 2).await.unwrap();
-            compio::time::sleep(Duration::from_millis(1100)).await;
-            assert_eq!(engine.get(b"ttl_key").await.unwrap(), Some(b"value".to_vec()), "a 2s TTL must survive 1.1s");
-        })
+        const WRITE_SECS: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 2;
+        let expire_at = crate::engines::lsm::domain::expire_at_from(WRITE_SECS, TTL_SECS);
+        assert!(!crate::storage::format::is_expired(expire_at, WRITE_SECS + 2), "a 2s TTL must survive 1.1s");
     }
 
     // spec kv/025 §2/§9.11: format::is_expired treats `Some(0)` as "no TTL",

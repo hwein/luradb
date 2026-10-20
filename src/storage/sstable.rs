@@ -1,3 +1,4 @@
+use crate::core::coop;
 use crate::engines::lsm::block_cache::{BlockCacheKey, CachedBlock, StripedBlockCache};
 use crate::engines::lsm::key::Timestamp;
 use crate::storage::format::{
@@ -323,7 +324,8 @@ impl SSTableReader {
     ///
     /// Semantics are identical to [`get`] but every data block read is
     /// first looked up in `cache`; on a miss the raw block bytes are stored
-    /// in the cache for future reads.
+    /// in the cache for future reads, except inside [`coop::inline_read`],
+    /// where a miss on a mapped table ends the lookup with an error.
     pub fn get_with_cache(
         &self,
         key: &[u8],
@@ -426,9 +428,10 @@ impl SSTableReader {
 
     /// Returns the raw bytes of a data block, using the cache when available.
     ///
-    /// On a cache miss the bytes are extracted from the in-memory `AlignedVec`
-    /// and, unless the table is retired, inserted into the cache before being
-    /// returned. Only the block's own stripe is locked (spec kv/031 A2).
+    /// On a cache miss the block is taken from the table's data and, unless
+    /// the table is retired, inserted into the cache before being returned.
+    /// Inside [`coop::inline_read`] a miss on a mapped table fails instead.
+    /// Only the block's own stripe is locked.
     fn get_or_cache_block(
         &self,
         handle: &Archived<BlockHandle>,
@@ -449,12 +452,18 @@ impl SSTableReader {
             .ok_or_else(|| anyhow::anyhow!("Invalid data block offset/size"))?;
 
         let block = match &self.data {
-            // Zero-copy: the cache entry references the shared mapping.
-            SSTableData::Mapped(mmap) => CachedBlock::Mapped {
-                mmap: std::sync::Arc::clone(mmap),
-                offset,
-                len: size,
-            },
+            SSTableData::Mapped(mmap) => {
+                // The mapping's pages may still be on disk.
+                if coop::would_block() {
+                    bail!("data block not cached: reading it may wait for the disk");
+                }
+                // Zero-copy: the cache entry references the shared mapping.
+                CachedBlock::Mapped {
+                    mmap: std::sync::Arc::clone(mmap),
+                    offset,
+                    len: size,
+                }
+            }
             SSTableData::Owned(_) => {
                 let mut aligned = AlignedVec::with_capacity(size);
                 aligned.extend_from_slice(&self.data.as_slice()[offset..end]);
@@ -950,6 +959,33 @@ mod tests {
         }
         // The uncached path reads from the mapping as well.
         assert!(reader.get(b"mkey")?.is_some());
+        Ok(())
+    }
+
+    // An uncached data block of a mapped table may still be on disk: an
+    // inline read gives up on it and says so, any other read caches it, and
+    // inline reads hit it from then on. An owned table sits in memory.
+    #[tokio::test]
+    async fn test_inline_read_gives_up_on_an_uncached_mapped_block() -> anyhow::Result<()> {
+        let mut builder = SSTableBuilder::new();
+        builder.add_inline(b"mkey".to_vec(), b"mval".to_vec(), 0);
+        let bytes = builder.finish()?;
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("table.sst");
+        std::fs::write(&path, &bytes)?;
+
+        let mapped = SSTableReader::open_mmap(&path)?;
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+        let (cold, gave_up) = coop::inline_read(async { mapped.get_with_cache(b"mkey", &cache) }).await;
+        assert!(cold.is_err() && gave_up);
+        assert!(mapped.get_with_cache(b"mkey", &cache)?.is_some());
+        let (warm, gave_up) = coop::inline_read(async { mapped.get_with_cache(b"mkey", &cache) }).await;
+        assert!(warm?.is_some() && !gave_up);
+
+        let owned = SSTableReader::open(bytes)?;
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+        let (read, gave_up) = coop::inline_read(async { owned.get_with_cache(b"mkey", &cache) }).await;
+        assert!(read?.is_some() && !gave_up);
         Ok(())
     }
 

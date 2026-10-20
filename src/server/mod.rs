@@ -1,8 +1,8 @@
-//! Process topology (spec perf/018a A1, perf/018b A1): the storage engines
-//! run on one engine thread (compio, spec perf/020) that serves the write
-//! requests, the read requests run on a multi-threaded reader pool against the
-//! same engines, and HTTP/TLS termination and the frontend layers on a
-//! multi-threaded frontend runtime, with the bridge in between.
+//! Process topology: the storage engines run on one engine thread (compio)
+//! that serves the write requests, the other read requests run on a
+//! multi-threaded reader pool against the same engines, and HTTP/TLS
+//! termination, the frontend layers and the point reads on a multi-threaded
+//! frontend runtime, with the bridge in between.
 
 mod engine;
 
@@ -34,8 +34,9 @@ use tower::ServiceExt;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-/// Handed from the engine thread to the frontend once the engines are up
-/// (perf/018a A1.3); the reader pool builds its router from `state` (perf/018b A1.2).
+/// Handed from the engine thread to the frontend once the engines are up; the
+/// reader pool and the point reads on the frontend build their routers from
+/// `state`.
 struct Ready {
     dispatch: mpsc::Sender<Job>,
     state: AppState,
@@ -364,12 +365,15 @@ impl Listeners {
     }
 }
 
-/// Binds every enabled listener, then serves the frontend router on them
-/// (A1.2, A1.4); `reader_tx` leads to the reader pool. Nothing is spawned
-/// before all binds succeeded.
+/// Binds every enabled listener, then serves the frontend router on them;
+/// `reader_tx` leads to the reader pool, point reads stay on the frontend
+/// unless they would touch the disk. Nothing is spawned before all binds
+/// succeeded.
 #[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 async fn run_frontend(ready: Ready, reader_tx: mpsc::Sender<Job>, config: &LuraConfig) -> anyhow::Result<Listeners> {
-    let ship = ShipService::new(EngineDispatch::Engine(ready.dispatch)).with_reader(reader_tx);
+    let ship = ShipService::new(EngineDispatch::Engine(ready.dispatch))
+        .with_reader(reader_tx)
+        .with_inline(api::create_router(ready.state.clone()));
     let app = build_router(config, ready.state.auth_cache, ready.trusted_cidrs, ship);
     let bind: IpAddr = config
         .server
@@ -1024,18 +1028,68 @@ mod tests {
         assert_eq!(reader_threads(6, 2, 1), 6);
     }
 
-    // Test 2: with M = 2, a GET runs on a reader thread and a PUT on the
-    // engine thread.
+    // With two reader threads, a point GET and the probes run on the frontend
+    // thread that holds the connection, any other read on a reader thread and
+    // a PUT on the engine thread.
     #[test]
-    fn reads_run_on_reader_threads_and_writes_on_the_engine_thread() {
+    fn point_reads_run_on_the_frontend_other_reads_on_reader_threads_and_writes_on_the_engine() {
         with_server(|addr| async move {
             let key = "/store-api/kv/default/keys/where";
             let (status, head, _) = exchange(addr, &with_body("PUT", key, "v")).await;
             assert_eq!((status, thread_of(&head)), (200, "luradb-engine"));
-            let (status, head, _) = exchange(addr, &get(key)).await;
+            for point in [key, "/health", "/version"] {
+                let (status, head, _) = exchange(addr, &get(point)).await;
+                assert_eq!(status, 200, "{point}");
+                assert!(thread_of(&head).starts_with("luradb-frontend"), "{point}: {head}");
+            }
+            let (status, head, _) = exchange(addr, &get(&format!("{key}/meta"))).await;
             assert_eq!(status, 200);
             assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
         });
+    }
+
+    // A point read of a key flushed to an SSTable whose block is not cached
+    // yet runs on a reader thread, which caches the block; the same read then
+    // stays on the frontend, as does one of a key still in the MemTable.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn a_point_read_of_an_uncached_sstable_block_runs_on_the_pool_then_inline() {
+        with_tuned_server(
+            // One flush: 300 inline values of 512 bytes outgrow 128 KiB once.
+            |cfg| cfg.lsm.memtable_size_threshold = 128 * 1024,
+            |addr| async move {
+                let value = |i: usize| format!("{i:0>512}");
+                for i in 0..300 {
+                    let put = with_body("PUT", &format!("/store-api/kv/default/keys/cold-{i}"), &value(i));
+                    assert_eq!(request(addr, &put).await.0, 200);
+                }
+                let mut flushed = false;
+                for _ in 0..500 {
+                    let (status, body) = request(addr, &get("/health")).await;
+                    assert_eq!(status, 200);
+                    if serde_json::from_slice::<Value>(&body).unwrap()["l0_sstable_count"].as_u64().unwrap() >= 1 {
+                        flushed = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(flushed, "no SSTable was flushed within the poll budget");
+
+                let cold = get("/store-api/kv/default/keys/cold-7");
+                let (status, head, body) = exchange(addr, &cold).await;
+                assert_eq!((status, body), (200, value(7).into_bytes()));
+                assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+                let (status, head, body) = exchange(addr, &cold).await;
+                assert_eq!((status, body), (200, value(7).into_bytes()));
+                assert!(thread_of(&head).starts_with("luradb-frontend"), "{head}");
+
+                let warm = "/store-api/kv/default/keys/warm";
+                assert_eq!(request(addr, &with_body("PUT", warm, "fresh")).await.0, 200);
+                let (status, head, body) = exchange(addr, &get(warm)).await;
+                assert_eq!((status, body.as_slice()), (200, b"fresh".as_slice()));
+                assert!(thread_of(&head).starts_with("luradb-frontend"), "{head}");
+            },
+        );
     }
 
     // Test 3: SQL arrives on the pool; write statements answer from the
@@ -1071,23 +1125,28 @@ mod tests {
         );
     }
 
-    // Test 4: a GET pipelined right behind a PUT of the same key on one
-    // connection runs on the pool and still sees the PUT's value.
+    // A point GET on the frontend thread and a read on the pool, pipelined
+    // right behind a PUT of the same key on one connection, both see the PUT.
     #[test]
-    fn a_read_on_the_pool_sees_the_write_before_it_on_the_connection() {
+    fn reads_on_the_frontend_and_the_pool_see_the_write_before_them_on_the_connection() {
         with_server(|addr| async move {
             let put = "PUT /store-api/kv/default/keys/ryw HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\nfirst";
-            let get = get("/store-api/kv/default/keys/ryw");
+            let point = "GET /store-api/kv/default/keys/ryw HTTP/1.1\r\nHost: test\r\n\r\n";
+            let meta = get("/store-api/kv/default/keys/ryw/meta");
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            stream.write_all(format!("{put}{get}").as_bytes()).await.unwrap();
+            stream.write_all(format!("{put}{point}{meta}").as_bytes()).await.unwrap();
             let mut raw = Vec::new();
             stream.read_to_end(&mut raw).await.unwrap();
             let (put_head, _, rest) = split_response(&raw);
-            let (get_head, value, _) = split_response(rest);
+            let (point_head, value, rest) = split_response(rest);
+            let (meta_head, _, _) = split_response(rest);
             assert_eq!(thread_of(&put_head), "luradb-engine");
-            assert!(get_head.starts_with("http/1.1 200"), "{get_head}");
-            assert!(thread_of(&get_head).starts_with("luradb-reader"), "{get_head}");
+            assert!(point_head.starts_with("http/1.1 200"), "{point_head}");
+            assert!(thread_of(&point_head).starts_with("luradb-frontend"), "{point_head}");
             assert_eq!(value, b"first");
+            // The key's metadata exists only once the PUT is in.
+            assert!(meta_head.starts_with("http/1.1 200"), "{meta_head}");
+            assert!(thread_of(&meta_head).starts_with("luradb-reader"), "{meta_head}");
         });
     }
 
@@ -1123,10 +1182,11 @@ mod tests {
         }
     }
 
-    // Test 5: four GETs on four connections, once answered, each block their
+    // Four key scans on four connections, once answered, each block their
     // reader thread in a hold until released — they can only all arrive if
     // four reader threads run them side by side — while a PUT goes through on
-    // the engine thread.
+    // the engine thread. Scans, not point GETs: a held point GET would block a
+    // frontend worker, not a reader thread.
     #[test]
     fn four_reads_run_side_by_side_while_a_write_goes_through() {
         let gate = Arc::new(Rendezvous::default());
@@ -1142,10 +1202,10 @@ mod tests {
         let addr = server.http_addr.expect("HTTP listener enabled");
         let client = tokio::runtime::Runtime::new().unwrap();
 
-        let key = "/store-api/kv/default/keys/parallel";
-        assert_eq!(client.block_on(request(addr, &with_body("PUT", key, "v"))).0, 200);
+        let keys = "/store-api/kv/default/keys";
+        assert_eq!(client.block_on(request(addr, &with_body("PUT", &format!("{keys}/parallel-1"), "v"))).0, 200);
         let held = format!(
-            "GET {key} HTTP/1.1\r\nHost: test\r\n{}: perf-018b-parallel\r\nConnection: close\r\n\r\n",
+            "GET {keys}?prefix=parallel HTTP/1.1\r\nHost: test\r\n{}: perf-018b-parallel\r\nConnection: close\r\n\r\n",
             bridge::test_hook::HOLD
         );
         let gets: Vec<_> = (0..4).map(|_| client.spawn({
@@ -1158,14 +1218,15 @@ mod tests {
         assert_eq!(threads.len(), 4, "{arrived:?}");
         assert!(arrived.iter().all(|(name, _)| name.starts_with("luradb-reader")), "{arrived:?}");
 
-        let (status, head, _) = client.block_on(exchange(addr, &with_body("PUT", key, "w")));
+        let (status, head, _) = client.block_on(exchange(addr, &with_body("PUT", &format!("{keys}/parallel-2"), "w")));
         assert_eq!((status, thread_of(&head)), (200, "luradb-engine"));
 
         gate.release();
-        // Read before the hold, so before the second PUT.
+        // Scanned before the hold, so before the second PUT.
         for get in gets {
-            let (status, head, value) = client.block_on(get).unwrap();
-            assert_eq!((status, value.as_slice()), (200, b"v".as_slice()));
+            let (status, head, body) = client.block_on(get).unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["keys"], json!(["parallel-1"]));
             assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
         }
         server.shutdown().unwrap();

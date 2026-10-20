@@ -1,9 +1,11 @@
-//! Engine bridge (spec perf/018a A2): ships each request from the frontend
-//! runtime over a bounded channel — reads to the reader pool, everything else
-//! to the engine thread (spec perf/018b) — and relays both body streams frame
-//! by frame.
+//! Engine bridge: answers point reads right on the frontend thread that holds
+//! the connection and ships every other request from the frontend runtime over
+//! a bounded channel — the other reads to the reader pool, everything else to
+//! the engine thread — relaying both body streams frame by frame. A point read
+//! that would touch the disk is handed to the pool instead.
 
 use crate::api::middleware::ApiError;
+use crate::core::coop;
 use axum::body::{Body, BodyDataStream, Bytes, HttpBody};
 use axum::http::{request, response, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -47,16 +49,22 @@ impl Payload {
     }
 }
 
-/// Where a request runs: on the reader pool or on the engine thread.
+/// Where a request runs: on the frontend thread that holds the connection, on
+/// the reader pool or on the engine thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteClass {
+    /// A point read — one key, document or row — or a probe: short enough that
+    /// the handover to another thread would cost more than the read itself.
+    ReadInline,
+    /// Every other read, scans and streams included.
     Read,
     Write,
 }
 
-/// Classifies a request by method and path alone (spec perf/018b A2): GET
-/// and HEAD read, as do the JSON search and the SQL route, whose handler
-/// sends write statements on to the engine thread itself.
+/// Classifies a request by method and path alone: GET and HEAD read — inline
+/// for a single key, document or row and for `/health` and `/version`,
+/// otherwise on the pool — as do the JSON search and the SQL route, whose
+/// handler sends write statements on to the engine thread itself.
 /// `auth::middleware::is_write_request` carries the same two POST exceptions;
 /// a new read-only POST route belongs in both.
 pub fn route_class(method: &Method, path: &str) -> RouteClass {
@@ -66,17 +74,34 @@ pub fn route_class(method: &Method, path: &str) -> RouteClass {
             .and_then(|rest| rest.strip_suffix(action))
             .is_some_and(|domain| !domain.is_empty() && !domain.contains('/'))
     };
-    if method == Method::GET
-        || method == Method::HEAD
-        || (method == Method::POST && (read_post("json/", "/search") || read_post("rel/", "/sql")))
-    {
+    if method == Method::GET || method == Method::HEAD {
+        if is_point_read(path) {
+            RouteClass::ReadInline
+        } else {
+            RouteClass::Read
+        }
+    } else if method == Method::POST && (read_post("json/", "/search") || read_post("rel/", "/sql")) {
         RouteClass::Read
     } else {
         RouteClass::Write
     }
 }
 
-/// Where [`ShipService`] hands every request the reader pool does not take.
+fn is_point_read(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+    let non_empty = |segment: &str| !segment.is_empty();
+    match segments[..] {
+        ["", "health" | "version"] => true,
+        ["", "store-api", "kv", domain, "keys", key] => non_empty(domain) && non_empty(key),
+        // The router takes `documents/count` for the counter, never as a key.
+        ["", "store-api", "json", domain, "documents", key] => non_empty(domain) && non_empty(key) && key != "count",
+        ["", "store-api", "rel", domain, "tables", table, "rows", pk] => non_empty(domain) && non_empty(table) && non_empty(pk),
+        _ => false,
+    }
+}
+
+/// Where [`ShipService`] hands every request neither the inline router nor
+/// the reader pool takes.
 #[derive(Clone)]
 pub enum EngineDispatch {
     /// Calls the router on the caller's runtime (tests).
@@ -85,22 +110,33 @@ pub enum EngineDispatch {
     Engine(mpsc::Sender<Job>),
 }
 
-/// Frontend end of the bridge, mounted as the frontend router's fallback.
+/// Frontend end of the bridge, mounted as the frontend router's fallback:
+/// runs each request where its [`RouteClass`] says — a point read as a plain
+/// call on the caller's task, handed over only if it would touch the disk.
 #[derive(Clone)]
 pub struct ShipService {
     engine: EngineDispatch,
-    /// Takes the read requests when set; without it the engine takes all.
+    /// Takes the reads the inline router leaves or gives up on when set; without it the engine takes all.
     reader: Option<mpsc::Sender<Job>>,
+    /// Answers the point reads when set; without it they go with the other reads.
+    inline: Option<Router>,
 }
 
 impl ShipService {
     pub fn new(engine: EngineDispatch) -> Self {
-        Self { engine, reader: None }
+        Self { engine, reader: None, inline: None }
     }
 
-    /// Ships read requests ([`route_class`]) to [`serve_reader`] over `reader`.
+    /// Ships the reads not answered inline ([`route_class`]), and the point
+    /// reads that gave up there, to [`serve_reader`] over `reader`.
     pub fn with_reader(self, reader: mpsc::Sender<Job>) -> Self {
         Self { reader: Some(reader), ..self }
+    }
+
+    /// Answers point reads ([`RouteClass::ReadInline`]) with `router` on the
+    /// calling thread; one that would touch the disk goes to the reader pool.
+    pub fn with_inline(self, router: Router) -> Self {
+        Self { inline: Some(router), ..self }
     }
 }
 
@@ -114,8 +150,12 @@ impl Service<Request<Body>> for ShipService {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let class = route_class(req.method(), req.uri().path());
+        if let (RouteClass::ReadInline, Some(router)) = (class, &self.inline) {
+            return read_inline(router.clone(), self.reader.clone(), req).map(Ok).boxed();
+        }
         if let Some(reader) = &self.reader {
-            if route_class(req.method(), req.uri().path()) == RouteClass::Read {
+            if class != RouteClass::Write {
                 return ship(reader.clone(), req).map(Ok).boxed();
             }
         }
@@ -123,6 +163,22 @@ impl Service<Request<Body>> for ShipService {
             EngineDispatch::Inline(router) => router.clone().oneshot(req).boxed(),
             EngineDispatch::Engine(jobs) => ship(jobs.clone(), req).map(Ok).boxed(),
         }
+    }
+}
+
+/// Answers a point read with `router` on the calling thread. With a reader
+/// pool, a read that would wait for the disk gives up there and runs again on
+/// the pool; without one, it reads on the caller.
+async fn read_inline(router: Router, reader: Option<mpsc::Sender<Job>>, req: Request<Body>) -> Response {
+    let Some(reader) = reader else {
+        return answer(router, req).await;
+    };
+    let (parts, body) = req.into_parts();
+    let head = parts.clone();
+    match coop::inline_read(answer(router, Request::from_parts(parts, body))).await {
+        (resp, false) => resp,
+        // Point reads take nothing from the body.
+        (_, true) => ship(reader, Request::from_parts(head, Body::empty())).await,
     }
 }
 
@@ -202,12 +258,11 @@ async fn engine_loop(mut jobs: mpsc::Receiver<Job>, router: Router) {
     }
 }
 
-/// Reader end of the bridge (spec perf/018b A1.3): runs every read request in
-/// its own task on the calling multi-threaded runtime, against the same shared
-/// engines as the engine thread. Returns once the last sender is gone; the
-/// requests still in flight end with the runtime (A7). POST requests carry an
-/// [`EngineForward`] to `engine`: the SQL route, the only read that forwards,
-/// is a POST.
+/// Reader end of the bridge: runs every shipped read request in its own task
+/// on the calling multi-threaded runtime, against the same shared engines as
+/// the engine thread. Returns once the last sender is gone; the requests still
+/// in flight end with the runtime. POST requests carry an [`EngineForward`] to
+/// `engine`: the SQL route, the only read that forwards, is a POST.
 #[allow(clippy::disallowed_methods, reason = "runs on the reader pool")]
 pub async fn serve_reader(mut jobs: mpsc::Receiver<Job>, router: Router, engine: EngineDispatch) {
     while let Some(mut job) = jobs.recv().await {
@@ -239,16 +294,21 @@ impl EngineForward {
     }
 }
 
-async fn handle(job: Job, router: Router) {
+/// Runs `req` through `router` on the calling thread.
+async fn answer(router: Router, req: Request<Body>) -> Response {
     #[cfg(test)]
-    let hold = test_hook::hold(&job.parts);
-    let body = job.body.map_or_else(Body::empty, |rx| Body::from_stream(frames(rx)));
-    let req = Request::from_parts(job.parts, body);
+    let hold = test_hook::hold(&req);
     let Ok(resp) = router.oneshot(req).await;
     #[cfg(test)]
     hold.await;
     #[cfg(test)]
     let resp = test_hook::tag_thread(resp);
+    resp
+}
+
+async fn handle(job: Job, router: Router) {
+    let body = job.body.map_or_else(Body::empty, |rx| Body::from_stream(frames(rx)));
+    let resp = answer(router, Request::from_parts(job.parts, body)).await;
     let (parts, mut body) = resp.into_parts();
 
     // A body that is already complete rides along in the reply. Bodies without
@@ -308,7 +368,7 @@ fn frames(mut rx: mpsc::Receiver<Frame>) -> impl Stream<Item = Frame> {
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
 
-/// Test hooks inside [`handle`], on whichever thread runs the request; the
+/// Test hooks inside [`answer`], on whichever thread runs the request; the
 /// in-process server tests reach them through headers.
 #[cfg(test)]
 pub(crate) mod test_hook {
@@ -341,10 +401,10 @@ pub(crate) mod test_hook {
         holds().lock().unwrap().insert(name.to_string(), Arc::new(hold));
     }
 
-    /// The hold `parts` names, taken before routing consumes the request.
-    pub(super) fn hold(parts: &request::Parts) -> BoxFuture<'static, ()> {
-        let hold = parts.headers.get(HOLD).and_then(|name| holds().lock().unwrap().get(name.to_str().unwrap()).cloned());
-        let engine = parts.extensions.get::<EngineForward>().and_then(|forward| match &forward.engine {
+    /// The hold `req` names, taken before routing consumes the request.
+    pub(super) fn hold(req: &Request<Body>) -> BoxFuture<'static, ()> {
+        let hold = req.headers().get(HOLD).and_then(|name| holds().lock().unwrap().get(name.to_str().unwrap()).cloned());
+        let engine = req.extensions().get::<EngineForward>().and_then(|forward| match &forward.engine {
             EngineDispatch::Engine(jobs) => Some(jobs.downgrade()),
             EngineDispatch::Inline(_) => None,
         });
@@ -633,19 +693,35 @@ mod tests {
         engine.join().unwrap();
     }
 
-    // Spec perf/018b test 1: GET and HEAD are reads everywhere, and so are
-    // the two POSTs that only read; everything else is a write.
+    // GET and HEAD are reads everywhere, and so are the two POSTs that only
+    // read; everything else is a write. Of the reads, one key, document or row
+    // and the two probes run inline, their path neighbours on the pool.
     #[test]
-    fn route_class_sends_reads_to_the_pool() {
-        use RouteClass::{Read, Write};
+    fn route_class_keeps_point_reads_inline_and_sends_other_reads_to_the_pool() {
+        use RouteClass::{Read, ReadInline, Write};
         let cases = [
-            (Method::GET, "/store-api/kv/x/keys/k", Read),
-            (Method::HEAD, "/store-api/kv/x/keys/k", Read),
-            (Method::GET, "/health", Read),
+            (Method::GET, "/store-api/kv/x/keys/k", ReadInline),
+            (Method::HEAD, "/store-api/kv/x/keys/k", ReadInline),
+            (Method::GET, "/store-api/json/x/documents/d", ReadInline),
+            (Method::HEAD, "/store-api/json/x/documents/d", ReadInline),
+            (Method::GET, "/store-api/rel/x/tables/t/rows/1", ReadInline),
+            (Method::GET, "/health", ReadInline),
+            (Method::HEAD, "/version", ReadInline),
+            (Method::GET, "/store-api/kv/x/keys", Read),
+            (Method::GET, "/store-api/kv/x/keys/", Read),
+            (Method::GET, "/store-api/kv/x/keys/k/meta", Read),
+            (Method::HEAD, "/store-api/kv/x/keys/k/meta", Read),
+            (Method::GET, "/store-api/json/x/documents", Read),
+            (Method::GET, "/store-api/json/x/documents/count", Read),
+            (Method::GET, "/store-api/rel/x/tables/t/rows", Read),
+            (Method::GET, "/store-api/rel/x/tables/t/count", Read),
+            (Method::GET, "/store-api/kv/x/watch", Read),
             (Method::POST, "/store-api/json/x/search", Read),
             (Method::POST, "/store-api/rel/x/sql", Read),
             (Method::POST, "/store-api/domains", Write),
             (Method::PUT, "/store-api/kv/x/keys/k", Write),
+            (Method::DELETE, "/store-api/json/x/documents/d", Write),
+            (Method::PUT, "/store-api/rel/x/tables/t/rows/1", Write),
             (Method::POST, "/store-api/json/x/documents", Write),
             (Method::POST, "/store-api/rel/x/tables/from-file", Write),
             (Method::POST, "/store-api/json/x/y/search", Write),
@@ -680,6 +756,96 @@ mod tests {
         assert!(write.ends_with(&format!(" {engine_id}")), "{write}");
 
         drop(ship);
+        reader.join().unwrap();
+        engine.join().unwrap();
+    }
+
+    // With an inline router, a point read runs on the caller's thread without
+    // a handover, the other reads still on the pool and writes on the engine
+    // thread; without one, point reads stay on the pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_reads_run_on_the_caller_with_an_inline_router() {
+        let thread = || async {
+            let current = std::thread::current();
+            format!("{} {:?}", current.name().unwrap_or_default(), current.id())
+        };
+        let router = Router::new()
+            .route("/store-api/kv/:domain/keys/:key", get(thread).put(thread))
+            .route("/store-api/kv/:domain/keys/:key/meta", get(thread));
+        let (engine_tx, engine) = engine_thread(router.clone());
+        let engine_id = format!("{:?}", engine.thread().id());
+        let (reader_tx, reader) = reader_pool(router.clone(), EngineDispatch::Engine(engine_tx.clone()));
+        let pooled = ShipService::new(EngineDispatch::Engine(engine_tx)).with_reader(reader_tx);
+        let ship = pooled.clone().with_inline(router);
+        let caller = std::thread::current();
+
+        let point = ship.clone().oneshot(get_req("/store-api/kv/x/keys/k")).await.unwrap();
+        assert_eq!(point.headers()[test_hook::THREAD], caller.name().unwrap());
+        assert_eq!(text_of(point).await, format!("{} {:?}", caller.name().unwrap(), caller.id()));
+        let meta = text_of(ship.clone().oneshot(get_req("/store-api/kv/x/keys/k/meta")).await.unwrap()).await;
+        assert!(meta.starts_with("test-reader "), "{meta}");
+        let put = Request::put("/store-api/kv/x/keys/k").body(Body::empty()).unwrap();
+        let write = text_of(ship.clone().oneshot(put).await.unwrap()).await;
+        assert!(write.ends_with(&format!(" {engine_id}")), "{write}");
+
+        let point = text_of(pooled.clone().oneshot(get_req("/store-api/kv/x/keys/k")).await.unwrap()).await;
+        assert!(point.starts_with("test-reader "), "{point}");
+
+        drop((ship, pooled));
+        reader.join().unwrap();
+        engine.join().unwrap();
+    }
+
+    // A point read that would wait for the disk gives up on the caller and
+    // runs again on the pool with the same headers and extensions, and the
+    // pool's answer is the only one the client gets. Without a pool there is
+    // nowhere to hand it, so it reads on the caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_point_read_that_would_block_runs_again_on_the_pool() {
+        use axum::extract::Extension;
+        use axum::http::HeaderMap;
+
+        #[derive(Clone)]
+        struct Caller(&'static str);
+
+        let gave_up = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&gave_up);
+        let router = Router::new().route(
+            "/store-api/kv/:domain/keys/:key",
+            get(move |Extension(caller): Extension<Caller>, headers: HeaderMap| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if coop::would_block() {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    let thread = std::thread::current().name().unwrap_or_default().to_string();
+                    format!("{thread} {} {}", caller.0, headers["x-probe"].to_str().unwrap()).into_response()
+                }
+            }),
+        );
+        let probe = || {
+            let mut req = Request::get("/store-api/kv/x/keys/k").header("x-probe", "1").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(Caller("alice"));
+            req
+        };
+        let (engine_tx, engine) = engine_thread(router.clone());
+        let (reader_tx, reader) = reader_pool(router.clone(), EngineDispatch::Engine(engine_tx.clone()));
+        let without_pool = ShipService::new(EngineDispatch::Engine(engine_tx)).with_inline(router);
+        let pooled = without_pool.clone().with_reader(reader_tx);
+
+        let resp = pooled.clone().oneshot(probe()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[test_hook::THREAD], "test-reader");
+        assert_eq!(text_of(resp).await, "test-reader alice 1");
+        assert_eq!(gave_up.load(Ordering::SeqCst), 1);
+
+        let resp = without_pool.clone().oneshot(probe()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(text_of(resp).await, format!("{} alice 1", std::thread::current().name().unwrap()));
+        assert_eq!(gave_up.load(Ordering::SeqCst), 1);
+
+        drop((pooled, without_pool));
         reader.join().unwrap();
         engine.join().unwrap();
     }

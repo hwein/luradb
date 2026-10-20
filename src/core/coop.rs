@@ -1,10 +1,35 @@
-//! Cooperative scheduling helpers for the single request-path thread
-//! (spec perf/017).
+//! Cooperative scheduling helpers: yielding, bounded offloading, and reads
+//! that give up rather than wait for the disk.
 
+use std::cell::Cell;
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 
-/// Hands the thread back every `every` ticks (spec perf/017).
+tokio::task_local! {
+    /// Set inside [`inline_read`] once a read there would have waited for the disk.
+    static WOULD_BLOCK: Cell<bool>;
+}
+
+/// Runs `fut` as a read that must not wait for the disk; also returns whether
+/// it gave up because it would have had to ([`would_block`]). Task-local, so
+/// it follows `fut` from one worker thread to the next.
+pub async fn inline_read<F: Future>(fut: F) -> (F::Output, bool) {
+    WOULD_BLOCK
+        .scope(Cell::new(false), async {
+            let out = fut.await;
+            (out, WOULD_BLOCK.with(Cell::get))
+        })
+        .await
+}
+
+/// True inside [`inline_read`], which then reports the read as given up: the
+/// caller must fail instead of waiting for the disk. False anywhere else.
+pub fn would_block() -> bool {
+    WOULD_BLOCK.try_with(|flag| flag.set(true)).is_ok()
+}
+
+/// Hands the thread back every `every` ticks.
 pub struct YieldEvery {
     every: u32,
     n: u32,
@@ -164,6 +189,27 @@ mod tests {
         release_tx.send(()).unwrap();
         first.await.unwrap();
         second.await.unwrap();
+    }
+
+    // Only a read inside `inline_read` learns to give up instead of waiting
+    // for the disk; its scope reports that across awaits, and the next scope
+    // starts afresh.
+    #[tokio::test]
+    async fn test_inline_read_reports_a_read_that_would_block() {
+        assert!(!would_block());
+
+        let (inside, gave_up) = inline_read(async {
+            tokio::task::yield_now().await;
+            let nested = async { would_block() }.await;
+            tokio::task::yield_now().await;
+            nested
+        })
+        .await;
+        assert!(inside && gave_up);
+
+        let ((), gave_up) = inline_read(async { tokio::task::yield_now().await }).await;
+        assert!(!gave_up);
+        assert!(!would_block());
     }
 
     // A5: `0` resolves to the auto count, anything else is taken verbatim.

@@ -933,17 +933,25 @@ mod router_coverage_tests {
         );
     }
 
+    /// Point reads served on the frontend thread that holds the connection.
+    /// Each handler answers without a scan; a route that scans or streams
+    /// belongs in `READ_ROUTES`.
+    const INLINE_ROUTES: &[(&str, &str)] = &[
+        ("get", "/health"),
+        ("get", "/version"),
+        ("get", "/store-api/kv/{domain}/keys/{key}"),
+        ("get", "/store-api/json/{domain}/documents/{key}"),
+        ("get", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
+    ];
+
     /// Routes served by the reader pool (spec perf/018b A2). Each handler was
     /// checked for engine writes; one that writes belongs in `WRITE_ROUTES`.
     const READ_ROUTES: &[(&str, &str)] = &[
-        ("get", "/health"),
-        ("get", "/version"),
         ("get", "/store-api/config"),
         ("get", "/store-api/metrics"),
         ("get", "/store-api/metrics/domains/{name}"),
         ("get", "/store-api/domains"),
         ("get", "/store-api/domains/{name}"),
-        ("get", "/store-api/kv/{domain}/keys/{key}"),
         ("get", "/store-api/kv/{domain}/keys/{key}/meta"),
         ("get", "/store-api/kv/{domain}/keys"),
         ("get", "/store-api/kv/{domain}/count"),
@@ -952,7 +960,6 @@ mod router_coverage_tests {
         ("get", "/store-api/json/domains/{name}"),
         ("get", "/store-api/json/{domain}/documents"),
         ("get", "/store-api/json/{domain}/documents/count"),
-        ("get", "/store-api/json/{domain}/documents/{key}"),
         ("get", "/store-api/json/{domain}/indexes"),
         ("post", "/store-api/json/{domain}/search"),
         ("get", "/store-api/json/{domain}/export"),
@@ -971,7 +978,6 @@ mod router_coverage_tests {
         ("get", "/store-api/rel/{domain}/tables/{table}"),
         ("get", "/store-api/rel/{domain}/views"),
         ("get", "/store-api/rel/{domain}/tables/{table}/rows"),
-        ("get", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
         ("get", "/store-api/rel/{domain}/tables/{table}/count"),
         ("get", "/store-api/auth/whoami"),
         ("get", "/store-api/auth/users"),
@@ -1011,9 +1017,9 @@ mod router_coverage_tests {
         ("post", "/store-api/auth/users/{name}/rotate-key"),
     ];
 
-    // Spec perf/018b A2: every registered route sits in exactly one of the
-    // lists above, and `route_class` sends it where its list says — a new
-    // route without a reviewed class fails here.
+    // Every registered route sits in exactly one of the three lists above, and
+    // `route_class` sends it where its list says — a new route without a
+    // reviewed class fails here.
     #[test]
     fn every_registered_route_has_a_reviewed_class() {
         use crate::bridge::{route_class, RouteClass};
@@ -1021,22 +1027,36 @@ mod router_coverage_tests {
         let listed = |list: &[(&str, &str)]| -> BTreeSet<(String, String)> {
             list.iter().map(|(method, path)| (method.to_string(), path.to_string())).collect()
         };
-        let (reads, writes) = (listed(READ_ROUTES), listed(WRITE_ROUTES));
-        assert!(reads.is_disjoint(&writes), "listed as read and write: {:?}", reads.intersection(&writes));
+        let (inline, reads, writes) = (listed(INLINE_ROUTES), listed(READ_ROUTES), listed(WRITE_ROUTES));
+        let pairs = [
+            ("inline and read", &inline, &reads),
+            ("inline and write", &inline, &writes),
+            ("read and write", &reads, &writes),
+        ];
+        for (lists, a, b) in pairs {
+            assert!(a.is_disjoint(b), "listed as {lists}: {:?}", a.intersection(b));
+        }
 
         let registered = registered_routes();
-        let all: BTreeSet<_> = reads.union(&writes).cloned().collect();
+        let all: BTreeSet<_> = inline.iter().chain(&reads).chain(&writes).cloned().collect();
         let unlisted: Vec<_> = registered.difference(&all).collect();
         let stale: Vec<_> = all.difference(&registered).collect();
         assert!(
             unlisted.is_empty() && stale.is_empty(),
             "Route classes and router diverge.\n\
-             Registered but in neither list — check the handler for engine writes, then list it: {unlisted:?}\n\
+             Registered but in no list — check the handler for engine writes, then list it: {unlisted:?}\n\
              Listed but not registered: {stale:?}"
         );
 
         for (method, path) in &registered {
-            let expected = if reads.contains(&(method.clone(), path.clone())) { RouteClass::Read } else { RouteClass::Write };
+            let route = (method.clone(), path.clone());
+            let expected = if inline.contains(&route) {
+                RouteClass::ReadInline
+            } else if reads.contains(&route) {
+                RouteClass::Read
+            } else {
+                RouteClass::Write
+            };
             // A concrete request path: every `{param}` segment gets a sample value.
             let concrete = path
                 .split('/')

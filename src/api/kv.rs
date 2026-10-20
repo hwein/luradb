@@ -1351,8 +1351,8 @@ mod tests {
     #[test]
     fn test_count_keys_large_volume() {
         crate::core::engine_runtime::block_on(async {
-            let mut config = crate::engines::lsm::domain::DomainConfig::default();
-            config.default_write_iops = 20_000;
+            let config =
+                crate::engines::lsm::domain::DomainConfig { default_write_iops: 20_000, ..Default::default() };
             let (app, _dir) = make_app_with_config(config).await;
 
             let app_ref = &app;
@@ -1462,8 +1462,8 @@ mod tests {
     #[test]
     fn test_bulk_delete_over_cap_413_nothing_deleted() {
         crate::core::engine_runtime::block_on(async {
-            let mut config = crate::engines::lsm::domain::DomainConfig::default();
-            config.max_bulk_delete_keys = 3;
+            let config =
+                crate::engines::lsm::domain::DomainConfig { max_bulk_delete_keys: 3, ..Default::default() };
             let (app, _dir) = make_app_with_config(config).await;
             for i in 0..5 {
                 send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/cap:{i}"), Body::from("v")).await;
@@ -1486,8 +1486,8 @@ mod tests {
     #[test]
     fn test_bulk_delete_exactly_at_cap_succeeds() {
         crate::core::engine_runtime::block_on(async {
-            let mut config = crate::engines::lsm::domain::DomainConfig::default();
-            config.max_bulk_delete_keys = 3;
+            let config =
+                crate::engines::lsm::domain::DomainConfig { max_bulk_delete_keys: 3, ..Default::default() };
             let (app, _dir) = make_app_with_config(config).await;
             for i in 0..3 {
                 send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/edge:{i}"), Body::from("v")).await;
@@ -1505,8 +1505,8 @@ mod tests {
     #[test]
     fn test_bulk_delete_cap_checked_after_contains_filter() {
         crate::core::engine_runtime::block_on(async {
-            let mut config = crate::engines::lsm::domain::DomainConfig::default();
-            config.max_bulk_delete_keys = 2;
+            let config =
+                crate::engines::lsm::domain::DomainConfig { max_bulk_delete_keys: 2, ..Default::default() };
             let (app, _dir) = make_app_with_config(config).await;
             send(&app, Method::PUT, "/store-api/kv/testdom/keys/f:x1", Body::from("v")).await;
             send(&app, Method::PUT, "/store-api/kv/testdom/keys/f:x2", Body::from("v")).await;
@@ -1527,8 +1527,7 @@ mod tests {
     #[test]
     fn test_bulk_delete_checks_write_token_before_scanning() {
         crate::core::engine_runtime::block_on(async {
-            let mut config = crate::engines::lsm::domain::DomainConfig::default();
-            config.default_read_iops = 1;
+            let config = crate::engines::lsm::domain::DomainConfig { default_read_iops: 1, ..Default::default() };
             let (state, _dir) = make_state(config, false).await;
             let store = state.registry.store("testdom").await.unwrap();
             let app = crate::api::router_inline(state, Arc::new(vec![]));
@@ -1935,8 +1934,8 @@ mod tests {
     #[test]
     fn test_scan_keys_default_limit_is_1000() {
         crate::core::engine_runtime::block_on(async {
-            let mut config = crate::engines::lsm::domain::DomainConfig::default();
-            config.default_write_iops = 5_000;
+            let config =
+                crate::engines::lsm::domain::DomainConfig { default_write_iops: 5_000, ..Default::default() };
             let (app, _dir) = make_app_with_config(config).await;
 
             let app_ref = &app;

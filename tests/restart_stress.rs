@@ -331,7 +331,7 @@ async fn run_background_loader(id: usize, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         let key = format!("bg{id}-{i}").into_bytes();
         let _ = engine.put(&key, &[b'x'; 256]).await;
-        if i % 4 == 0 {
+        if i.is_multiple_of(4) {
             let _ = engine.flush_memtable().await;
         }
         i += 1;

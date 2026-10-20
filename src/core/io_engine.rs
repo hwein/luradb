@@ -432,7 +432,7 @@ mod tests {
             engine.register_file(1, &small_path).await.unwrap();
 
             let mut buf = engine.checkout_buffer().unwrap();
-            buf.put_slice(&vec![b'X'; 100]);
+            buf.put_slice(&[b'X'; 100]);
             engine.write_fixed(0, 0, buf, 100).await.unwrap();
 
             // Small write reuses that slot; the file must hold exactly 4 bytes.

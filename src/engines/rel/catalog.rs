@@ -239,6 +239,8 @@ impl LiveIds {
     }
 }
 
+type ReservedIds = Arc<parking_lot::Mutex<HashSet<(Vec<u8>, u32)>>>;
+
 /// RAII cleanup for an index id reserved by [`RelCatalog::create_index_reserve`]
 /// but not yet catalog-visible (rel/013 F1). `ddl.rs` holds it across the index
 /// backfill: its `Drop` frees the reservation on any early abort (`KeyTooLong`,
@@ -247,7 +249,7 @@ impl LiveIds {
 /// `create_index_commit`, which already freed the reservation and made the
 /// index catalog-live.
 pub(crate) struct IndexReservationGuard {
-    reserved: Arc<parking_lot::Mutex<HashSet<(Vec<u8>, u32)>>>,
+    reserved: ReservedIds,
     key: (Vec<u8>, u32),
     armed: bool,
 }
@@ -281,7 +283,7 @@ pub struct RelCatalog {
     /// not yet catalog-live, so the rel/013 orphan sweep must spare it and its
     /// in-flight `IDX:` backfill (rel/013 F1). Never persisted — after a crash
     /// the set is empty and the then-orphaned bytes are reaped normally.
-    reserved_ids: Arc<parking_lot::Mutex<HashSet<(Vec<u8>, u32)>>>,
+    reserved_ids: ReservedIds,
     engine: Arc<LsmStorageEngine>,
     /// Serializes check-then-act catalog mutations (general/003).
     ddl_lock: Mutex<()>,
@@ -1055,7 +1057,6 @@ impl RelCatalog {
     /// Like [`rename_column`], but runs `check` against the prospective
     /// per-domain map (the column already renamed) under the same `ddl_lock`
     /// acquisition as the mutation (spec rel/008 §7).
-    #[allow(clippy::too_many_arguments)]
     pub async fn rename_column_checked(
         &self,
         domains: &RelDomainRegistry,

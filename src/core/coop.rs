@@ -36,7 +36,7 @@ pub struct YieldEvery {
 }
 
 impl YieldEvery {
-    /// `every` of `0` is clamped to `1` — the modulo below would divide by zero.
+    /// `every` of `0` is clamped to `1`, so a zero still yields on every tick.
     pub fn new(every: u32) -> Self {
         Self { every: every.max(1), n: 0 }
     }
@@ -44,7 +44,7 @@ impl YieldEvery {
     /// Counts one unit of work and yields on every `every`-th call.
     pub async fn tick(&mut self) {
         self.n = self.n.wrapping_add(1);
-        if self.n % self.every == 0 {
+        if self.n.is_multiple_of(self.every) {
             tokio::task::yield_now().await;
         }
     }

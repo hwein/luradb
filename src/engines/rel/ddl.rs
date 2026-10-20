@@ -1,13 +1,13 @@
-//! DDL executor for table/index statements (spec rel/004 §8).
+//! DDL executor for table/index statements.
 //!
 //! A thin dispatch layer: each `DdlPlan` variant maps to exactly one
-//! `RelCatalog` primitive, which is the self-validating, atomic (`ddl_lock`
-//! + one `WriteBatch`) source of truth — see rel/003's `create_table` and
-//! the primitives this spec adds alongside it (`add_column`, `drop_column`,
+//! `RelCatalog` primitive, which is the self-validating, atomic
+//! (`ddl_lock` plus one `WriteBatch`) source of truth — see `create_table`
+//! and the primitives alongside it (`add_column`, `drop_column`,
 //! `rename_column`, `rename_table`, `create_index`, `drop_index`). `DROP
-//! TABLE` is the one exception: it reuses the existing generic
-//! `RelCatalog::get`/`drop_object` (rel/003) rather than a new primitive,
-//! remapping their generic `ObjectNotFound` to the more specific
+//! TABLE` is the one exception: it reuses the generic
+//! `RelCatalog::drop_object_checked` rather than a new primitive,
+//! remapping its generic `ObjectNotFound` to the more specific
 //! `TableNotFound` and rejecting a same-named view — `DROP TABLE` must not
 //! silently delete a view.
 
@@ -129,7 +129,6 @@ pub async fn execute(
 /// then write the `IDX:` entries in chunk batches; (4) make the `IndexMeta`
 /// catalog-visible **last**. A crash between 0 and 4 leaves only a burned id
 /// and orphan bytes (purger fodder), never a visible index missing entries.
-#[allow(clippy::too_many_arguments)]
 pub async fn execute_create_index(
     engine: &LsmStorageEngine,
     catalog: &RelCatalog,

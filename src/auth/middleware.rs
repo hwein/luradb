@@ -130,13 +130,13 @@ pub fn enforce_sql_level(
     auth_enabled: bool,
     outcome: Option<AuthOutcome>,
     required: AccessLevel,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     match outcome {
         Some(AuthOutcome::Full) => Ok(()),
         Some(AuthOutcome::Scoped(level)) if level >= required => Ok(()),
-        Some(AuthOutcome::Scoped(_)) => Err(forbidden()),
+        Some(AuthOutcome::Scoped(_)) => Err(Box::new(forbidden())),
         None if !auth_enabled => Ok(()), // auth globally off: nothing is checked anywhere
-        None => Err(forbidden()),        // auth on, outcome missing: fail-closed
+        None => Err(Box::new(forbidden())), // auth on, outcome missing: fail-closed
     }
 }
 

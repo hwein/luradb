@@ -221,7 +221,7 @@ const SCAN_EXPIRED_YIELD_INTERVAL: usize = 1024;
 /// phase is synchronous and would otherwise block a worker for a whole file.
 async fn scan_expired_yield(checked: &mut usize) {
     *checked += 1;
-    if *checked % SCAN_EXPIRED_YIELD_INTERVAL == 0 {
+    if (*checked).is_multiple_of(SCAN_EXPIRED_YIELD_INTERVAL) {
         tokio::task::yield_now().await;
     }
 }
@@ -6098,13 +6098,13 @@ mod tests {
                         Err(e) => panic!("read of confirmed key {i} failed: {e}"),
                     }
                     reads += 1;
-                    if reads % 2_000 == 0 || finished {
+                    if reads.is_multiple_of(2_000) || finished {
                         assert_lists_known_keys(&engine.scan_keys(b"s").await.unwrap(), known);
                     }
                     if finished {
                         break;
                     }
-                    if reads % 64 == 0 {
+                    if reads.is_multiple_of(64) {
                         std::thread::sleep(Duration::from_micros(200));
                     }
                 }

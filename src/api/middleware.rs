@@ -18,16 +18,17 @@ use std::sync::Arc;
 // ── ApiError ──────────────────────────────────────────────────────────────────
 
 /// Unified API error that maps anyhow errors to HTTP responses.
-pub struct ApiError(StatusCode, String, HeaderMap);
+/// Extra headers are boxed so the error stays small on every `Result` path.
+pub struct ApiError(StatusCode, String, Option<Box<HeaderMap>>);
 
 impl ApiError {
     pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        ApiError(status, message.into(), HeaderMap::new())
+        ApiError(status, message.into(), None)
     }
 
     /// Adds a header to the error response; the plain-text body stays as is.
     pub(crate) fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
-        self.2.insert(name, value);
+        self.2.get_or_insert_with(Default::default).insert(name, value);
         self
     }
 }
@@ -57,7 +58,9 @@ impl From<anyhow::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut resp = (self.0, self.1).into_response();
-        resp.headers_mut().extend(self.2);
+        if let Some(headers) = self.2 {
+            resp.headers_mut().extend(*headers);
+        }
         if self.0 == StatusCode::TOO_MANY_REQUESTS {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, "1".parse().unwrap());
@@ -250,7 +253,7 @@ mod tests {
     #[test]
     fn trusted_proxy_xff_gives_real_ip() {
         let peer: IpAddr = "127.0.0.1".parse().unwrap();
-        let cidrs = vec![ParsedCidr::parse("127.0.0.1").unwrap()];
+        let cidrs = [ParsedCidr::parse("127.0.0.1").unwrap()];
         let headers = make_xff("1.2.3.4");
 
         let client_ip = if !cidrs.is_empty() && cidrs.iter().any(|c| c.contains(peer)) {
@@ -265,7 +268,7 @@ mod tests {
     #[test]
     fn trusted_proxy_xri_gives_real_ip() {
         let peer: IpAddr = "127.0.0.1".parse().unwrap();
-        let cidrs = vec![ParsedCidr::parse("127.0.0.1").unwrap()];
+        let cidrs = [ParsedCidr::parse("127.0.0.1").unwrap()];
         let headers = make_xri("5.6.7.8");
 
         let client_ip = if !cidrs.is_empty() && cidrs.iter().any(|c| c.contains(peer)) {
@@ -282,7 +285,7 @@ mod tests {
     #[test]
     fn non_trusted_proxy_xff_ignored() {
         let peer: IpAddr = "5.6.7.8".parse().unwrap();
-        let cidrs = vec![ParsedCidr::parse("127.0.0.1").unwrap()];
+        let cidrs = [ParsedCidr::parse("127.0.0.1").unwrap()];
         let headers = make_xff("1.2.3.4");
 
         let client_ip = if !cidrs.is_empty() && cidrs.iter().any(|c| c.contains(peer)) {

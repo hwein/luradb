@@ -659,7 +659,7 @@ impl BackupManager {
             .into_iter()
             .filter(|b| b.state == BackupState::Complete && !b.uploaded && b.schedule.as_deref() == Some(schedule_name))
             .collect();
-        matching.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        matching.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
         let mut deleted = 0;
         for old in matching.into_iter().skip(keep_last) {

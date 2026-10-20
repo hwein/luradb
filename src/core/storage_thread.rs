@@ -508,7 +508,7 @@ fn ring_op(ring: &mut IoUring, entry: squeue::Entry) -> std::io::Result<i32> {
         // a submitted op can still touch it.
         unsafe {
             sq.push(&entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "io_uring submission queue full")
+                std::io::Error::other("io_uring submission queue full")
             })?;
         }
         sq.sync();
@@ -586,6 +586,7 @@ fn open_rw(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .with_context(|| format!("open {}", path.display()))
 }

@@ -176,6 +176,7 @@ impl WriteAheadLog {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path.as_ref())
             .await?;
 
@@ -237,7 +238,7 @@ impl WriteAheadLog {
 
 /// Maps a storage-thread `anyhow` error back into the WAL's error type.
 fn wal_remote_err(e: anyhow::Error) -> WalError {
-    WalError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    WalError::Io(std::io::Error::other(e.to_string()))
 }
 
 fn broken_pipe_error() -> WalError {

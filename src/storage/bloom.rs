@@ -46,7 +46,7 @@ impl BloomFilter {
         let num_hashes = ((num_bits as f64 / num_items as f64)
             * std::f64::consts::LN_2).ceil() as u32;
 
-        let num_bytes = ((num_bits + 7) / 8) as usize;
+        let num_bytes = num_bits.div_ceil(8) as usize;
 
         Self {
             bits: vec![0u8; num_bytes],

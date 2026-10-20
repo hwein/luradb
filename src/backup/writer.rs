@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use crate::core::engine_runtime::{self, spawn_io};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) const FORMAT_VERSION: u32 = 1;
@@ -253,7 +253,7 @@ impl PartFile {
     }
 }
 
-async fn write_backup_file(part_path: &PathBuf, params: &BackupParams<'_>) -> anyhow::Result<()> {
+async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyhow::Result<()> {
     // include_auth only ever applies to all/kv (spec: auth records live in
     // the KV instance) -- other scopes silently ignore the flag.
     let export_auth = params.include_auth && matches!(params.scope, BackupScope::All | BackupScope::Kv);
@@ -469,7 +469,7 @@ async fn write_line(
 }
 
 pub(crate) async fn maybe_pause(i: usize, batch_size: usize, pause_ms: u64) {
-    if batch_size > 0 && (i + 1) % batch_size == 0 {
+    if batch_size > 0 && (i + 1).is_multiple_of(batch_size) {
         compio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
     }
 }

@@ -441,7 +441,7 @@ mod tests {
             // Safe: single writer, two distinct buffers of `len` bytes, header valid.
             let writer = unsafe {
                 SnapshotWriter::new(
-                    &*self.header,
+                    &self.header,
                     self.a.as_mut_ptr(),
                     self.b.as_mut_ptr(),
                     len,

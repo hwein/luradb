@@ -274,7 +274,7 @@ impl GlobalEventBus {
         let mut items = events.iter();
         self.log.publish_many(&self.tx, events.len(), |seq| {
             let (kind, object) = items.next().expect("publish_many: make is called exactly events.len() times");
-            GlobalEvent { seq, engine, kind: *kind, domain: domain.to_string(), object: object.clone(), ts }
+            GlobalEvent { seq, engine, kind, domain: domain.to_string(), object: object.clone(), ts }
         });
     }
 }

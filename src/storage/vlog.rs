@@ -271,7 +271,7 @@ pub async fn discover_generations(base: &Path) -> Result<Vec<u32>, VLogError> {
 
 /// Maps a storage-thread `anyhow` error back into the vLog's error type.
 fn vlog_remote_err(e: anyhow::Error) -> VLogError {
-    VLogError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    VLogError::Io(std::io::Error::other(e.to_string()))
 }
 
 #[cfg(test)]

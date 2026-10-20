@@ -574,7 +574,7 @@ where
     ///
     /// Pops the smallest entry, filters by MVCC visibility, deduplicates by
     /// user key, then advances the source (see [`Self::advance_source`]).
-    pub fn next(&mut self) -> Option<Result<VersionedEntry>> {
+    fn next_entry(&mut self) -> Option<Result<VersionedEntry>> {
         while let Some(std::cmp::Reverse(entry)) = self.heap.pop() {
             // Skip entries not visible in this snapshot.
             if !self.snapshot.is_visible(entry.current.1) {
@@ -614,7 +614,7 @@ where
     type Item = Result<VersionedEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next()
+        self.next_entry()
     }
 }
 

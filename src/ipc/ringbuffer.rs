@@ -28,7 +28,7 @@ impl DoubleMmapRegion {
     /// open for the duration of this call.
     pub unsafe fn new(fd: RawFd, size: usize) -> Result<Self> {
         let page = page_size();
-        ensure!(size >= page && size % page == 0, "ring size {size} is not a multiple of page size {page}");
+        ensure!(size >= page && size.is_multiple_of(page), "ring size {size} is not a multiple of page size {page}");
         ensure!(size.is_power_of_two(), "ring size {size} is not a power of two");
 
         // Reserve 2*size of address space with no access — a placeholder we

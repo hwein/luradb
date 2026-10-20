@@ -50,6 +50,12 @@ pub struct SSTableBuilder {
     total_keys: usize,
 }
 
+impl Default for SSTableBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SSTableBuilder {
     pub fn new() -> Self {
         let initial_bloom_size = 10000;

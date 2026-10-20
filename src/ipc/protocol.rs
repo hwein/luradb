@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(std::mem::align_of::<ReaderSlot>(), 64);
         assert_eq!(READER_SLOT_OFFSET, RingbufferHeader::SIZE);
         assert_eq!(READER_SLOT_OFFSET, 128);
-        assert!(READER_SLOT_OFFSET + ReaderSlot::SIZE <= CLIENT_HDR_SIZE);
+        const { assert!(READER_SLOT_OFFSET + ReaderSlot::SIZE <= CLIENT_HDR_SIZE) };
 
         let slot = ReaderSlot::zeroed();
         let base = addr_of!(slot) as usize;
@@ -689,7 +689,7 @@ mod tests {
     }
 
     /// Writer storm: 5000 alternating single-marker payloads of varying length.
-    fn publish_marker_storm(w: &SnapshotWriter, payload: &mut Vec<u8>) {
+    fn publish_marker_storm(w: &SnapshotWriter, payload: &mut [u8]) {
         for i in 0..5000u32 {
             let marker = 1 + (i % 250) as u8;
             let len = 1 + (i as usize % (LEN - 1));

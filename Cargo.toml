@@ -83,6 +83,15 @@ tempfile = "3.10"
 # h2c client for the per-connection ordering test (spec perf/018a).
 hyper = { version = "1", features = ["client", "http2"] }
 
+[lints.clippy]
+# House pattern: async trait methods are written as
+# `fn ... -> impl Future<Output = _> + Send` on purpose, without the async-trait crate.
+manual_async_fn = "allow"
+# Deliberately wide signatures (constructors, background-task wiring, staged
+# write paths) take their context as plain parameters; a parameter struct
+# would add churn without helping any call site.
+too_many_arguments = "allow"
+
 [package.metadata.deb]
 maintainer = "Heiko Wein <heiko.wein.hw@gmail.com>"
 copyright = "2026 Heiko Wein"

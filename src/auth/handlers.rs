@@ -116,15 +116,15 @@ pub struct SetPermissionParams {
 }
 
 /// Resolves the optional store_type field to the permission namespace.
-fn parse_store_type(value: &Option<String>) -> Result<StoreType, Response> {
+fn parse_store_type(value: &Option<String>) -> Result<StoreType, Box<Response>> {
     match value.as_deref() {
         None | Some("kv") => Ok(StoreType::Kv),
         Some("json") => Ok(StoreType::Json),
         Some("rel") => Ok(StoreType::Rel),
-        Some(other) => Err(err(
+        Some(other) => Err(Box::new(err(
             StatusCode::BAD_REQUEST,
             &format!("store_type must be 'kv', 'json' or 'rel', got '{other}'"),
-        )),
+        ))),
     }
 }
 
@@ -385,7 +385,7 @@ pub async fn set_permission(
     }
     let store_type = match parse_store_type(&body.store_type) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let allow_missing = params.allow_missing.unwrap_or(false);
     // Domain existence check (spec general/021): kv unchanged; json/rel check
@@ -470,7 +470,7 @@ pub async fn remove_permission(
 ) -> Response {
     let store_type = match parse_store_type(&params.store_type) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let perm_domain = crate::auth::middleware::permission_domain(store_type, &domain);
     if state.cache.get_permission(&name, &perm_domain).await.is_none() {

@@ -334,23 +334,24 @@ impl DomainRegistry {
 
     async fn load_from_engine(&self) -> Result<()> {
         let sys_keys = self.engine.scan_keys(SYS_DOMAIN_PREFIX).await?;
-        let mut cache = self.domains.write();
-        let mut runtimes = self.runtimes.write();
+        let mut loaded = Vec::new();
         for key in sys_keys {
             let snap = self.engine.snapshot();
-            match self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
-                Some(value) => match serde_json::from_slice::<Domain>(&value) {
-                    Ok(domain) => {
-                        runtimes.insert(domain.name.clone(), self.make_runtime());
-                        cache.insert(domain.name.clone(), domain);
-                    }
+            if let Some(value) = self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
+                match serde_json::from_slice::<Domain>(&value) {
+                    Ok(domain) => loaded.push(domain),
                     Err(e) => eprintln!(
                         "[DomainRegistry] Cannot deserialize domain at key {:?}: {e}",
                         key
                     ),
-                },
-                None => {}
+                }
             }
+        }
+        let mut cache = self.domains.write();
+        let mut runtimes = self.runtimes.write();
+        for domain in loaded {
+            runtimes.insert(domain.name.clone(), self.make_runtime());
+            cache.insert(domain.name.clone(), domain);
         }
         Ok(())
     }

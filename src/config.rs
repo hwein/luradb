@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LuraConfig {
     pub server: ServerConfig,
@@ -32,33 +32,6 @@ pub struct LuraConfig {
     pub events: EventsConfig,
     pub cors: CorsConfig,
     pub multicore: MulticoreConfig,
-}
-
-impl Default for LuraConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            io_engine: IoEngineConfig::default(),
-            buffer_pool: BufferPoolConfig::default(),
-            lsm: LsmConfig::default(),
-            compaction: CompactionCfg::default(),
-            janitor: JanitorCfg::default(),
-            ttl_sweeper: TtlSweeperCfg::default(),
-            domains: DomainsConfig::default(),
-            rate_limit: RateLimitConfig::default(),
-            log: LogConfig::default(),
-            auth: AuthConfig::default(),
-            proxy: ProxyConfig::default(),
-            json: JsonStoreConfig::default(),
-            rel: RelStoreConfig::default(),
-            shm: ShmConfig::default(),
-            backup: BackupConfig::default(),
-            events: EventsConfig::default(),
-            cors: CorsConfig::default(),
-            multicore: MulticoreConfig::default(),
-        }
-    }
 }
 
 impl LuraConfig {
@@ -354,17 +327,11 @@ impl Default for StorageConfig {
 ///
 /// Scaffolding only — not yet wired into the WAL/VLog/SSTable hot paths
 /// (see spec perf/004). Disabled by default.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct IoEngineConfig {
     /// Enables the IoEngine (Default: false). Also gates the perf/005 storage thread.
     pub enabled: bool,
-}
-
-impl Default for IoEngineConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 // ── Buffer Pool ───────────────────────────────────────────────────────────────
@@ -632,7 +599,7 @@ impl Default for RateLimitConfig {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AuthConfig {
     /// Set to `false` to disable auth enforcement (dev/local mode).
@@ -641,16 +608,6 @@ pub struct AuthConfig {
     /// UIDs authenticated via UDS peer credentials without an API key
     /// (admin access). Empty = UCred bypass disabled (perf/001).
     pub trusted_uids: Vec<u32>,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            admins: Vec::new(),
-            trusted_uids: Vec::new(),
-        }
-    }
 }
 
 impl AuthConfig {
@@ -758,20 +715,12 @@ pub struct LogModulesConfig {
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     /// CIDR strings of trusted reverse-proxy IPs/ranges.
     /// Empty = no trusted-header evaluation (direct mode).
     pub trusted_proxies: Vec<String>,
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            trusted_proxies: Vec::new(),
-        }
-    }
 }
 
 // ── JSON Store (spec json/001) ────────────────────────────────────────────────
@@ -1094,7 +1043,7 @@ impl Default for EventsConfig {
 
 // ── CORS (spec general/020) ───────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CorsConfig {
     /// Enables the `CorsLayer`. `false` (default) = no layer in the stack,
@@ -1103,15 +1052,6 @@ pub struct CorsConfig {
     /// Exact origins (`scheme://host[:port]`), byte-compared. `"*"` is
     /// allowed only as the sole entry — see `validate`.
     pub allowed_origins: Vec<String>,
-}
-
-impl Default for CorsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allowed_origins: Vec::new(),
-        }
-    }
 }
 
 impl CorsConfig {
@@ -1771,9 +1711,7 @@ mod tests {
 
     #[test]
     fn test_server_validate_rejects_both_listeners_disabled() {
-        let mut server = ServerConfig::default();
-        server.http_enabled = false;
-        server.tls_enabled = false;
+        let server = ServerConfig { http_enabled: false, tls_enabled: false, ..Default::default() };
         assert!(server.validate().is_err());
     }
 
@@ -1833,8 +1771,7 @@ mod tests {
 
     #[test]
     fn test_shm_data_size_and_snapshot_interval_minimums() {
-        let mut config = ShmConfig::default();
-        config.data_buffer_size = 100;
+        let mut config = ShmConfig { data_buffer_size: 100, ..Default::default() };
         assert_invalid(config.validate(), "shm.data_buffer_size (100)", "at least 4096");
 
         config.data_buffer_size = 8192;
@@ -1844,8 +1781,7 @@ mod tests {
 
     #[test]
     fn test_shm_instance_id_charset() {
-        let mut config = ShmConfig::default();
-        config.instance_id = "0_backup".to_string();
+        let mut config = ShmConfig { instance_id: "0_backup".to_string(), ..Default::default() };
         assert_invalid(config.validate(), "shm.instance_id ('0_backup')", "[A-Za-z0-9-]");
 
         config.instance_id = String::new();
@@ -2132,17 +2068,13 @@ mod tests {
     // Spec test 2: http_access=true + path="" -> validate() fails.
     #[test]
     fn test_log_validate_rejects_http_access_without_path() {
-        let mut log = LogConfig::default();
-        log.http_access = true;
-        log.path = String::new();
+        let log = LogConfig { http_access: true, path: String::new(), ..Default::default() };
         assert!(log.validate().is_err());
     }
 
     #[test]
     fn test_log_validate_accepts_http_access_with_path() {
-        let mut log = LogConfig::default();
-        log.http_access = true;
-        log.path = "/var/log/luradb".to_string();
+        let log = LogConfig { http_access: true, path: "/var/log/luradb".to_string(), ..Default::default() };
         assert!(log.validate().is_ok());
     }
 
@@ -2161,44 +2093,38 @@ mod tests {
 
     #[test]
     fn test_auth_validate_rejects_disabled_auth_on_all_interfaces_ipv4() {
-        let mut server = ServerConfig::default();
-        server.bind_address = "0.0.0.0".to_string();
+        let server = ServerConfig { bind_address: "0.0.0.0".to_string(), ..Default::default() };
         assert!(AuthConfig::default().validate(&server).is_err());
     }
 
     #[test]
     fn test_auth_validate_rejects_disabled_auth_on_all_interfaces_ipv6() {
-        let mut server = ServerConfig::default();
-        server.bind_address = "::".to_string();
+        let server = ServerConfig { bind_address: "::".to_string(), ..Default::default() };
         assert!(AuthConfig::default().validate(&server).is_err());
     }
 
     #[test]
     fn test_auth_validate_accepts_disabled_auth_on_loopback_ipv4() {
-        let mut server = ServerConfig::default();
-        server.bind_address = "127.0.0.1".to_string();
+        let server = ServerConfig { bind_address: "127.0.0.1".to_string(), ..Default::default() };
         assert!(AuthConfig::default().validate(&server).is_ok());
     }
 
     #[test]
     fn test_auth_validate_accepts_disabled_auth_on_loopback_ipv6() {
-        let mut server = ServerConfig::default();
-        server.bind_address = "::1".to_string();
+        let server = ServerConfig { bind_address: "::1".to_string(), ..Default::default() };
         assert!(AuthConfig::default().validate(&server).is_ok());
     }
 
     #[test]
     fn test_auth_validate_accepts_enabled_auth_on_all_interfaces() {
-        let mut server = ServerConfig::default();
-        server.bind_address = "0.0.0.0".to_string();
+        let server = ServerConfig { bind_address: "0.0.0.0".to_string(), ..Default::default() };
         let auth = AuthConfig { enabled: true, ..AuthConfig::default() };
         assert!(auth.validate(&server).is_ok());
     }
 
     #[test]
     fn test_auth_validate_rejects_unparseable_bind_address() {
-        let mut server = ServerConfig::default();
-        server.bind_address = "not-an-ip".to_string();
+        let server = ServerConfig { bind_address: "not-an-ip".to_string(), ..Default::default() };
         assert!(AuthConfig::default().validate(&server).is_err());
     }
 
@@ -2206,8 +2132,7 @@ mod tests {
     // loopback rule itself would apply — an unparseable address never binds.
     #[test]
     fn test_auth_validate_rejects_unparseable_bind_address_even_when_enabled() {
-        let mut server = ServerConfig::default();
-        server.bind_address = "not-an-ip".to_string();
+        let server = ServerConfig { bind_address: "not-an-ip".to_string(), ..Default::default() };
         let auth = AuthConfig { enabled: true, ..AuthConfig::default() };
         assert!(auth.validate(&server).is_err());
     }
@@ -2284,33 +2209,30 @@ mod tests {
 
     #[test]
     fn test_cors_validate_disabled_skips_all_checks() {
-        let mut cors = CorsConfig::default();
         // Would fail every check below if looked at — enabled=false must
         // short-circuit before any of it.
-        cors.allowed_origins = vec!["not a valid origin at all".to_string()];
+        let cors = CorsConfig { allowed_origins: vec!["not a valid origin at all".to_string()], ..Default::default() };
         assert!(cors.validate().is_ok());
     }
 
     #[test]
     fn test_cors_validate_rejects_enabled_with_empty_origins() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
+        let cors = CorsConfig { enabled: true, ..Default::default() };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_wildcard_mixed_with_concrete_origin() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["*".to_string(), "https://example.com".to_string()];
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string(), "https://example.com".to_string()],
+        };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_accepts_wildcard_alone() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["*".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["*".to_string()] };
         assert!(cors.validate().is_ok());
     }
 
@@ -2318,98 +2240,77 @@ mod tests {
     fn test_cors_validate_accepts_wildcard_duplicated() {
         // Duplicate "*" entries are still "only the wildcard", not "mixed
         // with concrete origins".
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["*".to_string(), "*".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["*".to_string(), "*".to_string()] };
         assert!(cors.validate().is_ok());
     }
 
     #[test]
     fn test_cors_validate_accepts_origin_with_port() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["http://localhost:5173".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["http://localhost:5173".to_string()] };
         assert!(cors.validate().is_ok());
     }
 
     #[test]
     fn test_cors_validate_accepts_origin_without_port() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://console.example.com".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["https://console.example.com".to_string()] };
         assert!(cors.validate().is_ok());
     }
 
     #[test]
     fn test_cors_validate_accepts_duplicate_origin() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins =
-            vec!["https://console.example.com".to_string(), "https://console.example.com".to_string()];
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["https://console.example.com".to_string(), "https://console.example.com".to_string()],
+        };
         assert!(cors.validate().is_ok());
     }
 
     #[test]
     fn test_cors_validate_rejects_trailing_slash() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://console.example.com/".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["https://console.example.com/".to_string()] };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_missing_scheme() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["console.example.com".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["console.example.com".to_string()] };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_userinfo() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://user:pw@console.example.com".to_string()];
+        let cors =
+            CorsConfig { enabled: true, allowed_origins: vec!["https://user:pw@console.example.com".to_string()] };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_query() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://console.example.com?x=1".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["https://console.example.com?x=1".to_string()] };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_fragment() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://console.example.com#f".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["https://console.example.com#f".to_string()] };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_empty_host() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["https://".to_string()] };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_uppercase_host() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://Console.example.com".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["https://Console.example.com".to_string()] };
         assert!(cors.validate().is_err());
     }
 
     #[test]
     fn test_cors_validate_rejects_unparseable_header_value() {
-        let mut cors = CorsConfig::default();
-        cors.enabled = true;
-        cors.allowed_origins = vec!["https://exa\nmple.com".to_string()];
+        let cors = CorsConfig { enabled: true, allowed_origins: vec!["https://exa\nmple.com".to_string()] };
         assert!(cors.validate().is_err());
     }
 
@@ -2423,15 +2324,13 @@ mod tests {
 
     #[test]
     fn test_lsm_validate_max_value_size_at_cap_ok() {
-        let mut lsm = LsmConfig::default();
-        lsm.max_value_size = WAL_MAX_FIELD_LEN;
+        let lsm = LsmConfig { max_value_size: WAL_MAX_FIELD_LEN, ..Default::default() };
         assert!(lsm.validate().is_ok());
     }
 
     #[test]
     fn test_lsm_validate_max_value_size_over_cap_rejected() {
-        let mut lsm = LsmConfig::default();
-        lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
+        let lsm = LsmConfig { max_value_size: WAL_MAX_FIELD_LEN + 1, ..Default::default() };
         let err = lsm.validate().unwrap_err().to_string();
         assert!(err.contains("lsm.max_value_size"), "{err}");
         assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
@@ -2440,8 +2339,7 @@ mod tests {
 
     #[test]
     fn test_lsm_validate_max_key_length_over_cap_rejected() {
-        let mut lsm = LsmConfig::default();
-        lsm.max_key_length = WAL_MAX_FIELD_LEN + 1;
+        let lsm = LsmConfig { max_key_length: WAL_MAX_FIELD_LEN + 1, ..Default::default() };
         let err = lsm.validate().unwrap_err().to_string();
         assert!(err.contains("lsm.max_key_length"), "{err}");
     }
@@ -2651,8 +2549,7 @@ mod tests {
     // Test 5.
     #[test]
     fn test_rel_validate_max_limit_and_max_sort_rows() {
-        let mut rel = RelStoreConfig::default();
-        rel.max_limit = 0;
+        let mut rel = RelStoreConfig { max_limit: 0, ..Default::default() };
         assert_invalid(rel.validate(), "rel.max_limit (0)", "at least 1");
         rel.max_limit = 1;
         assert!(rel.validate().is_ok());
@@ -2667,8 +2564,7 @@ mod tests {
     // storage value limit (at least max_row_size) must fit the WAL field cap.
     #[test]
     fn test_rel_validate_max_row_size() {
-        let mut rel = RelStoreConfig::default();
-        rel.max_row_size = 4;
+        let mut rel = RelStoreConfig { max_row_size: 4, ..Default::default() };
         assert_invalid(rel.validate(), "rel.max_row_size (4)", "at least 5");
         rel.max_row_size = 5;
         assert!(rel.validate().is_ok());

@@ -128,6 +128,7 @@ pub struct CountResponse {
 
 /// Builds the full domain + KV + auth router with the given app state — the
 /// routes only; the per-request layers come from [`frontend_layers`].
+#[allow(clippy::let_and_return, reason = "the router coverage test finds the root routes by the `let router` binding")]
 pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState {
         cache: Arc::clone(&state.auth_cache),

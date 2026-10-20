@@ -238,7 +238,7 @@ fn percentile(buckets: &[u64; 7], total: u64, pct: u64) -> u64 {
         return 0;
     }
     // Ceiling: smallest rank whose cumulative count >= target.
-    let target = (total * pct + 99) / 100;
+    let target = (total * pct).div_ceil(100);
     let mut cumulative = 0u64;
     for (i, &count) in buckets.iter().enumerate() {
         cumulative += count;

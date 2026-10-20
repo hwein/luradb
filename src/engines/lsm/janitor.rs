@@ -191,7 +191,6 @@ pub struct Janitor {
 
 impl Janitor {
     /// Creates a new Janitor.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         version: Arc<VersionCell>,
         vlog_base_path: PathBuf,
@@ -995,7 +994,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let vlog_path = dir.path().join("vlog");
             let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-            let live_off = vlog.append(&vec![b'L'; 100]).await.unwrap();
+            let live_off = vlog.append(&[b'L'; 100]).await.unwrap();
             vlog.append(&vec![b'D'; 900]).await.unwrap(); // dead_ratio = 0.9
 
             let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
@@ -1052,7 +1051,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let vlog_path = dir.path().join("vlog");
             let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-            vlog.append(&vec![b'D'; 100]).await.unwrap();
+            vlog.append(&[b'D'; 100]).await.unwrap();
 
             let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
             let mut manifest = Manifest::new();
@@ -1138,7 +1137,7 @@ mod tests {
             // Both levels rebuilt with pointers remapped into generation 2; old
             // files deleted.
             let m = manifest.read().clone();
-            let expectations: [(usize, &SSTableMetadata, Vec<(Vec<u8>, u64)>); 2] = [
+            let expectations = [
                 (0, &l0, vec![(b"ka".to_vec(), 0), (b"kb".to_vec(), 100)]),
                 (1, &l1, vec![(b"kb".to_vec(), 100)]),
             ];

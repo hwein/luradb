@@ -449,8 +449,7 @@ mod tests {
     // read must survive — keeping only the newest one loses the key silently.
     #[test]
     fn test_keeps_version_visible_at_low_watermark() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(100));
+        let cfg = CompactionConfig { low_watermark: Some(Timestamp::new(100)), ..Default::default() };
         let entries = vec![
             (encode(b"key1", 150), make_vp(1000)),
             (encode(b"key1", 50), make_vp(2000)),
@@ -464,8 +463,7 @@ mod tests {
 
     #[test]
     fn test_drops_versions_older_than_the_visible_one() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(100));
+        let cfg = CompactionConfig { low_watermark: Some(Timestamp::new(100)), ..Default::default() };
         let entries = vec![
             (encode(b"key1", 150), make_vp(1000)),
             (encode(b"key1", 100), make_vp(2000)), // visible at the watermark
@@ -498,8 +496,7 @@ mod tests {
     // watermark still reads the live version behind it.
     #[test]
     fn test_tombstone_above_watermark_keeps_older_visible_version() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(100));
+        let cfg = CompactionConfig { low_watermark: Some(Timestamp::new(100)), ..Default::default() };
         let entries = vec![
             (encode(b"key1", 200), tombstone_vp()),
             (encode(b"key1", 60), make_vp(500)),
@@ -516,8 +513,7 @@ mod tests {
     // that older value resurfaces for readers above it.
     #[test]
     fn test_expired_version_kept_while_it_shadows_an_older_one() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(100));
+        let cfg = CompactionConfig { low_watermark: Some(Timestamp::new(100)), ..Default::default() };
         let expired = DataBlockValue::Pointer(ValuePointer {
             file_id: 1, value_offset: 100, value_len: 10, expire_at: unix_now() - 100,
         });
@@ -542,8 +538,7 @@ mod tests {
 
     #[test]
     fn test_tombstone_dropped_below_low_watermark() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(200));
+        let cfg = CompactionConfig { low_watermark: Some(Timestamp::new(200)), ..Default::default() };
         let entries = vec![(encode(b"key1", 100), tombstone_vp())];
         let job = CompactionJob::new(vec![], vec![], cfg);
         let out = job.filter_entries(entries)?;
@@ -553,8 +548,7 @@ mod tests {
 
     #[test]
     fn test_tombstone_kept_above_low_watermark() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(50));
+        let cfg = CompactionConfig { low_watermark: Some(Timestamp::new(50)), ..Default::default() };
         let entries = vec![(encode(b"key1", 100), tombstone_vp())];
         let job = CompactionJob::new(vec![], vec![], cfg);
         let out = job.filter_entries(entries)?;
@@ -582,8 +576,8 @@ mod tests {
     // is never dropped, even below the tombstone-GC low watermark.
     #[test]
     fn test_null_record_survives_compaction_and_suppresses_older() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(500)); // everything below 500 GC-eligible
+        // Everything below 500 is GC-eligible.
+        let cfg = CompactionConfig { low_watermark: Some(Timestamp::new(500)), ..Default::default() };
         let entries = vec![
             (encode(b"key1", 200), null_vp()),
             (encode(b"key1", 100), make_vp(500)),
@@ -605,9 +599,11 @@ mod tests {
     // ones in the job still go.
     #[test]
     fn test_tombstone_below_low_watermark_kept_when_not_bottommost() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.low_watermark = Some(Timestamp::new(200));
-        cfg.bottommost = false;
+        let cfg = CompactionConfig {
+            low_watermark: Some(Timestamp::new(200)),
+            bottommost: false,
+            ..Default::default()
+        };
         let entries = vec![
             (encode(b"key1", 100), tombstone_vp()),
             (encode(b"key1", 50), make_vp(500)),
@@ -623,8 +619,7 @@ mod tests {
     // turns into a tombstone.
     #[test]
     fn test_expired_value_kept_when_not_bottommost() -> Result<()> {
-        let mut cfg = CompactionConfig::default();
-        cfg.bottommost = false;
+        let cfg = CompactionConfig { bottommost: false, ..Default::default() };
         let expired = DataBlockValue::Pointer(ValuePointer {
             file_id: 1, value_offset: 100, value_len: 10, expire_at: 1,
         });

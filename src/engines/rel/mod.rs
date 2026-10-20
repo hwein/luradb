@@ -411,14 +411,12 @@ impl RelEngine {
         auth: LinkAuth,
         mid: impl FnOnce(StatementClass) -> Result<(), RelStoreError> + Send,
     ) -> Result<ExecOutcome, RelStoreError> {
-        let tokens = lexer::tokenize(sql, self.max_statement_len).map_err(|e| {
+        let tokens = lexer::tokenize(sql, self.max_statement_len).inspect_err(|_| {
             self.metrics.record_rel_frontend_parse_error();
-            e
         })?;
         let param_count = lexer::count_params(&tokens);
-        let stmt = parser::parse(&tokens).map_err(|e| {
+        let stmt = parser::parse(&tokens).inspect_err(|_| {
             self.metrics.record_rel_frontend_parse_error();
-            e
         })?;
         let class = stmt.class();
 

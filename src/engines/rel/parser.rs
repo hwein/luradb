@@ -512,9 +512,7 @@ impl<'a> Parser<'a> {
     /// (never ambiguous: every reserved word is lexed as a `Keyword`, not
     /// an `Ident`).
     fn try_parse_alias(&mut self) -> Result<Option<String>, RelStoreError> {
-        if self.eat_kw(Keyword::As) {
-            Ok(Some(self.expect_ident()?))
-        } else if matches!(self.peek(), Some(Token::Ident(_))) {
+        if self.eat_kw(Keyword::As) || matches!(self.peek(), Some(Token::Ident(_))) {
             Ok(Some(self.expect_ident()?))
         } else {
             Ok(None)

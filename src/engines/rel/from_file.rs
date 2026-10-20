@@ -235,11 +235,13 @@ impl RelEngine {
     }
 }
 
+type DataRecords = Vec<Result<StringRecord, csv::Error>>;
+
 /// Everything [`RelEngine::create_table_from_file`] derives from the file
 /// alone — the result of the offloaded parse pass.
 struct ParsedFile {
     raw_headers: Vec<Option<String>>,
-    data_records: Vec<Result<StringRecord, csv::Error>>,
+    data_records: DataRecords,
     /// Normalized column names, one per file column.
     names: Vec<String>,
     /// Pass-1 inferred type, one per file column.
@@ -313,7 +315,7 @@ fn read_records(
     format: FileFormat,
     header: bool,
     body: &[u8],
-) -> Result<(Vec<Option<String>>, Vec<Result<StringRecord, csv::Error>>), RelStoreError> {
+) -> Result<(Vec<Option<String>>, DataRecords), RelStoreError> {
     let reader =
         ReaderBuilder::new().delimiter(format.delimiter()).has_headers(false).flexible(false).from_reader(body);
     let mut records = reader.into_records();

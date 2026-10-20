@@ -33,7 +33,7 @@ enum IoCommand {
     /// A request to write a page to disk.
     Write {
         page_id: PageId,
-        page: Page,
+        page: Box<Page>,
         responder: oneshot::Sender<Result<()>>,
     },
 }
@@ -62,6 +62,7 @@ impl DiskManager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
         let metadata = std_file.metadata()?;
         let num_pages = metadata.len() / PAGE_SIZE as u64;
@@ -109,7 +110,7 @@ impl DiskManager {
     /// Writes the content of a page to the database file.
     pub async fn write_page(&self, page_id: PageId, page: &Page) -> Result<()> {
         let (responder, receiver) = oneshot::channel();
-        let command = IoCommand::Write { page_id, page: *page, responder };
+        let command = IoCommand::Write { page_id, page: Box::new(*page), responder };
 
         if self.sender.send(command).await.is_err() {
             bail!("Failed to send write command to I/O task. It may have panicked.");

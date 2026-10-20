@@ -113,6 +113,10 @@ impl ShmSegment {
         self.size
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
     /// Name under `/dev/shm/` (e.g. `"/luradb_0_state"`).
     pub fn name(&self) -> &str {
         &self.name
@@ -141,6 +145,10 @@ impl ReadOnlySegment {
 
     pub fn len(&self) -> usize {
         self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
     }
 }
 
@@ -315,7 +323,7 @@ impl ClientShm {
                 resp_hdr: ShmSegment::create(&names[3], CLIENT_HDR_SIZE, mode)?,
             })
         };
-        build().map_err(|e| {
+        build().inspect_err(|_| {
             // Partial failure: unlink whatever landed (best effort; the
             // stale-scan is the backstop).
             for n in &names {
@@ -323,7 +331,6 @@ impl ClientShm {
                     unsafe { libc::shm_unlink(c.as_ptr()) };
                 }
             }
-            e
         })
     }
 
@@ -422,6 +429,7 @@ fn acquire_lock(instance_id: &str) -> Result<File> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(&path)
             .with_context(|| format!("open SHM lock file {}", path.display()))?;

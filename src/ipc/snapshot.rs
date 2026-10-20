@@ -224,7 +224,7 @@ impl SkipTracker {
     /// Records a skip; true on every `SKIP_WARN_EVERY`-th one in a row.
     fn on_skipped(&mut self) -> bool {
         self.consecutive += 1;
-        self.consecutive % SKIP_WARN_EVERY == 0
+        self.consecutive.is_multiple_of(SKIP_WARN_EVERY)
     }
 
     /// Records a successful publish; `Some(n)` if it ended a run of `n` skips.
@@ -419,7 +419,6 @@ pub struct SnapshotPublisher {
 }
 
 impl SnapshotPublisher {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         builder: SnapshotBuilder,
         manager: Arc<ShmManager>,
@@ -751,7 +750,7 @@ mod tests {
             // Safe: single writer, two distinct buffers of `len` bytes, header valid.
             let writer = unsafe {
                 SnapshotWriter::new(
-                    &*header,
+                    &header,
                     buf_a.as_mut_ptr(),
                     buf_b.as_mut_ptr(),
                     len,
@@ -762,7 +761,7 @@ mod tests {
             assert_eq!(writer.publish(&bytes).unwrap(), PublishOutcome::Published);
             drop(writer);
 
-            let guard = SnapshotGuard::acquire(&*header, &slot, &buf_a, &buf_b).expect("snapshot available");
+            let guard = SnapshotGuard::acquire(&header, &slot, &buf_a, &buf_b).expect("snapshot available");
 
             // Client side: validate, then read zero-copy from the mapped bytes.
             let mut aligned: AlignedVec = AlignedVec::with_capacity(guard.data().len());

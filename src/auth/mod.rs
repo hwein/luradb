@@ -175,7 +175,7 @@ impl AuthCache {
             .map(|((u, d), a)| DomainPermission {
                 username: u.clone(),
                 domain: d.clone(),
-                access: a.clone(),
+                access: *a,
             })
             .collect()
     }

@@ -3,11 +3,12 @@
 //! Errors from the domain/engine layer embed an HTTP status code as a numeric
 //! prefix in the message string (e.g. "404 Not Found: …"). `ApiError` reads
 //! that prefix and produces the appropriate HTTP response, including a
-//! `Retry-After: 1` header for 429 responses.
+//! `Retry-After: 1` header for 429 and `Cache-Control: no-store` for 428
+//! responses.
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -17,11 +18,17 @@ use std::sync::Arc;
 // ── ApiError ──────────────────────────────────────────────────────────────────
 
 /// Unified API error that maps anyhow errors to HTTP responses.
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(StatusCode, String, HeaderMap);
 
 impl ApiError {
     pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        ApiError(status, message.into())
+        ApiError(status, message.into(), HeaderMap::new())
+    }
+
+    /// Adds a header to the error response; the plain-text body stays as is.
+    pub(crate) fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.2.insert(name, value);
+        self
     }
 }
 
@@ -43,16 +50,22 @@ impl From<anyhow::Error> for ApiError {
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
-        ApiError(status, msg)
+        ApiError::new(status, msg)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut resp = (self.0, self.1).into_response();
+        resp.headers_mut().extend(self.2);
         if self.0 == StatusCode::TOO_MANY_REQUESTS {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, "1".parse().unwrap());
+        }
+        // RFC 6585 §3: a 428 must not be stored by a cache.
+        if self.0 == StatusCode::PRECONDITION_REQUIRED {
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         }
         resp
     }

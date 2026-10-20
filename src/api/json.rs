@@ -21,10 +21,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-// ── Error mapping (spec json/009 §6) ─────────────────────────────────────────
+// ── Error mapping ─────────────────────────────────────────────────────────────
 
 impl From<JsonStoreError> for ApiError {
     fn from(e: JsonStoreError) -> Self {
+        // A failed precondition carries the current ETag, if the document exists.
+        let current_etag = match &e {
+            JsonStoreError::VersionConflict { actual, .. } => actual.clone(),
+            JsonStoreError::DocumentAlreadyExists { etag, .. } => Some(etag.clone()),
+            _ => None,
+        };
         let status = match &e {
             JsonStoreError::DocumentNotFound { .. } => StatusCode::NOT_FOUND,
             JsonStoreError::DocumentAlreadyExists { .. } => StatusCode::PRECONDITION_FAILED,
@@ -42,11 +48,16 @@ impl From<JsonStoreError> for ApiError {
             JsonStoreError::InvalidIndexField(_) => StatusCode::BAD_REQUEST,
             JsonStoreError::InvalidFilter(_) => StatusCode::BAD_REQUEST,
             JsonStoreError::ReindexInProgress { .. } => StatusCode::CONFLICT,
-            JsonStoreError::VersionConflict { .. } => StatusCode::CONFLICT,
+            JsonStoreError::VersionConflict { .. } => StatusCode::PRECONDITION_FAILED,
+            JsonStoreError::PreconditionRequired { .. } => StatusCode::PRECONDITION_REQUIRED,
             JsonStoreError::SerializationError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             JsonStoreError::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        ApiError::new(status, e.to_string())
+        let err = ApiError::new(status, e.to_string());
+        match current_etag {
+            Some(etag) => err.with_header(header::ETAG, format!("\"{etag}\"").parse().expect("ETag is a valid header value")),
+            None => err,
+        }
     }
 }
 
@@ -171,8 +182,8 @@ pub struct ReindexAcceptedResponse {
     pub task_id: String,
 }
 
-/// Reads the optional `If-Match: "<etag>"` header (RFC 7232, json/011). The
-/// ETag is the opaque `{generation:x}-{version}` value from a prior read.
+/// Reads the optional `If-Match: "<etag>"` header (RFC 7232). The ETag is
+/// the opaque `{generation:x}-{version}` value from a prior read.
 fn parse_if_match(headers: &HeaderMap) -> Result<Option<ExpectedVersion>, ApiError> {
     let Some(value) = headers.get(header::IF_MATCH) else {
         return Ok(None);
@@ -198,35 +209,24 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<ExpectedVersion>, ApiErr
         })
 }
 
-/// Reads `If-Match`/`If-None-Match` into a write precondition (json/014
-/// §1/§4). The two headers are mutually exclusive; only the literal `*` is
-/// supported for `If-None-Match` (ETag lists are a deliberate non-goal).
-fn parse_precondition(headers: &HeaderMap) -> Result<Option<Precondition>, ApiError> {
-    let has_if_none_match = headers.contains_key(header::IF_NONE_MATCH);
-    if has_if_none_match && headers.contains_key(header::IF_MATCH) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "400 Bad Request: If-Match and If-None-Match are mutually exclusive",
-        ));
-    }
-    if !has_if_none_match {
-        return Ok(parse_if_match(headers)?.map(Precondition::IfMatch));
-    }
-    let raw = headers
-        .get(header::IF_NONE_MATCH)
-        .unwrap()
-        .to_str()
-        .map_err(|_| {
+/// Reads the write preconditions in evaluation order (RFC 9110 §13.2.2):
+/// `If-Match`, then `If-None-Match`, of which only the literal `*` is
+/// supported (ETag lists are a deliberate non-goal).
+fn parse_preconditions(headers: &HeaderMap) -> Result<Vec<Precondition>, ApiError> {
+    let mut preconditions: Vec<Precondition> = parse_if_match(headers)?.map(Precondition::IfMatch).into_iter().collect();
+    if let Some(value) = headers.get(header::IF_NONE_MATCH) {
+        let raw = value.to_str().map_err(|_| {
             ApiError::new(StatusCode::BAD_REQUEST, "400 Bad Request: invalid If-None-Match header")
         })?;
-    if raw.trim() == "*" {
-        Ok(Some(Precondition::MustNotExist))
-    } else {
-        Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("400 Bad Request: If-None-Match supports only the literal '*', got '{raw}'"),
-        ))
+        if raw.trim() != "*" {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("400 Bad Request: If-None-Match supports only the literal '*', got '{raw}'"),
+            ));
+        }
+        preconditions.push(Precondition::MustNotExist);
     }
+    Ok(preconditions)
 }
 
 // ── Document CRUD ─────────────────────────────────────────────────────────────
@@ -263,27 +263,28 @@ pub async fn create_document(
     params(
         ("domain" = String, Path, description = "JSON domain"),
         ("key" = String, Path, description = "Document key"),
-        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: conditional write, 409 on version mismatch"),
-        ("If-None-Match" = Option<String>, Header, description = "Only `*` is supported: create-only write, 412 if the document exists"),
+        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: write only if it is still the document's current version, else 412"),
+        ("If-None-Match" = Option<String>, Header, description = "Only `*` is supported: create-only write, 412 if the document exists. Evaluated after If-Match"),
     ),
     request_body = Object,
     responses(
         (status = 200, description = "Document updated", body = DocumentResponse),
         (status = 201, description = "Document created", body = DocumentResponse),
-        (status = 400, description = "Invalid key, reserved top-level field (_key, _version, _content), invalid If-Match or If-None-Match header, or both headers set together", body = String, content_type = "text/plain"),
-        (status = 404, description = "Domain not found, or If-Match on missing document", body = String, content_type = "text/plain"),
-        (status = 409, description = "Version conflict (If-Match mismatch)", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid key, reserved top-level field (_key, _version, _content), or invalid If-Match or If-None-Match header", body = String, content_type = "text/plain"),
+        (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
-        (status = 412, description = "Document already exists (If-None-Match: *)", body = String, content_type = "text/plain"),
+        (status = 412, description = "If-Match or If-None-Match does not hold (version mismatch, missing document, or document already exists); nothing was written", body = String, content_type = "text/plain",
+         headers(("ETag" = String, description = "ETag of the document's current version; absent when the document does not exist"))),
+        (status = 428, description = "The domain requires conditional writes and neither If-Match nor If-None-Match is set", body = String, content_type = "text/plain",
+         headers(("Cache-Control" = String, description = "no-store"))),
         (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
 /// Upserts a document. With an `If-Match: "<etag>"` header the write is a
-/// conditional update that fails with 409 on a version mismatch. With
-/// `If-None-Match: *` the write is create-only and fails with 412 if the
-/// document already exists (json/014); the two headers are mutually
-/// exclusive (400).
+/// conditional update; with `If-None-Match: *` it is create-only. Both may
+/// be combined and are evaluated in that order; a failed precondition
+/// answers 412 with the current `ETag`.
 pub async fn put_document(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
@@ -291,9 +292,9 @@ pub async fn put_document(
     Json(content): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let engine = json_engine(&state)?;
-    let precondition = parse_precondition(&headers)?;
+    let preconditions = parse_preconditions(&headers)?;
     let doc = engine
-        .put_document_with_version(&domain, &key, content, precondition)
+        .put_document_with_version(&domain, &key, content, &preconditions)
         .await?;
     let status = if doc.version == 1 { StatusCode::CREATED } else { StatusCode::OK };
     Ok((status, Json(document_to_value(&doc))))
@@ -335,28 +336,34 @@ pub async fn get_document(
     params(
         ("domain" = String, Path, description = "JSON domain"),
         ("key" = String, Path, description = "Document key"),
-        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: conditional write, 409 on version mismatch"),
+        ("If-Match" = Option<String>, Header, description = "Opaque ETag from a prior read: delete only if it is still the document's current version, else 412"),
+        ("If-None-Match" = Option<String>, Header, description = "Only `*` is supported: 412 if the document exists. Evaluated after If-Match"),
     ),
     responses(
         (status = 204, description = "Document deleted"),
+        (status = 400, description = "Invalid key, or invalid If-Match or If-None-Match header", body = String, content_type = "text/plain"),
         (status = 404, description = "Document or domain not found", body = String, content_type = "text/plain"),
-        (status = 409, description = "Version conflict (If-Match mismatch)", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 412, description = "If-Match or If-None-Match does not hold (version mismatch, missing document, or document exists); nothing was deleted", body = String, content_type = "text/plain",
+         headers(("ETag" = String, description = "ETag of the document's current version; absent when the document does not exist"))),
+        (status = 428, description = "The domain requires conditional writes and neither If-Match nor If-None-Match is set", body = String, content_type = "text/plain",
+         headers(("Cache-Control" = String, description = "no-store"))),
         (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
 /// Deletes a document and its index entries. Supports conditional delete via
-/// `If-Match: "<etag>"`.
+/// `If-Match: "<etag>"`; a failed precondition answers 412 with the current
+/// `ETag`.
 pub async fn delete_document(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let engine = json_engine(&state)?;
-    let expected_version = parse_if_match(&headers)?;
+    let preconditions = parse_preconditions(&headers)?;
     if engine
-        .delete_document_with_version(&domain, &key, expected_version)
+        .delete_document_with_version(&domain, &key, &preconditions)
         .await?
     {
         Ok(StatusCode::NO_CONTENT)
@@ -604,7 +611,8 @@ fn build_search_query(req: SearchRequest) -> Result<SearchQuery, ApiError> {
     ),
     tag = "JSON Document Store"
 )]
-/// Imports documents from an NDJSON body in atomic batches.
+/// Imports documents from an NDJSON body in atomic batches; bulk writes take
+/// no preconditions and are not subject to `require_conditional_writes`.
 pub async fn bulk_load(
     State(state): State<AppState>,
     Path(domain): Path<String>,
@@ -1114,7 +1122,7 @@ mod tests {
         resp.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string()
     }
 
-    // 12. ETag/If-Match: conditional update and delete (spec json/011).
+    // 12. ETag/If-Match: conditional update and delete; a stale ETag is a 412.
     #[test]
     fn test_etag_if_match_flow() {
         crate::core::engine_runtime::block_on(async {
@@ -1140,7 +1148,8 @@ mod tests {
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
 
-            // Stale If-Match → 409 with the actual ETag value in the body.
+            // Stale If-Match → 412 with the current ETag as header and the
+            // actual ETag value in the body.
             let req = Request::builder()
                 .method(Method::PUT)
                 .uri(uri)
@@ -1149,7 +1158,12 @@ mod tests {
                 .body(Body::from(r#"{"n": 3}"#))
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+                format!("\"{generation}-2\""),
+                "412 must carry the current ETag"
+            );
             let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             let body = String::from_utf8_lossy(&body);
             assert!(body.contains(&format!("actual \"{generation}-2\"")), "{body}");
@@ -1172,7 +1186,7 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
 
             let req = Request::builder()
                 .method(Method::DELETE)
@@ -1185,8 +1199,8 @@ mod tests {
         })
     }
 
-    // 15. ABA guard (json/011): a stale ETag of a deleted incarnation must
-    //     not match after delete + recreate of the same key.
+    // 15. ABA guard: a stale ETag of a deleted incarnation must not match
+    //     after delete + recreate of the same key.
     #[test]
     fn test_stale_etag_across_recreate_rejected() {
         crate::core::engine_runtime::block_on(async {
@@ -1210,7 +1224,7 @@ mod tests {
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(
                 resp.status(),
-                StatusCode::CONFLICT,
+                StatusCode::PRECONDITION_FAILED,
                 "stale ETag must not match the new incarnation"
             );
 
@@ -1221,7 +1235,7 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
 
             let (status, body) = request(&app, Method::GET, uri, None).await;
             assert_eq!(status, StatusCode::OK);
@@ -1229,7 +1243,35 @@ mod tests {
         })
     }
 
-    // ── Create-only precondition (spec json/014) ─────────────────────────────
+    // 15b. If-Match on a document that no longer exists → 412 without an ETag
+    //      (there is no current version) for PUT and DELETE; nothing is written.
+    #[test]
+    fn test_if_match_on_deleted_document_412_without_etag() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let uri = "/store-api/json/default/documents/vanished";
+            request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+            let etag = fetch_etag(&app, uri).await;
+            request(&app, Method::DELETE, uri, None).await;
+
+            for (method, body) in [(Method::PUT, Body::from(r#"{"n": 2}"#)), (Method::DELETE, Body::empty())] {
+                let req = Request::builder()
+                    .method(method.clone())
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("if-match", etag.as_str())
+                    .body(body)
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED, "{method}");
+                assert!(resp.headers().get(header::ETAG).is_none(), "{method}: a missing document has no ETag");
+            }
+            let (status, _) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "a failed precondition must not write");
+        })
+    }
+
+    // ── Create-only precondition ─────────────────────────────────────────────
 
     // 18. If-None-Match: * on a free key succeeds (201, fresh document).
     #[test]
@@ -1251,13 +1293,15 @@ mod tests {
         })
     }
 
-    // 19. If-None-Match: * on an occupied key → 412, document unchanged.
+    // 19. If-None-Match: * on an occupied key → 412 with the current ETag,
+    //     document unchanged.
     #[test]
     fn test_create_only_put_occupied_key_returns_412() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(true).await;
             let uri = "/store-api/json/default/documents/taken";
             request(&app, Method::PUT, uri, Some(r#"{"n": 1}"#)).await;
+            let current = fetch_etag(&app, uri).await;
 
             let req = Request::builder()
                 .method(Method::PUT)
@@ -1268,6 +1312,7 @@ mod tests {
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(resp.headers().get(header::ETAG).unwrap().to_str().unwrap(), current);
 
             let (status, body) = request(&app, Method::GET, uri, None).await;
             assert_eq!(status, StatusCode::OK);
@@ -1298,25 +1343,117 @@ mod tests {
         })
     }
 
-    // 21. If-Match and If-None-Match together are mutually exclusive (§1).
+    // 21. Both headers together: If-Match is evaluated first, then
+    //     If-None-Match (RFC 9110 §13.2.2) — on a free key the failing
+    //     If-Match decides (412 without ETag, nothing created); on an existing
+    //     document with a matching If-Match, the following If-None-Match: *
+    //     fails (412 with ETag).
     #[test]
-    fn test_if_match_and_if_none_match_together_rejected() {
+    fn test_if_match_evaluated_before_if_none_match() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(true).await;
-            let uri = "/store-api/json/default/documents/both";
+            let put_both = |uri: &str, etag: &str| {
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("if-match", etag)
+                    .header("if-none-match", "*")
+                    .body(Body::from("{}"))
+                    .unwrap()
+            };
+
+            let free = "/store-api/json/default/documents/both";
+            let resp = app.clone().oneshot(put_both(free, "\"0-1\"")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert!(resp.headers().get(header::ETAG).is_none());
+            let (status, _) = request(&app, Method::GET, free, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "If-Match must stop the create");
+
+            let taken = "/store-api/json/default/documents/both-taken";
+            request(&app, Method::PUT, taken, Some(r#"{"n": 1}"#)).await;
+            let current = fetch_etag(&app, taken).await;
+            let resp = app.clone().oneshot(put_both(taken, &current)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+                current,
+                "If-None-Match: * must still be evaluated"
+            );
+        })
+    }
+
+    // 21b. A JSON domain created with require_conditional_writes answers
+    //      PUT/DELETE without If-Match / If-None-Match: * with 428 (not
+    //      cacheable) and takes conditional ones; reads and server-keyed
+    //      POST stay unaffected.
+    #[test]
+    fn test_conditional_writes_domain_rejects_unconditional_writes_428() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let (status, body) = request(&app, Method::POST, "/store-api/json/domains",
+                Some(r#"{"name": "strict", "require_conditional_writes": true}"#)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["require_conditional_writes"], json!(true));
+            let (_, body) = request(&app, Method::GET, "/store-api/json/domains/strict", None).await;
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["require_conditional_writes"], json!(true));
+
+            let uri = "/store-api/json/strict/documents/d";
+            for (method, body) in [(Method::PUT, Some("{}")), (Method::DELETE, None)] {
+                let mut builder = Request::builder().method(method.clone()).uri(uri);
+                if body.is_some() {
+                    builder = builder.header("content-type", "application/json");
+                }
+                let resp = app.clone().oneshot(builder.body(Body::from(body.unwrap_or(""))).unwrap()).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED, "{method}");
+                assert_eq!(resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+                let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                assert!(bytes.starts_with(b"428"), "plain-text error body: {bytes:?}");
+            }
+            let (status, _) = request(&app, Method::GET, uri, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "a rejected write must not write");
+
             let req = Request::builder()
                 .method(Method::PUT)
                 .uri(uri)
                 .header("content-type", "application/json")
-                .header("if-match", "\"0-1\"")
                 .header("if-none-match", "*")
-                .body(Body::from("{}"))
+                .body(Body::from(r#"{"n": 1}"#))
                 .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+            let etag = fetch_etag(&app, uri).await;
+            let req = Request::builder()
+                .method(Method::DELETE)
+                .uri(uri)
+                .header("if-match", etag)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
-            let (status, _) = request(&app, Method::GET, uri, None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "conflicting preconditions must not write");
+            let (status, body) = request(&app, Method::POST, "/store-api/json/strict/documents", Some("{}")).await;
+            assert_eq!(status, StatusCode::CREATED, "server-keyed POST has no target to condition: {body}");
+            let (status, _) = request(&app, Method::PUT, "/store-api/json/default/documents/d", Some("{}")).await;
+            assert_eq!(status, StatusCode::CREATED, "other domains keep last-writer-wins");
+        })
+    }
+
+    // 21c. A write without preconditions to such a domain still meets
+    //      document validation (400) before the 428.
+    #[test]
+    fn test_conditional_writes_domain_400_before_428() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            request(&app, Method::POST, "/store-api/json/domains",
+                Some(r#"{"name": "strict", "require_conditional_writes": true}"#)).await;
+
+            let invalid_key = "/store-api/json/strict/documents/a:b";
+            let (status, body) = request(&app, Method::PUT, invalid_key, Some("{}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "PUT invalid key: {body}");
+            let (status, body) = request(&app, Method::DELETE, invalid_key, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "DELETE invalid key: {body}");
+            let (status, body) =
+                request(&app, Method::PUT, "/store-api/json/strict/documents/d", Some(r#"{"_key": "x"}"#)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "reserved field: {body}");
         })
     }
 

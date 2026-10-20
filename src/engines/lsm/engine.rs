@@ -1022,6 +1022,13 @@ impl LsmStorageEngine {
         reader.get_with_expiry(key, &snapshot).await
     }
 
+    /// [`Self::get_latest_with_expiry`] plus the write stamp of the version
+    /// read (0 = absent) — the KV `get` path, which serves it as `ETag`.
+    pub async fn get_latest_with_stamp(&self, key: &[u8]) -> Result<(GetResult, u64, u64)> {
+        let (reader, snapshot) = self.latest_view();
+        reader.get_with_stamp(key, &snapshot).await
+    }
+
     /// Metadata point read at the current state — the KV `meta` path; never
     /// dereferences the vLog. Registers no snapshot, see
     /// [`Self::latest_view`].

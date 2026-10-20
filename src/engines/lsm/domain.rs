@@ -39,6 +39,10 @@ const SYS_DOMAIN_PREFIX: &[u8] = b"__sys:domain:";
 /// share one counter (spec perf/017 A2, perf/033).
 const KEY_LOOP_YIELD_INTERVAL: u32 = 4096;
 
+/// Single-key write lock shards per domain. Not configurable — the number
+/// only caps how often a conditional write waits on writes to other keys.
+const KEY_WRITE_SHARDS: usize = 64;
+
 /// Strips the domain's system prefix off every scanned key.
 async fn strip_domain_prefix(raw_keys: Vec<Vec<u8>>, prefix_len: usize, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(raw_keys.len());
@@ -196,15 +200,20 @@ pub struct Domain {
     /// Lifecycle state — `Active` or `Deleting` (lazy background purge).
     #[serde(default)]
     pub state: DomainState,
+    /// Single-key writes over REST must carry `If-Match` or
+    /// `If-None-Match: *`; fixed at creation.
+    #[serde(default)]
+    pub require_conditional_writes: bool,
 }
 
 impl Domain {
-    fn new(name: &str) -> Self {
+    fn new(name: &str, require_conditional_writes: bool) -> Self {
         Domain {
             name: name.to_string(),
             system_prefix: generate_prefix(name),
             created_at: now_secs(),
             state: DomainState::Active,
+            require_conditional_writes,
         }
     }
 }
@@ -215,8 +224,13 @@ impl Domain {
 struct DomainRuntime {
     rate_limiter: RateLimiter,
     /// The domain's metrics window, fetched on its first read and kept, so
-    /// reads record without a lookup (spec kv/031 A6).
+    /// reads record without a lookup.
     metrics_window: OnceLock<Arc<MetricsWindow>>,
+    /// Single-key write locks, sharded by key. A conditional write holds its
+    /// shard exclusively from the precondition check through the write, so
+    /// no other write of that key falls in between; unconditional writes
+    /// hold it shared and keep running side by side.
+    key_write_locks: [tokio::sync::RwLock<()>; KEY_WRITE_SHARDS],
 }
 
 impl DomainRuntime {
@@ -224,7 +238,12 @@ impl DomainRuntime {
         Arc::new(Self {
             rate_limiter: RateLimiter::new(quota),
             metrics_window: OnceLock::new(),
+            key_write_locks: std::array::from_fn(|_| tokio::sync::RwLock::new(())),
         })
+    }
+
+    fn key_write_lock(&self, user_key: &[u8]) -> &tokio::sync::RwLock<()> {
+        &self.key_write_locks[(fnv64(user_key) % KEY_WRITE_SHARDS as u64) as usize]
     }
 }
 
@@ -338,12 +357,18 @@ impl DomainRegistry {
 
     /// Creates a new domain. Returns `Err` (409-style) if the name already exists.
     pub async fn create_domain(&self, name: &str) -> Result<Domain> {
+        self.create_domain_with(name, false).await
+    }
+
+    /// [`Self::create_domain`] with the domain's
+    /// [`Domain::require_conditional_writes`] setting.
+    pub async fn create_domain_with(&self, name: &str, require_conditional_writes: bool) -> Result<Domain> {
         validate_domain_name(name, self.config.max_name_length)?;
         let _guard = self.create_lock.lock().await;
         if self.domains.read().contains_key(name) {
             return Err(anyhow!("409 Conflict: Domain '{}' already exists", name));
         }
-        let domain = Domain::new(name);
+        let domain = Domain::new(name, require_conditional_writes);
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.runtimes.write().insert(name.to_string(), self.make_runtime());
@@ -512,6 +537,54 @@ pub struct WatchStart {
     pub rx: broadcast::Receiver<WatchMessage>,
 }
 
+/// The change a single-key write makes.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyWrite<'a> {
+    /// Upserts `value`; with `ttl_secs` it expires that many seconds from now.
+    Put { value: &'a [u8], ttl_secs: Option<u64> },
+    /// Sets the NULL state.
+    Null,
+    /// Tombstones the key.
+    Delete,
+}
+
+/// A precondition of a single-key write, checked against the write stamp of
+/// the key's visible version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precondition {
+    /// The key exists with exactly this version stamp (`If-Match`).
+    IfMatch(u64),
+    /// The key does not exist (`If-None-Match: *`).
+    MustNotExist,
+}
+
+impl Precondition {
+    /// Whether it holds for `current`, the visible version's stamp (`None` =
+    /// the key does not exist).
+    fn holds(self, current: Option<u64>) -> bool {
+        match self {
+            Precondition::IfMatch(stamp) => current == Some(stamp),
+            Precondition::MustNotExist => current.is_none(),
+        }
+    }
+}
+
+/// A single-key write whose precondition did not hold; nothing was written.
+#[derive(Debug, thiserror::Error)]
+#[error("412 Precondition Failed: the key's current version does not satisfy the write precondition")]
+pub struct PreconditionFailed {
+    /// Version stamp of the key's visible version; `None` if it does not exist.
+    pub current: Option<u64>,
+}
+
+/// A single-key write without preconditions to a domain that requires
+/// them; nothing was written.
+#[derive(Debug, thiserror::Error)]
+#[error("428 Precondition Required: domain '{domain}' requires If-Match or If-None-Match: * on writes")]
+pub struct PreconditionRequired {
+    pub domain: String,
+}
+
 impl DomainStore {
     fn prefixed_key(&self, user_key: &[u8]) -> Vec<u8> {
         let mut k = self.domain.system_prefix.clone();
@@ -545,29 +618,70 @@ impl DomainStore {
 
     /// Upserts a key-value pair in this domain.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_write() {
-            self.metrics.record_rate_limit_rejection(&self.domain.name);
-            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
-        }
-        let start = std::time::Instant::now();
-        self.engine.write_kv_pair(&self.prefixed_key(key), value, None).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(())
+        self.write_with(key, KeyWrite::Put { value, ttl_secs: None }, &[], false).await
     }
 
     /// Upserts a key-value pair with a TTL (seconds from now).
     pub async fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl_secs: u64) -> Result<()> {
+        self.write_with(key, KeyWrite::Put { value, ttl_secs: Some(ttl_secs) }, &[], false).await
+    }
+
+    /// Executes a single-key write if every precondition holds for the key's
+    /// visible version; otherwise fails with [`PreconditionFailed`] and
+    /// writes nothing. A domain that requires conditional writes rejects one
+    /// without preconditions with [`PreconditionRequired`], after key
+    /// validation and the rate limit; the shorthands such as [`Self::put`]
+    /// never do. Check and write run under the key's write lock, so no
+    /// other single-key write of the domain falls in between —
+    /// [`Self::delete_by_prefix`] takes no key lock.
+    pub async fn write(&self, key: &[u8], op: KeyWrite<'_>, preconditions: &[Precondition]) -> Result<()> {
+        self.write_with(key, op, preconditions, self.domain.require_conditional_writes).await
+    }
+
+    async fn write_with(
+        &self,
+        key: &[u8],
+        op: KeyWrite<'_>,
+        preconditions: &[Precondition],
+        require_preconditions: bool,
+    ) -> Result<()> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_write() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
         }
-        let expire_at = expire_at_from_ttl(ttl_secs);
-        let start = std::time::Instant::now();
-        self.engine.write_kv_pair(&self.prefixed_key(key), value, Some(expire_at)).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        if require_preconditions && preconditions.is_empty() {
+            return Err(PreconditionRequired { domain: self.domain.name.clone() }.into());
+        }
+        let lock = self.runtime.key_write_lock(key);
+        let key = self.prefixed_key(key);
+        let elapsed_us = if preconditions.is_empty() {
+            let _shared = lock.read().await;
+            self.apply(&key, op).await?
+        } else {
+            let _exclusive = lock.write().await;
+            let current = self.engine.get_latest_with_metadata(&key).await?.map(|m| m.stamp);
+            if !preconditions.iter().all(|p| p.holds(current)) {
+                return Err(PreconditionFailed { current }.into());
+            }
+            self.apply(&key, op).await?
+        };
+        self.metrics.record_write(&self.domain.name, elapsed_us);
         Ok(())
+    }
+
+    /// Runs `op` on the domain-prefixed `key`; returns the engine write's
+    /// latency in microseconds.
+    async fn apply(&self, key: &[u8], op: KeyWrite<'_>) -> Result<u64> {
+        let start = std::time::Instant::now();
+        match op {
+            KeyWrite::Put { value, ttl_secs } => {
+                self.engine.write_kv_pair(key, value, ttl_secs.map(expire_at_from_ttl)).await?
+            }
+            KeyWrite::Null => self.engine.write_null(key).await?,
+            KeyWrite::Delete => self.engine.write_tombstone(key).await?,
+        }
+        Ok(start.elapsed().as_micros() as u64)
     }
 
     /// Test-only: see `LsmStorageEngine::put_expired_for_test`.
@@ -581,22 +695,23 @@ impl DomainStore {
     /// `Null` (key exists in the NULL state), or `Absent`. Records latency
     /// and hit/miss in MetricsStore (a `Null` read counts as a hit).
     pub async fn get(&self, key: &[u8]) -> Result<GetResult> {
-        Ok(self.get_with_expiry(key).await?.0)
+        Ok(self.get_with_stamp(key).await?.0)
     }
 
     /// Like [`Self::get`], but also returns `expire_at` (absolute Unix
-    /// seconds, 0 = no TTL) — spec kv/022, backs the `X-Expires-At` response
-    /// header. Same validation, rate-limiting and hit/miss accounting as
+    /// seconds, 0 = no TTL), which backs the `X-Expires-At` response header,
+    /// and the write stamp of the version read (0 = absent), which backs the
+    /// `ETag`. Same validation, rate-limiting and hit/miss accounting as
     /// `get`; unlike [`Self::get_with_snapshot`] this reads the current state
-    /// (unregistered, spec kv/031 A3) and goes through the read rate limiter.
-    pub async fn get_with_expiry(&self, key: &[u8]) -> Result<(GetResult, u64)> {
+    /// without registering a snapshot and goes through the read rate limiter.
+    pub async fn get_with_stamp(&self, key: &[u8]) -> Result<(GetResult, u64, u64)> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let start = std::time::Instant::now();
-        let result = self.engine.get_latest_with_expiry(&self.prefixed_key(key)).await?;
+        let result = self.engine.get_latest_with_stamp(&self.prefixed_key(key)).await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
         self.metrics.record_read(self.metrics_window(), elapsed_us, !matches!(result.0, GetResult::Absent));
         Ok(result)
@@ -622,30 +737,14 @@ impl DomainStore {
 
     /// Tombstones a key (hard delete).
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
-        self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_write() {
-            self.metrics.record_rate_limit_rejection(&self.domain.name);
-            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
-        }
-        let start = std::time::Instant::now();
-        self.engine.write_tombstone(&self.prefixed_key(key)).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(())
+        self.write_with(key, KeyWrite::Delete, &[], false).await
     }
 
-    /// Sets a key to the technical NULL state (spec kv/018): an update, not a
-    /// delete — the key stays visible with no value and appears in scans. A
-    /// non-existent key is upserted into the NULL state.
+    /// Sets a key to the technical NULL state: an update, not a delete — the
+    /// key stays visible with no value and appears in scans. A non-existent
+    /// key is upserted into the NULL state.
     pub async fn set_null(&self, key: &[u8]) -> Result<()> {
-        self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_write() {
-            self.metrics.record_rate_limit_rejection(&self.domain.name);
-            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
-        }
-        let start = std::time::Instant::now();
-        self.engine.write_null(&self.prefixed_key(key)).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(())
+        self.write_with(key, KeyWrite::Null, &[], false).await
     }
 
     /// Returns all live user-keys whose raw form starts with `prefix`.
@@ -1032,7 +1131,7 @@ mod tests {
             let acquired = engine.snapshot_registry().acquire_count();
 
             assert_eq!(store.get(b"k").await.unwrap(), GetResult::Present(b"v".to_vec()));
-            assert_eq!(store.get_with_expiry(b"k").await.unwrap().0, GetResult::Present(b"v".to_vec()));
+            assert_eq!(store.get_with_stamp(b"k").await.unwrap().0, GetResult::Present(b"v".to_vec()));
             assert!(store.get_meta(b"k").await.unwrap().is_some());
             assert_eq!(engine.snapshot_registry().acquire_count(), acquired);
         })
@@ -1880,6 +1979,82 @@ mod tests {
             )
             .await;
             assert_eq!(order, ["small", "long"]);
+        })
+    }
+
+    // Two conditional writes race with the same ETag, each through its own
+    // `DomainStore` like two requests: exactly one wins, the other fails and
+    // names the winner's version as current.
+    #[test]
+    fn test_parallel_conditional_writes_single_winner() {
+        crate::core::engine_runtime::block_on(async {
+            let (_, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"k", b"v0").await.unwrap();
+            let read = store.get_with_stamp(b"k").await.unwrap().2;
+
+            let tasks: Vec<_> = (0..2)
+                .map(|i| {
+                    let registry = Arc::clone(&registry);
+                    compio::runtime::spawn(async move {
+                        let store = registry.default_store().await.unwrap();
+                        let value = format!("v{}", i + 1);
+                        let op = KeyWrite::Put { value: value.as_bytes(), ttl_secs: None };
+                        store.write(b"k", op, &[Precondition::IfMatch(read)]).await
+                    })
+                })
+                .collect();
+            let mut won = 0;
+            let mut lost = Vec::new();
+            for task in tasks {
+                match task.await.unwrap() {
+                    Ok(()) => won += 1,
+                    Err(e) => lost.push(e.downcast::<PreconditionFailed>().expect("a precondition failure")),
+                }
+            }
+            assert_eq!((won, lost.len()), (1, 1));
+            let winner = store.get_with_stamp(b"k").await.unwrap().2;
+            assert_eq!(lost[0].current, Some(winner));
+        })
+    }
+
+    // A domain that requires conditional writes rejects `write` without
+    // preconditions; the unconditional shorthands (the non-REST write
+    // paths) are not affected.
+    #[test]
+    fn test_required_preconditions_bind_only_write() {
+        crate::core::engine_runtime::block_on(async {
+            let (_, registry, _dir) = make_setup().await;
+            registry.create_domain_with("strict", true).await.unwrap();
+            let store = registry.store("strict").await.unwrap();
+
+            let err = store.write(b"k", KeyWrite::Null, &[]).await.unwrap_err();
+            let required = err.downcast::<PreconditionRequired>().expect("a missing precondition");
+            assert_eq!(required.domain, "strict");
+            assert_eq!(store.get(b"k").await.unwrap(), GetResult::Absent, "nothing was written");
+
+            store.put(b"k", b"v").await.unwrap();
+            store.set_null(b"k").await.unwrap();
+            store.delete(b"k").await.unwrap();
+        })
+    }
+
+    // require_conditional_writes is persisted with the domain and survives a
+    // restart; a domain created without it keeps it off.
+    #[test]
+    fn test_conditional_writes_setting_survives_recover() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, dir) = make_setup().await;
+            registry.create_domain_with("strict", true).await.unwrap();
+            registry.create_domain("plain").await.unwrap();
+            drop(registry);
+            drop(engine);
+
+            let engine2 = reopen_engine(&dir).await;
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let registry2 = DomainRegistry::recover(engine2, DomainConfig::default(), metrics).await.unwrap();
+            assert!(registry2.get_domain("strict").await.unwrap().unwrap().require_conditional_writes);
+            assert!(!registry2.get_domain("plain").await.unwrap().unwrap().require_conditional_writes);
         })
     }
 }

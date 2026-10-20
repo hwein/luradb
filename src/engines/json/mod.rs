@@ -180,6 +180,15 @@ impl JsonEngine {
         self.domains.create_domain(name).await
     }
 
+    /// Creates a new JSON domain with its `require_conditional_writes` setting.
+    pub async fn create_domain_with(
+        &self,
+        name: &str,
+        require_conditional_writes: bool,
+    ) -> Result<JsonDomain, JsonStoreError> {
+        self.domains.create_domain_with(name, require_conditional_writes).await
+    }
+
     /// Looks up an active JSON domain.
     pub fn get_domain(&self, name: &str) -> Option<JsonDomain> {
         self.domains.get_domain(name)
@@ -315,57 +324,31 @@ impl JsonEngine {
         key: &str,
         content: Value,
     ) -> Result<Document, JsonStoreError> {
-        self.put_document_with_version(domain, key, content, None).await
+        self.put_document_with_version(domain, key, content, &[]).await
     }
 
-    /// Upsert with an optional write precondition: `Precondition::IfMatch`
-    /// is the optimistic concurrency check of spec json/011 (fails with
-    /// `DocumentNotFound` if the document is missing or `VersionConflict` if
+    /// Upsert under write preconditions, checked in order under the key's
+    /// write shard: `Precondition::IfMatch` is the optimistic concurrency
+    /// check (fails with `VersionConflict` if the document is missing or
     /// generation or version differ — a stale ETag of a deleted incarnation
     /// never matches); `Precondition::MustNotExist` is the create-only write
-    /// of spec json/014 (fails with `DocumentAlreadyExists` if it is present).
+    /// (fails with `DocumentAlreadyExists` if it is present). A domain that
+    /// requires conditional writes rejects one without preconditions with
+    /// `PreconditionRequired`, after key, content and domain checks.
     pub async fn put_document_with_version(
         &self,
         domain: &str,
         key: &str,
         content: Value,
-        precondition: Option<Precondition>,
+        preconditions: &[Precondition],
     ) -> Result<Document, JsonStoreError> {
         validate_document_key(key, self.max_document_key_length)?;
         reject_reserved_fields(&content)?;
         let _guard = self.doc_write_locks[Self::shard(domain, key)].lock().await;
         let dom = self.domains.require_active(domain)?;
+        require_preconditions(&dom, preconditions)?;
         let old = self.read_stored(&dom, key).await?;
-        if let Some(precondition) = precondition {
-            match precondition {
-                Precondition::IfMatch(expected) => match &old {
-                    None => {
-                        return Err(JsonStoreError::DocumentNotFound {
-                            domain: dom.name.clone(),
-                            key: key.to_string(),
-                        })
-                    }
-                    Some(o)
-                        if o.generation != expected.generation
-                            || o.version != expected.version =>
-                    {
-                        return Err(JsonStoreError::VersionConflict {
-                            expected: etag_value(expected.generation, expected.version),
-                            actual: etag_value(o.generation, o.version),
-                        })
-                    }
-                    Some(_) => {}
-                },
-                Precondition::MustNotExist => {
-                    if old.is_some() {
-                        return Err(JsonStoreError::DocumentAlreadyExists {
-                            domain: dom.name.clone(),
-                            key: key.to_string(),
-                        });
-                    }
-                }
-            }
-        }
+        check_preconditions(&dom, key, old.as_ref(), preconditions)?;
         // No predecessor → new incarnation with a fresh random generation.
         let (generation, version) = match &old {
             Some(o) => (o.generation, o.version + 1),
@@ -423,40 +406,27 @@ impl JsonEngine {
     /// Deletes a document and all its index entries in one atomic batch.
     /// Returns `false` if it did not exist.
     pub async fn delete_document(&self, domain: &str, key: &str) -> Result<bool, JsonStoreError> {
-        self.delete_document_with_version(domain, key, None).await
+        self.delete_document_with_version(domain, key, &[]).await
     }
 
-    /// Delete with optional optimistic concurrency check (spec json/011).
+    /// Delete under write preconditions, checked like in
+    /// [`Self::put_document_with_version`].
     pub async fn delete_document_with_version(
         &self,
         domain: &str,
         key: &str,
-        expected_version: Option<ExpectedVersion>,
+        preconditions: &[Precondition],
     ) -> Result<bool, JsonStoreError> {
         let start = std::time::Instant::now();
         validate_document_key(key, self.max_document_key_length)?;
         let _guard = self.doc_write_locks[Self::shard(domain, key)].lock().await;
         let dom = self.domains.require_active(domain)?;
-        let old = match self.read_stored(&dom, key).await? {
-            Some(old) => old,
-            None => {
-                return match expected_version {
-                    Some(_) => Err(JsonStoreError::DocumentNotFound {
-                        domain: dom.name.clone(),
-                        key: key.to_string(),
-                    }),
-                    None => Ok(false),
-                }
-            }
+        require_preconditions(&dom, preconditions)?;
+        let old = self.read_stored(&dom, key).await?;
+        check_preconditions(&dom, key, old.as_ref(), preconditions)?;
+        let Some(old) = old else {
+            return Ok(false);
         };
-        if let Some(expected) = expected_version {
-            if old.generation != expected.generation || old.version != expected.version {
-                return Err(JsonStoreError::VersionConflict {
-                    expected: etag_value(expected.generation, expected.version),
-                    actual: etag_value(old.generation, old.version),
-                });
-            }
-        }
         let mut ops: Vec<BatchOp> = self
             .index_entry_keys(&dom, key, &old.content)
             .into_iter()
@@ -565,6 +535,46 @@ impl JsonEngine {
         }
         keys
     }
+}
+
+fn require_preconditions(dom: &JsonDomain, preconditions: &[Precondition]) -> Result<(), JsonStoreError> {
+    if dom.require_conditional_writes && preconditions.is_empty() {
+        return Err(JsonStoreError::PreconditionRequired { domain: dom.name.clone() });
+    }
+    Ok(())
+}
+
+/// Checks `preconditions` in order against the stored document (`None` =
+/// absent); the first that fails decides the error.
+fn check_preconditions(
+    dom: &JsonDomain,
+    key: &str,
+    old: Option<&StoredDocument>,
+    preconditions: &[Precondition],
+) -> Result<(), JsonStoreError> {
+    let current = old.map(|o| etag_value(o.generation, o.version));
+    for precondition in preconditions {
+        match precondition {
+            Precondition::IfMatch(expected) => {
+                if !old.is_some_and(|o| o.generation == expected.generation && o.version == expected.version) {
+                    return Err(JsonStoreError::VersionConflict {
+                        expected: etag_value(expected.generation, expected.version),
+                        actual: current,
+                    });
+                }
+            }
+            Precondition::MustNotExist => {
+                if let Some(etag) = current {
+                    return Err(JsonStoreError::DocumentAlreadyExists {
+                        domain: dom.name.clone(),
+                        key: key.to_string(),
+                        etag,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -923,6 +933,33 @@ mod tests {
         })
     }
 
+    // 22a. require_conditional_writes is persisted with the domain and
+    //      survives a restart; a domain created without it keeps it off.
+    #[test]
+    fn test_conditional_writes_setting_survives_restart() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = JsonStoreConfig {
+                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
+                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
+                sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+                ..JsonStoreConfig::default()
+            };
+            {
+                let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+                let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+                json.create_domain_with("strict", true).await.unwrap();
+                json.create_domain("plain").await.unwrap();
+                json.shutdown().await;
+            }
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+            assert!(json.get_domain("strict").unwrap().require_conditional_writes);
+            assert!(!json.get_domain("plain").unwrap().require_conditional_writes);
+            json.shutdown().await;
+        })
+    }
+
     // 22b. get_indexes_with_snapshot serves the definitions pinned by the
     //      snapshot, so index DDL during a backup export cannot leak into an
     //      archive whose documents come from an earlier point in time.
@@ -956,7 +993,7 @@ mod tests {
                     "default",
                     "k",
                     json!({"n": 2}),
-                    Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
+                    &[Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })],
                 )
                 .await
                 .unwrap();
@@ -977,14 +1014,14 @@ mod tests {
                     "default",
                     "k",
                     json!({"n": 3}),
-                    Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
+                    &[Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })],
                 )
                 .await
                 .unwrap_err();
             match err {
                 JsonStoreError::VersionConflict { expected, actual } => {
                     assert_eq!(expected, etag_value(created.generation, 1));
-                    assert_eq!(actual, etag_value(created.generation, 2));
+                    assert_eq!(actual, Some(etag_value(created.generation, 2)));
                 }
                 other => panic!("got: {other}"),
             }
@@ -993,7 +1030,8 @@ mod tests {
         })
     }
 
-    // 32. Conditional update on a missing document → DocumentNotFound.
+    // 32. Conditional update on a missing document → VersionConflict without
+    //     an actual version.
     #[test]
     fn test_occ_missing_document() {
         crate::core::engine_runtime::block_on(async {
@@ -1003,11 +1041,11 @@ mod tests {
                     "default",
                     "nope",
                     json!({}),
-                    Some(Precondition::IfMatch(ExpectedVersion { generation: 0, version: 1 })),
+                    &[Precondition::IfMatch(ExpectedVersion { generation: 0, version: 1 })],
                 )
                 .await
                 .unwrap_err();
-            assert!(matches!(err, JsonStoreError::DocumentNotFound { .. }), "got: {err}");
+            assert!(matches!(err, JsonStoreError::VersionConflict { actual: None, .. }), "got: {err}");
         })
     }
 
@@ -1027,7 +1065,7 @@ mod tests {
                                 "default",
                                 "k",
                                 json!({"winner": i}),
-                                Some(Precondition::IfMatch(expected)),
+                                &[Precondition::IfMatch(expected)],
                             )
                             .await
                     })
@@ -1059,7 +1097,7 @@ mod tests {
                 .delete_document_with_version(
                     "default",
                     "k",
-                    Some(ExpectedVersion { generation, version: 1 }),
+                    &[Precondition::IfMatch(ExpectedVersion { generation, version: 1 })],
                 )
                 .await
                 .unwrap_err();
@@ -1068,7 +1106,7 @@ mod tests {
                 .delete_document_with_version(
                     "default",
                     "k",
-                    Some(ExpectedVersion { generation, version: 2 }),
+                    &[Precondition::IfMatch(ExpectedVersion { generation, version: 2 })],
                 )
                 .await
                 .unwrap());
@@ -1095,12 +1133,12 @@ mod tests {
             );
 
             let err = json
-                .put_document_with_version("default", "k", json!({"n": 3}), Some(Precondition::IfMatch(stale)))
+                .put_document_with_version("default", "k", json!({"n": 3}), &[Precondition::IfMatch(stale)])
                 .await
                 .unwrap_err();
             assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
             let err = json
-                .delete_document_with_version("default", "k", Some(stale))
+                .delete_document_with_version("default", "k", &[Precondition::IfMatch(stale)])
                 .await
                 .unwrap_err();
             assert!(matches!(err, JsonStoreError::VersionConflict { .. }), "got: {err}");
@@ -1127,7 +1165,7 @@ mod tests {
                                 "default",
                                 "k",
                                 json!({"winner": i}),
-                                Some(Precondition::MustNotExist),
+                                &[Precondition::MustNotExist],
                             )
                             .await
                     })
@@ -1568,7 +1606,7 @@ mod tests {
                 "default",
                 "k",
                 json!({"n": 2}),
-                Some(Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })),
+                &[Precondition::IfMatch(ExpectedVersion { generation: created.generation, version: 1 })],
             )
             .await
             .unwrap();

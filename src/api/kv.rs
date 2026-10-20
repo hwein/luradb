@@ -1,10 +1,10 @@
 //! Domain-scoped KV REST handlers.
 //!
-//! PUT    /store-api/kv/{domain}/keys/{key}          → put_key   (200 | 429 | 400)
+//! PUT    /store-api/kv/{domain}/keys/{key}          → put_key   (200 | 429 | 400 | 412 | 428)
 //! PUT    /store-api/kv/{domain}/keys/{key}?ttl=N    → put_key   (TTL variant)
 //! GET    /store-api/kv/{domain}/keys/{key}          → get_key   (200 | 204 | 404 | 429)
-//! DELETE /store-api/kv/{domain}/keys/{key}          → delete_key (204 | 429)
-//! PATCH  /store-api/kv/{domain}/keys/{key}/null     → set_null  (200 | 429)
+//! DELETE /store-api/kv/{domain}/keys/{key}          → delete_key (204 | 429 | 412 | 428)
+//! PATCH  /store-api/kv/{domain}/keys/{key}/null     → set_null  (200 | 429 | 412 | 428)
 //! GET    /store-api/kv/{domain}/keys/{key}/meta     → get_key_meta (200 | 400 | 404 | 410 | 429)
 //! GET    /store-api/kv/{domain}/keys?prefix={p}&contains={s}&limit={n}&offset={o} → scan_keys (200 | 429)
 //! DELETE /store-api/kv/{domain}/keys?prefix={p}&contains={s} → delete_keys_by_prefix (200 | 400 | 413 | 429 | 404 | 410)
@@ -13,11 +13,14 @@
 
 use crate::api::{middleware::ApiError, AppState, CountResponse};
 use crate::core::events::{format_event_id, stream_epoch, ResetReason, Resume};
-use crate::engines::lsm::{GetResult, OpType, WalEvent, WatchMessage, WatchStart, WATCH_TAG};
+use crate::engines::lsm::{
+    GetResult, KeyWrite, OpType, Precondition, PreconditionFailed, PreconditionRequired, WalEvent, WatchMessage,
+    WatchStart, WATCH_TAG,
+};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
@@ -81,6 +84,62 @@ async fn resolve(
     domain: &str,
 ) -> Result<crate::engines::lsm::DomainStore, ApiError> {
     state.registry.store(domain).await.map_err(ApiError::from)
+}
+
+/// The `ETag` of a key version: its write stamp as quoted hex, a strong
+/// validator (unique per version, never reused after delete and recreate).
+fn etag(stamp: u64) -> HeaderValue {
+    format!("\"{stamp:x}\"").parse().expect("quoted hex is a valid header value")
+}
+
+/// The write preconditions of a single-key write request in evaluation
+/// order (RFC 9110 §13.2.2): `If-Match` with an ETag from a prior read,
+/// then `If-None-Match: *` — the only `If-None-Match` form supported.
+fn write_preconditions(headers: &HeaderMap) -> Result<Vec<Precondition>, ApiError> {
+    let mut preconditions = Vec::new();
+    if let Some(value) = headers.get(header::IF_MATCH) {
+        let stamp = value
+            .to_str()
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim().trim_matches('"'), 16).ok())
+            .ok_or_else(|| {
+                ApiError::new(StatusCode::BAD_REQUEST, "400 Bad Request: If-Match must be an ETag from a prior read")
+            })?;
+        preconditions.push(Precondition::IfMatch(stamp));
+    }
+    if let Some(value) = headers.get(header::IF_NONE_MATCH) {
+        if value.to_str().map(str::trim).ok() != Some("*") {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request: If-None-Match supports only the literal '*'",
+            ));
+        }
+        preconditions.push(Precondition::MustNotExist);
+    }
+    Ok(preconditions)
+}
+
+/// A failed precondition answers 412 with the current ETag; it is left out
+/// when the key does not exist.
+impl From<PreconditionFailed> for ApiError {
+    fn from(e: PreconditionFailed) -> Self {
+        let err = ApiError::new(StatusCode::PRECONDITION_FAILED, e.to_string());
+        match e.current {
+            Some(stamp) => err.with_header(header::ETAG, etag(stamp)),
+            None => err,
+        }
+    }
+}
+
+fn write_error(e: anyhow::Error) -> ApiError {
+    let e = match e.downcast::<PreconditionFailed>() {
+        Ok(failed) => return failed.into(),
+        Err(e) => e,
+    };
+    match e.downcast::<PreconditionRequired>() {
+        Ok(required) => ApiError::new(StatusCode::PRECONDITION_REQUIRED, required.to_string()),
+        Err(e) => e.into(),
+    }
 }
 
 /// Resolves the effective `Last-Event-ID` (spec kv/024 §4.1): the header —
@@ -175,32 +234,38 @@ fn watch_item(
         ("domain" = String, Path, description = "Domain name"),
         ("key"    = String, Path, description = "Key (valid UTF-8, max 256 bytes)"),
         ("ttl"    = Option<u64>, Query, description = "TTL in seconds (optional)"),
+        ("If-Match" = Option<String>, Header, description = "ETag from a prior read: write only if it is still the key's current version, else 412"),
+        ("If-None-Match" = Option<String>, Header, description = "Only `*`: write only if the key does not exist, else 412. Evaluated after If-Match"),
     ),
     request_body(content = String, content_type = "text/plain"),
     responses(
         (status = 200, description = "Key upserted"),
         (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
-        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid key, or invalid If-Match / If-None-Match header", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 412, description = "If-Match or If-None-Match does not hold; nothing was written", body = String, content_type = "text/plain",
+         headers(("ETag" = String, description = "ETag of the key's current version; absent when the key does not exist"))),
+        (status = 428, description = "The domain requires conditional writes and neither If-Match nor If-None-Match is set", body = String, content_type = "text/plain",
+         headers(("Cache-Control" = String, description = "no-store"))),
     ),
     tag = "Key-Value Store"
 )]
 /// Inserts or updates a value for the given key (upsert semantics).
 /// The optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.
+/// `If-Match` (an ETag from a prior read) or `If-None-Match: *` (create only) make the write conditional;
+/// without them the last writer wins.
 pub async fn put_key(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
     Query(params): Query<TtlParams>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let store = resolve(&state, &domain).await?;
-    match params.ttl {
-        Some(ttl) => {
-            store.put_with_ttl(key.as_bytes(), &body, ttl).await.map_err(ApiError::from)?
-        }
-        None => store.put(key.as_bytes(), &body).await.map_err(ApiError::from)?,
-    }
+    let preconditions = write_preconditions(&headers)?;
+    let op = KeyWrite::Put { value: &body, ttl_secs: params.ttl };
+    store.write(key.as_bytes(), op, &preconditions).await.map_err(write_error)?;
     Ok(StatusCode::OK)
 }
 
@@ -212,8 +277,10 @@ pub async fn put_key(
         ("key"    = String, Path, description = "Key (valid UTF-8, max 256 bytes)"),
     ),
     responses(
-        (status = 200, description = "Value (raw bytes; an empty value yields an empty body). The `X-Expires-At` header (absolute Unix seconds) is present only when the key has a TTL.", content_type = "application/octet-stream", headers(("X-Expires-At" = u64))),
-        (status = 204, description = "Key exists in the explicit null state (set via PATCH …/null)"),
+        (status = 200, description = "Value (raw bytes; an empty value yields an empty body). The `X-Expires-At` header (absolute Unix seconds) is present only when the key has a TTL.", content_type = "application/octet-stream",
+         headers(("X-Expires-At" = u64), ("ETag" = String, description = "Strong, opaque version tag for If-Match / If-None-Match"))),
+        (status = 204, description = "Key exists in the explicit null state (set via PATCH …/null)",
+         headers(("ETag" = String, description = "Strong, opaque version tag for If-Match / If-None-Match"))),
         (status = 404, description = "Key or domain not found", body = String, content_type = "text/plain"),
         (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
         (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
@@ -223,26 +290,28 @@ pub async fn put_key(
 )]
 /// Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.
 /// When the key has a TTL, the response carries an `X-Expires-At` header with the absolute Unix-seconds expiry.
+/// 200 and 204 carry an `ETag` identifying the version read, for a later conditional write.
 pub async fn get_key(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let store = resolve(&state, &domain).await?;
-    let (result, expire_at) = store.get_with_expiry(key.as_bytes()).await.map_err(ApiError::from)?;
-    match result {
+    let (result, expire_at, stamp) = store.get_with_stamp(key.as_bytes()).await.map_err(ApiError::from)?;
+    let mut resp = match result {
         GetResult::Present(value) => {
             let mut resp = Bytes::from(value).into_response();
             if expire_at != 0 {
                 resp.headers_mut().insert("x-expires-at", expire_at.to_string().parse().unwrap());
             }
-            Ok(resp)
+            resp
         }
-        GetResult::Null => Ok(StatusCode::NO_CONTENT.into_response()),
-        GetResult::Absent => Err(ApiError::from(anyhow::anyhow!(
-            "404 Not Found: key '{}' not found",
-            key
-        ))),
-    }
+        GetResult::Null => StatusCode::NO_CONTENT.into_response(),
+        GetResult::Absent => {
+            return Err(ApiError::from(anyhow::anyhow!("404 Not Found: key '{}' not found", key)))
+        }
+    };
+    resp.headers_mut().insert(header::ETAG, etag(stamp));
+    Ok(resp)
 }
 
 // ── KeyMetaResponse DTO ────────────────────────────────────────────────────────
@@ -296,22 +365,31 @@ pub async fn get_key_meta(
     params(
         ("domain" = String, Path, description = "Domain name"),
         ("key"    = String, Path, description = "Key (valid UTF-8, max 256 bytes)"),
+        ("If-Match" = Option<String>, Header, description = "ETag from a prior read: delete only if it is still the key's current version, else 412"),
+        ("If-None-Match" = Option<String>, Header, description = "Only `*`: delete only if the key does not exist, else 412. Evaluated after If-Match"),
     ),
     responses(
         (status = 204, description = "Key deleted"),
         (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
-        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid key, or invalid If-Match / If-None-Match header", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 412, description = "If-Match or If-None-Match does not hold; nothing was deleted", body = String, content_type = "text/plain",
+         headers(("ETag" = String, description = "ETag of the key's current version; absent when the key does not exist"))),
+        (status = 428, description = "The domain requires conditional writes and neither If-Match nor If-None-Match is set", body = String, content_type = "text/plain",
+         headers(("Cache-Control" = String, description = "no-store"))),
     ),
     tag = "Key-Value Store"
 )]
 /// Permanently removes a key from the domain. The operation is idempotent; deleting a non-existent key still returns 204.
+/// `If-Match` makes the delete conditional on the version read.
 pub async fn delete_key(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let store = resolve(&state, &domain).await?;
-    store.delete(key.as_bytes()).await.map_err(ApiError::from)?;
+    let preconditions = write_preconditions(&headers)?;
+    store.write(key.as_bytes(), KeyWrite::Delete, &preconditions).await.map_err(write_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -321,23 +399,32 @@ pub async fn delete_key(
     params(
         ("domain" = String, Path, description = "Domain name"),
         ("key"    = String, Path, description = "Key (valid UTF-8, max 256 bytes)"),
+        ("If-Match" = Option<String>, Header, description = "ETag from a prior read: write only if it is still the key's current version, else 412"),
+        ("If-None-Match" = Option<String>, Header, description = "Only `*`: write only if the key does not exist, else 412. Evaluated after If-Match"),
     ),
     responses(
         (status = 200, description = "Key set to the null value state"),
         (status = 429, description = "Rate limit exceeded", body = String, content_type = "text/plain", headers(("Retry-After" = u64))),
-        (status = 400, description = "Invalid key", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid key, or invalid If-Match / If-None-Match header", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
+        (status = 412, description = "If-Match or If-None-Match does not hold; nothing was written", body = String, content_type = "text/plain",
+         headers(("ETag" = String, description = "ETag of the key's current version; absent when the key does not exist"))),
+        (status = 428, description = "The domain requires conditional writes and neither If-Match nor If-None-Match is set", body = String, content_type = "text/plain",
+         headers(("Cache-Control" = String, description = "no-store"))),
     ),
     tag = "Key-Value Store"
 )]
 /// Sets the key to an explicit null value (upsert): the key stays registered and appears in scans,
-/// but carries no data — GET answers 204. A write like any other; it resets a previously set TTL.
+/// but carries no data — GET answers 204. A write like any other; it resets a previously set TTL,
+/// and takes the same `If-Match` / `If-None-Match: *` preconditions as PUT.
 pub async fn set_null(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let store = resolve(&state, &domain).await?;
-    store.set_null(key.as_bytes()).await.map_err(ApiError::from)?;
+    let preconditions = write_preconditions(&headers)?;
+    store.write(key.as_bytes(), KeyWrite::Null, &preconditions).await.map_err(write_error)?;
     Ok(StatusCode::OK)
 }
 
@@ -1943,6 +2030,312 @@ mod tests {
             let keys: Vec<String> = serde_json::from_value(body["keys"].clone()).unwrap();
             assert_eq!(keys, vec!["f:x2".to_string(), "f:x3".to_string()], "offset must slice the filtered set");
             assert_eq!(body["total"].as_u64().unwrap(), 3);
+        })
+    }
+
+    // ── Conditional writes: ETag, If-Match, If-None-Match, 428 ──────────────
+
+    async fn send_with(
+        app: &axum::Router,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Body,
+    ) -> axum::http::Response<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        app.clone().oneshot(builder.body(body).unwrap()).await.unwrap()
+    }
+
+    fn etag_of(resp: &axum::http::Response<Body>) -> Option<String> {
+        resp.headers().get(axum::http::header::ETAG).map(|v| v.to_str().unwrap().to_string())
+    }
+
+    async fn current_etag(app: &axum::Router, uri: &str) -> String {
+        let resp = send(app, Method::GET, uri, Body::empty()).await;
+        etag_of(&resp).unwrap_or_else(|| panic!("GET {uri} -> {} without ETag", resp.status()))
+    }
+
+    // GET carries a strong ETag (quoted hex, never W/) for a value and for a
+    // key in the NULL state (204); every write yields a new one.
+    #[test]
+    fn test_get_carries_strong_etag_for_value_and_null_state() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let uri = "/store-api/kv/testdom/keys/tagged";
+            send(&app, Method::PUT, uri, Body::from("v1")).await;
+
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let first = etag_of(&resp).expect("200 must carry an ETag");
+            let inner = first.strip_prefix('"').and_then(|s| s.strip_suffix('"')).expect("quoted ETag");
+            assert!(u64::from_str_radix(inner, 16).is_ok(), "ETag must be the quoted hex stamp: {first}");
+
+            send(&app, Method::PATCH, &format!("{uri}/null"), Body::empty()).await;
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            let second = etag_of(&resp).expect("204 must carry an ETag");
+            assert_ne!(second, first, "a write must change the ETag");
+        })
+    }
+
+    // GET -> ETag -> PUT with If-Match succeeds. After an intermediate write
+    // by someone else, the same ETag fails with 412: nothing is written and
+    // the 412 carries the current ETag, so the loser needs no extra GET.
+    #[test]
+    fn test_put_if_match_succeeds_and_stale_etag_412_carries_current_etag() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let uri = "/store-api/kv/testdom/keys/occ";
+            send(&app, Method::PUT, uri, Body::from("v1")).await;
+
+            let read = current_etag(&app, uri).await;
+            let resp = send_with(&app, Method::PUT, uri, &[("if-match", &read)], Body::from("v2")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let stale = current_etag(&app, uri).await;
+            send(&app, Method::PUT, uri, Body::from("intermediate")).await;
+            let now = current_etag(&app, uri).await;
+
+            let resp = send_with(&app, Method::PUT, uri, &[("if-match", &stale)], Body::from("lost")).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(etag_of(&resp), Some(now), "412 must carry the current ETag");
+
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), b"intermediate", "a failed precondition must not write");
+        })
+    }
+
+    // If-Match on a key that no longer exists -> 412 without an ETag (there
+    // is no current version) for PUT and DELETE, and the key stays absent.
+    #[test]
+    fn test_if_match_on_deleted_key_412_without_etag() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let uri = "/store-api/kv/testdom/keys/gone";
+            send(&app, Method::PUT, uri, Body::from("v1")).await;
+            let read = current_etag(&app, uri).await;
+            send(&app, Method::DELETE, uri, Body::empty()).await;
+
+            for method in [Method::PUT, Method::DELETE] {
+                let resp = send_with(&app, method.clone(), uri, &[("if-match", &read)], Body::from("v2")).await;
+                assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED, "{method}");
+                assert_eq!(etag_of(&resp), None, "{method}: a missing key has no current ETag");
+            }
+
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a failed precondition must not write");
+        })
+    }
+
+    // ABA: after delete and recreate, the ETag read before the delete never
+    // matches the new version; the 412 names the new version's ETag.
+    #[test]
+    fn test_stale_etag_across_recreate_412_with_new_etag() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let uri = "/store-api/kv/testdom/keys/aba";
+            send(&app, Method::PUT, uri, Body::from("v1")).await;
+            let stale = current_etag(&app, uri).await;
+            send(&app, Method::DELETE, uri, Body::empty()).await;
+            send(&app, Method::PUT, uri, Body::from("v1")).await;
+            let recreated = current_etag(&app, uri).await;
+
+            let resp = send_with(&app, Method::PUT, uri, &[("if-match", &stale)], Body::from("lost")).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(etag_of(&resp), Some(recreated));
+
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), b"v1", "a failed precondition must not write");
+        })
+    }
+
+    // If-None-Match: * creates a free key; on an existing key it fails with
+    // 412 carrying the current ETag, and the value stays unchanged.
+    #[test]
+    fn test_put_if_none_match_creates_once_then_412_with_etag() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let uri = "/store-api/kv/testdom/keys/fresh";
+
+            let resp = send_with(&app, Method::PUT, uri, &[("if-none-match", "*")], Body::from("first")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let created = current_etag(&app, uri).await;
+
+            let resp = send_with(&app, Method::PUT, uri, &[("if-none-match", "*")], Body::from("second")).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(etag_of(&resp), Some(created), "412 must carry the current ETag");
+
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), b"first");
+        })
+    }
+
+    // Both headers together: If-Match is evaluated first, then If-None-Match
+    // (RFC 9110 §13.2.2) — on a free key the failing If-Match decides (412
+    // without ETag, nothing created); on an existing key with a matching
+    // If-Match, the following If-None-Match: * fails (412 with ETag).
+    #[test]
+    fn test_if_match_evaluated_before_if_none_match() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let free = "/store-api/kv/testdom/keys/free";
+            let headers = [("if-match", "\"1\""), ("if-none-match", "*")];
+            let resp = send_with(&app, Method::PUT, free, &headers, Body::from("v")).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(etag_of(&resp), None);
+            let resp = send(&app, Method::GET, free, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "If-Match must stop the create");
+
+            let taken = "/store-api/kv/testdom/keys/taken";
+            send(&app, Method::PUT, taken, Body::from("v1")).await;
+            let read = current_etag(&app, taken).await;
+            let headers = [("if-match", read.as_str()), ("if-none-match", "*")];
+            let resp = send_with(&app, Method::PUT, taken, &headers, Body::from("v2")).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(etag_of(&resp), Some(read), "If-None-Match: * must still be evaluated");
+        })
+    }
+
+    // Malformed preconditions are a 400 and write nothing: an If-Match that
+    // is no ETag of this store (wildcard, weak, non-hex), an If-None-Match
+    // other than the literal '*' (no ETag lists).
+    #[test]
+    fn test_malformed_precondition_headers_400() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let uri = "/store-api/kv/testdom/keys/strict";
+            for value in ["*", "W/\"1f\"", "\"zz\""] {
+                let resp = send_with(&app, Method::PUT, uri, &[("if-match", value)], Body::from("v")).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "If-Match: {value}");
+            }
+            for value in ["\"1f\"", "W/\"*\""] {
+                let resp = send_with(&app, Method::PUT, uri, &[("if-none-match", value)], Body::from("v")).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "If-None-Match: {value}");
+            }
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a rejected precondition must not write");
+        })
+    }
+
+    // PATCH …/null and DELETE take the same preconditions as PUT: a stale
+    // If-Match is a 412 with the current ETag and changes nothing; the
+    // current ETag lets the write through.
+    #[test]
+    fn test_set_null_and_delete_honor_if_match() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let uri = "/store-api/kv/testdom/keys/cond";
+            let null_uri = "/store-api/kv/testdom/keys/cond/null";
+            send(&app, Method::PUT, uri, Body::from("v1")).await;
+            let stale = current_etag(&app, uri).await;
+            send(&app, Method::PUT, uri, Body::from("v2")).await;
+            let current = current_etag(&app, uri).await;
+
+            let resp = send_with(&app, Method::PATCH, null_uri, &[("if-match", &stale)], Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(etag_of(&resp), Some(current.clone()));
+            let resp = send_with(&app, Method::PATCH, null_uri, &[("if-match", &current)], Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let nulled = current_etag(&app, uri).await;
+
+            let resp = send_with(&app, Method::DELETE, uri, &[("if-match", &current)], Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(etag_of(&resp), Some(nulled.clone()));
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "a failed precondition must not delete");
+
+            let resp = send_with(&app, Method::DELETE, uri, &[("if-match", &nulled)], Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        })
+    }
+
+    // A domain created with require_conditional_writes answers single-key
+    // writes without If-Match / If-None-Match: * with 428 (not cacheable)
+    // and takes conditional ones; reads and the prefix bulk delete are never
+    // affected, and a domain without the setting keeps last-writer-wins.
+    #[test]
+    fn test_conditional_writes_domain_rejects_unconditional_writes_428() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let resp = send_with(
+                &app,
+                Method::POST,
+                "/store-api/domains",
+                &[("content-type", "application/json")],
+                Body::from(r#"{"name": "strict", "require_conditional_writes": true}"#),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], true);
+            let resp = send(&app, Method::GET, "/store-api/domains/strict", Body::empty()).await;
+            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], true);
+
+            let uri = "/store-api/kv/strict/keys/k";
+            let unconditional = [
+                (Method::PUT, uri.to_string()),
+                (Method::PATCH, format!("{uri}/null")),
+                (Method::DELETE, uri.to_string()),
+            ];
+            for (method, target) in &unconditional {
+                let resp = send(&app, method.clone(), target, Body::from("v")).await;
+                assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED, "{method} {target}");
+                assert_eq!(resp.headers().get(axum::http::header::CACHE_CONTROL).unwrap(), "no-store");
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                assert!(body.starts_with(b"428"), "plain-text error body: {body:?}");
+            }
+            let resp = send(&app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a rejected write must not write");
+
+            let resp = send_with(&app, Method::PUT, uri, &[("if-none-match", "*")], Body::from("v")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let read = current_etag(&app, uri).await;
+            let resp = send_with(&app, Method::PATCH, &format!("{uri}/null"), &[("if-match", &read)], Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let read = current_etag(&app, uri).await;
+            let resp = send_with(&app, Method::DELETE, uri, &[("if-match", &read)], Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+            send_with(&app, Method::PUT, "/store-api/kv/strict/keys/b:1", &[("if-none-match", "*")], Body::from("v")).await;
+            let resp = send(&app, Method::DELETE, "/store-api/kv/strict/keys?prefix=b:", Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "the prefix bulk delete is never conditional");
+            assert_eq!(body_json(resp.into_body()).await["deleted"], 1);
+
+            let resp = send(&app, Method::PUT, "/store-api/kv/testdom/keys/k", Body::from("v")).await;
+            assert_eq!(resp.status(), StatusCode::OK, "other domains keep last-writer-wins");
+        })
+    }
+
+    // A write without preconditions to such a domain still meets key
+    // validation (400) and the write rate limit (429) before the 428.
+    #[test]
+    fn test_conditional_writes_domain_400_and_429_before_428() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(crate::engines::lsm::domain::DomainConfig::default(), false).await;
+            state.registry.create_domain_with("strict", true).await.unwrap();
+            let store = state.registry.store("strict").await.unwrap();
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
+
+            let uri = format!("/store-api/kv/strict/keys/{}", "a".repeat(300));
+            for (method, target) in [
+                (Method::PUT, uri.clone()),
+                (Method::PATCH, format!("{uri}/null")),
+                (Method::DELETE, uri.clone()),
+            ] {
+                let resp = send(&app, method.clone(), &target, Body::from("v")).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{method}: invalid key");
+            }
+
+            store.drain_write_budget_for_test();
+            let resp = send(&app, Method::PUT, "/store-api/kv/strict/keys/k", Body::from("v")).await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         })
     }
 }

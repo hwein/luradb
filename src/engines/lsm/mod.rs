@@ -24,6 +24,9 @@ pub use reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegis
 pub use compaction::{CompactionConfig, CompactionJob};
 pub use janitor::{Janitor, JanitorConfig};
 pub use watcher::{OpType, WalEvent, WatchMessage, WATCH_TAG};
-pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta, WatchStart};
+pub use domain::{
+    Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta, KeyWrite, Precondition,
+    PreconditionFailed, PreconditionRequired, WatchStart,
+};
 pub use rate_limiter::{DomainQuota, RateLimiter, TokenBucket};
 pub use ttl_sweeper::TtlSweeper;

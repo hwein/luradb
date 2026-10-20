@@ -20,6 +20,10 @@ use utoipa::ToSchema;
 pub struct CreateDomainRequest {
     /// User-visible domain name (max 50 chars, [a-zA-Z0-9_-]).
     pub name: String,
+    /// When true, PUT, DELETE and PATCH …/null on single keys need `If-Match` or
+    /// `If-None-Match: *` and answer 428 without. Fixed at creation; default false.
+    #[serde(default)]
+    pub require_conditional_writes: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -28,11 +32,17 @@ pub struct DomainResponse {
     pub name: String,
     /// Creation timestamp (Unix seconds).
     pub created_at: u64,
+    /// Whether single-key writes need `If-Match` or `If-None-Match: *` (else 428).
+    pub require_conditional_writes: bool,
 }
 
 impl From<crate::engines::lsm::Domain> for DomainResponse {
     fn from(d: crate::engines::lsm::Domain) -> Self {
-        DomainResponse { name: d.name, created_at: d.created_at }
+        DomainResponse {
+            name: d.name,
+            created_at: d.created_at,
+            require_conditional_writes: d.require_conditional_writes,
+        }
     }
 }
 
@@ -51,11 +61,17 @@ impl From<crate::engines::lsm::Domain> for DomainResponse {
 )]
 /// Creates a new logical domain (isolated KV namespace).
 /// Domain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.
+/// With `require_conditional_writes`, single-key writes over REST (PUT, DELETE, PATCH …/null) must
+/// carry `If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.
 pub async fn create_domain(
     State(state): State<AppState>,
     Json(body): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<DomainResponse>), ApiError> {
-    let domain = state.registry.create_domain(&body.name).await.map_err(ApiError::from)?;
+    let domain = state
+        .registry
+        .create_domain_with(&body.name, body.require_conditional_writes)
+        .await
+        .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(DomainResponse::from(domain))))
 }
 

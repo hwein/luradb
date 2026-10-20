@@ -22,6 +22,10 @@ use utoipa::ToSchema;
 pub struct CreateJsonDomainRequest {
     /// User-visible domain name (max 50 chars, [a-zA-Z0-9_-]).
     pub name: String,
+    /// When true, PUT and DELETE on documents need `If-Match` or
+    /// `If-None-Match: *` and answer 428 without. Fixed at creation; default false.
+    #[serde(default)]
+    pub require_conditional_writes: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -31,6 +35,8 @@ pub struct JsonDomainResponse {
     pub created_at: u64,
     /// Lifecycle state: "active" or "deleting" (background purge running).
     pub state: String,
+    /// Whether document PUT and DELETE need `If-Match` or `If-None-Match: *` (else 428).
+    pub require_conditional_writes: bool,
     /// Number of documents — only set on the detail endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_count: Option<u64>,
@@ -46,6 +52,7 @@ impl From<JsonDomain> for JsonDomainResponse {
             name: d.name,
             created_at: d.created_at,
             state: state.to_string(),
+            require_conditional_writes: d.require_conditional_writes,
             document_count: None,
         }
     }
@@ -66,12 +73,14 @@ impl From<JsonDomain> for JsonDomainResponse {
     tag = "JSON Document Store"
 )]
 /// Creates a new JSON domain (isolated document namespace, separate from KV domains).
+/// With `require_conditional_writes`, single-document writes over REST (PUT, DELETE) must carry
+/// `If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.
 pub async fn create_domain(
     State(state): State<AppState>,
     Json(body): Json<CreateJsonDomainRequest>,
 ) -> Result<(StatusCode, Json<JsonDomainResponse>), ApiError> {
     let engine = json_engine(&state)?;
-    let domain = engine.create_domain(&body.name).await?;
+    let domain = engine.create_domain_with(&body.name, body.require_conditional_writes).await?;
     Ok((StatusCode::CREATED, Json(domain.into())))
 }
 

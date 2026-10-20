@@ -80,15 +80,20 @@ pub struct JsonDomain {
     pub created_at: u64,
     #[serde(default)]
     pub state: JsonDomainState,
+    /// Document writes over REST must carry `If-Match` or
+    /// `If-None-Match: *`; fixed at creation.
+    #[serde(default)]
+    pub require_conditional_writes: bool,
 }
 
 impl JsonDomain {
-    fn new(name: &str) -> Self {
+    fn new(name: &str, require_conditional_writes: bool) -> Self {
         Self {
             name: name.to_string(),
             system_prefix: format!("{:016x}", fnv64(name.as_bytes())).into_bytes(),
             created_at: now_secs(),
             state: JsonDomainState::Active,
+            require_conditional_writes,
         }
     }
 }
@@ -163,12 +168,22 @@ impl JsonDomainRegistry {
 
     /// Creates a new domain. Fails if the name already exists (incl. deleting).
     pub async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
+        self.create_domain_with(name, false).await
+    }
+
+    /// [`Self::create_domain`] with the domain's
+    /// [`JsonDomain::require_conditional_writes`] setting.
+    pub async fn create_domain_with(
+        &self,
+        name: &str,
+        require_conditional_writes: bool,
+    ) -> Result<JsonDomain, JsonStoreError> {
         validate_domain_name(name)?;
         let _guard = self.create_lock.lock().await;
         if self.domains.read().contains_key(name) {
             return Err(JsonStoreError::DomainAlreadyExists(name.to_string()));
         }
-        let domain = JsonDomain::new(name);
+        let domain = JsonDomain::new(name, require_conditional_writes);
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain.clone());

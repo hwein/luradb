@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.6.2",
+    "version": "0.7.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -839,7 +839,7 @@
         "tags": [
           "Domains"
         ],
-        "summary": "Creates a new logical domain (isolated KV namespace).\nDomain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.",
+        "summary": "Creates a new logical domain (isolated KV namespace).\nDomain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.\nWith `require_conditional_writes`, single-key writes over REST (PUT, DELETE, PATCH …/null) must\ncarry `If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.",
         "operationId": "create_domain",
         "requestBody": {
           "content": {
@@ -1058,7 +1058,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Creates a new JSON domain (isolated document namespace, separate from KV domains).",
+        "summary": "Creates a new JSON domain (isolated document namespace, separate from KV domains).\nWith `require_conditional_writes`, single-document writes over REST (PUT, DELETE) must carry\n`If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.",
         "operationId": "create_domain",
         "requestBody": {
           "content": {
@@ -1224,7 +1224,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Imports documents from an NDJSON body in atomic batches.",
+        "summary": "Imports documents from an NDJSON body in atomic batches; bulk writes take\nno preconditions and are not subject to `require_conditional_writes`.",
         "operationId": "bulk_load",
         "parameters": [
           {
@@ -1619,7 +1619,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a\nconditional update that fails with 409 on a version mismatch. With\n`If-None-Match: *` the write is create-only and fails with 412 if the\ndocument already exists (json/014); the two headers are mutually\nexclusive (400).",
+        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a\nconditional update; with `If-None-Match: *` it is create-only. Both may\nbe combined and are evaluated in that order; a failed precondition\nanswers 412 with the current `ETag`.",
         "operationId": "put_document",
         "parameters": [
           {
@@ -1643,7 +1643,7 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "Opaque ETag from a prior read: conditional write, 409 on version mismatch",
+            "description": "Opaque ETag from a prior read: write only if it is still the document's current version, else 412",
             "required": false,
             "schema": {
               "type": [
@@ -1655,7 +1655,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "Only `*` is supported: create-only write, 412 if the document exists",
+            "description": "Only `*` is supported: create-only write, 412 if the document exists. Evaluated after If-Match",
             "required": false,
             "schema": {
               "type": [
@@ -1697,7 +1697,7 @@
             }
           },
           "400": {
-            "description": "Invalid key, reserved top-level field (_key, _version, _content), invalid If-Match or If-None-Match header, or both headers set together",
+            "description": "Invalid key, reserved top-level field (_key, _version, _content), or invalid If-Match or If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1707,17 +1707,7 @@
             }
           },
           "404": {
-            "description": "Domain not found, or If-Match on missing document",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Version conflict (If-Match mismatch)",
+            "description": "Domain not found",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1737,7 +1727,33 @@
             }
           },
           "412": {
-            "description": "Document already exists (If-None-Match: *)",
+            "description": "If-Match or If-None-Match does not hold (version mismatch, missing document, or document already exists); nothing was written",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the document's current version; absent when the document does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1762,7 +1778,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Deletes a document and its index entries. Supports conditional delete via\n`If-Match: \"<etag>\"`.",
+        "summary": "Deletes a document and its index entries. Supports conditional delete via\n`If-Match: \"<etag>\"`; a failed precondition answers 412 with the current\n`ETag`.",
         "operationId": "delete_document",
         "parameters": [
           {
@@ -1786,7 +1802,19 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "Opaque ETag from a prior read: conditional write, 409 on version mismatch",
+            "description": "Opaque ETag from a prior read: delete only if it is still the document's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*` is supported: 412 if the document exists. Evaluated after If-Match",
             "required": false,
             "schema": {
               "type": [
@@ -1800,6 +1828,16 @@
           "204": {
             "description": "Document deleted"
           },
+          "400": {
+            "description": "Invalid key, or invalid If-Match or If-None-Match header",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Document or domain not found",
             "content": {
@@ -1810,8 +1848,8 @@
               }
             }
           },
-          "409": {
-            "description": "Version conflict (If-Match mismatch)",
+          "410": {
+            "description": "Domain is being deleted",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1820,8 +1858,34 @@
               }
             }
           },
-          "410": {
-            "description": "Domain is being deleted",
+          "412": {
+            "description": "If-Match or If-None-Match does not hold (version mismatch, missing document, or document exists); nothing was deleted",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the document's current version; absent when the document does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2620,7 +2684,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.\nWhen the key has a TTL, the response carries an `X-Expires-At` header with the absolute Unix-seconds expiry.",
+        "summary": "Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.\nWhen the key has a TTL, the response carries an `X-Expires-At` header with the absolute Unix-seconds expiry.\n200 and 204 carry an `ETag` identifying the version read, for a later conditional write.",
         "operationId": "get_key",
         "parameters": [
           {
@@ -2646,6 +2710,12 @@
           "200": {
             "description": "Value (raw bytes; an empty value yields an empty body). The `X-Expires-At` header (absolute Unix seconds) is present only when the key has a TTL.",
             "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong, opaque version tag for If-Match / If-None-Match"
+              },
               "X-Expires-At": {
                 "schema": {
                   "type": "integer",
@@ -2659,7 +2729,15 @@
             }
           },
           "204": {
-            "description": "Key exists in the explicit null state (set via PATCH …/null)"
+            "description": "Key exists in the explicit null state (set via PATCH …/null)",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong, opaque version tag for If-Match / If-None-Match"
+              }
+            }
           },
           "400": {
             "description": "Invalid key",
@@ -2716,7 +2794,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Inserts or updates a value for the given key (upsert semantics).\nThe optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.",
+        "summary": "Inserts or updates a value for the given key (upsert semantics).\nThe optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.\n`If-Match` (an ETag from a prior read) or `If-None-Match: *` (create only) make the write conditional;\nwithout them the last writer wins.",
         "operationId": "put_key",
         "parameters": [
           {
@@ -2747,6 +2825,30 @@
               "format": "int64",
               "minimum": 0
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "ETag from a prior read: write only if it is still the key's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*`: write only if the key does not exist, else 412. Evaluated after If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -2764,7 +2866,7 @@
             "description": "Key upserted"
           },
           "400": {
-            "description": "Invalid key",
+            "description": "Invalid key, or invalid If-Match / If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -2785,6 +2887,42 @@
           },
           "410": {
             "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "If-Match or If-None-Match does not hold; nothing was written",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the key's current version; absent when the key does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2818,7 +2956,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Permanently removes a key from the domain. The operation is idempotent; deleting a non-existent key still returns 204.",
+        "summary": "Permanently removes a key from the domain. The operation is idempotent; deleting a non-existent key still returns 204.\n`If-Match` makes the delete conditional on the version read.",
         "operationId": "delete_key",
         "parameters": [
           {
@@ -2838,6 +2976,30 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "ETag from a prior read: delete only if it is still the key's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*`: delete only if the key does not exist, else 412. Evaluated after If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -2845,7 +3007,7 @@
             "description": "Key deleted"
           },
           "400": {
-            "description": "Invalid key",
+            "description": "Invalid key, or invalid If-Match / If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -2856,6 +3018,42 @@
           },
           "410": {
             "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "If-Match or If-None-Match does not hold; nothing was deleted",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the key's current version; absent when the key does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2981,7 +3179,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Sets the key to an explicit null value (upsert): the key stays registered and appears in scans,\nbut carries no data — GET answers 204. A write like any other; it resets a previously set TTL.",
+        "summary": "Sets the key to an explicit null value (upsert): the key stays registered and appears in scans,\nbut carries no data — GET answers 204. A write like any other; it resets a previously set TTL,\nand takes the same `If-Match` / `If-None-Match: *` preconditions as PUT.",
         "operationId": "set_null",
         "parameters": [
           {
@@ -3001,6 +3199,30 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "ETag from a prior read: write only if it is still the key's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*`: write only if the key does not exist, else 412. Evaluated after If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -3008,7 +3230,7 @@
             "description": "Key set to the null value state"
           },
           "400": {
-            "description": "Invalid key",
+            "description": "Invalid key, or invalid If-Match / If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -3019,6 +3241,42 @@
           },
           "410": {
             "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "If-Match or If-None-Match does not hold; nothing was written",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the key's current version; absent when the key does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -5136,6 +5394,10 @@
           "name": {
             "type": "string",
             "description": "User-visible domain name (max 50 chars, [a-zA-Z0-9_-])."
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "When true, PUT, DELETE and PATCH …/null on single keys need `If-Match` or\n`If-None-Match: *` and answer 428 without. Fixed at creation; default false."
           }
         }
       },
@@ -5244,6 +5506,10 @@
           "name": {
             "type": "string",
             "description": "User-visible domain name (max 50 chars, [a-zA-Z0-9_-])."
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "When true, PUT and DELETE on documents need `If-Match` or\n`If-None-Match: *` and answer 428 without. Fixed at creation; default false."
           }
         }
       },
@@ -5359,7 +5625,8 @@
         "type": "object",
         "required": [
           "name",
-          "created_at"
+          "created_at",
+          "require_conditional_writes"
         ],
         "properties": {
           "created_at": {
@@ -5371,6 +5638,10 @@
           "name": {
             "type": "string",
             "description": "User-visible domain name."
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "Whether single-key writes need `If-Match` or `If-None-Match: *` (else 428)."
           }
         }
       },
@@ -5419,7 +5690,8 @@
         "required": [
           "name",
           "created_at",
-          "state"
+          "state",
+          "require_conditional_writes"
         ],
         "properties": {
           "created_at": {
@@ -5439,6 +5711,10 @@
           },
           "name": {
             "type": "string"
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "Whether document PUT and DELETE need `If-Match` or `If-None-Match: *` (else 428)."
           },
           "state": {
             "type": "string",

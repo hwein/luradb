@@ -45,14 +45,14 @@ pub(crate) struct StoredDocument {
     pub content: Value,
 }
 
-/// Expected incarnation + version for OCC checks (`If-Match`, json/011).
+/// The incarnation and version an `If-Match` put or delete expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpectedVersion {
     pub generation: u64,
     pub version: u64,
 }
 
-/// Write precondition for `put_document_with_version` (json/011, json/014).
+/// Precondition of a document put or delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Precondition {
     /// `If-Match`: document must exist with exactly this incarnation+version.

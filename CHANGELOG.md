@@ -57,6 +57,7 @@ All notable changes to LuraDB are documented in this file.
 
 - Upgraded rustls to 0.23.45+, resolving RUSTSEC-2026-0285.
 - Upgraded rustls to 0.23.46+, resolving RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
+- Upgraded rustls-webpki to 0.103.16+, resolving RUSTSEC-2026-0382.
 
 ## [0.4.0] - 2026-08-29
 

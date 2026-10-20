@@ -19,6 +19,9 @@
 //! Gate (one reader thread at most 5 % slower than before): met, 257 154
 //! ops/s against 236 405 in the first before run and 260 367 in this one.
 
+mod common;
+
+use luradb::core::storage_thread::WalTarget;
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::engine::{BatchOp, LsmEngineOptions};
 use luradb::engines::lsm::LsmStorageEngine;
@@ -94,7 +97,8 @@ fn read_scaling() {
     luradb::core::engine_runtime::block_on(async {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
-        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let (_hub, handle) = common::start_kv_hub(&wal_path);
+        let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));
         let vlog_path = dir.path().join("vlog.log");
         let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
         let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());

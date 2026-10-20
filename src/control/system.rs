@@ -27,15 +27,16 @@ const SHARDS_KEY: &[u8] = b"__sys:meta:shards";
 /// Set once the auth records moved out of the key-value engine.
 const AUTH_MIGRATED_KEY: &[u8] = b"__sys:meta:auth_migrated";
 
-/// Opens (or creates) the system store in `dir` and recovers it.
-pub async fn open(dir: &Path) -> Result<Arc<LsmStorageEngine>> {
+/// Opens (or creates) the system store in `dir` with `wal`, the log at
+/// `<dir>/wal`, and recovers it.
+pub async fn open_with_wal(dir: &Path, wal: WriteAheadLog) -> Result<Arc<LsmStorageEngine>> {
     let sstable_dir = dir.join(SSTABLE_DIR);
-    // Creates `dir` too, before the log files go into it.
+    // Creates `dir` too, before the value log goes into it.
     let file_manager = Arc::new(FileManager::new(&sstable_dir).await?);
     let manifest_manager = Arc::new(ManifestManager::new(&sstable_dir));
     let wal_path = dir.join(WAL_FILE);
     let vlog_path = dir.join(VLOG_FILE);
-    let wal = Arc::new(WriteAheadLog::new(&wal_path).await?);
+    let wal = Arc::new(wal);
     let vlog = Arc::new(VLog::new(&vlog_path).await?);
     let options = LsmEngineOptions {
         engine: LsmEngineConfig { watch_replay_buffer_size: 0, ..LsmEngineConfig::default() },
@@ -45,6 +46,14 @@ pub async fn open(dir: &Path) -> Result<Arc<LsmStorageEngine>> {
         Arc::new(LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options).await?);
     engine.start_background_tasks();
     Ok(engine)
+}
+
+/// Tests only: [`open_with_wal`] on a local WAL committer instead of the
+/// storage hub.
+#[cfg(test)]
+pub(crate) async fn open(dir: &Path) -> Result<Arc<LsmStorageEngine>> {
+    std::fs::create_dir_all(dir)?;
+    open_with_wal(dir, WriteAheadLog::new(dir.join(WAL_FILE)).await?).await
 }
 
 /// The shard count stored by an earlier start, if any.
@@ -93,6 +102,7 @@ pub async fn migrate_auth(kv: &LsmStorageEngine, sys: &LsmStorageEngine) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::storage_thread::{TestHub, WalTarget};
 
     async fn reopen(engine: Arc<LsmStorageEngine>, dir: &Path) -> Arc<LsmStorageEngine> {
         engine.shutdown().await;
@@ -100,18 +110,53 @@ mod tests {
         open(dir).await.unwrap()
     }
 
+    /// The system store in `dir`; with `on_hub` a fresh storage hub writes its WAL.
+    async fn open_on(dir: &Path, on_hub: bool) -> (Arc<LsmStorageEngine>, Option<TestHub>) {
+        if !on_hub {
+            return (open(dir).await.unwrap(), None);
+        }
+        std::fs::create_dir_all(dir).unwrap();
+        let hub = TestHub::start(&[(WalTarget::Sys, &dir.join(WAL_FILE))]);
+        let sys = open_with_wal(dir, hub.wal(WalTarget::Sys)).await.unwrap();
+        (sys, Some(hub))
+    }
+
     #[test]
     fn open_lays_out_the_store_and_keeps_its_data_across_a_restart() {
         crate::core::engine_runtime::block_on(async {
+            for on_hub in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dir = tmp.path().join("sys");
+                let (sys, hub) = open_on(&dir, on_hub).await;
+                assert!(dir.join(SSTABLE_DIR).is_dir());
+                assert!(dir.join(WAL_FILE).is_file());
+
+                sys.put(b"__sys:auth:user:alice", "clé ✓".as_bytes()).await.unwrap();
+                sys.shutdown().await;
+                drop(sys);
+                drop(hub);
+                let (sys, _hub) = open_on(&dir, on_hub).await;
+                assert_eq!(sys.get(b"__sys:auth:user:alice").await.unwrap(), Some("clé ✓".as_bytes().to_vec()));
+            }
+        })
+    }
+
+    // Writes of a system store that stopped without a shutdown -- no flush,
+    // no truncate -- come back from the WAL the storage hub wrote.
+    #[test]
+    fn unflushed_writes_come_back_from_the_hub_written_wal() {
+        crate::core::engine_runtime::block_on(async {
             let tmp = tempfile::TempDir::new().unwrap();
             let dir = tmp.path().join("sys");
-            let sys = open(&dir).await.unwrap();
-            assert!(dir.join(SSTABLE_DIR).is_dir());
-            assert!(dir.join(WAL_FILE).is_file());
+            let (sys, hub) = open_on(&dir, true).await;
+            sys.put("__sys:auth:user:zoé".as_bytes(), b"zoe-record").await.unwrap();
+            drop(sys);
+            drop(hub);
+            assert!(std::fs::metadata(dir.join(WAL_FILE)).unwrap().len() > 0, "the write is only in the WAL");
 
-            sys.put(b"__sys:auth:user:alice", "clé ✓".as_bytes()).await.unwrap();
-            let sys = reopen(sys, &dir).await;
-            assert_eq!(sys.get(b"__sys:auth:user:alice").await.unwrap(), Some("clé ✓".as_bytes().to_vec()));
+            let (sys, _hub) = open_on(&dir, true).await;
+            assert_eq!(sys.get("__sys:auth:user:zoé".as_bytes()).await.unwrap(), Some(b"zoe-record".to_vec()));
+            sys.shutdown().await;
         })
     }
 
@@ -157,20 +202,23 @@ mod tests {
         keys
     }
 
+    // With the system store's WAL local and on the storage hub.
     #[test]
     fn migration_moves_auth_records_and_leaves_everything_else() {
         crate::core::engine_runtime::block_on(async {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let kv = kv_with_auth(&tmp.path().join("kv")).await;
-            let sys = open(&tmp.path().join("sys")).await.unwrap();
+            for on_hub in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let kv = kv_with_auth(&tmp.path().join("kv")).await;
+                let (sys, _hub) = open_on(&tmp.path().join("sys"), on_hub).await;
 
-            migrate_auth(&kv, &sys).await.unwrap();
+                migrate_auth(&kv, &sys).await.unwrap();
 
-            assert_eq!(sys.get(b"__sys:auth:user:alice").await.unwrap(), Some(b"alice-record".to_vec()));
-            assert_eq!(sys.get(b"__sys:auth:perm:alice:shop").await.unwrap(), Some(b"alice-perm".to_vec()));
-            assert_eq!(sys.get(AUTH_MIGRATED_KEY).await.unwrap(), Some(b"1".to_vec()));
-            assert!(auth_keys(&kv).await.is_empty(), "the originals are gone");
-            assert_eq!(kv.get(b"__sys:domain:shop").await.unwrap(), Some(b"domain-record".to_vec()));
+                assert_eq!(sys.get(b"__sys:auth:user:alice").await.unwrap(), Some(b"alice-record".to_vec()));
+                assert_eq!(sys.get(b"__sys:auth:perm:alice:shop").await.unwrap(), Some(b"alice-perm".to_vec()));
+                assert_eq!(sys.get(AUTH_MIGRATED_KEY).await.unwrap(), Some(b"1".to_vec()));
+                assert!(auth_keys(&kv).await.is_empty(), "the originals are gone");
+                assert_eq!(kv.get(b"__sys:domain:shop").await.unwrap(), Some(b"domain-record".to_vec()));
+            }
         })
     }
 

@@ -13,7 +13,6 @@
 //! through the generation map of the reader's own engine version.
 
 use crate::core::engine_runtime;
-use crate::core::storage_thread::StorageHandle;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -35,20 +34,12 @@ pub enum VLogError {
     UnknownGeneration { id: u32 },
 }
 
-/// How appends reach the file. `Local` owns a write handle (default) and
-/// writes positionally on the engine ring.
-/// `Remote` forwards appends to the perf/005 storage thread, which owns the
-/// file; `offset` then tracks the size as a high-water mark for reporting only.
-enum VLogMode {
-    Local(Arc<std::fs::File>),
-    Remote(StorageHandle),
-}
-
 /// Append-only Value Log — one generation.
 pub struct VLog {
-    inner: VLogMode,
-    /// Read-only descriptor for positional reads in both modes: no cursor, no
-    /// lock, any thread at once (spec kv/031 A5).
+    /// Write handle; appends write positionally on the engine ring.
+    file: Arc<std::fs::File>,
+    /// Read-only descriptor for positional reads: no cursor, no lock, any
+    /// thread at once.
     reader: std::fs::File,
     /// Generation id, stamped into every `ValuePointer` written here.
     id: u32,
@@ -76,8 +67,7 @@ impl VLog {
         Self::open(path, 1).await
     }
 
-    /// Opens or creates the generation `id` vLog at `path` (local file I/O —
-    /// used when the storage thread is disabled).
+    /// Opens or creates the generation `id` vLog at `path`.
     ///
     /// If the file already exists the cursor is positioned at the end so
     /// subsequent appends do not overwrite existing data.
@@ -91,26 +81,8 @@ impl VLog {
         let reader = std::fs::File::open(&path)?;
 
         Ok(Self {
-            inner: VLogMode::Local(Arc::new(file)),
+            file: Arc::new(file),
             reader,
-            id,
-            sealed: AtomicBool::new(false),
-            offset: AtomicU64::new(initial_size),
-            path,
-            #[cfg(test)]
-            offloaded: AtomicU64::new(0),
-        })
-    }
-
-    /// Routes appends through the perf/005 storage thread, which owns the file
-    /// and has already created it. The size counter is seeded from the file's
-    /// current length.
-    pub fn with_storage_handle(path: impl AsRef<Path>, handle: StorageHandle, id: u32) -> Result<Self, VLogError> {
-        let path = path.as_ref().to_path_buf();
-        let initial_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Ok(Self {
-            inner: VLogMode::Remote(handle),
-            reader: std::fs::File::open(&path)?,
             id,
             sealed: AtomicBool::new(false),
             offset: AtomicU64::new(initial_size),
@@ -147,21 +119,11 @@ impl VLog {
             return Ok(self.offset.load(Ordering::SeqCst));
         }
 
-        match &self.inner {
-            VLogMode::Local(file) => {
-                let offset = self.offset.fetch_add(value.len() as u64, Ordering::SeqCst);
-                // Done before the pointer is handed out: reads go through
-                // `reader`, not this handle.
-                engine_runtime::write_all_at(file, value.to_vec(), offset).await?;
-                Ok(offset)
-            }
-            VLogMode::Remote(handle) => {
-                let (offset, len) =
-                    handle.vlog_append(value.to_vec(), self.id).await.map_err(vlog_remote_err)?;
-                self.offset.fetch_max(offset + len as u64, Ordering::SeqCst);
-                Ok(offset)
-            }
-        }
+        let offset = self.offset.fetch_add(value.len() as u64, Ordering::SeqCst);
+        // Done before the pointer is handed out: reads go through `reader`,
+        // not this handle.
+        engine_runtime::write_all_at(&self.file, value.to_vec(), offset).await?;
+        Ok(offset)
     }
 
     /// Returns the current size of the vLog in bytes.
@@ -170,8 +132,7 @@ impl VLog {
     }
 
     /// Reads `len` bytes starting at `offset`, positionally on this
-    /// generation's own descriptor — in both modes, never through the
-    /// storage thread (spec kv/031 A5). Blocks the calling thread until the
+    /// generation's own descriptor. Blocks the calling thread until the
     /// bytes are there; see [`Self::read_async`].
     pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, VLogError> {
         let mut buf = vec![0u8; len];
@@ -267,11 +228,6 @@ pub async fn discover_generations(base: &Path) -> Result<Vec<u32>, VLogError> {
     }
     ids.sort_unstable();
     Ok(ids)
-}
-
-/// Maps a storage-thread `anyhow` error back into the vLog's error type.
-fn vlog_remote_err(e: anyhow::Error) -> VLogError {
-    VLogError::Io(std::io::Error::other(e.to_string()))
 }
 
 #[cfg(test)]

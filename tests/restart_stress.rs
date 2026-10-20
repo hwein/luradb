@@ -13,6 +13,9 @@
 //! finding, snapshots (S1 before reopen, S2 after verify) are conserved
 //! first, and the single panic! happens only at the very end.
 
+mod common;
+
+use luradb::core::storage_thread::{StorageHandle, WalTarget};
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::LsmStorageEngine;
 use luradb::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions};
@@ -44,11 +47,12 @@ fn stress_engine_config() -> LsmEngineConfig {
 }
 
 /// One (re)open on `dir` -- fresh WAL/VLog/FileManager/ManifestManager
-/// handles each time, exactly what a real restart does (mirrors
-/// `engine.rs::tests::engine_on`).
-async fn open_engine(dir: &Path, config: LsmEngineConfig) -> anyhow::Result<LsmStorageEngine> {
+/// handles each time (mirrors `engine.rs::tests::engine_on`). Unlike a real
+/// restart, the storage hub behind `hub` lives on: it keeps the WAL open,
+/// its cursor at the end of the file.
+async fn open_engine(dir: &Path, hub: &StorageHandle, config: LsmEngineConfig) -> anyhow::Result<LsmStorageEngine> {
     let wal_path = dir.join("wal.log");
-    let wal = Arc::new(WriteAheadLog::new(&wal_path).await?);
+    let wal = Arc::new(WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Kv));
     let vlog_path = dir.join("vlog.log");
     let vlog = Arc::new(VLog::new(&vlog_path).await?);
     let file_manager = Arc::new(FileManager::new(dir).await?);
@@ -58,10 +62,10 @@ async fn open_engine(dir: &Path, config: LsmEngineConfig) -> anyhow::Result<LsmS
 }
 
 /// Like [`open_engine`], but a slow/failed open becomes a labeled finding
-/// instead of a hang or an unwrap (spec kv/026 A2: engine errors from
-/// `new()` get the same no-panic treatment as a verify mismatch).
-async fn open_engine_or_finding(dir: &Path, label: &str) -> Result<LsmStorageEngine, String> {
-    match compio::time::timeout(OP_TIMEOUT,open_engine(dir, stress_engine_config())).await {
+/// instead of a hang or an unwrap: engine errors from `new()` get the same
+/// no-panic treatment as a verify mismatch.
+async fn open_engine_or_finding(dir: &Path, hub: &StorageHandle, label: &str) -> Result<LsmStorageEngine, String> {
+    match compio::time::timeout(OP_TIMEOUT,open_engine(dir, hub, stress_engine_config())).await {
         Ok(Ok(engine)) => Ok(engine),
         Ok(Err(e)) => Err(format!("{label}: reopen failed: {e}")),
         Err(_) => Err(format!("{label}: reopen did not complete within {OP_TIMEOUT:?}")),
@@ -190,6 +194,7 @@ async fn finish_cycle(
 async fn run_shutdown_cycle(
     engine: Arc<LsmStorageEngine>,
     dir: &Path,
+    hub: &StorageHandle,
     artifact_root: &Path,
     instance: usize,
     cycle: usize,
@@ -209,7 +214,7 @@ async fn run_shutdown_cycle(
         Err(e) => { findings.push(e); None }
     };
 
-    let new_engine = match open_engine_or_finding(dir, &label_base).await {
+    let new_engine = match open_engine_or_finding(dir, hub, &label_base).await {
         Ok(e) => Arc::new(e),
         Err(f) => {
             findings.push(f);
@@ -228,6 +233,7 @@ async fn run_shutdown_cycle(
 async fn run_drop_cycle(
     engine: LsmStorageEngine,
     dir: &Path,
+    hub: &StorageHandle,
     artifact_root: &Path,
     instance: usize,
     cycle: usize,
@@ -244,7 +250,7 @@ async fn run_drop_cycle(
         Err(e) => { findings.push(e); None }
     };
 
-    let new_engine = match open_engine_or_finding(dir, &label_base).await {
+    let new_engine = match open_engine_or_finding(dir, hub, &label_base).await {
         Ok(e) => e,
         Err(f) => {
             findings.push(f);
@@ -266,9 +272,10 @@ struct InstanceOutcome {
 /// then M drop-family cycles, all on the same TempDir.
 async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_count: usize) -> InstanceOutcome {
     let dir = TempDir::new().expect("tempdir for stress instance");
+    let (_hub, hub) = common::start_kv_hub(&dir.path().join("wal.log"));
     let mut findings = Vec::new();
 
-    match open_engine_or_finding(dir.path(), &format!("instance {instance} shutdown-init")).await {
+    match open_engine_or_finding(dir.path(), &hub, &format!("instance {instance} shutdown-init")).await {
         Ok(engine) => {
             let engine = Arc::new(engine);
             engine.start_background_tasks();
@@ -276,7 +283,7 @@ async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_cou
             for cycle in 0..m {
                 let Some(engine) = current.take() else { break };
                 let (next, cycle_findings) =
-                    run_shutdown_cycle(engine, dir.path(), &artifact_root, instance, cycle, key_count).await;
+                    run_shutdown_cycle(engine, dir.path(), &hub, &artifact_root, instance, cycle, key_count).await;
                 findings.extend(cycle_findings);
                 current = next;
             }
@@ -290,13 +297,13 @@ async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_cou
         Err(f) => findings.push(f),
     }
 
-    match open_engine_or_finding(dir.path(), &format!("instance {instance} drop-init")).await {
+    match open_engine_or_finding(dir.path(), &hub, &format!("instance {instance} drop-init")).await {
         Ok(engine) => {
             let mut current = Some(engine);
             for cycle in 0..m {
                 let Some(engine) = current.take() else { break };
                 let (next, cycle_findings) =
-                    run_drop_cycle(engine, dir.path(), &artifact_root, instance, cycle, key_count).await;
+                    run_drop_cycle(engine, dir.path(), &hub, &artifact_root, instance, cycle, key_count).await;
                 findings.extend(cycle_findings);
                 current = next;
             }
@@ -323,7 +330,8 @@ async fn run_background_loader(id: usize, stop: Arc<AtomicBool>) {
         compaction_check_interval_ms: 5,
         ..Default::default()
     };
-    let Ok(engine) = open_engine(dir.path(), config).await else { return };
+    let (_hub, hub) = common::start_kv_hub(&dir.path().join("wal.log"));
+    let Ok(engine) = open_engine(dir.path(), &hub, config).await else { return };
     let engine = Arc::new(engine);
     engine.start_background_tasks();
 
@@ -429,7 +437,8 @@ fn self_test_conserves_evidence_on_verify_mismatch() {
         let dir = TempDir::new().unwrap();
         let artifact_dir = TempDir::new().unwrap();
 
-        let engine = open_engine(dir.path(), stress_engine_config()).await.unwrap();
+        let (_hub, hub) = common::start_kv_hub(&dir.path().join("wal.log"));
+        let engine = open_engine(dir.path(), &hub, stress_engine_config()).await.unwrap();
         let key = b"self-test-key".to_vec();
         let value = b"self-test-value".to_vec();
         engine.put(&key, &value).await.unwrap();
@@ -438,7 +447,7 @@ fn self_test_conserves_evidence_on_verify_mismatch() {
 
         let s1 = snapshot(dir.path(), artifact_dir.path(), "self-test-S1").expect("S1 snapshot must succeed");
 
-        let new_engine = open_engine(dir.path(), stress_engine_config()).await.unwrap();
+        let new_engine = open_engine(dir.path(), &hub, stress_engine_config()).await.unwrap();
 
         // Deliberately wrong expected value (spec kv/026 §Tests 3) -- forces a
         // mismatch without corrupting real engine state. Must not panic: both

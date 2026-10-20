@@ -61,8 +61,10 @@ sstable_dir = "/var/lib/luradb/sstables"
 system_dir = "/var/lib/luradb/luradb_sys"
 
 [io_engine]
-# Runs the key-value engine's WAL and value-log I/O on a dedicated io_uring
-# thread; falls back to standard file I/O if that thread cannot start.
+# Registers I/O buffers with the storage engine thread's io_uring ring; not
+# used on the data path yet. The storage thread — a dedicated io_uring thread
+# that writes the write-ahead logs of all engines and batches concurrent writes
+# into one fsync per log — runs either way; the server does not start without it.
 enabled = false
 
 [multicore]

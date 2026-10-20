@@ -653,7 +653,7 @@ mod tests {
     /// Loopback dev mode (auth off), HTTP on an ephemeral port, backups on,
     /// JSON and relational engines off, two reader threads, every data path
     /// under `dir`.
-    fn test_config(dir: &Path) -> LuraConfig {
+    pub(super) fn test_config(dir: &Path) -> LuraConfig {
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let mut cfg = LuraConfig::default();
         cfg.server.port = 0;
@@ -663,6 +663,9 @@ mod tests {
         cfg.storage.sstable_dir = path("sstables");
         cfg.storage.system_dir = path("sys");
         cfg.json.enabled = false;
+        cfg.json.wal_path = path("json.wal");
+        cfg.json.vlog_path = path("json.vlog");
+        cfg.json.sstable_dir = path("json_sstables");
         cfg.rel.enabled = false;
         cfg.rel.wal_path = path("rel.wal");
         cfg.rel.vlog_path = path("rel.vlog");
@@ -962,6 +965,18 @@ mod tests {
             format!("{err:#}").contains("shard count changed (stored 2, configured 1) — run the shard migration tool"),
             "{err:#}"
         );
+        assert!(!dir.path().join("sstables").exists(), "no engine was opened");
+    }
+
+    // No engine runs without the storage thread: when it cannot open a
+    // write-ahead log, the start fails and says so.
+    #[test]
+    fn a_storage_thread_that_cannot_start_fails_the_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.storage.wal_path = dir.path().join("missing").join("luradb.wal").to_string_lossy().into_owned();
+        let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
+        assert!(format!("{err:#}").contains("the storage thread failed to start"), "{err:#}");
         assert!(!dir.path().join("sstables").exists(), "no engine was opened");
     }
 

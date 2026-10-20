@@ -13,7 +13,8 @@ use crate::{
         coop,
         disk_manager::DiskManager,
         io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID, WAL_LOGICAL_ID},
-        storage_thread::{self, StorageHandle, StorageThread, StorageThreadConfig},
+        storage_thread::{self, StorageHandle, StorageThread, StorageThreadConfig, WalTarget},
+        wal::WriteAheadLog,
     },
     engines::json::JsonEngine,
     engines::lsm::{
@@ -30,7 +31,8 @@ use crate::{
     storage::vlog::VLog,
     uds,
 };
-use std::path::Path;
+use anyhow::Context;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicBool, Arc};
 
 /// The booted engine side: the state both API routers are built from, the
@@ -51,7 +53,7 @@ pub(super) struct Teardown {
     system_store: Arc<LsmStorageEngine>,
     shm_manager: Option<Arc<ShmManager>>,
     buffer_pool: Arc<BufferPoolManager>,
-    storage_thread: Option<StorageThread>,
+    storage_thread: StorageThread,
     io_engine: Option<IoEngine>,
 }
 
@@ -98,41 +100,31 @@ fn build_engine_configs(
     (engine_config, compaction_config, janitor_config, domain_config, metrics)
 }
 
-// --- Storage thread (perf/005): dedicated OS thread driving a SQPOLL
-// io_uring ring. When io_engine.enabled it owns the WAL/VLog files and
-// performs their I/O; otherwise the local file paths in `bootstrap_engine`
-// stay in use.
-fn start_storage_thread(
-    cfg: &LuraConfig,
-    wal_path: &std::path::Path,
-    vlog_path: &std::path::Path,
-) -> (Option<StorageThread>, Option<StorageHandle>) {
-    let mut storage_thread: Option<StorageThread> = None;
-    let storage_handle: Option<StorageHandle> = if cfg.io_engine.enabled {
-        let st_config = StorageThreadConfig {
-            sqpoll_enabled: storage_thread::SQPOLL_ENABLED,
-            sqpoll_idle_ms: storage_thread::SQPOLL_IDLE_MS,
-            ring_depth: storage_thread::RING_DEPTH,
-            channel_capacity: storage_thread::REQUEST_CHANNEL_CAPACITY,
-            cpu: storage_thread::STORAGE_THREAD_CPU,
-        };
-        match StorageThread::new(st_config, wal_path.to_path_buf(), vlog_path.to_path_buf()) {
-            Ok((st, handle)) => {
-                storage_thread = Some(st);
-                Some(handle)
-            }
-            Err(e) => {
-                tracing::warn!("Storage thread disabled: {e}. Falling back to local file I/O.");
-                None
-            }
-        }
-    } else {
-        None
+// --- Storage hub: dedicated OS thread driving a SQPOLL io_uring ring. It
+// owns the WAL file of every enabled engine and writes them all; no engine
+// runs without it.
+fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageThread, StorageHandle)> {
+    let st_config = StorageThreadConfig {
+        sqpoll_enabled: storage_thread::SQPOLL_ENABLED,
+        sqpoll_idle_ms: storage_thread::SQPOLL_IDLE_MS,
+        ring_depth: storage_thread::RING_DEPTH,
+        channel_capacity: storage_thread::REQUEST_CHANNEL_CAPACITY,
+        cpu: storage_thread::STORAGE_THREAD_CPU,
     };
-    (storage_thread, storage_handle)
+    let mut wals = vec![
+        (WalTarget::Kv, PathBuf::from(&cfg.storage.wal_path)),
+        (WalTarget::Sys, Path::new(&cfg.storage.system_dir).join(system::WAL_FILE)),
+    ];
+    if cfg.json.enabled {
+        wals.push((WalTarget::Json, PathBuf::from(&cfg.json.wal_path)));
+    }
+    if cfg.rel.enabled {
+        wals.push((WalTarget::Rel, PathBuf::from(&cfg.rel.wal_path)));
+    }
+    StorageThread::new(st_config, wals).context("the storage thread failed to start")
 }
 
-// --- IoEngine (spec perf/004) — scaffolding, not on the hot path yet ---
+// --- IoEngine — scaffolding, not on the hot path yet ---
 async fn init_io_engine(
     cfg: &LuraConfig,
     wal_path: &std::path::Path,
@@ -170,9 +162,14 @@ async fn init_io_engine(
 }
 
 // --- JSON engine (dedicated second LSM instance) ---
-async fn init_json_engine(cfg: &LuraConfig, metrics: &Arc<MetricsStore>) -> anyhow::Result<Option<Arc<JsonEngine>>> {
+async fn init_json_engine(
+    cfg: &LuraConfig,
+    hub: &StorageHandle,
+    metrics: &Arc<MetricsStore>,
+) -> anyhow::Result<Option<Arc<JsonEngine>>> {
     if cfg.json.enabled {
-        let engine = JsonEngine::bootstrap(&cfg.json, Arc::clone(metrics)).await?;
+        let wal = WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Json);
+        let engine = JsonEngine::bootstrap_with_wal(&cfg.json, wal, Arc::clone(metrics)).await?;
         tracing::info!("JSON engine ready.");
         Ok(Some(engine))
     } else {
@@ -184,6 +181,7 @@ async fn init_json_engine(cfg: &LuraConfig, metrics: &Arc<MetricsStore>) -> anyh
 // --- Relational engine (dedicated third LSM instance) ---
 async fn init_rel_engine(
     cfg: &LuraConfig,
+    hub: &StorageHandle,
     registry: &Arc<DomainRegistry>,
     json_engine: &Option<Arc<JsonEngine>>,
     metrics: &Arc<MetricsStore>,
@@ -196,7 +194,8 @@ async fn init_rel_engine(
             json_engine.clone(),
             Arc::clone(metrics),
         );
-        let engine = RelEngine::bootstrap(&cfg.rel, Arc::clone(metrics), resolver).await?;
+        let wal = WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Rel);
+        let engine = RelEngine::bootstrap_with_wal(&cfg.rel, wal, Arc::clone(metrics), resolver).await?;
         tracing::info!("Relational engine ready.");
         Ok(Some(engine))
     } else {
@@ -461,9 +460,17 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
     let (engine_config, compaction_config, janitor_config, domain_config, metrics) =
         build_engine_configs(config);
 
+    // --- Storage hub --- before every engine: it writes all their WALs. The
+    // system store's directory must exist before the hub opens its WAL there.
+    compio::fs::create_dir_all(&config.storage.system_dir)
+        .await
+        .with_context(|| format!("create storage.system_dir {}", config.storage.system_dir))?;
+    let (storage_thread, hub) = start_storage_thread(config)?;
+
     // --- System store --- before the engines: data laid out for another
     // shard count must not be opened at all.
-    let system_store = system::open(Path::new(&config.storage.system_dir)).await?;
+    let system_wal = WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Sys);
+    let system_store = system::open_with_wal(Path::new(&config.storage.system_dir), system_wal).await?;
     system::check_shard_count(&system_store, system::CONFIGURED_SHARDS).await?;
     tracing::info!("System store ready.");
 
@@ -471,19 +478,11 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
     let disk_manager = DiskManager::new(&config.storage.db_path).await?;
     let buffer_pool = Arc::new(BufferPoolManager::new(config.buffer_pool.pool_size, disk_manager));
 
-    let wal_path = std::path::PathBuf::from(&config.storage.wal_path);
-    let vlog_path = std::path::PathBuf::from(&config.storage.vlog_path);
+    let wal_path = PathBuf::from(&config.storage.wal_path);
+    let vlog_path = PathBuf::from(&config.storage.vlog_path);
 
-    let (storage_thread, storage_handle) = start_storage_thread(config, &wal_path, &vlog_path);
-
-    let wal = Arc::new(match &storage_handle {
-        Some(handle) => crate::core::wal::WriteAheadLog::with_storage_handle(handle.clone()),
-        None => crate::core::wal::WriteAheadLog::new(&config.storage.wal_path).await?,
-    });
-    let vlog = Arc::new(match &storage_handle {
-        Some(handle) => VLog::with_storage_handle(&vlog_path, handle.clone(), 1)?,
-        None => VLog::new(&config.storage.vlog_path).await?,
-    });
+    let wal = Arc::new(WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Kv));
+    let vlog = Arc::new(VLog::new(&vlog_path).await?);
     let file_manager =
         Arc::new(crate::storage::file_manager::FileManager::new(&config.storage.sstable_dir).await?);
     let manifest_manager =
@@ -491,7 +490,7 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
 
     let mut io_engine = init_io_engine(config, &wal_path, &vlog_path).await;
 
-    let mut lsm_engine = LsmStorageEngine::new(
+    let lsm_engine = LsmStorageEngine::new(
         wal,
         wal_path,
         vlog,
@@ -506,16 +505,6 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
         },
     )
     .await?;
-    // perf/005: route SSTable-flush writes through the storage thread and
-    // let the Janitor reopen the VLog through it after GC.
-    if let Some(handle) = &storage_handle {
-        lsm_engine.set_storage_handle(handle.clone());
-        // perf/013: if recovery found an active generation > 1, point the
-        // thread at it too instead of leaving it on generation 1 until
-        // the next GC cycle. Safe here: `LsmStorageEngine::new` above
-        // already awaited WAL recovery to completion.
-        lsm_engine.route_active_vlog_to_thread(handle).await?;
-    }
     let lsm_store = Arc::new(lsm_engine);
     if let Some(engine) = io_engine.as_mut() {
         lsm_store.register_sstables_with_io_engine(engine).await?;
@@ -532,8 +521,8 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
     );
     tracing::info!("Domain registry recovered.");
 
-    let json_engine = init_json_engine(config, &metrics).await?;
-    let rel_engine = init_rel_engine(config, &registry, &json_engine, &metrics).await?;
+    let json_engine = init_json_engine(config, &hub, &metrics).await?;
+    let rel_engine = init_rel_engine(config, &hub, &registry, &json_engine, &metrics).await?;
 
     // --- Auth cache --- on the system store, after the auth move above.
     let auth_cache = Arc::new(AuthCache::new(Arc::clone(&system_store)));
@@ -625,7 +614,7 @@ pub(super) async fn graceful_shutdown(teardown: Teardown) {
         system_store,
         shm_manager,
         buffer_pool,
-        storage_thread,
+        mut storage_thread,
         io_engine,
     } = teardown;
 
@@ -663,17 +652,79 @@ pub(super) async fn graceful_shutdown(teardown: Teardown) {
         tracing::error!("Failed to flush pages: {}", e);
     }
 
-    // Storage thread last: the engine flush above still routed WAL/VLog I/O
+    // Storage thread last: the engine shutdowns above still wrote their WALs
     // through it. Drains pending requests, then joins.
-    if let Some(mut st) = storage_thread {
-        tracing::info!("Shutting down storage thread...");
-        st.shutdown();
-        tracing::info!("Storage thread shutdown complete.");
-    }
+    tracing::info!("Shutting down storage thread...");
+    storage_thread.shutdown();
+    tracing::info!("Storage thread shutdown complete.");
 
     // Registered buffers and files stay alive for the whole run; this drop
     // closes their descriptors (a blocking `close(2)` each).
     drop(io_engine);
 
     tracing::info!("Shutdown complete.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::engine_runtime;
+
+    // With the IoEngine on or off, the storage hub runs and every engine's
+    // WAL goes through it: each engine writes while the hub runs and none
+    // once it has stopped.
+    #[test]
+    fn every_engine_writes_its_wal_through_the_storage_hub() {
+        for io_engine in [false, true] {
+            engine_runtime::block_on(async {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut cfg = super::super::tests::test_config(dir.path());
+                cfg.io_engine.enabled = io_engine;
+                cfg.json.enabled = true;
+                cfg.rel.enabled = true;
+                let mut engine = bootstrap_engine(&Arc::new(cfg), &dir.path().join("luradb.toml")).await.unwrap();
+                // Switched on, the IoEngine may still be absent: its registered
+                // buffers need lockable memory a test host does not guarantee,
+                // and starting without them is the intended fallback.
+                if !io_engine {
+                    assert!(engine.teardown.io_engine.is_none());
+                }
+
+                let teardown = &mut engine.teardown;
+                let json = teardown.json_engine.clone().expect("JSON engine enabled");
+                let rel = teardown.rel_engine.clone().expect("relational engine enabled");
+                let stores = [
+                    ("kv", Arc::clone(&teardown.lsm_store)),
+                    ("json", Arc::clone(json.engine())),
+                    ("rel", Arc::clone(rel.engine())),
+                    ("sys", Arc::clone(&teardown.system_store)),
+                ];
+                for (name, store) in &stores {
+                    store.put(b"hub-probe", b"before").await.unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+                teardown.storage_thread.shutdown();
+                for (name, store) in &stores {
+                    assert!(store.put(b"hub-probe", b"after").await.is_err(), "{name} wrote without the hub");
+                }
+                graceful_shutdown(engine.teardown).await;
+            })
+        }
+    }
+
+    // The hub opens a WAL for the enabled engines only: with JSON and
+    // relational off, no file of theirs appears.
+    #[test]
+    fn disabled_engines_get_no_write_ahead_log() {
+        engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = Arc::new(super::super::tests::test_config(dir.path()));
+            let engine = bootstrap_engine(&config, &dir.path().join("luradb.toml")).await.unwrap();
+
+            assert!(Path::new(&config.storage.wal_path).is_file());
+            assert!(Path::new(&config.storage.system_dir).join(system::WAL_FILE).is_file());
+            assert!(!Path::new(&config.json.wal_path).exists());
+            assert!(!Path::new(&config.rel.wal_path).exists());
+            graceful_shutdown(engine.teardown).await;
+        })
+    }
 }

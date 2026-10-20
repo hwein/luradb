@@ -12,7 +12,10 @@
 //! publish onto that buffer goes through again, (c) the bytes the child read
 //! match the published snapshot exactly.
 
+mod common;
+
 use luradb::config::ShmConfig;
+use luradb::core::storage_thread::{StorageThread, WalTarget};
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::domain::{DomainConfig, DomainRegistry};
 use luradb::engines::lsm::engine::LsmEngineOptions;
@@ -83,7 +86,7 @@ fn shm_reader_liveness_across_processes() {
             )
         };
 
-        let (registry, _db_dir) = make_registry().await;
+        let (registry, _hub, _db_dir) = make_registry().await;
         let listener = prepare_registration_socket(&sock.to_string_lossy()).expect("registration socket");
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -146,10 +149,12 @@ fn shm_config(instance_id: &str, sock: &Path) -> ShmConfig {
     }
 }
 
-async fn make_registry() -> (Arc<DomainRegistry>, tempfile::TempDir) {
+/// A key-value registry on a fresh store, with the storage hub that writes its WAL.
+async fn make_registry() -> (Arc<DomainRegistry>, StorageThread, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let wal_path = dir.path().join("wal.log");
-    let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+    let (hub, handle) = common::start_kv_hub(&wal_path);
+    let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));
     let vlog_path = dir.path().join("vlog.log");
     let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
     let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
@@ -170,7 +175,7 @@ async fn make_registry() -> (Arc<DomainRegistry>, tempfile::TempDir) {
     let metrics = MetricsStore::new(MetricsConfig::default());
     let registry =
         Arc::new(DomainRegistry::recover(engine, DomainConfig::default(), metrics).await.unwrap());
-    (registry, dir)
+    (registry, hub, dir)
 }
 
 /// Kills the child on drop, so a failing assertion cannot leak the process.

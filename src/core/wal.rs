@@ -1,8 +1,13 @@
-use crate::core::storage_thread::StorageHandle;
+use crate::core::storage_thread::{StorageHandle, WalTarget};
 use std::path::Path;
 use thiserror::Error;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::fs::File;
+#[cfg(test)]
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+#[cfg(test)]
 use tokio::sync::{mpsc, oneshot};
 
 /// Hard ceiling on any single length-prefixed WAL field (a key or a value)
@@ -144,6 +149,7 @@ fn field_too_long_error(len: usize) -> WalError {
     ))
 }
 
+#[cfg(test)]
 enum CommitRequest {
     Append {
         data: Vec<u8>,
@@ -156,12 +162,14 @@ enum CommitRequest {
 
 /// A Write-Ahead Log with Group Commit for high-throughput durability.
 ///
-/// `Local` runs the tokio::fs committer (default). `Remote` forwards all I/O to
-/// the perf/005 storage thread, which does the write + fdatasync on its io_uring
-/// ring. `append`'s empty-input shortcut is identical in both modes.
+/// `Remote` hands all I/O to the storage hub, which writes and fdatasyncs
+/// `engine`'s file on its io_uring ring. `Local` (tests only) runs a tokio::fs
+/// committer task with the same semantics: one writer per file, one fsync per
+/// group. `append`'s empty-input shortcut is identical in both modes.
 enum WalMode {
+    #[cfg(test)]
     Local(mpsc::Sender<CommitRequest>),
-    Remote(StorageHandle),
+    Remote { handle: StorageHandle, engine: WalTarget },
 }
 
 pub struct WriteAheadLog {
@@ -169,8 +177,9 @@ pub struct WriteAheadLog {
 }
 
 impl WriteAheadLog {
-    /// Creates a new WAL or opens an existing one at the given path (tokio::fs
-    /// committer path — unchanged when the storage thread is disabled).
+    /// Tests only: creates a new WAL or opens an existing one at the given
+    /// path, written by a local committer task instead of the storage hub.
+    #[cfg(test)]
     pub async fn new(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -189,10 +198,10 @@ impl WriteAheadLog {
         Ok(Self { inner: WalMode::Local(sender) })
     }
 
-    /// Routes all WAL I/O through the perf/005 storage thread. The thread owns
-    /// the WAL file; this WAL keeps no file handle of its own.
-    pub fn with_storage_handle(handle: StorageHandle) -> Self {
-        Self { inner: WalMode::Remote(handle) }
+    /// Routes all I/O of `engine`'s WAL through the storage hub. The hub owns
+    /// the file; this WAL keeps no file handle of its own.
+    pub fn with_storage_handle(handle: StorageHandle, engine: WalTarget) -> Self {
+        Self { inner: WalMode::Remote { handle, engine } }
     }
 
     /// Appends a new entry to the WAL and waits for it to be durably flushed.
@@ -205,6 +214,7 @@ impl WriteAheadLog {
         }
 
         match &self.inner {
+            #[cfg(test)]
             WalMode::Local(sender) => {
                 let (tx, rx) = oneshot::channel();
                 sender
@@ -213,7 +223,9 @@ impl WriteAheadLog {
                     .map_err(|_| broken_pipe_error())?;
                 rx.await.map_err(|_| broken_pipe_error())?
             }
-            WalMode::Remote(handle) => handle.wal_append(data.to_vec()).await.map_err(wal_remote_err),
+            WalMode::Remote { handle, engine } => {
+                handle.wal_append(*engine, data.to_vec()).await.map_err(wal_remote_err)
+            }
         }
     }
 
@@ -223,6 +235,7 @@ impl WriteAheadLog {
     /// recovered from the WAL at startup.
     pub async fn truncate(&self) -> Result<(), WalError> {
         match &self.inner {
+            #[cfg(test)]
             WalMode::Local(sender) => {
                 let (tx, rx) = oneshot::channel();
                 sender
@@ -231,7 +244,7 @@ impl WriteAheadLog {
                     .map_err(|_| broken_pipe_error())?;
                 rx.await.map_err(|_| broken_pipe_error())?
             }
-            WalMode::Remote(handle) => handle.wal_truncate().await.map_err(wal_remote_err),
+            WalMode::Remote { handle, engine } => handle.wal_truncate(*engine).await.map_err(wal_remote_err),
         }
     }
 }
@@ -241,6 +254,7 @@ fn wal_remote_err(e: anyhow::Error) -> WalError {
     WalError::Io(std::io::Error::other(e.to_string()))
 }
 
+#[cfg(test)]
 fn broken_pipe_error() -> WalError {
     WalError::Io(std::io::Error::new(
         std::io::ErrorKind::BrokenPipe,
@@ -248,9 +262,11 @@ fn broken_pipe_error() -> WalError {
     ))
 }
 
+#[cfg(test)]
 type AppendResponder = oneshot::Sender<Result<u64, WalError>>;
 
 /// Background task: drains the commit queue and batches writes into a single fsync per group.
+#[cfg(test)]
 async fn run_committer(
     mut file: File,
     mut offset: u64,
@@ -274,6 +290,7 @@ async fn run_committer(
     }
 }
 
+#[cfg(test)]
 async fn commit_append_group(
     file: &mut File,
     offset: &mut u64,
@@ -343,6 +360,7 @@ async fn commit_append_group(
     }
 }
 
+#[cfg(test)]
 async fn do_truncate(file: &mut File, offset: &mut u64) -> Result<(), WalError> {
     file.set_len(0).await?;
     file.seek(std::io::SeekFrom::Start(0)).await?;

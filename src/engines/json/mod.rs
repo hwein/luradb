@@ -89,12 +89,25 @@ pub struct JsonEngine {
 }
 
 impl JsonEngine {
-    /// Creates the dedicated JSON LSM instance from `config` and starts its
-    /// background tasks (flush, compaction, janitor).
+    /// Tests only: [`Self::bootstrap_with_wal`] on a local WAL committer
+    /// instead of the storage hub.
+    #[cfg(test)]
     pub async fn bootstrap(config: &JsonStoreConfig, metrics: Arc<MetricsStore>) -> Result<Arc<Self>> {
+        let wal = WriteAheadLog::new(&config.wal_path).await?;
+        Self::bootstrap_with_wal(config, wal, metrics).await
+    }
+
+    /// Creates the dedicated JSON LSM instance from `config`, with `wal` as
+    /// the log at `config.wal_path`, and starts its background tasks (flush,
+    /// compaction, janitor).
+    pub async fn bootstrap_with_wal(
+        config: &JsonStoreConfig,
+        wal: WriteAheadLog,
+        metrics: Arc<MetricsStore>,
+    ) -> Result<Arc<Self>> {
         let wal_path = PathBuf::from(&config.wal_path);
         let vlog_path = PathBuf::from(&config.vlog_path);
-        let wal = Arc::new(WriteAheadLog::new(&wal_path).await?);
+        let wal = Arc::new(wal);
         let vlog = Arc::new(VLog::new(&vlog_path).await?);
         let file_manager = Arc::new(FileManager::new(&config.sstable_dir).await?);
         let manifest_manager = Arc::new(ManifestManager::new(&config.sstable_dir));
@@ -601,19 +614,39 @@ fn check_preconditions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::storage_thread::{TestHub, WalTarget};
     use serde_json::json;
 
-    async fn make_engine() -> (Arc<JsonEngine>, tempfile::TempDir) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+    fn config_in(dir: &std::path::Path) -> JsonStoreConfig {
+        JsonStoreConfig {
+            wal_path: dir.join("json.wal").to_string_lossy().into_owned(),
+            vlog_path: dir.join("json.vlog").to_string_lossy().into_owned(),
+            sstable_dir: dir.join("json_sstables").to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
-        };
+        }
+    }
+
+    /// Bootstraps on `config`; with `on_hub` a fresh storage hub writes the WAL.
+    async fn bootstrap_on(config: &JsonStoreConfig, on_hub: bool) -> (Arc<JsonEngine>, Option<TestHub>) {
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-        let engine = JsonEngine::bootstrap(&config, metrics).await.unwrap();
+        if !on_hub {
+            return (JsonEngine::bootstrap(config, metrics).await.unwrap(), None);
+        }
+        let hub = TestHub::start(&[(WalTarget::Json, std::path::Path::new(&config.wal_path))]);
+        let engine = JsonEngine::bootstrap_with_wal(config, hub.wal(WalTarget::Json), metrics).await.unwrap();
+        (engine, Some(hub))
+    }
+
+    async fn make_engine() -> (Arc<JsonEngine>, tempfile::TempDir) {
+        let (engine, _, dir) = make_engine_on(false).await;
         (engine, dir)
+    }
+
+    /// [`make_engine`]; with `on_hub` a running storage hub writes the WAL.
+    async fn make_engine_on(on_hub: bool) -> (Arc<JsonEngine>, Option<TestHub>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, hub) = bootstrap_on(&config_in(dir.path()), on_hub).await;
+        (engine, hub, dir)
     }
 
     // 1. Bootstrap creates a working second LSM instance (put/get roundtrip).
@@ -653,19 +686,22 @@ mod tests {
         })
     }
 
-    // 3. create_document → get_document returns identical content.
+    // 3. create_document → get_document returns identical content, with the
+    //    WAL local and on the storage hub.
     #[test]
     fn test_create_then_get_roundtrip() {
         crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            json.create_domain("people").await.unwrap();
-            let content = json!({"name": "Ada", "tags": ["a", "b"], "age": 42});
-            let doc = json.create_document("people", content.clone()).await.unwrap();
-            assert_eq!(doc.version, 1);
-            let fetched = json.get_document("people", &doc.key).await.unwrap().unwrap();
-            assert_eq!(fetched.content, content);
-            assert_eq!(fetched.version, 1);
-            assert_eq!(fetched.domain, "people");
+            for on_hub in [false, true] {
+                let (json, _hub, _dir) = make_engine_on(on_hub).await;
+                json.create_domain("people").await.unwrap();
+                let content = json!({"name": "Ada", "tags": ["a", "b"], "age": 42});
+                let doc = json.create_document("people", content.clone()).await.unwrap();
+                assert_eq!(doc.version, 1);
+                let fetched = json.get_document("people", &doc.key).await.unwrap().unwrap();
+                assert_eq!(fetched.content, content);
+                assert_eq!(fetched.version, 1);
+                assert_eq!(fetched.domain, "people");
+            }
         })
     }
 
@@ -703,29 +739,35 @@ mod tests {
         })
     }
 
-    // 6. put_document twice increments the version.
+    // 6. put_document twice increments the version, with the WAL local and
+    //    on the storage hub.
     #[test]
     fn test_put_twice_increments_version() {
         crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            let v1 = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
-            assert_eq!(v1.version, 1);
-            let v2 = json.put_document("default", "k", json!({"n": 2})).await.unwrap();
-            assert_eq!(v2.version, 2);
-            let fetched = json.get_document("default", "k").await.unwrap().unwrap();
-            assert_eq!(fetched.version, 2);
-            assert_eq!(fetched.content, json!({"n": 2}));
+            for on_hub in [false, true] {
+                let (json, _hub, _dir) = make_engine_on(on_hub).await;
+                let v1 = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
+                assert_eq!(v1.version, 1);
+                let v2 = json.put_document("default", "k", json!({"n": 2})).await.unwrap();
+                assert_eq!(v2.version, 2);
+                let fetched = json.get_document("default", "k").await.unwrap().unwrap();
+                assert_eq!(fetched.version, 2);
+                assert_eq!(fetched.content, json!({"n": 2}));
+            }
         })
     }
 
-    // 7. delete_document → get_document returns None.
+    // 7. delete_document → get_document returns None, with the WAL local and
+    //    on the storage hub.
     #[test]
     fn test_delete_then_get_none() {
         crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            json.put_document("default", "gone", json!({})).await.unwrap();
-            assert!(json.delete_document("default", "gone").await.unwrap());
-            assert!(json.get_document("default", "gone").await.unwrap().is_none());
+            for on_hub in [false, true] {
+                let (json, _hub, _dir) = make_engine_on(on_hub).await;
+                json.put_document("default", "gone", json!({})).await.unwrap();
+                assert!(json.delete_document("default", "gone").await.unwrap());
+                assert!(json.get_document("default", "gone").await.unwrap().is_none());
+            }
         })
     }
 
@@ -926,30 +968,49 @@ mod tests {
         })
     }
 
-    // 22. Index definitions survive an engine restart (recovery).
+    // 22. Index definitions survive an engine restart (recovery), with the
+    //     WAL local and on the storage hub.
     #[test]
     fn test_index_recovery_after_restart() {
         crate::core::engine_runtime::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let config = JsonStoreConfig {
-                wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-                vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-                sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
-                ..JsonStoreConfig::default()
-            };
-            {
-                let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-                let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
-                json.create_domain("persistent").await.unwrap();
-                json.create_index("persistent", "city", IndexFieldType::String).await.unwrap();
+            for on_hub in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let config = config_in(dir.path());
+                {
+                    let (json, _hub) = bootstrap_on(&config, on_hub).await;
+                    json.create_domain("persistent").await.unwrap();
+                    json.create_index("persistent", "city", IndexFieldType::String).await.unwrap();
+                    json.shutdown().await;
+                }
+                let (json, _hub) = bootstrap_on(&config, on_hub).await;
+                assert!(json.get_domain("persistent").is_some(), "domain must survive restart");
+                let defs = json.get_indexes("persistent").unwrap();
+                assert_eq!(defs.len(), 1);
+                assert_eq!(defs[0].field, "city");
                 json.shutdown().await;
             }
-            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-            let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
-            assert!(json.get_domain("persistent").is_some(), "domain must survive restart");
-            let defs = json.get_indexes("persistent").unwrap();
-            assert_eq!(defs.len(), 1);
-            assert_eq!(defs[0].field, "city");
+        })
+    }
+
+    // Writes of an engine that stopped without a shutdown -- no flush, no
+    // truncate -- come back from the WAL the storage hub wrote.
+    #[test]
+    fn test_unflushed_writes_come_back_from_the_hub_written_wal() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = config_in(dir.path());
+            let (json, hub) = bootstrap_on(&config, true).await;
+            json.create_domain("crash").await.unwrap();
+            json.put_document("crash", "doc", json!({"name": "clé ✓"})).await.unwrap();
+            json.engine().stop_background_tasks().await;
+            drop(json);
+            drop(hub);
+            assert!(std::fs::metadata(&config.wal_path).unwrap().len() > 0, "the writes are only in the WAL");
+
+            let (json, _hub) = bootstrap_on(&config, true).await;
+            assert!(json.get_domain("crash").is_some());
+            let doc = json.get_document("crash", "doc").await.unwrap().unwrap();
+            assert_eq!(doc.content, json!({"name": "clé ✓"}));
             json.shutdown().await;
         })
     }
@@ -1293,19 +1354,22 @@ mod tests {
         })
     }
 
-    // 24. Update replaces the stale index entry with the new one.
+    // 24. Update replaces the stale index entry with the new one, in one
+    //     batch, with the WAL local and on the storage hub.
     #[test]
     fn test_update_swaps_index_entry() {
         crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            json.create_index("default", "city", IndexFieldType::String).await.unwrap();
-            json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
-            json.put_document("default", "u1", json!({"city": "Berlin"})).await.unwrap();
-            let prefix = default_prefix(&json).await;
-            let old_idx = index::index_key(&prefix, "city", b"Essen", "u1");
-            let new_idx = index::index_key(&prefix, "city", b"Berlin", "u1");
-            assert!(json.engine().get(&old_idx).await.unwrap().is_none(), "stale entry must be gone");
-            assert!(json.engine().get(&new_idx).await.unwrap().is_some());
+            for on_hub in [false, true] {
+                let (json, _hub, _dir) = make_engine_on(on_hub).await;
+                json.create_index("default", "city", IndexFieldType::String).await.unwrap();
+                json.put_document("default", "u1", json!({"city": "Essen"})).await.unwrap();
+                json.put_document("default", "u1", json!({"city": "Berlin"})).await.unwrap();
+                let prefix = default_prefix(&json).await;
+                let old_idx = index::index_key(&prefix, "city", b"Essen", "u1");
+                let new_idx = index::index_key(&prefix, "city", b"Berlin", "u1");
+                assert!(json.engine().get(&old_idx).await.unwrap().is_none(), "stale entry must be gone");
+                assert!(json.engine().get(&new_idx).await.unwrap().is_some());
+            }
         })
     }
 

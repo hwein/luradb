@@ -32,6 +32,8 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING**: Requires Linux kernel 6.1 or newer; the server refuses to start on older kernels.
 - **BREAKING** API: a failed `If-Match` on a JSON document answers 412 instead of 409 (also for a missing document), every 412 carries the `ETag` of the current version, and `If-Match` may be combined with `If-None-Match: *` (If-Match is checked first).
 - Auth records move to the system store on first start (automatic, one-way; a downgrade needs a backup restore).
+- The storage thread always runs; all write-ahead logs (KV, JSON, relational, system) are written by it with shared group commit.
+- `io_engine.enabled` now only toggles registered buffers.
 
 ### Removed
 

@@ -22,7 +22,6 @@ use crate::engines::StorageEngine;
 use crate::core::coop::YieldEvery;
 use crate::core::events::{stream_epoch, Resume, SeqRing};
 use crate::core::io_engine::IoEngine;
-use crate::core::storage_thread::StorageHandle;
 use crate::core::wal::WriteAheadLog;
 use crate::storage::vlog::{discover_generations, generation_path, VLog, VLogError};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
@@ -403,10 +402,6 @@ pub struct LsmStorageEngine {
     /// counter into its background task.
     janitor_runs: Arc<AtomicU64>,
 
-    /// Storage thread handle (perf/005). When set, `flush_memtable` writes
-    /// SSTables through it and the Janitor reopens the VLog through it after GC.
-    storage_handle: Option<StorageHandle>,
-
     /// Notified after every MemTable flush — an extra tick of the SHM snapshot
     /// publisher (spec perf/009 §4) besides its interval.
     flush_notify: Arc<Notify>,
@@ -531,7 +526,6 @@ impl LsmStorageEngine {
             block_cache,
             compaction_runs: AtomicU64::new(0),
             janitor_runs: Arc::new(AtomicU64::new(0)),
-            storage_handle: None,
             flush_notify: Arc::new(Notify::new()),
             change_epoch: AtomicU64::new(0),
             in_flight_writes: Arc::new(tokio::sync::RwLock::new(())),
@@ -562,47 +556,6 @@ impl LsmStorageEngine {
         engine.wal.truncate().await?;
 
         Ok(engine)
-    }
-
-    /// Attaches the storage thread handle (perf/005). Call once at startup,
-    /// before the engine is wrapped in an `Arc` and shared.
-    pub fn set_storage_handle(&mut self, handle: StorageHandle) {
-        self.storage_handle = Some(handle);
-    }
-
-    /// Points the storage thread at the vLog generation that startup
-    /// discovered as active and swaps in a handle-backed `VLog` for it, so
-    /// its I/O takes the io_uring path instead of bypassing it until the
-    /// next GC cycle (spec perf/013). A no-op when the active generation is
-    /// already 1 — the thread already owns that file, since it always spawns
-    /// on the canonical path (see `main.rs`).
-    ///
-    /// Must run after `recover_from_wal` has completed; `LsmStorageEngine::new`
-    /// already awaits that internally, so calling this once `new` has
-    /// returned is always safe. Reopening earlier would race WAL recovery,
-    /// which still appends locally while the handle-backed `VLog` seeds its
-    /// cursor from the file length.
-    ///
-    /// The thread's single fd can back only one generation at a time, so
-    /// generation 1 — no longer thread-owned once this swap runs — is
-    /// reopened locally afterward; every other generation was already local
-    /// (`discover_vlog_generations` opens ids > 1 as local files).
-    pub async fn route_active_vlog_to_thread(&self, handle: &StorageHandle) -> Result<()> {
-        let active = Arc::clone(&self.version().active_vlog);
-        let id = active.id();
-        if id <= 1 {
-            return Ok(());
-        }
-        let path = active.path().to_path_buf();
-        handle.vlog_reopen(path.clone(), id).await?;
-        let routed = Arc::new(VLog::with_storage_handle(path, handle.clone(), id)?);
-        let gen1 = Arc::new(VLog::open(&self.vlog_path, 1).await?);
-        self.install(|v| {
-            let mut next = v.with_active_vlog(routed);
-            Arc::make_mut(&mut next.vlog).insert(1, gen1);
-            next
-        });
-        Ok(())
     }
 
     // ── Recovery ────────────────────────────────────────────────────────────
@@ -777,7 +730,6 @@ impl LsmStorageEngine {
             config,
             self.engine_config.use_mmap,
             Arc::clone(&self.shutdown),
-            self.storage_handle.clone(),
             Arc::clone(&self.janitor_runs),
             Some(flush_barrier),
             Some(Arc::clone(&self.flush_lock)),
@@ -884,24 +836,10 @@ impl LsmStorageEngine {
     /// "LSM engine shutdown complete." right after it only means the
     /// shutdown sequence ran to completion, not that the flush succeeded.
     pub async fn shutdown(&self) {
-        // 1. Signal: flag for cheap sync checks + watch send to wake any
-        // loop that is sleeping (M2) instead of leaving it to poll.
-        self.shutdown.store(true, Ordering::Relaxed);
-        let _ = self.shutdown_tx.send(true);
+        // Joined before touching MemTables/WAL below.
+        self.stop_background_tasks().await;
 
-        // 2. Join before touching MemTables/WAL below. The lock cannot be
-        // held across the awaits in the loop, so the handles are taken first.
-        let handles = {
-            let mut tasks = self.background_tasks.lock();
-            std::mem::take(&mut *tasks)
-        };
-        for handle in handles {
-            if let Err(e) = handle.await {
-                eprintln!("[Engine] Background task join error: {e}");
-            }
-        }
-
-        // 3. Only now is nothing left running concurrently (M1). A failed
+        // Only now is nothing left running concurrently. A failed
         // flush must not be followed by the truncate below — see doc comment.
         if let Err(e) = self.flush_all_memtables().await {
             eprintln!("[Engine] Shutdown flush error: {e}");
@@ -920,6 +858,27 @@ impl LsmStorageEngine {
         // the unnecessary MemTable-to-SSTable flush cycle.
         if let Err(e) = self.wal.truncate().await {
             eprintln!("[Engine] Shutdown WAL truncate error: {e}");
+        }
+    }
+
+    /// Signals the background tasks to stop and joins them, without the
+    /// flush and WAL truncate of [`Self::shutdown`].
+    pub(crate) async fn stop_background_tasks(&self) {
+        // Flag for cheap sync checks + watch send to wake any loop that is
+        // sleeping instead of leaving it to poll.
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.shutdown_tx.send(true);
+
+        // The lock cannot be held across the awaits in the loop, so the
+        // handles are taken first.
+        let handles = {
+            let mut tasks = self.background_tasks.lock();
+            std::mem::take(&mut *tasks)
+        };
+        for handle in handles {
+            if let Err(e) = handle.await {
+                eprintln!("[Engine] Background task join error: {e}");
+            }
         }
     }
 
@@ -1790,15 +1749,8 @@ impl LsmStorageEngine {
             hook.pause().await;
         }
 
-        // With the storage thread active, route the SSTable write through it
-        // (crash-safe temp + fsync + rename). Both writers hand the bytes
-        // back, so the non-mmap reader below needs no extra copy.
-        let sstable_data = match &self.storage_handle {
-            Some(handle) => {
-                handle.sstable_write(self.file_manager.file_path(file_id), sstable_data).await?
-            }
-            None => self.file_manager.write_sstable(file_id, sstable_data).await?,
-        };
+        // The bytes come back, so the non-mmap reader below needs no copy.
+        let sstable_data = self.file_manager.write_sstable(file_id, sstable_data).await?;
 
         let mut sstable = if self.engine_config.use_mmap {
             SSTableReader::open_mmap(&self.file_manager.file_path(file_id))?
@@ -2201,7 +2153,7 @@ impl StorageEngine for LsmStorageEngine {
 mod tests {
     use super::*;
     use crate::core::wal::WriteAheadLog;
-    use crate::core::storage_thread::{StorageThread, StorageThreadConfig};
+    use crate::core::storage_thread::{TestHub, WalTarget};
     use crate::storage::vlog::VLog;
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
@@ -2267,6 +2219,21 @@ mod tests {
         let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
         LsmStorageEngine::new(
             wal, wal_path, vlog, vlog_path, file_manager, manifest_manager,
+            LsmEngineOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// [`engine_on`] with the WAL at `<dir>/wal.log` written through `hub`.
+    async fn engine_on_hub(dir: &tempfile::TempDir, hub: &TestHub) -> LsmStorageEngine {
+        let wal_path = dir.path().join("wal.log");
+        let vlog_path = dir.path().join("vlog.log");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+        LsmStorageEngine::new(
+            Arc::new(hub.wal(WalTarget::Kv)), wal_path, vlog, vlog_path, file_manager, manifest_manager,
             LsmEngineOptions::default(),
         )
         .await
@@ -4508,12 +4475,11 @@ mod tests {
         })
     }
 
-    // Spec perf/013 test 3: startup with an active generation > 1 and a live
-    // storage thread repoints the thread at that generation instead of
-    // leaving it on the canonical file until the next GC. Generation 1 (no
-    // longer thread-owned) stays correctly readable through a local handle.
+    // Startup with an active generation > 1 and the WAL on the storage hub:
+    // appends go to that generation's file, after its existing bytes, and
+    // generation 1 stays readable.
     #[test]
-    fn test_startup_routes_active_generation_through_thread() {
+    fn test_startup_appends_to_an_active_generation_above_one() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let wal_path = dir.path().join("wal.log");
@@ -4521,52 +4487,49 @@ mod tests {
             std::fs::write(&vlog_path, b"generation-1").unwrap();
             std::fs::write(generation_path(&vlog_path, 2), b"generation-2").unwrap();
 
-            let st_config = StorageThreadConfig {
-                sqpoll_enabled: false,
-                sqpoll_idle_ms: 500,
-                ring_depth: 64,
-                channel_capacity: 64,
-                cpu: -1,
-            };
-            let (mut st, handle) =
-                StorageThread::new(st_config, wal_path.clone(), vlog_path.clone()).unwrap();
-
-            let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
-            let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
-            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
-            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
-            let engine = LsmStorageEngine::new(
-                wal,
-                wal_path,
-                vlog,
-                vlog_path,
-                file_manager,
-                manifest_manager,
-                LsmEngineOptions::default(),
-            )
-            .await
-            .unwrap();
-
-            // Before the repoint: version-only bookkeeping, thread still on gen 1.
-            assert_eq!(engine.version().active_vlog.id(), 2, "generation 2 is the highest on disk");
-
-            engine.route_active_vlog_to_thread(&handle).await.unwrap();
+            let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
+            let engine = engine_on_hub(&dir, &hub).await;
 
             let active = Arc::clone(&engine.version().active_vlog);
-            assert_eq!(active.id(), 2, "active reference is handle-backed generation 2");
+            assert_eq!(active.id(), 2, "generation 2 is the highest on disk");
             let off = active.append(b"-added").await.unwrap();
             assert_eq!(off, 12, "cursor seeded from generation 2's on-disk length");
-            assert_eq!(
-                std::fs::read(generation_path(&engine.vlog_path, 2)).unwrap(),
-                b"generation-2-added",
-                "the append routed through the thread into generation 2's file"
-            );
+            assert_eq!(std::fs::read(generation_path(&engine.vlog_path, 2)).unwrap(), b"generation-2-added");
             assert_eq!(active.read(off, 6).unwrap(), b"-added");
-
-            // Generation 1 is no longer thread-owned but stays correctly readable.
             assert_eq!(engine.version().vlog[&1].read(0, 12).unwrap(), b"generation-1");
 
-            st.shutdown();
+            let big = vec![b'g'; 4096];
+            engine.put(b"big", &big).await.unwrap();
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+            assert_eq!(std::fs::metadata(generation_path(&engine.vlog_path, 2)).unwrap().len(), 18 + 4096);
+        })
+    }
+
+    // Writes of an engine dropped without a shutdown -- no flush, no
+    // truncate -- come back from the WAL the storage hub wrote; the restart
+    // then flushes them and truncates the WAL through the hub.
+    #[test]
+    fn test_unflushed_writes_come_back_from_the_hub_written_wal() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal.log");
+            let big = vec![b'w'; 4096];
+            {
+                let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
+                let engine = engine_on_hub(&dir, &hub).await;
+                engine.put(b"small", "clé ✓".as_bytes()).await.unwrap();
+                engine.put(b"big", &big).await.unwrap();
+                engine.put(b"gone", b"x").await.unwrap();
+                engine.delete(b"gone").await.unwrap();
+            }
+            assert!(std::fs::metadata(&wal_path).unwrap().len() > 0, "the writes are only in the WAL");
+
+            let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
+            let engine = engine_on_hub(&dir, &hub).await;
+            assert_eq!(engine.get(b"small").await.unwrap(), Some("clé ✓".as_bytes().to_vec()));
+            assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
+            assert_eq!(engine.get(b"gone").await.unwrap(), None);
+            assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
         })
     }
 

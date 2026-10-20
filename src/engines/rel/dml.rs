@@ -1302,6 +1302,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 mod tests {
     use super::*;
     use crate::config::RelStoreConfig;
+    use crate::core::storage_thread::{TestHub, WalTarget};
     use crate::metrics::{MetricsConfig, MetricsStore};
     use serde_json::json;
     use std::path::Path;
@@ -1321,10 +1322,30 @@ mod tests {
         RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap()
     }
 
+    /// [`boot`]; with `on_hub` a fresh storage hub writes the WAL.
+    async fn boot_on(config: RelStoreConfig, on_hub: bool) -> (Arc<RelEngine>, Option<TestHub>) {
+        if !on_hub {
+            return (boot(config).await, None);
+        }
+        let hub = TestHub::start(&[(WalTarget::Rel, Path::new(&config.wal_path))]);
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let cross_engine = crate::engines::rel::CrossEngineResolver::disabled(Arc::clone(&metrics));
+        let wal = hub.wal(WalTarget::Rel);
+        let rel = RelEngine::bootstrap_with_wal(&config, wal, metrics, cross_engine).await.unwrap();
+        (rel, Some(hub))
+    }
+
     async fn make() -> (Arc<RelEngine>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let rel = boot(config_in(dir.path())).await;
         (rel, dir)
+    }
+
+    /// [`make`]; with `on_hub` a running storage hub writes the WAL.
+    async fn make_on(on_hub: bool) -> (Arc<RelEngine>, Option<TestHub>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (rel, hub) = boot_on(config_in(dir.path()), on_hub).await;
+        (rel, hub, dir)
     }
 
     async fn run(rel: &RelEngine, sql: &str, params: &[Value]) -> Result<ExecOutcome, RelStoreError> {
@@ -1385,66 +1406,98 @@ mod tests {
         rel.engine().scan_keys(&scan).await.unwrap().len()
     }
 
-    // 3. INSERT single row, then PK-point SELECT returns identical values.
+    // 3. INSERT single row, then PK-point SELECT returns identical values,
+    //    with the WAL local and on the storage hub.
     #[test]
     fn test_insert_and_pk_select() {
         crate::core::engine_runtime::block_on(async {
-            let (rel, _d) = make().await;
-            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)").await;
-            let r = dml(&rel, "INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)", &[]).await;
-            assert_eq!(r.affected, 1);
-            assert_eq!(r.last_pk, Some(ScalarValue::Integer(1)));
+            for on_hub in [false, true] {
+                let (rel, _hub, _d) = make_on(on_hub).await;
+                ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)").await;
+                let r = dml(&rel, "INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)", &[]).await;
+                assert_eq!(r.affected, 1);
+                assert_eq!(r.last_pk, Some(ScalarValue::Integer(1)));
 
-            let s = sel(&rel, "SELECT * FROM t WHERE id = ?", &[json!(1)]).await;
-            assert_eq!(s.rows.len(), 1);
-            assert_eq!(
-                s.rows[0],
-                vec![
-                    ScalarValue::Integer(1),
-                    ScalarValue::Text("alice".into()),
-                    ScalarValue::Integer(30)
-                ]
-            );
+                let s = sel(&rel, "SELECT * FROM t WHERE id = ?", &[json!(1)]).await;
+                assert_eq!(s.rows.len(), 1);
+                assert_eq!(
+                    s.rows[0],
+                    vec![
+                        ScalarValue::Integer(1),
+                        ScalarValue::Text("alice".into()),
+                        ScalarValue::Integer(30)
+                    ]
+                );
+            }
         })
     }
 
-    // 4. Multi-row INSERT is atomic: one bad row (missing link) leaves none.
+    // 4. Multi-row INSERT is atomic: one bad row (missing link) leaves none,
+    //    with the WAL local and on the storage hub.
     #[test]
     fn test_multi_row_insert_atomic() {
         crate::core::engine_runtime::block_on(async {
-            let (rel, _d) = make().await;
-            ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
-            ok(&rel, "INSERT INTO parent VALUES (1)").await;
-            ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
+            for on_hub in [false, true] {
+                let (rel, _hub, _d) = make_on(on_hub).await;
+                ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
+                ok(&rel, "INSERT INTO parent VALUES (1)").await;
+                ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
 
-            let e = err(&rel, "INSERT INTO child VALUES (1, 1), (2, 999)", &[]).await;
-            assert!(matches!(e, RelStoreError::LinkTargetMissing { .. }), "got: {e}");
-            assert_eq!(row_count(&rel, "child").await, 0, "no row of the statement survives");
+                let e = err(&rel, "INSERT INTO child VALUES (1, 1), (2, 999)", &[]).await;
+                assert!(matches!(e, RelStoreError::LinkTargetMissing { .. }), "got: {e}");
+                assert_eq!(row_count(&rel, "child").await, 0, "no row of the statement survives");
+            }
         })
     }
 
     // 5. AUTOINCREMENT: sequential; explicit larger PK lifts the sequence;
-    //    DELETE never lowers it; the high-water survives a restart.
+    //    DELETE never lowers it; the high-water survives a restart -- with
+    //    the WAL local and on the storage hub.
     #[test]
     fn test_autoincrement_and_recovery() {
         crate::core::engine_runtime::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let rel = boot(config_in(dir.path())).await;
-            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)").await;
-            assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (10)", &[]).await.last_pk, Some(ScalarValue::Integer(1)));
-            assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (20)", &[]).await.last_pk, Some(ScalarValue::Integer(2)));
-            ok(&rel, "INSERT INTO t (id, v) VALUES (100, 30)").await; // explicit lifts hw
-            assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (40)", &[]).await.last_pk, Some(ScalarValue::Integer(101)));
-            ok(&rel, "DELETE FROM t WHERE id = 101").await; // does not lower the sequence
-            assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (50)", &[]).await.last_pk, Some(ScalarValue::Integer(102)));
+            for on_hub in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let (rel, hub) = boot_on(config_in(dir.path()), on_hub).await;
+                ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)").await;
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (10)", &[]).await.last_pk, Some(ScalarValue::Integer(1)));
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (20)", &[]).await.last_pk, Some(ScalarValue::Integer(2)));
+                ok(&rel, "INSERT INTO t (id, v) VALUES (100, 30)").await; // explicit lifts hw
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (40)", &[]).await.last_pk, Some(ScalarValue::Integer(101)));
+                ok(&rel, "DELETE FROM t WHERE id = 101").await; // does not lower the sequence
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (50)", &[]).await.last_pk, Some(ScalarValue::Integer(102)));
 
+                rel.shutdown().await;
+                drop(hub);
+                let (rel, _hub) = boot_on(config_in(dir.path()), on_hub).await;
+                assert_eq!(
+                    dml(&rel, "INSERT INTO t (v) VALUES (60)", &[]).await.last_pk,
+                    Some(ScalarValue::Integer(103)),
+                    "the high-water must survive the restart"
+                );
+            }
+        })
+    }
+
+    // Writes of an engine that stopped without a shutdown -- no flush, no
+    // truncate -- come back from the WAL the storage hub wrote.
+    #[test]
+    fn test_unflushed_writes_come_back_from_the_hub_written_wal() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (rel, hub) = boot_on(config_in(dir.path()), true).await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 'clé ✓')").await;
+            rel.engine().stop_background_tasks().await;
+            drop(rel);
+            drop(hub);
+            let wal_len = std::fs::metadata(dir.path().join("rel.wal")).unwrap().len();
+            assert!(wal_len > 0, "the writes are only in the WAL");
+
+            let (rel, _hub) = boot_on(config_in(dir.path()), true).await;
+            let s = sel(&rel, "SELECT name FROM t WHERE id = 1", &[]).await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Text("clé ✓".into())]]);
             rel.shutdown().await;
-            let rel = boot(config_in(dir.path())).await;
-            assert_eq!(
-                dml(&rel, "INSERT INTO t (v) VALUES (60)", &[]).await.last_pk,
-                Some(ScalarValue::Integer(103)),
-                "the high-water must survive the restart"
-            );
         })
     }
 
@@ -1641,21 +1694,23 @@ mod tests {
     }
 
     // 16. Full-scan UPDATE/DELETE: only matching rows; affected correct; no
-    //     match → 0.
+    //     match → 0 -- with the WAL local and on the storage hub.
     #[test]
     fn test_full_scan_update_delete() {
         crate::core::engine_runtime::block_on(async {
-            let (rel, _d) = make().await;
-            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)").await;
-            ok(&rel, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)").await;
+            for on_hub in [false, true] {
+                let (rel, _hub, _d) = make_on(on_hub).await;
+                ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)").await;
+                ok(&rel, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)").await;
 
-            assert_eq!(dml(&rel, "UPDATE t SET v = 0 WHERE grp = 1", &[]).await.affected, 2);
-            assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(0));
-            assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 3", &[]).await.rows[0][0], ScalarValue::Integer(30));
+                assert_eq!(dml(&rel, "UPDATE t SET v = 0 WHERE grp = 1", &[]).await.affected, 2);
+                assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(0));
+                assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 3", &[]).await.rows[0][0], ScalarValue::Integer(30));
 
-            assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 2", &[]).await.affected, 1);
-            assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 9", &[]).await.affected, 0);
-            assert_eq!(row_count(&rel, "t").await, 2);
+                assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 2", &[]).await.affected, 1);
+                assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 9", &[]).await.affected, 0);
+                assert_eq!(row_count(&rel, "t").await, 2);
+            }
         })
     }
 

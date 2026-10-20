@@ -1,12 +1,13 @@
-//! Dedicated OS-thread storage I/O via a raw io_uring ring in SQPOLL mode (spec perf/005).
+//! The storage hub: a dedicated OS thread that writes the write-ahead log of
+//! every engine (key-value, JSON, relational, system) through a raw io_uring
+//! ring in SQPOLL mode, one group commit across all of them.
 //!
-//! Two separate "ring worlds" exist when the IoEngine is enabled: spec 004's
+//! Two separate "ring worlds" exist when the IoEngine is enabled:
 //! [`crate::core::io_engine::IoEngine`] (registered buffers, `!Send`, on the
 //! engine thread's ring) and this module's raw [`io_uring::IoUring`]
 //! (SQPOLL, owned exclusively by one `std::thread`). They cannot share buffers
-//! or file handles, so the SQPOLL ring is built and driven entirely here — the
-//! spec's "SQPOLL activation in io_engine.rs" lives here instead, because the
-//! engine thread's ring runs without SQPOLL.
+//! or file handles, so the SQPOLL ring is built and driven entirely here,
+//! because the engine thread's ring runs without SQPOLL.
 //!
 //! Engine tasks talk to the thread over a bounded `tokio::sync::mpsc` channel
 //! (async backpressure) and await the result over a tokio `oneshot`.
@@ -42,28 +43,21 @@ pub struct StorageThreadConfig {
     pub cpu: i32,
 }
 
+/// The engine a write-ahead log belongs to; the hub keeps one file per engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalTarget {
+    Kv,
+    Json,
+    Rel,
+    Sys,
+}
+
 /// An I/O request from an engine task to the storage thread.
 pub enum IoRequest {
-    /// Append bytes to the WAL and fdatasync before responding with the offset.
-    WalAppend { data: Vec<u8>, response: oneshot::Sender<Result<u64>> },
-    /// Reset the WAL to length 0.
-    WalTruncate { response: oneshot::Sender<Result<()>> },
-    /// Append bytes to the VLog; responds with `(offset, len)`. Rejected with
-    /// an `Err` if `expected_generation` does not match the generation the
-    /// thread currently has open (spec perf/013).
-    VlogAppend {
-        data: Vec<u8>,
-        expected_generation: u32,
-        response: oneshot::Sender<Result<(u64, usize)>>,
-    },
-    /// Write a complete SSTable to `path` (temp file + fsync + atomic rename).
-    /// Returns `data` back so a non-mmap flush can build the reader without a copy.
-    SstableWrite { path: PathBuf, data: Vec<u8>, response: oneshot::Sender<Result<Vec<u8>>> },
-    /// Reopen the VLog on `path` after GC: close the old fd, reset the offset
-    /// to the file length, refresh the fixed-file slot, and record
-    /// `generation` as the id now open (checked against by `VlogAppend`,
-    /// spec perf/013).
-    VlogReopen { path: PathBuf, generation: u32, response: oneshot::Sender<Result<()>> },
+    /// Append bytes to `engine`'s WAL and fdatasync before responding with the offset.
+    WalAppend { engine: WalTarget, data: Vec<u8>, response: oneshot::Sender<Result<u64>> },
+    /// Reset `engine`'s WAL to length 0.
+    WalTruncate { engine: WalTarget, response: oneshot::Sender<Result<()>> },
     /// Drain pending requests, then stop the thread.
     Shutdown,
 }
@@ -75,46 +69,19 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
-    pub async fn wal_append(&self, data: Vec<u8>) -> Result<u64> {
+    pub async fn wal_append(&self, engine: WalTarget, data: Vec<u8>) -> Result<u64> {
         let (tx, rx) = oneshot::channel();
         self.request_tx
-            .send(IoRequest::WalAppend { data, response: tx })
+            .send(IoRequest::WalAppend { engine, data, response: tx })
             .await
             .map_err(|_| anyhow!("storage thread shut down"))?;
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
     }
 
-    pub async fn wal_truncate(&self) -> Result<()> {
+    pub async fn wal_truncate(&self, engine: WalTarget) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.request_tx
-            .send(IoRequest::WalTruncate { response: tx })
-            .await
-            .map_err(|_| anyhow!("storage thread shut down"))?;
-        rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
-    }
-
-    pub async fn vlog_append(&self, data: Vec<u8>, expected_generation: u32) -> Result<(u64, usize)> {
-        let (tx, rx) = oneshot::channel();
-        self.request_tx
-            .send(IoRequest::VlogAppend { data, expected_generation, response: tx })
-            .await
-            .map_err(|_| anyhow!("storage thread shut down"))?;
-        rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
-    }
-
-    pub async fn sstable_write(&self, path: PathBuf, data: Vec<u8>) -> Result<Vec<u8>> {
-        let (tx, rx) = oneshot::channel();
-        self.request_tx
-            .send(IoRequest::SstableWrite { path, data, response: tx })
-            .await
-            .map_err(|_| anyhow!("storage thread shut down"))?;
-        rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
-    }
-
-    pub async fn vlog_reopen(&self, path: PathBuf, generation: u32) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.request_tx
-            .send(IoRequest::VlogReopen { path, generation, response: tx })
+            .send(IoRequest::WalTruncate { engine, response: tx })
             .await
             .map_err(|_| anyhow!("storage thread shut down"))?;
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
@@ -129,29 +96,27 @@ pub struct StorageThread {
 }
 
 impl StorageThread {
-    /// Spawns the storage thread, which builds its own SQPOLL ring and opens the
-    /// WAL and VLog. Blocks until the thread reports readiness (or an init error).
-    pub fn new(
-        config: StorageThreadConfig,
-        wal_path: PathBuf,
-        vlog_path: PathBuf,
-    ) -> Result<(Self, StorageHandle)> {
+    /// Spawns the storage thread, which builds its own SQPOLL ring and opens
+    /// one WAL file per engine in `wals`. Blocks until the thread reports
+    /// readiness (or an init error).
+    pub fn new(config: StorageThreadConfig, wals: Vec<(WalTarget, PathBuf)>) -> Result<(Self, StorageHandle)> {
         let (request_tx, request_rx) = mpsc::channel(config.channel_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool>>();
         let thread_shutdown = Arc::clone(&shutdown);
+        let wal_count = wals.len();
 
         let join_handle = std::thread::Builder::new()
             .name("luradb-storage".into())
             .spawn(move || {
-                storage_thread_main(config, wal_path, vlog_path, request_rx, thread_shutdown, ready_tx);
+                storage_thread_main(config, wals, request_rx, thread_shutdown, ready_tx);
             })
             .context("failed to spawn storage thread")?;
 
         match ready_rx.recv() {
             Ok(Ok(sqpoll_active)) => {
                 tracing::info!(
-                    "Storage thread ready (SQPOLL {}).",
+                    "Storage thread ready (SQPOLL {}, {wal_count} write-ahead logs).",
                     if sqpoll_active { "active" } else { "disabled" }
                 );
                 let handle = StorageHandle { request_tx: request_tx.clone() };
@@ -191,35 +156,45 @@ impl Drop for StorageThread {
 
 // ── Thread internals ────────────────────────────────────────────────────────
 
+/// One engine's WAL file and its append cursor.
+struct WalFile {
+    engine: WalTarget,
+    file: File,
+    offset: u64,
+}
+
+/// Totals the thread logs when it stops; appends per fdatasync is the
+/// average group-commit size.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HubStats {
+    appends: u64,
+    /// Batches with at least one append.
+    batches: u64,
+    fdatasyncs: u64,
+}
+
 struct StorageState {
     ring: IoUring,
-    wal: File,
-    wal_offset: u64,
-    vlog: File,
-    vlog_offset: u64,
-    /// Generation id of the currently open `vlog` file (spec perf/013);
-    /// starts at 1 (the thread always spawns on the canonical path) and is
-    /// updated by `VlogReopen`. Checked against `VlogAppend` so a caller
-    /// holding a stale generation gets a clean error instead of a write
-    /// into the wrong file.
-    vlog_generation: u32,
-    /// WAL and VLog are registered as fixed files (slots 0 and 1); `false` after
-    /// a failed `register_files` — ops then fall back to raw fds.
+    /// In the order given to [`StorageThread::new`]; a file's index is its
+    /// fixed-file slot.
+    wals: Vec<WalFile>,
+    /// `false` after a failed `register_files` — ops then fall back to raw fds.
     fixed_files: bool,
+    stats: HubStats,
 }
 
 impl StorageState {
-    fn wal_file(&self) -> RingFile {
-        if self.fixed_files { RingFile::Fixed(WAL_SLOT) } else { RingFile::Raw(self.wal.as_raw_fd()) }
+    fn wal_index(&self, engine: WalTarget) -> Result<usize> {
+        self.wals
+            .iter()
+            .position(|wal| wal.engine == engine)
+            .ok_or_else(|| anyhow!("the storage thread has no write-ahead log open for the {engine:?} engine"))
     }
-    fn vlog_file(&self) -> RingFile {
-        if self.fixed_files { RingFile::Fixed(VLOG_SLOT) } else { RingFile::Raw(self.vlog.as_raw_fd()) }
+
+    fn ring_file(&self, index: usize) -> RingFile {
+        if self.fixed_files { RingFile::Fixed(index as u32) } else { RingFile::Raw(self.wals[index].file.as_raw_fd()) }
     }
 }
-
-/// Fixed-file slot indices for the two long-lived files.
-const WAL_SLOT: u32 = 0;
-const VLOG_SLOT: u32 = 1;
 
 /// Target file for a ring op: a registered fixed-file slot, or a raw fd.
 #[derive(Clone, Copy)]
@@ -230,8 +205,7 @@ enum RingFile {
 
 fn storage_thread_main(
     config: StorageThreadConfig,
-    wal_path: PathBuf,
-    vlog_path: PathBuf,
+    wals: Vec<(WalTarget, PathBuf)>,
     mut request_rx: Receiver<IoRequest>,
     shutdown: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::Sender<Result<bool>>,
@@ -242,29 +216,7 @@ fn storage_thread_main(
         }
     }
 
-    let init = (|| -> Result<(StorageState, bool)> {
-        let (ring, sqpoll_active) =
-            build_ring(config.sqpoll_enabled, config.sqpoll_idle_ms, config.ring_depth)?;
-        let wal = open_rw(&wal_path)?;
-        let vlog = open_rw(&vlog_path)?;
-        let wal_offset = wal.metadata()?.len();
-        let vlog_offset = vlog.metadata()?.len();
-        // Register WAL/VLog once as fixed files so the kernel skips fd lookup per
-        // op; on failure fall back to raw fds.
-        let fixed_files = match ring.submitter().register_files(&[wal.as_raw_fd(), vlog.as_raw_fd()]) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("io_uring register_files failed: {e}; using raw fds");
-                false
-            }
-        };
-        Ok((
-            StorageState { ring, wal, wal_offset, vlog, vlog_offset, vlog_generation: 1, fixed_files },
-            sqpoll_active,
-        ))
-    })();
-
-    let mut state = match init {
+    let mut state = match open_state(&config, &wals) {
         Ok((state, sqpoll_active)) => {
             let _ = ready_tx.send(Ok(sqpoll_active));
             state
@@ -276,6 +228,31 @@ fn storage_thread_main(
     };
 
     event_loop(&mut state, &mut request_rx, &shutdown);
+    let HubStats { appends, batches, fdatasyncs } = state.stats;
+    tracing::info!("Storage thread stopped: {appends} WAL appends in {batches} batches, {fdatasyncs} fdatasyncs.");
+}
+
+/// Builds the ring and opens the WALs; returns the state and whether SQPOLL
+/// is active.
+fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Result<(StorageState, bool)> {
+    let (ring, sqpoll_active) = build_ring(config.sqpoll_enabled, config.sqpoll_idle_ms, config.ring_depth)?;
+    let mut files = Vec::with_capacity(wals.len());
+    for (engine, path) in wals {
+        let file = open_rw(path)?;
+        let offset = file.metadata()?.len();
+        files.push(WalFile { engine: *engine, file, offset });
+    }
+    // Register the WALs once as fixed files so the kernel skips the fd lookup
+    // per op; on failure fall back to raw fds.
+    let fds: Vec<RawFd> = files.iter().map(|wal| wal.file.as_raw_fd()).collect();
+    let fixed_files = match ring.submitter().register_files(&fds) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("io_uring register_files failed: {e}; using raw fds");
+            false
+        }
+    };
+    Ok((StorageState { ring, wals: files, fixed_files, stats: HubStats::default() }, sqpoll_active))
 }
 
 fn event_loop(state: &mut StorageState, rx: &mut Receiver<IoRequest>, shutdown: &AtomicBool) {
@@ -310,164 +287,109 @@ fn drain_remaining(state: &mut StorageState, rx: &mut Receiver<IoRequest>) {
     }
 }
 
-/// Processes a batch in order, coalescing consecutive WAL appends into a single
-/// write + one fdatasync (group commit). Returns `true` if a `Shutdown` was seen.
+/// Processes a batch in channel order. Each run of WAL appends is written
+/// with one write and one fdatasync per file (group commit across engines);
+/// only a truncate ends a run and runs at its place. Returns `true` if a
+/// `Shutdown` was seen.
 fn process_batch(state: &mut StorageState, batch: Vec<IoRequest>) -> bool {
     let mut stop = false;
-    let mut iter = batch.into_iter().peekable();
-    while let Some(req) = iter.next() {
-        match req {
+    let mut appended = false;
+    let mut run = Vec::new();
+    for request in batch {
+        match request {
             IoRequest::Shutdown => stop = true,
-            IoRequest::WalAppend { data, response } => {
-                let mut group = vec![(data, response)];
-                while matches!(iter.peek(), Some(IoRequest::WalAppend { .. })) {
-                    if let Some(IoRequest::WalAppend { data, response }) = iter.next() {
-                        group.push((data, response));
-                    }
-                }
-                do_wal_group(state, group);
+            IoRequest::WalAppend { engine, data, response } => {
+                run.push((engine, data, response));
+                appended = true;
             }
-            IoRequest::WalTruncate { response } => {
-                let _ = response.send(do_wal_truncate(state));
-            }
-            IoRequest::VlogAppend { data, expected_generation, response } => {
-                let _ = response.send(do_vlog_append(state, &data, expected_generation));
-            }
-            IoRequest::SstableWrite { path, data, response } => {
-                let result = do_sstable_write(state, &path, &data).map(|()| data);
-                let _ = response.send(result);
-            }
-            IoRequest::VlogReopen { path, generation, response } => {
-                let _ = response.send(do_vlog_reopen(state, &path, generation));
+            IoRequest::WalTruncate { engine, response } => {
+                commit_appends(state, std::mem::take(&mut run));
+                let _ = response.send(do_wal_truncate(state, engine));
             }
         }
+    }
+    commit_appends(state, run);
+    if appended {
+        state.stats.batches += 1;
     }
     stop
 }
 
-type WalGroup = Vec<(Vec<u8>, oneshot::Sender<Result<u64>>)>;
+/// One combined write of a batch to one WAL file.
+#[derive(Debug, PartialEq, Eq)]
+struct FileWrite {
+    engine: WalTarget,
+    /// The payloads for this file, concatenated in channel order.
+    data: Vec<u8>,
+    /// Per payload: its position in the batch and its offset within `data`.
+    parts: Vec<(usize, u64)>,
+}
 
-/// One combined write for the whole group, one fdatasync, then per-item offsets.
-/// Mirrors the group-commit durability of the tokio::fs WAL committer.
-fn do_wal_group(state: &mut StorageState, group: WalGroup) {
-    let start = state.wal_offset;
-    let mut combined = Vec::new();
-    let mut offsets = Vec::with_capacity(group.len());
-    for (data, _) in &group {
-        offsets.push(state.wal_offset);
-        state.wal_offset += data.len() as u64;
-        combined.extend_from_slice(data);
-    }
-
-    let wal = state.wal_file();
-    let result: Result<()> = (|| {
-        if !combined.is_empty() {
-            ring_write_all(&mut state.ring, wal, start, &combined)?;
-            ring_fsync(&mut state.ring, wal, true)?;
-        }
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            for ((_, response), offset) in group.into_iter().zip(offsets) {
-                let _ = response.send(Ok(offset));
+/// Plans a run of appends: one [`FileWrite`] per engine that has any, in the
+/// order the engines first appear.
+fn plan_batch<'a>(appends: impl IntoIterator<Item = (WalTarget, &'a [u8])>) -> Vec<FileWrite> {
+    let mut writes: Vec<FileWrite> = Vec::new();
+    for (position, (engine, payload)) in appends.into_iter().enumerate() {
+        let index = match writes.iter().position(|write| write.engine == engine) {
+            Some(index) => index,
+            None => {
+                writes.push(FileWrite { engine, data: Vec::new(), parts: Vec::new() });
+                writes.len() - 1
             }
+        };
+        let write = &mut writes[index];
+        write.parts.push((position, write.data.len() as u64));
+        write.data.extend_from_slice(payload);
+    }
+    writes
+}
+
+type Append = (WalTarget, Vec<u8>, oneshot::Sender<Result<u64>>);
+
+/// Writes a run of appends, one [`FileWrite`] per WAL file, and answers each
+/// request with the offset its payload landed at.
+fn commit_appends(state: &mut StorageState, run: Vec<Append>) {
+    state.stats.appends += run.len() as u64;
+    let writes = plan_batch(run.iter().map(|(engine, data, _)| (*engine, data.as_slice())));
+    let mut responses: Vec<_> = run.into_iter().map(|(_, _, response)| Some(response)).collect();
+    for write in writes {
+        let result = write_file(state, &write).map_err(|e| e.to_string());
+        for (position, offset) in write.parts {
+            let Some(response) = responses[position].take() else { continue };
+            let _ = response.send(match &result {
+                Ok(start) => Ok(start + offset),
+                Err(msg) => Err(anyhow!("WAL append failed: {msg}")),
+            });
         }
-        Err(e) => {
-            state.wal_offset = start; // rollback: nothing was durably written
-            let msg = e.to_string();
-            for (_, response) in group {
-                let _ = response.send(Err(anyhow!("WAL append failed: {msg}")));
-            }
-        }
     }
 }
 
-fn do_wal_truncate(state: &mut StorageState) -> Result<()> {
-    state.wal.set_len(0)?;
-    state.wal_offset = 0;
-    state.wal.sync_all()?;
+/// Appends `write` at the end of its file and fdatasyncs it; returns the
+/// offset it starts at. A failed write leaves the cursor where it was.
+fn write_file(state: &mut StorageState, write: &FileWrite) -> Result<u64> {
+    let index = state.wal_index(write.engine)?;
+    let file = state.ring_file(index);
+    let start = state.wals[index].offset;
+    if !write.data.is_empty() {
+        // At most one write per WAL file in flight: `ring_op` reaps every op
+        // before it returns, so the fdatasync and the file's next write are
+        // submitted only once this write has completed — each file gets its
+        // bytes in channel order.
+        ring_write_all(&mut state.ring, file, start, &write.data)?;
+        ring_fsync(&mut state.ring, file)?;
+        state.stats.fdatasyncs += 1;
+    }
+    state.wals[index].offset += write.data.len() as u64;
+    Ok(start)
+}
+
+fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
+    let index = state.wal_index(engine)?;
+    let wal = &mut state.wals[index];
+    wal.file.set_len(0)?;
+    wal.offset = 0;
+    wal.file.sync_all()?;
     Ok(())
-}
-
-/// Rejects a request made against any generation other than the one the
-/// thread currently has open — the one-fd write window becomes a clean
-/// `Err` instead of a silent write into the wrong file (spec perf/013).
-fn check_vlog_generation(state: &StorageState, expected: u32) -> Result<()> {
-    if expected != state.vlog_generation {
-        return Err(anyhow!(
-            "vLog generation mismatch: expected {expected}, thread has {}",
-            state.vlog_generation
-        ));
-    }
-    Ok(())
-}
-
-fn do_vlog_append(state: &mut StorageState, data: &[u8], expected_generation: u32) -> Result<(u64, usize)> {
-    check_vlog_generation(state, expected_generation)?;
-    if data.is_empty() {
-        return Ok((state.vlog_offset, 0));
-    }
-    let offset = state.vlog_offset;
-    let vlog = state.vlog_file();
-    ring_write_all(&mut state.ring, vlog, offset, data)?;
-    state.vlog_offset += data.len() as u64;
-    Ok((offset, data.len()))
-}
-
-/// Reopens the VLog on `path` after GC: swaps in the new fd (refreshing fixed
-/// slot 1 when registered), resets the write cursor to the file length, and
-/// records `generation` as the id now open (spec perf/013).
-fn do_vlog_reopen(state: &mut StorageState, path: &Path, generation: u32) -> Result<()> {
-    let new = open_rw(path)?;
-    let new_offset = new.metadata()?.len();
-    if state.fixed_files {
-        state
-            .ring
-            .submitter()
-            .register_files_update(VLOG_SLOT, &[new.as_raw_fd()])
-            .context("register_files_update VLog slot")?;
-    }
-    state.vlog = new; // drops the old fd (frees the stale GC'd inode)
-    state.vlog_offset = new_offset;
-    state.vlog_generation = generation;
-    Ok(())
-}
-
-/// Crash-safe SSTable install: write to `<path>.tmp`, full fsync, atomic rename.
-/// On any failure the temp file is removed so repeated errors don't accumulate
-/// `.tmp` leftovers.
-fn do_sstable_write(state: &mut StorageState, path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = sstable_tmp_path(path);
-    let result = install_sstable(state, &tmp, path, data);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
-fn install_sstable(state: &mut StorageState, tmp: &Path, path: &Path, data: &[u8]) -> Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp)
-        .with_context(|| format!("open temp sstable {}", tmp.display()))?;
-    // One-shot temp file: raw fd, not worth a fixed-file slot registration.
-    let file_ref = RingFile::Raw(file.as_raw_fd());
-    ring_write_all(&mut state.ring, file_ref, 0, data)?;
-    ring_fsync(&mut state.ring, file_ref, false)?;
-    drop(file);
-    std::fs::rename(tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-fn sstable_tmp_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".tmp");
-    PathBuf::from(s)
 }
 
 // ── Raw io_uring helpers (single op, submit_and_wait) ────────────────────────
@@ -545,9 +467,9 @@ fn write_entry(file: RingFile, ptr: *const u8, len: u32, offset: u64) -> squeue:
     }
 }
 
-/// Builds an Fsync SQE for either a fixed-file slot or a raw fd.
-fn fsync_entry(file: RingFile, datasync: bool) -> squeue::Entry {
-    let flags = if datasync { types::FsyncFlags::DATASYNC } else { types::FsyncFlags::empty() };
+/// Builds an fdatasync SQE for either a fixed-file slot or a raw fd.
+fn fsync_entry(file: RingFile) -> squeue::Entry {
+    let flags = types::FsyncFlags::DATASYNC;
     match file {
         RingFile::Fixed(i) => opcode::Fsync::new(types::Fixed(i)).flags(flags).build(),
         RingFile::Raw(fd) => opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
@@ -572,9 +494,9 @@ fn ring_write_all(ring: &mut IoUring, file: RingFile, mut offset: u64, data: &[u
     Ok(())
 }
 
-/// `datasync = true` -> fdatasync, else a full fsync.
-fn ring_fsync(ring: &mut IoUring, file: RingFile, datasync: bool) -> std::io::Result<()> {
-    let res = ring_op(ring, fsync_entry(file, datasync))?;
+/// fdatasync on `file`; the WAL needs no metadata sync.
+fn ring_fsync(ring: &mut IoUring, file: RingFile) -> std::io::Result<()> {
+    let res = ring_op(ring, fsync_entry(file))?;
     if res < 0 {
         return Err(std::io::Error::from_raw_os_error(-res));
     }
@@ -613,15 +535,54 @@ fn pin_to_cpu(cpu: i32) -> Result<()> {
     Ok(())
 }
 
+/// Test helper: a running hub over the WAL files it is given, handing out the
+/// matching [`WriteAheadLog`](crate::core::wal::WriteAheadLog)s. Dropping it
+/// drains and stops the hub.
+#[cfg(test)]
+pub(crate) struct TestHub {
+    thread: StorageThread,
+    handle: StorageHandle,
+}
+
+#[cfg(test)]
+impl TestHub {
+    pub(crate) fn start(wals: &[(WalTarget, &Path)]) -> Self {
+        let config = StorageThreadConfig {
+            sqpoll_enabled: false,
+            sqpoll_idle_ms: SQPOLL_IDLE_MS,
+            ring_depth: RING_DEPTH,
+            channel_capacity: REQUEST_CHANNEL_CAPACITY,
+            cpu: STORAGE_THREAD_CPU,
+        };
+        let wals = wals.iter().map(|(engine, path)| (*engine, path.to_path_buf())).collect();
+        let (thread, handle) = StorageThread::new(config, wals).expect("test storage hub");
+        Self { thread, handle }
+    }
+
+    /// `engine`'s WAL, written through this hub.
+    pub(crate) fn wal(&self, engine: WalTarget) -> crate::core::wal::WriteAheadLog {
+        crate::core::wal::WriteAheadLog::with_storage_handle(self.handle.clone(), engine)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHub {
+    fn drop(&mut self) {
+        self.thread.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::wal::WriteAheadLog;
+    use crate::core::wal::{self, WalEntry, WriteAheadLog};
     use crate::engines::lsm::engine::{LsmEngineOptions, LsmStorageEngine};
     use crate::engines::StorageEngine;
     use crate::storage::file_manager::FileManager;
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
+
+    const ALL_TARGETS: [WalTarget; 4] = [WalTarget::Kv, WalTarget::Json, WalTarget::Rel, WalTarget::Sys];
 
     fn cfg(sqpoll: bool, capacity: usize) -> StorageThreadConfig {
         StorageThreadConfig {
@@ -633,8 +594,56 @@ mod tests {
         }
     }
 
+    /// A hub with the key-value WAL alone, at `<dir>/wal`.
     fn spawn(dir: &Path, sqpoll: bool, capacity: usize) -> (StorageThread, StorageHandle) {
-        StorageThread::new(cfg(sqpoll, capacity), dir.join("wal"), dir.join("vlog")).unwrap()
+        StorageThread::new(cfg(sqpoll, capacity), vec![(WalTarget::Kv, dir.join("wal"))]).unwrap()
+    }
+
+    /// One WAL file per target in `dir`, named after the target.
+    fn wal_paths(dir: &Path, targets: &[WalTarget]) -> Vec<(WalTarget, PathBuf)> {
+        targets.iter().map(|target| (*target, dir.join(format!("{target:?}.wal")))).collect()
+    }
+
+    /// A DELETE record of `key`, the smallest record `wal::recover` reads.
+    fn delete_record(timestamp: u64, key: &[u8]) -> Vec<u8> {
+        let mut record = vec![2u8];
+        record.extend_from_slice(&timestamp.to_be_bytes());
+        record.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        record.extend_from_slice(key);
+        record
+    }
+
+    async fn recovered_keys(path: &Path) -> Vec<String> {
+        wal::recover(path)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| match entry {
+                WalEntry::Delete { key, .. } => String::from_utf8(key).unwrap(),
+                other => panic!("expected a DELETE record, got {other:?}"),
+            })
+            .collect()
+    }
+
+    // A run of appends for three targets plans one write per target, each
+    // with its payloads in channel order; a target without appends gets none.
+    #[test]
+    fn test_plan_batch_writes_each_target_once_in_channel_order() {
+        let appends: [(WalTarget, &[u8]); 5] = [
+            (WalTarget::Kv, b"k1"),
+            (WalTarget::Json, b"j1"),
+            (WalTarget::Kv, b"k22"),
+            (WalTarget::Sys, b"s1"),
+            (WalTarget::Json, b"j2"),
+        ];
+        assert_eq!(
+            plan_batch(appends),
+            vec![
+                FileWrite { engine: WalTarget::Kv, data: b"k1k22".to_vec(), parts: vec![(0, 0), (2, 2)] },
+                FileWrite { engine: WalTarget::Json, data: b"j1j2".to_vec(), parts: vec![(1, 0), (4, 2)] },
+                FileWrite { engine: WalTarget::Sys, data: b"s1".to_vec(), parts: vec![(3, 0)] },
+            ]
+        );
     }
 
     // 1. StorageThread starts and stops cleanly.
@@ -652,8 +661,8 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let (mut st, handle) = spawn(dir.path(), false, 64);
-            let o1 = handle.wal_append(b"hello".to_vec()).await.unwrap();
-            let o2 = handle.wal_append(b"world!".to_vec()).await.unwrap();
+            let o1 = handle.wal_append(WalTarget::Kv, b"hello".to_vec()).await.unwrap();
+            let o2 = handle.wal_append(WalTarget::Kv, b"world!".to_vec()).await.unwrap();
             assert_eq!(o1, 0);
             assert_eq!(o2, 5);
             st.shutdown();
@@ -661,64 +670,96 @@ mod tests {
         })
     }
 
-    // 3. vlog_append -- data lands at the returned offset.
+    // Every engine's appends land in its own file, at offsets that grow per
+    // file; a truncate empties its own file alone; `recover` reads each file
+    // back on its own. With SQPOLL too: four fixed-file slots on the
+    // production ring setup.
     #[test]
-    fn test_vlog_append_writes_at_the_returned_offset() {
+    fn test_hub_keeps_one_wal_per_engine() {
+        for sqpoll in [false, true] {
+            crate::core::engine_runtime::block_on(async {
+                let dir = tempfile::TempDir::new().unwrap();
+                let wals = wal_paths(dir.path(), &ALL_TARGETS);
+                let (mut st, handle) = StorageThread::new(cfg(sqpoll, 64), wals.clone()).unwrap();
+
+                let mut offsets = Vec::new();
+                for round in 1..=2u64 {
+                    for target in ALL_TARGETS {
+                        let record = delete_record(round, format!("{target:?}-{round}").as_bytes());
+                        offsets.push((target, handle.wal_append(target, record).await.unwrap()));
+                    }
+                }
+                // Second offset = length of the first record: 13 bytes + the key.
+                let expected = [
+                    (WalTarget::Kv, 0), (WalTarget::Json, 0), (WalTarget::Rel, 0), (WalTarget::Sys, 0),
+                    (WalTarget::Kv, 17), (WalTarget::Json, 19), (WalTarget::Rel, 18), (WalTarget::Sys, 18),
+                ];
+                assert_eq!(offsets, expected);
+
+                handle.wal_truncate(WalTarget::Json).await.unwrap();
+                assert_eq!(handle.wal_append(WalTarget::Json, delete_record(3, b"Json-3")).await.unwrap(), 0);
+                st.shutdown();
+
+                let paths: Vec<&Path> = wals.iter().map(|(_, path)| path.as_path()).collect();
+                assert_eq!(recovered_keys(paths[0]).await, ["Kv-1", "Kv-2"]);
+                assert_eq!(recovered_keys(paths[1]).await, ["Json-3"]);
+                assert_eq!(recovered_keys(paths[2]).await, ["Rel-1", "Rel-2"]);
+                assert_eq!(recovered_keys(paths[3]).await, ["Sys-1", "Sys-2"]);
+            })
+        }
+    }
+
+    // The hub opens a file for the engines it was given and no other; a
+    // request for any other engine fails, and the given ones keep working.
+    #[test]
+    fn test_requests_for_an_engine_without_a_wal_fail() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let (mut st, handle) = spawn(dir.path(), false, 64);
-            let (off, len) = handle.vlog_append(b"payload-XYZ".to_vec(), 1).await.unwrap();
-            assert_eq!((off, len), (0, 11));
+
+            let err = handle.wal_append(WalTarget::Json, b"doc".to_vec()).await.unwrap_err();
+            assert!(err.to_string().contains("Json"), "{err}");
+            let err = handle.wal_truncate(WalTarget::Rel).await.unwrap_err();
+            assert!(err.to_string().contains("Rel"), "{err}");
+            assert_eq!(handle.wal_append(WalTarget::Kv, b"kv".to_vec()).await.unwrap(), 0);
+
             st.shutdown();
-            assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"payload-XYZ");
+            let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(files, ["wal"]);
         })
     }
 
-    // Spec kv/031 test 7 (remote mode): a thread-backed generation reads
-    // through its own descriptor -- the thread has no read command left, and
-    // the reads keep working after it is gone.
-    #[test]
-    fn test_thread_backed_vlog_reads_without_the_thread() {
-        crate::core::engine_runtime::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let (mut st, handle) = spawn(dir.path(), false, 64);
-            let vlog = VLog::with_storage_handle(dir.path().join("vlog"), handle.clone(), 1).unwrap();
-            let off = vlog.append(b"thread-appended").await.unwrap();
-            assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
-
-            drop(handle);
-            st.shutdown();
-            assert_eq!(vlog.read(off, 15).unwrap(), b"thread-appended");
-        })
+    /// One-byte append requests for `targets`, in order, with their receivers.
+    fn appends(targets: &[WalTarget]) -> (Vec<IoRequest>, Vec<oneshot::Receiver<Result<u64>>>) {
+        targets
+            .iter()
+            .map(|engine| {
+                let (response, rx) = oneshot::channel();
+                (IoRequest::WalAppend { engine: *engine, data: vec![b'x'], response }, rx)
+            })
+            .unzip()
     }
 
-    // Spec perf/013 test 1: vlog_append rejects a request whose expected
-    // generation does not match the one the thread has open, and
-    // vlog_reopen's id becomes the new expectation.
+    // Group commit across engines: one batch syncs each file it writes to
+    // once, however many of its requests go to that file.
     #[test]
-    fn test_vlog_generation_mismatch_is_rejected() {
-        crate::core::engine_runtime::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let (mut st, handle) = spawn(dir.path(), false, 64);
+    fn test_one_batch_syncs_each_written_file_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut state, _) = open_state(&cfg(false, 64), &wal_paths(dir.path(), &ALL_TARGETS)).unwrap();
+        use WalTarget::{Json, Kv, Rel};
 
-            // Thread spawns on generation 1; any other id is rejected.
-            let err = handle.vlog_append(b"x".to_vec(), 2).await.unwrap_err();
-            assert!(err.to_string().contains("generation mismatch"), "{err}");
+        let (batch, mut receivers) = appends(&[Kv, Json, Kv, Rel, Json, Kv]);
+        process_batch(&mut state, batch);
+        assert_eq!(state.stats, HubStats { appends: 6, batches: 1, fdatasyncs: 3 });
 
-            // The right id still performs unchanged I/O.
-            handle.vlog_append(b"hello".to_vec(), 1).await.unwrap();
+        let (batch, more) = appends(&[Kv; 20]);
+        process_batch(&mut state, batch);
+        assert_eq!(state.stats, HubStats { appends: 26, batches: 2, fdatasyncs: 4 });
 
-            // After a reopen to generation 2, the old id is rejected and the new
-            // one succeeds.
-            let new_path = dir.path().join("vlog.2");
-            handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
-            assert!(handle.vlog_append(b"y".to_vec(), 1).await.is_err());
-            handle.vlog_append(b"world".to_vec(), 2).await.unwrap();
-
-            st.shutdown();
-            assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"hello");
-            assert_eq!(std::fs::read(new_path).unwrap(), b"world");
-        })
+        receivers.extend(more);
+        let offsets: Vec<u64> = receivers.iter_mut().map(|rx| rx.try_recv().unwrap().unwrap()).collect();
+        assert_eq!(&offsets[..6], [0, 0, 1, 0, 1, 2]);
+        assert_eq!(offsets[6..], (3..23).collect::<Vec<u64>>());
     }
 
     // 4. Batching: 100 concurrent wal_append requests processed correctly.
@@ -730,7 +771,7 @@ mod tests {
         let mut tasks = Vec::new();
         for _ in 0..100u32 {
             let h = handle.clone();
-            tasks.push(tokio::spawn(async move { h.wal_append(vec![b'x'; 10]).await.unwrap() }));
+            tasks.push(tokio::spawn(async move { h.wal_append(WalTarget::Kv, vec![b'x'; 10]).await.unwrap() }));
         }
         let mut offsets = Vec::new();
         for t in tasks {
@@ -770,7 +811,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let (mut st, handle) = spawn(dir.path(), true, 64);
-            handle.wal_append(b"sqpoll".to_vec()).await.unwrap();
+            handle.wal_append(WalTarget::Kv, b"sqpoll".to_vec()).await.unwrap();
             st.shutdown();
             assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"sqpoll");
         })
@@ -789,7 +830,7 @@ mod tests {
                 let (tx, rx) = oneshot::channel();
                 handle
                     .request_tx
-                    .try_send(IoRequest::WalAppend { data: vec![b'a'; 10], response: tx })
+                    .try_send(IoRequest::WalAppend { engine: WalTarget::Kv, data: vec![b'a'; 10], response: tx })
                     .unwrap();
                 receivers.push(rx);
             }
@@ -809,43 +850,12 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let (mut st, handle) = spawn(dir.path(), false, 64);
-            handle.wal_append(b"abcde".to_vec()).await.unwrap();
-            handle.wal_truncate().await.unwrap();
-            let off = handle.wal_append(b"XY".to_vec()).await.unwrap();
+            handle.wal_append(WalTarget::Kv, b"abcde".to_vec()).await.unwrap();
+            handle.wal_truncate(WalTarget::Kv).await.unwrap();
+            let off = handle.wal_append(WalTarget::Kv, b"XY".to_vec()).await.unwrap();
             assert_eq!(off, 0);
             st.shutdown();
             assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
-        })
-    }
-
-    // SstableWrite installs the file atomically and cleans up the temp file.
-    #[test]
-    fn test_sstable_write_installs_file() {
-        crate::core::engine_runtime::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let (mut st, handle) = spawn(dir.path(), false, 64);
-            let path = dir.path().join("sstable_000.sst");
-            handle.sstable_write(path.clone(), b"SSTABLE-DATA".to_vec()).await.unwrap();
-            st.shutdown();
-            assert_eq!(std::fs::read(&path).unwrap(), b"SSTABLE-DATA");
-            assert!(!sstable_tmp_path(&path).exists());
-        })
-    }
-
-    // Finding 4: a failed install removes the temp file (no `.tmp` accumulation).
-    #[test]
-    fn test_sstable_write_removes_tmp_on_error() {
-        crate::core::engine_runtime::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let (mut st, handle) = spawn(dir.path(), false, 64);
-            // Destination is an existing directory: temp write + fsync succeed, but
-            // the atomic rename fails, so the temp file must be cleaned up.
-            let path = dir.path().join("dest");
-            std::fs::create_dir(&path).unwrap();
-            let res = handle.sstable_write(path.clone(), b"DATA".to_vec()).await;
-            assert!(res.is_err());
-            assert!(!sstable_tmp_path(&path).exists(), "temp file must be removed on error");
-            st.shutdown();
         })
     }
 
@@ -856,46 +866,27 @@ mod tests {
         assert!(pin_to_cpu(libc::CPU_SETSIZE + 1000).is_err());
     }
 
-    // Finding 1: registered (fixed) files — WAL slot 0 / VLog slot 1 writes.
+    // Registered (fixed) files: each WAL writes through its own slot.
     #[test]
-    fn test_fixed_files_write_through_both_slots() {
+    fn test_fixed_files_write_through_their_own_slots() {
         let dir = tempfile::TempDir::new().unwrap();
-        let wal = open_rw(&dir.path().join("wal")).unwrap();
-        let vlog = open_rw(&dir.path().join("vlog")).unwrap();
+        let kv = open_rw(&dir.path().join("kv.wal")).unwrap();
+        let json = open_rw(&dir.path().join("json.wal")).unwrap();
         let (mut ring, _) = build_ring(false, 500, 64).unwrap();
         ring.submitter()
-            .register_files(&[wal.as_raw_fd(), vlog.as_raw_fd()])
+            .register_files(&[kv.as_raw_fd(), json.as_raw_fd()])
             .unwrap();
 
-        ring_write_all(&mut ring, RingFile::Fixed(VLOG_SLOT), 0, b"fixed-vlog").unwrap();
-        ring_write_all(&mut ring, RingFile::Fixed(WAL_SLOT), 0, b"fixed-wal").unwrap();
-        ring_fsync(&mut ring, RingFile::Fixed(WAL_SLOT), true).unwrap();
+        ring_write_all(&mut ring, RingFile::Fixed(1), 0, b"fixed-json").unwrap();
+        ring_write_all(&mut ring, RingFile::Fixed(0), 0, b"fixed-kv").unwrap();
+        ring_fsync(&mut ring, RingFile::Fixed(0)).unwrap();
 
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"fixed-wal");
-        assert_eq!(std::fs::read(dir.path().join("vlog")).unwrap(), b"fixed-vlog");
+        assert_eq!(std::fs::read(dir.path().join("kv.wal")).unwrap(), b"fixed-kv");
+        assert_eq!(std::fs::read(dir.path().join("json.wal")).unwrap(), b"fixed-json");
     }
 
-    // Finding 3 (thread level): VlogReopen swaps the file and resets the offset.
-    #[test]
-    fn test_vlog_reopen_switches_file_and_offset() {
-        crate::core::engine_runtime::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let (mut st, handle) = spawn(dir.path(), false, 64);
-            handle.vlog_append(b"old-data".to_vec(), 1).await.unwrap();
-
-            let new_path = dir.path().join("vlog.2"); // next vLog generation
-            std::fs::write(&new_path, b"NEW").unwrap();
-            handle.vlog_reopen(new_path.clone(), 2).await.unwrap();
-
-            // Offset now tracks the new file: the append lands after its 3 bytes.
-            let (off, len) = handle.vlog_append(b"XY".to_vec(), 2).await.unwrap();
-            assert_eq!((off, len), (3, 2));
-            st.shutdown();
-            assert_eq!(std::fs::read(&new_path).unwrap(), b"NEWXY");
-        })
-    }
-
-    // 8. Integration: LsmStorageEngine with StorageHandle -> write + read E2E.
+    // Integration: the key-value engine with its WAL on the hub and its
+    // vLog local -- small and large values round-trip.
     #[test]
     fn test_lsm_engine_with_storage_handle_end_to_end() {
         crate::core::engine_runtime::block_on(async {
@@ -904,8 +895,8 @@ mod tests {
             let vlog_path = dir.path().join("vlog");
             let (mut st, handle) = spawn(dir.path(), false, 1024);
 
-            let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone()));
-            let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
+            let wal = Arc::new(WriteAheadLog::with_storage_handle(handle.clone(), WalTarget::Kv));
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
             let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
             let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
             let engine = LsmStorageEngine::new(
@@ -920,11 +911,11 @@ mod tests {
             .await
             .unwrap();
 
-            // Small value: WAL append routes through the storage thread.
+            // Small value: inline in the WAL record, which the hub writes.
             engine.put(b"k", b"v").await.unwrap();
             assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v".to_vec()));
 
-            // Large value: VLog append + read route through the storage thread.
+            // Large value: the WAL record through the hub, the vLog append local.
             let big = vec![b'z'; 4096];
             engine.put(b"big", &big).await.unwrap();
             assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
@@ -933,7 +924,7 @@ mod tests {
         })
     }
 
-    // 9. io_engine disabled -> local WAL/VLog path, no regression.
+    // The test-only local WAL committer: same round trip, no regression.
     #[test]
     fn test_lsm_engine_local_path_no_regression() {
         crate::core::engine_runtime::block_on(async {

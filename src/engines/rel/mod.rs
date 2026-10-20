@@ -139,17 +139,30 @@ pub struct RelEngine {
 }
 
 impl RelEngine {
-    /// Creates the dedicated relational LSM instance from `config`, starts its
-    /// background tasks, and recovers the domain registry (rel/002) and the
-    /// catalog (rel/003).
+    /// Tests only: [`Self::bootstrap_with_wal`] on a local WAL committer
+    /// instead of the storage hub.
+    #[cfg(test)]
     pub async fn bootstrap(
         config: &RelStoreConfig,
         metrics: Arc<MetricsStore>,
         cross_engine: Arc<CrossEngineResolver>,
     ) -> Result<Arc<Self>> {
+        let wal = WriteAheadLog::new(&config.wal_path).await?;
+        Self::bootstrap_with_wal(config, wal, metrics, cross_engine).await
+    }
+
+    /// Creates the dedicated relational LSM instance from `config`, with
+    /// `wal` as the log at `config.wal_path`, starts its background tasks,
+    /// and recovers the domain registry and the catalog.
+    pub async fn bootstrap_with_wal(
+        config: &RelStoreConfig,
+        wal: WriteAheadLog,
+        metrics: Arc<MetricsStore>,
+        cross_engine: Arc<CrossEngineResolver>,
+    ) -> Result<Arc<Self>> {
         let wal_path = PathBuf::from(&config.wal_path);
         let vlog_path = PathBuf::from(&config.vlog_path);
-        let wal = Arc::new(WriteAheadLog::new(&wal_path).await?);
+        let wal = Arc::new(wal);
         let vlog = Arc::new(VLog::new(&vlog_path).await?);
         let file_manager = Arc::new(FileManager::new(&config.sstable_dir).await?);
         let manifest_manager = Arc::new(ManifestManager::new(&config.sstable_dir));

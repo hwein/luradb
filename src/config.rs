@@ -337,16 +337,16 @@ impl Default for StorageConfig {
     }
 }
 
-// ── IO Engine (spec perf/004) ──────────────────────────────────────────────────
+// ── IO Engine ──────────────────────────────────────────────────────────────────
 
 /// Registered-buffer I/O on the engine thread's io_uring ring.
 ///
-/// Scaffolding only — not yet wired into the WAL/VLog/SSTable hot paths
-/// (see spec perf/004). Disabled by default.
+/// Scaffolding only — not yet used on the data path. Disabled by default.
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct IoEngineConfig {
-    /// Enables the IoEngine (Default: false). Also gates the perf/005 storage thread.
+    /// Enables the IoEngine's registered buffers (default: false). The storage
+    /// thread runs either way.
     pub enabled: bool,
 }
 

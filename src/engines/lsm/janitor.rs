@@ -5,7 +5,7 @@
 //! the SSTable index, not the vLog payloads).
 //!
 //! The Janitor runs as a background engine task and reclaims dead space by
-//! rolling the vLog forward one *generation* per cycle (spec kv/017):
+//! rolling the vLog forward one *generation* per cycle:
 //!
 //! 1. Gate on the estimated dead-byte ratio; below the threshold, skip.
 //! 2. Open generation `N+1` and publish it as the active append target,
@@ -17,15 +17,13 @@
 //! 6. Copy those values into `N+1`, recording the remap.
 //! 7. Rebuild every snapshot SSTable with the remapped pointers.
 //! 8. Install a version without the old generations; each file is deleted
-//!    once no version holds its generation any more (spec kv/031 A5).
-//! 9. With a storage thread, roll one more generation that the thread owns, so
-//!    thread and local writers never append to the same file.
+//!    once no version holds its generation any more, so a reader still on
+//!    an older version keeps reading it.
 //!
 //! All steps are performed without holding any write-path locks for extended
 //! periods, so normal reads and writes are never stalled.
 
 use crate::core::engine_runtime::spawn_io;
-use crate::core::storage_thread::StorageHandle;
 use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::engine::LsmStorageEngine;
 #[cfg(test)]
@@ -145,10 +143,6 @@ pub struct Janitor {
 
     shutdown: Arc<AtomicBool>,
 
-    /// Storage thread handle (perf/005). When set, the vLog is reopened through
-    /// the thread after GC so remote I/O survives the swap.
-    storage_handle: Option<StorageHandle>,
-
     /// Incremented once per GC cycle that actually ran (`GcStats::ran ==
     /// true`) -- shared with `LsmStorageEngine::janitor_runs` for the
     /// `/metrics` system block (spec general/024).
@@ -202,7 +196,6 @@ impl Janitor {
         config: JanitorConfig,
         use_mmap: bool,
         shutdown: Arc<AtomicBool>,
-        storage_handle: Option<StorageHandle>,
         janitor_runs: Arc<AtomicU64>,
         flush_barrier: Option<FlushBarrier>,
         flush_lock: Option<Arc<tokio::sync::Mutex<()>>>,
@@ -220,7 +213,6 @@ impl Janitor {
             config,
             use_mmap,
             shutdown,
-            storage_handle,
             janitor_runs,
             flush_barrier,
             flush_lock,
@@ -413,28 +405,6 @@ impl Janitor {
         let live_bytes_by_generation = live_bytes_per_generation(&source_ids, &live);
         let live_bytes: u64 = live_bytes_by_generation.iter().map(|(_, b)| *b).sum();
         let reclaimed_bytes = self.retire_generations(&source_ids).await.saturating_sub(live_bytes);
-
-        // ── Storage-thread mode (perf/005) ─────────────────────────────────
-        //
-        // The thread owns a single vLog fd, still pointing at a retired
-        // generation. It must not take over `N+1`: writers append there through
-        // a local cursor, while the thread seeds its own cursor from the file
-        // length at reopen time — everything written after that stat would be
-        // overwritten. Roll one more generation that only the thread writes.
-        // Reads never use the thread's fd (spec kv/031 A5), so the reopen
-        // leaves every reader of a source generation on its own descriptor.
-        if let Some(handle) = &self.storage_handle {
-            let thread_id = new_id + 1;
-            let thread_path = generation_path(&self.vlog_base_path, thread_id);
-            handle.vlog_reopen(thread_path.clone(), thread_id).await?;
-            self.activate(Arc::new(VLog::with_storage_handle(&thread_path, handle.clone(), thread_id)?))
-                .await;
-            // Invariant 1 again: seal only after publishing. In-flight appends
-            // past the seal check finish alone in the local file, later fetches
-            // retry against `N+2`. `N+1` stays registered and readable; the next
-            // cycle collects it.
-            new_vlog.seal();
-        }
 
         eprintln!(
             "[Janitor] GC complete: generation {new_id} took over {live_bytes} live bytes \
@@ -740,7 +710,6 @@ fn live_bytes_per_generation(source_ids: &[u32], live: &[(u32, u64, u32)]) -> Ve
 mod tests {
     use super::*;
     use crate::config::BlockCacheConfig;
-    use crate::core::storage_thread::{StorageThread, StorageThreadConfig};
     use crate::engines::lsm::version::Version;
     use crate::storage::format::ValuePointer;
     use crate::storage::vlog::VLogError;
@@ -751,33 +720,19 @@ mod tests {
         Arc::new(VersionCell::new(Version::new(vlog).with_levels(levels)))
     }
 
-    fn st_config() -> StorageThreadConfig {
-        StorageThreadConfig {
-            sqpoll_enabled: false,
-            sqpoll_idle_ms: 500,
-            ring_depth: 64,
-            channel_capacity: 256,
-            cpu: -1,
-        }
-    }
-
-    /// Everything a storage-thread GC test needs; `st` must be shut down last.
-    struct StFixture {
-        st: StorageThread,
+    /// Everything a GC fixture test needs.
+    struct GcFixture {
         vlog_path: PathBuf,
         version: Arc<VersionCell>,
         janitor: Janitor,
         live_val: Vec<u8>,
     }
 
-    /// Generation 1 routed through the storage thread with one live (100 B) and
-    /// one dead (900 B) value, plus one SSTable naming the live one.
-    async fn storage_thread_fixture(dir: &std::path::Path) -> StFixture {
+    /// Generation 1 with one live (100 B) and one dead (900 B) value, plus one
+    /// SSTable naming the live one.
+    async fn gc_fixture(dir: &std::path::Path) -> GcFixture {
         let vlog_path = dir.join("vlog");
-        let (st, handle) =
-            StorageThread::new(st_config(), dir.join("wal"), vlog_path.clone()).unwrap();
-
-        let vlog = Arc::new(VLog::with_storage_handle(&vlog_path, handle.clone(), 1).unwrap());
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
         let live_val = vec![b'L'; 100];
         let live_off = vlog.append(&live_val).await.unwrap();
         vlog.append(&vec![b'D'; 900]).await.unwrap();
@@ -808,127 +763,93 @@ mod tests {
         let reader = LsmStorageEngine::open_sstable_reader(&file_manager, file_id, false).await.unwrap();
         let version = version_over(vlog, vec![(0, vec![Arc::new(reader)])]);
 
-        let bc = BlockCacheConfig::default();
-        let block_cache = Arc::new(StripedBlockCache::new(bc.capacity_bytes, bc.small_ratio, bc.ghost_capacity));
-
-        let janitor = Janitor::new(
+        let janitor = build_janitor(
+            dir,
             Arc::clone(&version),
             vlog_path.clone(),
             manifest,
-            Arc::new(ManifestManager::new(dir)),
             file_manager,
-            block_cache,
-            Arc::new(SnapshotRegistry::new()),
             JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 1 },
-            false,
-            Arc::new(AtomicBool::new(false)),
-            Some(handle.clone()),
             Arc::new(AtomicU64::new(0)),
-            None,
-            None,
-            None,
-            None,
         );
 
-        StFixture { st, vlog_path, version, janitor, live_val }
+        GcFixture { vlog_path, version, janitor, live_val }
     }
 
-    // Finding 3: a GC pass with an active storage thread must leave the vLog
-    // reachable *through the thread* — remote append/read keep working after the
-    // swap and the reclaimed offsets line up.
+    // A GC pass rolls the vLog into a fresh generation that takes over the
+    // live values and every later append: the live value moves to offset 0
+    // of generation 2, the next append lands right behind it.
     #[test]
-    fn test_gc_survives_with_storage_thread() {
+    fn test_gc_moves_live_values_and_later_appends_into_the_new_generation() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut fx = storage_thread_fixture(dir.path()).await;
+            let fx = gc_fixture(dir.path()).await;
 
             let stats = fx.janitor.run_gc().await.unwrap();
             assert!(stats.ran, "900/1000 dead bytes must trigger GC");
             assert_eq!(stats.reclaimed_bytes, 900);
             assert_eq!(stats.new_generation, 2, "live values were copied into 2");
 
-            // The thread rolled a further generation instead of taking over the
-            // copy target; both stay registered.
             let version = fx.version.get();
-            let swapped = Arc::clone(&version.active_vlog);
-            assert_eq!(swapped.id(), 3);
-            assert_eq!(swapped.path(), generation_path(&fx.vlog_path, 3));
-            assert_eq!(version.vlog_ids(), vec![2, 3]);
+            let active = Arc::clone(&version.active_vlog);
+            assert_eq!(active.id(), 2);
+            assert_eq!(active.path(), generation_path(&fx.vlog_path, 2));
+            assert_eq!(version.vlog_ids(), vec![2]);
+            assert_eq!(active.read(0, 100).unwrap(), fx.live_val);
 
-            // The live value survives at its remapped offset (0 — first value
-            // copied) in the copy generation, which is sealed.
-            assert_eq!(version.vlog[&2].read(0, 100).unwrap(), fx.live_val);
-            assert!(version.vlog[&2].is_sealed());
-
-            // Remote append still routes through the thread and starts at 0 in the
-            // fresh generation, the thread's own file.
-            let new_off = swapped.append(b"AFTER-GC").await.unwrap();
-            assert_eq!(new_off, 0);
-            assert_eq!(swapped.read(new_off, 8).unwrap(), b"AFTER-GC");
-            assert_eq!(std::fs::read(generation_path(&fx.vlog_path, 3)).unwrap(), b"AFTER-GC");
-
-            fx.st.shutdown();
+            assert_eq!(active.append(b"AFTER-GC").await.unwrap(), 100);
+            assert_eq!(active.read(100, 8).unwrap(), b"AFTER-GC");
+            let file = std::fs::read(generation_path(&fx.vlog_path, 2)).unwrap();
+            assert_eq!((&file[..100], &file[100..]), (fx.live_val.as_slice(), &b"AFTER-GC"[..]));
         })
     }
 
-    // Spec kv/031 test 7 (storage thread): reads never go through the thread,
-    // so a source generation held across the GC still reads its own file,
-    // which stays on disk until the holder lets go.
+    // Reads go through each generation's own descriptor, so a source
+    // generation held across the GC still reads its own file, which stays on
+    // disk until the holder lets go.
     #[test]
     fn test_gc_keeps_a_held_source_generation_readable_until_released() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut fx = storage_thread_fixture(dir.path()).await;
+            let fx = gc_fixture(dir.path()).await;
             let held = Arc::clone(&fx.version.get().vlog[&1]);
 
             assert!(fx.janitor.run_gc().await.unwrap().ran);
             assert!(!fx.version.get().vlog.contains_key(&1), "generation 1 is retired");
-            assert_eq!(held.read(0, 100).unwrap(), fx.live_val, "the thread has moved on to generation 3");
+            assert_eq!(held.read(0, 100).unwrap(), fx.live_val, "the active generation is 2 now");
             assert!(fx.vlog_path.exists(), "a holder keeps the file");
 
             drop(held);
             assert!(!fx.janitor.run_gc().await.unwrap().ran, "nothing left to collect");
             assert!(!fx.vlog_path.exists(), "the next run deletes the released generation");
-
-            fx.st.shutdown();
         })
     }
 
-    // The two writers of a GC cycle never share a file: the thread owns its own
-    // generation, so its appends cannot land on top of the copy target.
+    // A late writer still holding a source generation is bounced instead of
+    // appending to a retired file; the new generation's appends land behind
+    // the copied live value and leave it byte-identical.
     #[test]
-    fn test_gc_storage_thread_generation_is_disjoint_from_copy_target() {
+    fn test_gc_bounces_a_late_writer_off_the_source_generation() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut fx = storage_thread_fixture(dir.path()).await;
+            let fx = gc_fixture(dir.path()).await;
+            let source = Arc::clone(&fx.version.get().vlog[&1]);
             assert!(fx.janitor.run_gc().await.unwrap().ran);
 
-            // A late writer still holding the copy generation is bounced to the
-            // active one instead of writing a second cursor into that file.
-            let version = fx.version.get();
-            let copy_gen = Arc::clone(&version.vlog[&2]);
-            let active = Arc::clone(&version.active_vlog);
-            assert_ne!(copy_gen.path(), active.path());
-            assert!(matches!(copy_gen.append(b"late").await, Err(VLogError::Sealed { id: 2 })));
+            assert!(matches!(source.append(b"late").await, Err(VLogError::Sealed { id: 1 })));
+            assert_eq!(std::fs::metadata(source.path()).unwrap().len(), 1000, "the source file does not grow");
 
-            let copy_len = std::fs::metadata(copy_gen.path()).unwrap().len();
-            assert_eq!(copy_len, 100);
-
-            // Thread appends fill the fresh generation from offset 0 and leave the
-            // copy generation byte-identical.
+            let active = Arc::clone(&fx.version.get().active_vlog);
             for i in 0..4u64 {
-                assert_eq!(active.append(&[b'T'; 10]).await.unwrap(), i * 10);
+                assert_eq!(active.append(&[b'T'; 10]).await.unwrap(), 100 + i * 10);
             }
-            assert_eq!(std::fs::metadata(active.path()).unwrap().len(), 40);
-            assert_eq!(std::fs::metadata(copy_gen.path()).unwrap().len(), copy_len);
-            assert_eq!(copy_gen.read(0, 100).unwrap(), fx.live_val);
-
-            fx.st.shutdown();
+            assert_eq!(std::fs::metadata(active.path()).unwrap().len(), 140);
+            assert_eq!(active.read(0, 100).unwrap(), fx.live_val);
         })
     }
 
-    /// Builds a local-file-path Janitor (no storage thread) over the given
-    /// fixtures. No flush barrier: these fixtures have no MemTables.
+    /// Builds a Janitor over the given fixtures. No flush barrier: these
+    /// fixtures have no MemTables.
     /// `janitor_runs` is passed straight through, so a caller that wants to
     /// inspect it keeps its own clone.
     fn build_janitor(
@@ -952,7 +873,6 @@ mod tests {
             config,
             false,
             Arc::new(AtomicBool::new(false)),
-            None,
             janitor_runs,
             None,
             None,

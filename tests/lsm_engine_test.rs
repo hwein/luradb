@@ -1,3 +1,6 @@
+mod common;
+
+use luradb::core::storage_thread::WalTarget;
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::LsmStorageEngine;
 use luradb::engines::lsm::engine::LsmEngineOptions;
@@ -15,7 +18,8 @@ fn test_lsm_engine_writes_and_reads() {
         let wal_path = dir.path().join("test.wal");
         let vlog_path = dir.path().join("test.vlog");
 
-        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let (_hub, handle) = common::start_kv_hub(&wal_path);
+        let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));
         let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
         let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
         let manifest_manager = Arc::new(ManifestManager::new(dir.path()));

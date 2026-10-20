@@ -1192,7 +1192,8 @@ pub struct MulticoreConfig {
     /// the request-path thread and one core of headroom.
     pub cpu_offload_threads: usize,
     /// Worker threads of the frontend runtime (HTTP/TLS termination). `0` =
-    /// auto = an eighth of the cores, at least 1 and at most 4.
+    /// auto = a sixth of the cores, at least 2 and at most 4 on hosts with at
+    /// least 4 cores, otherwise 1.
     pub frontend_workers: usize,
     /// Requests the bridge channel to the engine thread holds; a full channel
     /// holds further requests back.

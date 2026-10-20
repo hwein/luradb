@@ -145,13 +145,16 @@ impl ServerHandle {
     }
 }
 
-/// Worker threads of the frontend runtime: `configured`, or with `0` an
-/// eighth of the cores, 1 to 4 (spec perf/018a A5).
+/// Worker threads of the frontend runtime: `configured`, or with `0` a sixth
+/// of the cores, 2 to 4, on hosts with at least 4 cores, otherwise 1 (spec
+/// perf/038).
 fn frontend_workers(configured: usize, cores: usize) -> usize {
     if configured > 0 {
         configured
+    } else if cores >= 4 {
+        (cores / 6).clamp(2, 4)
     } else {
-        (cores / 8).clamp(1, 4)
+        1
     }
 }
 
@@ -479,10 +482,14 @@ mod tests {
 
     #[test]
     fn frontend_workers_auto_and_explicit() {
-        assert_eq!(frontend_workers(0, 64), 4);
         assert_eq!(frontend_workers(0, 32), 4);
-        assert_eq!(frontend_workers(0, 16), 2);
-        assert_eq!(frontend_workers(0, 8), 1);
+        assert_eq!(frontend_workers(0, 24), 4);
+        assert_eq!(frontend_workers(0, 18), 3);
+        assert_eq!(frontend_workers(0, 12), 2);
+        assert_eq!(frontend_workers(0, 6), 2);
+        assert_eq!(frontend_workers(0, 4), 2);
+        assert_eq!(frontend_workers(0, 3), 1);
+        assert_eq!(frontend_workers(0, 2), 1);
         assert_eq!(frontend_workers(0, 1), 1);
         assert_eq!(frontend_workers(3, 32), 3);
         assert_eq!(frontend_workers(6, 2), 6);

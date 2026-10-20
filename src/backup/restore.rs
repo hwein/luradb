@@ -8,8 +8,10 @@ use super::writer::{
 };
 use super::{BackupError, MAX_LINE_BYTES};
 use crate::auth::{perm_key, user_key, DomainPermission, UserRecord};
+use crate::control::{ControlPlane, Engine};
 use crate::engines::json::{JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{now_secs, DomainRegistry, DomainStore};
+use crate::engines::lsm::engine::LsmStorageEngine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +52,9 @@ pub(crate) struct RestoreParams<'a> {
     pub include_auth: bool,
     pub kv_registry: &'a Arc<DomainRegistry>,
     pub json_engine: &'a Option<Arc<JsonEngine>>,
+    /// Creates and deletes the target domains; its system store takes the
+    /// auth records.
+    pub control: &'a ControlPlane,
     pub scan_batch_size: usize,
     pub scan_pause_ms: u64,
 }
@@ -99,18 +104,9 @@ pub(crate) async fn run_restore(params: RestoreParams<'_>) -> anyhow::Result<Res
     }
     let remap = build_remap(params.into_domain, &scan)?;
 
-    prepare_domains(&scan, params.mode, &remap, params.kv_registry, params.json_engine).await?;
+    prepare_domains(&scan, params.mode, &remap, params.kv_registry, params.json_engine, params.control).await?;
 
-    apply_pass(
-        &path,
-        &remap,
-        params.include_auth,
-        params.kv_registry,
-        params.json_engine,
-        params.scan_batch_size,
-        params.scan_pause_ms,
-    )
-    .await
+    apply_pass(&path, &remap, &params).await
 }
 
 // ── Pass 1: checksum verification + domain-name collection ─────────────
@@ -371,29 +367,35 @@ async fn prepare_domains(
     remap: &Option<(String, String)>,
     kv_registry: &Arc<DomainRegistry>,
     json_engine: &Option<Arc<JsonEngine>>,
+    control: &ControlPlane,
 ) -> anyhow::Result<()> {
     for name in &scan.kv_domains {
-        ready_kv_domain(remapped(remap, name), mode, kv_registry).await?;
+        ready_kv_domain(remapped(remap, name), mode, kv_registry, control).await?;
     }
     if let Some(json) = json_engine {
         for name in &scan.json_domains {
-            ready_json_domain(remapped(remap, name), mode, json).await?;
+            ready_json_domain(remapped(remap, name), mode, json, control).await?;
         }
     }
 
     for name in &scan.kv_domains {
-        kv_registry.create_domain(remapped(remap, name)).await?;
+        control.create_domain(Engine::Kv, remapped(remap, name), false).await?;
     }
-    if let Some(json) = json_engine {
+    if json_engine.is_some() {
         for name in &scan.json_domains {
-            json.create_domain(remapped(remap, name)).await?;
+            control.create_domain(Engine::Json, remapped(remap, name), false).await?;
         }
     }
 
     Ok(())
 }
 
-async fn ready_kv_domain(target: &str, mode: RestoreMode, kv_registry: &Arc<DomainRegistry>) -> anyhow::Result<()> {
+async fn ready_kv_domain(
+    target: &str,
+    mode: RestoreMode,
+    kv_registry: &Arc<DomainRegistry>,
+    control: &ControlPlane,
+) -> anyhow::Result<()> {
     let active = kv_registry.get_domain(target).await?;
     let deleting = kv_registry.list_deleting_domains().into_iter().any(|d| d.name == target);
     match mode {
@@ -405,7 +407,7 @@ async fn ready_kv_domain(target: &str, mode: RestoreMode, kv_registry: &Arc<Doma
         }
         RestoreMode::Replace => {
             if active.is_some() {
-                kv_registry.delete_domain(target).await?;
+                control.delete_domain(Engine::Kv, target).await?;
                 wait_for_kv_domain_gone(target, kv_registry).await?;
             } else if deleting {
                 wait_for_kv_domain_gone(target, kv_registry).await?;
@@ -422,7 +424,12 @@ async fn wait_for_kv_domain_gone(name: &str, kv_registry: &Arc<DomainRegistry>) 
     .await
 }
 
-async fn ready_json_domain(target: &str, mode: RestoreMode, json: &Arc<JsonEngine>) -> anyhow::Result<()> {
+async fn ready_json_domain(
+    target: &str,
+    mode: RestoreMode,
+    json: &Arc<JsonEngine>,
+    control: &ControlPlane,
+) -> anyhow::Result<()> {
     let existing = json.get_domain_any(target);
     match mode {
         RestoreMode::FailIfExists => {
@@ -434,7 +441,7 @@ async fn ready_json_domain(target: &str, mode: RestoreMode, json: &Arc<JsonEngin
         RestoreMode::Replace => {
             match existing {
                 Some(d) if d.state == JsonDomainState::Active => {
-                    json.delete_domain(target).await?;
+                    control.delete_domain(Engine::Json, target).await?;
                     wait_for_json_domain_gone(target, json).await?;
                 }
                 Some(_) => wait_for_json_domain_gone(target, json).await?,
@@ -480,12 +487,10 @@ async fn wait_for_purge(name: &str, timeout: Duration, is_gone: impl Fn() -> boo
 async fn apply_pass(
     path: &Path,
     remap: &Option<(String, String)>,
-    include_auth: bool,
-    kv_registry: &Arc<DomainRegistry>,
-    json_engine: &Option<Arc<JsonEngine>>,
-    scan_batch_size: usize,
-    scan_pause_ms: u64,
+    params: &RestoreParams<'_>,
 ) -> anyhow::Result<RestoreOutcome> {
+    let RestoreParams { include_auth, kv_registry, json_engine, scan_batch_size, scan_pause_ms, .. } = *params;
+    let system_store = params.control.system_store();
     let mut reader = ArchiveReader::open(path).await?;
     let mut line: Vec<u8> = Vec::new();
 
@@ -569,12 +574,12 @@ async fn apply_pass(
             "auth-user" => {
                 flush_doc_batch(&mut doc_domain, &mut doc_batch, json_engine, &mut outcome).await?;
                 if include_auth {
-                    apply_auth_user(&value, kv_registry, &mut outcome).await;
+                    apply_auth_user(&value, system_store, &mut outcome).await;
                 }
             }
             "auth-perm" => {
                 if include_auth {
-                    apply_auth_perm(&value, kv_registry, &mut outcome).await;
+                    apply_auth_perm(&value, system_store, &mut outcome).await;
                 }
             }
             // The checksum line marks the verified end of the archive
@@ -647,7 +652,7 @@ async fn flush_doc_batch(
     Ok(())
 }
 
-async fn apply_auth_user(value: &Value, kv_registry: &Arc<DomainRegistry>, outcome: &mut RestoreOutcome) {
+async fn apply_auth_user(value: &Value, system_store: &LsmStorageEngine, outcome: &mut RestoreOutcome) {
     let record: UserRecord = match serde_json::from_value(value.clone()) {
         Ok(r) => r,
         Err(e) => {
@@ -663,13 +668,13 @@ async fn apply_auth_user(value: &Value, kv_registry: &Arc<DomainRegistry>, outco
             return;
         }
     };
-    match kv_registry.engine().put(&key, &bytes).await {
+    match system_store.put(&key, &bytes).await {
         Ok(()) => outcome.imported += 1,
         Err(e) => outcome.fail(record.name, e.to_string()),
     }
 }
 
-async fn apply_auth_perm(value: &Value, kv_registry: &Arc<DomainRegistry>, outcome: &mut RestoreOutcome) {
+async fn apply_auth_perm(value: &Value, system_store: &LsmStorageEngine, outcome: &mut RestoreOutcome) {
     let perm: DomainPermission = match serde_json::from_value(value.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -686,7 +691,7 @@ async fn apply_auth_perm(value: &Value, kv_registry: &Arc<DomainRegistry>, outco
             return;
         }
     };
-    match kv_registry.engine().put(&key, &bytes).await {
+    match system_store.put(&key, &bytes).await {
         Ok(()) => outcome.imported += 1,
         Err(e) => outcome.fail(label, e.to_string()),
     }
@@ -750,8 +755,23 @@ mod tests {
         (JsonEngine::bootstrap(&config, metrics).await.unwrap(), dir)
     }
 
-    /// Runs a backup of `scope` from `kv`/`json` into `out_dir`, returning
-    /// the archive's path.
+    /// The system store of the instance whose files are in `dir`.
+    async fn system_store(dir: &tempfile::TempDir) -> Arc<LsmStorageEngine> {
+        crate::control::system::open(&dir.path().join("sys")).await.unwrap()
+    }
+
+    /// A control plane over `kv` and `json`, with its system store in `dir`.
+    async fn control_over(
+        dir: &tempfile::TempDir,
+        kv: &Arc<DomainRegistry>,
+        json: &Option<Arc<JsonEngine>>,
+    ) -> Arc<ControlPlane> {
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
+        crate::control::testing::start(dir.path(), Arc::clone(kv), json.clone(), None, bus).await.0
+    }
+
+    /// Runs a backup of `scope` from `kv`/`json`, auth from `system`, into
+    /// `out_dir`, returning the archive's path.
     async fn make_backup(
         out_dir: &Path,
         id: &str,
@@ -759,6 +779,7 @@ mod tests {
         include_auth: bool,
         kv: &Arc<DomainRegistry>,
         json: &Option<Arc<JsonEngine>>,
+        system: &Arc<LsmStorageEngine>,
     ) -> std::path::PathBuf {
         let resolved: ResolvedScope = resolve_scope(&scope, kv, json).await.unwrap();
         let params = BackupParams {
@@ -770,6 +791,7 @@ mod tests {
             resolved: &resolved,
             kv_registry: kv,
             json_engine: json,
+            system_store: system,
             scan_batch_size: 500,
             scan_pause_ms: 0,
         };
@@ -819,10 +841,12 @@ mod tests {
                 false,
                 &kv_src,
                 &None,
+                &system_store(&_d1).await,
             )
             .await;
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_rt",
@@ -831,6 +855,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -871,11 +896,13 @@ mod tests {
                 false,
                 &kv,
                 &json_src_opt,
+                &system_store(&_d1).await,
             )
             .await;
 
             let (json_dst, _d3) = make_json_engine().await;
             let json_dst_opt = Some(Arc::clone(&json_dst));
+            let control = control_over(&_d3, &kv, &json_dst_opt).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_json",
@@ -884,6 +911,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv,
                 json_engine: &json_dst_opt,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -926,6 +954,7 @@ mod tests {
                 false,
                 &kv,
                 &json_src_opt,
+                &system_store(&_d1).await,
             )
             .await;
 
@@ -947,6 +976,7 @@ mod tests {
 
             let (json_dst, _d3) = make_json_engine().await;
             let json_dst_opt = Some(Arc::clone(&json_dst));
+            let control = control_over(&_d3, &kv, &json_dst_opt).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_legacy",
@@ -955,6 +985,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv,
                 json_engine: &json_dst_opt,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -981,12 +1012,14 @@ mod tests {
 
             let out_dir = tempfile::TempDir::new().unwrap();
             let json_src_opt = Some(Arc::clone(&json_src));
-            make_backup(out_dir.path(), "bk_dom", BackupScope::Domain("shop".to_string()), false, &kv_src, &json_src_opt)
+            let system = system_store(&_d1).await;
+            make_backup(out_dir.path(), "bk_dom", BackupScope::Domain("shop".to_string()), false, &kv_src, &json_src_opt, &system)
                 .await;
 
             let (_engine2, kv_dst, _d3) = make_kv_registry().await;
             let (json_dst, _d4) = make_json_engine().await;
             let json_dst_opt = Some(Arc::clone(&json_dst));
+            let control = control_over(&_d3, &kv_dst, &json_dst_opt).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_dom",
@@ -995,6 +1028,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &json_dst_opt,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1025,10 +1059,13 @@ mod tests {
 
             let out_dir = tempfile::TempDir::new().unwrap();
             let json_src_opt = Some(Arc::clone(&json_src));
-            make_backup(out_dir.path(), "bk_all", BackupScope::All, false, &kv_src, &json_src_opt).await;
+            make_backup(out_dir.path(), "bk_all", BackupScope::All, false, &kv_src, &json_src_opt, &system_store(&_d1).await)
+                .await;
 
             let (engine2, kv_dst, _d3) = make_kv_registry().await;
             let (json_dst, _d4) = make_json_engine().await;
+            let json_dst_opt = Some(Arc::clone(&json_dst));
+            let control = control_over(&_d3, &kv_dst, &json_dst_opt).await;
 
             let kv_shutdown = Arc::new(AtomicBool::new(false));
             let kv_purger = Arc::new(crate::engines::lsm::domain::DomainPurger::new(
@@ -1052,7 +1089,6 @@ mod tests {
                 }
             });
 
-            let json_dst_opt = Some(Arc::clone(&json_dst));
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_all",
@@ -1061,6 +1097,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &json_dst_opt,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1089,7 +1126,7 @@ mod tests {
             kv_src.store("shop").await.unwrap().put_with_ttl(b"soon-gone", b"v", 1).await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_ttl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_ttl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
             // Polls the expiry clock: a backwards clock correction cuts a fixed
             // sleep short before the stamp is reached.
             let deadline = now_secs() + 1 + 1;
@@ -1098,6 +1135,7 @@ mod tests {
             }
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_ttl",
@@ -1106,6 +1144,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1126,13 +1165,14 @@ mod tests {
             kv_src.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let path = make_backup(out_dir.path(), "bk_bad", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            let path = make_backup(out_dir.path(), "bk_bad", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
 
             let mut content = std::fs::read_to_string(&path).unwrap();
             content = content.replace("\"k\":\"6b\"", "\"k\":\"6c\""); // flip the exported key's hex
             std::fs::write(&path, content).unwrap();
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let err = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_bad",
@@ -1141,6 +1181,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1160,12 +1201,13 @@ mod tests {
             kv_src.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let path = make_backup(out_dir.path(), "bk_trunc", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            let path = make_backup(out_dir.path(), "bk_trunc", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
             let content = std::fs::read_to_string(&path).unwrap();
             let truncated: String = content.lines().take_while(|l| !l.contains("\"checksum\"")).collect::<Vec<_>>().join("\n");
             std::fs::write(&path, truncated + "\n").unwrap();
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let err = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_trunc",
@@ -1174,6 +1216,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1193,9 +1236,10 @@ mod tests {
             kv_src.store("shop").await.unwrap().put(b"k1", b"v1").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_exists", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_exists", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             kv_dst.create_domain("shop").await.unwrap();
             kv_dst.store("shop").await.unwrap().put(b"pre-existing", b"untouched").await.unwrap();
 
@@ -1207,6 +1251,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1230,11 +1275,12 @@ mod tests {
             kv_src.store("shop").await.unwrap().put(b"new-key", b"new-val").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_replace", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_replace", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
 
             let (engine2, kv_dst, _d2) = make_kv_registry().await;
             kv_dst.create_domain("shop").await.unwrap();
             kv_dst.store("shop").await.unwrap().put(b"old-key", b"old-val").await.unwrap();
+            let control = control_over(&_d2, &kv_dst, &None).await;
 
             // Drive the KV purger in the background so replace's delete+wait converges.
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -1263,6 +1309,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1287,9 +1334,10 @@ mod tests {
             kv_src.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_remap", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_remap", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_remap",
@@ -1298,6 +1346,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1324,12 +1373,14 @@ mod tests {
 
             let out_dir = tempfile::TempDir::new().unwrap();
             let json_src_opt = Some(Arc::clone(&json_src));
-            make_backup(out_dir.path(), "bk_remap2", BackupScope::Domain("shop".to_string()), false, &kv_src, &json_src_opt)
+            let system = system_store(&_d1).await;
+            make_backup(out_dir.path(), "bk_remap2", BackupScope::Domain("shop".to_string()), false, &kv_src, &json_src_opt, &system)
                 .await;
 
             let (_engine2, kv_dst, _d3) = make_kv_registry().await;
             let (json_dst, _d4) = make_json_engine().await;
             let json_dst_opt = Some(Arc::clone(&json_dst));
+            let control = control_over(&_d3, &kv_dst, &json_dst_opt).await;
             run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_remap2",
@@ -1338,6 +1389,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &json_dst_opt,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1362,9 +1414,10 @@ mod tests {
             kv_src.store("b").await.unwrap().put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_multi", BackupScope::Kv, false, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_multi", BackupScope::Kv, false, &kv_src, &None, &system_store(&_d1).await).await;
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let err = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_multi",
@@ -1373,6 +1426,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1387,23 +1441,24 @@ mod tests {
     #[test]
     fn test_include_auth_opt_in() {
         crate::core::engine_runtime::block_on(async {
-            let (engine, kv_src, _d1) = make_kv_registry().await;
+            let (_engine, kv_src, _d1) = make_kv_registry().await;
             kv_src.create_domain("shop").await.unwrap();
+            let system = system_store(&_d1).await;
             let record = UserRecord {
                 name: "alice".to_string(),
                 api_key_hash: "deadbeef".to_string(),
                 role: crate::auth::UserRole::User,
                 created_at: now_secs(),
             };
-            engine.put(b"__sys:auth:user:alice", &serde_json::to_vec(&record).unwrap()).await.unwrap();
+            system.put(b"__sys:auth:user:alice", &serde_json::to_vec(&record).unwrap()).await.unwrap();
             let perm = DomainPermission { username: "alice".to_string(), domain: "shop".to_string(), access: crate::auth::AccessLevel::Read };
-            engine
+            system
                 .put(format!("{PREFIX_PERM}alice:shop").as_bytes(), &serde_json::to_vec(&perm).unwrap())
                 .await
                 .unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_auth", BackupScope::All, true, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_auth", BackupScope::All, true, &kv_src, &None, &system).await;
 
             // A scope="all" archive always contains "default" (every registry
             // auto-creates it), so restoring into a freshly-recovered registry
@@ -1412,8 +1467,9 @@ mod tests {
             async fn run_replace_restore(
                 out_dir: &Path,
                 include_auth: bool,
-            ) -> (Arc<LsmStorageEngine>, RestoreOutcome, tempfile::TempDir) {
+            ) -> (Arc<LsmStorageEngine>, Arc<ControlPlane>, RestoreOutcome, tempfile::TempDir) {
                 let (engine, kv_dst, dir) = make_kv_registry().await;
+                let control = control_over(&dir, &kv_dst, &None).await;
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let purger = Arc::new(crate::engines::lsm::domain::DomainPurger::new(
                     Arc::clone(&engine),
@@ -1439,26 +1495,70 @@ mod tests {
                     include_auth,
                     kv_registry: &kv_dst,
                     json_engine: &None,
+                    control: &control,
                     scan_batch_size: 500,
                     scan_pause_ms: 0,
                 })
                 .await
                 .unwrap();
                 drop(purger_task);
-                (engine, outcome, dir)
+                (engine, control, outcome, dir)
             }
 
             // Default (false): auth lines are ignored.
-            let (engine2, _outcome, _keep2) = run_replace_restore(out_dir.path(), false).await;
-            assert!(engine2.get(b"__sys:auth:user:alice").await.unwrap().is_none());
+            let (_engine2, control2, _outcome, _keep2) = run_replace_restore(out_dir.path(), false).await;
+            assert!(control2.system_store().get(b"__sys:auth:user:alice").await.unwrap().is_none());
 
-            // true: auth lines are upserted.
-            let (engine3, outcome, _keep3) = run_replace_restore(out_dir.path(), true).await;
+            // true: auth lines are upserted into the system store.
+            let (engine3, control3, outcome, _keep3) = run_replace_restore(out_dir.path(), true).await;
             assert!(outcome.imported >= 2, "kv default domain data + 2 auth records");
-            let raw = engine3.get(b"__sys:auth:user:alice").await.unwrap().unwrap();
+            let system3 = control3.system_store();
+            let raw = system3.get(b"__sys:auth:user:alice").await.unwrap().unwrap();
             let restored: UserRecord = serde_json::from_slice(&raw).unwrap();
             assert_eq!(restored.api_key_hash, "deadbeef");
-            assert!(engine3.get(format!("{PREFIX_PERM}alice:shop").as_bytes()).await.unwrap().is_some());
+            assert!(system3.get(format!("{PREFIX_PERM}alice:shop").as_bytes()).await.unwrap().is_some());
+            assert!(engine3.get(b"__sys:auth:user:alice").await.unwrap().is_none(), "nothing lands in the KV engine");
+        })
+    }
+
+    // 8a. An archive written before the system store existed — the auth
+    //     lines are the same — restores its auth records into the system store.
+    #[test]
+    fn test_older_archive_restores_auth_into_the_system_store() {
+        crate::core::engine_runtime::block_on(async {
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let path = out_dir.path().join("bk_old.ndjson");
+            let manifest = json!({
+                "t": "manifest", "format_version": FORMAT_VERSION, "id": "bk_old", "created_at": 1_700_000_000u64,
+                "luradb_version": "0.4.0", "scope": "kv", "include_auth": true, "kv_snapshot_ts": 1,
+                "json_snapshot_ts": 0, "encoding": "hex", "schedule": null,
+            });
+            let user = json!({"t": "auth-user", "name": "zoé", "api_key_hash": "f00d", "role": "User", "created_at": 1});
+            let perm = json!({"t": "auth-perm", "username": "zoé", "domain": "json:shop", "access": "Write"});
+            reseal(&path, &[manifest.to_string(), user.to_string(), perm.to_string()]);
+
+            let (engine, kv_dst, dir) = make_kv_registry().await;
+            let control = control_over(&dir, &kv_dst, &None).await;
+            let outcome = run_restore(RestoreParams {
+                dir: out_dir.path(),
+                backup_id: "bk_old",
+                mode: RestoreMode::FailIfExists,
+                into_domain: None,
+                include_auth: true,
+                kv_registry: &kv_dst,
+                json_engine: &None,
+                control: &control,
+                scan_batch_size: 500,
+                scan_pause_ms: 0,
+            })
+            .await
+            .unwrap();
+
+            assert_eq!((outcome.imported, outcome.failed), (2, 0));
+            let system = control.system_store();
+            assert!(system.get("__sys:auth:user:zoé".as_bytes()).await.unwrap().is_some());
+            assert!(system.get("__sys:auth:perm:zoé:json:shop".as_bytes()).await.unwrap().is_some());
+            assert!(engine.scan_keys(b"__sys:auth:").await.unwrap().is_empty());
         })
     }
 
@@ -1468,17 +1568,18 @@ mod tests {
     #[test]
     fn test_backup_include_auth_false_excludes_auth_lines() {
         crate::core::engine_runtime::block_on(async {
-            let (engine, kv_src, _d1) = make_kv_registry().await;
+            let (_engine, kv_src, _d1) = make_kv_registry().await;
+            let system = system_store(&_d1).await;
             let record = UserRecord {
                 name: "bob".to_string(),
                 api_key_hash: "cafe".to_string(),
                 role: crate::auth::UserRole::Admin,
                 created_at: now_secs(),
             };
-            engine.put(b"__sys:auth:user:bob", &serde_json::to_vec(&record).unwrap()).await.unwrap();
+            system.put(b"__sys:auth:user:bob", &serde_json::to_vec(&record).unwrap()).await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let path = make_backup(out_dir.path(), "bk_noauth", BackupScope::All, false, &kv_src, &None).await;
+            let path = make_backup(out_dir.path(), "bk_noauth", BackupScope::All, false, &kv_src, &None, &system).await;
             let content = std::fs::read_to_string(path).unwrap();
             assert!(!content.contains("auth-user"));
         })
@@ -1491,6 +1592,7 @@ mod tests {
     fn test_run_restore_rejects_traversal_like_id_via_missing_file() {
         crate::core::engine_runtime::block_on(async {
             let (_engine, kv_dst, _d1) = make_kv_registry().await;
+            let control = control_over(&_d1, &kv_dst, &None).await;
             let out_dir = tempfile::TempDir::new().unwrap();
             let err = run_restore(RestoreParams {
                 dir: out_dir.path(),
@@ -1500,6 +1602,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1521,9 +1624,10 @@ mod tests {
             }
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_batch", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_batch", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_batch",
@@ -1532,6 +1636,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 2,
                 scan_pause_ms: 5,
             })
@@ -1556,13 +1661,14 @@ mod tests {
             }
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            make_backup(out_dir.path(), "bk_rl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            make_backup(out_dir.path(), "bk_rl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
 
             let (_engine2, kv_dst, _d2) = make_kv_registry_with_config(DomainConfig {
                 default_write_iops: 1,
                 ..DomainConfig::default()
             })
             .await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_rl",
@@ -1571,6 +1677,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1591,12 +1698,13 @@ mod tests {
             kv_src.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let path = make_backup(out_dir.path(), "bk_trail", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            let path = make_backup(out_dir.path(), "bk_trail", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
             let mut content = std::fs::read_to_string(&path).unwrap();
             content.push_str("{\"t\":\"kv\",\"domain\":\"shop\",\"k\":\"6578747261\",\"v\":\"6578747261\",\"expires_at\":0}\n");
             std::fs::write(&path, content).unwrap();
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let err = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_trail",
@@ -1605,6 +1713,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1625,13 +1734,14 @@ mod tests {
             kv_src.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let path = make_backup(out_dir.path(), "bk_blank", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None).await;
+            let path = make_backup(out_dir.path(), "bk_blank", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await).await;
             let content = std::fs::read_to_string(&path).unwrap();
             let mut file_lines: Vec<&str> = content.lines().collect();
             file_lines.insert(1, "");
             std::fs::write(&path, file_lines.join("\n") + "\n").unwrap();
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             let err = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_blank",
@@ -1640,6 +1750,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1668,10 +1779,12 @@ mod tests {
                 false,
                 &kv,
                 &json_src_opt,
+                &system_store(&_d1).await,
             )
             .await;
 
             let (_engine2, kv_dst, _d3) = make_kv_registry().await;
+            let control = control_over(&_d3, &kv_dst, &None).await;
             let err = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_nojson",
@@ -1680,6 +1793,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1708,12 +1822,15 @@ mod tests {
                 false,
                 &kv,
                 &json_src_opt,
+                &system_store(&_d1).await,
             )
             .await;
 
             let (json_dst, _d3) = make_json_engine().await;
             json_dst.create_domain("catalog").await.unwrap();
             json_dst.put_document("catalog", "old", json!({"n": 1})).await.unwrap();
+            let json_dst_opt = Some(Arc::clone(&json_dst));
+            let control = control_over(&_d3, &kv, &json_dst_opt).await;
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let purger = Arc::new(JsonDomainPurger::new(Arc::clone(&json_dst), Arc::clone(&shutdown), 100, 1));
@@ -1727,7 +1844,6 @@ mod tests {
                 }
             });
 
-            let json_dst_opt = Some(Arc::clone(&json_dst));
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_jreplace",
@@ -1736,6 +1852,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv,
                 json_engine: &json_dst_opt,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })
@@ -1762,7 +1879,7 @@ mod tests {
 
             let out_dir = tempfile::TempDir::new().unwrap();
             let path =
-                make_backup(out_dir.path(), "bk_undecl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None)
+                make_backup(out_dir.path(), "bk_undecl", BackupScope::KvDomain("shop".to_string()), false, &kv_src, &None, &system_store(&_d1).await)
                     .await;
 
             // Retarget the data line at an undeclared domain (the declaration
@@ -1776,6 +1893,7 @@ mod tests {
             reseal(&path, &body);
 
             let (_engine2, kv_dst, _d2) = make_kv_registry().await;
+            let control = control_over(&_d2, &kv_dst, &None).await;
             kv_dst.create_domain("live").await.unwrap();
             kv_dst.store("live").await.unwrap().put(b"production", b"untouched").await.unwrap();
 
@@ -1787,6 +1905,7 @@ mod tests {
                 include_auth: false,
                 kv_registry: &kv_dst,
                 json_engine: &None,
+                control: &control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             })

@@ -7,6 +7,7 @@
 
 use crate::api::rel::rel_engine;
 use crate::api::{middleware::ApiError, AppState};
+use crate::control::{DomainEntry, Engine};
 use crate::engines::rel::{RelDomain, RelDomainState};
 use axum::{
     extract::{Path, State},
@@ -45,6 +46,12 @@ impl From<RelDomain> for RelDomainResponse {
     }
 }
 
+impl From<&DomainEntry> for RelDomainResponse {
+    fn from(d: &DomainEntry) -> Self {
+        RelDomainResponse { name: d.name.clone(), created_at: d.created_at, state: d.state.as_str().to_string() }
+    }
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -65,9 +72,9 @@ pub async fn create_domain(
     State(state): State<AppState>,
     Json(body): Json<CreateRelDomainRequest>,
 ) -> Result<(StatusCode, Json<RelDomainResponse>), ApiError> {
-    let engine = rel_engine(&state)?;
-    let domain = engine.create_domain(&body.name).await?;
-    Ok((StatusCode::CREATED, Json(domain.into())))
+    rel_engine(&state)?;
+    let domain = state.control.create_domain(Engine::Rel, &body.name, false).await?;
+    Ok((StatusCode::CREATED, Json((&domain).into())))
 }
 
 #[utoipa::path(
@@ -81,8 +88,8 @@ pub async fn create_domain(
 )]
 /// Returns all active relational domains.
 pub async fn list_domains(State(state): State<AppState>) -> Result<Json<Vec<RelDomainResponse>>, ApiError> {
-    let engine = rel_engine(&state)?;
-    Ok(Json(engine.list_domains().into_iter().map(Into::into).collect()))
+    rel_engine(&state)?;
+    Ok(Json(state.control.directory().domains(Engine::Rel).map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -134,7 +141,7 @@ pub async fn delete_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let engine = rel_engine(&state)?;
-    engine.delete_domain(&name).await?;
+    rel_engine(&state)?;
+    state.control.delete_domain(Engine::Rel, &name).await?;
     Ok(StatusCode::ACCEPTED)
 }

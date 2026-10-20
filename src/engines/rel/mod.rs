@@ -51,7 +51,7 @@ pub enum ExecOutcome {
 }
 
 use crate::config::{BlockCacheConfig, RelStoreConfig};
-use crate::core::events::GlobalEventBus;
+use crate::control::{ControlPlane, Engine};
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
@@ -133,11 +133,9 @@ pub struct RelEngine {
     /// intact). `parking_lot::RwLock`: sync-only critical sections, never
     /// held across an `.await`.
     rate_limiters: RwLock<HashMap<String, Arc<RateLimiter>>>,
-    /// Global lifecycle/DDL event bus (spec general/018 §1) — backs the
-    /// central DDL dispatch in `execute_checked`; domain lifecycle events are
-    /// published by `domains` itself. Unset in unit tests and a standalone-
-    /// built engine, which then publish nothing.
-    event_bus: OnceLock<Arc<GlobalEventBus>>,
+    /// Publishes the DDL events of `execute_checked` and finishes purges.
+    /// Unset for a standalone engine, which then publishes nothing.
+    control: OnceLock<Arc<ControlPlane>>,
 }
 
 impl RelEngine {
@@ -208,7 +206,7 @@ impl RelEngine {
             max_response_bytes: MAX_RESPONSE_BYTES,
             import_body_limit_bytes: config.import_body_limit_bytes,
             rate_limiters: RwLock::new(HashMap::new()),
-            event_bus: OnceLock::new(),
+            control: OnceLock::new(),
         }))
     }
 
@@ -217,12 +215,9 @@ impl RelEngine {
         &self.engine
     }
 
-    /// Wires the global event bus (spec general/018 §1): its own `OnceLock`
-    /// backs the central DDL dispatch, and it forwards to `domains` for the
-    /// domain lifecycle events.
-    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
-        self.domains.attach_event_bus(Arc::clone(&bus));
-        let _ = self.event_bus.set(bus);
+    /// Set once at startup, before the purger runs.
+    pub(crate) fn attach_control_plane(&self, control: Arc<ControlPlane>) {
+        let _ = self.control.set(control);
     }
 
     /// Gracefully shuts down the underlying LSM instance.
@@ -233,7 +228,7 @@ impl RelEngine {
     // ── Domain management (spec rel/002) ───────────────────────────────────────
 
     /// Creates a new rel domain.
-    pub async fn create_domain(&self, name: &str) -> Result<RelDomain, RelStoreError> {
+    pub(crate) async fn create_domain(&self, name: &str) -> Result<RelDomain, RelStoreError> {
         self.domains.create_domain(name).await
     }
 
@@ -255,9 +250,35 @@ impl RelEngine {
         self.domains.list_domains()
     }
 
-    /// Marks a rel domain as deleting; the purger (rel/013) cleans up later.
-    pub async fn delete_domain(&self, name: &str) -> Result<(), RelStoreError> {
+    /// Marks a rel domain as deleting; the purger cleans up later.
+    pub(crate) async fn delete_domain(&self, name: &str) -> Result<(), RelStoreError> {
         self.domains.delete_domain(name).await
+    }
+
+    /// Removes a purged domain's metadata for good.
+    pub(crate) async fn finalize_deletion(&self, name: &str) -> Result<(), RelStoreError> {
+        self.domains.finalize_deletion(name).await
+    }
+
+    /// Removes a purged domain — through the control plane once attached.
+    async fn finish_purge(&self, name: &str) -> Result<()> {
+        match self.control.get() {
+            Some(control) => control.finalize_deletion(Engine::Rel, name).await,
+            None => Ok(self.finalize_deletion(name).await?),
+        }
+    }
+
+    /// Returns once every row commit and catalog change in progress ended;
+    /// later ones see the current domain state. Neither lock is held while
+    /// taking the other.
+    pub(crate) async fn quiesce_writes(&self) {
+        drop(self.write_guard.lock().await);
+        self.catalog.quiesce().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn write_guard_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.write_guard.lock().await
     }
 
     // ── Catalog (spec rel/003) ─────────────────────────────────────────────────
@@ -477,28 +498,27 @@ impl RelEngine {
     }
 
     /// Maps a successfully executed `DdlOutcome` to its global-event-stream
-    /// `kind`/`object` and publishes it (spec general/018 §2/§4 point 10). A
-    /// `RENAME TABLE` (`TableAltered` with `renamed_from: Some(old)`)
-    /// publishes two adjacent events instead of one (§2.1): `table_dropped`
-    /// for the name that no longer exists, `table_created` for the one that
-    /// now does — correct for every client without new field knowledge.
+    /// `kind`/`object` and publishes it. A `RENAME TABLE` (`TableAltered`
+    /// with `renamed_from: Some(old)`) publishes two adjacent events instead
+    /// of one: `table_dropped` for the name that no longer exists,
+    /// `table_created` for the one that now does — correct for every client
+    /// without new field knowledge.
     fn publish_ddl_event(&self, domain: &str, outcome: &DdlOutcome) {
-        let Some(bus) = self.event_bus.get() else { return };
+        let Some(control) = self.control.get() else { return };
+        let publish = |kind, object: &str| control.publish_global(Engine::Rel, kind, domain, Some(object.to_string()));
         match outcome {
-            DdlOutcome::TableCreated(schema) => bus.publish("rel", "table_created", domain, Some(schema.name.clone())),
-            DdlOutcome::TableAltered { schema, renamed_from: Some(old) } => bus.publish_many(
-                "rel",
+            DdlOutcome::TableCreated(schema) => publish("table_created", &schema.name),
+            DdlOutcome::TableAltered { schema, renamed_from: Some(old) } => control.publish_global_many(
+                Engine::Rel,
                 domain,
                 &[("table_dropped", Some(old.clone())), ("table_created", Some(schema.name.clone()))],
             ),
-            DdlOutcome::TableAltered { schema, renamed_from: None } => {
-                bus.publish("rel", "table_altered", domain, Some(schema.name.clone()))
-            }
-            DdlOutcome::TableDropped { name } => bus.publish("rel", "table_dropped", domain, Some(name.clone())),
-            DdlOutcome::IndexCreated(meta) => bus.publish("rel", "index_created", domain, Some(meta.name.clone())),
-            DdlOutcome::IndexDropped { name } => bus.publish("rel", "index_dropped", domain, Some(name.clone())),
-            DdlOutcome::ViewCreated(view) => bus.publish("rel", "view_created", domain, Some(view.name.clone())),
-            DdlOutcome::ViewDropped { name } => bus.publish("rel", "view_dropped", domain, Some(name.clone())),
+            DdlOutcome::TableAltered { schema, renamed_from: None } => publish("table_altered", &schema.name),
+            DdlOutcome::TableDropped { name } => publish("table_dropped", name),
+            DdlOutcome::IndexCreated(meta) => publish("index_created", &meta.name),
+            DdlOutcome::IndexDropped { name } => publish("index_dropped", name),
+            DdlOutcome::ViewCreated(view) => publish("view_created", &view.name),
+            DdlOutcome::ViewDropped { name } => publish("view_dropped", name),
         }
     }
 }
@@ -937,7 +957,8 @@ mod tests {
     async fn make_engine_with_bus() -> (Arc<RelEngine>, Arc<crate::core::events::GlobalEventBus>, tempfile::TempDir) {
         let (rel, dir) = make_engine().await;
         let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
-        rel.attach_event_bus(Arc::clone(&bus));
+        let kv = crate::control::testing::kv_registry(dir.path()).await;
+        crate::control::testing::start(dir.path(), kv, None, Some(Arc::clone(&rel)), Arc::clone(&bus)).await;
         (rel, bus, dir)
     }
 
@@ -1031,34 +1052,11 @@ mod tests {
         })
     }
 
-    // Test 2 (rel slice): after a purge run, domain_purged appears, after
-    // domain_deleted.
+    // DDL without a control plane succeeds unchanged, no panic.
     #[test]
-    fn test_domain_purge_event_published_after_domain_deleted() {
+    fn test_rel_ddl_without_control_plane_succeeds_without_panic() {
         crate::core::engine_runtime::block_on(async {
-            let (rel, bus, _dir) = make_engine_with_bus().await;
-            let mut rx = bus.subscribe();
-
-            rel.create_domain("purge-ev").await.unwrap();
-            rx.try_recv().unwrap(); // domain_created, not under test here
-            rel.delete_domain("purge-ev").await.unwrap();
-
-            let purger = RelDomainPurger::new(Arc::clone(&rel), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
-            purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
-
-            let deleted = rx.try_recv().unwrap();
-            assert_eq!(deleted.kind, "domain_deleted");
-            let purged = rx.try_recv().unwrap();
-            assert_eq!(purged.kind, "domain_purged");
-            assert_eq!(purged.domain, "purge-ev");
-        })
-    }
-
-    // Test 12 (rel slice): DDL without a bus attached succeeds unchanged, no panic.
-    #[test]
-    fn test_rel_ddl_without_event_bus_attached_succeeds_without_panic() {
-        crate::core::engine_runtime::block_on(async {
-            let (rel, _dir) = make_engine().await; // no attach_event_bus call
+            let (rel, _dir) = make_engine().await; // no control plane attached
             rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
             rel.execute("default", "ALTER TABLE t ADD COLUMN a INTEGER", &[]).await.unwrap();
             rel.execute("default", "DROP TABLE t", &[]).await.unwrap();

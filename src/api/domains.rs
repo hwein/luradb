@@ -6,6 +6,7 @@
 //! DELETE /store-api/domains/{name}       → delete_domain  (202 Accepted | 404)
 
 use crate::api::{middleware::ApiError, AppState};
+use crate::control::{DomainEntry, Engine, Lifecycle};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -46,6 +47,16 @@ impl From<crate::engines::lsm::Domain> for DomainResponse {
     }
 }
 
+impl From<&DomainEntry> for DomainResponse {
+    fn from(d: &DomainEntry) -> Self {
+        DomainResponse {
+            name: d.name.clone(),
+            created_at: d.created_at,
+            require_conditional_writes: d.require_conditional_writes,
+        }
+    }
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -67,12 +78,8 @@ pub async fn create_domain(
     State(state): State<AppState>,
     Json(body): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<DomainResponse>), ApiError> {
-    let domain = state
-        .registry
-        .create_domain_with(&body.name, body.require_conditional_writes)
-        .await
-        .map_err(ApiError::from)?;
-    Ok((StatusCode::CREATED, Json(DomainResponse::from(domain))))
+    let domain = state.control.create_domain(Engine::Kv, &body.name, body.require_conditional_writes).await?;
+    Ok((StatusCode::CREATED, Json(DomainResponse::from(&domain))))
 }
 
 #[utoipa::path(
@@ -87,8 +94,9 @@ pub async fn create_domain(
 pub async fn list_domains(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<DomainResponse>>, ApiError> {
-    let domains = state.registry.list_domains().await.map_err(ApiError::from)?;
-    Ok(Json(domains.into_iter().map(DomainResponse::from).collect()))
+    let directory = state.control.directory();
+    let active = directory.domains(Engine::Kv).filter(|d| d.state == Lifecycle::Active);
+    Ok(Json(active.map(DomainResponse::from).collect()))
 }
 
 #[utoipa::path(
@@ -131,6 +139,6 @@ pub async fn delete_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.registry.delete_domain(&name).await.map_err(ApiError::from)?;
+    state.control.delete_domain(Engine::Kv, &name).await?;
     Ok(StatusCode::ACCEPTED)
 }

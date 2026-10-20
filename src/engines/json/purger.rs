@@ -50,35 +50,44 @@ impl JsonDomainPurger {
     }
 
     /// One purge cycle: tombstones up to `batch_size` keys per deleting
-    /// domain; finalizes the domain once no data keys remain. Scans through
-    /// tombstone/finalize run under every document-write shard so no
-    /// in-flight writer can land keys after the final empty scan (json/013).
+    /// domain; finalizes the domain once no data keys remain. The scans run
+    /// under every document-write shard: a writer still in flight lands its
+    /// keys before the final empty scan, every later one sees the domain
+    /// `Deleting` and writes nothing — so the finalize needs no shard.
     pub async fn purge_tick(&self) -> anyhow::Result<()> {
         for domain in self.engine.domains.list_deleting_domains() {
-            let _guards = self.engine.lock_shards((0..DOC_WRITE_SHARDS).collect()).await;
-            let doc_keys = self
-                .engine
-                .engine()
-                .scan_keys_limited(&doc_scan_prefix(&domain.system_prefix), self.batch_size)
-                .await?;
-            let idx_keys = self
-                .engine
-                .engine()
-                .scan_keys_limited(&index_domain_prefix(&domain.system_prefix), self.batch_size)
-                .await?;
-            if doc_keys.is_empty() && idx_keys.is_empty() {
-                self.engine.indexes.purge_domain_definitions(&domain.name).await?;
-                self.engine.domains.finalize_deletion(&domain.name).await?;
+            let emptied = {
+                let _guards = self.engine.lock_shards((0..DOC_WRITE_SHARDS).collect()).await;
+                let doc_keys = self
+                    .engine
+                    .engine()
+                    .scan_keys_limited(&doc_scan_prefix(&domain.system_prefix), self.batch_size)
+                    .await?;
+                let idx_keys = self
+                    .engine
+                    .engine()
+                    .scan_keys_limited(&index_domain_prefix(&domain.system_prefix), self.batch_size)
+                    .await?;
+                if doc_keys.is_empty() && idx_keys.is_empty() {
+                    self.engine.indexes.purge_domain_definitions(&domain.name).await?;
+                    true
+                } else {
+                    let ops: Vec<BatchOp> = doc_keys
+                        .into_iter()
+                        .chain(idx_keys)
+                        .take(self.batch_size)
+                        .map(|key| BatchOp::Delete { key })
+                        .collect();
+                    self.engine.engine().write_batch(ops).await?;
+                    false
+                }
+            };
+            // Without the shards: a domain delete waits for them, and the
+            // finalize may queue behind one.
+            if emptied {
+                self.engine.finish_purge(&domain.name).await?;
                 tracing::info!("[JsonDomainPurger] domain '{}' fully purged", domain.name);
-                continue;
             }
-            let ops: Vec<BatchOp> = doc_keys
-                .into_iter()
-                .chain(idx_keys)
-                .take(self.batch_size)
-                .map(|key| BatchOp::Delete { key })
-                .collect();
-            self.engine.engine().write_batch(ops).await?;
         }
         Ok(())
     }

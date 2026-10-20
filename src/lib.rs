@@ -6,6 +6,7 @@ pub mod auth;
 pub mod backup;
 pub mod bridge;
 pub mod config;
+pub mod control;
 pub mod core;
 pub mod cors;
 pub mod engines;

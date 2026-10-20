@@ -7,6 +7,7 @@ use crate::auth::{DomainPermission, UserRecord, PREFIX_PERM, PREFIX_USER};
 use crate::core::coop::YieldEvery;
 use crate::engines::json::{IndexFieldType, JsonDomain, JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{now_secs, Domain, DomainRegistry};
+use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::{GetResult, RegistrySnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -183,6 +184,8 @@ pub(crate) struct BackupParams<'a> {
     pub resolved: &'a ResolvedScope,
     pub kv_registry: &'a Arc<DomainRegistry>,
     pub json_engine: &'a Option<Arc<JsonEngine>>,
+    /// Holds the auth records.
+    pub system_store: &'a LsmStorageEngine,
     pub scan_batch_size: usize,
     pub scan_pause_ms: u64,
 }
@@ -254,16 +257,15 @@ impl PartFile {
 }
 
 async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyhow::Result<()> {
-    // include_auth only ever applies to all/kv (spec: auth records live in
-    // the KV instance) -- other scopes silently ignore the flag.
+    // include_auth only ever applies to all/kv -- other scopes silently
+    // ignore the flag.
     let export_auth = params.include_auth && matches!(params.scope, BackupScope::All | BackupScope::Kv);
 
     // One registered snapshot per engine, held for the whole export so the
-    // compaction low watermark keeps every visible version around (spec
-    // general/006 consistency guarantee). `None` when that engine has
-    // nothing to export in this scope, so no snapshot (and no GC
-    // back-pressure) is taken for it. Auth records sit on the raw KV engine
-    // outside every domain, so they need the KV snapshot on their own.
+    // compaction low watermark keeps every visible version around. `None`
+    // when that engine has nothing to export in this scope, so no snapshot
+    // (and no GC back-pressure) is taken for it. An auth export still dates
+    // the manifest by the KV snapshot; the records come from the system store.
     let kv_snapshot: Option<RegistrySnapshot> =
         if !params.resolved.kv_domains.is_empty() || export_auth {
             Some(params.kv_registry.engine().snapshot())
@@ -302,8 +304,7 @@ async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyho
     write_json_section(&mut out, &mut hasher, &mut lines, params, json_snapshot.as_ref()).await?;
 
     if export_auth {
-        let snap = kv_snapshot.as_ref().expect("export_auth implies a kv snapshot");
-        write_auth_section(&mut out, &mut hasher, &mut lines, params.kv_registry, snap).await?;
+        write_auth_section(&mut out, &mut hasher, &mut lines, params.system_store).await?;
     }
 
     let sha256 = hex::encode(hasher.finalize());
@@ -360,14 +361,14 @@ async fn write_kv_section(
     Ok(())
 }
 
+/// Exports the auth records on one snapshot of the system store.
 async fn write_auth_section(
     out: &mut PartFile,
     hasher: &mut Sha256,
     lines: &mut u64,
-    kv_registry: &Arc<DomainRegistry>,
-    snap: &RegistrySnapshot,
+    engine: &LsmStorageEngine,
 ) -> anyhow::Result<()> {
-    let engine = kv_registry.engine();
+    let snap = engine.snapshot();
 
     let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
     let user_keys = engine.scan_keys_with_snapshot(PREFIX_USER.as_bytes(), snap.snapshot()).await?;
@@ -488,7 +489,8 @@ mod tests {
     use crate::core::wal::WriteAheadLog;
     use serde_json::json;
 
-    async fn make_kv_registry() -> (Arc<DomainRegistry>, tempfile::TempDir) {
+    /// A KV registry and, next to it, the system store holding auth records.
+    async fn make_kv_registry() -> (Arc<DomainRegistry>, Arc<LsmStorageEngine>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -504,7 +506,8 @@ mod tests {
         let metrics = MetricsStore::new(MetricsConfig::default());
         let registry =
             Arc::new(DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap());
-        (registry, dir)
+        let system = crate::control::system::open(&dir.path().join("sys")).await.unwrap();
+        (registry, system, dir)
     }
 
     async fn make_json_engine() -> (Arc<JsonEngine>, tempfile::TempDir) {
@@ -523,7 +526,7 @@ mod tests {
     #[test]
     fn test_resolve_all_scope_kv_only() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir) = make_kv_registry().await;
+            let (kv, _, _dir) = make_kv_registry().await;
             kv.create_domain("shop").await.unwrap();
             let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
             let names: Vec<_> = resolved.kv_domains.iter().map(|d| d.name.clone()).collect();
@@ -537,7 +540,7 @@ mod tests {
     #[test]
     fn test_resolve_kv_domain_missing_errors() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir) = make_kv_registry().await;
+            let (kv, _, _dir) = make_kv_registry().await;
             let err = resolve_scope(&BackupScope::KvDomain("nope".to_string()), &kv, &None)
                 .await
                 .unwrap_err();
@@ -549,7 +552,7 @@ mod tests {
     #[test]
     fn test_resolve_json_scope_without_engine_errors() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir) = make_kv_registry().await;
+            let (kv, _, _dir) = make_kv_registry().await;
             let err = resolve_scope(&BackupScope::Json, &kv, &None).await.unwrap_err();
             assert!(matches!(err, BackupError::JsonEngineDisabled));
             let err = resolve_scope(&BackupScope::JsonDomain("x".to_string()), &kv, &None)
@@ -563,7 +566,7 @@ mod tests {
     #[test]
     fn test_resolve_domain_scope_single_engine() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, _, _dir1) = make_kv_registry().await;
             let (json, _dir2) = make_json_engine().await;
             kv.create_domain("only-kv").await.unwrap();
             let resolved = resolve_scope(&BackupScope::Domain("only-kv".to_string()), &kv, &Some(Arc::clone(&json)))
@@ -578,7 +581,7 @@ mod tests {
     #[test]
     fn test_resolve_domain_scope_missing_everywhere() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, _, _dir1) = make_kv_registry().await;
             let (json, _dir2) = make_json_engine().await;
             let err = resolve_scope(&BackupScope::Domain("nope".to_string()), &kv, &Some(json))
                 .await
@@ -592,7 +595,7 @@ mod tests {
     #[test]
     fn test_run_backup_kv_only_writes_valid_ndjson() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             kv.create_domain("shop").await.unwrap();
             let store = kv.store("shop").await.unwrap();
             store.put(b"order:1", b"hello").await.unwrap();
@@ -611,6 +614,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &None,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
@@ -657,7 +661,7 @@ mod tests {
     #[test]
     fn test_run_backup_snapshot_excludes_writes_during_export() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             kv.create_domain("shop").await.unwrap();
             let store = kv.store("shop").await.unwrap();
             store.put(b"a1", b"v1").await.unwrap();
@@ -679,6 +683,7 @@ mod tests {
                     resolved: &resolved,
                     kv_registry: &kv_for_task,
                     json_engine: &None,
+                    system_store: &system,
                     scan_batch_size: 1,
                     scan_pause_ms: 300,
                 };
@@ -705,7 +710,7 @@ mod tests {
     #[test]
     fn test_include_auth_ignored_for_domain_scope() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             kv.create_domain("shop").await.unwrap();
             let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -719,6 +724,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &None,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
@@ -735,8 +741,8 @@ mod tests {
     #[test]
     fn test_backup_include_auth_true_exports_auth_lines() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
-            let engine = kv.engine();
+            let (kv, system, _dir1) = make_kv_registry().await;
+            let engine = &system;
             let record = UserRecord {
                 name: "carol".to_string(),
                 api_key_hash: "abc123".to_string(),
@@ -766,6 +772,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &None,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
@@ -795,7 +802,7 @@ mod tests {
     #[test]
     fn test_backup_exports_auth_without_any_kv_domain() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             kv.delete_domain("default").await.unwrap();
             let record = UserRecord {
                 name: "erin".to_string(),
@@ -803,7 +810,7 @@ mod tests {
                 role: crate::auth::UserRole::Admin,
                 created_at: 1_700_000_000,
             };
-            kv.engine()
+            system
                 .put(format!("{PREFIX_USER}erin").as_bytes(), &serde_json::to_vec(&record).unwrap())
                 .await
                 .unwrap();
@@ -822,6 +829,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &None,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
@@ -839,7 +847,7 @@ mod tests {
     #[test]
     fn test_run_backup_json_domain_with_index_and_docs() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             let (json, _dir2) = make_json_engine().await;
             json.create_domain("catalog").await.unwrap();
             json.create_index("catalog", "city", IndexFieldType::String).await.unwrap();
@@ -861,6 +869,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &json_engine_opt,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
@@ -878,7 +887,7 @@ mod tests {
     #[test]
     fn test_backup_section_order_kv_json_auth_checksum() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             let (json, _dir2) = make_json_engine().await;
             kv.create_domain("shop").await.unwrap();
             kv.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
@@ -890,7 +899,7 @@ mod tests {
                 role: crate::auth::UserRole::User,
                 created_at: 1,
             };
-            kv.engine().put(b"__sys:auth:user:dave", &serde_json::to_vec(&record).unwrap()).await.unwrap();
+            system.put(b"__sys:auth:user:dave", &serde_json::to_vec(&record).unwrap()).await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
             let json_opt = Some(Arc::clone(&json));
@@ -905,6 +914,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &json_opt,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
@@ -928,7 +938,7 @@ mod tests {
     #[test]
     fn test_checksum_line_is_valid() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             kv.create_domain("shop").await.unwrap();
             let store = kv.store("shop").await.unwrap();
             store.put(b"k1", b"v1").await.unwrap();
@@ -946,6 +956,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &None,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
@@ -971,7 +982,7 @@ mod tests {
     #[test]
     fn test_run_backup_cleans_up_part_file_on_error() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _dir1) = make_kv_registry().await;
+            let (kv, system, _dir1) = make_kv_registry().await;
             // A scope resolving to a KV domain that was deleted right after
             // resolution simulates a mid-job failure: `store()` on a Deleting/
             // gone domain errors out inside the writer.
@@ -990,6 +1001,7 @@ mod tests {
                 resolved: &resolved,
                 kv_registry: &kv,
                 json_engine: &None,
+                system_store: &system,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };

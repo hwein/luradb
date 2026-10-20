@@ -13,6 +13,7 @@
 
 use crate::auth::middleware::{extract_bearer, split_permission_domain, StoreType, TrustedPeer};
 use crate::auth::{generate_api_key, hash_api_key, AccessLevel, AuthCache, DomainPermission, UserRecord, UserRole};
+use crate::control::{AuthChange, ControlPlane};
 use crate::engines::json::JsonEngine;
 use crate::engines::lsm::DomainRegistry;
 use crate::engines::rel::RelEngine;
@@ -31,6 +32,8 @@ use utoipa::ToSchema;
 #[derive(Clone)]
 pub struct AuthState {
     pub cache: Arc<AuthCache>,
+    /// Runs every change to the auth records.
+    pub control: Arc<ControlPlane>,
     pub registry: Arc<DomainRegistry>,
     /// Mirrors `AppState::auth_enabled` (`api/mod.rs`) — needed by `whoami`
     /// to report the `Disabled` pseudo-role when the `auth_layer` middleware
@@ -245,7 +248,7 @@ pub async fn create_user(
         created_at: now_secs(),
     };
 
-    if let Err(e) = state.cache.upsert_user(record).await {
+    if let Err(e) = state.control.change_auth(AuthChange::UpsertUser(record)).await {
         return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
 
@@ -349,7 +352,7 @@ pub async fn delete_user(
     if state.cache.get_user_by_name(&name).await.is_none() {
         return err(StatusCode::NOT_FOUND, "404 Not Found: user not found");
     }
-    match state.cache.remove_user(&name).await {
+    match state.control.change_auth(AuthChange::RemoveUser(name)).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -440,7 +443,7 @@ pub async fn set_permission(
         domain: crate::auth::middleware::permission_domain(store_type, &body.domain),
         access,
     };
-    match state.cache.set_permission(perm).await {
+    match state.control.change_auth(AuthChange::SetPermission(perm)).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -476,7 +479,7 @@ pub async fn remove_permission(
     if state.cache.get_permission(&name, &perm_domain).await.is_none() {
         return err(StatusCode::NOT_FOUND, "404 Not Found: permission not found");
     }
-    match state.cache.remove_permission(&name, &perm_domain).await {
+    match state.control.change_auth(AuthChange::RemovePermission { username: name, domain: perm_domain }).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -504,7 +507,8 @@ pub async fn rotate_key(
     }
     let new_key = generate_api_key();
     let new_hash = hash_api_key(&new_key);
-    match state.cache.rotate_key(&name, &new_hash).await {
+    let change = AuthChange::RotateKey { name: name.clone(), new_hash };
+    match state.control.change_auth(change).await {
         Ok(()) => Json(RotateKeyResponse {
             name,
             api_key: new_key,
@@ -569,7 +573,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = Arc::new(AuthCache::new(Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             crate::engines::lsm::DomainRegistry::recover(
@@ -607,6 +610,14 @@ mod tests {
         } else {
             None
         };
+        let (control, auth_cache) = crate::control::testing::start(
+            dir.path(),
+            Arc::clone(&registry),
+            json_engine.clone(),
+            rel_engine.clone(),
+            Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+        )
+        .await;
         let state = crate::api::AppState {
             registry,
             auth_cache: Arc::clone(&auth_cache),
@@ -617,7 +628,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,

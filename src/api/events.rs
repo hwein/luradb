@@ -13,6 +13,7 @@ use axum::{
 use futures::StreamExt;
 use serde::Deserialize;
 use std::convert::Infallible;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 // ── Query param types ─────────────────────────────────────────────────────────
@@ -133,8 +134,9 @@ pub async fn get_events(
     // subscribe() before the ring snapshot (spec §5, kv/024 §4.3): nothing
     // published between them can be lost — only re-delivered, which the live
     // loop below discards via `suppress_upto`.
-    let rx = state.event_bus.subscribe();
-    let resume = state.event_bus.decide_resume(last_event_id.as_deref());
+    let bus = Arc::clone(state.control.event_bus());
+    let rx = bus.subscribe();
+    let resume = bus.decide_resume(last_event_id.as_deref());
 
     let (leading, suppress_upto): (Vec<Event>, Option<u64>) = match resume {
         Resume::Live => (Vec::new(), None),
@@ -146,7 +148,6 @@ pub async fn get_events(
     };
     let leading_stream = futures::stream::iter(leading.into_iter().map(Ok::<Event, Infallible>));
 
-    let bus = state.event_bus;
     let live_stream = futures::stream::unfold((rx, suppress_upto, bus), move |(mut rx, suppress_upto, bus)| async move {
         loop {
             let msg = rx.recv().await;
@@ -183,9 +184,9 @@ mod tests {
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
-    /// Full three-engine test app, admin key pre-provisioned, bus wired to
-    /// all three engines before the router is built (mirrors the engine
-    /// bootstrap's startup order in `server`, spec §1).
+    /// Full three-engine test app, admin key pre-provisioned, the control
+    /// plane attached to all three engines before the router is built
+    /// (mirrors the engine bootstrap's startup order in `server`).
     struct TestApp {
         app: axum::Router,
         admin_key: String,
@@ -244,11 +245,14 @@ mod tests {
         .unwrap();
 
         let bus = Arc::new(GlobalEventBus::new(channel_capacity, replay_buffer_size));
-        registry.attach_event_bus(Arc::clone(&bus)); // attach before anything runs, spec §1
-        json_engine.attach_event_bus(Arc::clone(&bus));
-        rel_engine.attach_event_bus(Arc::clone(&bus));
-
-        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
+        let (control, auth_cache) = crate::control::testing::start(
+            dir.path(),
+            Arc::clone(&registry),
+            Some(Arc::clone(&json_engine)),
+            Some(Arc::clone(&rel_engine)),
+            bus,
+        )
+        .await;
         let admin_key = "lura_test_events_admin".to_string();
         auth_cache
             .upsert_user(crate::auth::UserRecord {
@@ -270,7 +274,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: bus,
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,

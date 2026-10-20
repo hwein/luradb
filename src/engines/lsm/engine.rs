@@ -1157,6 +1157,18 @@ impl LsmStorageEngine {
         Ok(())
     }
 
+    /// Returns once every write that already holds its in-flight guard has
+    /// applied; writes admitted later are not waited for.
+    pub(crate) async fn quiesce_writes(&self) {
+        drop(self.in_flight_writes.write().await);
+    }
+
+    /// A write in flight, as far as [`Self::quiesce_writes`] can tell.
+    #[cfg(test)]
+    pub(crate) async fn in_flight_write_for_test(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.in_flight_writes.read().await
+    }
+
     // ── Core write helpers ───────────────────────────────────────────────────
 
     /// Assigns the next watch-stream sequence, rings it, and broadcasts it

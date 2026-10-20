@@ -7,15 +7,13 @@
 //! `Deleting`; physical cleanup follows in spec rel/013.
 
 use super::error::RelStoreError;
-use crate::core::events::GlobalEventBus;
 use crate::engines::lsm::domain::{fnv64, now_secs};
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::StorageEngine;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
 const SYS_REL_DOMAIN_PREFIX: &[u8] = b"__sys:rel_domain:";
 pub(crate) const DEFAULT_DOMAIN: &str = "default";
@@ -94,17 +92,11 @@ impl RelDomain {
 
 // ── RelDomainRegistry ──────────────────────────────────────────────────────────
 
-/// Manages rel domain lifecycle: creation, lookup, listing, deletion, recovery.
+/// Holds the rel domains: lookup, listing, recovery. Creates and deletes run
+/// through the control plane, one at a time.
 pub struct RelDomainRegistry {
     domains: RwLock<HashMap<String, RelDomain>>,
     engine: Arc<LsmStorageEngine>,
-    /// Serializes `create_domain`/`delete_domain` end-to-end: each is a
-    /// check-then-act that spans an await, so the lifecycle transitions must
-    /// not interleave (spec general/003; rel/002 §4).
-    lifecycle_lock: Mutex<()>,
-    /// Global lifecycle/DDL event bus (spec general/018 §1) — unset in unit
-    /// tests and a standalone-built registry, which then publishes nothing.
-    event_bus: OnceLock<Arc<GlobalEventBus>>,
 }
 
 impl RelDomainRegistry {
@@ -126,12 +118,7 @@ impl RelDomainRegistry {
                 }
             }
         }
-        let registry = Self {
-            domains: RwLock::new(loaded),
-            engine,
-            lifecycle_lock: Mutex::new(()),
-            event_bus: OnceLock::new(),
-        };
+        let registry = Self { domains: RwLock::new(loaded), engine };
         // Any state counts: creating over a Deleting default would fail with
         // DomainAlreadyExists and abort every boot. The purger (rel/013)
         // finalizes it; the next recover() then recreates it.
@@ -148,23 +135,11 @@ impl RelDomainRegistry {
         Ok(registry)
     }
 
-    /// Wires the global event bus (spec general/018 §1); a no-op call site
-    /// (`event_bus.get()` returning `None`) means it was never attached.
-    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
-        let _ = self.event_bus.set(bus);
-    }
-
-    /// `domain_created` / `domain_deleted` / `domain_purged` (spec §2).
-    fn publish_lifecycle_event(&self, kind: &'static str, domain: &str) {
-        if let Some(bus) = self.event_bus.get() {
-            bus.publish("rel", kind, domain, None);
-        }
-    }
-
-    /// Creates a new domain. Fails if the name already exists (incl. deleting).
-    pub async fn create_domain(&self, name: &str) -> Result<RelDomain, RelStoreError> {
+    /// Creates a new domain. Fails if the name already exists (incl.
+    /// deleting). The check and the insert span an await: callers must not
+    /// run two lifecycle changes at once.
+    pub(crate) async fn create_domain(&self, name: &str) -> Result<RelDomain, RelStoreError> {
         validate_domain_name(name)?;
-        let _guard = self.lifecycle_lock.lock().await;
         if self.domains.read().contains_key(name) {
             return Err(RelStoreError::DomainAlreadyExists(name.to_string()));
         }
@@ -172,7 +147,6 @@ impl RelDomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain.clone());
-        self.publish_lifecycle_event("domain_created", name);
         Ok(domain)
     }
 
@@ -213,8 +187,7 @@ impl RelDomainRegistry {
     /// Marks the domain `Deleting` and persists the change. Catalog and row
     /// data (rel/003+) stay on disk under the domain's prefix until the
     /// purger (spec rel/013) cleans them up.
-    pub async fn delete_domain(&self, name: &str) -> Result<(), RelStoreError> {
-        let _guard = self.lifecycle_lock.lock().await;
+    pub(crate) async fn delete_domain(&self, name: &str) -> Result<(), RelStoreError> {
         let mut domain = match self.get_domain_any(name) {
             None => return Err(RelStoreError::DomainNotFound(name.to_string())),
             Some(d) if d.state == RelDomainState::Deleting => {
@@ -226,18 +199,16 @@ impl RelDomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain);
-        self.publish_lifecycle_event("domain_deleted", name);
         Ok(())
     }
 
     /// Removes the domain metadata for good — `__sys:rel_domain:{name}` from
-    /// persistence and the cache. The rel/013 purger calls this after all data
-    /// and catalog keys of the domain are gone (metadata is the last anchor,
-    /// so a crash before this leaves the domain `Deleting` and resumable).
+    /// persistence and the cache — once the purger removed all data and
+    /// catalog keys of the domain (metadata is the last anchor, so a crash
+    /// before this leaves the domain `Deleting` and resumable).
     pub(crate) async fn finalize_deletion(&self, name: &str) -> Result<(), RelStoreError> {
         self.engine.delete(&sys_key(name)).await?;
         self.domains.write().remove(name);
-        self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
 
@@ -441,28 +412,6 @@ mod tests {
         })
     }
 
-    // 10. 8 parallel create_domain calls for the same name -> exactly one Ok
-    //     (create-lock, spec general/003).
-    #[test]
-    fn test_concurrent_create_domain_single_winner() {
-        crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let tasks: Vec<_> = (0..8)
-                .map(|_| {
-                    let reg = Arc::clone(&registry);
-                    compio::runtime::spawn(async move { reg.create_domain("contested").await })
-                })
-                .collect();
-            let mut ok = 0;
-            for t in tasks {
-                if t.await.unwrap().is_ok() {
-                    ok += 1;
-                }
-            }
-            assert_eq!(ok, 1, "exactly one concurrent create_domain must succeed");
-        })
-    }
-
     // 11. recover survives a Deleting default domain without a 409 boot loop;
     //     it stays invisible/Deleting (until rel/013 purges it).
     #[test]
@@ -482,79 +431,4 @@ mod tests {
         })
     }
 
-    // 12. 8 parallel delete_domain calls on the same active domain -> exactly
-    //     one Ok, the rest DomainDeleting (410): the lifecycle lock serializes
-    //     the check-then-act across its await (rel/002 §4). Without the lock all
-    //     callers read `Active` and return Ok.
-    #[test]
-    fn test_concurrent_delete_domain_single_winner() {
-        crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            registry.create_domain("contested").await.unwrap();
-            let tasks: Vec<_> = (0..8)
-                .map(|_| {
-                    let reg = Arc::clone(&registry);
-                    compio::runtime::spawn(async move { reg.delete_domain("contested").await })
-                })
-                .collect();
-            let mut ok = 0;
-            let mut deleting = 0;
-            for t in tasks {
-                match t.await.unwrap() {
-                    Ok(()) => ok += 1,
-                    Err(RelStoreError::DomainDeleting(_)) => deleting += 1,
-                    Err(e) => panic!("unexpected error: {e}"),
-                }
-            }
-            assert_eq!(ok, 1, "exactly one concurrent delete_domain must succeed");
-            assert_eq!(deleting, 7, "the losers must see DomainDeleting (410)");
-        })
-    }
-
-    // ── Spec general/018: global lifecycle event bus ────────────────────────
-
-    // Test 1 (rel slice): create_domain/delete_domain publish domain_created/
-    // domain_deleted with engine "rel" and the right domain.
-    #[test]
-    fn test_domain_lifecycle_events_published_with_rel_engine_tag() {
-        crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
-            registry.attach_event_bus(Arc::clone(&bus));
-            let mut rx = bus.subscribe();
-
-            registry.create_domain("evdom").await.unwrap();
-            registry.delete_domain("evdom").await.unwrap();
-
-            let created = rx.try_recv().unwrap();
-            assert_eq!(created.engine, "rel");
-            assert_eq!(created.kind, "domain_created");
-            assert_eq!(created.domain, "evdom");
-            assert_eq!(created.object, None);
-
-            let deleted = rx.try_recv().unwrap();
-            assert_eq!(deleted.kind, "domain_deleted");
-            assert_eq!(deleted.domain, "evdom");
-        })
-    }
-
-    // Test 2 (rel slice) lives in rel/mod.rs's test module, which already
-    // has the RelEngine (not just this bare registry) fixture RelDomainPurger
-    // needs (see test_domain_purge_event_published_after_domain_deleted).
-
-    // Test 12 (rel slice): no bus attached -> lifecycle ops succeed unchanged,
-    // no panic, and nothing is published anywhere.
-    #[test]
-    fn test_lifecycle_ops_without_event_bus_attached_publish_nothing() {
-        crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let bus = crate::core::events::GlobalEventBus::new(16, 16); // never attached
-            let mut rx = bus.subscribe();
-
-            registry.create_domain("no-bus").await.unwrap();
-            registry.delete_domain("no-bus").await.unwrap();
-
-            assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
-        })
-    }
 }

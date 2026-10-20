@@ -7,6 +7,7 @@
 /luradb.db
 /luradb.vlog
 /luradb_sstables
+/luradb_sys
 /luradb_rel.wal
 /luradb_rel.vlog
 /luradb_rel_sstables

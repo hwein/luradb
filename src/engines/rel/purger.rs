@@ -6,9 +6,8 @@
 //! resumable — the domain stays `Deleting`); (b) reap orphaned
 //! `ROW:`/`IDX:`/`SEQ:` ranges left in **active** domains by `DROP TABLE`/`DROP
 //! INDEX` (ids allocated but no longer in the catalog). Both are batch-bounded
-//! and crash-trivial; job (a)'s emptiness check + finalization run under the
-//! engine write guard so no in-flight writer can land keys after finalization
-//! (rel/013 §3, pattern: json/013).
+//! and crash-trivial; job (a)'s emptiness check runs under the engine write
+//! guard so no in-flight writer can land keys after finalization.
 
 use super::domain::{RelDomain, RelDomainState};
 use super::keys;
@@ -78,39 +77,42 @@ impl RelDomainPurger {
 
     /// Tombstones up to `batch_size` data keys of one deleting domain; once
     /// `ROW:`/`IDX:`/`SEQ:` are all empty, drops the catalog definitions and
-    /// then the domain metadata. The whole per-domain body runs under the
-    /// engine write guard, so the emptiness check that gates finalization sees
-    /// every committed writer's keys (spec rel/013 §3, pattern: json/013).
+    /// then the domain metadata. The emptiness check runs under the engine
+    /// write guard, so it sees every committed writer's keys; every later
+    /// writer finds the domain `Deleting` — the finalize needs no guard.
     async fn purge_one_deleting(&self, domain: &RelDomain) -> anyhow::Result<()> {
-        let _wg = self.engine.write_guard.lock().await;
-        let engine = self.engine.engine();
-        let prefix = &domain.system_prefix;
-        let row_p = keys::row_domain_prefix(prefix);
-        let idx_p = keys::index_domain_prefix(prefix);
-        let seq_p = keys::seq_domain_prefix(prefix);
+        {
+            let _wg = self.engine.write_guard.lock().await;
+            let engine = self.engine.engine();
+            let prefix = &domain.system_prefix;
+            let row_p = keys::row_domain_prefix(prefix);
+            let idx_p = keys::index_domain_prefix(prefix);
+            let seq_p = keys::seq_domain_prefix(prefix);
 
-        let row_keys = engine.scan_keys_limited(&row_p, self.batch_size).await?;
-        let idx_keys = engine.scan_keys_limited(&idx_p, self.batch_size).await?;
-        let seq_keys = engine.scan_keys_limited(&seq_p, self.batch_size).await?;
+            let row_keys = engine.scan_keys_limited(&row_p, self.batch_size).await?;
+            let idx_keys = engine.scan_keys_limited(&idx_p, self.batch_size).await?;
+            let seq_keys = engine.scan_keys_limited(&seq_p, self.batch_size).await?;
 
-        if row_keys.is_empty() && idx_keys.is_empty() && seq_keys.is_empty() {
+            if !(row_keys.is_empty() && idx_keys.is_empty() && seq_keys.is_empty()) {
+                let ops: Vec<BatchOp> = row_keys
+                    .into_iter()
+                    .chain(idx_keys)
+                    .chain(seq_keys)
+                    .take(self.batch_size)
+                    .map(|key| BatchOp::Delete { key })
+                    .collect();
+                let purged = ops.len() as u64;
+                engine.write_batch(ops).await?;
+                self.engine.metrics.record_rel_purged_keys(purged);
+                return Ok(());
+            }
             self.engine.catalog.purge_domain_definitions(domain).await?;
-            self.engine.domains.finalize_deletion(&domain.name).await?;
-            self.engine.drop_domain_rate_limiter(&domain.name);
-            tracing::info!("[RelDomainPurger] domain '{}' fully purged", domain.name);
-            return Ok(());
         }
-
-        let ops: Vec<BatchOp> = row_keys
-            .into_iter()
-            .chain(idx_keys)
-            .chain(seq_keys)
-            .take(self.batch_size)
-            .map(|key| BatchOp::Delete { key })
-            .collect();
-        let purged = ops.len() as u64;
-        engine.write_batch(ops).await?;
-        self.engine.metrics.record_rel_purged_keys(purged);
+        // Without the guard: a domain delete waits for it, and the finalize
+        // may queue behind one.
+        self.engine.finish_purge(&domain.name).await?;
+        self.engine.drop_domain_rate_limiter(&domain.name);
+        tracing::info!("[RelDomainPurger] domain '{}' fully purged", domain.name);
         Ok(())
     }
 

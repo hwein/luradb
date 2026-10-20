@@ -1,3 +1,4 @@
+use crate::control::system;
 use crate::core::wal::WAL_MAX_FIELD_LEN;
 use crate::engines::json::domain as json_domain;
 use crate::engines::rel::{catalog as rel_catalog, row::ROW_HEADER_LEN};
@@ -48,20 +49,31 @@ impl LuraConfig {
     /// Parses config text. Also returns the keys it sets that the server does
     /// not read, sorted and deduplicated; they are ignored (spec general/030).
     pub fn parse(content: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
-        let config = toml::from_str(content)?;
+        let mut config: Self = toml::from_str(content)?;
         let mut keys = Vec::new();
         toml_keys(&content.parse()?, "", &mut keys);
+        if !keys.iter().any(|key| key == "storage.system_dir") {
+            let parent = Path::new(&config.storage.sstable_dir).parent().unwrap_or(Path::new(""));
+            config.storage.system_dir = parent.join("luradb_sys").to_string_lossy().into_owned();
+        }
         Ok((config, unknown_keys(keys, &known_keys())))
     }
 
     /// Rejects data paths that share a real location or land on a vLog
     /// generation file `<vlog_path>.<n>`; relative paths resolve against `base`.
     pub fn validate_data_paths(&self, base: &Path) -> anyhow::Result<()> {
+        // The system store's own files collide like any other data path.
+        let [system_wal, system_vlog, system_sstables] = [system::WAL_FILE, system::VLOG_FILE, system::SSTABLE_DIR]
+            .map(|name| Path::new(&self.storage.system_dir).join(name).to_string_lossy().into_owned());
         let mut entries: Vec<(&str, &str, bool)> = vec![
             ("storage.db_path", self.storage.db_path.as_str(), false),
             ("storage.wal_path", self.storage.wal_path.as_str(), false),
             ("storage.vlog_path", self.storage.vlog_path.as_str(), true),
             ("storage.sstable_dir", self.storage.sstable_dir.as_str(), false),
+            ("storage.system_dir", self.storage.system_dir.as_str(), false),
+            ("storage.system_dir", system_wal.as_str(), false),
+            ("storage.system_dir", system_vlog.as_str(), true),
+            ("storage.system_dir", system_sstables.as_str(), false),
         ];
         if self.json.enabled {
             entries.push(("json.wal_path", self.json.wal_path.as_str(), false));
@@ -308,6 +320,9 @@ pub struct StorageConfig {
     pub wal_path: String,
     pub vlog_path: String,
     pub sstable_dir: String,
+    /// Directory of the system store: auth records and the store's own markers.
+    /// Unset in the config file, it is `luradb_sys` beside `sstable_dir`.
+    pub system_dir: String,
 }
 
 impl Default for StorageConfig {
@@ -317,6 +332,7 @@ impl Default for StorageConfig {
             wal_path: "luradb.wal".to_string(),
             vlog_path: "luradb.vlog".to_string(),
             sstable_dir: "luradb_sstables".to_string(),
+            system_dir: "luradb_sys".to_string(),
         }
     }
 }
@@ -1966,6 +1982,28 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_data_paths_system_dir_collision_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let mut config = LuraConfig::default();
+        config.storage.system_dir = config.storage.sstable_dir.clone();
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("storage.system_dir") && err.contains("storage.sstable_dir"), "{err}");
+
+        // The system store's own files count too, not just its directory.
+        let mut config = LuraConfig::default();
+        config.storage.system_dir = "data".to_string();
+        config.storage.sstable_dir = "data/sstables".to_string();
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("storage.system_dir") && err.contains("storage.sstable_dir"), "{err}");
+
+        let mut config = LuraConfig::default();
+        config.json.wal_path = format!("{}/wal", config.storage.system_dir);
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("storage.system_dir") && err.contains("json.wal_path"), "{err}");
+    }
+
+    #[test]
     fn test_validate_data_paths_backup_enabled_default_dir_ok() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = LuraConfig::default();
@@ -2690,6 +2728,29 @@ flag = true
         let (config, unknown) = LuraConfig::parse(toml_str).unwrap();
         assert_eq!(config.server.port, LuraConfig::default().server.port);
         assert_eq!(unknown, [r#""server.port""#, r#"auth."admins.name""#]);
+    }
+
+    #[test]
+    fn test_parse_puts_an_unset_system_dir_beside_the_sstable_dir() {
+        let (config, _) = LuraConfig::parse("[storage]\nsstable_dir = \"/data/kv/sstables\"\n").unwrap();
+        assert_eq!(config.storage.system_dir, "/data/kv/luradb_sys");
+
+        let (config, _) = LuraConfig::parse("[storage]\nsstable_dir = \"kv/sstables\"\n").unwrap();
+        assert_eq!(config.storage.system_dir, "kv/luradb_sys");
+    }
+
+    #[test]
+    fn test_parse_keeps_an_explicit_system_dir() {
+        let toml_str = "[storage]\nsstable_dir = \"/data/kv/sstables\"\nsystem_dir = \"/srv/sys\"\n";
+        let (config, _) = LuraConfig::parse(toml_str).unwrap();
+        assert_eq!(config.storage.system_dir, "/srv/sys");
+    }
+
+    #[test]
+    fn test_default_system_dir_is_beside_the_default_sstable_dir() {
+        assert_eq!(LuraConfig::default().storage.system_dir, "luradb_sys");
+        let (config, _) = LuraConfig::parse("").unwrap();
+        assert_eq!(config.storage.system_dir, "luradb_sys");
     }
 
     /// What the config-file gate finds (spec general/030).

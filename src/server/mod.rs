@@ -515,7 +515,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = Arc::new(AuthCache::new(Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             crate::engines::lsm::DomainRegistry::recover(
@@ -526,6 +525,8 @@ mod tests {
             .await
             .unwrap(),
         );
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(256, 1024));
+        let (control, auth_cache) = crate::control::testing::start(dir.path(), Arc::clone(&registry), None, None, bus).await;
         let state = api::AppState {
             registry,
             auth_cache,
@@ -536,7 +537,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: Arc::new(LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,
@@ -660,6 +661,7 @@ mod tests {
         cfg.storage.wal_path = path("luradb.wal");
         cfg.storage.vlog_path = path("luradb.vlog");
         cfg.storage.sstable_dir = path("sstables");
+        cfg.storage.system_dir = path("sys");
         cfg.json.enabled = false;
         cfg.rel.enabled = false;
         cfg.rel.wal_path = path("rel.wal");
@@ -890,6 +892,77 @@ mod tests {
         let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
         assert!(format!("{err:#}").contains("trusted_proxies"), "{err:#}");
         assert!(dir.path().join("sstables").exists(), "the engines booted before the failure");
+    }
+
+    /// The key-value engine on `cfg`'s paths, as the server opens it.
+    async fn open_kv_engine(cfg: &LuraConfig) -> Arc<crate::engines::lsm::engine::LsmStorageEngine> {
+        let (wal_path, vlog_path) = (PathBuf::from(&cfg.storage.wal_path), PathBuf::from(&cfg.storage.vlog_path));
+        let wal = Arc::new(crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
+        let fm = Arc::new(crate::storage::file_manager::FileManager::new(&cfg.storage.sstable_dir).await.unwrap());
+        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&cfg.storage.sstable_dir));
+        let options = crate::engines::lsm::engine::LsmEngineOptions::default();
+        Arc::new(crate::engines::lsm::engine::LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, fm, mm, options).await.unwrap())
+    }
+
+    // An older data directory keeps its users in the key-value engine: the
+    // first start moves them into the system store, the next one finds
+    // nothing left to move, and both serve them.
+    #[test]
+    fn the_first_start_moves_auth_records_out_of_the_key_value_engine() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let record = crate::auth::UserRecord {
+            name: "zoé".to_string(),
+            api_key_hash: crate::auth::hash_api_key("lura_zoe"),
+            role: crate::auth::UserRole::User,
+            created_at: 1,
+        };
+        engine_runtime::block_on(async {
+            let kv = open_kv_engine(&cfg).await;
+            kv.put("__sys:auth:user:zoé".as_bytes(), &serde_json::to_vec(&record).unwrap()).await.unwrap();
+            kv.shutdown().await;
+        });
+
+        for start in ["first", "second"] {
+            let server = Server::start(Arc::new(test_config(dir.path())), &dir.path().join("luradb.toml")).unwrap();
+            let addr = server.http_addr.expect("HTTP listener enabled");
+            let (status, users) =
+                tokio::runtime::Runtime::new().unwrap().block_on(request(addr, &get("/store-api/auth/users")));
+            server.shutdown().unwrap();
+            assert_eq!(status, 200, "{start} start");
+            let users: Value = serde_json::from_slice(&users).unwrap();
+            assert_eq!(users[0]["name"], json!("zoé"), "{start} start: {users}");
+
+            engine_runtime::block_on(async {
+                use crate::engines::StorageEngine;
+                let kv = open_kv_engine(&cfg).await;
+                assert!(kv.scan_keys(b"__sys:auth:").await.unwrap().is_empty(), "{start} start");
+                kv.shutdown().await;
+                let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
+                assert!(system.get("__sys:auth:user:zoé".as_bytes()).await.unwrap().is_some(), "{start} start");
+                system.shutdown().await;
+            });
+        }
+    }
+
+    // Data laid out for another shard count is not opened at all.
+    #[test]
+    fn a_start_with_a_changed_shard_count_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        engine_runtime::block_on(async {
+            let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
+            crate::control::system::check_shard_count(&system, 2).await.unwrap();
+            system.shutdown().await;
+        });
+
+        let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
+        assert!(
+            format!("{err:#}").contains("shard count changed (stored 2, configured 1) — run the shard migration tool"),
+            "{err:#}"
+        );
+        assert!(!dir.path().join("sstables").exists(), "no engine was opened");
     }
 
     // A1.5: a bridge capacity the channel cannot take down must fail the

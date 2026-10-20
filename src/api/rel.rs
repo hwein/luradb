@@ -331,6 +331,16 @@ mod tests {
     /// with `cfg`'s limits (paths are always freshly assigned into a temp dir).
     /// `auth_enabled` toggles the auth middleware layer (rel/011 tests need it on).
     async fn make_state(rel_config: Option<RelStoreConfig>, auth_enabled: bool) -> (AppState, tempfile::TempDir) {
+        make_tuned_state(rel_config, auth_enabled, |_| {}).await
+    }
+
+    /// [`make_state`], with `tune` overriding the engine's fixed limits
+    /// before anything else holds the engine.
+    async fn make_tuned_state(
+        rel_config: Option<RelStoreConfig>,
+        auth_enabled: bool,
+        tune: impl FnOnce(&mut RelEngine),
+    ) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let kv_dir = dir.path().join("kv");
         std::fs::create_dir_all(&kv_dir).unwrap();
@@ -348,7 +358,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), Arc::clone(&metrics))
@@ -372,9 +381,14 @@ mod tests {
                     None,
                     Arc::clone(&metrics),
                 );
-                Some(RelEngine::bootstrap(&cfg, Arc::clone(&metrics), resolver).await.unwrap())
+                let mut engine = RelEngine::bootstrap(&cfg, Arc::clone(&metrics), resolver).await.unwrap();
+                tune(Arc::get_mut(&mut engine).unwrap());
+                Some(engine)
             }
         };
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(256, 1024));
+        let (control, auth_cache) =
+            crate::control::testing::start(dir.path(), Arc::clone(&registry), None, rel_engine.clone(), bus).await;
         let state = AppState {
             registry,
             auth_cache,
@@ -385,7 +399,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,
@@ -405,8 +419,7 @@ mod tests {
 
     /// The default rel config, with `tune` overriding the engine's fixed limits.
     async fn make_tuned_app(tune: impl FnOnce(&mut RelEngine)) -> (axum::Router, tempfile::TempDir) {
-        let (mut state, dir) = make_state(Some(RelStoreConfig::default()), false).await;
-        tune(Arc::get_mut(state.rel_engine.as_mut().unwrap()).unwrap());
+        let (state, dir) = make_tuned_state(Some(RelStoreConfig::default()), false, tune).await;
         (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 

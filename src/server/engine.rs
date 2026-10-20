@@ -7,6 +7,7 @@ use crate::{
     auth::{reconcile_admins, AuthCache},
     backup,
     config::LuraConfig,
+    control::{system, ControlPlane, Owners},
     core::{
         buffer_pool::BufferPoolManager,
         coop,
@@ -47,6 +48,7 @@ pub(super) struct Teardown {
     lsm_store: Arc<LsmStorageEngine>,
     json_engine: Option<Arc<JsonEngine>>,
     rel_engine: Option<Arc<RelEngine>>,
+    system_store: Arc<LsmStorageEngine>,
     shm_manager: Option<Arc<ShmManager>>,
     buffer_pool: Arc<BufferPoolManager>,
     storage_thread: Option<StorageThread>,
@@ -212,6 +214,7 @@ fn init_backup(
     cfg: &LuraConfig,
     registry: &Arc<DomainRegistry>,
     json_engine: &Option<Arc<JsonEngine>>,
+    control: &Arc<ControlPlane>,
     shutdown_flag: &Arc<AtomicBool>,
 ) -> anyhow::Result<Option<Arc<backup::BackupManager>>> {
     if !cfg.backup.enabled {
@@ -225,7 +228,8 @@ fn init_backup(
             "backup.enabled is true but auth.enabled is false — any client that reaches this port can create and download full backups."
         );
     }
-    let manager = backup::BackupManager::new(&cfg.backup, Arc::clone(registry), json_engine.clone())?;
+    let manager =
+        backup::BackupManager::new(&cfg.backup, Arc::clone(registry), json_engine.clone(), Arc::clone(control))?;
     let scheduler = Arc::new(backup::scheduler::BackupScheduler::new(
         Arc::clone(&manager),
         &cfg.backup.schedule,
@@ -457,6 +461,12 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
     let (engine_config, compaction_config, janitor_config, domain_config, metrics) =
         build_engine_configs(config);
 
+    // --- System store --- before the engines: data laid out for another
+    // shard count must not be opened at all.
+    let system_store = system::open(Path::new(&config.storage.system_dir)).await?;
+    system::check_shard_count(&system_store, system::CONFIGURED_SHARDS).await?;
+    tracing::info!("System store ready.");
+
     // --- Storage stack ---
     let disk_manager = DiskManager::new(&config.storage.db_path).await?;
     let buffer_pool = Arc::new(BufferPoolManager::new(config.buffer_pool.pool_size, disk_manager));
@@ -512,6 +522,7 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
     }
     lsm_store.start_background_tasks();
     tracing::info!("Storage engine ready.");
+    system::migrate_auth(&lsm_store, &system_store).await?;
 
     // --- Domain registry ---
     let purger_batch_size = domain_config.purger_batch_size;
@@ -524,21 +535,26 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
     let json_engine = init_json_engine(config, &metrics).await?;
     let rel_engine = init_rel_engine(config, &registry, &json_engine, &metrics).await?;
 
-    // --- Global event bus (spec general/018 §1) --- attached before the
-    // purgers are spawned and before the listener accepts requests: a
-    // finalize_* running against an unattached bus would silently drop
-    // its domain_purged event, which is exactly what this ordering avoids.
+    // --- Auth cache --- on the system store, after the auth move above.
+    let auth_cache = Arc::new(AuthCache::new(Arc::clone(&system_store)));
+    auth_cache.load_from_engine().await?;
+    reconcile_admins(&auth_cache, &config.auth.admins, config.auth.enabled).await?;
+    tracing::info!("Auth cache loaded.");
+
+    // --- Control plane --- attached to the engines before the purgers are
+    // spawned and before the listener accepts requests: a purge finished
+    // behind its back would never reach the directory or the event stream.
     let event_bus = Arc::new(crate::core::events::GlobalEventBus::new(
         config.events.channel_capacity,
         config.events.replay_buffer_size,
     ));
-    registry.attach_event_bus(Arc::clone(&event_bus));
-    if let Some(engine) = &json_engine {
-        engine.attach_event_bus(Arc::clone(&event_bus));
-    }
-    if let Some(engine) = &rel_engine {
-        engine.attach_event_bus(Arc::clone(&event_bus));
-    }
+    let owners = Owners {
+        kv: Arc::clone(&registry),
+        json: json_engine.clone(),
+        rel: rel_engine.clone(),
+        auth: Arc::clone(&auth_cache),
+    };
+    let control = ControlPlane::start(owners, Arc::clone(&system_store), event_bus).await?;
 
     let shutdown_flag = spawn_background_tasks(
         config,
@@ -551,14 +567,8 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
         purger_interval_secs,
     );
 
-    let backup_manager = init_backup(config, &registry, &json_engine, &shutdown_flag)?;
+    let backup_manager = init_backup(config, &registry, &json_engine, &control, &shutdown_flag)?;
     let log_access = init_log_access(config);
-
-    // --- Auth cache ---
-    let auth_cache = Arc::new(AuthCache::new(Arc::clone(&lsm_store)));
-    auth_cache.load_from_engine().await?;
-    reconcile_admins(&auth_cache, &config.auth.admins, config.auth.enabled).await?;
-    tracing::info!("Auth cache loaded.");
 
     // --- Trusted proxy CIDRs ---
     let trusted_cidrs = Arc::new(
@@ -579,7 +589,7 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
         shm_manager: shm_manager.clone(),
         backup_manager,
         log_access,
-        event_bus,
+        control,
         config: Arc::clone(config),
         config_path: config_path.display().to_string(),
         config_file_loaded: config_path.exists(),
@@ -594,6 +604,7 @@ pub(super) async fn bootstrap_engine(config: &Arc<LuraConfig>, config_path: &Pat
             lsm_store,
             json_engine,
             rel_engine,
+            system_store,
             shm_manager,
             buffer_pool,
             storage_thread,
@@ -611,6 +622,7 @@ pub(super) async fn graceful_shutdown(teardown: Teardown) {
         lsm_store,
         json_engine,
         rel_engine,
+        system_store,
         shm_manager,
         buffer_pool,
         storage_thread,
@@ -636,6 +648,10 @@ pub(super) async fn graceful_shutdown(teardown: Teardown) {
         rel.shutdown().await;
         tracing::info!("Relational engine shutdown complete.");
     }
+
+    tracing::info!("Shutting down system store...");
+    system_store.shutdown().await;
+    tracing::info!("System store shutdown complete.");
 
     if let Some(shm) = &shm_manager {
         tracing::info!("Shutting down SHM manager...");

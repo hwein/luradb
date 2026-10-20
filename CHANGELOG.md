@@ -16,6 +16,7 @@ All notable changes to LuraDB are documented in this file.
 - New `[shm].kick_blocking_client_after_secs` config key disconnects clients that keep the shared-memory snapshot from being updated (`0` = off).
 - **BREAKING** API: KV keys carry an `ETag`; PUT, DELETE and PATCH …/null accept `If-Match` (412 on mismatch or a missing key) and `If-None-Match: *` (create only, 412 if the key exists).
 - **BREAKING** API: domains created with `require_conditional_writes` reject unconditional single-key writes with 428.
+- New `[storage].system_dir` config key sets the directory of the system store, which holds users, API key hashes and permissions apart from domain data.
 
 ### Changed
 
@@ -30,6 +31,7 @@ All notable changes to LuraDB are documented in this file.
 - Short reads are served on the connection thread; long reads run on a multi-threaded reader pool and writes stay on the engine thread.
 - **BREAKING**: Requires Linux kernel 6.1 or newer; the server refuses to start on older kernels.
 - **BREAKING** API: a failed `If-Match` on a JSON document answers 412 instead of 409 (also for a missing document), every 412 carries the `ETag` of the current version, and `If-Match` may be combined with `If-None-Match: *` (If-Match is checked first).
+- Auth records move to the system store on first start (automatic, one-way; a downgrade needs a backup restore).
 
 ### Removed
 

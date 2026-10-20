@@ -171,7 +171,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = std::sync::Arc::new(crate::auth::AuthCache::new(std::sync::Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = std::sync::Arc::new(
             DomainRegistry::recover(std::sync::Arc::clone(&engine), DomainConfig::default(), std::sync::Arc::clone(&metrics))
@@ -195,6 +194,9 @@ mod tests {
                 Some(RelEngine::bootstrap(&cfg, std::sync::Arc::clone(&metrics), resolver).await.unwrap())
             }
         };
+        let bus = std::sync::Arc::new(crate::core::events::GlobalEventBus::new(256, 1024));
+        let (control, auth_cache) =
+            crate::control::testing::start(dir.path(), std::sync::Arc::clone(&registry), None, rel_engine.clone(), bus).await;
         let state = AppState {
             registry,
             auth_cache,
@@ -205,7 +207,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: std::sync::Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: std::sync::Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,

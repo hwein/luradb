@@ -312,6 +312,11 @@ impl RelCatalog {
         })
     }
 
+    /// Returns once the catalog change in progress, if any, ended.
+    pub(super) async fn quiesce(&self) {
+        drop(self.ddl_lock.lock().await);
+    }
+
     /// Validates and creates a table, assigning `table_id` and `index_id`s from
     /// the per-domain counter; the counter bump and the `CAT:` entry are
     /// committed in one atomic `WriteBatch`.

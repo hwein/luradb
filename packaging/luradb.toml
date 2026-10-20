@@ -45,8 +45,8 @@ name = "admin"
 # Placeholder — postinst replaces it with a random key on first install.
 api_key = "@GENERATED_ON_INSTALL@"
 
-# Files of the key-value engine. Relative paths resolve against the working
-# directory; no two data paths may resolve to the same location.
+# Files of the key-value engine and the system store. Relative paths resolve
+# against the working directory; no two data paths may resolve to the same location.
 [storage]
 # Page file of the buffer pool. Default: luradb.db
 db_path = "/var/lib/luradb/luradb.db"
@@ -56,6 +56,9 @@ wal_path = "/var/lib/luradb/luradb.wal"
 vlog_path = "/var/lib/luradb/luradb.vlog"
 # SSTable directory. Default: luradb_sstables
 sstable_dir = "/var/lib/luradb/sstables"
+# Directory of the system store, which keeps the users, API key hashes and
+# permissions apart from domain data. Default: luradb_sys beside the SSTable directory
+system_dir = "/var/lib/luradb/luradb_sys"
 
 [io_engine]
 # Runs the key-value engine's WAL and value-log I/O on a dedicated io_uring

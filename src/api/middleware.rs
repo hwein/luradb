@@ -6,6 +6,7 @@
 //! `Retry-After: 1` header for 429 and `Cache-Control: no-store` for 428
 //! responses.
 
+use crate::control::DomainError;
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
@@ -52,6 +53,20 @@ impl From<anyhow::Error> for ApiError {
             StatusCode::INTERNAL_SERVER_ERROR
         };
         ApiError::new(status, msg)
+    }
+}
+
+impl From<DomainError> for ApiError {
+    fn from(e: DomainError) -> Self {
+        match e {
+            DomainError::Kv(e) => e.into(),
+            DomainError::Json(e) => e.into(),
+            DomainError::Rel(e) => e.into(),
+            DomainError::Disabled(engine) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("503 Service Unavailable: the {} engine is disabled", engine.as_str()),
+            ),
+        }
     }
 }
 

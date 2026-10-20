@@ -7,6 +7,7 @@
 
 use crate::api::json::json_engine;
 use crate::api::{middleware::ApiError, AppState};
+use crate::control::{DomainEntry, Engine};
 use crate::engines::json::{JsonDomain, JsonDomainState};
 use axum::{
     extract::{Path, State},
@@ -58,6 +59,18 @@ impl From<JsonDomain> for JsonDomainResponse {
     }
 }
 
+impl From<&DomainEntry> for JsonDomainResponse {
+    fn from(d: &DomainEntry) -> Self {
+        JsonDomainResponse {
+            name: d.name.clone(),
+            created_at: d.created_at,
+            state: d.state.as_str().to_string(),
+            require_conditional_writes: d.require_conditional_writes,
+            document_count: None,
+        }
+    }
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -79,9 +92,9 @@ pub async fn create_domain(
     State(state): State<AppState>,
     Json(body): Json<CreateJsonDomainRequest>,
 ) -> Result<(StatusCode, Json<JsonDomainResponse>), ApiError> {
-    let engine = json_engine(&state)?;
-    let domain = engine.create_domain_with(&body.name, body.require_conditional_writes).await?;
-    Ok((StatusCode::CREATED, Json(domain.into())))
+    json_engine(&state)?;
+    let domain = state.control.create_domain(Engine::Json, &body.name, body.require_conditional_writes).await?;
+    Ok((StatusCode::CREATED, Json((&domain).into())))
 }
 
 #[utoipa::path(
@@ -97,8 +110,8 @@ pub async fn create_domain(
 pub async fn list_domains(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<JsonDomainResponse>>, ApiError> {
-    let engine = json_engine(&state)?;
-    Ok(Json(engine.list_domains().into_iter().map(Into::into).collect()))
+    json_engine(&state)?;
+    Ok(Json(state.control.directory().domains(Engine::Json).map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -150,7 +163,7 @@ pub async fn delete_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let engine = json_engine(&state)?;
-    engine.delete_domain(&name).await?;
+    json_engine(&state)?;
+    state.control.delete_domain(Engine::Json, &name).await?;
     Ok(StatusCode::ACCEPTED)
 }

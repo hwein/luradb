@@ -20,7 +20,7 @@ pub use query::{DocumentListResult, FilterCondition, ListOptions, SearchQuery, S
 pub use reindex::{ReindexResult, ReindexStatus};
 
 use crate::config::{BlockCacheConfig, JsonStoreConfig};
-use crate::core::events::GlobalEventBus;
+use crate::control::{ControlPlane, Engine};
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
@@ -80,11 +80,9 @@ pub struct JsonEngine {
     /// Sharded per document reference (json/018) — writes on keys of
     /// different shards no longer wait for each other.
     doc_write_locks: [tokio::sync::Mutex<()>; DOC_WRITE_SHARDS],
-    /// Global lifecycle/DDL event bus (spec general/018 §1) — backs
-    /// `create_index`/`delete_index`'s `index_created`/`index_dropped`;
-    /// domain lifecycle events are published by `domains` itself. Unset in
-    /// unit tests and a standalone-built engine, which then publish nothing.
-    event_bus: OnceLock<Arc<GlobalEventBus>>,
+    /// Publishes the index events and finishes purges. Unset for a
+    /// standalone engine, which then publishes nothing.
+    control: OnceLock<Arc<ControlPlane>>,
     /// Engine-aggregate op/latency window (spec general/019). No `Option`,
     /// no setter — always supplied at bootstrap.
     metrics: Arc<MetricsStore>,
@@ -145,7 +143,7 @@ impl JsonEngine {
             reindex_tasks: RwLock::new(HashMap::new()),
             reindex_running: SyncMutex::new(HashMap::new()),
             doc_write_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
-            event_bus: OnceLock::new(),
+            control: OnceLock::new(),
             metrics,
         }))
     }
@@ -155,12 +153,9 @@ impl JsonEngine {
         &self.engine
     }
 
-    /// Wires the global event bus (spec general/018 §1): its own `OnceLock`
-    /// backs `create_index`/`delete_index`, and it forwards to `domains` for
-    /// the domain lifecycle events.
-    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
-        self.domains.attach_event_bus(Arc::clone(&bus));
-        let _ = self.event_bus.set(bus);
+    /// Set once at startup, before the purger runs.
+    pub(crate) fn attach_control_plane(&self, control: Arc<ControlPlane>) {
+        let _ = self.control.set(control);
     }
 
     /// Max HTTP body size for bulk imports (applied at router build).
@@ -175,13 +170,14 @@ impl JsonEngine {
 
     // ── Domain management (spec json/003) ─────────────────────────────────────
 
-    /// Creates a new JSON domain.
-    pub async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
+    /// Creates a new JSON domain, bypassing the control plane.
+    #[cfg(test)]
+    pub(crate) async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
         self.domains.create_domain(name).await
     }
 
     /// Creates a new JSON domain with its `require_conditional_writes` setting.
-    pub async fn create_domain_with(
+    pub(crate) async fn create_domain_with(
         &self,
         name: &str,
         require_conditional_writes: bool,
@@ -207,8 +203,33 @@ impl JsonEngine {
     /// Marks a JSON domain as deleting; the purger cleans up in background.
     /// A running re-index is not aborted here — it stops itself at the next
     /// chunk via its per-chunk domain-state check (run_reindex).
-    pub async fn delete_domain(&self, name: &str) -> Result<(), JsonStoreError> {
+    pub(crate) async fn delete_domain(&self, name: &str) -> Result<(), JsonStoreError> {
         self.domains.delete_domain(name).await
+    }
+
+    /// Removes a purged domain's metadata for good.
+    pub(crate) async fn finalize_deletion(&self, name: &str) -> Result<(), JsonStoreError> {
+        self.domains.finalize_deletion(name).await
+    }
+
+    /// Removes a purged domain — through the control plane once attached.
+    async fn finish_purge(&self, name: &str) -> Result<()> {
+        match self.control.get() {
+            Some(control) => control.finalize_deletion(Engine::Json, name).await,
+            None => Ok(self.finalize_deletion(name).await?),
+        }
+    }
+
+    /// Returns once every document write that holds its lock shard ended;
+    /// later ones see the current domain state.
+    pub(crate) async fn quiesce_writes(&self) {
+        drop(self.lock_shards((0..DOC_WRITE_SHARDS).collect()).await);
+    }
+
+    /// The lock shard a write of `key` in `domain` holds.
+    #[cfg(test)]
+    pub(crate) async fn doc_write_lock_for_test(&self, domain: &str, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.doc_write_locks[Self::shard(domain, key)].lock().await
     }
 
     // ── Index management (spec json/004) ──────────────────────────────────────
@@ -224,8 +245,8 @@ impl JsonEngine {
         field_type: IndexFieldType,
     ) -> Result<IndexDefinition, JsonStoreError> {
         let def = self.indexes.create_index(&self.domains, domain, field, field_type).await?;
-        if let Some(bus) = self.event_bus.get() {
-            bus.publish("json", "index_created", domain, Some(field.to_string()));
+        if let Some(control) = self.control.get() {
+            control.publish_global(Engine::Json, "index_created", domain, Some(field.to_string()));
         }
         Ok(def)
     }
@@ -261,8 +282,8 @@ impl JsonEngine {
     /// Removes an index definition and tombstones the field's `IDX:` entries.
     pub async fn delete_index(&self, domain: &str, field: &str) -> Result<(), JsonStoreError> {
         self.indexes.delete_index(&self.domains, domain, field).await?;
-        if let Some(bus) = self.event_bus.get() {
-            bus.publish("json", "index_dropped", domain, Some(field.to_string()));
+        if let Some(control) = self.control.get() {
+            control.publish_global(Engine::Json, "index_dropped", domain, Some(field.to_string()));
         }
         Ok(())
     }
@@ -1491,39 +1512,15 @@ mod tests {
 
     // ── Spec general/018: global lifecycle event bus ────────────────────────
 
-    // Test 1 (json slice): create_domain/delete_domain publish domain_created/
-    // domain_deleted with engine "json" and the right domain.
-    #[test]
-    fn test_domain_lifecycle_events_published_with_json_engine_tag() {
-        crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            let bus = Arc::new(GlobalEventBus::new(16, 16));
-            json.attach_event_bus(Arc::clone(&bus));
-            let mut rx = bus.subscribe();
-
-            json.create_domain("evdom").await.unwrap();
-            json.delete_domain("evdom").await.unwrap();
-
-            let created = rx.try_recv().unwrap();
-            assert_eq!(created.engine, "json");
-            assert_eq!(created.kind, "domain_created");
-            assert_eq!(created.domain, "evdom");
-            assert_eq!(created.object, None);
-
-            let deleted = rx.try_recv().unwrap();
-            assert_eq!(deleted.kind, "domain_deleted");
-            assert_eq!(deleted.domain, "evdom");
-        })
-    }
-
     // Test 5: create_index/delete_index publish index_created/index_dropped
     // with engine "json" and the field name as `object`.
     #[test]
     fn test_index_events_published_with_field_as_object() {
         crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            let bus = Arc::new(GlobalEventBus::new(16, 16));
-            json.attach_event_bus(Arc::clone(&bus));
+            let (json, dir) = make_engine().await;
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
+            let kv = crate::control::testing::kv_registry(dir.path()).await;
+            crate::control::testing::start(dir.path(), kv, Some(Arc::clone(&json)), None, Arc::clone(&bus)).await;
             let mut rx = bus.subscribe();
 
             json.create_index("default", "city", IndexFieldType::String).await.unwrap();
@@ -1541,46 +1538,15 @@ mod tests {
         })
     }
 
-    // Test 2 (json slice): after a purge run, domain_purged appears, after
-    // domain_deleted.
+    // Without a control plane, domain and index ops succeed unchanged, no panic.
     #[test]
-    fn test_domain_purge_event_published_after_domain_deleted() {
+    fn test_lifecycle_and_index_ops_without_control_plane_succeed() {
         crate::core::engine_runtime::block_on(async {
             let (json, _dir) = make_engine().await;
-            let bus = Arc::new(GlobalEventBus::new(16, 16));
-            json.attach_event_bus(Arc::clone(&bus));
-            let mut rx = bus.subscribe();
-
-            json.create_domain("purge-ev").await.unwrap();
-            rx.try_recv().unwrap(); // domain_created, not under test here
-            json.delete_domain("purge-ev").await.unwrap();
-
-            let purger = JsonDomainPurger::new(Arc::clone(&json), Arc::new(std::sync::atomic::AtomicBool::new(false)), 100, 5);
-            purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
-
-            let deleted = rx.try_recv().unwrap();
-            assert_eq!(deleted.kind, "domain_deleted");
-            let purged = rx.try_recv().unwrap();
-            assert_eq!(purged.kind, "domain_purged");
-            assert_eq!(purged.domain, "purge-ev");
-        })
-    }
-
-    // Test 12 (json slice): no bus attached -> domain and index lifecycle ops
-    // succeed unchanged, no panic, and nothing is published anywhere.
-    #[test]
-    fn test_lifecycle_and_index_ops_without_event_bus_attached_publish_nothing() {
-        crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            let bus = GlobalEventBus::new(16, 16); // never attached
-            let mut rx = bus.subscribe();
-
             json.create_domain("no-bus").await.unwrap();
             json.create_index("no-bus", "city", IndexFieldType::String).await.unwrap();
             json.delete_index("no-bus", "city").await.unwrap();
             json.delete_domain("no-bus").await.unwrap();
-
-            assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
         })
     }
 

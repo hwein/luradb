@@ -700,7 +700,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             crate::engines::lsm::DomainRegistry::recover(
@@ -711,12 +710,14 @@ mod tests {
             .await
             .unwrap(),
         );
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(256, 1024));
+        let (control, auth_cache) = crate::control::testing::start(dir.path(), Arc::clone(&registry), None, None, bus).await;
 
         let backup_manager = match backup_config {
             None => None,
             Some(cfg) => {
                 let cfg = BackupConfig { dir: dir.path().join("backups").to_string_lossy().into_owned(), ..cfg };
-                Some(BackupManager::new(&cfg, Arc::clone(&registry), None).unwrap())
+                Some(BackupManager::new(&cfg, Arc::clone(&registry), None, Arc::clone(&control)).unwrap())
             }
         };
 
@@ -730,7 +731,7 @@ mod tests {
             shm_manager: None,
             backup_manager,
             log_access: None,
-            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,

@@ -163,6 +163,9 @@ mod tests {
         let metrics = MetricsStore::new(MetricsConfig::default());
         let registry =
             Arc::new(DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap());
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
+        let (control, _) =
+            crate::control::testing::start(engine_dir.path(), Arc::clone(&registry), None, None, bus).await;
 
         let backup_dir = tempfile::TempDir::new().unwrap();
         let config = BackupConfig {
@@ -170,7 +173,7 @@ mod tests {
             dir: backup_dir.path().to_string_lossy().into_owned(),
             schedule: Vec::new(),
         };
-        let manager = BackupManager::new(&config, registry, None).unwrap();
+        let manager = BackupManager::new(&config, registry, None, control).unwrap();
         (manager, engine_dir, backup_dir)
     }
 

@@ -18,7 +18,7 @@ pub mod rel_import;
 use crate::auth::{handlers::AuthState, middleware::auth_layer, AuthCache};
 use crate::backup::BackupManager;
 use crate::config::LuraConfig;
-use crate::core::events::GlobalEventBus;
+use crate::control::ControlPlane;
 use crate::engines::json::JsonEngine;
 use crate::engines::lsm::DomainRegistry;
 use crate::engines::rel::RelEngine;
@@ -100,10 +100,9 @@ pub struct AppState {
     /// `None` when `log.http_access = false` (spec general/005) — routes stay
     /// registered either way; handlers answer 503 (plaintext `ApiError`).
     pub log_access: Option<logs::LogAccessState>,
-    /// Global lifecycle/DDL event bus backing `GET /store-api/events` (spec
-    /// general/018) — always present; whether anything was ever attached to
-    /// the KV/JSON/rel engines is a startup-wiring concern, not an `Option` here.
-    pub event_bus: Arc<GlobalEventBus>,
+    /// Runs domain creates and deletes and auth changes, lists the domains,
+    /// and carries the global event stream behind `GET /store-api/events`.
+    pub control: Arc<ControlPlane>,
     /// Effective configuration of the running process, backing
     /// `GET /store-api/config` (spec general/022) — always present.
     pub config: Arc<LuraConfig>,
@@ -132,6 +131,7 @@ pub struct CountResponse {
 pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState {
         cache: Arc::clone(&state.auth_cache),
+        control: Arc::clone(&state.control),
         registry: Arc::clone(&state.registry),
         auth_enabled: state.auth_enabled,
         json_engine: state.json_engine.clone(),

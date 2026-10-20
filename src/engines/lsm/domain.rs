@@ -11,8 +11,9 @@
 //!
 //! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
 
+use crate::control::{ControlPlane, Engine};
 use crate::core::coop::YieldEvery;
-use crate::core::events::{GlobalEventBus, Resume};
+use crate::core::events::Resume;
 use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
@@ -29,7 +30,7 @@ use std::sync::{
 };
 use compio::time::sleep;
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -249,22 +250,18 @@ impl DomainRuntime {
 
 // ── DomainRegistry ────────────────────────────────────────────────────────────
 
-/// Manages domain lifecycle: creation, lookup, listing, deletion, and recovery.
+/// Holds the domains: lookup, listing and recovery. Creates and deletes run
+/// through the control plane, one at a time.
 pub struct DomainRegistry {
     /// Persistent domain metadata (name → Domain), cached in memory.
     domains: RwLock<HashMap<String, Domain>>,
     /// Non-serializable runtime state (rate limiter).
     runtimes: RwLock<HashMap<String, Arc<DomainRuntime>>>,
-    /// Serializes `create_domain` end-to-end: the check-then-act spans an
-    /// `.await`, so a `parking_lot` guard cannot cover it (spec general/003).
-    create_lock: Mutex<()>,
     engine: Arc<LsmStorageEngine>,
     config: DomainConfig,
     metrics: Arc<MetricsStore>,
-    /// Global lifecycle/DDL event bus (spec general/018 §1) — unset in unit
-    /// tests and standalone-built registries, which then simply publish
-    /// nothing (`publish_lifecycle_event`'s `if let Some(bus) = ...`).
-    event_bus: OnceLock<Arc<GlobalEventBus>>,
+    /// Unset for a standalone registry, whose purger then finalizes directly.
+    control: OnceLock<Arc<ControlPlane>>,
 }
 
 impl DomainRegistry {
@@ -279,11 +276,10 @@ impl DomainRegistry {
         let registry = Self {
             domains: RwLock::new(HashMap::new()),
             runtimes: RwLock::new(HashMap::new()),
-            create_lock: Mutex::new(()),
             engine,
             config,
             metrics,
-            event_bus: OnceLock::new(),
+            control: OnceLock::new(),
         };
         registry.load_from_engine().await?;
         // Check in any state: creating over a Deleting default would 409 and
@@ -308,19 +304,16 @@ impl DomainRegistry {
         &self.engine
     }
 
-    /// Wires the global event bus (spec general/018 §1). Must run before the
-    /// purgers are spawned and before the listener accepts requests — set
-    /// only once, during startup; every read afterward goes through
-    /// `publish_lifecycle_event`'s `OnceLock::get`.
-    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
-        let _ = self.event_bus.set(bus);
+    /// Set once at startup, before the purger runs.
+    pub(crate) fn attach_control_plane(&self, control: Arc<ControlPlane>) {
+        let _ = self.control.set(control);
     }
 
-    /// `domain_created` / `domain_deleted` / `domain_purged` (spec §2) — a
-    /// no-op when no bus is attached.
-    fn publish_lifecycle_event(&self, kind: &'static str, domain: &str) {
-        if let Some(bus) = self.event_bus.get() {
-            bus.publish("kv", kind, domain, None);
+    /// Removes a purged domain — through the control plane once attached.
+    async fn finish_purge(&self, name: &str) -> Result<()> {
+        match self.control.get() {
+            Some(control) => control.finalize_deletion(Engine::Kv, name).await,
+            None => self.finalize_domain_deletion(name).await,
         }
     }
 
@@ -357,15 +350,15 @@ impl DomainRegistry {
     }
 
     /// Creates a new domain. Returns `Err` (409-style) if the name already exists.
-    pub async fn create_domain(&self, name: &str) -> Result<Domain> {
+    pub(crate) async fn create_domain(&self, name: &str) -> Result<Domain> {
         self.create_domain_with(name, false).await
     }
 
     /// [`Self::create_domain`] with the domain's
-    /// [`Domain::require_conditional_writes`] setting.
-    pub async fn create_domain_with(&self, name: &str, require_conditional_writes: bool) -> Result<Domain> {
+    /// [`Domain::require_conditional_writes`] setting. The check and the
+    /// insert span an await: callers must not run two lifecycle changes at once.
+    pub(crate) async fn create_domain_with(&self, name: &str, require_conditional_writes: bool) -> Result<Domain> {
         validate_domain_name(name, self.config.max_name_length)?;
-        let _guard = self.create_lock.lock().await;
         if self.domains.read().contains_key(name) {
             return Err(anyhow!("409 Conflict: Domain '{}' already exists", name));
         }
@@ -374,9 +367,8 @@ impl DomainRegistry {
         self.engine.put(&sys_key(name), &data).await?;
         self.runtimes.write().insert(name.to_string(), self.make_runtime());
         self.domains.write().insert(name.to_string(), domain.clone());
-        // The engine write above raised the epoch before `list_domains` changed (spec perf/028 A1.3).
+        // The engine write above raised the epoch before `list_domains` changed.
         self.engine.raise_change_epoch();
-        self.publish_lifecycle_event("domain_created", name);
         Ok(domain)
     }
 
@@ -425,7 +417,7 @@ impl DomainRegistry {
     ///
     /// Returns `Err` if the domain doesn't exist. Physical key cleanup is
     /// handled asynchronously by `DomainPurger`.
-    pub async fn delete_domain(&self, name: &str) -> Result<()> {
+    pub(crate) async fn delete_domain(&self, name: &str) -> Result<()> {
         let mut domain = {
             let cache = self.domains.read();
             cache
@@ -437,9 +429,8 @@ impl DomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain);
-        // The engine write above raised the epoch before `list_domains` changed (spec perf/028 A1.3).
+        // The engine write above raised the epoch before `list_domains` changed.
         self.engine.raise_change_epoch();
-        self.publish_lifecycle_event("domain_deleted", name);
         Ok(())
     }
 
@@ -454,7 +445,7 @@ impl DomainRegistry {
     }
 
     /// Finalises a purged domain: removes metadata from engine and cache.
-    pub async fn finalize_domain_deletion(&self, name: &str) -> Result<()> {
+    pub(crate) async fn finalize_domain_deletion(&self, name: &str) -> Result<()> {
         self.engine.write_tombstone(&sys_key(name)).await?;
         // Metrics window, then runtime, then domain: a create_domain that
         // passed the domains check can then neither lose its freshly
@@ -462,7 +453,6 @@ impl DomainRegistry {
         self.metrics.remove_domain(name);
         self.runtimes.write().remove(name);
         self.domains.write().remove(name);
-        self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
 
@@ -1034,7 +1024,7 @@ impl DomainPurger {
             let prefix = domain.system_prefix.clone();
             let all_keys = self.engine.scan_keys(&prefix).await?;
             if all_keys.is_empty() {
-                self.registry.finalize_domain_deletion(&domain.name).await?;
+                self.registry.finish_purge(&domain.name).await?;
                 continue;
             }
             for key in all_keys.iter().take(self.batch_size) {
@@ -1250,27 +1240,6 @@ mod tests {
             let p2 = generate_prefix("myapp");
             assert_eq!(p1, p2);
             assert_ne!(generate_prefix("myapp"), generate_prefix("myapp2"));
-        })
-    }
-
-    // 9. Concurrent create of the same name → exactly one succeeds (spec general/003).
-    #[test]
-    fn test_concurrent_create_domain_single_winner() {
-        crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let tasks: Vec<_> = (0..8)
-                .map(|_| {
-                    let reg = Arc::clone(&registry);
-                    compio::runtime::spawn(async move { reg.create_domain("contested").await })
-                })
-                .collect();
-            let mut ok = 0;
-            for t in tasks {
-                if t.await.unwrap().is_ok() {
-                    ok += 1;
-                }
-            }
-            assert_eq!(ok, 1, "exactly one concurrent create_domain must succeed");
         })
     }
 
@@ -1722,112 +1691,6 @@ mod tests {
                 }
                 _ => panic!("expected a gapless replay"),
             }
-        })
-    }
-
-    // ── Spec general/018: global lifecycle event bus ────────────────────────
-
-    // Test 1 (kv slice): create_domain/delete_domain publish domain_created/
-    // domain_deleted with the right engine, domain and a real ts.
-    #[test]
-    fn test_domain_lifecycle_events_published_with_engine_domain_and_ts() {
-        crate::core::engine_runtime::block_on(async {
-            let (_engine, registry, _dir) = make_setup().await;
-            let bus = Arc::new(GlobalEventBus::new(16, 16));
-            registry.attach_event_bus(Arc::clone(&bus));
-            let mut rx = bus.subscribe();
-
-            registry.create_domain("evdom").await.unwrap();
-            registry.delete_domain("evdom").await.unwrap();
-
-            let created = rx.try_recv().unwrap();
-            assert_eq!(created.engine, "kv");
-            assert_eq!(created.kind, "domain_created");
-            assert_eq!(created.domain, "evdom");
-            assert_eq!(created.object, None);
-            assert!(created.ts > 0);
-
-            let deleted = rx.try_recv().unwrap();
-            assert_eq!(deleted.kind, "domain_deleted");
-            assert_eq!(deleted.domain, "evdom");
-        })
-    }
-
-    // Test 2: after a purge run, domain_purged appears, and after domain_deleted.
-    #[test]
-    fn test_domain_purge_event_published_after_domain_deleted() {
-        crate::core::engine_runtime::block_on(async {
-            let (engine, registry, _dir) = make_setup().await;
-            let bus = Arc::new(GlobalEventBus::new(16, 16));
-            registry.attach_event_bus(Arc::clone(&bus));
-            let mut rx = bus.subscribe();
-
-            registry.create_domain("purge-ev").await.unwrap();
-            rx.try_recv().unwrap(); // domain_created, not under test here
-
-            registry.delete_domain("purge-ev").await.unwrap();
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let cfg = DomainConfig::default();
-            let purger = DomainPurger::new(
-                Arc::clone(&engine),
-                Arc::clone(&registry),
-                Arc::clone(&shutdown),
-                cfg.purger_batch_size,
-                cfg.purger_interval_secs,
-            );
-            purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
-
-            let deleted = rx.try_recv().unwrap();
-            assert_eq!(deleted.kind, "domain_deleted");
-            let purged = rx.try_recv().unwrap();
-            assert_eq!(purged.kind, "domain_purged");
-            assert_eq!(purged.domain, "purge-ev");
-        })
-    }
-
-    // Test 12 (kv slice): no bus attached -> lifecycle ops succeed unchanged,
-    // no panic, and nothing is published anywhere.
-    #[test]
-    fn test_lifecycle_ops_without_event_bus_attached_publish_nothing() {
-        crate::core::engine_runtime::block_on(async {
-            let (_engine, registry, _dir) = make_setup().await;
-            let bus = GlobalEventBus::new(16, 16); // never attached
-            let mut rx = bus.subscribe();
-
-            registry.create_domain("no-bus").await.unwrap();
-            registry.delete_domain("no-bus").await.unwrap();
-
-            assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
-        })
-    }
-
-    // Test 13: attach_event_bus, THEN spawn the purger (main.rs's startup
-    // order, spec §1) -- a purge run afterward still delivers domain_purged.
-    #[test]
-    fn test_attach_before_purger_spawn_still_delivers_domain_purged() {
-        crate::core::engine_runtime::block_on(async {
-            let (engine, registry, _dir) = make_setup().await;
-            let bus = Arc::new(GlobalEventBus::new(16, 16));
-            registry.attach_event_bus(Arc::clone(&bus)); // attach first
-            let mut rx = bus.subscribe();
-
-            registry.create_domain("late-purge").await.unwrap();
-            registry.delete_domain("late-purge").await.unwrap();
-
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let purger = Arc::new(DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), Arc::clone(&shutdown), 1, 1));
-            compio::runtime::spawn(purger.run()).detach(); // spawned after attach, mirroring main.rs's startup order
-
-            // Drain domain_created/domain_deleted, then wait for domain_purged.
-            rx.recv().await.unwrap();
-            rx.recv().await.unwrap();
-            let purged = compio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("timed out waiting for domain_purged")
-                .unwrap();
-            assert_eq!(purged.kind, "domain_purged");
-            assert_eq!(purged.domain, "late-purge");
-            shutdown.store(true, Ordering::Relaxed);
         })
     }
 

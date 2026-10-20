@@ -678,10 +678,11 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(DomainRegistry::recover(engine, config, Arc::clone(&metrics)).await.unwrap());
         registry.create_domain("testdom").await.unwrap();
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(256, 1024));
+        let (control, auth_cache) = crate::control::testing::start(dir.path(), Arc::clone(&registry), None, None, bus).await;
         let state = AppState {
             registry,
             auth_cache,
@@ -692,7 +693,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,

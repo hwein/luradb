@@ -50,14 +50,18 @@ api_key = "@GENERATED_ON_INSTALL@"
 [storage]
 # Page file of the buffer pool. Default: luradb.db
 db_path = "/var/lib/luradb/luradb.db"
-# Write-ahead log. Default: luradb.wal
+# Write-ahead log. A failed write may leave luradb.wal.unsafe-end (the log's file name
+# plus .unsafe-end), marking where the next start cuts the log; never delete it by hand,
+# or recovery reads that write. Default: luradb.wal
 wal_path = "/var/lib/luradb/luradb.wal"
 # Value log for large values. Default: luradb.vlog
 vlog_path = "/var/lib/luradb/luradb.vlog"
 # SSTable directory. Default: luradb_sstables
 sstable_dir = "/var/lib/luradb/sstables"
-# Directory of the system store, which keeps the users, API key hashes and
-# permissions apart from domain data. Default: luradb_sys beside the SSTable directory
+# Directory of the system store, which keeps the users, API key hashes and permissions
+# apart from domain data. A failed write may leave wal.unsafe-end beside its write-ahead
+# log wal, marking where the next start cuts the log; never delete it by hand, or
+# recovery reads that write. Default: luradb_sys beside the SSTable directory
 system_dir = "/var/lib/luradb/luradb_sys"
 
 [io_engine]
@@ -169,7 +173,9 @@ default_max_storage_bytes = 0
 # Starts the JSON document engine.
 # While disabled, relational tables show JSON references as NULL.
 enabled = true
-# Write-ahead log; relative paths resolve against the working directory.
+# Write-ahead log; relative paths resolve against the working directory. A failed write
+# may leave luradb_json.wal.unsafe-end (the log's file name plus .unsafe-end), marking
+# where the next start cuts the log; never delete it by hand, or recovery reads that write.
 wal_path = "luradb_json.wal"
 # Value log for large documents.
 vlog_path = "luradb_json.vlog"
@@ -190,7 +196,9 @@ max_value_size = 524288
 [rel]
 # Starts the relational engine.
 enabled = true
-# Write-ahead log; relative paths resolve against the working directory.
+# Write-ahead log; relative paths resolve against the working directory. A failed write
+# may leave luradb_rel.wal.unsafe-end (the log's file name plus .unsafe-end), marking
+# where the next start cuts the log; never delete it by hand, or recovery reads that write.
 wal_path = "luradb_rel.wal"
 # Value log for large rows.
 vlog_path = "luradb_rel.vlog"

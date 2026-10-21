@@ -1,11 +1,13 @@
 #[cfg(test)]
-use crate::core::storage_thread::Faults;
+use crate::core::storage_thread::{
+    apply_unsafe_end_marker, mark_unsafe_end, unmark_unsafe_end, unsafe_end_marker, Faults,
+};
 use crate::core::storage_thread::{StorageHandle, WalTarget};
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use thiserror::Error;
 use tokio::fs::File;
-#[cfg(test)]
-use tokio::fs::OpenOptions;
 use tokio::io::AsyncReadExt;
 #[cfg(test)]
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -257,13 +259,14 @@ fn broken_pipe_error() -> WalError {
 #[cfg(test)]
 type AppendResponder = oneshot::Sender<Result<u64, WalError>>;
 
-/// The local committer's file and its append cursor.
 #[cfg(test)]
 struct LocalWal {
     file: File,
+    /// Where a failed cut records `offset` for the next open.
+    marker: PathBuf,
     offset: u64,
-    /// A failed append may have left bytes past `offset` that a failed cut
-    /// could not remove; the next append cuts first.
+    /// Bytes a failed append left past `offset`, or the unsafe-end marker,
+    /// may still be there; the next append cuts first.
     unsafe_end: bool,
     faults: Faults,
 }
@@ -271,21 +274,22 @@ struct LocalWal {
 #[cfg(test)]
 impl LocalWal {
     async fn open(path: &Path) -> Result<Self, WalError> {
-        let mut file = OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)
-            .await?;
+            .open(path)?;
+        apply_unsafe_end_marker(path, &file).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
 
+        let mut file = File::from_std(file);
         let offset = file.metadata().await?.len();
         file.seek(std::io::SeekFrom::Start(offset)).await?;
-        Ok(Self { file, offset, unsafe_end: false, faults: Faults::default() })
+        Ok(Self { file, marker: unsafe_end_marker(path), offset, unsafe_end: false, faults: Faults::default() })
     }
 
-    /// Writes `data` at the cursor and syncs it. A failed write or sync cuts
-    /// the file back to the cursor, which stays where it was.
+    /// A failed write or sync cuts the file back to the cursor, which stays
+    /// where it was.
     async fn write_at_cursor(&mut self, data: &[u8]) -> std::io::Result<()> {
         if self.unsafe_end {
             if let Err(cut) = self.cut_to_cursor().await {
@@ -311,24 +315,39 @@ impl LocalWal {
         result
     }
 
-    /// Cuts the file back to the cursor and syncs the new length; the file's
-    /// end stays unsafe until this succeeds.
+    /// The file's end stays unsafe until the cut and the marker removal both succeed.
     async fn cut_to_cursor(&mut self) -> std::io::Result<()> {
         self.unsafe_end = true;
-        if std::mem::take(&mut self.faults.cut) {
-            return Err(std::io::Error::other("injected cut failure"));
+        if let Err(e) = self.cut_file().await {
+            mark_unsafe_end(&self.marker, self.offset);
+            return Err(e);
         }
-        self.file.set_len(self.offset).await?;
-        self.file.sync_all().await?;
+        self.unmark()?;
         self.unsafe_end = false;
         Ok(())
     }
 
-    /// Every failed cut is logged: the file's end stays unsafe until one succeeds.
+    async fn cut_file(&mut self) -> std::io::Result<()> {
+        if std::mem::take(&mut self.faults.cut) {
+            return Err(std::io::Error::other("injected cut failure"));
+        }
+        self.file.set_len(self.offset).await?;
+        self.file.sync_all().await
+    }
+
+    fn unmark(&mut self) -> std::io::Result<()> {
+        if std::mem::take(&mut self.faults.unmark) {
+            return Err(std::io::Error::other("injected marker removal failure"));
+        }
+        unmark_unsafe_end(&self.marker)
+    }
+
+    /// Every failed cut, marker removal included, is logged: the file's end
+    /// stays unsafe until one succeeds.
     fn log_failed_cut(&self, error: &std::io::Error) {
         tracing::error!(
-            "Cutting the write-ahead log back to {} bytes failed: {error}; \
-             the next append retries the cut before it writes.",
+            "Securing the end of the write-ahead log at {} bytes failed: {error}; \
+             the next append retries before it writes.",
             self.offset
         );
     }
@@ -419,6 +438,11 @@ async fn do_truncate(wal: &mut LocalWal) -> Result<(), WalError> {
     wal.file.seek(std::io::SeekFrom::Start(0)).await?;
     wal.offset = 0;
     wal.file.sync_all().await?;
+    if let Err(e) = wal.unmark() {
+        wal.unsafe_end = true;
+        wal.log_failed_cut(&e);
+        return Err(e.into());
+    }
     wal.unsafe_end = false;
     Ok(())
 }
@@ -597,14 +621,8 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("wal");
             let len = || std::fs::metadata(&path).unwrap().len();
-            let mut wal = LocalWal::open(&path).await.unwrap();
-            commit_group(&mut wal, vec![delete_record(b"kept-one")]).await[0].as_ref().unwrap();
-            let start = len();
-
-            wal.faults = Faults { sync: true, cut: true };
-            assert!(commit_group(&mut wal, vec![delete_record(b"lost-with-a-long-key")]).await[0].is_err());
+            let (mut wal, start) = wal_after_a_failed_cut(&path).await;
             let tail = len();
-            assert!(tail > start);
 
             wal.faults.cut = true;
             assert!(commit_group(&mut wal, vec![delete_record(b"refused")]).await[0].is_err());
@@ -613,6 +631,134 @@ mod tests {
             let kept = commit_group(&mut wal, vec![delete_record(b"kept-two")]).await;
             assert_eq!(kept[0].as_ref().unwrap(), &start);
             assert_eq!(recovered_keys(&path).await, ["kept-one", "kept-two"]);
+        })
+    }
+
+    /// The local committer at `path` after a group whose cut failed: the log
+    /// holds `kept-one`, which ends at the returned cursor, and a tail past it.
+    async fn wal_after_a_failed_cut(path: &Path) -> (LocalWal, u64) {
+        let mut wal = LocalWal::open(path).await.unwrap();
+        assert!(commit_group(&mut wal, vec![delete_record(b"kept-one")]).await[0].is_ok());
+        let start = wal.offset;
+
+        wal.faults = Faults { sync: true, cut: true, ..Faults::default() };
+        assert!(commit_group(&mut wal, vec![delete_record(b"lost-with-a-long-key")]).await[0].is_err());
+        assert!(std::fs::metadata(path).unwrap().len() > start);
+        (wal, start)
+    }
+
+    // A failed cut leaves the cursor in a marker beside the log; the next
+    // open cuts the log back to it before recovery reads the log.
+    #[test]
+    fn test_open_cuts_the_log_back_to_the_cursor_a_failed_cut_left() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let marker = dir.path().join("wal.unsafe-end");
+            let (wal, start) = wal_after_a_failed_cut(&path).await;
+            assert_eq!(std::fs::read(&marker).unwrap(), start.to_be_bytes());
+            drop(wal);
+
+            let mut wal = LocalWal::open(&path).await.unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), start);
+            assert_eq!(wal.offset, start);
+            assert!(!marker.exists());
+            assert_eq!(recovered_keys(&path).await, ["kept-one"]);
+            let kept = commit_group(&mut wal, vec![delete_record(b"kept-two")]).await;
+            assert_eq!(kept[0].as_ref().unwrap(), &start);
+        })
+    }
+
+    // A cut that fails again leaves the marker as it is: its cursor does not
+    // change while the file's end is unsafe.
+    #[test]
+    fn test_a_repeated_failed_cut_keeps_the_marker() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let marker = dir.path().join("wal.unsafe-end");
+            let (mut wal, _) = wal_after_a_failed_cut(&path).await;
+            std::fs::write(&marker, 5u64.to_be_bytes()).unwrap();
+
+            wal.faults.cut = true;
+            assert!(commit_group(&mut wal, vec![delete_record(b"refused")]).await[0].is_err());
+            assert_eq!(std::fs::read(&marker).unwrap(), 5u64.to_be_bytes());
+        })
+    }
+
+    // The cut that succeeds after a failed one removes the marker.
+    #[test]
+    fn test_a_successful_cut_removes_the_marker() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let marker = dir.path().join("wal.unsafe-end");
+            let (mut wal, start) = wal_after_a_failed_cut(&path).await;
+            assert!(marker.exists());
+
+            let kept = commit_group(&mut wal, vec![delete_record(b"kept-two")]).await;
+            assert_eq!(kept[0].as_ref().unwrap(), &start);
+            assert!(!marker.exists());
+        })
+    }
+
+    // A truncate after a failed cut empties the log, removes the marker and
+    // leaves the log's end safe.
+    #[test]
+    fn test_truncate_removes_the_marker() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let marker = dir.path().join("wal.unsafe-end");
+            let (mut wal, _) = wal_after_a_failed_cut(&path).await;
+            assert!(marker.exists());
+
+            do_truncate(&mut wal).await.unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            assert!(!marker.exists());
+            assert!(!wal.unsafe_end);
+        })
+    }
+
+    // A marker that cannot be removed fails the cut: no group is confirmed
+    // while the marker exists, so its cursor never cuts a confirmed group.
+    #[test]
+    fn test_a_failed_marker_removal_fails_the_cut() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let marker = dir.path().join("wal.unsafe-end");
+            let (mut wal, start) = wal_after_a_failed_cut(&path).await;
+
+            wal.faults.unmark = true;
+            assert!(commit_group(&mut wal, vec![delete_record(b"refused")]).await[0].is_err());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), start);
+            assert!(marker.exists());
+
+            let kept = commit_group(&mut wal, vec![delete_record(b"kept-two")]).await;
+            assert_eq!(kept[0].as_ref().unwrap(), &start);
+            assert!(!marker.exists());
+        })
+    }
+
+    // A truncate whose marker cannot be removed fails and leaves the log's
+    // end unsafe; the next group removes the marker before it writes.
+    #[test]
+    fn test_a_failed_marker_removal_fails_the_truncate() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let marker = dir.path().join("wal.unsafe-end");
+            let (mut wal, _) = wal_after_a_failed_cut(&path).await;
+
+            wal.faults.unmark = true;
+            assert!(do_truncate(&mut wal).await.is_err());
+            assert!(wal.unsafe_end);
+            assert!(marker.exists());
+
+            let kept = commit_group(&mut wal, vec![delete_record(b"kept-two")]).await;
+            assert_eq!(kept[0].as_ref().unwrap(), &0);
+            assert!(!marker.exists());
         })
     }
 

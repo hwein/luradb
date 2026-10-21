@@ -55,6 +55,7 @@ All notable changes to LuraDB are documented in this file.
 - Deleted or expired keys no longer reappear with an older value after compaction.
 - Small requests wait less behind concurrent key listings.
 - A failed write-ahead log append no longer leaves its partial bytes behind the log's end.
+- A write-ahead log whose cleanup after a failed append also failed is cut on the next start, before recovery reads it.
 
 ### Security
 

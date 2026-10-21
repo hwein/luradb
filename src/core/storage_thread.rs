@@ -160,9 +160,11 @@ impl Drop for StorageThread {
 struct WalFile {
     engine: WalTarget,
     file: File,
+    /// Where a failed cut records `offset` for the next start.
+    marker: PathBuf,
     offset: u64,
-    /// A failed append may have left bytes past `offset` that a failed cut
-    /// could not remove; the next append cuts first.
+    /// Bytes a failed append left past `offset`, or the unsafe-end marker,
+    /// may still be there; the next append cuts first.
     unsafe_end: bool,
 }
 
@@ -196,6 +198,8 @@ pub(crate) struct Faults {
     pub(crate) sync: bool,
     /// The next cut back to the cursor fails and leaves the file as it is.
     pub(crate) cut: bool,
+    /// The next removal of the unsafe-end marker fails and leaves it.
+    pub(crate) unmark: bool,
 }
 
 impl StorageState {
@@ -210,19 +214,35 @@ impl StorageState {
         if self.fixed_files { RingFile::Fixed(index as u32) } else { RingFile::Raw(self.wals[index].file.as_raw_fd()) }
     }
 
-    /// Cuts `index`'s file back to its cursor and syncs the new length; the
-    /// file's end stays unsafe until this succeeds.
+    /// The file's end stays unsafe until the cut and the marker removal both succeed.
     fn cut_to_cursor(&mut self, index: usize) -> std::io::Result<()> {
-        let wal = &mut self.wals[index];
-        wal.unsafe_end = true;
+        self.wals[index].unsafe_end = true;
+        if let Err(e) = self.cut_file(index) {
+            let wal = &self.wals[index];
+            mark_unsafe_end(&wal.marker, wal.offset);
+            return Err(e);
+        }
+        self.unmark(index)?;
+        self.wals[index].unsafe_end = false;
+        Ok(())
+    }
+
+    fn cut_file(&mut self, index: usize) -> std::io::Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.faults.cut) {
             return Err(std::io::Error::other("injected cut failure"));
         }
+        let wal = &self.wals[index];
         wal.file.set_len(wal.offset)?;
-        wal.file.sync_all()?;
-        wal.unsafe_end = false;
-        Ok(())
+        wal.file.sync_all()
+    }
+
+    fn unmark(&mut self, index: usize) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults.unmark) {
+            return Err(std::io::Error::other("injected marker removal failure"));
+        }
+        unmark_unsafe_end(&self.wals[index].marker)
     }
 }
 
@@ -269,8 +289,12 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
     let mut files = Vec::with_capacity(wals.len());
     for (engine, path) in wals {
         let file = open_rw(path)?;
+        let marker = unsafe_end_marker(path);
+        apply_unsafe_end_marker(path, &file).with_context(|| {
+            format!("applying the unsafe-end marker {} to the write-ahead log {}", marker.display(), path.display())
+        })?;
         let offset = file.metadata()?.len();
-        files.push(WalFile { engine: *engine, file, offset, unsafe_end: false });
+        files.push(WalFile { engine: *engine, file, marker, offset, unsafe_end: false });
     }
     // Register the WALs once as fixed files so the kernel skips the fd lookup
     // per op; on failure fall back to raw fds.
@@ -441,11 +465,12 @@ fn write_and_sync(state: &mut StorageState, file: RingFile, start: u64, data: &[
     ring_fsync(&mut state.ring, file)
 }
 
-/// Every failed cut is logged: the file's end stays unsafe until one succeeds.
+/// Every failed cut, marker removal included, is logged: the file's end stays
+/// unsafe until one succeeds.
 fn log_failed_cut(engine: WalTarget, cursor: u64, error: &std::io::Error) {
     tracing::error!(
-        "Cutting the {engine:?} write-ahead log back to {cursor} bytes failed: {error}; \
-         the next append retries the cut before it writes."
+        "Securing the end of the {engine:?} write-ahead log at {cursor} bytes failed: {error}; \
+         the next append retries before it writes."
     );
 }
 
@@ -455,8 +480,106 @@ fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     wal.file.set_len(0)?;
     wal.offset = 0;
     wal.file.sync_all()?;
-    wal.unsafe_end = false;
+    if let Err(e) = state.unmark(index) {
+        state.wals[index].unsafe_end = true;
+        log_failed_cut(engine, 0, &e);
+        return Err(e.into());
+    }
+    state.wals[index].unsafe_end = false;
     Ok(())
+}
+
+// ── Unsafe-end marker ───────────────────────────────────────────────────────
+
+/// The file beside the WAL at `log` that holds the cursor (8 bytes,
+/// big-endian) while a failed cut leaves bytes past it; the next start cuts
+/// the log back to it before recovery reads the log.
+pub(crate) fn unsafe_end_marker(log: &Path) -> PathBuf {
+    with_suffix(log, ".unsafe-end")
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Records `cursor` in `marker` unless a marker is there already. A failure
+/// is logged; nothing more can be done about it.
+pub(crate) fn mark_unsafe_end(marker: &Path, cursor: u64) {
+    if let Err(e) = write_marker(marker, cursor) {
+        tracing::error!(
+            "Writing the unsafe-end marker {} failed: {e}; a restart before the next \
+             successful cut may read the failed append back.",
+            marker.display()
+        );
+    }
+}
+
+/// Written beside its final name and renamed into place, so the marker is
+/// whole or absent.
+fn write_marker(marker: &Path, cursor: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    if marker.try_exists()? {
+        return Ok(());
+    }
+    let tmp = with_suffix(marker, ".tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(&cursor.to_be_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, marker)?;
+    sync_dir(marker)
+}
+
+pub(crate) fn unmark_unsafe_end(marker: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result
+            .and_then(|()| sync_dir(marker))
+            .map_err(|e| std::io::Error::new(e.kind(), format!("removing {}: {e}", marker.display()))),
+    }
+}
+
+/// A rename or removal survives a power loss only once its directory is synced.
+fn sync_dir(file: &Path) -> std::io::Result<()> {
+    let dir = match file.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    File::open(dir)?.sync_all()
+}
+
+/// Applies the unsafe-end marker a failed cut left beside `log` before the
+/// last stop: cuts `file` back to the marker's cursor, then removes the
+/// marker, and a temporary marker an interrupted write left. Any failure
+/// leaves the log unread.
+pub(crate) fn apply_unsafe_end_marker(log: &Path, file: &File) -> Result<()> {
+    let marker = unsafe_end_marker(log);
+    unmark_unsafe_end(&with_suffix(&marker, ".tmp"))?;
+    let bytes = match std::fs::read(&marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        read => read?,
+    };
+    let Ok(cursor) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+        return Err(anyhow!("the marker holds {} bytes instead of an 8-byte cursor", bytes.len()));
+    };
+    let cursor = u64::from_be_bytes(cursor);
+    cut_to_marker(log, file, &marker, cursor).with_context(|| format!("cutting the log back to {cursor} bytes"))
+}
+
+fn cut_to_marker(log: &Path, file: &File, marker: &Path, cursor: u64) -> std::io::Result<()> {
+    let len = file.metadata()?.len();
+    // A longer set_len would pad the log with zero bytes.
+    if cursor < len {
+        file.set_len(cursor)?;
+        file.sync_all()?;
+        tracing::warn!(
+            "Cut the write-ahead log {} from {len} back to {cursor} bytes: the cut after a failed \
+             append had failed before the last stop.",
+            log.display()
+        );
+    }
+    unmark_unsafe_end(marker)
 }
 
 // ── Raw io_uring helpers (single op, submit_and_wait) ────────────────────────
@@ -909,17 +1032,8 @@ mod tests {
             let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
             let path = wals[0].1.as_path();
             let len = || std::fs::metadata(path).unwrap().len();
-            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
-            let (batch, _) = record_appends(WalTarget::Kv, vec![delete_record(1, b"kept-one")]);
-            process_batch(&mut state, batch);
-            let start = len();
-
-            state.faults = Faults { sync: true, cut: true };
-            let (batch, mut failed) = record_appends(WalTarget::Kv, vec![delete_record(2, b"lost-with-a-long-key")]);
-            process_batch(&mut state, batch);
-            assert!(failed[0].try_recv().unwrap().is_err());
+            let (mut state, start) = state_after_a_failed_cut(&wals);
             let tail = len();
-            assert!(tail > start);
 
             state.faults.cut = true;
             let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(3, b"refused")]);
@@ -932,6 +1046,187 @@ mod tests {
             assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
             assert_eq!(recovered_keys(path).await, ["kept-one", "kept-two"]);
         })
+    }
+
+    /// A hub over `wals` after an append whose cut failed: the key-value WAL
+    /// holds `kept-one`, which ends at the returned cursor, and a tail past it.
+    fn state_after_a_failed_cut(wals: &[(WalTarget, PathBuf)]) -> (StorageState, u64) {
+        let (mut state, _) = open_state(&cfg(false, 64), wals).unwrap();
+        let (batch, _) = record_appends(WalTarget::Kv, vec![delete_record(1, b"kept-one")]);
+        process_batch(&mut state, batch);
+        let start = state.wals[0].offset;
+
+        state.faults = Faults { sync: true, cut: true, ..Faults::default() };
+        let (batch, mut failed) = record_appends(WalTarget::Kv, vec![delete_record(2, b"lost-with-a-long-key")]);
+        process_batch(&mut state, batch);
+        assert!(failed[0].try_recv().unwrap().is_err());
+        assert!(std::fs::metadata(&wals[0].1).unwrap().len() > start);
+        (state, start)
+    }
+
+    // A failed cut leaves the cursor in a marker beside the log; the next
+    // start cuts the log back to it before recovery reads the log.
+    #[test]
+    fn test_start_cuts_the_log_back_to_the_cursor_a_failed_cut_left() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let path = wals[0].1.as_path();
+            let marker = dir.path().join("Kv.wal.unsafe-end");
+            let (state, start) = state_after_a_failed_cut(&wals);
+            assert_eq!(std::fs::read(&marker).unwrap(), start.to_be_bytes());
+            drop(state);
+
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            assert_eq!(std::fs::metadata(path).unwrap().len(), start);
+            assert_eq!(state.wals[0].offset, start);
+            assert!(!marker.exists());
+            assert_eq!(recovered_keys(path).await, ["kept-one"]);
+            let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept-two")]);
+            process_batch(&mut state, batch);
+            assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+        })
+    }
+
+    // A cut that fails again leaves the marker as it is: its cursor does not
+    // change while the file's end is unsafe.
+    #[test]
+    fn test_a_repeated_failed_cut_keeps_the_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        let (mut state, _) = state_after_a_failed_cut(&wals);
+        std::fs::write(&marker, 5u64.to_be_bytes()).unwrap();
+
+        state.faults.cut = true;
+        let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(3, b"refused")]);
+        process_batch(&mut state, batch);
+        assert!(refused[0].try_recv().unwrap().is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), 5u64.to_be_bytes());
+    }
+
+    // The cut that succeeds after a failed one removes the marker.
+    #[test]
+    fn test_a_successful_cut_removes_the_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        let (mut state, start) = state_after_a_failed_cut(&wals);
+        assert!(marker.exists());
+
+        let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept-two")]);
+        process_batch(&mut state, batch);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+        assert!(!marker.exists());
+    }
+
+    // A truncate after a failed cut empties the log, removes the marker and
+    // leaves the log's end safe.
+    #[test]
+    fn test_wal_truncate_removes_the_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        let (mut state, _) = state_after_a_failed_cut(&wals);
+        assert!(marker.exists());
+
+        let (response, mut truncated) = oneshot::channel();
+        process_batch(&mut state, vec![IoRequest::WalTruncate { engine: WalTarget::Kv, response }]);
+        truncated.try_recv().unwrap().unwrap();
+        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), 0);
+        assert!(!marker.exists());
+        assert!(!state.wals[0].unsafe_end);
+    }
+
+    // A marker that cannot be removed fails the cut: no append is confirmed
+    // while the marker exists, so its cursor never cuts a confirmed append.
+    #[test]
+    fn test_a_failed_marker_removal_fails_the_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        let (mut state, start) = state_after_a_failed_cut(&wals);
+
+        state.faults.unmark = true;
+        let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(3, b"refused")]);
+        process_batch(&mut state, batch);
+        assert!(refused[0].try_recv().unwrap().is_err());
+        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), start);
+        assert!(marker.exists());
+
+        let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(4, b"kept-two")]);
+        process_batch(&mut state, batch);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+        assert!(!marker.exists());
+    }
+
+    // A truncate whose marker cannot be removed fails and leaves the log's
+    // end unsafe; the next append removes the marker before it writes.
+    #[test]
+    fn test_a_failed_marker_removal_fails_the_truncate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        let (mut state, _) = state_after_a_failed_cut(&wals);
+
+        state.faults.unmark = true;
+        let (response, mut truncated) = oneshot::channel();
+        process_batch(&mut state, vec![IoRequest::WalTruncate { engine: WalTarget::Kv, response }]);
+        assert!(truncated.try_recv().unwrap().is_err());
+        assert!(state.wals[0].unsafe_end);
+        assert!(marker.exists());
+
+        let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept-two")]);
+        process_batch(&mut state, batch);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap(), 0);
+        assert!(!marker.exists());
+    }
+
+    // A marker that holds no 8-byte cursor stops the start and is named in
+    // the error; the log and the marker stay as they are.
+    #[test]
+    fn test_start_refuses_a_marker_without_a_cursor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        std::fs::write(&wals[0].1, b"log-bytes").unwrap();
+        std::fs::write(&marker, [0, 0, 7]).unwrap();
+
+        let Err(err) = open_state(&cfg(false, 64), &wals) else { panic!("the start must fail") };
+        assert!(err.to_string().contains(&marker.display().to_string()), "{err}");
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), b"log-bytes");
+        assert_eq!(std::fs::read(&marker).unwrap(), [0, 0, 7]);
+    }
+
+    // A cursor at or past the log's end leaves the log as it is: cutting to
+    // it would pad the log with zero bytes.
+    #[test]
+    fn test_start_never_lengthens_the_log_to_the_marker_cursor() {
+        for (log, cursor) in [("", 21u64), ("log-bytes", 9)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let marker = dir.path().join("Kv.wal.unsafe-end");
+            std::fs::write(&wals[0].1, log).unwrap();
+            std::fs::write(&marker, cursor.to_be_bytes()).unwrap();
+
+            let (state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log.as_bytes());
+            assert_eq!(state.wals[0].offset, log.len() as u64);
+            assert!(!marker.exists());
+        }
+    }
+
+    // The temporary marker an interrupted marker write left behind is
+    // removed at the start.
+    #[test]
+    fn test_start_removes_a_temporary_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let tmp = dir.path().join("Kv.wal.unsafe-end.tmp");
+        std::fs::write(&tmp, [0, 0]).unwrap();
+
+        open_state(&cfg(false, 64), &wals).unwrap();
+        assert!(!tmp.exists());
     }
 
     // 4. Batching: 100 concurrent wal_append requests processed correctly.

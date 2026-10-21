@@ -210,6 +210,25 @@ impl CachedValue {
     }
 }
 
+impl From<DataBlockValue> for CachedValue {
+    /// An owned SSTable value in the read-path form, sentinels resolved.
+    fn from(value: DataBlockValue) -> Self {
+        match value {
+            DataBlockValue::Pointer(vp) if vp.file_id == 0 && vp.value_offset == TOMBSTONE_OFFSET => {
+                CachedValue::Tombstone
+            }
+            DataBlockValue::Pointer(vp) if vp.file_id == 0 && vp.value_offset == NULL_OFFSET => CachedValue::Null,
+            DataBlockValue::Pointer(vp) => CachedValue::VLogPointer {
+                file_id: vp.file_id,
+                value_offset: vp.value_offset,
+                value_len: vp.value_len,
+                expire_at: vp.expire_at,
+            },
+            DataBlockValue::Inline { data, expire_at } => CachedValue::Owned { data, expire_at },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

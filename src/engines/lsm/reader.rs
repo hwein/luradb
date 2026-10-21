@@ -14,7 +14,7 @@ use crate::storage::vlog::VLogError;
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicU64};
-use std::collections::{BinaryHeap, BTreeSet};
+use std::collections::{BinaryHeap, BTreeMap, BTreeSet};
 use std::cmp::Ordering;
 
 fn now_secs() -> u64 {
@@ -122,7 +122,7 @@ impl GetResult {
     }
 }
 
-/// A value plus the metadata the SHM snapshot builder needs (spec perf/009 §3).
+/// A value plus the metadata the SHM snapshot builder needs.
 ///
 /// Unlike [`LsmReader::get`], a VLog-backed value is *not* dereferenced: the
 /// pointer is only flagged via `from_vlog` and `data` is left empty. Callers
@@ -277,7 +277,7 @@ impl<'a> LsmReader<'a> {
     }
 
     /// Like [`Self::get`], but returns the newest visible value with metadata
-    /// (VLog status, expiry) and never dereferences the VLog (spec perf/009 §3).
+    /// (VLog status, expiry) and never dereferences the VLog.
     ///
     /// Same newest-first source order and MVCC/TTL/tombstone semantics as
     /// `get`; a VLog hit yields `from_vlog = true` with empty `data`.
@@ -329,27 +329,74 @@ impl<'a> LsmReader<'a> {
         let encoded_key = search_key.encode();
 
         let maybe_value = sstable.get_with_cache_and_ts(&encoded_key, &self.cache)?;
+        Ok(maybe_value.map(|(value, ts)| Self::meta_from_stored(value, ts)))
+    }
 
-        match maybe_value {
-            None => Ok(None),
-            Some((CachedValue::Tombstone, _)) => Ok(Some(None)),
-            Some((CachedValue::Null, ts)) => {
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true, last_modified_ms: hlc_physical_ms(ts), stamp: ts.as_u64() })))
+    /// Metadata of a stored SSTable version stamped `ts`; `None` =
+    /// tombstone/expired. A VLog pointer is flagged, not resolved.
+    fn meta_from_stored(value: CachedValue, ts: Timestamp) -> Option<ValueWithMetadata> {
+        match value {
+            CachedValue::Tombstone => None,
+            CachedValue::Null => {
+                Some(ValueWithMetadata { data: Vec::new(), expire_at: 0, from_vlog: false, is_null: true, last_modified_ms: hlc_physical_ms(ts), stamp: ts.as_u64() })
             }
-            Some((CachedValue::VLogPointer { expire_at, .. }, ts)) => {
+            CachedValue::VLogPointer { expire_at, .. } => {
                 if format::is_expired(expire_at, now_secs()) {
-                    return Ok(Some(None));
+                    return None;
                 }
-                Ok(Some(Some(ValueWithMetadata { data: Vec::new(), expire_at, from_vlog: true, is_null: false, last_modified_ms: hlc_physical_ms(ts), stamp: ts.as_u64() })))
+                Some(ValueWithMetadata { data: Vec::new(), expire_at, from_vlog: true, is_null: false, last_modified_ms: hlc_physical_ms(ts), stamp: ts.as_u64() })
             }
-            Some((value, ts)) => {
+            value => {
                 let expire_at = value.expire_at();
                 if format::is_expired(expire_at, now_secs()) {
-                    return Ok(Some(None));
+                    return None;
                 }
-                Ok(Some(Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false, is_null: false, last_modified_ms: hlc_physical_ms(ts), stamp: ts.as_u64() })))
+                Some(ValueWithMetadata { data: value.to_owned_bytes(), expire_at, from_vlog: false, is_null: false, last_modified_ms: hlc_physical_ms(ts), stamp: ts.as_u64() })
             }
         }
+    }
+
+    /// Every live entry under `prefix` visible at `snapshot`, key-sorted, as
+    /// [`Self::get_with_metadata`] reads each one — but in one pass over the
+    /// sources instead of a lookup per key. Synchronous and without yield
+    /// points: meant for a thread that may block.
+    pub fn scan_with_metadata(
+        &self,
+        prefix: &[u8],
+        snapshot: &Snapshot,
+    ) -> Result<Vec<(Vec<u8>, ValueWithMetadata)>> {
+        // Sources come newest-first, so the first visible version of a user
+        // key decides it; `None` = a tombstone or an expired version.
+        let mut decided: BTreeMap<Vec<u8>, Option<ValueWithMetadata>> = BTreeMap::new();
+        for memtable in self.version.memtables_newest_first() {
+            for (encoded_key, value) in memtable.iter_from(prefix) {
+                if !encoded_key.starts_with(prefix) {
+                    break;
+                }
+                let (Some(user_key), Some(ts)) =
+                    (InternalKey::extract_user_key(&encoded_key), InternalKey::extract_timestamp(&encoded_key))
+                else {
+                    continue;
+                };
+                // A version of the batch being applied does not decide, see
+                // `newest_in_memtables`.
+                if !user_key.starts_with(prefix)
+                    || !snapshot.is_visible(ts)
+                    || decided.contains_key(user_key)
+                    || is_applying(self.applying_batch, ts)
+                {
+                    continue;
+                }
+                decided.insert(user_key.to_vec(), Self::meta_from_memtable(value, ts));
+            }
+        }
+        for sstable in self.version.sstables_newest_first() {
+            for version in sstable.prefix_versions(prefix, Some(snapshot.timestamp().inverted())) {
+                let (user_key, ts, value) = version?;
+                decided.entry(user_key).or_insert_with(|| Self::meta_from_stored(value.into(), ts));
+            }
+        }
+        Ok(decided.into_iter().filter_map(|(key, meta)| Some((key, meta?))).collect())
     }
 
     /// Newest version of `user_key` as (write stamp, liveness) — the TTL

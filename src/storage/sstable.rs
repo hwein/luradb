@@ -668,11 +668,10 @@ impl SSTableReader {
     }
 
     /// Shared implementation for [`Self::keys_with_prefix`]/
-    /// [`Self::keys_with_prefix_at`]: `max_inv_ts` of `None` matches every
-    /// version (today's `keys_with_prefix` behavior). Returns each version's
-    /// write timestamp and liveness classification (spec kv/025 §2) — the
-    /// callers above collapse it to today's `(user_key, bool)`, the TTL
-    /// sweeper's expiry scan uses it directly.
+    /// [`Self::keys_with_prefix_at`]: [`Self::prefix_versions`] with each
+    /// version's liveness at the current time in place of its value — the
+    /// callers above collapse it to `(user_key, bool)`, the TTL sweeper's
+    /// expiry scan uses it directly.
     pub(crate) fn prefix_entries<'a>(
         &'a self,
         prefix: &'a [u8],
@@ -682,7 +681,20 @@ impl SSTableReader {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        self.prefix_versions(prefix, max_inv_ts)
+            .map(move |version| version.map(|(user_key, ts, value)| (user_key, ts, value.version_state(now))))
+    }
 
+    /// Every version whose user key starts with `prefix`, in key order
+    /// (newest first per user key), with its write timestamp and stored
+    /// value. `max_inv_ts` of `None` matches every version; `Some` is a
+    /// snapshot timestamp in inverted form and skips the versions newer than
+    /// that snapshot.
+    pub(crate) fn prefix_versions<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        max_inv_ts: Option<u64>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Timestamp, DataBlockValue)>> + 'a {
         // The start block may open before the range: those entries pass here
         // and fall to the filter below. Behind the range, none match.
         let range_entries = self.iter_blocks(self.prefix_blocks(prefix)).take_while(move |entry| match entry {
@@ -708,8 +720,7 @@ impl SSTableReader {
                     return None; // newer than the snapshot -- not decisive
                 }
             }
-            let state = dbv.version_state(now);
-            Some(Ok((user_key.to_vec(), Timestamp::from_inverted(inv_ts), state)))
+            Some(Ok((user_key.to_vec(), Timestamp::from_inverted(inv_ts), dbv)))
         })
     }
 

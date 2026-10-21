@@ -9,17 +9,16 @@
 //! values the entry carries only a `is_vlog_pointer` flag and the client falls
 //! back to a command-ring GET.
 
-use crate::core::coop::{self, YieldEvery};
 use crate::engines::lsm::domain::now_secs;
-use crate::engines::lsm::{Domain, DomainRegistry, LsmStorageEngine, RegistrySnapshot, ValueWithMetadata};
+use crate::engines::lsm::{Domain, DomainRegistry, LsmStorageEngine, Snapshot, ValueWithMetadata};
 use crate::metrics::MetricsStore;
 use crate::storage::format::is_expired;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rkyv::util::AlignedVec;
 use rkyv::{rancor, Archive, Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 
 use super::{PublishOutcome, ReaderRegistry, ShmManager, SnapshotWriter, StateHeader};
 
@@ -31,9 +30,6 @@ const PER_ENTRY_OVERHEAD: usize = 64;
 /// Warn on every N-th consecutive skipped publish (spec perf/012 §9) — about
 /// once a second at the default interval.
 const SKIP_WARN_EVERY: u32 = 10;
-
-/// Entries collected between two yields (spec perf/017 A2).
-const ENTRY_YIELD_INTERVAL: u32 = 1024;
 
 // ── SHM snapshot format (spec §1) ──────────────────────────────────────────────
 
@@ -119,88 +115,99 @@ impl SnapshotBuilder {
     /// earliest entry expiry.
     ///
     /// One MVCC snapshot pins a consistent point-in-time across all domains.
-    /// Accumulation stops once a conservative budget (7/8 of the buffer) is hit;
-    /// the truncated result is logged and still published. Whether it fits after
-    /// serialization is the final call of [`SnapshotWriter::publish`].
+    /// Only taking it and listing the domains run on the calling thread; the
+    /// reads and the serialization run on a thread of their own, so the engine
+    /// thread serves requests meanwhile. Accumulation stops once a
+    /// conservative budget (7/8 of the buffer) is hit; the truncated result is
+    /// logged and still published. Whether it fits after serialization is the
+    /// final call of [`SnapshotWriter::publish`].
     pub async fn build(&self) -> Result<BuiltSnapshot> {
         let snap = self.engine.snapshot();
-        // Point-in-time stamp of this snapshot = its MVCC read timestamp.
-        let ts = snap.snapshot().timestamp().as_u64();
 
         // Active domains only (list_domains filters Deleting), sorted by name so
-        // truncation is deterministic (spec §6 first-come-first-served).
+        // truncation is deterministic.
         let mut domains = self.registry.list_domains().await?;
         domains.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let budget = self.max_snapshot_size / 8 * 7;
-        let mut running = 0usize;
-        // On truncation: (domain where the budget ran out, count of later domains omitted).
-        let mut truncation: Option<(String, usize)> = None;
+        let engine = Arc::clone(&self.engine);
+        let max_snapshot_size = self.max_snapshot_size;
+        let (built_tx, built_rx) = oneshot::channel();
+        // `snap` moves along and keeps the read point pinned until the end.
+        std::thread::Builder::new()
+            .name("luradb-shm".into())
+            .spawn(move || {
+                let _ = built_tx.send(build_at(&engine, &domains, snap.snapshot(), max_snapshot_size));
+            })
+            .context("failed to start the SHM snapshot build thread")?;
+        built_rx.await.context("the SHM snapshot build thread ended without a result")?
+    }
+}
 
-        let mut domain_indices = Vec::with_capacity(domains.len());
-        for (idx, domain) in domains.iter().enumerate() {
-            let (entries, truncated) =
-                self.collect_domain_entries(domain, &snap, budget, &mut running).await?;
-            domain_indices.push(ShmDomainIndex { name: domain.name.clone(), entries });
-            if truncated {
-                // Remaining name-sorted domains are dropped entirely (spec §6 FCFS).
-                truncation = Some((domain.name.clone(), domains.len() - idx - 1));
-                break;
-            }
+/// The blocking part of [`SnapshotBuilder::build`], run on its own thread:
+/// reads `domains` at `read_point` against the byte budget and serializes the
+/// result.
+fn build_at(
+    engine: &LsmStorageEngine,
+    domains: &[Domain],
+    read_point: &Snapshot,
+    max_snapshot_size: usize,
+) -> Result<BuiltSnapshot> {
+    // Point-in-time stamp of this snapshot = its MVCC read timestamp.
+    let ts = read_point.timestamp().as_u64();
+    let budget = max_snapshot_size / 8 * 7;
+    let mut running = 0usize;
+    // On truncation: (domain where the budget ran out, count of later domains omitted).
+    let mut truncation: Option<(String, usize)> = None;
+
+    let mut domain_indices = Vec::with_capacity(domains.len());
+    for (idx, domain) in domains.iter().enumerate() {
+        let (entries, truncated) = collect_domain_entries(engine, domain, read_point, budget, &mut running)?;
+        domain_indices.push(ShmDomainIndex { name: domain.name.clone(), entries });
+        if truncated {
+            // Remaining name-sorted domains are dropped entirely.
+            truncation = Some((domain.name.clone(), domains.len() - idx - 1));
+            break;
         }
-
-        if let Some((domain, omitted)) = &truncation {
-            tracing::warn!(
-                "SHM snapshot truncated in domain '{domain}' ({omitted} later domain(s) omitted): \
-                 accumulated size exceeded budget of {} bytes (buffer {})",
-                budget,
-                self.max_snapshot_size
-            );
-        }
-
-        let snapshot = ShmSnapshot { version: ts, timestamp: ts, domains: domain_indices };
-        // Serialization and the expiry scan are pure CPU work over an owned
-        // value — they run on the blocking pool (spec perf/017 A4).
-        Ok(coop::offload(move || BuiltSnapshot {
-            earliest_expiry: earliest_expiry(&snapshot),
-            bytes: serialize_snapshot(&snapshot),
-        })
-        .await)
     }
 
-    /// Collects one domain's entries against the shared byte budget, stopping at
-    /// the first entry that would exceed it. Returns the entries and whether this
-    /// domain was truncated. `snap` is the single MVCC read point (passed
-    /// through, never re-taken); `running` accumulates across domains.
-    async fn collect_domain_entries(
-        &self,
-        domain: &Domain,
-        snap: &RegistrySnapshot,
-        budget: usize,
-        running: &mut usize,
-    ) -> Result<(Vec<ShmEntry>, bool)> {
-        let prefix_len = domain.system_prefix.len();
-        let raw_keys = self.engine.scan_keys(&domain.system_prefix).await?;
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        let mut coop = YieldEvery::new(ENTRY_YIELD_INTERVAL);
-        for raw_key in raw_keys {
-            coop.tick().await;
-            let meta = match self.engine.get_with_metadata(&raw_key, snap.snapshot()).await? {
-                Some(m) => m,
-                None => continue, // vanished or expired between scan and read
-            };
-            let user_key = raw_key[prefix_len..].to_vec();
-            let cost = user_key.len() + meta.data.len() + PER_ENTRY_OVERHEAD;
-            if *running + cost > budget {
-                truncated = true;
-                break;
-            }
-            *running += cost;
-            entries.push(to_entry(user_key, meta));
-        }
-        Ok((entries, truncated))
+    if let Some((domain, omitted)) = &truncation {
+        tracing::warn!(
+            "SHM snapshot truncated in domain '{domain}' ({omitted} later domain(s) omitted): \
+             accumulated size exceeded budget of {} bytes (buffer {})",
+            budget,
+            max_snapshot_size
+        );
     }
+
+    let snapshot = ShmSnapshot { version: ts, timestamp: ts, domains: domain_indices };
+    Ok(BuiltSnapshot { earliest_expiry: earliest_expiry(&snapshot), bytes: serialize_snapshot(&snapshot) })
+}
+
+/// Collects one domain's entries against the shared byte budget, stopping at
+/// the first entry that would exceed it. Returns the entries and whether this
+/// domain was truncated. `read_point` is the single MVCC read point (passed
+/// through, never re-taken); `running` accumulates across domains.
+fn collect_domain_entries(
+    engine: &LsmStorageEngine,
+    domain: &Domain,
+    read_point: &Snapshot,
+    budget: usize,
+    running: &mut usize,
+) -> Result<(Vec<ShmEntry>, bool)> {
+    let prefix_len = domain.system_prefix.len();
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for (raw_key, meta) in engine.scan_with_metadata(&domain.system_prefix, read_point)? {
+        let user_key = raw_key[prefix_len..].to_vec();
+        let cost = user_key.len() + meta.data.len() + PER_ENTRY_OVERHEAD;
+        if *running + cost > budget {
+            truncated = true;
+            break;
+        }
+        *running += cost;
+        entries.push(to_entry(user_key, meta));
+    }
+    Ok((entries, truncated))
 }
 
 /// Builds an entry, flagging VLog-backed values (empty `value`, client falls
@@ -497,7 +504,7 @@ mod tests {
     use super::*;
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::domain::DomainConfig;
-    use crate::engines::lsm::engine::LsmEngineOptions;
+    use crate::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions, TestHooks, ThreadHook};
     use crate::ipc::{ReaderSlot, ReaderSlotHandle, ReaderSlotLease, SnapshotGuard, PUBLISH_WAIT_TIMEOUT_US};
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::file_manager::FileManager;
@@ -508,6 +515,19 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     async fn make_setup() -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
+        make_setup_with(LsmEngineOptions::default()).await
+    }
+
+    async fn make_setup_with(
+        options: LsmEngineOptions,
+    ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
+        make_setup_with_hooks(options, TestHooks::default()).await
+    }
+
+    async fn make_setup_with_hooks(
+        options: LsmEngineOptions,
+        hooks: TestHooks,
+    ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -515,19 +535,9 @@ mod tests {
         let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
         let fm = Arc::new(FileManager::new(dir.path()).await.unwrap());
         let mm = Arc::new(ManifestManager::new(dir.path()));
-        let engine = Arc::new(
-            LsmStorageEngine::new(
-                wal,
-                wal_path,
-                vlog,
-                vlog_path,
-                fm,
-                mm,
-                LsmEngineOptions::default(),
-            )
-            .await
-            .unwrap(),
-        );
+        let mut engine = LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, fm, mm, options).await.unwrap();
+        engine.hooks = hooks;
+        let engine = Arc::new(engine);
         let metrics = MetricsStore::new(MetricsConfig::default());
         let registry = Arc::new(
             DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap(),
@@ -552,40 +562,97 @@ mod tests {
         snap.domains.iter().find(|d| d.name == name)
     }
 
-    // Spec perf/017 test 7: a 20 000-key snapshot build hands the thread
-    // back, so a point `get` spawned after it answers first.
+    /// Engine options under which the MemTable never rotates on its own, so
+    /// the test alone decides where the keys live.
+    fn unrotated() -> LsmEngineOptions {
+        LsmEngineOptions {
+            engine: LsmEngineConfig { memtable_size_threshold: usize::MAX, ..LsmEngineConfig::default() },
+            ..LsmEngineOptions::default()
+        }
+    }
+
+    /// Writes the keys `c000000..` (`n` of them, 64-byte values) under
+    /// `prefix`, split evenly over `sstables` flushed SSTables; 0 leaves them
+    /// all in the MemTable.
+    async fn seed(engine: &LsmStorageEngine, prefix: &[u8], n: u32, sstables: u32) {
+        use crate::engines::lsm::engine::BatchOp;
+        let parts = sstables.max(1);
+        for part in 0..parts {
+            let (from, to) = (n / parts * part, n / parts * (part + 1));
+            for start in (from..to).step_by(1024) {
+                let ops = (start..(start + 1024).min(to))
+                    .map(|i| BatchOp::Put {
+                        key: [prefix, format!("c{i:06}").as_bytes()].concat(),
+                        value: vec![b'v'; 64],
+                    })
+                    .collect();
+                engine.write_batch(ops).await.unwrap();
+            }
+            if sstables > 0 {
+                engine.flush_all_memtables().await.unwrap();
+            }
+        }
+    }
+
+    // A build over keys in SSTables reads them on another thread while the
+    // engine thread answers a write: the build holds the engine thread only to
+    // take its read point, its first scan stays parked until the write returned.
     #[test]
-    fn test_snapshot_build_interleaves_with_get() {
+    fn test_sources_are_read_off_the_engine_thread_while_it_answers_a_write() {
         crate::core::engine_runtime::block_on(async {
-            use crate::engines::lsm::engine::BatchOp;
-            use crate::engines::StorageEngine;
-
-            let (engine, registry, _dir) = make_setup().await;
+            let (hook, reached, release) = ThreadHook::new();
+            let hooks = TestHooks { before_scan: Some(hook), ..TestHooks::default() };
+            let (engine, registry, _dir) = make_setup_with_hooks(unrotated(), hooks).await;
             let domain = registry.create_domain("shm").await.unwrap();
-            let ops: Vec<BatchOp> = (0..20_000u32)
-                .map(|i| BatchOp::Put {
-                    key: [domain.system_prefix.as_slice(), format!("k:{i:05}").as_bytes()].concat(),
-                    value: b"v".to_vec(),
-                })
-                .collect();
-            engine.write_batch(ops).await.unwrap();
+            seed(&engine, &domain.system_prefix, 2_048, 2).await;
+            let engine_thread = std::thread::current().id();
+            let builder = builder(&registry, &engine, ARENA_LEN);
+            let build = compio::runtime::spawn(async move { builder.build().await.unwrap() });
+            // Waits off the engine thread and lets a scan parked on the engine
+            // thread itself go at once, so that case fails instead of hanging.
+            let (scan_thread, release) = tokio::task::spawn_blocking(move || {
+                let scan_thread = reached.recv().unwrap();
+                if scan_thread == engine_thread {
+                    release.send(()).unwrap();
+                }
+                (scan_thread, release)
+            })
+            .await
+            .unwrap();
+            assert_ne!(scan_thread, engine_thread, "the build read its sources on the engine thread");
 
-            let builder = builder(&registry, &engine, 32 * 1024 * 1024);
-            let reader = Arc::clone(&engine);
-            let probe_key = [domain.system_prefix.as_slice(), b"k:00001".as_slice()].concat();
-            let order = crate::core::coop::completion_order(
-                async move {
-                    let bytes = builder.build().await.unwrap().bytes;
-                    let snapshot = decode(bytes.as_slice());
-                    assert_eq!(find(&snapshot, "shm").unwrap().entries.len(), 20_000);
-                },
-                async move {
-                    assert!(reader.get(&probe_key).await.unwrap().is_some());
-                },
-            )
-            .await;
-            assert_eq!(order, ["small", "long"]);
+            registry.store("shm").await.unwrap().put(b"late", b"v").await.unwrap();
+            release.send(()).unwrap();
+            let snap = decode(&build.await.unwrap().bytes);
+            let dom = find(&snap, "shm").unwrap();
+            assert_eq!(dom.entries.len(), 2_048);
+            assert!(!dom.entries.iter().any(|e| e.key == b"late"), "the write came after the build's read point");
         })
+    }
+
+    // Diagnosis, asserts no timing: prints how long one build takes against
+    // the key count, with the keys in the MemTable, in one SSTable, or split
+    // over two. Run it in release:
+    // `cargo test --release -- --ignored --nocapture snapshot_build_cost`
+    #[test]
+    #[ignore = "diagnosis: prints build durations"]
+    fn snapshot_build_cost_by_key_count_and_layout() {
+        for n in [50_000u32, 100_000, 200_000, 400_000] {
+            for sstables in [0, 1, 2] {
+                let elapsed = crate::core::engine_runtime::block_on(async {
+                    let (engine, registry, _dir) = make_setup_with(unrotated()).await;
+                    let domain = registry.create_domain("shm").await.unwrap();
+                    seed(&engine, &domain.system_prefix, n, sstables).await;
+                    let builder = builder(&registry, &engine, 1 << 30);
+                    let start = Instant::now();
+                    let built = builder.build().await.unwrap();
+                    let elapsed = start.elapsed();
+                    assert_eq!(find(&decode(&built.bytes), "shm").unwrap().entries.len(), n as usize);
+                    elapsed
+                });
+                println!("build: {n:>7} keys, {sstables} SSTable(s): {elapsed:?}");
+            }
+        }
     }
 
     // 1. ShmSnapshot serialize/deserialize roundtrip.
@@ -795,6 +862,38 @@ mod tests {
             let dom = find(&snap, "default").unwrap();
             assert!(dom.entries.iter().any(|e| e.key == b"stays"));
             assert!(!dom.entries.iter().any(|e| e.key == b"gone"), "expired key must be absent");
+        })
+    }
+
+    // Keys in SSTables come out as their newest version: an overwrite in the
+    // newer table wins, a tombstone or an expiry hides the key, and the NULL
+    // and vLog flags survive the flush.
+    #[test]
+    fn test_build_reads_the_newest_version_from_sstables() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup_with(unrotated()).await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"kept", b"1").await.unwrap();
+            store.put(b"overwritten", b"old").await.unwrap();
+            store.put(b"deleted", b"v").await.unwrap();
+            store.put(b"large", &vec![b'x'; 2048]).await.unwrap();
+            store.set_null(b"nulled").await.unwrap();
+            store.put_expired_for_test(b"gone", b"v").await.unwrap();
+            engine.flush_all_memtables().await.unwrap();
+            store.put(b"overwritten", b"new").await.unwrap();
+            store.delete(b"deleted").await.unwrap();
+            engine.flush_all_memtables().await.unwrap();
+
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            let dom = find(&snap, "default").unwrap();
+            let keys: Vec<&[u8]> = dom.entries.iter().map(|e| e.key.as_slice()).collect();
+            assert_eq!(keys, [b"kept".as_slice(), b"large", b"nulled", b"overwritten"]);
+            assert_eq!(default_entry(&snap, b"kept").unwrap().value, b"1");
+            assert_eq!(default_entry(&snap, b"overwritten").unwrap().value, b"new");
+            let large = default_entry(&snap, b"large").unwrap();
+            assert!(large.is_vlog_pointer && large.value.is_empty());
+            let nulled = default_entry(&snap, b"nulled").unwrap();
+            assert!(nulled.is_null && !nulled.is_vlog_pointer && nulled.value.is_empty());
         })
     }
 

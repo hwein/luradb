@@ -302,17 +302,18 @@ impl TestHook {
 }
 
 /// Test-only rendezvous for a synchronous path on a thread of its own: the
-/// first `pause` signals `reached`, then blocks until `release` is sent.
+/// first `pause` sends its thread's id on `reached`, then blocks until
+/// `release` is sent.
 #[cfg(test)]
 pub(crate) struct ThreadHook {
-    ends: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    ends: Mutex<Option<(std::sync::mpsc::Sender<std::thread::ThreadId>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 #[cfg(test)]
 impl ThreadHook {
-    /// The hook plus the test's ends: `reached` receives once the path is
-    /// parked, a send on `release` lets it go on.
-    pub fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    /// The hook plus the test's ends: `reached` receives the id of the
+    /// parked thread, a send on `release` lets it go on.
+    pub fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<std::thread::ThreadId>, std::sync::mpsc::Sender<()>) {
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         (Arc::new(Self { ends: Mutex::new(Some((reached_tx, release_rx))) }), reached_rx, release_tx)
@@ -321,7 +322,7 @@ impl ThreadHook {
     /// Parks the first caller only; later calls pass straight through.
     pub fn pause(&self) {
         let Some((reached, release)) = self.ends.lock().take() else { return };
-        reached.send(()).unwrap();
+        reached.send(std::thread::current().id()).unwrap();
         release.recv().unwrap();
     }
 }
@@ -340,6 +341,8 @@ pub(crate) struct TestHooks {
     pub snapshot_stamp_drawn: Option<Arc<ThreadHook>>,
     /// Parks `write_batch` in Phase 2 right after its first MemTable insert.
     pub batch_first_applied: Option<Arc<ThreadHook>>,
+    /// Parks `scan_with_metadata` before it reads.
+    pub before_scan: Option<Arc<ThreadHook>>,
     /// Parks `write_kv_pair` of this key under its in-flight guard, right
     /// before the MemTable insert.
     pub before_kv_pair_apply: Option<(Vec<u8>, Arc<TestHook>)>,
@@ -1017,8 +1020,7 @@ impl LsmStorageEngine {
     }
 
     /// MVCC-aware point read returning value + metadata without dereferencing
-    /// the VLog (spec perf/009 §3). Additive to [`Self::get_with_snapshot`];
-    /// used by the SHM snapshot builder.
+    /// the VLog. Additive to [`Self::get_with_snapshot`].
     pub async fn get_with_metadata(
         &self,
         key: &[u8],
@@ -1609,6 +1611,22 @@ impl LsmStorageEngine {
         snapshot: &Snapshot,
     ) -> Result<Vec<Vec<u8>>> {
         self.scan_keys_inner(prefix, limit, Some(snapshot)).await
+    }
+
+    /// Every live entry under `prefix` visible at `snapshot`, with value and
+    /// metadata, in one pass over the current sources (see
+    /// [`LsmReader::scan_with_metadata`]) — the SHM snapshot builder's read.
+    /// It blocks for the whole pass: call it off the engine thread.
+    pub fn scan_with_metadata(
+        &self,
+        prefix: &[u8],
+        snapshot: &Snapshot,
+    ) -> Result<Vec<(Vec<u8>, ValueWithMetadata)>> {
+        #[cfg(test)]
+        if let Some(hook) = &self.hooks.before_scan {
+            hook.pause();
+        }
+        self.build_reader().scan_with_metadata(prefix, snapshot)
     }
 
     /// Shared implementation for [`Self::scan_keys_limited`]/
@@ -6614,7 +6632,7 @@ mod tests {
     // ── Spec kv/034: a batch whole or not at all for other threads ───────────
 
     /// Ends of a hook that parks `write_batch` after its first MemTable insert.
-    type BatchHook = (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>);
+    type BatchHook = (std::sync::mpsc::Receiver<std::thread::ThreadId>, std::sync::mpsc::Sender<()>);
 
     /// Engine whose `write_batch` parks after its first MemTable insert.
     async fn engine_with_batch_hook() -> (Arc<LsmStorageEngine>, BatchHook, tempfile::TempDir) {

@@ -60,6 +60,7 @@ All notable changes to LuraDB are documented in this file.
 - A failed write-ahead log append no longer leaves its partial bytes behind the log's end.
 - A write-ahead log whose cleanup after a failed append also failed is cut on the next start, before recovery reads it.
 - A write admitted just before its KV domain was deleted is refused with 410 instead of leaving an orphaned key.
+- Writes no longer stall for minutes while the SHM snapshot of a large domain is built.
 
 ### Security
 

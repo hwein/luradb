@@ -36,6 +36,7 @@ All notable changes to LuraDB are documented in this file.
 - The storage thread always runs; all write-ahead logs (KV, JSON, relational, system) are written by it with shared group commit.
 - `io_engine.enabled` now only toggles registered buffers.
 - Write-ahead log format v2 (LSN-framed); existing logs are upgraded automatically on first start (one-way — a downgrade needs a backup restore).
+- The storage thread syncs the write-ahead logs of several engines in parallel instead of one after another.
 
 ### Removed
 

@@ -21,6 +21,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Changed
 
+- Building the SHM snapshot of a domain larger than the data buffer no longer holds the whole domain in memory.
 - Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.
 - SHM snapshots are only rebuilt after data changes, cutting tail latency of small requests on idle servers.
 - The SHM command dispatcher wakes on a per-client doorbell passed with the registration reply instead of a 10 µs idle sleep loop.

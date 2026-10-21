@@ -16,6 +16,7 @@ use crate::storage::format::is_expired;
 use anyhow::{Context, Result};
 use rkyv::util::AlignedVec;
 use rkyv::{rancor, Archive, Deserialize, Serialize};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch, Notify};
@@ -183,10 +184,11 @@ fn build_at(
     Ok(BuiltSnapshot { earliest_expiry: earliest_expiry(&snapshot), bytes: serialize_snapshot(&snapshot) })
 }
 
-/// Collects one domain's entries against the shared byte budget, stopping at
-/// the first entry that would exceed it. Returns the entries and whether this
-/// domain was truncated. `read_point` is the single MVCC read point (passed
-/// through, never re-taken); `running` accumulates across domains.
+/// Collects one domain's entries against the shared byte budget, reading no
+/// further than the first entry that would exceed it. Returns the entries,
+/// sorted by key, and whether this domain was truncated. `read_point` is the
+/// single MVCC read point (passed through, never re-taken); `running`
+/// accumulates across domains.
 fn collect_domain_entries(
     engine: &LsmStorageEngine,
     domain: &Domain,
@@ -197,16 +199,19 @@ fn collect_domain_entries(
     let prefix_len = domain.system_prefix.len();
     let mut entries = Vec::new();
     let mut truncated = false;
-    for (raw_key, meta) in engine.scan_with_metadata(&domain.system_prefix, read_point)? {
-        let user_key = raw_key[prefix_len..].to_vec();
+    engine.scan_with_metadata(&domain.system_prefix, read_point, |raw_key, meta| {
+        let user_key = &raw_key[prefix_len..];
         let cost = user_key.len() + meta.data.len() + PER_ENTRY_OVERHEAD;
         if *running + cost > budget {
             truncated = true;
-            break;
+            return ControlFlow::Break(());
         }
         *running += cost;
-        entries.push(to_entry(user_key, meta));
-    }
+        entries.push(to_entry(user_key.to_vec(), meta));
+        ControlFlow::Continue(())
+    })?;
+    // The scan can put a key after its extensions; clients binary-search by key.
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
     Ok((entries, truncated))
 }
 
@@ -776,6 +781,68 @@ mod tests {
             let total: usize = snap.domains.iter().map(|d| d.entries.len()).sum();
             assert!(total > 0, "at least one entry fits");
             assert!(total < 200, "snapshot must be truncated, got {total}");
+        })
+    }
+
+    // A domain four times the budget is read only up to the budget: the build
+    // stops reading its sources at the first entry that no longer fits.
+    #[test]
+    fn test_build_of_a_domain_over_budget_stops_reading_at_the_budget() {
+        use crate::engines::lsm::engine::BatchOp;
+        use crate::engines::lsm::reader::scanned_versions;
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup_with(unrotated()).await;
+            let domain = registry.create_domain("shm").await.unwrap();
+            let max_snapshot_size = 1 << 16;
+            // Every entry costs the same: a 7-byte key, a 64-byte value, the overhead.
+            let fits = (max_snapshot_size / 8 * 7) / (7 + 64 + PER_ENTRY_OVERHEAD);
+            let n = 4 * fits;
+            // The keys interleave over three sources: two SSTables and the MemTable.
+            for source in 0..3 {
+                let ops = (source..n)
+                    .step_by(3)
+                    .map(|i| BatchOp::Put {
+                        key: [domain.system_prefix.as_slice(), format!("k{i:06}").as_bytes()].concat(),
+                        value: vec![b'v'; 64],
+                    })
+                    .collect();
+                engine.write_batch(ops).await.unwrap();
+                if source < 2 {
+                    engine.flush_all_memtables().await.unwrap();
+                }
+            }
+
+            let read_point = engine.snapshot();
+            let before = scanned_versions();
+            let built =
+                build_at(&engine, std::slice::from_ref(&domain), read_point.snapshot(), max_snapshot_size).unwrap();
+            let read = scanned_versions() - before;
+
+            let snap = decode(&built.bytes);
+            let dom = find(&snap, "shm").unwrap();
+            let keys: Vec<Vec<u8>> = dom.entries.iter().map(|e| e.key.clone()).collect();
+            let smallest: Vec<Vec<u8>> = (0..fits).map(|i| format!("k{i:06}").into_bytes()).collect();
+            assert_eq!(keys, smallest);
+            // Lead: the entry that no longer fit, plus one queued version per source.
+            assert!(read <= (fits + 1 + 3) as u64, "read {read} versions to publish {fits}");
+        })
+    }
+
+    // A key sorts before the keys it is a prefix of, wherever each one lives.
+    #[test]
+    fn test_build_sorts_a_key_before_its_extensions() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup_with(unrotated()).await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"ab", b"2").await.unwrap();
+            engine.flush_all_memtables().await.unwrap();
+            store.put(b"a", b"1").await.unwrap();
+            store.put(b"abc", b"3").await.unwrap();
+
+            let snap = decode(&builder(&registry, &engine, 1 << 20).build().await.unwrap().bytes);
+            let dom = find(&snap, "default").unwrap();
+            let keys: Vec<&[u8]> = dom.entries.iter().map(|e| e.key.as_slice()).collect();
+            assert_eq!(keys, [b"a".as_slice(), b"ab", b"abc"]);
         })
     }
 

@@ -31,6 +31,7 @@ use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use compio::time::sleep;
@@ -1613,20 +1614,22 @@ impl LsmStorageEngine {
         self.scan_keys_inner(prefix, limit, Some(snapshot)).await
     }
 
-    /// Every live entry under `prefix` visible at `snapshot`, with value and
-    /// metadata, in one pass over the current sources (see
-    /// [`LsmReader::scan_with_metadata`]) — the SHM snapshot builder's read.
-    /// It blocks for the whole pass: call it off the engine thread.
+    /// Hands every live entry under `prefix` visible at `snapshot`, with value
+    /// and metadata, to `emit` until it breaks, in one pass over the current
+    /// sources (see [`LsmReader::scan_with_metadata`]) — the SHM snapshot
+    /// builder's read. It blocks for the whole pass: call it off the engine
+    /// thread.
     pub fn scan_with_metadata(
         &self,
         prefix: &[u8],
         snapshot: &Snapshot,
-    ) -> Result<Vec<(Vec<u8>, ValueWithMetadata)>> {
+        emit: impl FnMut(&[u8], ValueWithMetadata) -> ControlFlow<()>,
+    ) -> Result<()> {
         #[cfg(test)]
         if let Some(hook) = &self.hooks.before_scan {
             hook.pause();
         }
-        self.build_reader().scan_with_metadata(prefix, snapshot)
+        self.build_reader().scan_with_metadata(prefix, snapshot, emit)
     }
 
     /// Shared implementation for [`Self::scan_keys_limited`]/

@@ -14,8 +14,9 @@ use crate::storage::vlog::VLogError;
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicU64};
-use std::collections::{BinaryHeap, BTreeMap, BTreeSet};
-use std::cmp::Ordering;
+use std::collections::{BinaryHeap, BTreeSet};
+use std::cmp::{Ordering, Reverse};
+use std::ops::ControlFlow;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -49,6 +50,24 @@ fn with_stamp(result: GetResult, expire_at: u64, ts: Timestamp) -> (GetResult, u
 pub(crate) fn is_applying(applying_batch: &AtomicU64, ts: Timestamp) -> bool {
     let applying = applying_batch.load(atomic::Ordering::Acquire);
     applying != 0 && ts.as_u64() == applying
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Versions [`LsmReader::scan_with_metadata`] read from its sources on this thread.
+    static SCANNED_VERSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Versions [`LsmReader::scan_with_metadata`] read from its sources on the
+/// calling thread so far.
+#[cfg(test)]
+pub(crate) fn scanned_versions() -> u64 {
+    SCANNED_VERSIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn count_scanned_version() {
+    SCANNED_VERSIONS.with(|n| n.set(n.get() + 1));
 }
 
 /// A snapshot for MVCC reads.
@@ -356,47 +375,66 @@ impl<'a> LsmReader<'a> {
         }
     }
 
-    /// Every live entry under `prefix` visible at `snapshot`, key-sorted, as
-    /// [`Self::get_with_metadata`] reads each one — but in one pass over the
-    /// sources instead of a lookup per key. Synchronous and without yield
+    /// Hands every live entry under `prefix` visible at `snapshot` to `emit`,
+    /// as [`Self::get_with_metadata`] reads each one, until `emit` breaks. One
+    /// k-way merge over the sources, so a break also ends the reading.
+    /// Entries come in encoded key order, which can put a key after the keys
+    /// it is a prefix of (`ab` before `a`). Synchronous and without yield
     /// points: meant for a thread that may block.
-    pub fn scan_with_metadata(
-        &self,
-        prefix: &[u8],
-        snapshot: &Snapshot,
-    ) -> Result<Vec<(Vec<u8>, ValueWithMetadata)>> {
-        // Sources come newest-first, so the first visible version of a user
-        // key decides it; `None` = a tombstone or an expired version.
-        let mut decided: BTreeMap<Vec<u8>, Option<ValueWithMetadata>> = BTreeMap::new();
+    pub fn scan_with_metadata<'s>(
+        &'s self,
+        prefix: &'s [u8],
+        snapshot: &'s Snapshot,
+        mut emit: impl FnMut(&[u8], ValueWithMetadata) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let applying_batch = self.applying_batch;
+        let mut sources: Vec<Box<dyn Iterator<Item = Result<ScanVersion>> + 's>> = Vec::new();
         for memtable in self.version.memtables_newest_first() {
-            for (encoded_key, value) in memtable.iter_from(prefix) {
-                if !encoded_key.starts_with(prefix) {
-                    break;
-                }
-                let (Some(user_key), Some(ts)) =
-                    (InternalKey::extract_user_key(&encoded_key), InternalKey::extract_timestamp(&encoded_key))
-                else {
-                    continue;
-                };
-                // A version of the batch being applied does not decide, see
-                // `newest_in_memtables`.
-                if !user_key.starts_with(prefix)
-                    || !snapshot.is_visible(ts)
-                    || decided.contains_key(user_key)
-                    || is_applying(self.applying_batch, ts)
-                {
-                    continue;
-                }
-                decided.insert(user_key.to_vec(), Self::meta_from_memtable(value, ts));
-            }
+            let versions = memtable
+                .iter_from(prefix)
+                .take_while(move |(encoded_key, _)| encoded_key.starts_with(prefix))
+                .filter_map(move |(encoded_key, value)| {
+                    let user_key = InternalKey::extract_user_key(&encoded_key)?;
+                    let ts = InternalKey::extract_timestamp(&encoded_key)?;
+                    // A version of the batch being applied does not decide, see
+                    // `newest_in_memtables`.
+                    let decides =
+                        user_key.starts_with(prefix) && snapshot.is_visible(ts) && !is_applying(applying_batch, ts);
+                    decides.then(|| Ok((user_key.to_vec(), ts, Self::meta_from_memtable(value, ts))))
+                });
+            sources.push(Box::new(versions));
         }
         for sstable in self.version.sstables_newest_first() {
-            for version in sstable.prefix_versions(prefix, Some(snapshot.timestamp().inverted())) {
-                let (user_key, ts, value) = version?;
-                decided.entry(user_key).or_insert_with(|| Self::meta_from_stored(value.into(), ts));
+            let versions = sstable
+                .prefix_versions(prefix, Some(snapshot.timestamp().inverted()))
+                .map(|version| version.map(|(user_key, ts, value)| (user_key, ts, Self::meta_from_stored(value.into(), ts))));
+            sources.push(Box::new(versions));
+        }
+
+        let mut heads = BinaryHeap::with_capacity(sources.len());
+        for (rank, source) in sources.iter_mut().enumerate() {
+            if let Some(head) = next_head(source, rank)? {
+                heads.push(Reverse(head));
             }
         }
-        Ok(decided.into_iter().filter_map(|(key, meta)| Some((key, meta?))).collect())
+        // The first head of a user key decides it, see the order of `ScanHead`;
+        // remembering only the last key relies on a key's versions being adjacent.
+        let mut decided: Option<Vec<u8>> = None;
+        while let Some(Reverse(head)) = heads.pop() {
+            if let Some(next) = next_head(&mut sources[head.rank], head.rank)? {
+                heads.push(Reverse(next));
+            }
+            if decided.as_ref() == Some(&head.user_key) {
+                continue;
+            }
+            if let Some(meta) = head.meta {
+                if emit(&head.user_key, meta).is_break() {
+                    return Ok(());
+                }
+            }
+            decided = Some(head.user_key);
+        }
+        Ok(())
     }
 
     /// Newest version of `user_key` as (write stamp, liveness) — the TTL
@@ -424,6 +462,54 @@ impl<'a> LsmReader<'a> {
         }
         Ok(None)
     }
+}
+
+/// A source version as [`LsmReader::scan_with_metadata`] merges it: user key,
+/// write stamp, metadata (`None` = a tombstone or an expired version).
+type ScanVersion = (Vec<u8>, Timestamp, Option<ValueWithMetadata>);
+
+/// The next version of one scan source; `rank` is the source's place in
+/// newest-first order.
+struct ScanHead {
+    user_key: Vec<u8>,
+    ts: Timestamp,
+    meta: Option<ValueWithMetadata>,
+    rank: usize,
+}
+
+impl Ord for ScanHead {
+    /// Encoded key order, as each source yields its versions; the versions of
+    /// one user key newest source first, as the point reads decide.
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.user_key == other.user_key {
+            return self.rank.cmp(&other.rank);
+        }
+        let (stamp, other_stamp) = (self.ts.to_be_bytes(), other.ts.to_be_bytes());
+        self.user_key.iter().chain(&stamp).cmp(other.user_key.iter().chain(&other_stamp))
+    }
+}
+
+impl PartialOrd for ScanHead {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ScanHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ScanHead {}
+
+/// Reads the next version of scan source `rank` as its merge head.
+fn next_head(source: &mut impl Iterator<Item = Result<ScanVersion>>, rank: usize) -> Result<Option<ScanHead>> {
+    let Some(version) = source.next() else { return Ok(None) };
+    #[cfg(test)]
+    count_scanned_version();
+    let (user_key, ts, meta) = version?;
+    Ok(Some(ScanHead { user_key, ts, meta, rank }))
 }
 
 /// A versioned entry in the LSM-Tree.

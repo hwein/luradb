@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::core::storage_thread::Faults;
 use crate::core::storage_thread::{StorageHandle, WalTarget};
 use std::path::Path;
 use thiserror::Error;
@@ -181,19 +183,9 @@ impl WriteAheadLog {
     /// path, written by a local committer task instead of the storage hub.
     #[cfg(test)]
     pub async fn new(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.as_ref())
-            .await?;
-
-        let initial_size = file.metadata().await?.len();
-        file.seek(std::io::SeekFrom::Start(initial_size)).await?;
-
+        let wal = LocalWal::open(path.as_ref()).await?;
         let (sender, receiver) = mpsc::channel(1024);
-        compio::runtime::spawn(run_committer(file, initial_size, receiver)).detach();
+        compio::runtime::spawn(run_committer(wal, receiver)).detach();
 
         Ok(Self { inner: WalMode::Local(sender) })
     }
@@ -265,13 +257,86 @@ fn broken_pipe_error() -> WalError {
 #[cfg(test)]
 type AppendResponder = oneshot::Sender<Result<u64, WalError>>;
 
+/// The local committer's file and its append cursor.
+#[cfg(test)]
+struct LocalWal {
+    file: File,
+    offset: u64,
+    /// A failed append may have left bytes past `offset` that a failed cut
+    /// could not remove; the next append cuts first.
+    unsafe_end: bool,
+    faults: Faults,
+}
+
+#[cfg(test)]
+impl LocalWal {
+    async fn open(path: &Path) -> Result<Self, WalError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .await?;
+
+        let offset = file.metadata().await?.len();
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        Ok(Self { file, offset, unsafe_end: false, faults: Faults::default() })
+    }
+
+    /// Writes `data` at the cursor and syncs it. A failed write or sync cuts
+    /// the file back to the cursor, which stays where it was.
+    async fn write_at_cursor(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if self.unsafe_end {
+            if let Err(cut) = self.cut_to_cursor().await {
+                self.log_failed_cut(&cut);
+                return Err(cut);
+            }
+        }
+        let result = async {
+            self.file.seek(std::io::SeekFrom::Start(self.offset)).await?;
+            self.file.write_all(data).await?;
+            self.file.flush().await?;
+            if std::mem::take(&mut self.faults.sync) {
+                return Err(std::io::Error::other("injected fsync failure"));
+            }
+            self.file.sync_all().await
+        }
+        .await;
+        if result.is_err() {
+            if let Err(cut) = self.cut_to_cursor().await {
+                self.log_failed_cut(&cut);
+            }
+        }
+        result
+    }
+
+    /// Cuts the file back to the cursor and syncs the new length; the file's
+    /// end stays unsafe until this succeeds.
+    async fn cut_to_cursor(&mut self) -> std::io::Result<()> {
+        self.unsafe_end = true;
+        if std::mem::take(&mut self.faults.cut) {
+            return Err(std::io::Error::other("injected cut failure"));
+        }
+        self.file.set_len(self.offset).await?;
+        self.file.sync_all().await?;
+        self.unsafe_end = false;
+        Ok(())
+    }
+
+    /// Every failed cut is logged: the file's end stays unsafe until one succeeds.
+    fn log_failed_cut(&self, error: &std::io::Error) {
+        tracing::error!(
+            "Cutting the write-ahead log back to {} bytes failed: {error}; \
+             the next append retries the cut before it writes.",
+            self.offset
+        );
+    }
+}
+
 /// Background task: drains the commit queue and batches writes into a single fsync per group.
 #[cfg(test)]
-async fn run_committer(
-    mut file: File,
-    mut offset: u64,
-    mut rx: mpsc::Receiver<CommitRequest>,
-) {
+async fn run_committer(mut wal: LocalWal, mut rx: mpsc::Receiver<CommitRequest>) {
     loop {
         // Block until at least one request arrives.
         let first = match rx.recv().await {
@@ -281,10 +346,10 @@ async fn run_committer(
 
         match first {
             CommitRequest::Truncate { responder } => {
-                let _ = responder.send(do_truncate(&mut file, &mut offset).await);
+                let _ = responder.send(do_truncate(&mut wal).await);
             }
             CommitRequest::Append { data, responder } => {
-                commit_append_group(&mut file, &mut offset, &mut rx, data, responder).await;
+                commit_append_group(&mut wal, &mut rx, data, responder).await;
             }
         }
     }
@@ -292,8 +357,7 @@ async fn run_committer(
 
 #[cfg(test)]
 async fn commit_append_group(
-    file: &mut File,
-    offset: &mut u64,
+    wal: &mut LocalWal,
     rx: &mut mpsc::Receiver<CommitRequest>,
     data: Vec<u8>,
     responder: AppendResponder,
@@ -317,33 +381,22 @@ async fn commit_append_group(
     }
 
     // Compute per-item offsets and build the single combined write buffer.
-    let start_offset = *offset;
     let mut combined = Vec::new();
     let mut item_offsets = Vec::with_capacity(group.len());
     for (data, _) in &group {
-        item_offsets.push(*offset);
-        *offset += data.len() as u64;
+        item_offsets.push(wal.offset + combined.len() as u64);
         combined.extend_from_slice(data);
     }
 
     // One write + one fsync for the entire group.
-    let result = async {
-        file.seek(std::io::SeekFrom::Start(start_offset)).await?;
-        file.write_all(&combined).await?;
-        file.flush().await?;
-        file.sync_all().await
-    }
-    .await;
-
-    match result {
+    match wal.write_at_cursor(&combined).await {
         Ok(()) => {
+            wal.offset += combined.len() as u64;
             for ((_, responder), item_offset) in group.into_iter().zip(item_offsets) {
                 let _ = responder.send(Ok(item_offset));
             }
         }
         Err(e) => {
-            // Roll back offset — data was not durably written.
-            *offset = start_offset;
             let kind = e.kind();
             let msg = e.to_string();
             for (_, responder) in group {
@@ -356,16 +409,17 @@ async fn commit_append_group(
     }
 
     if let Some(responder) = pending_truncate {
-        let _ = responder.send(do_truncate(file, offset).await);
+        let _ = responder.send(do_truncate(wal).await);
     }
 }
 
 #[cfg(test)]
-async fn do_truncate(file: &mut File, offset: &mut u64) -> Result<(), WalError> {
-    file.set_len(0).await?;
-    file.seek(std::io::SeekFrom::Start(0)).await?;
-    *offset = 0;
-    file.sync_all().await?;
+async fn do_truncate(wal: &mut LocalWal) -> Result<(), WalError> {
+    wal.file.set_len(0).await?;
+    wal.file.seek(std::io::SeekFrom::Start(0)).await?;
+    wal.offset = 0;
+    wal.file.sync_all().await?;
+    wal.unsafe_end = false;
     Ok(())
 }
 
@@ -457,6 +511,108 @@ mod tests {
             assert_eq!(wal.append(b"XY").await.unwrap(), 0);
             drop(wal);
             assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+        })
+    }
+
+    /// Commits `records` as one group on the local committer, the way
+    /// `run_committer` does; returns each append's result in order.
+    async fn commit_group(wal: &mut LocalWal, records: Vec<Vec<u8>>) -> Vec<Result<u64, WalError>> {
+        let (tx, mut rx) = mpsc::channel(records.len());
+        let mut receivers = Vec::new();
+        for data in records {
+            let (responder, receiver) = oneshot::channel();
+            assert!(tx.try_send(CommitRequest::Append { data, responder }).is_ok());
+            receivers.push(receiver);
+        }
+        let Some(CommitRequest::Append { data, responder }) = rx.recv().await else {
+            panic!("expected an append");
+        };
+        commit_append_group(wal, &mut rx, data, responder).await;
+        let mut results = Vec::new();
+        for receiver in receivers {
+            results.push(receiver.await.unwrap());
+        }
+        results
+    }
+
+    fn delete_record(key: &[u8]) -> Vec<u8> {
+        raw_delete_record(key.len() as u32, key)
+    }
+
+    async fn recovered_keys(path: &Path) -> Vec<String> {
+        recover(path)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| match entry {
+                WalEntry::Delete { key, .. } => String::from_utf8(key).unwrap(),
+                other => panic!("expected a DELETE record, got {other:?}"),
+            })
+            .collect()
+    }
+
+    // A failed group cuts the file back to the cursor, keeps the cursor and
+    // fails every append of the group.
+    #[test]
+    fn test_failed_group_cuts_the_file_back_to_the_cursor() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let mut wal = LocalWal::open(&path).await.unwrap();
+            assert_eq!(commit_group(&mut wal, vec![b"kept".to_vec()]).await[0].as_ref().unwrap(), &0);
+
+            wal.faults.sync = true;
+            let results = commit_group(&mut wal, vec![b"lost-one".to_vec(), b"lost-two".to_vec()]).await;
+            assert!(results.iter().all(Result::is_err));
+            assert_eq!(wal.offset, 4);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 4);
+        })
+    }
+
+    // A failed group leaves nothing behind the log's end: after a long group
+    // whose fsync fails and a shorter one that succeeds, recovery reads the
+    // shorter one alone.
+    #[test]
+    fn test_failed_group_leaves_no_tail_behind_a_shorter_one() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let mut wal = LocalWal::open(&path).await.unwrap();
+
+            wal.faults.sync = true;
+            let long = vec![delete_record(b"lost-with-a-long-key"), delete_record(b"lost-as-well")];
+            assert!(commit_group(&mut wal, long).await.iter().all(Result::is_err));
+
+            let kept = commit_group(&mut wal, vec![delete_record(b"kept")]).await;
+            assert_eq!(kept[0].as_ref().unwrap(), &0);
+            assert_eq!(recovered_keys(&path).await, ["kept"]);
+        })
+    }
+
+    // A cut that fails leaves the file's end unsafe: the next group cuts
+    // first, fails while it cannot, and writes at the cursor once it can.
+    #[test]
+    fn test_group_after_a_failed_cut_cuts_first() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let len = || std::fs::metadata(&path).unwrap().len();
+            let mut wal = LocalWal::open(&path).await.unwrap();
+            commit_group(&mut wal, vec![delete_record(b"kept-one")]).await[0].as_ref().unwrap();
+            let start = len();
+
+            wal.faults = Faults { sync: true, cut: true };
+            assert!(commit_group(&mut wal, vec![delete_record(b"lost-with-a-long-key")]).await[0].is_err());
+            let tail = len();
+            assert!(tail > start);
+
+            wal.faults.cut = true;
+            assert!(commit_group(&mut wal, vec![delete_record(b"refused")]).await[0].is_err());
+            assert_eq!(len(), tail);
+
+            let kept = commit_group(&mut wal, vec![delete_record(b"kept-two")]).await;
+            assert_eq!(kept[0].as_ref().unwrap(), &start);
+            assert_eq!(recovered_keys(&path).await, ["kept-one", "kept-two"]);
         })
     }
 

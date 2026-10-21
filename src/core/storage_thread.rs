@@ -161,6 +161,9 @@ struct WalFile {
     engine: WalTarget,
     file: File,
     offset: u64,
+    /// A failed append may have left bytes past `offset` that a failed cut
+    /// could not remove; the next append cuts first.
+    unsafe_end: bool,
 }
 
 /// Totals the thread logs when it stops; appends per fdatasync is the
@@ -181,6 +184,18 @@ struct StorageState {
     /// `false` after a failed `register_files` — ops then fall back to raw fds.
     fixed_files: bool,
     stats: HubStats,
+    #[cfg(test)]
+    faults: Faults,
+}
+
+/// Test-only faults, each reported once by the next operation of its kind.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Faults {
+    /// The next sync fails after its write has landed.
+    pub(crate) sync: bool,
+    /// The next cut back to the cursor fails and leaves the file as it is.
+    pub(crate) cut: bool,
 }
 
 impl StorageState {
@@ -193,6 +208,21 @@ impl StorageState {
 
     fn ring_file(&self, index: usize) -> RingFile {
         if self.fixed_files { RingFile::Fixed(index as u32) } else { RingFile::Raw(self.wals[index].file.as_raw_fd()) }
+    }
+
+    /// Cuts `index`'s file back to its cursor and syncs the new length; the
+    /// file's end stays unsafe until this succeeds.
+    fn cut_to_cursor(&mut self, index: usize) -> std::io::Result<()> {
+        let wal = &mut self.wals[index];
+        wal.unsafe_end = true;
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults.cut) {
+            return Err(std::io::Error::other("injected cut failure"));
+        }
+        wal.file.set_len(wal.offset)?;
+        wal.file.sync_all()?;
+        wal.unsafe_end = false;
+        Ok(())
     }
 }
 
@@ -240,7 +270,7 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
     for (engine, path) in wals {
         let file = open_rw(path)?;
         let offset = file.metadata()?.len();
-        files.push(WalFile { engine: *engine, file, offset });
+        files.push(WalFile { engine: *engine, file, offset, unsafe_end: false });
     }
     // Register the WALs once as fixed files so the kernel skips the fd lookup
     // per op; on failure fall back to raw fds.
@@ -252,7 +282,15 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
             false
         }
     };
-    Ok((StorageState { ring, wals: files, fixed_files, stats: HubStats::default() }, sqpoll_active))
+    let state = StorageState {
+        ring,
+        wals: files,
+        fixed_files,
+        stats: HubStats::default(),
+        #[cfg(test)]
+        faults: Faults::default(),
+    };
+    Ok((state, sqpoll_active))
 }
 
 fn event_loop(state: &mut StorageState, rx: &mut Receiver<IoRequest>, shutdown: &AtomicBool) {
@@ -365,22 +403,50 @@ fn commit_appends(state: &mut StorageState, run: Vec<Append>) {
 }
 
 /// Appends `write` at the end of its file and fdatasyncs it; returns the
-/// offset it starts at. A failed write leaves the cursor where it was.
+/// offset it starts at. A failed write or fdatasync cuts the file back to
+/// the cursor, which stays where it was.
 fn write_file(state: &mut StorageState, write: &FileWrite) -> Result<u64> {
     let index = state.wal_index(write.engine)?;
     let file = state.ring_file(index);
     let start = state.wals[index].offset;
     if !write.data.is_empty() {
+        if state.wals[index].unsafe_end {
+            if let Err(cut) = state.cut_to_cursor(index) {
+                log_failed_cut(write.engine, start, &cut);
+                return Err(cut.into());
+            }
+        }
         // At most one write per WAL file in flight: `ring_op` reaps every op
         // before it returns, so the fdatasync and the file's next write are
         // submitted only once this write has completed — each file gets its
-        // bytes in channel order.
-        ring_write_all(&mut state.ring, file, start, &write.data)?;
-        ring_fsync(&mut state.ring, file)?;
+        // bytes in channel order, and a cut after a failure races no write.
+        if let Err(e) = write_and_sync(state, file, start, &write.data) {
+            if let Err(cut) = state.cut_to_cursor(index) {
+                log_failed_cut(write.engine, start, &cut);
+            }
+            return Err(e.into());
+        }
         state.stats.fdatasyncs += 1;
     }
     state.wals[index].offset += write.data.len() as u64;
     Ok(start)
+}
+
+fn write_and_sync(state: &mut StorageState, file: RingFile, start: u64, data: &[u8]) -> std::io::Result<()> {
+    ring_write_all(&mut state.ring, file, start, data)?;
+    #[cfg(test)]
+    if std::mem::take(&mut state.faults.sync) {
+        return Err(std::io::Error::other("injected fdatasync failure"));
+    }
+    ring_fsync(&mut state.ring, file)
+}
+
+/// Every failed cut is logged: the file's end stays unsafe until one succeeds.
+fn log_failed_cut(engine: WalTarget, cursor: u64, error: &std::io::Error) {
+    tracing::error!(
+        "Cutting the {engine:?} write-ahead log back to {cursor} bytes failed: {error}; \
+         the next append retries the cut before it writes."
+    );
 }
 
 fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
@@ -389,6 +455,7 @@ fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     wal.file.set_len(0)?;
     wal.offset = 0;
     wal.file.sync_all()?;
+    wal.unsafe_end = false;
     Ok(())
 }
 
@@ -760,6 +827,111 @@ mod tests {
         let offsets: Vec<u64> = receivers.iter_mut().map(|rx| rx.try_recv().unwrap().unwrap()).collect();
         assert_eq!(&offsets[..6], [0, 0, 1, 0, 1, 2]);
         assert_eq!(offsets[6..], (3..23).collect::<Vec<u64>>());
+    }
+
+    /// Append requests of `records` to `engine`'s WAL, in order, with their receivers.
+    fn record_appends(
+        engine: WalTarget,
+        records: Vec<Vec<u8>>,
+    ) -> (Vec<IoRequest>, Vec<oneshot::Receiver<Result<u64>>>) {
+        records
+            .into_iter()
+            .map(|data| {
+                let (response, rx) = oneshot::channel();
+                (IoRequest::WalAppend { engine, data, response }, rx)
+            })
+            .unzip()
+    }
+
+    // A write that fails on one file cuts that file back to its cursor and
+    // fails that file's requests alone; the batch's other file commits.
+    #[test]
+    fn test_failed_write_cuts_its_file_back_to_the_cursor() {
+        use std::io::Write;
+        use WalTarget::{Json, Kv};
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[Kv, Json]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        assert!(state.fixed_files);
+        let (batch, _) = appends(&[Kv, Kv, Json]);
+        process_batch(&mut state, batch);
+
+        // The bytes a torn write landed before it failed.
+        OpenOptions::new().append(true).open(&wals[0].1).unwrap().write_all(b"torn").unwrap();
+        // Every further write to the key-value WAL fails: its slot holds /dev/full.
+        let dev_full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        state.ring.submitter().register_files_update(0, &[dev_full.as_raw_fd()]).unwrap();
+
+        let (batch, mut receivers) = appends(&[Kv, Json, Kv]);
+        process_batch(&mut state, batch);
+
+        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), 2);
+        assert_eq!(state.wals[0].offset, 2);
+        for i in [0, 2] {
+            let err = receivers[i].try_recv().unwrap().unwrap_err();
+            assert!(err.to_string().starts_with("WAL append failed"), "{err}");
+        }
+        assert_eq!(receivers[1].try_recv().unwrap().unwrap(), 1);
+    }
+
+    // A failed append leaves nothing behind the log's end: after a long run
+    // whose fdatasync fails and a shorter run that succeeds, recovery reads
+    // the shorter run alone.
+    #[test]
+    fn test_failed_append_leaves_no_tail_behind_a_shorter_one() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+
+            state.faults.sync = true;
+            let long = vec![delete_record(1, b"lost-with-a-long-key"), delete_record(1, b"lost-as-well")];
+            let (batch, failed) = record_appends(WalTarget::Kv, long);
+            process_batch(&mut state, batch);
+            for mut rx in failed {
+                let err = rx.try_recv().unwrap().unwrap_err();
+                assert!(err.to_string().starts_with("WAL append failed"), "{err}");
+            }
+
+            let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(2, b"kept")]);
+            process_batch(&mut state, batch);
+            assert_eq!(kept[0].try_recv().unwrap().unwrap(), 0);
+            assert_eq!(recovered_keys(&wals[0].1).await, ["kept"]);
+        })
+    }
+
+    // A cut that fails leaves the file's end unsafe: the next append cuts
+    // first, fails while it cannot, and writes at the cursor once it can.
+    #[test]
+    fn test_append_after_a_failed_cut_cuts_first() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let path = wals[0].1.as_path();
+            let len = || std::fs::metadata(path).unwrap().len();
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            let (batch, _) = record_appends(WalTarget::Kv, vec![delete_record(1, b"kept-one")]);
+            process_batch(&mut state, batch);
+            let start = len();
+
+            state.faults = Faults { sync: true, cut: true };
+            let (batch, mut failed) = record_appends(WalTarget::Kv, vec![delete_record(2, b"lost-with-a-long-key")]);
+            process_batch(&mut state, batch);
+            assert!(failed[0].try_recv().unwrap().is_err());
+            let tail = len();
+            assert!(tail > start);
+
+            state.faults.cut = true;
+            let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(3, b"refused")]);
+            process_batch(&mut state, batch);
+            assert!(refused[0].try_recv().unwrap().is_err());
+            assert_eq!(len(), tail);
+
+            let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(4, b"kept-two")]);
+            process_batch(&mut state, batch);
+            assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+            assert_eq!(recovered_keys(path).await, ["kept-one", "kept-two"]);
+        })
     }
 
     // 4. Batching: 100 concurrent wal_append requests processed correctly.

@@ -54,6 +54,7 @@ All notable changes to LuraDB are documented in this file.
 - Shutdown saves the manifest before it truncates the WAL, so a flush whose manifest save failed is no longer lost.
 - Deleted or expired keys no longer reappear with an older value after compaction.
 - Small requests wait less behind concurrent key listings.
+- A failed write-ahead log append no longer leaves its partial bytes behind the log's end.
 
 ### Security
 

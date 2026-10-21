@@ -182,6 +182,10 @@ fn sys_key(name: &str) -> Vec<u8> {
     k
 }
 
+fn deleting_error(name: &str) -> anyhow::Error {
+    anyhow!("410 Gone: Domain '{}' is being deleted", name)
+}
+
 // ── DomainState ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -232,6 +236,9 @@ struct DomainRuntime {
     /// no other write of that key falls in between; unconditional writes
     /// hold it shared and keep running side by side.
     key_write_locks: [tokio::sync::RwLock<()>; KEY_WRITE_SHARDS],
+    /// Set once the domain turns `Deleting`, never cleared: a domain created
+    /// again under the same name gets a runtime of its own.
+    deleting: AtomicBool,
 }
 
 impl DomainRuntime {
@@ -240,7 +247,12 @@ impl DomainRuntime {
             rate_limiter: RateLimiter::new(quota),
             metrics_window: OnceLock::new(),
             key_write_locks: std::array::from_fn(|_| tokio::sync::RwLock::new(())),
+            deleting: AtomicBool::new(false),
         })
+    }
+
+    fn mark_deleting(&self) {
+        self.deleting.store(true, Ordering::Release);
     }
 
     fn key_write_lock(&self, user_key: &[u8]) -> &tokio::sync::RwLock<()> {
@@ -343,7 +355,11 @@ impl DomainRegistry {
         let mut cache = self.domains.write();
         let mut runtimes = self.runtimes.write();
         for domain in loaded {
-            runtimes.insert(domain.name.clone(), self.make_runtime());
+            let runtime = self.make_runtime();
+            if domain.state == DomainState::Deleting {
+                runtime.mark_deleting();
+            }
+            runtimes.insert(domain.name.clone(), runtime);
             cache.insert(domain.name.clone(), domain);
         }
         Ok(())
@@ -413,7 +429,8 @@ impl DomainRegistry {
             .collect())
     }
 
-    /// Transitions the domain to `Deleting` state and persists the change.
+    /// Transitions the domain to `Deleting` state and persists the change;
+    /// stores taken before refuse every write from then on.
     ///
     /// Returns `Err` if the domain doesn't exist. Physical key cleanup is
     /// handled asynchronously by `DomainPurger`.
@@ -428,6 +445,9 @@ impl DomainRegistry {
         domain.state = DomainState::Deleting;
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
+        if let Some(runtime) = self.runtimes.read().get(name) {
+            runtime.mark_deleting();
+        }
         self.domains.write().insert(name.to_string(), domain);
         // The engine write above raised the epoch before `list_domains` changed.
         self.engine.raise_change_epoch();
@@ -465,9 +485,7 @@ impl DomainRegistry {
             let cache = self.domains.read();
             match cache.get(name) {
                 None => return Err(anyhow!("404 Not Found: Domain '{}' not found", name)),
-                Some(d) if d.state == DomainState::Deleting => {
-                    return Err(anyhow!("410 Gone: Domain '{}' is being deleted", name));
-                }
+                Some(d) if d.state == DomainState::Deleting => return Err(deleting_error(name)),
                 Some(d) => {
                     let rt = self
                         .runtimes
@@ -661,16 +679,27 @@ impl DomainStore {
         Ok(())
     }
 
+    /// Refuses a write once the domain is deleting. The engine runs it under
+    /// the write's in-flight guard, so a delete's drain waits for every
+    /// write it let through.
+    fn admit(&self) -> Result<()> {
+        if self.runtime.deleting.load(Ordering::Acquire) {
+            return Err(deleting_error(&self.domain.name));
+        }
+        Ok(())
+    }
+
     /// Runs `op` on the domain-prefixed `key`; returns the engine write's
     /// latency in microseconds.
     async fn apply(&self, key: &[u8], op: KeyWrite<'_>) -> Result<u64> {
         let start = std::time::Instant::now();
+        let admit = || self.admit();
         match op {
             KeyWrite::Put { value, ttl_secs } => {
-                self.engine.write_kv_pair(key, value, ttl_secs.map(expire_at_from_ttl)).await?
+                self.engine.write_kv_pair_admitted(key, value, ttl_secs.map(expire_at_from_ttl), admit).await?
             }
-            KeyWrite::Null => self.engine.write_null(key).await?,
-            KeyWrite::Delete => self.engine.write_tombstone(key).await?,
+            KeyWrite::Null => self.engine.write_null_admitted(key, admit).await?,
+            KeyWrite::Delete => self.engine.write_tombstone_admitted(key, admit).await?,
         }
         Ok(start.elapsed().as_micros() as u64)
     }
@@ -679,7 +708,7 @@ impl DomainStore {
     #[cfg(test)]
     pub(crate) async fn put_expired_for_test(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.validate_user_key(key)?;
-        self.engine.write_kv_pair(&self.prefixed_key(key), value, Some(1)).await
+        self.engine.write_kv_pair_admitted(&self.prefixed_key(key), value, Some(1), || self.admit()).await
     }
 
     /// Reads a value by user key — three-valued (spec kv/018): `Present`,
@@ -830,7 +859,7 @@ impl DomainStore {
             ops.push(BatchOp::Delete { key: self.prefixed_key(&k) });
         }
         let start = std::time::Instant::now();
-        self.engine.write_batch(ops).await?;
+        self.engine.write_batch_admitted(ops, || self.admit()).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
         Ok(count)
     }
@@ -862,7 +891,7 @@ impl DomainStore {
     pub(crate) async fn put_unthrottled(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
         self.validate_user_key(key)?;
         let start = std::time::Instant::now();
-        self.engine.write_kv_pair(&self.prefixed_key(key), value, expire_at).await?;
+        self.engine.write_kv_pair_admitted(&self.prefixed_key(key), value, expire_at, || self.admit()).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
         Ok(())
     }
@@ -872,7 +901,7 @@ impl DomainStore {
     pub(crate) async fn set_null_unthrottled(&self, key: &[u8]) -> Result<()> {
         self.validate_user_key(key)?;
         let start = std::time::Instant::now();
-        self.engine.write_null(&self.prefixed_key(key)).await?;
+        self.engine.write_null_admitted(&self.prefixed_key(key), || self.admit()).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
         Ok(())
     }
@@ -1024,7 +1053,16 @@ impl DomainPurger {
             let prefix = domain.system_prefix.clone();
             let all_keys = self.engine.scan_keys(&prefix).await?;
             if all_keys.is_empty() {
-                self.registry.finish_purge(&domain.name).await?;
+                // Rescanned under a drain: a write that held its guard during
+                // the scan above may not have applied its key yet. The finalize
+                // writes too, so it runs after the drain.
+                let empty = {
+                    let _drain = self.engine.drain_writes().await;
+                    self.engine.scan_keys_limited(&prefix, 1).await?.is_empty()
+                };
+                if empty {
+                    self.registry.finish_purge(&domain.name).await?;
+                }
                 continue;
             }
             for key in all_keys.iter().take(self.batch_size) {
@@ -1042,7 +1080,7 @@ mod tests {
     use super::*;
     use crate::core::events::{format_event_id, stream_epoch, ResetReason};
     use crate::core::wal::WriteAheadLog;
-    use crate::engines::lsm::engine::LsmEngineConfig;
+    use crate::engines::lsm::engine::{LsmEngineConfig, TestHook, TestHooks};
     use crate::engines::lsm::watcher::WATCH_TAG;
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::vlog::VLog;
@@ -1059,6 +1097,13 @@ mod tests {
     async fn make_setup_with_engine_config(
         engine_config: LsmEngineConfig,
     ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
+        make_setup_with_hooks(engine_config, TestHooks::default()).await
+    }
+
+    async fn make_setup_with_hooks(
+        engine_config: LsmEngineConfig,
+        hooks: TestHooks,
+    ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -1066,17 +1111,17 @@ mod tests {
         let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
         let fm = Arc::new(FileManager::new(dir.path()).await.unwrap());
         let mm = Arc::new(ManifestManager::new(dir.path()));
-        let engine = Arc::new(
-            LsmStorageEngine::new(
-                wal, wal_path, vlog, vlog_path, fm, mm,
-                crate::engines::lsm::engine::LsmEngineOptions {
-                    engine: engine_config,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap(),
-        );
+        let mut engine = LsmStorageEngine::new(
+            wal, wal_path, vlog, vlog_path, fm, mm,
+            crate::engines::lsm::engine::LsmEngineOptions {
+                engine: engine_config,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.hooks = hooks;
+        let engine = Arc::new(engine);
         let metrics = MetricsStore::new(MetricsConfig::default());
         let registry = Arc::new(DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap());
         (engine, registry, dir)
@@ -1257,6 +1302,39 @@ mod tests {
         })
     }
 
+    // A store taken before the delete keeps its domain; every write it still
+    // tries is refused under the in-flight guard and reaches neither the WAL
+    // nor the MemTable.
+    #[test]
+    fn test_writes_through_a_store_of_a_deleting_domain_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, dir) = make_setup().await;
+            registry.create_domain("doomed").await.unwrap();
+            let store = registry.store("doomed").await.unwrap();
+            store.put(b"p:1", b"v").await.unwrap();
+            registry.delete_domain("doomed").await.unwrap();
+            let wal = dir.path().join("wal.log");
+            let wal_len = std::fs::metadata(&wal).unwrap().len();
+
+            let refusals = [
+                store.put(b"k", b"v").await,
+                store.put_with_ttl(b"k", b"v", 60).await,
+                store.delete(b"p:1").await,
+                store.set_null(b"k").await,
+                store.write(b"k", KeyWrite::Null, &[Precondition::MustNotExist]).await,
+                store.put_unthrottled(b"k", b"v", None).await,
+                store.set_null_unthrottled(b"k").await,
+                store.delete_by_prefix(b"p:", None).await.map(|_| ()),
+            ];
+            for refused in refusals {
+                assert_eq!(refused.unwrap_err().to_string(), "410 Gone: Domain 'doomed' is being deleted");
+            }
+            assert_eq!(std::fs::metadata(&wal).unwrap().len(), wal_len, "nothing may reach the WAL");
+            let prefix = store.domain().system_prefix.clone();
+            assert_eq!(engine.scan_keys(&prefix).await.unwrap(), [[prefix.as_slice(), b"p:1"].concat()]);
+        })
+    }
+
     // Test: Domain-Purge removes all keys → scan_keys returns empty.
     #[test]
     fn test_domain_purge_removes_keys() {
@@ -1286,6 +1364,40 @@ mod tests {
             let remaining = engine.scan_keys(&prefix).await.unwrap();
             assert!(remaining.is_empty(), "All domain keys must be removed after purge");
             assert!(registry.get_domain("purge-test").await.unwrap().is_none());
+        })
+    }
+
+    // A write that holds its in-flight guard with a key not yet applied keeps
+    // the purger's final empty scan waiting; once the key is in, the scan
+    // finds it and the domain is not finalized.
+    #[test]
+    fn test_purger_rescans_under_a_drain_before_it_finalizes() {
+        crate::core::engine_runtime::block_on(async {
+            let key = [generate_prefix("doomed").as_slice(), b"late"].concat();
+            let hook = Arc::new(TestHook::default());
+            let hooks = TestHooks { before_kv_pair_apply: Some((key.clone(), Arc::clone(&hook))), ..Default::default() };
+            let (engine, registry, _dir) = make_setup_with_hooks(LsmEngineConfig::default(), hooks).await;
+            registry.create_domain("doomed").await.unwrap();
+            registry.delete_domain("doomed").await.unwrap();
+
+            let writer = compio::runtime::spawn({
+                let (engine, key) = (Arc::clone(&engine), key.clone());
+                async move { engine.write_kv_pair(&key, b"v", None).await }
+            });
+            hook.reached.notified().await;
+            let purger =
+                DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), Arc::new(AtomicBool::new(false)), 100, 1);
+            let tick = compio::runtime::spawn(async move { purger.purge_tick().await });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!tick.is_finished(), "the final scan must wait for the write in flight");
+
+            hook.release.notify_one();
+            writer.await.unwrap().unwrap();
+            tick.await.unwrap().unwrap();
+            assert_eq!(engine.scan_keys(&key).await.unwrap(), [key]);
+            assert!(registry.list_deleting_domains().iter().any(|d| d.name == "doomed"), "must not be finalized");
         })
     }
 

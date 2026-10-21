@@ -340,6 +340,9 @@ pub(crate) struct TestHooks {
     pub snapshot_stamp_drawn: Option<Arc<ThreadHook>>,
     /// Parks `write_batch` in Phase 2 right after its first MemTable insert.
     pub batch_first_applied: Option<Arc<ThreadHook>>,
+    /// Parks `write_kv_pair` of this key under its in-flight guard, right
+    /// before the MemTable insert.
+    pub before_kv_pair_apply: Option<(Vec<u8>, Arc<TestHook>)>,
 }
 
 /// LSM-Tree Storage Engine with MVCC and background maintenance.
@@ -1122,6 +1125,12 @@ impl LsmStorageEngine {
         drop(self.in_flight_writes.write().await);
     }
 
+    /// Like [`Self::quiesce_writes`], but keeps every later write out until
+    /// the returned guard drops.
+    pub(super) async fn drain_writes(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.in_flight_writes.write().await
+    }
+
     /// A write in flight, as far as [`Self::quiesce_writes`] can tell.
     #[cfg(test)]
     pub(crate) async fn in_flight_write_for_test(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
@@ -1145,6 +1154,18 @@ impl LsmStorageEngine {
     /// ones are stored inline. `expire_at` is an absolute Unix timestamp (seconds)
     /// for TTL; `None` or `0` means no expiry.
     pub(super) async fn write_kv_pair(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
+        self.write_kv_pair_admitted(key, value, expire_at, || Ok(())).await
+    }
+
+    /// [`Self::write_kv_pair`] that first runs `admit` under the in-flight
+    /// guard; an error from it refuses the write before the stamp and the WAL.
+    pub(super) async fn write_kv_pair_admitted(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        expire_at: Option<u64>,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         // Freeze check first (spec kv/029): its drain takes the write side of
         // `in_flight_writes`, which would deadlock under the guard below.
         self.maybe_freeze_memtable().await?;
@@ -1156,6 +1177,7 @@ impl LsmStorageEngine {
         // but need the guard all the same — the stamp ordering applies to
         // every write.
         let _guard = self.in_flight_writes.read().await;
+        admit()?;
 
         let timestamp = self.next_timestamp();
         let expire_at_val = expire_at.unwrap_or(0);
@@ -1177,6 +1199,12 @@ impl LsmStorageEngine {
         } else {
             Value::Inline(value.to_vec(), expire_at)
         };
+        #[cfg(test)]
+        if let Some((hooked, hook)) = &self.hooks.before_kv_pair_apply {
+            if hooked.as_slice() == key {
+                hook.pause().await;
+            }
+        }
         self.version().memtable.set(key.to_vec(), timestamp, resolved);
         self.raise_change_epoch();
 
@@ -1200,10 +1228,16 @@ impl LsmStorageEngine {
 
     /// Appends a DELETE entry to the WAL and inserts a tombstone into the MemTable.
     pub(super) async fn write_tombstone(&self, key: &[u8]) -> Result<()> {
+        self.write_tombstone_admitted(key, || Ok(())).await
+    }
+
+    /// [`Self::write_tombstone`], admitted like [`Self::write_kv_pair_admitted`].
+    pub(super) async fn write_tombstone_admitted(&self, key: &[u8], admit: impl FnOnce() -> Result<()>) -> Result<()> {
         // Freeze check before the guard, then guard before the stamp — see
-        // `write_kv_pair` (spec kv/029).
+        // `write_kv_pair_admitted`.
         self.maybe_freeze_memtable().await?;
         let _guard = self.in_flight_writes.read().await;
+        admit()?;
 
         let timestamp = self.next_timestamp();
 
@@ -1214,7 +1248,7 @@ impl LsmStorageEngine {
         self.version().memtable.set(key.to_vec(), timestamp, Value::Tombstone);
         self.raise_change_epoch();
 
-        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        // Broadcast after the apply is visible — see `write_kv_pair_admitted`.
         self.publish_change(key, OpType::Delete);
         Ok(())
     }
@@ -1256,10 +1290,16 @@ impl LsmStorageEngine {
     /// visible and overwrites older versions like a Put. Writes without
     /// expiry (`set_null` never carries a TTL).
     pub(super) async fn write_null(&self, key: &[u8]) -> Result<()> {
+        self.write_null_admitted(key, || Ok(())).await
+    }
+
+    /// [`Self::write_null`], admitted like [`Self::write_kv_pair_admitted`].
+    pub(super) async fn write_null_admitted(&self, key: &[u8], admit: impl FnOnce() -> Result<()>) -> Result<()> {
         // Freeze check before the guard, then guard before the stamp — see
-        // `write_kv_pair` (spec kv/029).
+        // `write_kv_pair_admitted`.
         self.maybe_freeze_memtable().await?;
         let _guard = self.in_flight_writes.read().await;
+        admit()?;
 
         let timestamp = self.next_timestamp();
 
@@ -1275,8 +1315,8 @@ impl LsmStorageEngine {
         self.version().memtable.set(key.to_vec(), timestamp, Value::Null);
         self.raise_change_epoch();
 
-        // set_null is an Update (spec kv/018 §1/§2) — a Set-Event, not Delete.
-        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        // set_null is an update — a Set event, not Delete.
+        // Broadcast after the apply is visible — see `write_kv_pair_admitted`.
         self.publish_change(key, OpType::Set);
         Ok(())
     }
@@ -1361,12 +1401,22 @@ impl LsmStorageEngine {
     /// the apply runs, `applying_batch` hides it from readers on other
     /// threads (spec kv/034).
     pub async fn write_batch(&self, ops: Vec<BatchOp>) -> Result<()> {
+        self.write_batch_admitted(ops, || Ok(())).await
+    }
+
+    /// [`Self::write_batch`], admitted like [`Self::write_kv_pair_admitted`];
+    /// an empty batch writes nothing and is not checked.
+    pub(super) async fn write_batch_admitted(
+        &self,
+        ops: Vec<BatchOp>,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
         self.validate_batch_ops(&ops)?;
 
-        // Freeze check before the guard (spec kv/029) — see `write_kv_pair`.
+        // Freeze check before the guard — see `write_kv_pair_admitted`.
         self.maybe_freeze_memtable().await?;
 
         // In-flight guard (spec kv/020, widened by kv/029), held across the
@@ -1375,6 +1425,7 @@ impl LsmStorageEngine {
         // before the shared stamp and held through every `memtable.set` in
         // Phase 2 below.
         let _guard = self.in_flight_writes.read().await;
+        admit()?;
 
         let timestamp = self.next_timestamp();
 
@@ -1412,7 +1463,7 @@ impl LsmStorageEngine {
         self.applying_batch.store(0, Ordering::Release);
         self.raise_change_epoch();
 
-        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        // Broadcast after the apply is visible — see `write_kv_pair_admitted`.
         self.broadcast_batch_events(&batch_events);
         Ok(())
     }

@@ -543,6 +543,61 @@ mod tests {
         })
     }
 
+    const KV_GONE: &str = "410 Gone: Domain 'doomed' is being deleted";
+
+    #[test]
+    fn a_kv_write_that_reaches_its_guard_during_the_delete_is_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            f.control.create_domain(Engine::Kv, "doomed", false).await.unwrap();
+            let store = f.kv.store("doomed").await.unwrap();
+            let late = f.kv.store("doomed").await.unwrap();
+            let prefix = store.domain().system_prefix.clone();
+
+            let in_flight = f.kv.engine().in_flight_write_for_test().await;
+            let delete = compio::runtime::spawn({
+                let control = Arc::clone(&f.control);
+                async move { control.delete_domain(Engine::Kv, "doomed").await }
+            });
+            f.until_deleting(Engine::Kv, "doomed").await;
+            let late_write = compio::runtime::spawn(async move { late.put(b"late", b"v").await });
+            settle().await;
+            assert!(!delete.is_finished(), "the delete must wait for the write in flight");
+
+            drop(in_flight);
+            delete.await.unwrap().unwrap();
+            assert_eq!(late_write.await.unwrap().unwrap_err().to_string(), KV_GONE);
+            assert_eq!(store.put(b"again", b"v").await.unwrap_err().to_string(), KV_GONE);
+            assert_eq!(f.state(Engine::Kv, "doomed"), Some(Lifecycle::Deleting), "refused before the finalize");
+            assert!(f.kv.engine().scan_keys(&prefix).await.unwrap().is_empty());
+        })
+    }
+
+    #[test]
+    fn a_kv_store_taken_before_the_delete_stays_refused_after_the_purge() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            f.control.create_domain(Engine::Kv, "doomed", false).await.unwrap();
+            let store = f.kv.store("doomed").await.unwrap();
+            store.put(b"k", b"v").await.unwrap();
+            let prefix = store.domain().system_prefix.clone();
+
+            f.control.delete_domain(Engine::Kv, "doomed").await.unwrap();
+            let purger = purger(&f);
+            purger.purge_tick().await.unwrap(); // tombstones the key
+            purger.purge_tick().await.unwrap(); // finalizes
+            assert_eq!(f.state(Engine::Kv, "doomed"), None);
+
+            assert_eq!(store.put(b"late", b"v").await.unwrap_err().to_string(), KV_GONE);
+            assert!(f.kv.engine().scan_keys(&prefix).await.unwrap().is_empty());
+
+            f.control.create_domain(Engine::Kv, "doomed", false).await.unwrap();
+            assert_eq!(store.put(b"late", b"v").await.unwrap_err().to_string(), KV_GONE);
+            let reborn = f.kv.store("doomed").await.unwrap();
+            assert!(reborn.scan_keys(b"").await.unwrap().is_empty(), "no orphan in the new domain");
+        })
+    }
+
     #[test]
     fn a_json_delete_waits_for_a_held_document_lock_and_then_hands_over_to_the_purger() {
         crate::core::engine_runtime::block_on(async {

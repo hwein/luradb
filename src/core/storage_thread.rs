@@ -190,7 +190,8 @@ struct StorageState {
     faults: Faults,
 }
 
-/// Test-only faults, each reported once by the next operation of its kind.
+/// Test-only faults, each reported once by the next operation of its kind,
+/// and the counters the tests read.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct Faults {
@@ -200,6 +201,42 @@ pub(crate) struct Faults {
     pub(crate) cut: bool,
     /// The next removal of the unsafe-end marker fails and leaves it.
     pub(crate) unmark: bool,
+    /// The next removal of the unsafe-end marker removes it, then fails to
+    /// sync its directory.
+    pub(crate) unmark_sync: bool,
+    /// Directory syncs the removals of the unsafe-end marker have attempted,
+    /// the injected failure included.
+    pub(crate) unmark_syncs: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (fail the next sync, syncs attempted) of the marker removal running on
+    /// this thread, set while its [`DirSyncProbe`] lives.
+    static DIR_SYNC_PROBE: std::cell::Cell<Option<(bool, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+impl Faults {
+    /// Lets the directory syncs on this thread see `unmark_sync` and count
+    /// into `unmark_syncs` until the returned probe drops.
+    pub(crate) fn probe_unmark_syncs(&mut self) -> DirSyncProbe<'_> {
+        DIR_SYNC_PROBE.set(Some((std::mem::take(&mut self.unmark_sync), 0)));
+        DirSyncProbe(self)
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct DirSyncProbe<'a>(&'a mut Faults);
+
+#[cfg(test)]
+impl Drop for DirSyncProbe<'_> {
+    fn drop(&mut self) {
+        if let Some((fail, syncs)) = DIR_SYNC_PROBE.take() {
+            self.0.unmark_sync |= fail;
+            self.0.unmark_syncs += syncs;
+        }
+    }
 }
 
 impl StorageState {
@@ -242,6 +279,8 @@ impl StorageState {
         if std::mem::take(&mut self.faults.unmark) {
             return Err(std::io::Error::other("injected marker removal failure"));
         }
+        #[cfg(test)]
+        let _probe = self.faults.probe_unmark_syncs();
         unmark_unsafe_end(&self.wals[index].marker)
     }
 }
@@ -531,17 +570,28 @@ fn write_marker(marker: &Path, cursor: u64) -> std::io::Result<()> {
     sync_dir(marker)
 }
 
+/// Removes `marker` and syncs its directory. A missing marker gets the sync
+/// too: a retry after a failed sync finds the marker gone, and only the sync
+/// keeps it gone after a power loss.
 pub(crate) fn unmark_unsafe_end(marker: &Path) -> std::io::Result<()> {
+    let failed =
+        |step: &str, e: std::io::Error| std::io::Error::new(e.kind(), format!("{step} {}: {e}", marker.display()));
     match std::fs::remove_file(marker) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result
-            .and_then(|()| sync_dir(marker))
-            .map_err(|e| std::io::Error::new(e.kind(), format!("removing {}: {e}", marker.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        removed => removed.map_err(|e| failed("removing", e))?,
     }
+    sync_dir(marker).map_err(|e| failed("syncing the directory after removing", e))
 }
 
 /// A rename or removal survives a power loss only once its directory is synced.
 fn sync_dir(file: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some((fail, syncs)) = DIR_SYNC_PROBE.get() {
+        DIR_SYNC_PROBE.set(Some((false, syncs + 1)));
+        if fail {
+            return Err(std::io::Error::other("injected directory sync failure"));
+        }
+    }
     let dir = match file.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -1180,6 +1230,34 @@ mod tests {
         process_batch(&mut state, batch);
         assert_eq!(kept[0].try_recv().unwrap().unwrap(), 0);
         assert!(!marker.exists());
+    }
+
+    // A removal whose directory sync fails fails the cut; the retry finds the
+    // marker gone and still syncs the directory before it confirms an append.
+    #[test]
+    fn test_a_failed_directory_sync_after_the_marker_removal_fails_the_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        let (mut state, start) = state_after_a_failed_cut(&wals);
+        assert!(marker.exists());
+
+        state.faults.unmark_sync = true;
+        let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(3, b"refused")]);
+        process_batch(&mut state, batch);
+        assert!(refused[0].try_recv().unwrap().is_err());
+        assert!(!marker.exists());
+        assert!(state.wals[0].unsafe_end);
+
+        let syncs = state.faults.unmark_syncs;
+        let record = delete_record(4, b"kept-two");
+        let end = start + record.len() as u64;
+        let (batch, mut kept) = record_appends(WalTarget::Kv, vec![record]);
+        process_batch(&mut state, batch);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+        assert_eq!(state.faults.unmark_syncs, syncs + 1);
+        assert!(!state.wals[0].unsafe_end);
+        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), end);
     }
 
     // A marker that holds no 8-byte cursor stops the start and is named in

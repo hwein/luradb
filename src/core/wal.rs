@@ -339,6 +339,7 @@ impl LocalWal {
         if std::mem::take(&mut self.faults.unmark) {
             return Err(std::io::Error::other("injected marker removal failure"));
         }
+        let _probe = self.faults.probe_unmark_syncs();
         unmark_unsafe_end(&self.marker)
     }
 
@@ -759,6 +760,33 @@ mod tests {
             let kept = commit_group(&mut wal, vec![delete_record(b"kept-two")]).await;
             assert_eq!(kept[0].as_ref().unwrap(), &0);
             assert!(!marker.exists());
+        })
+    }
+
+    // A removal whose directory sync fails fails the cut; the retry finds the
+    // marker gone and still syncs the directory before it confirms a group.
+    #[test]
+    fn test_a_failed_directory_sync_after_the_marker_removal_fails_the_cut() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let marker = dir.path().join("wal.unsafe-end");
+            let (mut wal, start) = wal_after_a_failed_cut(&path).await;
+            assert!(marker.exists());
+
+            wal.faults.unmark_sync = true;
+            assert!(commit_group(&mut wal, vec![delete_record(b"refused")]).await[0].is_err());
+            assert!(!marker.exists());
+            assert!(wal.unsafe_end);
+
+            let syncs = wal.faults.unmark_syncs;
+            let record = delete_record(b"kept-two");
+            let end = start + record.len() as u64;
+            let kept = commit_group(&mut wal, vec![record]).await;
+            assert_eq!(kept[0].as_ref().unwrap(), &start);
+            assert_eq!(wal.faults.unmark_syncs, syncs + 1);
+            assert!(!wal.unsafe_end);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), end);
         })
     }
 

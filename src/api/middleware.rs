@@ -66,6 +66,9 @@ impl From<DomainError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("503 Service Unavailable: the {} engine is disabled", engine.as_str()),
             ),
+            DomainError::Stopped => {
+                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable: the control plane is not running")
+            }
         }
     }
 }
@@ -335,5 +338,12 @@ mod tests {
     fn api_error_maps_400_prefix_to_bad_request() {
         let err = ApiError::from(anyhow::anyhow!("400 Bad Request: key must be valid UTF-8"));
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_stopped_control_plane_maps_to_service_unavailable() {
+        let err = ApiError::from(DomainError::Stopped);
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1, "503 Service Unavailable: the control plane is not running");
     }
 }

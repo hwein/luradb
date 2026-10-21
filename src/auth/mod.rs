@@ -107,9 +107,9 @@ impl AuthCache {
 
     /// Loads all auth data from the engine into the in-memory cache.
     ///
-    /// Rebuilds both maps rather than merging: a reload after a restore may
-    /// change a user's api_key_hash, and the superseded hash must stop
-    /// authenticating. Built off-lock, then swapped in — no empty-cache window.
+    /// Rebuilds both maps rather than merging, so a hash the store no longer
+    /// holds stops authenticating. Built off-lock, then swapped in — no
+    /// empty-cache window.
     pub async fn load_from_engine(&self) -> Result<()> {
         let user_keys = self
             .engine
@@ -387,9 +387,9 @@ mod tests {
         (AuthCache::new(engine), dir)
     }
 
-    /// A restore overwrites a user record by name with a different
-    /// api_key_hash — reloading must drop the superseded hash, not keep it
-    /// alongside the new one.
+    /// A user record overwritten by name with a different api_key_hash —
+    /// reloading must drop the superseded hash, not keep it alongside the
+    /// new one.
     #[test]
     fn load_from_engine_drops_superseded_key_hash() {
         crate::core::engine_runtime::block_on(async {
@@ -409,7 +409,7 @@ mod tests {
             cache.load_from_engine().await.unwrap();
             assert!(cache.get_user_by_key_hash(&hash_a).await.is_some());
 
-            // Restore overwrites the same record by name with a new key hash.
+            // The same record, overwritten by name with a new key hash.
             record.api_key_hash = hash_b.clone();
             let value = serde_json::to_vec(&record).unwrap();
             cache.engine.put(&key, &value).await.unwrap();

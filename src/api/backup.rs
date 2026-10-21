@@ -601,32 +601,7 @@ pub async fn restore_backup(
     }
 
     let (restore_id, handle) = manager.start_restore(&id, mode, body.into_domain, body.include_auth).await?;
-
-    // Post-completion hook (orchestrator hint 2): a successful include_auth
-    // restore must refresh the in-RAM AuthCache, or restored users stay
-    // invisible until a process restart.
-    if body.include_auth {
-        let auth_cache = Arc::clone(&state.auth_cache);
-        let manager_for_reload = Arc::clone(manager);
-        let reload_restore_id = restore_id.clone();
-        compio::runtime::spawn(async move {
-            let _ = handle.await;
-            let completed = manager_for_reload
-                .get_restore_status(&reload_restore_id)
-                .map(|s| s.state == RestoreState::Complete)
-                .unwrap_or(false);
-            if completed {
-                if let Err(e) = auth_cache.load_from_engine().await {
-                    tracing::warn!(
-                        "[Backup API] auth cache reload after restore '{reload_restore_id}' failed: {e:#}"
-                    );
-                }
-            }
-        })
-        .detach();
-    } else {
-        handle.detach();
-    }
+    handle.detach();
 
     log_audit(&admin_name(&state, &headers).await, "backup restore started", &id);
     Ok((StatusCode::ACCEPTED, Json(RestoreAcceptedResponse { restore_id, state: "running".to_string() })))

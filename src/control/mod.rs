@@ -160,6 +160,9 @@ pub enum DomainError {
     /// The engine is disabled by config.
     #[error("the {} engine is disabled", .0.as_str())]
     Disabled(Engine),
+    /// The worker that runs the commands is gone.
+    #[error("the control plane is not running")]
+    Stopped,
 }
 
 /// A change to the auth records.
@@ -276,10 +279,13 @@ impl ControlPlane {
         self.bus.publish_many(engine.as_str(), domain, events);
     }
 
-    async fn request<T>(&self, command: impl FnOnce(oneshot::Sender<T>) -> Command) -> T {
+    async fn request<T, E: From<DomainError>>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, E>>) -> Command,
+    ) -> Result<T, E> {
         let (reply, answer) = oneshot::channel();
-        self.commands.send(command(reply)).expect("the worker lives as long as the runtime");
-        answer.await.expect("the worker answers every command")
+        self.commands.send(command(reply)).map_err(|_| DomainError::Stopped)?;
+        answer.await.map_err(|_| DomainError::Stopped)?
     }
 
     fn change_directory(&self, change: impl FnOnce(&mut Directory)) {
@@ -701,6 +707,7 @@ mod tests {
             (DomainError::Json(JsonStoreError::DomainNotFound("ghost".to_string())), "domain 'ghost' not found"),
             (DomainError::Rel(RelStoreError::DomainDeleting("doomed".to_string())), "domain 'doomed' is being deleted"),
             (DomainError::Disabled(Engine::Json), "the json engine is disabled"),
+            (DomainError::Stopped, "the control plane is not running"),
         ];
         for (error, text) in errors {
             assert_eq!(error.to_string(), text);
@@ -780,6 +787,54 @@ mod tests {
             f.control.change_auth(AuthChange::RemoveUser("alice".to_string())).await.unwrap();
             assert!(f.auth.get_user_by_name("alice").await.is_none());
             assert!(f.control.system_store().get(b"__sys:auth:user:alice").await.unwrap().is_none());
+        })
+    }
+
+    /// A control plane with no worker behind it; the receiver is the worker's end.
+    async fn without_worker(dir: &tempfile::TempDir) -> (ControlPlane, mpsc::UnboundedReceiver<Command>) {
+        let (commands, inbox) = mpsc::unbounded_channel();
+        let control = ControlPlane {
+            commands,
+            directory: RwLock::default(),
+            bus: Arc::new(GlobalEventBus::new(16, 16)),
+            system: system::open(&dir.path().join("sys")).await.unwrap(),
+        };
+        (control, inbox)
+    }
+
+    #[test]
+    fn every_command_fails_once_the_worker_is_gone() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (control, inbox) = without_worker(&dir).await;
+            drop(inbox);
+
+            let created = control.create_domain(Engine::Kv, "orphan", false).await.unwrap_err();
+            assert!(matches!(created, DomainError::Stopped), "{created:?}");
+            let deleted = control.delete_domain(Engine::Kv, "orphan").await.unwrap_err();
+            assert!(matches!(deleted, DomainError::Stopped), "{deleted:?}");
+            let record = UserRecord {
+                name: "alice".to_string(),
+                api_key_hash: hash_api_key("lura_alice"),
+                role: UserRole::User,
+                created_at: 0,
+            };
+            let changed = control.change_auth(AuthChange::UpsertUser(record)).await.unwrap_err();
+            assert_eq!(changed.to_string(), "the control plane is not running");
+            let finalized = control.finalize_deletion(Engine::Kv, "orphan").await.unwrap_err();
+            assert_eq!(finalized.to_string(), "the control plane is not running");
+        })
+    }
+
+    #[test]
+    fn a_command_dropped_unanswered_fails() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (control, inbox) = without_worker(&dir).await;
+            // Queued first, then dropped with the inbox, as when the worker panics.
+            let create = control.create_domain(Engine::Kv, "orphan", false);
+            let (created, ()) = futures::future::join(create, async move { drop(inbox) }).await;
+            assert!(matches!(created, Err(DomainError::Stopped)), "{created:?}");
         })
     }
 }

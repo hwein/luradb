@@ -7,11 +7,10 @@ use super::writer::{
     FORMAT_VERSION,
 };
 use super::{BackupError, MAX_LINE_BYTES};
-use crate::auth::{perm_key, user_key, DomainPermission, UserRecord};
-use crate::control::{ControlPlane, Engine};
+use crate::auth::{DomainPermission, UserRecord};
+use crate::control::{AuthChange, ControlPlane, Engine};
 use crate::engines::json::{JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{now_secs, DomainRegistry, DomainStore};
-use crate::engines::lsm::engine::LsmStorageEngine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -52,8 +51,8 @@ pub(crate) struct RestoreParams<'a> {
     pub include_auth: bool,
     pub kv_registry: &'a Arc<DomainRegistry>,
     pub json_engine: &'a Option<Arc<JsonEngine>>,
-    /// Creates and deletes the target domains; its system store takes the
-    /// auth records.
+    /// Creates and deletes the target domains and takes the auth records as
+    /// auth changes.
     pub control: &'a ControlPlane,
     pub scan_batch_size: usize,
     pub scan_pause_ms: u64,
@@ -489,8 +488,7 @@ async fn apply_pass(
     remap: &Option<(String, String)>,
     params: &RestoreParams<'_>,
 ) -> anyhow::Result<RestoreOutcome> {
-    let RestoreParams { include_auth, kv_registry, json_engine, scan_batch_size, scan_pause_ms, .. } = *params;
-    let system_store = params.control.system_store();
+    let RestoreParams { include_auth, kv_registry, json_engine, control, scan_batch_size, scan_pause_ms, .. } = *params;
     let mut reader = ArchiveReader::open(path).await?;
     let mut line: Vec<u8> = Vec::new();
 
@@ -574,12 +572,12 @@ async fn apply_pass(
             "auth-user" => {
                 flush_doc_batch(&mut doc_domain, &mut doc_batch, json_engine, &mut outcome).await?;
                 if include_auth {
-                    apply_auth_user(&value, system_store, &mut outcome).await;
+                    apply_auth_user(&value, control, &mut outcome).await;
                 }
             }
             "auth-perm" => {
                 if include_auth {
-                    apply_auth_perm(&value, system_store, &mut outcome).await;
+                    apply_auth_perm(&value, control, &mut outcome).await;
                 }
             }
             // The checksum line marks the verified end of the archive
@@ -652,7 +650,7 @@ async fn flush_doc_batch(
     Ok(())
 }
 
-async fn apply_auth_user(value: &Value, system_store: &LsmStorageEngine, outcome: &mut RestoreOutcome) {
+async fn apply_auth_user(value: &Value, control: &ControlPlane, outcome: &mut RestoreOutcome) {
     let record: UserRecord = match serde_json::from_value(value.clone()) {
         Ok(r) => r,
         Err(e) => {
@@ -660,21 +658,14 @@ async fn apply_auth_user(value: &Value, system_store: &LsmStorageEngine, outcome
             return;
         }
     };
-    let key = user_key(&record.name);
-    let bytes = match serde_json::to_vec(&record) {
-        Ok(b) => b,
-        Err(e) => {
-            outcome.fail(record.name, e.to_string());
-            return;
-        }
-    };
-    match system_store.put(&key, &bytes).await {
+    let name = record.name.clone();
+    match control.change_auth(AuthChange::UpsertUser(record)).await {
         Ok(()) => outcome.imported += 1,
-        Err(e) => outcome.fail(record.name, e.to_string()),
+        Err(e) => outcome.fail(name, e.to_string()),
     }
 }
 
-async fn apply_auth_perm(value: &Value, system_store: &LsmStorageEngine, outcome: &mut RestoreOutcome) {
+async fn apply_auth_perm(value: &Value, control: &ControlPlane, outcome: &mut RestoreOutcome) {
     let perm: DomainPermission = match serde_json::from_value(value.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -682,16 +673,8 @@ async fn apply_auth_perm(value: &Value, system_store: &LsmStorageEngine, outcome
             return;
         }
     };
-    let key = perm_key(&perm.username, &perm.domain);
     let label = format!("{}:{}", perm.username, perm.domain);
-    let bytes = match serde_json::to_vec(&perm) {
-        Ok(b) => b,
-        Err(e) => {
-            outcome.fail(label, e.to_string());
-            return;
-        }
-    };
-    match system_store.put(&key, &bytes).await {
+    match control.change_auth(AuthChange::SetPermission(perm)).await {
         Ok(()) => outcome.imported += 1,
         Err(e) => outcome.fail(label, e.to_string()),
     }
@@ -1441,7 +1424,7 @@ mod tests {
     #[test]
     fn test_include_auth_opt_in() {
         crate::core::engine_runtime::block_on(async {
-            let (_engine, kv_src, _d1) = make_kv_registry().await;
+            let (_, kv_src, _d1) = make_kv_registry().await;
             kv_src.create_domain("shop").await.unwrap();
             let system = system_store(&_d1).await;
             let record = UserRecord {
@@ -1538,7 +1521,8 @@ mod tests {
             reseal(&path, &[manifest.to_string(), user.to_string(), perm.to_string()]);
 
             let (engine, kv_dst, dir) = make_kv_registry().await;
-            let control = control_over(&dir, &kv_dst, &None).await;
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
+            let (control, auth) = crate::control::testing::start(dir.path(), Arc::clone(&kv_dst), None, None, bus).await;
             let outcome = run_restore(RestoreParams {
                 dir: out_dir.path(),
                 backup_id: "bk_old",
@@ -1559,6 +1543,8 @@ mod tests {
             assert!(system.get("__sys:auth:user:zoé".as_bytes()).await.unwrap().is_some());
             assert!(system.get("__sys:auth:perm:zoé:json:shop".as_bytes()).await.unwrap().is_some());
             assert!(engine.scan_keys(b"__sys:auth:").await.unwrap().is_empty());
+            assert_eq!(auth.get_user_by_name("zoé").await.unwrap().api_key_hash, "f00d", "the cache knows the user");
+            assert_eq!(auth.get_permission("zoé", "json:shop").await, Some(crate::auth::AccessLevel::Write));
         })
     }
 
@@ -1568,7 +1554,7 @@ mod tests {
     #[test]
     fn test_backup_include_auth_false_excludes_auth_lines() {
         crate::core::engine_runtime::block_on(async {
-            let (_engine, kv_src, _d1) = make_kv_registry().await;
+            let (_, kv_src, _d1) = make_kv_registry().await;
             let system = system_store(&_d1).await;
             let record = UserRecord {
                 name: "bob".to_string(),

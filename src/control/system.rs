@@ -150,6 +150,7 @@ mod tests {
             let dir = tmp.path().join("sys");
             let (sys, hub) = open_on(&dir, true).await;
             sys.put("__sys:auth:user:zoé".as_bytes(), b"zoe-record").await.unwrap();
+            sys.stop_background_tasks().await;
             drop(sys);
             drop(hub);
             assert!(std::fs::metadata(dir.join(WAL_FILE)).unwrap().len() > 0, "the write is only in the WAL");

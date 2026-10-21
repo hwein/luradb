@@ -84,6 +84,8 @@ impl WalPermit<'_> {
     /// Queues `data` and waits until it is durable; returns its offset and LSN.
     pub async fn send(self, data: Vec<u8>) -> Result<(u64, u64)> {
         let (response, rx) = oneshot::channel();
+        #[cfg(test)]
+        let rx = crate::core::write_trace::wal_wait(self.engine, rx);
         self.permit.send(IoRequest::WalAppend { engine: self.engine, data, response });
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
     }
@@ -523,12 +525,18 @@ type Append = (WalTarget, Vec<u8>, oneshot::Sender<Result<(u64, u64)>>);
 /// Writes a run of appends, one [`FileWrite`] per WAL file, and answers each
 /// request with the offset and the LSN of its record.
 fn commit_appends(state: &mut StorageState, run: Vec<Append>) {
+    #[cfg(test)]
+    let picked = crate::core::write_trace::now();
     state.stats.appends += run.len() as u64;
     let last_lsn = |engine: WalTarget| state.wal_index(engine).map_or(0, |index| state.wals[index].lsn);
     let writes = plan_batch(run.iter().map(|(engine, data, _)| (*engine, data.as_slice())), last_lsn);
     let mut responses: Vec<_> = run.into_iter().map(|(_, _, response)| Some(response)).collect();
     for (write, result) in write_files(state, &writes) {
         let result = result.map_err(|e| e.to_string());
+        #[cfg(test)]
+        if result.is_ok() {
+            crate::core::write_trace::hub_answered(picked, write.engine, write.parts.iter().map(|part| part.2));
+        }
         for &(position, offset, lsn) in &write.parts {
             let Some(response) = responses[position].take() else { continue };
             let _ = response.send(match &result {
@@ -853,6 +861,8 @@ struct Chain<'a> {
 /// reap nor cancel; returning would free a live buffer, so we abort instead
 /// (safety over uptime).
 fn ring_chains(ring: &mut IoUring, chains: &[Chain<'_>]) -> Vec<(i32, i32)> {
+    #[cfg(test)]
+    let mut stamps = crate::core::write_trace::ChainStamps::start();
     let mut results = Vec::with_capacity(chains.len());
     {
         let mut sq = ring.submission();
@@ -874,7 +884,10 @@ fn ring_chains(ring: &mut IoUring, chains: &[Chain<'_>]) -> Vec<(i32, i32)> {
     }
     let mut unreaped = 2 * results.len();
     while unreaped > 0 {
-        match ring.submit_and_wait(unreaped) {
+        let wait = unreaped;
+        #[cfg(test)]
+        let wait = stamps.wait(wait);
+        match ring.submit_and_wait(wait) {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
             Err(e) => {
@@ -886,6 +899,8 @@ fn ring_chains(ring: &mut IoUring, chains: &[Chain<'_>]) -> Vec<(i32, i32)> {
             }
         }
         for entry in ring.completion() {
+            #[cfg(test)]
+            stamps.complete(entry.user_data());
             let (write, sync) = &mut results[entry.user_data() as usize / 2];
             if entry.user_data() % 2 == 0 {
                 *write = entry.result();
@@ -895,6 +910,8 @@ fn ring_chains(ring: &mut IoUring, chains: &[Chain<'_>]) -> Vec<(i32, i32)> {
             unreaped -= 1;
         }
     }
+    #[cfg(test)]
+    stamps.finish();
     results
 }
 

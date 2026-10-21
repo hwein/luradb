@@ -5,6 +5,8 @@
 //! frontend runtime, with the bridge in between.
 
 mod engine;
+#[cfg(test)]
+mod write_phases;
 
 use crate::{
     api::{self, middleware::ParsedCidr, ApiDoc, AppState},
@@ -321,6 +323,8 @@ pub(crate) async fn serve_connection<I, F>(
 {
     let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
         extend(req.extensions_mut());
+        #[cfg(test)]
+        crate::core::write_trace::arrive(req.extensions_mut());
         router.clone().oneshot(req)
     });
     let builder = connection_builder();

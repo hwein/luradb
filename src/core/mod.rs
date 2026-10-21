@@ -9,3 +9,5 @@ pub mod page;
 pub mod replacer;
 pub mod storage_thread;
 pub mod wal;
+#[cfg(test)]
+pub(crate) mod write_trace;

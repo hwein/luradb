@@ -184,6 +184,8 @@ async fn read_inline(router: Router, reader: Option<mpsc::Sender<Job>>, req: Req
 
 async fn ship(jobs: mpsc::Sender<Job>, req: Request<Body>) -> Response {
     let (parts, body) = req.into_parts();
+    #[cfg(test)]
+    let (parts, traced) = crate::core::write_trace::ship(parts);
     let (reply, reply_rx) = oneshot::channel();
     // A full channel makes this wait: backpressure onto the connection.
     let sent = jobs.send(Job { parts, body: relay_request_body(body), reply }).await;
@@ -192,6 +194,8 @@ async fn ship(jobs: mpsc::Sender<Job>, req: Request<Body>) -> Response {
     if sent.is_err() {
         return bridge_unavailable();
     }
+    #[cfg(test)]
+    let reply_rx = crate::core::write_trace::reply(traced, reply_rx);
     match reply_rx.await {
         Ok((parts, payload)) => Response::from_parts(parts, payload.into_body()),
         Err(_) => bridge_unavailable(),
@@ -298,7 +302,12 @@ impl EngineForward {
 async fn answer(router: Router, req: Request<Body>) -> Response {
     #[cfg(test)]
     let hold = test_hook::hold(&req);
-    let Ok(resp) = router.oneshot(req).await;
+    #[cfg(test)]
+    let trace = crate::core::write_trace::of(req.extensions());
+    let routed = router.oneshot(req);
+    #[cfg(test)]
+    let routed = crate::core::write_trace::within(trace, routed);
+    let Ok(resp) = routed.await;
     #[cfg(test)]
     hold.await;
     #[cfg(test)]

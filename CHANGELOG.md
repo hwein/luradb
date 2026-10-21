@@ -45,6 +45,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Fixed
 
+- Point reads no longer slow down with the size of newer SSTables that do not hold the key.
 - Reads no longer miss keys while a MemTable flush or a compaction installs its result.
 - Reads no longer fail or return stale values when vLog garbage collection overlaps a MemTable flush or a compaction.
 - `expand` no longer returns `null` for a reference whose target was compacted away during the query.

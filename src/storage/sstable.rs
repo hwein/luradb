@@ -45,8 +45,6 @@ pub struct SSTableBuilder {
     current_block: DataBlock,
     // (last_key, block_handle)
     index: IndexBlock,
-    // Bloom filter keyed on user_key (MVCC timestamp stripped)
-    bloom_filter: BloomFilterImpl,
     total_keys: usize,
 }
 
@@ -58,7 +56,6 @@ impl Default for SSTableBuilder {
 
 impl SSTableBuilder {
     pub fn new() -> Self {
-        let initial_bloom_size = 10000;
         Self {
             data_blocks: Vec::new(),
             current_block: DataBlock {
@@ -67,7 +64,6 @@ impl SSTableBuilder {
             index: IndexBlock {
                 entries: Vec::new(),
             },
-            bloom_filter: BloomFilterImpl::new(initial_bloom_size, 0.01),
             total_keys: 0,
         }
     }
@@ -75,8 +71,6 @@ impl SSTableBuilder {
     /// Adds a key-value pointer pair (large value in VLog) to the SSTable.
     /// Keys must be added in sorted order.
     pub fn add(&mut self, key: Vec<u8>, value_pointer: ValuePointer) {
-        // Bloom filter keyed on user_key so that MVCC snapshot reads hit correctly.
-        self.bloom_filter.insert(mvcc_user_key(&key));
         self.total_keys += 1;
         self.current_block
             .entries
@@ -89,7 +83,6 @@ impl SSTableBuilder {
     /// Adds a key with inline value data (small value, no VLog) to the SSTable.
     /// Keys must be added in sorted order.
     pub fn add_inline(&mut self, key: Vec<u8>, data: Vec<u8>, expire_at: u64) {
-        self.bloom_filter.insert(mvcc_user_key(&key));
         self.total_keys += 1;
         self.current_block
             .entries
@@ -152,9 +145,15 @@ impl SSTableBuilder {
         buf.extend_from_slice(&index_bytes);
         pad_to_align8(&mut buf);
 
+        // Sized for the keys actually written; keyed on the user key so that
+        // reads at any snapshot timestamp hit.
+        let mut filter = BloomFilterImpl::new(self.total_keys, 0.01);
+        for (key, _) in self.data_blocks.iter().flat_map(|block| &block.entries) {
+            filter.insert(mvcc_user_key(key));
+        }
         let bloom_filter = BloomFilter {
-            data: self.bloom_filter.as_bytes().to_vec(),
-            num_hashes: self.bloom_filter.num_hashes(),
+            data: filter.as_bytes().to_vec(),
+            num_hashes: filter.num_hashes(),
         };
         let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter)?;
         let bloom_filter_handle = BlockHandle {
@@ -289,10 +288,10 @@ impl SSTableReader {
         let bloom_archived = rkyv::access::<Archived<BloomFilter>, rancor::Error>(bloom_slice)
             .map_err(|e| anyhow::anyhow!("Bloom filter validation failed: {}", e))?;
 
-        // kv/021: an empty bit array paired with num_hashes >= 1 would divide
-        // by zero on every lookup (BloomFilter::hash). A legitimate writer
-        // never produces this combination (see SSTableBuilder::new), so it
-        // only occurs on corrupted/torn/crafted bytes -- reject it here.
+        // An empty bit array paired with num_hashes >= 1 would divide by zero
+        // on every lookup (BloomFilter::hash). A legitimate writer never
+        // produces this combination (see SSTableBuilder::finish), so it only
+        // occurs on corrupted/torn/crafted bytes -- reject it here.
         if bloom_archived.data.is_empty() && u32::from(bloom_archived.num_hashes) >= 1 {
             bail!("Invalid bloom filter: empty bit array with non-zero hash count");
         }
@@ -394,8 +393,14 @@ impl SSTableReader {
 
         let start_idx = self.find_block_by_user_key(search_user_key)?.map_or(0, |i| i.saturating_sub(1));
 
+        // Every version of the user key sorts before any entry whose user key
+        // is behind the run of keys that start with it. A longer key with
+        // that prefix may still sort first (`ab`+stamp before `a`+stamp).
         for bi in start_idx..self.index.entries.len() {
-            let block_handle = &self.index.entries[bi].1;
+            let (first_key, block_handle) = (&self.index.entries[bi].0, &self.index.entries[bi].1);
+            if !not_behind_prefix_run(mvcc_user_key(first_key.as_slice()), search_user_key) {
+                break;
+            }
             let block_offset = u64::from(block_handle.offset);
             let cache_key = BlockCacheKey { file_id: self.file_id, block_offset };
 
@@ -410,7 +415,7 @@ impl SSTableReader {
                 let bk_user = mvcc_user_key(bk);
 
                 if bk_user != search_user_key {
-                    if passed_user_key {
+                    if passed_user_key || !not_behind_prefix_run(bk_user, search_user_key) {
                         return Ok(None);
                     }
                     continue;
@@ -448,6 +453,8 @@ impl SSTableReader {
         if let Some(cached) = stripe.get(cache_key) {
             return Ok(cached);
         }
+        #[cfg(test)]
+        self.blocks_read.fetch_add(1, Ordering::Relaxed);
 
         let offset = u64::from(handle.offset) as usize;
         let size = u64::from(handle.size) as usize;
@@ -1333,9 +1340,9 @@ mod tests {
         Ok(buf.into_vec())
     }
 
-    // kv/021: an empty bloom bit array combined with num_hashes >= 1 can only
-    // come from corrupted/torn/crafted bytes (a real writer never produces
-    // it, see SSTableBuilder::new) -- from_data must reject it, not panic.
+    // An empty bloom bit array combined with num_hashes >= 1 can only come
+    // from corrupted/torn/crafted bytes (a real writer never produces it, see
+    // SSTableBuilder::finish) -- from_data must reject it, not panic.
     #[test]
     fn test_from_data_rejects_empty_bloom_block_with_nonzero_hashes() -> anyhow::Result<()> {
         let buf = build_sstable_with_empty_bloom_block(3)?;
@@ -1560,6 +1567,138 @@ mod tests {
         let reader = SSTableReader::open(build_sstable_with_corrupt_block_handle()?)?;
         let first = reader.keys_with_prefix(b"key1").next();
         assert!(first.is_some_and(|entry| entry.is_err()));
+        Ok(())
+    }
+
+    // ── Point reads cost the table that holds the key, not the newer ones ────
+
+    fn spaced_key(n: usize) -> Vec<u8> {
+        format!("k:{n:07}").into_bytes()
+    }
+
+    /// `count` keys `spaced_key(first)`, `spaced_key(first + step)`, ... written at `ts`.
+    fn spaced_table(first: usize, step: usize, count: usize, ts: u64) -> anyhow::Result<SSTableReader> {
+        let mut builder = SSTableBuilder::new();
+        for i in 0..count {
+            builder.add_inline(encode(&spaced_key(first + i * step), ts), b"v".to_vec(), 0);
+        }
+        SSTableReader::open(builder.finish()?)
+    }
+
+    #[test]
+    fn test_filter_of_a_large_table_rejects_absent_keys() -> anyhow::Result<()> {
+        let reader = spaced_table(0, 2, 200_000, 10)?;
+        let rejected = (0..10_000)
+            .filter(|i| !reader.bloom_filter.contains(&spaced_key(2 * i + 1)))
+            .count();
+        assert!(rejected >= 9_700, "only {rejected} of 10 000 absent keys rejected");
+        Ok(())
+    }
+
+    // An absent key the filter lets through: the read ends at the first key
+    // behind it instead of running to the end of the table.
+    #[test]
+    fn test_point_read_of_an_absent_key_reads_at_most_two_blocks() -> anyhow::Result<()> {
+        let reader = spaced_table(0, 2, 50_000, 10)?;
+        let absent = (0..50_000)
+            .map(|i| spaced_key(2 * i + 1))
+            .find(|key| reader.bloom_filter.contains(key))
+            .expect("some absent key passes the filter");
+        let cache = StripedBlockCache::new(64 * 1024 * 1024, 0.1, 100);
+
+        assert!(reader.get_with_cache_and_ts(&encode(&absent, 30), &cache)?.is_none());
+        let blocks_read = reader.blocks_read.load(Ordering::Relaxed);
+        assert!(blocks_read <= 2, "read {blocks_read} blocks");
+        Ok(())
+    }
+
+    // The newer `ab` sorts before the older `a` and opens the block holding
+    // it: neither the entry nor the block may end the read of `a`.
+    #[test]
+    fn test_point_read_passes_a_longer_key_that_sorts_first() -> anyhow::Result<()> {
+        let mut versions = numbered("0", ENTRIES_PER_BLOCK);
+        versions.extend([version("ab", 20, true), version("a", 10, true)]);
+        let reader = build_table(versions)?;
+        assert_eq!(reader.index.entries[1].0.as_slice(), encode(b"ab", 20), "layout precondition");
+        assert!(encode(b"ab", 20) < encode(b"a", 10), "layout precondition");
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+
+        let (_, ts) = reader.get_with_cache_and_ts(&encode(b"a", 15), &cache)?.expect("a@10 is visible at 15");
+        assert_eq!(ts, Timestamp::new(10));
+        Ok(())
+    }
+
+    // The only version visible at the snapshot lies in the block after the
+    // newer ones.
+    #[test]
+    fn test_point_read_follows_versions_into_the_next_block() -> anyhow::Result<()> {
+        let mut versions = numbered("a:", 10);
+        versions.extend((1..=ENTRIES_PER_BLOCK as u64).map(|i| version("m", 10 * i, true)));
+        versions.extend(numbered("z:", 10));
+        let reader = build_table(versions)?;
+        assert_eq!(reader.index.entries.len(), 2, "layout precondition");
+        assert_eq!(mvcc_user_key(reader.index.entries[1].0.as_slice()), b"m", "layout precondition");
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+
+        let (_, ts) = reader.get_with_cache_and_ts(&encode(b"m", 15), &cache)?.expect("m@10 is visible at 15");
+        assert_eq!(ts, Timestamp::new(10));
+        Ok(())
+    }
+
+    #[test]
+    fn test_point_read_of_a_key_in_the_older_table_skips_the_newer_one() -> anyhow::Result<()> {
+        let mut older = spaced_table(0, 2, 100_000, 10)?;
+        older.set_file_id(1);
+        let mut newer = spaced_table(1, 2, 100_000, 20)?;
+        newer.set_file_id(2);
+        let cache = StripedBlockCache::new(64 * 1024 * 1024, 0.1, 100);
+        let key = encode(&spaced_key(2_000), 30);
+
+        assert!(newer.get_with_cache_and_ts(&key, &cache)?.is_none());
+        assert!(older.get_with_cache_and_ts(&key, &cache)?.is_some());
+        let blocks_read = newer.blocks_read.load(Ordering::Relaxed);
+        assert!(blocks_read <= 1, "read {blocks_read} blocks of the newer table");
+        Ok(())
+    }
+
+    // Release build, warm cache, mean over 10 000 reads of keys spread over
+    // the older table (`cargo test --release -- --ignored --nocapture
+    // point_read_through_a_newer_table`). Measured on WSL2: 230 µs through
+    // the newer table (one table: 3.6 µs) with a filter sized for 10 000
+    // keys and a fallback that read to the table's end; 4.6 µs (one table:
+    // 4.4 µs) with the filter sized by key count and the bounded fallback.
+    #[test]
+    #[ignore]
+    fn test_point_read_through_a_newer_table_timing() -> anyhow::Result<()> {
+        let mut older = spaced_table(0, 2, 100_000, 10)?;
+        older.set_file_id(1);
+        let mut newer = spaced_table(1, 2, 100_000, 20)?;
+        newer.set_file_id(2);
+        let cache = StripedBlockCache::new(256 * 1024 * 1024, 0.1, 100);
+        let keys: Vec<Vec<u8>> = (0..1000).map(|i| encode(&spaced_key(i * 200), 30)).collect();
+
+        let two_tables = |key: &[u8]| -> anyhow::Result<()> {
+            assert!(newer.get_with_cache_and_ts(key, &cache)?.is_none());
+            assert!(older.get_with_cache_and_ts(key, &cache)?.is_some());
+            Ok(())
+        };
+        let one_table = |key: &[u8]| -> anyhow::Result<()> {
+            assert!(older.get_with_cache_and_ts(key, &cache)?.is_some());
+            Ok(())
+        };
+        for key in &keys {
+            two_tables(key)?;
+        }
+        let mean = |read: &dyn Fn(&[u8]) -> anyhow::Result<()>| -> anyhow::Result<std::time::Duration> {
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                for key in &keys {
+                    read(key)?;
+                }
+            }
+            Ok(start.elapsed() / 10_000)
+        };
+        println!("two tables: {:?}, one table: {:?}", mean(&two_tables)?, mean(&one_table)?);
         Ok(())
     }
 }

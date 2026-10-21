@@ -437,6 +437,10 @@ pub struct LsmStorageEngine {
     /// thread runs it.
     applying_batch: AtomicU64,
 
+    /// Highest LSN of a WAL record whose write reached the MemTable; after
+    /// recovery the log's highest one. Never decreases.
+    last_applied_lsn: AtomicU64,
+
     /// Held by a flush from its claim to its install, so L0 and the manifest
     /// carry the SSTables in MemTable age order and whoever takes this lock
     /// knows that no flush claimed before it is still in flight (spec
@@ -477,12 +481,14 @@ impl LsmStorageEngine {
         let mut version = Self::discover_vlog_generations(vlog, &vlog_path).await?;
 
         // Recover the MemTable from the WAL first.
-        let (recovered, wal_max_ts) = Self::recover_from_wal(
+        let (recovered, wal_max_ts, wal_max_lsn) = Self::recover_from_wal(
             &wal_path,
             &version.active_vlog,
             engine_config.vlog_inline_threshold,
         )
         .await?;
+        // Before the first append: new records continue the log's LSNs.
+        wal.set_lsn_start(wal_max_lsn).await?;
 
         let manifest = manifest_manager.load().await?;
 
@@ -533,6 +539,7 @@ impl LsmStorageEngine {
             change_epoch: AtomicU64::new(0),
             in_flight_writes: Arc::new(tokio::sync::RwLock::new(())),
             applying_batch: AtomicU64::new(0),
+            last_applied_lsn: AtomicU64::new(wal_max_lsn),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -581,11 +588,11 @@ impl LsmStorageEngine {
 
     /// Recovers the MemTable state from the WAL, together with the highest
     /// raw MVCC timestamp it replayed (0 for an empty WAL) — [`Self::new`]
-    /// seeds the HLC with it (spec kv/026 M3).
+    /// seeds the HLC with it — and the WAL's highest LSN.
     ///
     /// A single DELETE record keeps an entry with the identical internal key,
-    /// as [`Self::write_tombstone_at`] does live (spec kv/032); ops of one
-    /// batch share a stamp and replay in order, the later one wins.
+    /// as [`Self::write_tombstone_at`] does live; ops of one batch share a
+    /// stamp and replay in order, the later one wins.
     ///
     /// Does NOT truncate the WAL — [`Self::new`] first flushes the recovered
     /// data to an SSTable, so an interrupted startup never loses it.
@@ -593,12 +600,12 @@ impl LsmStorageEngine {
         wal_path: &PathBuf,
         vlog: &VLog,
         vlog_inline_threshold: usize,
-    ) -> Result<(MemTable, u64)> {
+    ) -> Result<(MemTable, u64, u64)> {
         let memtable = MemTable::new();
-        let entries = crate::core::wal::recover(wal_path).await?;
+        let recovered = crate::core::wal::recover(wal_path).await?;
         let mut max_ts = 0;
 
-        for entry in entries {
+        for (_, entry) in recovered.entries {
             match entry {
                 crate::core::wal::WalEntry::Set { timestamp, key, value, expire_at } => {
                     max_ts = max_ts.max(timestamp);
@@ -628,7 +635,7 @@ impl LsmStorageEngine {
             }
         }
 
-        Ok((memtable, max_ts))
+        Ok((memtable, max_ts, recovered.max_lsn))
     }
 
     /// Opens an SSTable reader for `file_id` — memory-mapped when `use_mmap`
@@ -1139,6 +1146,17 @@ impl LsmStorageEngine {
 
     // ── Core write helpers ───────────────────────────────────────────────────
 
+    /// Highest LSN of a WAL record whose write reached the MemTable.
+    pub fn last_applied_lsn(&self) -> u64 {
+        self.last_applied_lsn.load(Ordering::Acquire)
+    }
+
+    /// Records that the write of WAL record `lsn` reached the MemTable;
+    /// writes apply in any order, the highest LSN stays.
+    fn applied(&self, lsn: u64) {
+        self.last_applied_lsn.fetch_max(lsn, Ordering::Release);
+    }
+
     /// Assigns the next watch-stream sequence, rings it, and broadcasts it
     /// (spec kv/024 §2) — the single choke point every non-batch write path
     /// goes through. Every caller invokes this only after its own
@@ -1179,6 +1197,10 @@ impl LsmStorageEngine {
         let _guard = self.in_flight_writes.read().await;
         admit()?;
 
+        // Reserve, then stamp: a full WAL queue is waited out before the
+        // stamp. From the stamp to `send` no `.await` — `send` fixes the
+        // record's LSN, so the stamps follow the LSNs.
+        let permit = self.wal.reserve().await?;
         let timestamp = self.next_timestamp();
         let expire_at_val = expire_at.unwrap_or(0);
 
@@ -1191,7 +1213,7 @@ impl LsmStorageEngine {
         log_entry.extend_from_slice(&(value.len() as u32).to_be_bytes());
         log_entry.extend_from_slice(value);
         log_entry.extend_from_slice(&expire_at_val.to_be_bytes());
-        self.wal.append(&log_entry).await?;
+        let (_, lsn) = permit.send(log_entry).await?;
 
         let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
             let (file_id, offset) = append_to_active(&self.version, value).await?;
@@ -1206,11 +1228,12 @@ impl LsmStorageEngine {
             }
         }
         self.version().memtable.set(key.to_vec(), timestamp, resolved);
+        self.applied(lsn);
         self.raise_change_epoch();
 
-        // Broadcast after the apply is visible, not just WAL-durable (spec
-        // kv/030): closes the window where a racing delete's event could
-        // describe a state that never becomes visible.
+        // Broadcast after the apply is visible, not just WAL-durable: closes
+        // the window where a racing delete's event could describe a state
+        // that never becomes visible.
         self.publish_change(key, OpType::Set);
         Ok(())
     }
@@ -1239,13 +1262,15 @@ impl LsmStorageEngine {
         let _guard = self.in_flight_writes.read().await;
         admit()?;
 
+        // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
+        let permit = self.wal.reserve().await?;
         let timestamp = self.next_timestamp();
-
-        self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
+        let (_, lsn) = permit.send(Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
         // Still pinned after the WAL append; the guard above now closes the
-        // inversion window this placement only narrowed (spec kv/025 §3.2).
+        // inversion window this placement only narrowed.
         self.version().memtable.set(key.to_vec(), timestamp, Value::Tombstone);
+        self.applied(lsn);
         self.raise_change_epoch();
 
         // Broadcast after the apply is visible — see `write_kv_pair_admitted`.
@@ -1260,27 +1285,33 @@ impl LsmStorageEngine {
     }
 
     /// Writes a tombstone dated `timestamp` into the *given* MemTable — the
-    /// TTL sweeper's pinned one (spec kv/025 §3.2). Deliberately without
+    /// TTL sweeper's pinned one. Deliberately without
     /// `maybe_freeze_memtable` and without re-reading the active MemTable: a
     /// tombstone that ends up in a newer source than the value it dates
     /// against would win despite its older stamp (§4.2). A write that drew
     /// the same stamp and is already in that MemTable keeps its entry; the
-    /// tombstone and its event are then dropped (spec kv/032).
+    /// tombstone and its event are then dropped.
     /// Sweeper-exclusive — [`Self::write_tombstone`] does not delegate here.
+    /// Holds the in-flight guard like every other WAL writer, so a drain
+    /// waits for it.
     pub(super) async fn write_tombstone_at(
         &self,
         memtable: &Arc<MemTable>,
         key: &[u8],
         timestamp: Timestamp,
     ) -> Result<()> {
-        self.wal.append(&Self::encode_tombstone_wal_record(timestamp, key)).await?;
+        let _guard = self.in_flight_writes.read().await;
+        let permit = self.wal.reserve().await?;
+        let (_, lsn) = permit.send(Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
-        if !memtable.set_if_absent(key.to_vec(), timestamp, Value::Tombstone) {
+        let inserted = memtable.set_if_absent(key.to_vec(), timestamp, Value::Tombstone);
+        self.applied(lsn);
+        if !inserted {
             return Ok(());
         }
         self.raise_change_epoch();
 
-        // Broadcast after the apply is visible (spec kv/030) — see `write_kv_pair`.
+        // Broadcast after the apply is visible — see `write_kv_pair_admitted`.
         self.publish_change(key, OpType::Delete);
         Ok(())
     }
@@ -1301,18 +1332,21 @@ impl LsmStorageEngine {
         let _guard = self.in_flight_writes.read().await;
         admit()?;
 
+        // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
+        let permit = self.wal.reserve().await?;
         let timestamp = self.next_timestamp();
 
         // WAL entry: [type=4][ts:u64][key_len:u32][key] — type 3 is already
-        // the batch record (json/005), so SetNull uses 4.
+        // the batch record, so SetNull uses 4.
         let mut log_entry = Vec::new();
         log_entry.push(4u8);
         log_entry.extend_from_slice(&timestamp.as_u64().to_be_bytes());
         log_entry.extend_from_slice(&(key.len() as u32).to_be_bytes());
         log_entry.extend_from_slice(key);
-        self.wal.append(&log_entry).await?;
+        let (_, lsn) = permit.send(log_entry).await?;
 
         self.version().memtable.set(key.to_vec(), timestamp, Value::Null);
+        self.applied(lsn);
         self.raise_change_epoch();
 
         // set_null is an update — a Set event, not Delete.
@@ -1427,13 +1461,13 @@ impl LsmStorageEngine {
         let _guard = self.in_flight_writes.read().await;
         admit()?;
 
+        // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
+        let permit = self.wal.reserve().await?;
         let timestamp = self.next_timestamp();
-
-        let log_entry = Self::encode_batch_wal_record(timestamp, &ops);
-        self.wal.append(&log_entry).await?;
+        let (_, lsn) = permit.send(Self::encode_batch_wal_record(timestamp, &ops)).await?;
 
         // Captured before `resolve_batch_values` below consumes `ops` — the
-        // broadcast itself waits until after the Phase 2 apply (spec kv/030).
+        // broadcast itself waits until after the Phase 2 apply.
         let batch_events: Vec<(Vec<u8>, OpType)> = ops
             .iter()
             .map(|op| match op {
@@ -1461,6 +1495,7 @@ impl LsmStorageEngine {
             }
         }
         self.applying_batch.store(0, Ordering::Release);
+        self.applied(lsn);
         self.raise_change_epoch();
 
         // Broadcast after the apply is visible — see `write_kv_pair_admitted`.
@@ -2453,7 +2488,7 @@ mod tests {
             std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
             assert!(
-                !std::fs::read(&wal_path).unwrap().is_empty(),
+                std::fs::read(&wal_path).unwrap().len() > crate::core::wal::WAL_MAGIC.len(),
                 "a failed shutdown flush must leave the WAL in place"
             );
 
@@ -2464,8 +2499,9 @@ mod tests {
             // Success case unchanged: a normal shutdown flush still truncates.
             engine2.put(b"post-recovery", b"v2").await.unwrap();
             engine2.shutdown().await;
-            assert!(
-                std::fs::read(&wal_path).unwrap().is_empty(),
+            assert_eq!(
+                std::fs::read(&wal_path).unwrap(),
+                crate::core::wal::WAL_MAGIC,
                 "a successful shutdown flush still truncates the WAL"
             );
         })
@@ -2715,8 +2751,9 @@ mod tests {
         })
     }
 
-    // Test 2: clean-shutdown variant — the WAL is empty afterwards, so only
-    // the manifest high-water mark can carry the clock across the restart.
+    // Test 2: clean-shutdown variant — the WAL holds only its header
+    // afterwards, so only the manifest high-water mark can carry the clock
+    // across the restart.
     #[test]
     fn test_clean_shutdown_restart_sees_data_written_ahead_of_the_wall_clock() {
         crate::core::engine_runtime::block_on(async {
@@ -2727,9 +2764,10 @@ mod tests {
             engine.shutdown().await;
             drop(engine);
 
-            assert!(
-                std::fs::read(dir.path().join("wal.log")).unwrap().is_empty(),
-                "a clean shutdown leaves no WAL to seed from"
+            assert_eq!(
+                std::fs::read(dir.path().join("wal.log")).unwrap(),
+                crate::core::wal::WAL_MAGIC,
+                "a clean shutdown leaves no WAL record to seed from"
             );
 
             let engine2 = engine_on(&dir).await;
@@ -3114,7 +3152,7 @@ mod tests {
             // WAL replay: the live engine hasn't truncated its WAL yet, so
             // recovering it independently reflects exactly what a restart would see.
             let wal_path = dir.path().join("wal.log");
-            let (recovered, _) = LsmStorageEngine::recover_from_wal(
+            let (recovered, _, _) = LsmStorageEngine::recover_from_wal(
                 &wal_path,
                 &engine.version().active_vlog,
                 engine.engine_config.vlog_inline_threshold,
@@ -4573,14 +4611,201 @@ mod tests {
                 engine.put(b"gone", b"x").await.unwrap();
                 engine.delete(b"gone").await.unwrap();
             }
-            assert!(std::fs::metadata(&wal_path).unwrap().len() > 0, "the writes are only in the WAL");
+            let header = crate::core::wal::WAL_HEADER_LEN;
+            assert!(std::fs::metadata(&wal_path).unwrap().len() > header, "the writes are only in the WAL");
 
             let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
             let engine = engine_on_hub(&dir, &hub).await;
             assert_eq!(engine.get(b"small").await.unwrap(), Some("clé ✓".as_bytes().to_vec()));
             assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
             assert_eq!(engine.get(b"gone").await.unwrap(), None);
-            assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+            assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), header);
+        })
+    }
+
+    // A WAL of the earlier format: the start replays it, flushes it and
+    // replaces it with the header; the writes after it are LSN-framed, and
+    // the next start reads them back.
+    #[test]
+    fn test_start_upgrades_a_wal_of_the_earlier_format() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal.log");
+            std::fs::write(&wal_path, include_bytes!("../../../tests/fixtures/wal/v1.wal")).unwrap();
+            {
+                let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
+                let engine = engine_on_hub(&dir, &hub).await;
+                assert_eq!(std::fs::read(&wal_path).unwrap(), crate::core::wal::WAL_MAGIC);
+                assert_eq!(engine.last_applied_lsn(), 5, "the five records of the old WAL");
+                engine.put(b"after", b"upgrade").await.unwrap();
+                assert_eq!(engine.last_applied_lsn(), 6);
+            }
+            let recovered = crate::core::wal::recover(&wal_path).await.unwrap();
+            assert_eq!(recovered.entries.len(), 1);
+            assert_eq!(recovered.max_lsn, 6);
+
+            let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
+            let engine = engine_on_hub(&dir, &hub).await;
+            assert_eq!(engine.get(b"alpha").await.unwrap(), None);
+            assert_eq!(engine.get(b"beta").await.unwrap(), None);
+            let snap = engine.snapshot();
+            assert_eq!(engine.get_with_snapshot(b"gamma", snap.snapshot()).await.unwrap(), GetResult::Null);
+            assert_eq!(engine.get("clé".as_bytes()).await.unwrap(), Some("🦀".as_bytes().to_vec()));
+            assert_eq!(engine.get(b"after").await.unwrap(), Some(b"upgrade".to_vec()));
+            assert_eq!(engine.last_applied_lsn(), 6);
+        })
+    }
+
+    // Every write path applies one WAL record and reports its LSN; a batch is
+    // one record, however many ops it holds.
+    #[test]
+    fn test_last_applied_lsn_follows_every_write_and_a_batch_takes_one() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, dir) = make_engine().await;
+            assert_eq!(engine.last_applied_lsn(), 0);
+            engine.put(b"a", b"1").await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 1);
+            engine.put_with_ttl(b"b", b"2", 3600).await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 2);
+            engine.delete(b"a").await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 3);
+            engine.set_null(b"c").await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 4);
+            let batch = vec![
+                BatchOp::Put { key: b"d".to_vec(), value: b"4".to_vec() },
+                BatchOp::Put { key: b"e".to_vec(), value: b"5".to_vec() },
+                BatchOp::Delete { key: b"b".to_vec() },
+            ];
+            engine.write_batch(batch).await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 5);
+            let memtable = engine.pin_memtable();
+            engine.write_tombstone_at(&memtable, b"c", Timestamp::new(1)).await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 6);
+
+            let recovered = crate::core::wal::recover(dir.path().join("wal.log")).await.unwrap();
+            let lsns: Vec<u64> = recovered.entries.iter().map(|(lsn, _)| *lsn).collect();
+            assert_eq!(lsns, [1, 2, 3, 4, 5, 5, 5, 6]);
+            assert_eq!(recovered.max_lsn, engine.last_applied_lsn());
+        })
+    }
+
+    // Concurrent writers apply in whatever order their vLog appends finish;
+    // the applied LSN never goes back and ends at the last record's.
+    #[test]
+    fn test_last_applied_lsn_never_decreases_under_concurrent_writes() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, dir) = make_engine().await;
+            let engine = Arc::new(engine);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let writers: Vec<_> = (0..20u32)
+                .map(|i| {
+                    let (engine, seen) = (Arc::clone(&engine), Arc::clone(&seen));
+                    let value = if i % 2 == 0 { vec![b'v'; 4096] } else { b"small".to_vec() };
+                    compio::runtime::spawn(async move {
+                        engine.put(format!("k{i}").as_bytes(), &value).await.unwrap();
+                        seen.lock().push(engine.last_applied_lsn());
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.await.unwrap();
+            }
+
+            let seen = seen.lock().clone();
+            assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]), "{seen:?}");
+            assert_eq!(seen.last(), Some(&20));
+            assert_eq!(crate::core::wal::recover(dir.path().join("wal.log")).await.unwrap().max_lsn, 20);
+        })
+    }
+
+    // A restart continues the LSNs of the WAL it recovers: with k records in
+    // it, the first write after the start carries k + 1 — on a local
+    // committer and on a fresh hub, which both count from 0 until told.
+    #[test]
+    fn test_restart_continues_the_lsns_of_the_recovered_wal() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal.log");
+            {
+                let engine = engine_on(&dir).await;
+                for i in 0..3u32 {
+                    engine.put(format!("local-{i}").as_bytes(), b"v").await.unwrap();
+                }
+            }
+            let engine = engine_on(&dir).await;
+            assert_eq!(engine.last_applied_lsn(), 3);
+            engine.put(b"local-next", b"v").await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 4);
+            assert_eq!(crate::core::wal::recover(&wal_path).await.unwrap().max_lsn, 4);
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal.log");
+            {
+                let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
+                let engine = engine_on_hub(&dir, &hub).await;
+                for i in 0..3u32 {
+                    engine.put(format!("hub-{i}").as_bytes(), b"v").await.unwrap();
+                }
+            }
+            let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
+            let engine = engine_on_hub(&dir, &hub).await;
+            assert_eq!(engine.last_applied_lsn(), 3);
+            engine.put(b"hub-next", b"v").await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), 4);
+            drop(hub);
+            assert_eq!(crate::core::wal::recover(&wal_path).await.unwrap().max_lsn, 4);
+        })
+    }
+
+    // A TTL-sweeper tombstone write holds the in-flight guard from before its
+    // WAL append through its MemTable insert: a drain started meanwhile
+    // returns only once the tombstone is in.
+    #[test]
+    fn test_quiesce_waits_for_a_sweeper_tombstone_write_in_flight() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wal_path = dir.path().join("wal.log");
+            let wal = Arc::new(WriteAheadLog::with_capacity(&wal_path, 1).await.unwrap());
+            let vlog_path = dir.path().join("vlog.log");
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+            let manifest_manager = Arc::new(ManifestManager::new(dir.path()));
+            let engine = Arc::new(
+                LsmStorageEngine::new(
+                    Arc::clone(&wal), wal_path, vlog, vlog_path, file_manager, manifest_manager,
+                    LsmEngineOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let memtable = engine.pin_memtable();
+            let tombstone_in = |memtable: &MemTable| {
+                memtable.iter().any(|(encoded, value)| {
+                    InternalKey::extract_user_key(&encoded) == Some(b"k".as_slice()) && matches!(value, Value::Tombstone)
+                })
+            };
+
+            // The queue's one slot is taken: the sweeper's write waits for it.
+            let slot = wal.reserve().await.unwrap();
+            let sweeper = compio::runtime::spawn({
+                let (engine, memtable) = (Arc::clone(&engine), Arc::clone(&memtable));
+                async move { engine.write_tombstone_at(&memtable, b"k", Timestamp::new(1)).await.unwrap() }
+            });
+            for _ in 0..100 {
+                if engine.in_flight_writes.try_write().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(engine.in_flight_writes.try_write().is_err(), "the sweeper write holds the in-flight guard");
+
+            let mut drain = std::pin::pin!(engine.quiesce_writes());
+            assert!(futures::poll!(drain.as_mut()).is_pending(), "the drain waits for the sweeper write");
+            assert!(!tombstone_in(&memtable));
+            drop(slot);
+            drain.await;
+            assert!(tombstone_in(&memtable), "the drain returned before the tombstone was in");
+            sweeper.await.unwrap();
         })
     }
 

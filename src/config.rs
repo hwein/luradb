@@ -323,6 +323,9 @@ pub struct StorageConfig {
     /// Directory of the system store: auth records and the store's own markers.
     /// Unset in the config file, it is `luradb_sys` beside `sstable_dir`.
     pub system_dir: String,
+    /// Writes the queue to the storage thread holds for the write-ahead logs
+    /// of all engines; a full queue holds further writes back.
+    pub wal_queue_capacity: usize,
 }
 
 impl Default for StorageConfig {
@@ -333,7 +336,25 @@ impl Default for StorageConfig {
             vlog_path: "luradb.vlog".to_string(),
             sstable_dir: "luradb_sstables".to_string(),
             system_dir: "luradb_sys".to_string(),
+            wal_queue_capacity: 1024,
         }
+    }
+}
+
+/// Largest `storage.wal_queue_capacity`: the engine thread reserves a wake
+/// slot per queued write up front.
+const MAX_WAL_QUEUE_CAPACITY: usize = 65_536;
+
+impl StorageConfig {
+    /// Startup validation: the queue needs a slot, and no more than
+    /// [`MAX_WAL_QUEUE_CAPACITY`].
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=MAX_WAL_QUEUE_CAPACITY).contains(&self.wal_queue_capacity),
+            "invalid config: storage.wal_queue_capacity ({}) must be 1 to {MAX_WAL_QUEUE_CAPACITY}",
+            self.wal_queue_capacity
+        );
+        Ok(())
     }
 }
 
@@ -1529,6 +1550,28 @@ mod tests {
 
         let config: LuraConfig = toml::from_str("[multicore]\nengine_queue_capacity = 0\n").unwrap();
         assert_invalid(config.multicore.validate(8), "multicore.engine_queue_capacity (0)", "at least 1");
+    }
+
+    // The WAL queue: the default passes, the bounds pass, a queue without a
+    // slot or past the bound stops the start.
+    #[test]
+    fn test_storage_wal_queue_capacity_bounds() {
+        let config = LuraConfig::default();
+        assert_eq!(config.storage.wal_queue_capacity, 1024);
+        assert!(config.storage.validate().is_ok());
+
+        for capacity in [1, 65_536] {
+            let config: LuraConfig = toml::from_str(&format!("[storage]\nwal_queue_capacity = {capacity}\n")).unwrap();
+            assert!(config.storage.validate().is_ok(), "{capacity}");
+        }
+        for capacity in [0, 65_537] {
+            let config: LuraConfig = toml::from_str(&format!("[storage]\nwal_queue_capacity = {capacity}\n")).unwrap();
+            assert_invalid(
+                config.storage.validate(),
+                &format!("storage.wal_queue_capacity ({capacity})"),
+                "1 to 65536",
+            );
+        }
     }
 
     // Spec perf/018b A6: defaults, then 0 (auto) up to the core count for
@@ -2859,6 +2902,7 @@ flag = true
             config.server.validate().unwrap();
             config.log.validate().unwrap();
             config.backup.validate().unwrap();
+            config.storage.validate().unwrap();
             config.validate_data_paths(tmp.path()).unwrap();
             config.auth.validate(&config.server).unwrap();
             config.cors.validate().unwrap();

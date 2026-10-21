@@ -63,6 +63,9 @@ sstable_dir = "/var/lib/luradb/sstables"
 # log wal, marking where the next start cuts the log; never delete it by hand, or
 # recovery reads that write. Default: luradb_sys beside the SSTable directory
 system_dir = "/var/lib/luradb/luradb_sys"
+# Writes waiting for the storage thread, which writes the write-ahead logs of all
+# engines; a full queue holds further writes back. 1 to 65536. Default: 1024
+wal_queue_capacity = 1024
 
 [io_engine]
 # Registers I/O buffers with the storage engine thread's io_uring ring; not

@@ -11,7 +11,7 @@ use crate::{
     auth::{middleware::docs_auth_layer, AuthCache},
     bridge::{self, EngineDispatch, Job, ShipService},
     config::LuraConfig,
-    core::{coop, engine_runtime, storage_thread},
+    core::{coop, engine_runtime},
     cors, tls, uds,
 };
 use axum::{
@@ -176,7 +176,7 @@ fn reader_threads(configured: usize, cores: usize, frontend: usize) -> usize {
 /// plus compio's default for the background tasks. Running request tasks
 /// have no bound of their own.
 fn remote_wakes(config: &LuraConfig) -> usize {
-    storage_thread::REQUEST_CHANNEL_CAPACITY
+    config.storage.wal_queue_capacity
         + config.multicore.engine_queue_capacity
         + engine_runtime::DEFAULT_REMOTE_WAKES
 }

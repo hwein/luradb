@@ -108,7 +108,7 @@ fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageThread, Stor
         sqpoll_enabled: storage_thread::SQPOLL_ENABLED,
         sqpoll_idle_ms: storage_thread::SQPOLL_IDLE_MS,
         ring_depth: storage_thread::RING_DEPTH,
-        channel_capacity: storage_thread::REQUEST_CHANNEL_CAPACITY,
+        channel_capacity: cfg.storage.wal_queue_capacity,
         cpu: storage_thread::STORAGE_THREAD_CPU,
     };
     let mut wals = vec![

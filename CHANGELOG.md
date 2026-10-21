@@ -17,6 +17,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: KV keys carry an `ETag`; PUT, DELETE and PATCH …/null accept `If-Match` (412 on mismatch or a missing key) and `If-None-Match: *` (create only, 412 if the key exists).
 - **BREAKING** API: domains created with `require_conditional_writes` reject unconditional single-key writes with 428.
 - New `[storage].system_dir` config key sets the directory of the system store, which holds users, API key hashes and permissions apart from domain data.
+- New `[storage].wal_queue_capacity` config key sets how many writes may wait for the storage thread.
 
 ### Changed
 
@@ -34,6 +35,7 @@ All notable changes to LuraDB are documented in this file.
 - Auth records move to the system store on first start (automatic, one-way; a downgrade needs a backup restore).
 - The storage thread always runs; all write-ahead logs (KV, JSON, relational, system) are written by it with shared group commit.
 - `io_engine.enabled` now only toggles registered buffers.
+- Write-ahead log format v2 (LSN-framed); existing logs are upgraded automatically on first start (one-way — a downgrade needs a backup restore).
 
 ### Removed
 

@@ -12,10 +12,12 @@
 //! Engine tasks talk to the thread over a bounded `tokio::sync::mpsc` channel
 //! (async backpressure) and await the result over a tokio `oneshot`.
 
+use crate::core::wal::{WAL_HEADER_LEN, WAL_MAGIC};
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use io_uring::{opcode, squeue, types, IoUring};
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,8 +29,6 @@ use tokio::sync::oneshot;
 pub const SQPOLL_ENABLED: bool = true;
 pub const SQPOLL_IDLE_MS: u32 = 2000;
 pub const RING_DEPTH: u32 = 256;
-/// Bounded request channel capacity for backpressure.
-pub const REQUEST_CHANNEL_CAPACITY: usize = 1024;
 /// No CPU pinning.
 pub const STORAGE_THREAD_CPU: i32 = -1;
 
@@ -54,10 +54,16 @@ pub enum WalTarget {
 
 /// An I/O request from an engine task to the storage thread.
 pub enum IoRequest {
-    /// Append bytes to `engine`'s WAL and fdatasync before responding with the offset.
-    WalAppend { engine: WalTarget, data: Vec<u8>, response: oneshot::Sender<Result<u64>> },
-    /// Reset `engine`'s WAL to length 0.
+    /// Frame `data` with the next LSN of `engine`'s WAL, append it and
+    /// fdatasync before responding with its offset and LSN.
+    WalAppend { engine: WalTarget, data: Vec<u8>, response: oneshot::Sender<Result<(u64, u64)>> },
+    /// Cut `engine`'s WAL back to its header; its LSNs go on where they were.
     WalTruncate { engine: WalTarget, response: oneshot::Sender<Result<()>> },
+    /// Give the next append to `engine`'s WAL an LSN after `lsn`; never moves
+    /// the counter back.
+    SetLsnStart { engine: WalTarget, lsn: u64, response: oneshot::Sender<Result<()>> },
+    /// Respond with the LSN of the last record durable in `engine`'s WAL.
+    WalHeadLsn { engine: WalTarget, response: oneshot::Sender<Result<u64>> },
     /// Drain pending requests, then stop the thread.
     Shutdown,
 }
@@ -68,22 +74,50 @@ pub struct StorageHandle {
     request_tx: Sender<IoRequest>,
 }
 
-impl StorageHandle {
-    pub async fn wal_append(&self, engine: WalTarget, data: Vec<u8>) -> Result<u64> {
-        let (tx, rx) = oneshot::channel();
-        self.request_tx
-            .send(IoRequest::WalAppend { engine, data, response: tx })
-            .await
-            .map_err(|_| anyhow!("storage thread shut down"))?;
+/// A slot reserved in the request channel for one append to `engine`'s WAL.
+pub struct WalPermit<'a> {
+    permit: mpsc::Permit<'a, IoRequest>,
+    engine: WalTarget,
+}
+
+impl WalPermit<'_> {
+    /// Queues `data` and waits until it is durable; returns its offset and LSN.
+    pub async fn send(self, data: Vec<u8>) -> Result<(u64, u64)> {
+        let (response, rx) = oneshot::channel();
+        self.permit.send(IoRequest::WalAppend { engine: self.engine, data, response });
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
+    }
+}
+
+impl StorageHandle {
+    /// Waits for a slot in the request channel for an append to `engine`'s WAL.
+    pub async fn reserve_wal(&self, engine: WalTarget) -> Result<WalPermit<'_>> {
+        let permit = self.request_tx.reserve().await.map_err(|_| anyhow!("storage thread shut down"))?;
+        Ok(WalPermit { permit, engine })
+    }
+
+    #[cfg(test)]
+    pub async fn wal_append(&self, engine: WalTarget, data: Vec<u8>) -> Result<(u64, u64)> {
+        self.reserve_wal(engine).await?.send(data).await
     }
 
     pub async fn wal_truncate(&self, engine: WalTarget) -> Result<()> {
+        self.request(|response| IoRequest::WalTruncate { engine, response }).await
+    }
+
+    pub async fn set_lsn_start(&self, engine: WalTarget, lsn: u64) -> Result<()> {
+        self.request(|response| IoRequest::SetLsnStart { engine, lsn, response }).await
+    }
+
+    /// The LSN of the last record durable in `engine`'s WAL, after every
+    /// append queued before this request.
+    pub async fn wal_head_lsn(&self, engine: WalTarget) -> Result<u64> {
+        self.request(|response| IoRequest::WalHeadLsn { engine, response }).await
+    }
+
+    async fn request<T>(&self, request: impl FnOnce(oneshot::Sender<Result<T>>) -> IoRequest) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        self.request_tx
-            .send(IoRequest::WalTruncate { engine, response: tx })
-            .await
-            .map_err(|_| anyhow!("storage thread shut down"))?;
+        self.request_tx.send(request(tx)).await.map_err(|_| anyhow!("storage thread shut down"))?;
         rx.await.map_err(|_| anyhow!("storage thread dropped response"))?
     }
 }
@@ -100,6 +134,10 @@ impl StorageThread {
     /// one WAL file per engine in `wals`. Blocks until the thread reports
     /// readiness (or an init error).
     pub fn new(config: StorageThreadConfig, wals: Vec<(WalTarget, PathBuf)>) -> Result<(Self, StorageHandle)> {
+        // The hub numbers each WAL's appends in the order they leave this
+        // channel. A request's place in it is fixed when a permit is filled,
+        // not when it is reserved, so a writer draws its stamp in between and
+        // the stamps follow the LSNs. A replacement channel must keep that.
         let (request_tx, request_rx) = mpsc::channel(config.channel_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool>>();
@@ -163,6 +201,11 @@ struct WalFile {
     /// Where a failed cut records `offset` for the next start.
     marker: PathBuf,
     offset: u64,
+    /// LSN of the last record written; the next append gets the one after it.
+    lsn: u64,
+    /// The file has no header — a log of the earlier format — and takes no
+    /// append until a truncate writes one.
+    awaits_truncate: bool,
     /// Bytes a failed append left past `offset`, or the unsafe-end marker,
     /// may still be there; the next append cuts first.
     unsafe_end: bool,
@@ -332,8 +375,10 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
         apply_unsafe_end_marker(path, &file).with_context(|| {
             format!("applying the unsafe-end marker {} to the write-ahead log {}", marker.display(), path.display())
         })?;
+        let awaits_truncate = !ensure_header(&file)
+            .with_context(|| format!("writing the header of the write-ahead log {}", path.display()))?;
         let offset = file.metadata()?.len();
-        files.push(WalFile { engine: *engine, file, marker, offset, unsafe_end: false });
+        files.push(WalFile { engine: *engine, file, marker, offset, lsn: 0, awaits_truncate, unsafe_end: false });
     }
     // Register the WALs once as fixed files so the kernel skips the fd lookup
     // per op; on failure fall back to raw fds.
@@ -390,8 +435,8 @@ fn drain_remaining(state: &mut StorageState, rx: &mut Receiver<IoRequest>) {
 
 /// Processes a batch in channel order. Each run of WAL appends is written
 /// with one write and one fdatasync per file (group commit across engines);
-/// only a truncate ends a run and runs at its place. Returns `true` if a
-/// `Shutdown` was seen.
+/// only a truncate or an LSN request ends a run and runs at its place.
+/// Returns `true` if a `Shutdown` was seen.
 fn process_batch(state: &mut StorageState, batch: Vec<IoRequest>) -> bool {
     let mut stop = false;
     let mut appended = false;
@@ -407,6 +452,19 @@ fn process_batch(state: &mut StorageState, batch: Vec<IoRequest>) -> bool {
                 commit_appends(state, std::mem::take(&mut run));
                 let _ = response.send(do_wal_truncate(state, engine));
             }
+            IoRequest::SetLsnStart { engine, lsn, response } => {
+                commit_appends(state, std::mem::take(&mut run));
+                let index = state.wal_index(engine);
+                if let Ok(index) = &index {
+                    let wal = &mut state.wals[*index];
+                    wal.lsn = wal.lsn.max(lsn);
+                }
+                let _ = response.send(index.map(|_| ()));
+            }
+            IoRequest::WalHeadLsn { engine, response } => {
+                commit_appends(state, std::mem::take(&mut run));
+                let _ = response.send(state.wal_index(engine).map(|index| state.wals[index].lsn));
+            }
         }
     }
     commit_appends(state, run);
@@ -420,15 +478,21 @@ fn process_batch(state: &mut StorageState, batch: Vec<IoRequest>) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 struct FileWrite {
     engine: WalTarget,
-    /// The payloads for this file, concatenated in channel order.
+    /// The records for this file, each framed with its LSN, concatenated in
+    /// channel order.
     data: Vec<u8>,
-    /// Per payload: its position in the batch and its offset within `data`.
-    parts: Vec<(usize, u64)>,
+    /// Per record: its position in the batch, its offset within `data` and
+    /// its LSN.
+    parts: Vec<(usize, u64, u64)>,
 }
 
 /// Plans a run of appends: one [`FileWrite`] per engine that has any, in the
-/// order the engines first appear.
-fn plan_batch<'a>(appends: impl IntoIterator<Item = (WalTarget, &'a [u8])>) -> Vec<FileWrite> {
+/// order the engines first appear. Each engine's records get the LSNs after
+/// `last_lsn` of that engine, in channel order.
+fn plan_batch<'a>(
+    appends: impl IntoIterator<Item = (WalTarget, &'a [u8])>,
+    last_lsn: impl Fn(WalTarget) -> u64,
+) -> Vec<FileWrite> {
     let mut writes: Vec<FileWrite> = Vec::new();
     for (position, (engine, payload)) in appends.into_iter().enumerate() {
         let index = match writes.iter().position(|write| write.engine == engine) {
@@ -439,26 +503,29 @@ fn plan_batch<'a>(appends: impl IntoIterator<Item = (WalTarget, &'a [u8])>) -> V
             }
         };
         let write = &mut writes[index];
-        write.parts.push((position, write.data.len() as u64));
+        let lsn = last_lsn(engine) + write.parts.len() as u64 + 1;
+        write.parts.push((position, write.data.len() as u64, lsn));
+        write.data.extend_from_slice(&lsn.to_be_bytes());
         write.data.extend_from_slice(payload);
     }
     writes
 }
 
-type Append = (WalTarget, Vec<u8>, oneshot::Sender<Result<u64>>);
+type Append = (WalTarget, Vec<u8>, oneshot::Sender<Result<(u64, u64)>>);
 
 /// Writes a run of appends, one [`FileWrite`] per WAL file, and answers each
-/// request with the offset its payload landed at.
+/// request with the offset and the LSN of its record.
 fn commit_appends(state: &mut StorageState, run: Vec<Append>) {
     state.stats.appends += run.len() as u64;
-    let writes = plan_batch(run.iter().map(|(engine, data, _)| (*engine, data.as_slice())));
+    let last_lsn = |engine: WalTarget| state.wal_index(engine).map_or(0, |index| state.wals[index].lsn);
+    let writes = plan_batch(run.iter().map(|(engine, data, _)| (*engine, data.as_slice())), last_lsn);
     let mut responses: Vec<_> = run.into_iter().map(|(_, _, response)| Some(response)).collect();
     for write in writes {
         let result = write_file(state, &write).map_err(|e| e.to_string());
-        for (position, offset) in write.parts {
+        for (position, offset, lsn) in write.parts {
             let Some(response) = responses[position].take() else { continue };
             let _ = response.send(match &result {
-                Ok(start) => Ok(start + offset),
+                Ok(start) => Ok((start + offset, lsn)),
                 Err(msg) => Err(anyhow!("WAL append failed: {msg}")),
             });
         }
@@ -467,31 +534,34 @@ fn commit_appends(state: &mut StorageState, run: Vec<Append>) {
 
 /// Appends `write` at the end of its file and fdatasyncs it; returns the
 /// offset it starts at. A failed write or fdatasync cuts the file back to
-/// the cursor, which stays where it was.
+/// the cursor, which stays where it was, and leaves its LSNs to the next
+/// write.
 fn write_file(state: &mut StorageState, write: &FileWrite) -> Result<u64> {
     let index = state.wal_index(write.engine)?;
+    if state.wals[index].awaits_truncate {
+        return Err(appends_refused().into());
+    }
     let file = state.ring_file(index);
     let start = state.wals[index].offset;
-    if !write.data.is_empty() {
-        if state.wals[index].unsafe_end {
-            if let Err(cut) = state.cut_to_cursor(index) {
-                log_failed_cut(write.engine, start, &cut);
-                return Err(cut.into());
-            }
+    if state.wals[index].unsafe_end {
+        if let Err(cut) = state.cut_to_cursor(index) {
+            log_failed_cut(write.engine, start, &cut);
+            return Err(cut.into());
         }
-        // At most one write per WAL file in flight: `ring_op` reaps every op
-        // before it returns, so the fdatasync and the file's next write are
-        // submitted only once this write has completed — each file gets its
-        // bytes in channel order, and a cut after a failure races no write.
-        if let Err(e) = write_and_sync(state, file, start, &write.data) {
-            if let Err(cut) = state.cut_to_cursor(index) {
-                log_failed_cut(write.engine, start, &cut);
-            }
-            return Err(e.into());
-        }
-        state.stats.fdatasyncs += 1;
     }
+    // At most one write per WAL file in flight: `ring_op` reaps every op
+    // before it returns, so the fdatasync and the file's next write are
+    // submitted only once this write has completed — each file gets its
+    // bytes in channel order, and a cut after a failure races no write.
+    if let Err(e) = write_and_sync(state, file, start, &write.data) {
+        if let Err(cut) = state.cut_to_cursor(index) {
+            log_failed_cut(write.engine, start, &cut);
+        }
+        return Err(e.into());
+    }
+    state.stats.fdatasyncs += 1;
     state.wals[index].offset += write.data.len() as u64;
+    state.wals[index].lsn += write.parts.len() as u64;
     Ok(start)
 }
 
@@ -513,11 +583,18 @@ fn log_failed_cut(engine: WalTarget, cursor: u64, error: &std::io::Error) {
     );
 }
 
+/// Cuts the log back to its header, or replaces a log of the earlier format
+/// with the header alone.
 fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     let index = state.wal_index(engine)?;
     let wal = &mut state.wals[index];
-    wal.file.set_len(0)?;
-    wal.offset = 0;
+    if wal.awaits_truncate {
+        write_header(&wal.file)?;
+        wal.awaits_truncate = false;
+    } else {
+        wal.file.set_len(WAL_HEADER_LEN)?;
+    }
+    wal.offset = WAL_HEADER_LEN;
     wal.file.sync_all()?;
     if let Err(e) = state.unmark(index) {
         state.wals[index].unsafe_end = true;
@@ -526,6 +603,42 @@ fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     }
     state.wals[index].unsafe_end = false;
     Ok(())
+}
+
+// ── Log header ──────────────────────────────────────────────────────────────
+
+/// Starts an empty log with the header and completes a torn one; returns
+/// whether the log has the header — `false` for a log of the earlier format,
+/// which stays as it is.
+pub(crate) fn ensure_header(file: &File) -> std::io::Result<bool> {
+    let len = file.metadata()?.len().min(WAL_HEADER_LEN) as usize;
+    let mut head = [0; WAL_MAGIC.len()];
+    file.read_exact_at(&mut head[..len], 0)?;
+    if len == WAL_MAGIC.len() {
+        return Ok(head == WAL_MAGIC);
+    }
+    // A part of the header is a torn one; a header goes only into a file
+    // without records, so writing it again loses nothing.
+    if !WAL_MAGIC.starts_with(&head[..len]) {
+        return Ok(false);
+    }
+    write_header(file)?;
+    file.sync_all()?;
+    Ok(true)
+}
+
+/// Replaces the content of `file` with the header; the caller syncs it.
+fn write_header(file: &File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.write_all_at(&WAL_MAGIC, 0)
+}
+
+/// Why a log of the earlier format takes no append: records with and without
+/// an LSN must never share a file.
+pub(crate) fn appends_refused() -> std::io::Error {
+    std::io::Error::other(
+        "the write-ahead log still has the format of an earlier version; it takes appends once the start has truncated it",
+    )
 }
 
 // ── Unsafe-end marker ───────────────────────────────────────────────────────
@@ -791,7 +904,7 @@ impl TestHub {
             sqpoll_enabled: false,
             sqpoll_idle_ms: SQPOLL_IDLE_MS,
             ring_depth: RING_DEPTH,
-            channel_capacity: REQUEST_CHANNEL_CAPACITY,
+            channel_capacity: crate::config::StorageConfig::default().wal_queue_capacity,
             cpu: STORAGE_THREAD_CPU,
         };
         let wals = wals.iter().map(|(engine, path)| (*engine, path.to_path_buf())).collect();
@@ -857,16 +970,23 @@ mod tests {
         wal::recover(path)
             .await
             .unwrap()
+            .entries
             .into_iter()
-            .map(|entry| match entry {
+            .map(|(_, entry)| match entry {
                 WalEntry::Delete { key, .. } => String::from_utf8(key).unwrap(),
                 other => panic!("expected a DELETE record, got {other:?}"),
             })
             .collect()
     }
 
+    /// `records` framed with their LSNs and concatenated.
+    fn framed(records: &[(u64, &[u8])]) -> Vec<u8> {
+        records.iter().flat_map(|(lsn, payload)| lsn.to_be_bytes().into_iter().chain(payload.iter().copied())).collect()
+    }
+
     // A run of appends for three targets plans one write per target, each
-    // with its payloads in channel order; a target without appends gets none.
+    // with its records in channel order, numbered on from that target's last
+    // LSN; a target without appends gets none.
     #[test]
     fn test_plan_batch_writes_each_target_once_in_channel_order() {
         let appends: [(WalTarget, &[u8]); 5] = [
@@ -876,12 +996,25 @@ mod tests {
             (WalTarget::Sys, b"s1"),
             (WalTarget::Json, b"j2"),
         ];
+        let last_lsn = |engine| match engine {
+            WalTarget::Json => 7,
+            WalTarget::Sys => 41,
+            _ => 0,
+        };
         assert_eq!(
-            plan_batch(appends),
+            plan_batch(appends, last_lsn),
             vec![
-                FileWrite { engine: WalTarget::Kv, data: b"k1k22".to_vec(), parts: vec![(0, 0), (2, 2)] },
-                FileWrite { engine: WalTarget::Json, data: b"j1j2".to_vec(), parts: vec![(1, 0), (4, 2)] },
-                FileWrite { engine: WalTarget::Sys, data: b"s1".to_vec(), parts: vec![(3, 0)] },
+                FileWrite {
+                    engine: WalTarget::Kv,
+                    data: framed(&[(1, b"k1"), (2, b"k22")]),
+                    parts: vec![(0, 0, 1), (2, 10, 2)],
+                },
+                FileWrite {
+                    engine: WalTarget::Json,
+                    data: framed(&[(8, b"j1"), (9, b"j2")]),
+                    parts: vec![(1, 0, 8), (4, 10, 9)],
+                },
+                FileWrite { engine: WalTarget::Sys, data: framed(&[(42, b"s1")]), parts: vec![(3, 0, 42)] },
             ]
         );
     }
@@ -895,7 +1028,8 @@ mod tests {
         st.shutdown();
     }
 
-    // 2. wal_append -- data written, offset correct.
+    // 2. wal_append -- a new log starts with the header, each record lands
+    // framed with its LSN, offsets correct.
     #[test]
     fn test_wal_append_offsets_and_bytes() {
         crate::core::engine_runtime::block_on(async {
@@ -903,17 +1037,18 @@ mod tests {
             let (mut st, handle) = spawn(dir.path(), false, 64);
             let o1 = handle.wal_append(WalTarget::Kv, b"hello".to_vec()).await.unwrap();
             let o2 = handle.wal_append(WalTarget::Kv, b"world!".to_vec()).await.unwrap();
-            assert_eq!(o1, 0);
-            assert_eq!(o2, 5);
+            assert_eq!(o1, (8, 1));
+            assert_eq!(o2, (21, 2));
             st.shutdown();
-            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"helloworld!");
+            let log = [&WAL_MAGIC[..], &framed(&[(1, b"hello"), (2, b"world!")])].concat();
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), log);
         })
     }
 
     // Every engine's appends land in its own file, at offsets that grow per
-    // file; a truncate empties its own file alone; `recover` reads each file
-    // back on its own. With SQPOLL too: four fixed-file slots on the
-    // production ring setup.
+    // file and with LSNs counted per file; a truncate empties its own file
+    // alone, its LSNs go on; `recover` reads each file back on its own. With
+    // SQPOLL too: four fixed-file slots on the production ring setup.
     #[test]
     fn test_hub_keeps_one_wal_per_engine() {
         for sqpoll in [false, true] {
@@ -922,22 +1057,25 @@ mod tests {
                 let wals = wal_paths(dir.path(), &ALL_TARGETS);
                 let (mut st, handle) = StorageThread::new(cfg(sqpoll, 64), wals.clone()).unwrap();
 
-                let mut offsets = Vec::new();
+                let mut appended = Vec::new();
                 for round in 1..=2u64 {
                     for target in ALL_TARGETS {
                         let record = delete_record(round, format!("{target:?}-{round}").as_bytes());
-                        offsets.push((target, handle.wal_append(target, record).await.unwrap()));
+                        appended.push((target, handle.wal_append(target, record).await.unwrap()));
                     }
                 }
-                // Second offset = length of the first record: 13 bytes + the key.
+                // Second offset = header + LSN frame + the first record (13 bytes + the key).
                 let expected = [
-                    (WalTarget::Kv, 0), (WalTarget::Json, 0), (WalTarget::Rel, 0), (WalTarget::Sys, 0),
-                    (WalTarget::Kv, 17), (WalTarget::Json, 19), (WalTarget::Rel, 18), (WalTarget::Sys, 18),
+                    (WalTarget::Kv, (8, 1)), (WalTarget::Json, (8, 1)), (WalTarget::Rel, (8, 1)), (WalTarget::Sys, (8, 1)),
+                    (WalTarget::Kv, (33, 2)), (WalTarget::Json, (35, 2)), (WalTarget::Rel, (34, 2)), (WalTarget::Sys, (34, 2)),
                 ];
-                assert_eq!(offsets, expected);
+                assert_eq!(appended, expected);
 
                 handle.wal_truncate(WalTarget::Json).await.unwrap();
-                assert_eq!(handle.wal_append(WalTarget::Json, delete_record(3, b"Json-3")).await.unwrap(), 0);
+                assert_eq!(handle.wal_append(WalTarget::Json, delete_record(3, b"Json-3")).await.unwrap(), (8, 3));
+                for (target, head) in [(WalTarget::Kv, 2), (WalTarget::Json, 3), (WalTarget::Rel, 2), (WalTarget::Sys, 2)] {
+                    assert_eq!(handle.wal_head_lsn(target).await.unwrap(), head);
+                }
                 st.shutdown();
 
                 let paths: Vec<&Path> = wals.iter().map(|(_, path)| path.as_path()).collect();
@@ -945,6 +1083,7 @@ mod tests {
                 assert_eq!(recovered_keys(paths[1]).await, ["Json-3"]);
                 assert_eq!(recovered_keys(paths[2]).await, ["Rel-1", "Rel-2"]);
                 assert_eq!(recovered_keys(paths[3]).await, ["Sys-1", "Sys-2"]);
+                assert_eq!(wal::recover(paths[1]).await.unwrap().max_lsn, 3);
             })
         }
     }
@@ -961,7 +1100,11 @@ mod tests {
             assert!(err.to_string().contains("Json"), "{err}");
             let err = handle.wal_truncate(WalTarget::Rel).await.unwrap_err();
             assert!(err.to_string().contains("Rel"), "{err}");
-            assert_eq!(handle.wal_append(WalTarget::Kv, b"kv".to_vec()).await.unwrap(), 0);
+            let err = handle.set_lsn_start(WalTarget::Sys, 3).await.unwrap_err();
+            assert!(err.to_string().contains("Sys"), "{err}");
+            let err = handle.wal_head_lsn(WalTarget::Json).await.unwrap_err();
+            assert!(err.to_string().contains("Json"), "{err}");
+            assert_eq!(handle.wal_append(WalTarget::Kv, b"kv".to_vec()).await.unwrap(), (8, 1));
 
             st.shutdown();
             let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -969,8 +1112,93 @@ mod tests {
         })
     }
 
+    // After `SetLsnStart` with k the next append carries k + 1, and the head
+    // follows the appends.
+    #[test]
+    fn test_set_lsn_start_numbers_the_next_append_after_it() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            assert_eq!(handle.wal_head_lsn(WalTarget::Kv).await.unwrap(), 0);
+
+            handle.set_lsn_start(WalTarget::Kv, 41).await.unwrap();
+            assert_eq!(handle.wal_head_lsn(WalTarget::Kv).await.unwrap(), 41);
+            assert_eq!(handle.wal_append(WalTarget::Kv, delete_record(1, b"first")).await.unwrap(), (8, 42));
+            assert_eq!(handle.wal_append(WalTarget::Kv, delete_record(2, b"second")).await.unwrap().1, 43);
+            assert_eq!(handle.wal_head_lsn(WalTarget::Kv).await.unwrap(), 43);
+            st.shutdown();
+
+            assert_eq!(wal::recover(dir.path().join("wal")).await.unwrap().max_lsn, 43);
+        })
+    }
+
+    // `SetLsnStart` never moves the counter back: an engine that reopens its
+    // log on a live hub, the header alone after a clean shutdown, sends 0.
+    #[test]
+    fn test_set_lsn_start_never_moves_the_counter_back() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut st, handle) = spawn(dir.path(), false, 64);
+            for i in 1..=3u64 {
+                handle.wal_append(WalTarget::Kv, delete_record(i, b"before")).await.unwrap();
+            }
+            handle.wal_truncate(WalTarget::Kv).await.unwrap();
+
+            handle.set_lsn_start(WalTarget::Kv, 0).await.unwrap();
+            assert_eq!(handle.wal_append(WalTarget::Kv, delete_record(4, b"after")).await.unwrap(), (8, 4));
+            assert_eq!(handle.wal_head_lsn(WalTarget::Kv).await.unwrap(), 4);
+            st.shutdown();
+        })
+    }
+
+    // A log of the earlier format stays as it is at the start and refuses
+    // appends until a truncate replaces it with the header; no record with an
+    // LSN ever lands behind a record without one.
+    #[test]
+    fn test_a_log_of_the_earlier_format_takes_appends_only_after_a_truncate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let earlier = delete_record(1, b"earlier");
+        std::fs::write(&wals[0].1, &earlier).unwrap();
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+
+        let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(2, b"refused")]);
+        process_batch(&mut state, batch);
+        let err = refused[0].try_recv().unwrap().unwrap_err();
+        assert!(err.to_string().contains("earlier version"), "{err}");
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), earlier);
+
+        let (response, mut truncated) = oneshot::channel();
+        process_batch(&mut state, vec![IoRequest::WalTruncate { engine: WalTarget::Kv, response }]);
+        truncated.try_recv().unwrap().unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), WAL_MAGIC);
+
+        let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept")]);
+        process_batch(&mut state, batch);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap(), (8, 1));
+    }
+
+    // A crash while the header was written leaves a part of it; the start
+    // writes the header again.
+    #[test]
+    fn test_start_completes_a_torn_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        std::fs::write(&wals[0].1, b"LUR").unwrap();
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), WAL_MAGIC);
+        assert_eq!(state.wals[0].offset, WAL_HEADER_LEN);
+
+        let (batch, mut appended) = record_appends(WalTarget::Kv, vec![delete_record(1, b"first")]);
+        process_batch(&mut state, batch);
+        assert_eq!(appended[0].try_recv().unwrap().unwrap(), (8, 1));
+    }
+
+    /// The receivers of append requests, each for the offset and the LSN.
+    type Appended = Vec<oneshot::Receiver<Result<(u64, u64)>>>;
+
     /// One-byte append requests for `targets`, in order, with their receivers.
-    fn appends(targets: &[WalTarget]) -> (Vec<IoRequest>, Vec<oneshot::Receiver<Result<u64>>>) {
+    fn appends(targets: &[WalTarget]) -> (Vec<IoRequest>, Appended) {
         targets
             .iter()
             .map(|engine| {
@@ -996,17 +1224,16 @@ mod tests {
         process_batch(&mut state, batch);
         assert_eq!(state.stats, HubStats { appends: 26, batches: 2, fdatasyncs: 4 });
 
+        // Each one-byte payload takes 9 bytes behind the 8-byte header; the
+        // LSNs count per file across both batches.
         receivers.extend(more);
-        let offsets: Vec<u64> = receivers.iter_mut().map(|rx| rx.try_recv().unwrap().unwrap()).collect();
-        assert_eq!(&offsets[..6], [0, 0, 1, 0, 1, 2]);
-        assert_eq!(offsets[6..], (3..23).collect::<Vec<u64>>());
+        let appended: Vec<(u64, u64)> = receivers.iter_mut().map(|rx| rx.try_recv().unwrap().unwrap()).collect();
+        assert_eq!(&appended[..6], [(8, 1), (8, 1), (17, 2), (8, 1), (17, 2), (26, 3)]);
+        assert_eq!(appended[6..], (3..23).map(|i| (8 + 9 * i, i + 1)).collect::<Vec<_>>());
     }
 
     /// Append requests of `records` to `engine`'s WAL, in order, with their receivers.
-    fn record_appends(
-        engine: WalTarget,
-        records: Vec<Vec<u8>>,
-    ) -> (Vec<IoRequest>, Vec<oneshot::Receiver<Result<u64>>>) {
+    fn record_appends(engine: WalTarget, records: Vec<Vec<u8>>) -> (Vec<IoRequest>, Appended) {
         records
             .into_iter()
             .map(|data| {
@@ -1017,7 +1244,8 @@ mod tests {
     }
 
     // A write that fails on one file cuts that file back to its cursor and
-    // fails that file's requests alone; the batch's other file commits.
+    // fails that file's requests alone, its LSNs unused; the batch's other
+    // file commits.
     #[test]
     fn test_failed_write_cuts_its_file_back_to_the_cursor() {
         use std::io::Write;
@@ -1038,13 +1266,14 @@ mod tests {
         let (batch, mut receivers) = appends(&[Kv, Json, Kv]);
         process_batch(&mut state, batch);
 
-        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), 2);
-        assert_eq!(state.wals[0].offset, 2);
+        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), 26);
+        assert_eq!(state.wals[0].offset, 26);
+        assert_eq!(state.wals[0].lsn, 2);
         for i in [0, 2] {
             let err = receivers[i].try_recv().unwrap().unwrap_err();
             assert!(err.to_string().starts_with("WAL append failed"), "{err}");
         }
-        assert_eq!(receivers[1].try_recv().unwrap().unwrap(), 1);
+        assert_eq!(receivers[1].try_recv().unwrap().unwrap(), (17, 2));
     }
 
     // A failed append leaves nothing behind the log's end: after a long run
@@ -1068,7 +1297,7 @@ mod tests {
 
             let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(2, b"kept")]);
             process_batch(&mut state, batch);
-            assert_eq!(kept[0].try_recv().unwrap().unwrap(), 0);
+            assert_eq!(kept[0].try_recv().unwrap().unwrap(), (8, 1));
             assert_eq!(recovered_keys(&wals[0].1).await, ["kept"]);
         })
     }
@@ -1093,7 +1322,7 @@ mod tests {
 
             let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(4, b"kept-two")]);
             process_batch(&mut state, batch);
-            assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+            assert_eq!(kept[0].try_recv().unwrap().unwrap().0, start);
             assert_eq!(recovered_keys(path).await, ["kept-one", "kept-two"]);
         })
     }
@@ -1134,7 +1363,7 @@ mod tests {
             assert_eq!(recovered_keys(path).await, ["kept-one"]);
             let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept-two")]);
             process_batch(&mut state, batch);
-            assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+            assert_eq!(kept[0].try_recv().unwrap().unwrap().0, start);
         })
     }
 
@@ -1166,7 +1395,7 @@ mod tests {
 
         let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept-two")]);
         process_batch(&mut state, batch);
-        assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap().0, start);
         assert!(!marker.exists());
     }
 
@@ -1183,7 +1412,7 @@ mod tests {
         let (response, mut truncated) = oneshot::channel();
         process_batch(&mut state, vec![IoRequest::WalTruncate { engine: WalTarget::Kv, response }]);
         truncated.try_recv().unwrap().unwrap();
-        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), 0);
+        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), WAL_HEADER_LEN);
         assert!(!marker.exists());
         assert!(!state.wals[0].unsafe_end);
     }
@@ -1206,7 +1435,7 @@ mod tests {
 
         let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(4, b"kept-two")]);
         process_batch(&mut state, batch);
-        assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap().0, start);
         assert!(!marker.exists());
     }
 
@@ -1228,7 +1457,7 @@ mod tests {
 
         let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept-two")]);
         process_batch(&mut state, batch);
-        assert_eq!(kept[0].try_recv().unwrap().unwrap(), 0);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap(), (8, 2));
         assert!(!marker.exists());
     }
 
@@ -1251,10 +1480,10 @@ mod tests {
 
         let syncs = state.faults.unmark_syncs;
         let record = delete_record(4, b"kept-two");
-        let end = start + record.len() as u64;
+        let end = start + 8 + record.len() as u64;
         let (batch, mut kept) = record_appends(WalTarget::Kv, vec![record]);
         process_batch(&mut state, batch);
-        assert_eq!(kept[0].try_recv().unwrap().unwrap(), start);
+        assert_eq!(kept[0].try_recv().unwrap().unwrap().0, start);
         assert_eq!(state.faults.unmark_syncs, syncs + 1);
         assert!(!state.wals[0].unsafe_end);
         assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), end);
@@ -1280,7 +1509,7 @@ mod tests {
     // it would pad the log with zero bytes.
     #[test]
     fn test_start_never_lengthens_the_log_to_the_marker_cursor() {
-        for (log, cursor) in [("", 21u64), ("log-bytes", 9)] {
+        for (log, cursor) in [(WAL_MAGIC.as_slice(), 21u64), (b"log-bytes".as_slice(), 9)] {
             let dir = tempfile::TempDir::new().unwrap();
             let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
             let marker = dir.path().join("Kv.wal.unsafe-end");
@@ -1288,7 +1517,7 @@ mod tests {
             std::fs::write(&marker, cursor.to_be_bytes()).unwrap();
 
             let (state, _) = open_state(&cfg(false, 64), &wals).unwrap();
-            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log.as_bytes());
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
             assert_eq!(state.wals[0].offset, log.len() as u64);
             assert!(!marker.exists());
         }
@@ -1325,10 +1554,10 @@ mod tests {
         offsets.sort_unstable();
         assert_eq!(offsets.len(), 100);
         for (i, off) in offsets.iter().enumerate() {
-            assert_eq!(*off, (i as u64) * 10);
+            assert_eq!(*off, (8 + (i as u64) * 18, i as u64 + 1));
         }
         st.shutdown();
-        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 1000);
+        assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 8 + 1800);
     }
 
     // 5. Backpressure: bounded channel full -> try_send reports Full.
@@ -1358,7 +1587,8 @@ mod tests {
             let (mut st, handle) = spawn(dir.path(), true, 64);
             handle.wal_append(WalTarget::Kv, b"sqpoll".to_vec()).await.unwrap();
             st.shutdown();
-            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"sqpoll");
+            let log = [&WAL_MAGIC[..], &framed(&[(1, b"sqpoll")])].concat();
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), log);
         })
     }
 
@@ -1382,14 +1612,15 @@ mod tests {
             drop(handle);
             st.shutdown();
             for (i, rx) in receivers.into_iter().enumerate() {
-                let offset = rx.await.unwrap().unwrap();
-                assert_eq!(offset, (i as u64) * 10);
+                let appended = rx.await.unwrap().unwrap();
+                assert_eq!(appended, (8 + (i as u64) * 18, i as u64 + 1));
             }
-            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 500);
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 8 + 900);
         })
     }
 
-    // WAL truncate resets the write cursor to 0.
+    // WAL truncate resets the write cursor to the end of the header; the LSNs
+    // go on.
     #[test]
     fn test_wal_truncate_resets_offset() {
         crate::core::engine_runtime::block_on(async {
@@ -1397,10 +1628,11 @@ mod tests {
             let (mut st, handle) = spawn(dir.path(), false, 64);
             handle.wal_append(WalTarget::Kv, b"abcde".to_vec()).await.unwrap();
             handle.wal_truncate(WalTarget::Kv).await.unwrap();
-            let off = handle.wal_append(WalTarget::Kv, b"XY".to_vec()).await.unwrap();
-            assert_eq!(off, 0);
+            let appended = handle.wal_append(WalTarget::Kv, b"XY".to_vec()).await.unwrap();
+            assert_eq!(appended, (8, 2));
             st.shutdown();
-            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), b"XY");
+            let log = [&WAL_MAGIC[..], &framed(&[(2, b"XY")])].concat();
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), log);
         })
     }
 

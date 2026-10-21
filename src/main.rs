@@ -61,6 +61,7 @@ fn main() -> anyhow::Result<()> {
     config.server.validate()?;
     config.log.validate()?;
     config.backup.validate()?;
+    config.storage.validate()?;
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to determine the current working directory: {e}"))?;
     config.validate_data_paths(&cwd)?;

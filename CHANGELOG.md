@@ -21,6 +21,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Changed
 
+- Relational domains follow the `[rate_limit]` defaults instead of a fixed 1000 reads/500 writes per second.
 - Building the SHM snapshot of a domain larger than the data buffer no longer holds the whole domain in memory.
 - Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.
 - SHM snapshots are only rebuilt after data changes, cutting tail latency of small requests on idle servers.

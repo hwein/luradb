@@ -320,6 +320,7 @@ mod tests {
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::domain::{DomainConfig, DomainRegistry};
     use crate::engines::lsm::engine::LsmStorageEngine;
+    use crate::engines::lsm::rate_limiter::DomainQuota;
     use crate::storage::{file_manager::FileManager, manifest::ManifestManager, vlog::VLog};
     use axum::body::to_bytes;
     use axum::body::Body;
@@ -331,14 +332,16 @@ mod tests {
     /// with `cfg`'s limits (paths are always freshly assigned into a temp dir).
     /// `auth_enabled` toggles the auth middleware layer (rel/011 tests need it on).
     async fn make_state(rel_config: Option<RelStoreConfig>, auth_enabled: bool) -> (AppState, tempfile::TempDir) {
-        make_tuned_state(rel_config, auth_enabled, |_| {}).await
+        make_tuned_state(rel_config, auth_enabled, DomainQuota::default(), |_| {}).await
     }
 
-    /// [`make_state`], with `tune` overriding the engine's fixed limits
-    /// before anything else holds the engine.
+    /// [`make_state`], with `quota` as the engine's per-domain rate limit and
+    /// `tune` overriding the engine's fixed limits before anything else holds
+    /// the engine.
     async fn make_tuned_state(
         rel_config: Option<RelStoreConfig>,
         auth_enabled: bool,
+        quota: DomainQuota,
         tune: impl FnOnce(&mut RelEngine),
     ) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -381,7 +384,10 @@ mod tests {
                     None,
                     Arc::clone(&metrics),
                 );
-                let mut engine = RelEngine::bootstrap(&cfg, Arc::clone(&metrics), resolver).await.unwrap();
+                let wal = WriteAheadLog::new(&cfg.wal_path).await.unwrap();
+                let mut engine = RelEngine::bootstrap_with_wal(&cfg, quota, wal, Arc::clone(&metrics), resolver)
+                    .await
+                    .unwrap();
                 tune(Arc::get_mut(&mut engine).unwrap());
                 Some(engine)
             }
@@ -419,7 +425,16 @@ mod tests {
 
     /// The default rel config, with `tune` overriding the engine's fixed limits.
     async fn make_tuned_app(tune: impl FnOnce(&mut RelEngine)) -> (axum::Router, tempfile::TempDir) {
-        let (state, dir) = make_tuned_state(Some(RelStoreConfig::default()), false, tune).await;
+        let (state, dir) = make_tuned_state(Some(RelStoreConfig::default()), false, DomainQuota::default(), tune).await;
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
+    }
+
+    /// The default rel config with `quota` as the per-domain rate limit; table
+    /// `t` exists in `default` (created without drawing the budget).
+    async fn make_quota_app(quota: DomainQuota) -> (axum::Router, tempfile::TempDir) {
+        let (state, dir) = make_tuned_state(Some(RelStoreConfig::default()), false, quota, |_| {}).await;
+        let engine = state.rel_engine.clone().unwrap();
+        engine.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
         (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
@@ -893,6 +908,34 @@ mod tests {
 
             // Now drain read too, confirming SELECT gets rejected on its own bucket.
             engine.drain_domain_budget_for_test("default", false);
+            let (status, _) = sql(&app, "default", r#"{"sql": "SELECT * FROM t"}"#).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        })
+    }
+
+    // 15b. The quota handed to the engine at startup applies to relational
+    //      domains: a zero write quota rejects DML at once (SELECT stays
+    //      open), a zero read quota rejects SELECT (DML stays open). A zero
+    //      bucket never refills, so the outcome does not depend on timing.
+    #[test]
+    fn test_rate_limit_write_quota_from_startup() {
+        crate::core::engine_runtime::block_on(async {
+            let quota = DomainQuota { write_iops: 0, ..DomainQuota::default() };
+            let (app, _dir) = make_quota_app(quota).await;
+            let (status, _) = sql(&app, "default", r#"{"sql": "INSERT INTO t VALUES (1)"}"#).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            let (status, body) = sql(&app, "default", r#"{"sql": "SELECT * FROM t"}"#).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        })
+    }
+
+    #[test]
+    fn test_rate_limit_read_quota_from_startup() {
+        crate::core::engine_runtime::block_on(async {
+            let quota = DomainQuota { read_iops: 0, ..DomainQuota::default() };
+            let (app, _dir) = make_quota_app(quota).await;
+            let (status, body) = sql(&app, "default", r#"{"sql": "INSERT INTO t VALUES (1)"}"#).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
             let (status, _) = sql(&app, "default", r#"{"sql": "SELECT * FROM t"}"#).await;
             assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         })

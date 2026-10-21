@@ -1303,6 +1303,7 @@ mod tests {
     use super::*;
     use crate::config::RelStoreConfig;
     use crate::core::storage_thread::{TestHub, WalTarget};
+    use crate::engines::lsm::rate_limiter::DomainQuota;
     use crate::metrics::{MetricsConfig, MetricsStore};
     use serde_json::json;
     use std::path::Path;
@@ -1331,7 +1332,7 @@ mod tests {
         let metrics = MetricsStore::new(MetricsConfig::default());
         let cross_engine = crate::engines::rel::CrossEngineResolver::disabled(Arc::clone(&metrics));
         let wal = hub.wal(WalTarget::Rel);
-        let rel = RelEngine::bootstrap_with_wal(&config, wal, metrics, cross_engine).await.unwrap();
+        let rel = RelEngine::bootstrap_with_wal(&config, DomainQuota::default(), wal, metrics, cross_engine).await.unwrap();
         (rel, Some(hub))
     }
 

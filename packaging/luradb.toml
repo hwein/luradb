@@ -162,7 +162,7 @@ purger_interval_secs = 5
 # Cap on keys removed by one DELETE …/keys?prefix= bulk delete (spec kv/023).
 max_bulk_delete_keys = 10000
 
-# Limits of every key-value domain.
+# Limits of every key-value and relational domain.
 [rate_limit]
 # Reads per second per domain.
 default_read_iops = 1000

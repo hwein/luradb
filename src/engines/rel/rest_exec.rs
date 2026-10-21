@@ -9,7 +9,7 @@ use super::cross_engine::LinkAuth;
 use super::dml::{DmlResult, SelectResult};
 use super::error::RelStoreError;
 use super::{ExecOutcome, RelEngine};
-use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
+use crate::engines::lsm::rate_limiter::RateLimiter;
 use std::sync::Arc;
 
 /// One entry per resolved `expand` column: the output name, and one resolved
@@ -47,21 +47,24 @@ impl RelEngine {
         Ok(stmt.class())
     }
 
-    /// Lazily creates a per-domain `RateLimiter` (spec §7, KV `DomainRegistry`
-    /// pattern reuse: `DomainQuota::default()`, no per-domain tuning) and
-    /// charges one op against it. `write`: DML/DDL draw the write bucket,
-    /// SELECT the read bucket (separate buckets, spec §7). `false` ⇒ the
-    /// caller must not perform any execution I/O.
-    pub fn check_domain_budget(&self, domain: &str, write: bool) -> bool {
+    /// The domain's rate limiter, created from the engine's quota on first use.
+    fn limiter_for(&self, domain: &str) -> Arc<RateLimiter> {
         let existing = self.rate_limiters.read().get(domain).cloned();
-        let limiter = existing.unwrap_or_else(|| {
+        existing.unwrap_or_else(|| {
             Arc::clone(
                 self.rate_limiters
                     .write()
                     .entry(domain.to_string())
-                    .or_insert_with(|| Arc::new(RateLimiter::new(DomainQuota::default()))),
+                    .or_insert_with(|| Arc::new(RateLimiter::new(self.domain_quota))),
             )
-        });
+        })
+    }
+
+    /// Charges one op against the domain's rate limiter. `write`: DML/DDL
+    /// draw the write bucket, SELECT the read bucket (separate buckets).
+    /// `false` ⇒ the caller must not perform any execution I/O.
+    pub fn check_domain_budget(&self, domain: &str, write: bool) -> bool {
+        let limiter = self.limiter_for(domain);
         if write {
             limiter.check_write()
         } else {
@@ -69,20 +72,12 @@ impl RelEngine {
         }
     }
 
-    /// Test-only counterpart to `check_domain_budget`: same lazy-registry
-    /// lookup, but drains and locks the matching bucket (`drain_for_test`)
-    /// instead of consuming one token (flaky-test fix, spec general/008).
+    /// Test-only counterpart to `check_domain_budget`: drains and locks the
+    /// matching bucket (`drain_for_test`) instead of consuming one token, so
+    /// the outcome does not depend on refill timing.
     #[cfg(test)]
     pub fn drain_domain_budget_for_test(&self, domain: &str, write: bool) {
-        let existing = self.rate_limiters.read().get(domain).cloned();
-        let limiter = existing.unwrap_or_else(|| {
-            Arc::clone(
-                self.rate_limiters
-                    .write()
-                    .entry(domain.to_string())
-                    .or_insert_with(|| Arc::new(RateLimiter::new(DomainQuota::default()))),
-            )
-        });
+        let limiter = self.limiter_for(domain);
         if write {
             limiter.write_bucket.drain_for_test()
         } else {

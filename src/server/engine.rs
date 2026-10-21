@@ -22,6 +22,7 @@ use crate::{
         domain::{DomainConfig, DomainPurger, DomainRegistry},
         engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine},
         janitor::JanitorConfig,
+        rate_limiter::DomainQuota,
         ttl_sweeper::TtlSweeper,
     },
     engines::rel::RelEngine,
@@ -195,7 +196,12 @@ async fn init_rel_engine(
             Arc::clone(metrics),
         );
         let wal = WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Rel);
-        let engine = RelEngine::bootstrap_with_wal(&cfg.rel, wal, Arc::clone(metrics), resolver).await?;
+        let quota = DomainQuota {
+            read_iops: cfg.rate_limit.default_read_iops,
+            write_iops: cfg.rate_limit.default_write_iops,
+            max_storage_bytes: cfg.rate_limit.default_max_storage_bytes,
+        };
+        let engine = RelEngine::bootstrap_with_wal(&cfg.rel, quota, wal, Arc::clone(metrics), resolver).await?;
         tracing::info!("Relational engine ready.");
         Ok(Some(engine))
     } else {

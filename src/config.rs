@@ -1641,6 +1641,20 @@ mod tests {
         assert!(config.validate_data_paths(tmp.path()).is_err());
     }
 
+    // Without a `[rate_limit]` section every domain keeps 1000 reads and 500
+    // writes per second; the engine quota default must agree.
+    #[test]
+    fn test_rate_limit_defaults_without_section() {
+        let config: LuraConfig = toml::from_str("").unwrap();
+        assert_eq!(config.rate_limit.default_read_iops, 1000);
+        assert_eq!(config.rate_limit.default_write_iops, 500);
+        assert_eq!(config.rate_limit.default_max_storage_bytes, 0);
+        let quota = crate::engines::lsm::rate_limiter::DomainQuota::default();
+        assert_eq!(quota.read_iops, config.rate_limit.default_read_iops);
+        assert_eq!(quota.write_iops, config.rate_limit.default_write_iops);
+        assert_eq!(quota.max_storage_bytes, config.rate_limit.default_max_storage_bytes);
+    }
+
     #[test]
     fn test_rel_store_defaults() {
         let config = LuraConfig::default();

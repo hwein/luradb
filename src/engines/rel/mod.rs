@@ -56,7 +56,7 @@ use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
 use crate::engines::lsm::janitor::JanitorConfig;
-use crate::engines::lsm::rate_limiter::RateLimiter;
+use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::metrics::MetricsStore;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::ManifestManager;
@@ -133,6 +133,8 @@ pub struct RelEngine {
     /// intact). `parking_lot::RwLock`: sync-only critical sections, never
     /// held across an `.await`.
     rate_limiters: RwLock<HashMap<String, Arc<RateLimiter>>>,
+    /// Quota every lazily-created limiter is built with.
+    domain_quota: DomainQuota,
     /// Publishes the DDL events of `execute_checked` and finishes purges.
     /// Unset for a standalone engine, which then publishes nothing.
     control: OnceLock<Arc<ControlPlane>>,
@@ -140,7 +142,7 @@ pub struct RelEngine {
 
 impl RelEngine {
     /// Tests only: [`Self::bootstrap_with_wal`] on a local WAL committer
-    /// instead of the storage hub.
+    /// instead of the storage hub, with the default domain quota.
     #[cfg(test)]
     pub async fn bootstrap(
         config: &RelStoreConfig,
@@ -148,14 +150,16 @@ impl RelEngine {
         cross_engine: Arc<CrossEngineResolver>,
     ) -> Result<Arc<Self>> {
         let wal = WriteAheadLog::new(&config.wal_path).await?;
-        Self::bootstrap_with_wal(config, wal, metrics, cross_engine).await
+        Self::bootstrap_with_wal(config, DomainQuota::default(), wal, metrics, cross_engine).await
     }
 
     /// Creates the dedicated relational LSM instance from `config`, with
     /// `wal` as the log at `config.wal_path`, starts its background tasks,
-    /// and recovers the domain registry and the catalog.
+    /// and recovers the domain registry and the catalog. `quota` is the
+    /// rate limit of every domain.
     pub async fn bootstrap_with_wal(
         config: &RelStoreConfig,
+        quota: DomainQuota,
         wal: WriteAheadLog,
         metrics: Arc<MetricsStore>,
         cross_engine: Arc<CrossEngineResolver>,
@@ -219,6 +223,7 @@ impl RelEngine {
             max_response_bytes: MAX_RESPONSE_BYTES,
             import_body_limit_bytes: config.import_body_limit_bytes,
             rate_limiters: RwLock::new(HashMap::new()),
+            domain_quota: quota,
             control: OnceLock::new(),
         }))
     }

@@ -72,7 +72,24 @@ On 12 cores with a new data directory that is 2 frontend workers, 3 data shards 
 
 Memory: the block cache of each engine (64 MiB) and the buffer pool (`buffer_pool.pool_size`) are split evenly across the shards; the MemTable threshold (`lsm.memtable_size_threshold`) applies per engine and shard, so MemTable memory grows to engines × shards × threshold (plus MemTables being flushed).
 
-The shard count is fixed for a data directory: with `shards = 0` the service keeps the count the data was written with, also after an upgrade or a move to a host with another core count; a different count set explicitly refuses the start.
+The shard count belongs to the data directory: with `shards = 0` the service keeps the count the data was written with, also after an upgrade or a move to a host with another core count; a different count set explicitly refuses the start. Only the migration tool changes it.
+
+## Changing the shard count
+
+The migration tool rewrites the data directory for another number of data shards, more or fewer, down to 1. It works offline, on a stopped service, and moves the key-value, JSON and relational data alike:
+
+```bash
+sudo systemctl stop luradb
+sudo -u luradb /usr/bin/luradb --config /etc/luradb/luradb.toml --migrate-shards 4
+sudo systemctl start luradb
+```
+
+- The service must have been shut down cleanly. If the tool reports writes that are not flushed yet, start the service once, stop it again and rerun the tool.
+- It refuses to run while the service runs on the same data directory: the service holds a lock on `<system_dir>/lock` for as long as it runs, so a second LuraDB process on the same data directory does not start, and the tool runs only while the service is stopped.
+- It needs free disk space for a second copy of the data next to the first: the new layout is built in a `migrate_<timestamp>/` directory inside each data directory and only then moved into place. The old layout is removed once the move has finished.
+- Leave `shards = 0` in `[multicore]`, or set it to the new count; any other explicit value refuses the start.
+- If the tool stops while it moves the new layout into place, the service refuses to start with "shard migration incomplete — rerun the migration tool"; running the same command again finishes the change. A tool stopped earlier leaves the old layout untouched.
+- Backups are not affected: an archive restores into any shard count. Write-ahead-log positions (`lsn_cut` in a backup manifest) restart at 1 after the change.
 
 ## Enabling HTTPS (quickstart)
 

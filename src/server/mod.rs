@@ -8,10 +8,13 @@
 
 mod control;
 mod layout;
+mod migrate;
 mod recovery;
 mod shard;
 #[cfg(test)]
 mod write_phases;
+
+pub use migrate::migrate_shards;
 
 use crate::{
     api::{self, middleware::ParsedCidr, ApiDoc},
@@ -523,6 +526,28 @@ pub(crate) mod test_hook {
     pub(crate) fn pings_silenced(system_dir: &str, shard: usize) -> bool {
         silent().lock().unwrap().iter().any(|(dir, k)| dir == system_dir && *k == shard)
     }
+
+    fn faults() -> &'static Mutex<Vec<(String, &'static str)>> {
+        static FAULTS: OnceLock<Mutex<Vec<(String, &'static str)>>> = OnceLock::new();
+        FAULTS.get_or_init(Default::default)
+    }
+
+    /// The next shard migration fails once, at `point` in `dir`: the system
+    /// directory during the copy, a data root after its swap.
+    pub(crate) fn fail_migration_at(dir: &str, point: &'static str) {
+        faults().lock().unwrap().push((dir.to_string(), point));
+    }
+
+    pub(crate) fn migration_fault(dir: &str, point: &'static str) -> anyhow::Result<()> {
+        let mut faults = faults().lock().unwrap();
+        match faults.iter().position(|(at_dir, at)| at_dir == dir && *at == point) {
+            Some(i) => {
+                faults.remove(i);
+                anyhow::bail!("injected fault {point}")
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -760,11 +785,11 @@ mod tests {
         server.shutdown().unwrap();
     }
 
-    fn get(path: &str) -> String {
+    pub(super) fn get(path: &str) -> String {
         format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
     }
 
-    fn with_body(method: &str, path: &str, body: &str) -> String {
+    pub(super) fn with_body(method: &str, path: &str, body: &str) -> String {
         format!(
             "{method} {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -827,13 +852,13 @@ mod tests {
     }
 
     /// One request (with `Connection: close`) on a fresh connection.
-    async fn request(addr: SocketAddr, raw: &str) -> (u16, Vec<u8>) {
+    pub(super) async fn request(addr: SocketAddr, raw: &str) -> (u16, Vec<u8>) {
         let (status, _, body) = exchange(addr, raw).await;
         (status, body)
     }
 
     /// [`request`], with the lower-cased response head as well.
-    async fn exchange(addr: SocketAddr, raw: &str) -> (u16, String, Vec<u8>) {
+    pub(super) async fn exchange(addr: SocketAddr, raw: &str) -> (u16, String, Vec<u8>) {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(raw.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
@@ -956,7 +981,7 @@ mod tests {
 
     /// The key-value engine on `cfg`'s paths, as a server opens it: those of
     /// `shard`, or with `None` those of a data directory without shards.
-    async fn open_kv_engine(cfg: &LuraConfig, shard: Option<usize>) -> Arc<crate::engines::lsm::engine::LsmStorageEngine> {
+    pub(super) async fn open_kv_engine(cfg: &LuraConfig, shard: Option<usize>) -> Arc<crate::engines::lsm::engine::LsmStorageEngine> {
         let wal_path = PathBuf::from(&cfg.storage.wal_path);
         let (vlog_path, sstable_dir) = match shard {
             Some(k) => (
@@ -1087,7 +1112,10 @@ mod tests {
         legacy_data_directory(&cfg, b"kept");
         cfg.multicore.shards = 2;
         let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
-        assert!(format!("{err:#}").contains("shard count changed (stored 1, configured 2)"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("shard count changed (stored 1, configured 2) — run `luradb --migrate-shards 2`"),
+            "{err:#}"
+        );
         let cfg = test_config(dir.path());
         assert!(Path::new(&cfg.storage.vlog_path).is_file(), "nothing moved");
         assert!(!layout::shard_dir(Path::new(&cfg.storage.sstable_dir), 0).exists(), "nothing moved");
@@ -1123,7 +1151,7 @@ mod tests {
 
         let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
         assert!(
-            format!("{err:#}").contains("shard count changed (stored 2, configured 1) — run the shard migration tool"),
+            format!("{err:#}").contains("shard count changed (stored 2, configured 1) — run `luradb --migrate-shards 1`"),
             "{err:#}"
         );
         assert!(!dir.path().join("sstables").exists(), "no engine was opened");
@@ -1679,14 +1707,14 @@ mod tests {
 
     /// The data shard of a lower-cased response head, from the bridge's
     /// test-hook header.
-    fn shard_in(head: &str) -> &str {
+    pub(super) fn shard_in(head: &str) -> &str {
         head.lines()
             .find_map(|line| line.strip_prefix(bridge::test_hook::SHARD)?.strip_prefix(": "))
             .unwrap_or_else(|| panic!("no shard header in {head}"))
             .trim()
     }
 
-    fn sql_body(statement: &str) -> String {
+    pub(super) fn sql_body(statement: &str) -> String {
         json!({ "sql": statement }).to_string()
     }
 
@@ -1892,6 +1920,132 @@ mod tests {
                 }
             },
         );
+    }
+
+    /// The body of `path` once its `state` is no longer `running`.
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    async fn when_finished(addr: SocketAddr, path: &str) -> Value {
+        for _ in 0..500 {
+            let (status, body) = request(addr, &get(path)).await;
+            assert_eq!(status, 200, "{path}: {}", String::from_utf8_lossy(&body));
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            if body["state"] != json!("running") {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{path} did not finish within the poll budget");
+    }
+
+    // A backup taken on two shards restores into one shard and into three:
+    // every key with its expiry, every document with its index and every
+    // user with its permission comes back, and each domain is read on the
+    // shard that owns it on the target.
+    #[test]
+    fn a_backup_of_two_shards_restores_into_one_and_into_three() {
+        use crate::control::slots::shard_of_domain;
+        // One domain on each of the two shards, neither on shard 0 of three.
+        let on = |two: u16, three: u16| {
+            (0u64..).map(|i| format!("r{i}")).find(|n| shard_of_domain(n, 2) == two && shard_of_domain(n, 3) == three)
+        };
+        let names = [on(0, 1).unwrap(), on(1, 2).unwrap()];
+        let with_shards = |shards: u16| {
+            move |cfg: &mut LuraConfig| {
+                cfg.multicore.shards = shards;
+                cfg.json.enabled = true;
+            }
+        };
+        let (mut archive, mut expiries, mut users) = (Vec::new(), Vec::new(), Value::Null);
+        let source = (&mut archive, &mut expiries, &mut users, &names);
+        with_tuned_server(with_shards(2), |addr| async move {
+            let (archive, expiries, users, names) = source;
+            // The default domains would make the restore wait for their purge.
+            for path in ["/store-api/domains/default", "/store-api/json/domains/default"] {
+                let delete = format!("DELETE {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+                assert_eq!(request(addr, &delete).await.0, 202, "{path}");
+            }
+            for name in names {
+                let create = json!({ "name": name }).to_string();
+                for path in ["/store-api/domains", "/store-api/json/domains"] {
+                    assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path}");
+                }
+                let kv = format!("/store-api/kv/{name}/keys");
+                assert_eq!(request(addr, &with_body("PUT", &format!("{kv}/k"), &format!("clé {name}"))).await.0, 200);
+                assert_eq!(request(addr, &with_body("PUT", &format!("{kv}/session?ttl=86400"), "tok")).await.0, 200);
+                let (status, meta) = request(addr, &get(&format!("{kv}/session/meta"))).await;
+                assert_eq!(status, 200);
+                expiries.push(serde_json::from_slice::<Value>(&meta).unwrap()["expires_at"].clone());
+                let index = json!({ "field": "city", "type": "string" }).to_string();
+                assert_eq!(request(addr, &with_body("POST", &format!("/store-api/json/{name}/indexes"), &index)).await.0, 201);
+                for (key, city) in [("d1", "Lyon"), ("d2", "Porto")] {
+                    let doc = json!({ "city": city }).to_string();
+                    let put = with_body("PUT", &format!("/store-api/json/{name}/documents/{key}"), &doc);
+                    assert_eq!(request(addr, &put).await.0, 201);
+                }
+            }
+            let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
+            assert_eq!(request(addr, &user).await.0, 201);
+            let grant = json!({ "domain": names[1], "access": "read", "store_type": "json" }).to_string();
+            assert_eq!(request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await.0, 200);
+            *users = serde_json::from_slice(&request(addr, &get("/store-api/auth/users")).await.1).unwrap();
+
+            let start = json!({ "scope": "all", "include_auth": true }).to_string();
+            let (status, body) = request(addr, &with_body("POST", "/store-api/backups", &start)).await;
+            assert_eq!(status, 202, "{}", String::from_utf8_lossy(&body));
+            let id = serde_json::from_slice::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            let detail = when_finished(addr, &format!("/store-api/backups/{id}")).await;
+            assert_eq!((detail["state"].clone(), detail["shards"].clone()), (json!("complete"), json!(2)), "{detail}");
+            let (status, bytes) = request(addr, &get(&format!("/store-api/backups/{id}/download"))).await;
+            assert_eq!(status, 200);
+            *archive = bytes;
+        });
+
+        for target in [1u16, 3] {
+            let (archive, expiries, users, names) = (&archive, &expiries, &users, &names);
+            with_tuned_server(with_shards(target), |addr| async move {
+                let upload = format!(
+                    "POST /store-api/backups/upload HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    archive.len()
+                );
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                stream.write_all(&[upload.as_bytes(), archive.as_slice()].concat()).await.unwrap();
+                let mut raw = Vec::new();
+                stream.read_to_end(&mut raw).await.unwrap();
+                let (status, body, _) = next_response(&raw);
+                assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+                let id = serde_json::from_slice::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+
+                let restore = json!({ "include_auth": true }).to_string();
+                let (status, body) = request(addr, &with_body("POST", &format!("/store-api/backups/{id}/restore"), &restore)).await;
+                assert_eq!(status, 202, "{}", String::from_utf8_lossy(&body));
+                let restore_id = serde_json::from_slice::<Value>(&body).unwrap()["restore_id"].as_str().unwrap().to_string();
+                let status = when_finished(addr, &format!("/store-api/restores/{restore_id}")).await;
+                assert_eq!((status["state"].clone(), status["failed"].clone()), (json!("complete"), json!(0)), "{status}");
+
+                for (name, expiry) in names.iter().zip(expiries) {
+                    let owner = shard_of_domain(name, target).to_string();
+                    let kv = format!("/store-api/kv/{name}/keys");
+                    let (status, head, value) = exchange(addr, &get(&format!("{kv}/k"))).await;
+                    assert_eq!((status, value), (200, format!("clé {name}").into_bytes()), "{target} shards");
+                    assert_eq!(shard_in(&head), owner, "{name} on {target} shards");
+                    let (status, meta) = request(addr, &get(&format!("{kv}/session/meta"))).await;
+                    assert_eq!(status, 200);
+                    assert_eq!(serde_json::from_slice::<Value>(&meta).unwrap()["expires_at"], *expiry);
+
+                    let search = json!({ "filter": { "city": "Lyon" } }).to_string();
+                    let (status, head, found) =
+                        exchange(addr, &with_body("POST", &format!("/store-api/json/{name}/search"), &search)).await;
+                    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&found));
+                    assert_eq!(shard_in(&head), owner);
+                    let found: Value = serde_json::from_slice(&found).unwrap();
+                    assert_eq!((found["total"].clone(), found["documents"][0]["_key"].clone()), (json!(1), json!("d1")));
+                    let (status, _) = request(addr, &get(&format!("/store-api/json/{name}/documents/d2"))).await;
+                    assert_eq!(status, 200);
+                }
+                let restored: Value = serde_json::from_slice(&request(addr, &get("/store-api/auth/users")).await.1).unwrap();
+                assert_eq!(restored, *users, "{target} shards");
+            });
+        }
     }
 
     /// The `shards` list of a `/health` body.

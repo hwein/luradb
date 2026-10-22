@@ -45,7 +45,8 @@ pub(super) async fn open_sharded(
     Ok(instances)
 }
 
-async fn open_instance(
+/// The instance of data shard `shard` on `files`, recovered by the caller.
+pub(super) async fn open_instance(
     files: &EngineFiles,
     shard: usize,
     wal: Arc<WriteAheadLog>,
@@ -82,7 +83,7 @@ pub(super) fn route(entries: Vec<(u64, WalEntry)>, shards: u16) -> anyhow::Resul
 
 /// Auth records in an engine's log predate the system store: they go to
 /// shard 0, whose key-value engine hands them over to it.
-fn owner(key: &[u8], shards: u16) -> Option<usize> {
+pub(super) fn owner(key: &[u8], shards: u16) -> Option<usize> {
     if key.starts_with(PREFIX_USER.as_bytes()) || key.starts_with(PREFIX_PERM.as_bytes()) {
         return Some(0);
     }

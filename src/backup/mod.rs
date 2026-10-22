@@ -13,8 +13,7 @@ pub mod writer;
 
 use crate::config::BackupConfig;
 use crate::control::ControlPlane;
-use crate::engines::json::JsonEngine;
-use crate::engines::lsm::domain::{now_secs, DomainRegistry};
+use crate::engines::lsm::domain::now_secs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -268,7 +267,9 @@ const SCAN_BATCH_SIZE: usize = 500;
 const SCAN_PAUSE_MS: u64 = 10;
 
 /// Owns the global backup/restore job slot, ID assignment, the on-disk
-/// backup listing/retention, and the RAM restore-status registry.
+/// backup listing/retention, and the RAM restore-status registry. It lives
+/// on the control plane, whose thread starts every job: the requests that
+/// start one carry no domain, and the scheduler runs there.
 ///
 /// Job-starting methods take `self: &Arc<Self>`: they validate synchronously
 /// (job slot, and for backups the scope) and spawn the actual work as a task
@@ -279,8 +280,7 @@ pub struct BackupManager {
     dir: PathBuf,
     scan_batch_size: usize,
     scan_pause_ms: u64,
-    kv_registry: Arc<DomainRegistry>,
-    json_engine: Option<Arc<JsonEngine>>,
+    /// Reaches the domains of every data shard.
     control: Arc<ControlPlane>,
     slot: parking_lot::Mutex<Option<RunningJobInfo>>,
     restores: parking_lot::RwLock<HashMap<String, RestoreStatus>>,
@@ -295,12 +295,7 @@ pub struct BackupManager {
 impl BackupManager {
     /// Creates the manager, ensures `config.dir` exists, and drops `.part`
     /// leftovers from a previous process.
-    pub fn new(
-        config: &BackupConfig,
-        kv_registry: Arc<DomainRegistry>,
-        json_engine: Option<Arc<JsonEngine>>,
-        control: Arc<ControlPlane>,
-    ) -> anyhow::Result<Arc<Self>> {
+    pub fn new(config: &BackupConfig, control: Arc<ControlPlane>) -> anyhow::Result<Arc<Self>> {
         let dir = PathBuf::from(&config.dir);
         std::fs::create_dir_all(&dir)?;
         sweep_scratch_files(&dir);
@@ -308,8 +303,6 @@ impl BackupManager {
             dir,
             scan_batch_size: SCAN_BATCH_SIZE,
             scan_pause_ms: SCAN_PAUSE_MS,
-            kv_registry,
-            json_engine,
             control,
             slot: parking_lot::Mutex::new(None),
             restores: parking_lot::RwLock::new(HashMap::new()),
@@ -354,7 +347,7 @@ impl BackupManager {
         include_auth: bool,
         schedule: Option<String>,
     ) -> Result<(String, compio::runtime::JoinHandle<()>), BackupError> {
-        let resolved = writer::resolve_scope(&scope, &self.kv_registry, &self.json_engine).await?;
+        let resolved = writer::resolve_scope(&scope, &self.control)?;
 
         let id = {
             let mut slot = self.slot.lock();
@@ -384,9 +377,7 @@ impl BackupManager {
                 include_auth,
                 schedule: schedule.as_deref(),
                 resolved: &resolved,
-                kv_registry: &manager.kv_registry,
-                json_engine: &manager.json_engine,
-                system_store: manager.control.system_store(),
+                control: &manager.control,
                 scan_batch_size: manager.scan_batch_size,
                 scan_pause_ms: manager.scan_pause_ms,
             };
@@ -490,8 +481,6 @@ impl BackupManager {
                 mode,
                 into_domain: into_domain.as_deref(),
                 include_auth,
-                kv_registry: &manager.kv_registry,
-                json_engine: &manager.json_engine,
                 control: &manager.control,
                 scan_batch_size: manager.scan_batch_size,
                 scan_pause_ms: manager.scan_pause_ms,
@@ -888,7 +877,7 @@ mod tests {
 #[cfg(test)]
 mod manager_tests {
     use super::*;
-    use crate::engines::lsm::domain::DomainConfig;
+    use crate::engines::lsm::domain::{DomainConfig, DomainRegistry};
     use crate::engines::lsm::engine::{LsmEngineOptions, LsmStorageEngine};
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::file_manager::FileManager;
@@ -922,7 +911,7 @@ mod manager_tests {
             dir: backup_dir.path().to_string_lossy().into_owned(),
             schedule: Vec::new(),
         };
-        let manager = BackupManager::new(&config, registry, None, control).unwrap();
+        let manager = BackupManager::new(&config, control).unwrap();
         (manager, engine_dir, backup_dir)
     }
 
@@ -942,6 +931,8 @@ mod manager_tests {
             json_snapshot_ts: 0,
             encoding: "hex".to_string(),
             schedule: schedule.map(|s| s.to_string()),
+            shards: 1,
+            lsn_cut: writer::LsnCut::default(),
         };
         let mut content = serde_json::to_string(&manifest).unwrap();
         content.push('\n');
@@ -1261,7 +1252,7 @@ mod manager_tests {
             dir: dir.to_string_lossy().into_owned(),
             ..BackupConfig::default()
         };
-        BackupManager::new(&config, Arc::clone(&manager.kv_registry), None, Arc::clone(&manager.control)).unwrap()
+        BackupManager::new(&config, Arc::clone(&manager.control)).unwrap()
     }
 
     // 12. Startup sweeps `.part` leftovers (crashed export, abandoned upload

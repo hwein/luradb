@@ -7,7 +7,8 @@ use crate::config::BlockCacheConfig;
 use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::memtable::{MemTable, Value};
 use crate::engines::lsm::reader::{
-    is_applying, GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata,
+    is_applying, GetResult, LsmReader, RawEntry, RawValue, RegistrySnapshot, Snapshot, SnapshotRegistry,
+    ValueWithMetadata,
 };
 use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::engines::lsm::version::{Version, VersionCell};
@@ -607,6 +608,25 @@ impl LsmStorageEngine {
         self.flush_recovered(recovered).await
     }
 
+    /// Writes `entries` under their own stamps and expiries, raises the clock
+    /// to the newest stamp and flushes them. Built with
+    /// [`Recovery::External`], the instance must take no other write until
+    /// the last batch is in.
+    pub async fn import_raw(&self, entries: Vec<RawEntry>) -> Result<()> {
+        let entries = entries
+            .into_iter()
+            .map(|RawEntry { key, stamp: timestamp, value, expire_at }| {
+                let entry = match value {
+                    RawValue::Bytes(value) => WalEntry::Set { timestamp, key, value, expire_at },
+                    RawValue::Null => WalEntry::SetNull { timestamp, key },
+                    RawValue::Tombstone => WalEntry::Delete { timestamp, key, in_batch: true },
+                };
+                (0, entry)
+            })
+            .collect();
+        self.apply_recovered(entries, 0).await
+    }
+
     async fn flush_recovered(&self, recovered: MemTable) -> Result<()> {
         if !recovered.is_empty() {
             self.install(|v| {
@@ -1046,7 +1066,7 @@ impl LsmStorageEngine {
     // ── Read path ───────────────────────────────────────────────────────────
 
     /// Reader over the current version.
-    fn build_reader(&self) -> LsmReader<'_> {
+    pub(crate) fn build_reader(&self) -> LsmReader<'_> {
         LsmReader::new(self.version(), Arc::clone(&self.block_cache), &self.applying_batch)
     }
 
@@ -2817,6 +2837,72 @@ mod tests {
     fn advance_hlc(engine: &LsmStorageEngine) {
         let ahead = engine.hlc().try_now().unwrap().physical() + HLC_SKEW_MS;
         engine.hlc().update(HLCTimestamp::from_components(ahead, 0)).unwrap();
+    }
+
+    // Every key's newest version moves to another instance under its own
+    // stamp and expiry — overwritten, value-log, NULL, deleted and expired
+    // ones alike, from SSTables and the MemTable — and that instance's clock,
+    // behind the stamps here, issues its next stamp above all of them.
+    #[test]
+    fn test_export_raw_moves_every_newest_version_and_import_raw_stamps_above_it() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let source = engine_on(&dir).await;
+            advance_hlc(&source);
+            let large = vec![7u8; 2048];
+            source.put(b"a", b"old").await.unwrap();
+            source.put(b"a", b"new").await.unwrap();
+            source.put(b"big", &large).await.unwrap();
+            source.put(b"gone", b"v").await.unwrap();
+            source.freeze_active_memtable();
+            source.flush_memtable().await.unwrap();
+            source.delete(b"gone").await.unwrap();
+            source.set_null(b"nulled").await.unwrap();
+            source.put_expired_for_test(b"expired", b"v").await.unwrap();
+            source.put_with_ttl(b"ttl", "clé".as_bytes(), 3600).await.unwrap();
+
+            let snapshot = source.snapshot().await;
+            let reader = source.build_reader();
+            let exported: Vec<RawEntry> = reader.export_raw(snapshot.snapshot()).unwrap().map(Result::unwrap).collect();
+            let keys: Vec<&[u8]> = exported.iter().map(|entry| entry.key.as_slice()).collect();
+            assert_eq!(keys, [&b"a"[..], b"big", b"expired", b"gone", b"nulled", b"ttl"]);
+            let by_key = |key: &[u8]| exported.iter().find(|entry| entry.key == key).unwrap().clone();
+            assert_eq!(by_key(b"a").value, RawValue::Bytes(b"new".to_vec()));
+            assert_eq!(by_key(b"big").value, RawValue::Bytes(large.clone()));
+            assert_eq!(by_key(b"gone").value, RawValue::Tombstone);
+            assert_eq!(by_key(b"nulled").value, RawValue::Null);
+            assert_eq!((by_key(b"expired").value, by_key(b"expired").expire_at), (RawValue::Bytes(b"v".to_vec()), 1));
+            assert!(by_key(b"ttl").expire_at > 1);
+            for key in [&b"a"[..], b"big", b"nulled", b"ttl"] {
+                assert_eq!(by_key(key).stamp, source.get_latest_with_stamp(key).await.unwrap().2);
+            }
+            let newest = exported.iter().map(|entry| entry.stamp).max().unwrap();
+
+            let other = tempfile::TempDir::new().unwrap();
+            let wal_path = other.path().join("wal.log");
+            let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+            let vlog_path = other.path().join("vlog.log");
+            let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+            let file_manager = Arc::new(FileManager::new(other.path()).await.unwrap());
+            let manifest_manager = Arc::new(ManifestManager::new(other.path()));
+            let options = LsmEngineOptions { recovery: Recovery::External, ..LsmEngineOptions::default() };
+            let target =
+                LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options).await.unwrap();
+            assert!(target.hlc().peek().as_u64() < newest, "the target's clock starts behind the stamps");
+            target.import_raw(exported.clone()).await.unwrap();
+
+            let snapshot = target.snapshot().await;
+            let reader = target.build_reader();
+            let imported: Vec<RawEntry> = reader.export_raw(snapshot.snapshot()).unwrap().map(Result::unwrap).collect();
+            assert_eq!(imported, exported);
+            for key in [&b"a"[..], b"big", b"nulled", b"ttl", b"gone", b"expired"] {
+                let (source_read, target_read) =
+                    (source.get_latest_with_stamp(key).await.unwrap(), target.get_latest_with_stamp(key).await.unwrap());
+                assert_eq!(source_read, target_read, "{}", String::from_utf8_lossy(key));
+            }
+            target.put(b"after", b"v").await.unwrap();
+            assert!(target.get_latest_with_stamp(b"after").await.unwrap().2 > newest);
+        })
     }
 
     /// `engine` on a clock that reads `now`, its logical counter saturated

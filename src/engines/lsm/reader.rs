@@ -437,6 +437,37 @@ impl<'a> LsmReader<'a> {
         Ok(())
     }
 
+    /// Every key's newest version visible at `snapshot`, in key order, with
+    /// its stamp and expiry: tombstones, NULLs and expired versions as they
+    /// are, value-log values read in. Synchronous: meant for an instance no
+    /// one else uses.
+    pub fn export_raw<'s>(&'s self, snapshot: &'s Snapshot) -> Result<RawScan<'s>> {
+        let applying_batch = self.applying_batch;
+        let mut sources: Vec<Box<dyn Iterator<Item = Result<ScanVersion<Stored>>> + 's>> = Vec::new();
+        for memtable in self.version.memtables_newest_first() {
+            let versions = memtable.iter().filter_map(move |(encoded_key, value)| {
+                let user_key = InternalKey::extract_user_key(&encoded_key)?;
+                let ts = InternalKey::extract_timestamp(&encoded_key)?;
+                let decides = snapshot.is_visible(ts) && !is_applying(applying_batch, ts);
+                decides.then(|| Ok((user_key.to_vec(), ts, Stored::from(value))))
+            });
+            sources.push(Box::new(versions));
+        }
+        for sstable in self.version.sstables_newest_first() {
+            let versions = sstable
+                .prefix_versions(&[], Some(snapshot.timestamp().inverted()))
+                .map(|version| version.map(|(user_key, ts, value)| (user_key, ts, Stored::from(CachedValue::from(value)))));
+            sources.push(Box::new(versions));
+        }
+        let mut heads = BinaryHeap::with_capacity(sources.len());
+        for (rank, source) in sources.iter_mut().enumerate() {
+            if let Some(head) = next_head(source, rank)? {
+                heads.push(Reverse(head));
+            }
+        }
+        Ok(RawScan { version: &self.version, sources, heads, decided: None })
+    }
+
     /// Newest version of `user_key` as (write stamp, liveness) — the TTL
     /// sweeper's authoritative re-check (spec kv/025 §3.1). Same newest-first
     /// source order as [`Self::get_with_metadata`] and no VLog access, but it
@@ -466,18 +497,18 @@ impl<'a> LsmReader<'a> {
 
 /// A source version as [`LsmReader::scan_with_metadata`] merges it: user key,
 /// write stamp, metadata (`None` = a tombstone or an expired version).
-type ScanVersion = (Vec<u8>, Timestamp, Option<ValueWithMetadata>);
+type ScanVersion<M = Option<ValueWithMetadata>> = (Vec<u8>, Timestamp, M);
 
 /// The next version of one scan source; `rank` is the source's place in
 /// newest-first order.
-struct ScanHead {
+struct ScanHead<M = Option<ValueWithMetadata>> {
     user_key: Vec<u8>,
     ts: Timestamp,
-    meta: Option<ValueWithMetadata>,
+    meta: M,
     rank: usize,
 }
 
-impl Ord for ScanHead {
+impl<M> Ord for ScanHead<M> {
     /// Encoded key order, as each source yields its versions; the versions of
     /// one user key newest source first, as the point reads decide.
     fn cmp(&self, other: &Self) -> Ordering {
@@ -489,27 +520,128 @@ impl Ord for ScanHead {
     }
 }
 
-impl PartialOrd for ScanHead {
+impl<M> PartialOrd for ScanHead<M> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl PartialEq for ScanHead {
+impl<M> PartialEq for ScanHead<M> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl Eq for ScanHead {}
+impl<M> Eq for ScanHead<M> {}
 
 /// Reads the next version of scan source `rank` as its merge head.
-fn next_head(source: &mut impl Iterator<Item = Result<ScanVersion>>, rank: usize) -> Result<Option<ScanHead>> {
+fn next_head<M>(
+    source: &mut impl Iterator<Item = Result<ScanVersion<M>>>,
+    rank: usize,
+) -> Result<Option<ScanHead<M>>> {
     let Some(version) = source.next() else { return Ok(None) };
     #[cfg(test)]
     count_scanned_version();
     let (user_key, ts, meta) = version?;
     Ok(Some(ScanHead { user_key, ts, meta, rank }))
+}
+
+/// A key's newest version as [`LsmReader::export_raw`] yields it, to be
+/// written elsewhere with [`LsmStorageEngine::import_raw`] under the same
+/// stamp.
+///
+/// [`LsmStorageEngine::import_raw`]: crate::engines::lsm::LsmStorageEngine::import_raw
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawEntry {
+    pub key: Vec<u8>,
+    pub stamp: u64,
+    pub value: RawValue,
+    /// Unix seconds, 0 = no expiry; a past one marks an expired version.
+    pub expire_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawValue {
+    Bytes(Vec<u8>),
+    Null,
+    Tombstone,
+}
+
+/// A stored version before its value-log bytes are read.
+enum Stored {
+    Value(Vec<u8>, u64),
+    Pointer { file_id: u32, offset: u64, len: usize, expire_at: u64 },
+    Null,
+    Tombstone,
+}
+
+impl From<Value> for Stored {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Inline(bytes, expire_at) => Stored::Value(bytes, expire_at.unwrap_or(0)),
+            Value::Pointer { file_id, offset, len, expire_at } => {
+                Stored::Pointer { file_id, offset, len, expire_at: expire_at.unwrap_or(0) }
+            }
+            Value::Null => Stored::Null,
+            Value::Tombstone => Stored::Tombstone,
+        }
+    }
+}
+
+impl From<CachedValue> for Stored {
+    fn from(value: CachedValue) -> Self {
+        match value {
+            CachedValue::Tombstone => Stored::Tombstone,
+            CachedValue::Null => Stored::Null,
+            CachedValue::VLogPointer { file_id, value_offset, value_len, expire_at } => {
+                Stored::Pointer { file_id, offset: value_offset, len: value_len as usize, expire_at }
+            }
+            value => Stored::Value(value.to_owned_bytes(), value.expire_at()),
+        }
+    }
+}
+
+/// The merge behind [`LsmReader::export_raw`].
+pub struct RawScan<'s> {
+    version: &'s Version,
+    sources: Vec<Box<dyn Iterator<Item = Result<ScanVersion<Stored>>> + 's>>,
+    heads: BinaryHeap<Reverse<ScanHead<Stored>>>,
+    decided: Option<Vec<u8>>,
+}
+
+impl RawScan<'_> {
+    fn resolve(&self, head: ScanHead<Stored>) -> Result<RawEntry> {
+        let (value, expire_at) = match head.meta {
+            Stored::Value(bytes, expire_at) => (RawValue::Bytes(bytes), expire_at),
+            Stored::Pointer { file_id, offset, len, expire_at } => {
+                let vlog = self.version.vlog.get(&file_id).ok_or(VLogError::UnknownGeneration { id: file_id })?;
+                (RawValue::Bytes(vlog.read(offset, len)?), expire_at)
+            }
+            Stored::Null => (RawValue::Null, 0),
+            Stored::Tombstone => (RawValue::Tombstone, 0),
+        };
+        Ok(RawEntry { key: head.user_key, stamp: head.ts.as_u64(), value, expire_at })
+    }
+}
+
+impl Iterator for RawScan<'_> {
+    type Item = Result<RawEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let Reverse(head) = self.heads.pop()?;
+            match next_head(&mut self.sources[head.rank], head.rank) {
+                Ok(Some(next)) => self.heads.push(Reverse(next)),
+                Ok(None) => {}
+                Err(e) => return Some(Err(e)),
+            }
+            if self.decided.as_ref() == Some(&head.user_key) {
+                continue;
+            }
+            self.decided = Some(head.user_key.clone());
+            return Some(self.resolve(head));
+        }
+    }
 }
 
 /// A versioned entry in the LSM-Tree.

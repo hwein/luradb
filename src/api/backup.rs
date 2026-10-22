@@ -202,14 +202,33 @@ pub struct BackupDetailResponse {
     pub luradb_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_auth: Option<bool>,
+    /// The newest read-snapshot stamp of the KV engine among the data shards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_snapshot_ts: Option<u64>,
+    /// The newest read-snapshot stamp of the JSON engine among the data shards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json_snapshot_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
+    /// Data shards of the server that wrote the archive; 0 for format
+    /// version 1. Informational: a restore places every domain by the shard
+    /// count of the server it runs on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shards: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lsn_cut: Option<LsnCutResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
+}
+
+/// Per engine, a write-ahead-log position that every write in the archive is
+/// at or below; 0 for an engine outside the scope and for format version 1.
+/// Positions restart at 1 after a clean shutdown, so they compare only within
+/// one run of the server.
+#[derive(Serialize, ToSchema)]
+pub struct LsnCutResponse {
+    pub kv: u64,
+    pub json: u64,
 }
 
 impl BackupDetailResponse {
@@ -227,6 +246,8 @@ impl BackupDetailResponse {
             kv_snapshot_ts: None,
             json_snapshot_ts: None,
             encoding: None,
+            shards: None,
+            lsn_cut: None,
             started_at: Some(job.started_at),
         }
     }
@@ -245,6 +266,8 @@ impl BackupDetailResponse {
             kv_snapshot_ts: Some(manifest.kv_snapshot_ts),
             json_snapshot_ts: Some(manifest.json_snapshot_ts),
             encoding: Some(manifest.encoding),
+            shards: Some(manifest.shards),
+            lsn_cut: Some(LsnCutResponse { kv: manifest.lsn_cut.kv, json: manifest.lsn_cut.json }),
             started_at: None,
         }
     }
@@ -417,8 +440,27 @@ pub async fn get_backup(
     ),
     tag = "Backup"
 )]
-/// Streams the archive (`ServeFile`/tower-http `fs`) with HTTP Range support
-/// for resumable downloads (spec general/006).
+/// Streams the archive with HTTP Range support for resumable downloads.
+///
+/// The archive is NDJSON. Its first line is the manifest, format version 2:
+/// `format_version`, `id`, `created_at`, `luradb_version`, `scope`,
+/// `include_auth`, `encoding`, `schedule`, and
+/// - `shards`: data shards of the server that wrote it. Informational only:
+///   a restore places every domain by the shard count of the server it runs
+///   on, so an archive restores into any shard count.
+/// - `lsn_cut`: `{kv, json}`, per engine a write-ahead-log position that
+///   every write in the archive is at or below (a lower bound of the cut);
+///   0 for an engine outside the scope. Positions restart at 1 after a clean
+///   shutdown, so they compare only within one run of the server.
+/// - `kv_snapshot_ts`, `json_snapshot_ts`: per engine, the newest
+///   read-snapshot stamp among the data shards; 0 for an engine outside the
+///   scope.
+///
+/// All shards of one engine are read at one consistent cut: an archive that
+/// holds a write holds every write confirmed before it. Domain lines carry
+/// their domain's name; auth records form a section of their own; the last
+/// line is the checksum. Archives of format version 1, which lack `shards`
+/// and `lsn_cut`, remain restorable.
 pub async fn download_backup(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -583,7 +625,7 @@ pub async fn restore_backup(
     // Synchronous pre-checks (orchestrator hint 1 / spec general/006):
     // start_restore itself only validates id/existence/slot synchronously.
     let summary = manager.get_backup(&id)?;
-    if summary.format_version != writer::FORMAT_VERSION {
+    if !writer::is_supported_format(summary.format_version) {
         return Err(BackupError::UnsupportedFormatVersion(summary.format_version).into());
     }
     if summary.state == BackupState::Incomplete {
@@ -692,7 +734,7 @@ mod tests {
             None => None,
             Some(cfg) => {
                 let cfg = BackupConfig { dir: dir.path().join("backups").to_string_lossy().into_owned(), ..cfg };
-                Some(BackupManager::new(&cfg, Arc::clone(&registry), None, Arc::clone(&control)).unwrap())
+                Some(BackupManager::new(&cfg, Arc::clone(&control)).unwrap())
             }
         };
 
@@ -938,7 +980,7 @@ mod tests {
     fn test_get_backup_ignores_running_restore_job() {
         crate::core::engine_runtime::block_on(async {
             let (state, _dir) = make_slow_state().await;
-            state.registry.create_domain("shop").await.unwrap();
+            state.control.create_domain(crate::control::Engine::Kv, "shop", false).await.unwrap();
             let store = state.registry.store("shop").await.unwrap();
             for i in 0..3 {
                 store.put(format!("order:{i}").as_bytes(), b"v").await.unwrap();
@@ -1006,7 +1048,10 @@ mod tests {
             let detail = wait_for_backup_completion(&app, &id).await;
             assert_eq!(detail["state"], json!("complete"), "{detail}");
             assert_eq!(detail["scope"], json!("kv:default"));
-            assert_eq!(detail["format_version"], json!(1));
+            assert_eq!(detail["format_version"], json!(2));
+            assert_eq!(detail["shards"], json!(1));
+            assert!(detail["lsn_cut"]["kv"].as_u64().unwrap() >= 1, "{detail}");
+            assert_eq!(detail["lsn_cut"]["json"], json!(0));
 
             let (status, body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
             assert_eq!(status, StatusCode::OK);
@@ -1107,7 +1152,7 @@ mod tests {
             let uploaded_id = value["id"].as_str().unwrap().to_string();
             assert!(uploaded_id.ends_with("_upload"), "got id '{uploaded_id}'");
             assert_ne!(uploaded_id, source_id, "the server must assign a fresh id, not adopt the manifest's own id");
-            assert_eq!(value["format_version"], json!(1));
+            assert_eq!(value["format_version"], json!(2));
 
             let (status, list_body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
             assert_eq!(status, StatusCode::OK);
@@ -1226,7 +1271,7 @@ mod tests {
     fn test_restore_roundtrip_with_remap() {
         crate::core::engine_runtime::block_on(async {
             let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-            state.registry.create_domain("shop").await.unwrap();
+            state.control.create_domain(crate::control::Engine::Kv, "shop", false).await.unwrap();
             let store = state.registry.store("shop").await.unwrap();
             store.put(b"order:1", b"hello").await.unwrap();
             let app = crate::api::router_inline(state, Arc::new(vec![]));
@@ -1364,6 +1409,8 @@ mod tests {
             json_snapshot_ts: 0,
             encoding: "hex".to_string(),
             schedule: schedule.map(|s| s.to_string()),
+            shards: 1,
+            lsn_cut: writer::LsnCut::default(),
         };
         let mut content = serde_json::to_string(&manifest).unwrap();
         content.push('\n');

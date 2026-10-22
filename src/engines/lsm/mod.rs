@@ -20,7 +20,10 @@ pub mod ttl_sweeper;
 pub use block_cache::{BlockCache, BlockCacheKey, BlockCacheMetrics};
 pub use engine::LsmStorageEngine;
 pub use key::{InternalKey, Timestamp};
-pub use reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata, VersionedEntry};
+pub use reader::{
+    GetResult, LsmReader, RawEntry, RawScan, RawValue, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata,
+    VersionedEntry,
+};
 pub use compaction::{CompactionConfig, CompactionJob};
 pub use janitor::{Janitor, JanitorConfig};
 pub use watcher::{OpType, WalEvent, WatchMessage, WATCH_TAG};

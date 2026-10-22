@@ -33,7 +33,7 @@ pub(super) async fn shard_count(config: &LuraConfig, sys: &LsmStorageEngine, aut
         None if !system::layout_is_sharded(sys).await? && !legacy_files(config).await?.is_empty() => 1,
         None => return Ok(auto),
     };
-    tracing::info!("Data shards: {stored}, as the data directory was written; the shard migration tool changes it.");
+    tracing::info!("Data shards: {stored}, as the data directory was written; `luradb --migrate-shards N` changes it.");
     Ok(stored)
 }
 
@@ -51,7 +51,7 @@ pub(super) async fn migrate(config: &LuraConfig, sys: &LsmStorageEngine, shards:
     }
     let moves = legacy_files(config).await?;
     if !moves.is_empty() && shards != 1 {
-        anyhow::bail!("shard count changed (stored 1, configured {shards}) — run the shard migration tool");
+        anyhow::bail!("shard count changed (stored 1, configured {shards}) — run `luradb --migrate-shards {shards}`");
     }
     system::check_shard_count(sys, shards).await?;
     if let Some((from, to)) = moves.iter().find(|(_, to)| to.exists()) {
@@ -123,7 +123,7 @@ fn is_sstable_dir_file(path: &Path) -> bool {
 }
 
 /// Makes the renames in `dir` durable.
-fn sync_dir(dir: &Path) -> anyhow::Result<()> {
+pub(super) fn sync_dir(dir: &Path) -> anyhow::Result<()> {
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
     std::fs::File::open(dir)
         .and_then(|dir| dir.sync_all())

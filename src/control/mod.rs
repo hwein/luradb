@@ -12,7 +12,7 @@ use crate::core::events::GlobalEventBus;
 use crate::engines::json::{JsonDomain, JsonDomainState, JsonEngine, JsonStoreError};
 use crate::engines::lsm::domain::{Domain, DomainRegistry, DomainState};
 use crate::engines::lsm::engine::LsmStorageEngine;
-use crate::engines::lsm::reader::RegistrySnapshot;
+use crate::engines::lsm::reader::{RegistrySnapshot, Snapshot};
 use crate::engines::rel::{RelDomain, RelDomainState, RelEngine, RelStoreError};
 use crate::metrics::MetricsSample;
 use anyhow::Context;
@@ -397,6 +397,18 @@ pub struct Cut {
     pub system: RegistrySnapshot,
 }
 
+impl Cut {
+    /// The read snapshot of data shard `shard`.
+    pub fn read_of(&self, shard: u16) -> &Snapshot {
+        self.reads[usize::from(shard)].1.snapshot()
+    }
+
+    /// The newest stamp among the shards' read snapshots.
+    pub fn max_stamp(&self) -> u64 {
+        self.reads.iter().map(|(_, read)| read.snapshot().timestamp().as_u64()).max().unwrap_or(0)
+    }
+}
+
 pub struct ControlPlane {
     commands: mpsc::UnboundedSender<Command>,
     directory: RwLock<Arc<Directory>>,
@@ -440,8 +452,17 @@ impl ControlPlane {
 
     /// The data shard that owns the domain `name`.
     fn owner(&self, name: &str) -> &Shard {
-        let shards = u16::try_from(self.shards.len()).expect("at most u16::MAX data shards");
-        &self.shards[usize::from(slots::shard_of_domain(name, shards))]
+        &self.shards[usize::from(self.shard_of(name))]
+    }
+
+    /// How many data shards run.
+    pub fn shard_count(&self) -> u16 {
+        u16::try_from(self.shards.len()).expect("at most u16::MAX data shards")
+    }
+
+    /// Index of the data shard that owns the domain `name`.
+    pub fn shard_of(&self, name: &str) -> u16 {
+        slots::shard_of_domain(name, self.shard_count())
     }
 
     /// Takes a consistent cut through `engine` across all data shards. Every

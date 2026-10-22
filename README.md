@@ -168,11 +168,28 @@ shards, so their totals stay the same. The MemTable threshold
 MemTable memory grows with the shard count: up to engines × shards ×
 threshold, plus MemTables being flushed.
 
-The shard count is fixed for a data directory: the automatic setting keeps
+The shard count belongs to the data directory: the automatic setting keeps
 the count an existing data directory was written with, also after an
 upgrade or a move to a host with another core count, and a start with a
 different count set explicitly is refused. Shared memory (`[shm]`) serves
-all shards: each snapshot is taken at one consistent point across them.
+all shards: each snapshot is taken at one consistent point across them, and
+so is every backup.
+
+### Changing the shard count
+
+The migration tool rewrites a stopped server's data directory for another
+number of data shards, more or fewer, down to 1, for all three engines:
+
+```bash
+luradb --config luradb.toml --migrate-shards 4
+```
+
+The server must have been shut down cleanly (otherwise start it once and
+stop it again), and the data directories need room for a second copy of the
+data while the tool builds the new layout next to the old one. Afterwards
+leave `[multicore].shards` at `0` or set it to the new count. A tool that
+stops halfway is finished by running the same command again; until then the
+server refuses to start. Backups restore into any shard count.
 
 ## License
 

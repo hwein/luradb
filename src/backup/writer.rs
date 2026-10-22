@@ -1,14 +1,16 @@
-//! Backup export pipeline (spec general/006): scope resolution, snapshot
-//! acquisition, and the NDJSON writer (manifest -> kv-domains -> kv-pairs ->
-//! json-domains -> index-definitions -> docs -> auth -> checksum).
+//! Backup export pipeline: scope resolution, one consistent cut per engine
+//! across the data shards, and the NDJSON writer (manifest -> kv-domains ->
+//! kv-pairs -> json-domains -> index-definitions -> docs -> auth -> checksum).
 
 use super::{BackupError, BackupScope};
 use crate::auth::{DomainPermission, UserRecord, PREFIX_PERM, PREFIX_USER};
+use crate::control::{ControlPlane, Cut, DomainEntry, Engine, Lifecycle};
 use crate::core::coop::YieldEvery;
-use crate::engines::json::{IndexFieldType, JsonDomain, JsonDomainState, JsonEngine};
-use crate::engines::lsm::domain::{now_secs, Domain, DomainRegistry};
+use crate::engines::json::IndexFieldType;
+use crate::engines::lsm::domain::now_secs;
 use crate::engines::lsm::engine::LsmStorageEngine;
-use crate::engines::lsm::{GetResult, RegistrySnapshot};
+use crate::engines::lsm::{GetResult, Snapshot};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,13 +18,20 @@ use crate::core::engine_runtime::{self, spawn_io};
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// Version 2 adds `shards` and `lsn_cut` to the manifest.
+pub(crate) const FORMAT_VERSION: u32 = 2;
+
+/// Whether restore reads archives of `format_version`.
+pub(crate) fn is_supported_format(format_version: u32) -> bool {
+    (1..=FORMAT_VERSION).contains(&format_version)
+}
 
 /// Keys exported between two yields (spec perf/017 A2).
 const EXPORT_KEY_YIELD_INTERVAL: u32 = 1024;
 
 // ── Wire format (shared with `restore`) ─────────────────────────────────
 
+/// The first line of an archive. Fields a version 1 archive lacks read as 0.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ManifestLine {
     pub t: String,
@@ -32,10 +41,24 @@ pub(crate) struct ManifestLine {
     pub luradb_version: String,
     pub scope: String,
     pub include_auth: bool,
+    /// The newest read-snapshot stamp among the data shards.
     pub kv_snapshot_ts: u64,
     pub json_snapshot_ts: u64,
     pub encoding: String,
     pub schedule: Option<String>,
+    /// Data shards of the server that wrote the archive; restore ignores it.
+    #[serde(default)]
+    pub shards: u16,
+    #[serde(default)]
+    pub lsn_cut: LsnCut,
+}
+
+/// Per engine, the write-ahead-log position every write of the archive is at
+/// or below; 0 for an engine outside the scope.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LsnCut {
+    pub kv: u64,
+    pub json: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,74 +124,51 @@ struct AuthPermLine<'a> {
 
 // ── Scope resolution ─────────────────────────────────────────────────────
 
-/// The concrete domains a scope resolves to, already filtered to `Active`
-/// state (spec general/006: `Deleting` domains are skipped). Either list can
-/// be empty for any scope — every domain of an engine may be deleted at
-/// runtime — and only means there is no *domain* data to export; auth
-/// records live outside any domain and still need the KV snapshot.
+/// The concrete domains a scope resolves to, from the directory of every
+/// data shard, each engine's in name order and only `Active` ones. Either
+/// list can be empty for any scope — every domain of an engine may be
+/// deleted at runtime — and only means there is no *domain* data to export;
+/// auth records live outside any domain and still need the KV cut.
 #[derive(Debug)]
 pub(crate) struct ResolvedScope {
-    pub kv_domains: Vec<Domain>,
-    pub json_domains: Vec<JsonDomain>,
+    pub kv_domains: Vec<DomainEntry>,
+    pub json_domains: Vec<DomainEntry>,
 }
 
-pub(crate) async fn resolve_scope(
-    scope: &BackupScope,
-    kv_registry: &Arc<DomainRegistry>,
-    json_engine: &Option<Arc<JsonEngine>>,
-) -> Result<ResolvedScope, BackupError> {
+pub(crate) fn resolve_scope(scope: &BackupScope, control: &ControlPlane) -> Result<ResolvedScope, BackupError> {
+    let directory = control.directory();
+    let json_enabled = control.shard_owners().any(|owners| owners.json.is_some());
+    let all = |engine| -> Vec<DomainEntry> {
+        directory.domains(engine).filter(|d| d.state == Lifecycle::Active).cloned().collect()
+    };
+    let one = |engine, name: &str| directory.get(engine, name).filter(|d| d.state == Lifecycle::Active).cloned();
+    let not_found = |name: &String| BackupError::DomainNotFound(name.clone());
     match scope {
-        BackupScope::All => {
-            let kv_domains = kv_registry.list_domains().await.map_err(BackupError::Other)?;
-            let json_domains = match json_engine {
-                Some(j) => j
-                    .list_domains()
-                    .into_iter()
-                    .filter(|d| d.state == JsonDomainState::Active)
-                    .collect(),
-                None => Vec::new(),
-            };
-            Ok(ResolvedScope { kv_domains, json_domains })
-        }
-        BackupScope::Kv => {
-            let kv_domains = kv_registry.list_domains().await.map_err(BackupError::Other)?;
-            Ok(ResolvedScope { kv_domains, json_domains: Vec::new() })
-        }
+        BackupScope::All => Ok(ResolvedScope { kv_domains: all(Engine::Kv), json_domains: all(Engine::Json) }),
+        BackupScope::Kv => Ok(ResolvedScope { kv_domains: all(Engine::Kv), json_domains: Vec::new() }),
         BackupScope::Json => {
-            let j = json_engine.as_ref().ok_or(BackupError::JsonEngineDisabled)?;
-            let json_domains = j
-                .list_domains()
-                .into_iter()
-                .filter(|d| d.state == JsonDomainState::Active)
-                .collect();
-            Ok(ResolvedScope { kv_domains: Vec::new(), json_domains })
+            if !json_enabled {
+                return Err(BackupError::JsonEngineDisabled);
+            }
+            Ok(ResolvedScope { kv_domains: Vec::new(), json_domains: all(Engine::Json) })
         }
         BackupScope::KvDomain(name) => {
-            let d = kv_registry
-                .get_domain(name)
-                .await
-                .map_err(BackupError::Other)?
-                .ok_or_else(|| BackupError::DomainNotFound(name.clone()))?;
+            let d = one(Engine::Kv, name).ok_or_else(|| not_found(name))?;
             Ok(ResolvedScope { kv_domains: vec![d], json_domains: Vec::new() })
         }
         BackupScope::JsonDomain(name) => {
-            let j = json_engine.as_ref().ok_or(BackupError::JsonEngineDisabled)?;
-            let d = j.get_domain(name).ok_or_else(|| BackupError::DomainNotFound(name.clone()))?;
+            if !json_enabled {
+                return Err(BackupError::JsonEngineDisabled);
+            }
+            let d = one(Engine::Json, name).ok_or_else(|| not_found(name))?;
             Ok(ResolvedScope { kv_domains: Vec::new(), json_domains: vec![d] })
         }
         BackupScope::Domain(name) => {
-            let kv_d = kv_registry.get_domain(name).await.map_err(BackupError::Other)?;
-            let json_d = match json_engine {
-                Some(j) => j.get_domain(name),
-                None => None,
-            };
+            let (kv_d, json_d) = (one(Engine::Kv, name), one(Engine::Json, name));
             if kv_d.is_none() && json_d.is_none() {
-                return Err(BackupError::DomainNotFound(name.clone()));
+                return Err(not_found(name));
             }
-            Ok(ResolvedScope {
-                kv_domains: kv_d.into_iter().collect(),
-                json_domains: json_d.into_iter().collect(),
-            })
+            Ok(ResolvedScope { kv_domains: kv_d.into_iter().collect(), json_domains: json_d.into_iter().collect() })
         }
     }
 }
@@ -182,10 +182,9 @@ pub(crate) struct BackupParams<'a> {
     pub include_auth: bool,
     pub schedule: Option<&'a str>,
     pub resolved: &'a ResolvedScope,
-    pub kv_registry: &'a Arc<DomainRegistry>,
-    pub json_engine: &'a Option<Arc<JsonEngine>>,
-    /// Holds the auth records.
-    pub system_store: &'a LsmStorageEngine,
+    /// Takes the cuts; each domain is read on the instance of its owner, the
+    /// auth records on the system store.
+    pub control: &'a ControlPlane,
     pub scan_batch_size: usize,
     pub scan_pause_ms: u64,
 }
@@ -261,20 +260,19 @@ async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyho
     // ignore the flag.
     let export_auth = params.include_auth && matches!(params.scope, BackupScope::All | BackupScope::Kv);
 
-    // One registered snapshot per engine, held for the whole export so the
-    // compaction low watermark keeps every visible version around. `None`
-    // when that engine has nothing to export in this scope, so no snapshot
-    // (and no GC back-pressure) is taken for it. An auth export still dates
-    // the manifest by the KV snapshot; the records come from the system store.
-    let kv_snapshot: Option<RegistrySnapshot> =
-        if !params.resolved.kv_domains.is_empty() || export_auth {
-            Some(params.kv_registry.engine().snapshot().await)
-        } else {
-            None
-        };
-    let json_snapshot: Option<RegistrySnapshot> = match &params.json_engine {
-        Some(json) if !params.resolved.json_domains.is_empty() => Some(json.engine().snapshot().await),
-        _ => None,
+    // One cut per engine, held for the whole export so compaction keeps every
+    // version it reads; it holds back no write. `None` when that engine has
+    // nothing to export in this scope. The auth records come from the system
+    // store as of the KV cut.
+    let kv_cut = if !params.resolved.kv_domains.is_empty() || export_auth {
+        Some(params.control.consistent_cut(Engine::Kv).await?)
+    } else {
+        None
+    };
+    let json_cut = if !params.resolved.json_domains.is_empty() {
+        Some(params.control.consistent_cut(Engine::Json).await?)
+    } else {
+        None
     };
 
     let mut out = PartFile::create(part_path).await?;
@@ -289,21 +287,31 @@ async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyho
         luradb_version: env!("CARGO_PKG_VERSION").to_string(),
         scope: params.scope.as_string(),
         include_auth: export_auth,
-        kv_snapshot_ts: kv_snapshot.as_ref().map(|s| s.snapshot().timestamp().as_u64()).unwrap_or(0),
-        json_snapshot_ts: json_snapshot.as_ref().map(|s| s.snapshot().timestamp().as_u64()).unwrap_or(0),
+        kv_snapshot_ts: kv_cut.as_ref().map_or(0, Cut::max_stamp),
+        json_snapshot_ts: json_cut.as_ref().map_or(0, Cut::max_stamp),
         encoding: "hex".to_string(),
         schedule: params.schedule.map(|s| s.to_string()),
+        shards: params.control.shard_count(),
+        lsn_cut: LsnCut {
+            kv: kv_cut.as_ref().map_or(0, |cut| cut.s),
+            json: json_cut.as_ref().map_or(0, |cut| cut.s),
+        },
     };
     write_line(&mut out, &mut hasher, &mut lines, &manifest).await?;
 
-    // Binding section order (spec general/006 backup format): kv sections,
-    // then json sections, then auth, then the checksum line.
-    write_kv_section(&mut out, &mut hasher, &mut lines, params, kv_snapshot.as_ref()).await?;
+    // Binding section order: kv sections, then json sections, then auth,
+    // then the checksum line.
+    if let Some(cut) = &kv_cut {
+        write_kv_section(&mut out, &mut hasher, &mut lines, params, cut).await?;
+    }
 
-    write_json_section(&mut out, &mut hasher, &mut lines, params, json_snapshot.as_ref()).await?;
+    if let Some(cut) = &json_cut {
+        write_json_section(&mut out, &mut hasher, &mut lines, params, cut).await?;
+    }
 
-    if export_auth {
-        write_auth_section(&mut out, &mut hasher, &mut lines, params.system_store).await?;
+    if let (true, Some(cut)) = (export_auth, &kv_cut) {
+        write_auth_section(&mut out, &mut hasher, &mut lines, params.control.system_store(), cut.system.snapshot())
+            .await?;
     }
 
     let sha256 = hex::encode(hasher.finalize());
@@ -321,10 +329,8 @@ async fn write_kv_section(
     hasher: &mut Sha256,
     lines: &mut u64,
     params: &BackupParams<'_>,
-    kv_snapshot: Option<&RegistrySnapshot>,
+    cut: &Cut,
 ) -> anyhow::Result<()> {
-    let Some(snap) = kv_snapshot else { return Ok(()) };
-
     for domain in &params.resolved.kv_domains {
         write_line(
             out,
@@ -334,12 +340,13 @@ async fn write_kv_section(
         )
         .await?;
 
-        let store = params.kv_registry.store(&domain.name).await?;
-        let keys = store.scan_keys_with_snapshot(b"", snap.snapshot()).await?;
+        let snapshot = cut.read_of(params.control.shard_of(&domain.name));
+        let store = params.control.owners_of(&domain.name).kv.store(&domain.name).await?;
+        let keys = store.scan_keys_with_snapshot(b"", snapshot).await?;
         let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
         for (i, key) in keys.iter().enumerate() {
             coop.tick().await;
-            let (result, expires_at) = store.get_with_snapshot(key, snap.snapshot()).await?;
+            let (result, expires_at) = store.get_with_snapshot(key, snapshot).await?;
             let v = match result {
                 GetResult::Present(bytes) => Some(hex::encode(bytes)),
                 GetResult::Null => None,
@@ -360,30 +367,29 @@ async fn write_kv_section(
     Ok(())
 }
 
-/// Exports the auth records on one snapshot of the system store.
+/// Exports the auth records of the system store as of `snapshot`.
 async fn write_auth_section(
     out: &mut PartFile,
     hasher: &mut Sha256,
     lines: &mut u64,
     engine: &LsmStorageEngine,
+    snapshot: &Snapshot,
 ) -> anyhow::Result<()> {
-    let snap = engine.snapshot().await;
-
     let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
-    let user_keys = engine.scan_keys_with_snapshot(PREFIX_USER.as_bytes(), snap.snapshot()).await?;
+    let user_keys = engine.scan_keys_with_snapshot(PREFIX_USER.as_bytes(), snapshot).await?;
     for key in &user_keys {
         coop.tick().await;
-        let (result, _) = engine.get_with_expiry(key, snap.snapshot()).await?;
+        let (result, _) = engine.get_with_expiry(key, snapshot).await?;
         if let GetResult::Present(bytes) = result {
             let record: UserRecord = serde_json::from_slice(&bytes)?;
             write_line(out, hasher, lines, &AuthUserLine { t: "auth-user", record: &record }).await?;
         }
     }
 
-    let perm_keys = engine.scan_keys_with_snapshot(PREFIX_PERM.as_bytes(), snap.snapshot()).await?;
+    let perm_keys = engine.scan_keys_with_snapshot(PREFIX_PERM.as_bytes(), snapshot).await?;
     for key in &perm_keys {
         coop.tick().await;
-        let (result, _) = engine.get_with_expiry(key, snap.snapshot()).await?;
+        let (result, _) = engine.get_with_expiry(key, snapshot).await?;
         if let GetResult::Present(bytes) = result {
             let perm: DomainPermission = serde_json::from_slice(&bytes)?;
             write_line(out, hasher, lines, &AuthPermLine { t: "auth-perm", perm: &perm }).await?;
@@ -397,11 +403,8 @@ async fn write_json_section(
     hasher: &mut Sha256,
     lines: &mut u64,
     params: &BackupParams<'_>,
-    json_snapshot: Option<&RegistrySnapshot>,
+    cut: &Cut,
 ) -> anyhow::Result<()> {
-    let Some(snap) = json_snapshot else { return Ok(()) };
-    let json = params.json_engine.as_ref().expect("json snapshot implies json_engine is Some");
-
     for domain in &params.resolved.json_domains {
         write_line(
             out,
@@ -411,7 +414,9 @@ async fn write_json_section(
         )
         .await?;
 
-        for def in json.get_indexes_with_snapshot(&domain.name, snap.snapshot()).await? {
+        let snapshot = cut.read_of(params.control.shard_of(&domain.name));
+        let json = params.control.owners_of(&domain.name).json.as_ref().context("the JSON engine is disabled")?;
+        for def in json.get_indexes_with_snapshot(&domain.name, snapshot).await? {
             write_line(
                 out,
                 hasher,
@@ -426,11 +431,11 @@ async fn write_json_section(
             .await?;
         }
 
-        let keys = json.scan_document_keys_with_snapshot(&domain.name, snap.snapshot()).await?;
+        let keys = json.scan_document_keys_with_snapshot(&domain.name, snapshot).await?;
         let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
         for (i, key) in keys.iter().enumerate() {
             coop.tick().await;
-            if let Some(doc) = json.get_document_with_snapshot(&domain.name, key, snap.snapshot()).await? {
+            if let Some(doc) = json.get_document_with_snapshot(&domain.name, key, snapshot).await? {
                 write_line(
                     out,
                     hasher,
@@ -478,59 +483,120 @@ pub(crate) async fn maybe_pause(i: usize, batch_size: usize, pause_ms: u64) {
 mod tests {
     use super::*;
     use crate::config::JsonStoreConfig;
-    use crate::engines::json::IndexFieldType;
-    use crate::engines::lsm::domain::{DomainConfig, DomainRegistry};
-    use crate::engines::lsm::engine::{LsmEngineOptions, LsmStorageEngine};
+    use crate::control::{slots, testing};
+    use crate::engines::json::JsonEngine;
+    use crate::engines::lsm::domain::{fnv64, DomainRegistry};
     use crate::metrics::{MetricsConfig, MetricsStore};
-    use crate::storage::file_manager::FileManager;
-    use crate::storage::manifest::ManifestManager;
-    use crate::storage::vlog::VLog;
-    use crate::core::wal::WriteAheadLog;
     use serde_json::json;
 
-    /// A KV registry and, next to it, the system store holding auth records.
-    async fn make_kv_registry() -> (Arc<DomainRegistry>, Arc<LsmStorageEngine>, tempfile::TempDir) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let wal_path = dir.path().join("wal.log");
-        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
-        let vlog_path = dir.path().join("vlog.log");
-        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
-        let fm = Arc::new(FileManager::new(dir.path()).await.unwrap());
-        let mm = Arc::new(ManifestManager::new(dir.path()));
-        let engine = Arc::new(
-            LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, fm, mm, LsmEngineOptions::default())
-                .await
-                .unwrap(),
-        );
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let registry =
-            Arc::new(DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap());
-        let system = crate::control::system::open(&dir.path().join("sys")).await.unwrap();
-        (registry, system, dir)
+    /// A control plane over one data shard with a key-value engine and, when
+    /// asked for, a JSON engine; its system store holds the auth records.
+    struct Fixture {
+        control: Arc<ControlPlane>,
+        kv: Arc<DomainRegistry>,
+        json: Option<Arc<JsonEngine>>,
+        _dir: tempfile::TempDir,
     }
 
-    async fn make_json_engine() -> (Arc<JsonEngine>, tempfile::TempDir) {
+    async fn fixture(with_json: bool) -> Fixture {
         let dir = tempfile::TempDir::new().unwrap();
+        let kv = testing::kv_registry(dir.path()).await;
+        let json = if with_json { Some(json_engine(dir.path()).await) } else { None };
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
+        let (control, _) = testing::start(dir.path(), Arc::clone(&kv), json.clone(), None, bus).await;
+        Fixture { control, kv, json, _dir: dir }
+    }
+
+    async fn json_engine(dir: &Path) -> Arc<JsonEngine> {
         let config = JsonStoreConfig {
-            wal_path: dir.path().join("json.wal").to_string_lossy().into_owned(),
-            vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
-            sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
+            wal_path: dir.join("json.wal").to_string_lossy().into_owned(),
+            vlog_path: dir.join("json.vlog").to_string_lossy().into_owned(),
+            sstable_dir: dir.join("json_sstables").to_string_lossy().into_owned(),
             ..JsonStoreConfig::default()
         };
         let metrics = MetricsStore::new(MetricsConfig::default());
-        (JsonEngine::bootstrap(&config, metrics).await.unwrap(), dir)
+        JsonEngine::bootstrap(&config, metrics).await.unwrap()
+    }
+
+    impl Fixture {
+        async fn create(&self, engine: Engine, name: &str) {
+            self.control.create_domain(engine, name, false).await.unwrap();
+        }
+
+        fn json(&self) -> &Arc<JsonEngine> {
+            self.json.as_ref().unwrap()
+        }
+    }
+
+    /// Backs `scope` up from `control` into `out` as `id`, unthrottled.
+    async fn backup(control: &ControlPlane, out: &Path, id: &str, scope: BackupScope, include_auth: bool) {
+        let resolved = resolve_scope(&scope, control).unwrap();
+        let params = BackupParams {
+            dir: out,
+            id,
+            scope: &scope,
+            include_auth,
+            schedule: None,
+            resolved: &resolved,
+            control,
+            scan_batch_size: 500,
+            scan_pause_ms: 0,
+        };
+        run_backup(params).await.unwrap();
+    }
+
+    fn manifest_of(content: &str) -> ManifestLine {
+        serde_json::from_str(content.lines().next().unwrap()).unwrap()
+    }
+
+    // A version 2 manifest reads back as written; one of version 1, without
+    // the fields version 2 added, still reads, with zero shards and a zero
+    // LSN cut, and both versions are restorable.
+    #[test]
+    fn a_v2_manifest_round_trips_and_a_v1_manifest_still_reads() {
+        let manifest = ManifestLine {
+            t: "manifest".to_string(),
+            format_version: FORMAT_VERSION,
+            id: "bk_x".to_string(),
+            created_at: 1_700_000_000,
+            luradb_version: "0.0.0".to_string(),
+            scope: "all".to_string(),
+            include_auth: true,
+            kv_snapshot_ts: 7,
+            json_snapshot_ts: 9,
+            encoding: "hex".to_string(),
+            schedule: Some("nightly".to_string()),
+            shards: 3,
+            lsn_cut: LsnCut { kv: 41, json: 12 },
+        };
+        let line = serde_json::to_string(&manifest).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["format_version"], json!(2));
+        assert_eq!(value["shards"], json!(3));
+        assert_eq!(value["lsn_cut"], json!({"kv": 41, "json": 12}));
+        let back: ManifestLine = serde_json::from_str(&line).unwrap();
+        assert_eq!((back.shards, back.lsn_cut), (3, LsnCut { kv: 41, json: 12 }));
+        assert_eq!((back.kv_snapshot_ts, back.json_snapshot_ts, back.schedule.as_deref()), (7, 9, Some("nightly")));
+
+        let v1 = json!({
+            "t": "manifest", "format_version": 1, "id": "bk_old", "created_at": 1, "luradb_version": "0.4.0",
+            "scope": "kv", "include_auth": false, "kv_snapshot_ts": 5, "json_snapshot_ts": 0, "encoding": "hex",
+            "schedule": null,
+        });
+        let old: ManifestLine = serde_json::from_value(v1).unwrap();
+        assert_eq!((old.format_version, old.kv_snapshot_ts, old.shards, old.lsn_cut), (1, 5, 0, LsnCut::default()));
+        assert_eq!([0, 1, 2, 3].map(is_supported_format), [false, true, true, false]);
     }
 
     // 1. resolve_scope: `all` picks up every active KV domain.
     #[test]
     fn test_resolve_all_scope_kv_only() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _, _dir) = make_kv_registry().await;
-            kv.create_domain("shop").await.unwrap();
-            let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
+            let fx = fixture(false).await;
+            fx.create(Engine::Kv, "shop").await;
+            let resolved = resolve_scope(&BackupScope::All, &fx.control).unwrap();
             let names: Vec<_> = resolved.kv_domains.iter().map(|d| d.name.clone()).collect();
-            assert!(names.contains(&"default".to_string()));
-            assert!(names.contains(&"shop".to_string()));
+            assert_eq!(names, ["default", "shop"]);
             assert!(resolved.json_domains.is_empty(), "no json engine given");
         })
     }
@@ -539,10 +605,8 @@ mod tests {
     #[test]
     fn test_resolve_kv_domain_missing_errors() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _, _dir) = make_kv_registry().await;
-            let err = resolve_scope(&BackupScope::KvDomain("nope".to_string()), &kv, &None)
-                .await
-                .unwrap_err();
+            let fx = fixture(false).await;
+            let err = resolve_scope(&BackupScope::KvDomain("nope".to_string()), &fx.control).unwrap_err();
             assert!(matches!(err, BackupError::DomainNotFound(d) if d == "nope"));
         })
     }
@@ -551,12 +615,10 @@ mod tests {
     #[test]
     fn test_resolve_json_scope_without_engine_errors() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _, _dir) = make_kv_registry().await;
-            let err = resolve_scope(&BackupScope::Json, &kv, &None).await.unwrap_err();
+            let fx = fixture(false).await;
+            let err = resolve_scope(&BackupScope::Json, &fx.control).unwrap_err();
             assert!(matches!(err, BackupError::JsonEngineDisabled));
-            let err = resolve_scope(&BackupScope::JsonDomain("x".to_string()), &kv, &None)
-                .await
-                .unwrap_err();
+            let err = resolve_scope(&BackupScope::JsonDomain("x".to_string()), &fx.control).unwrap_err();
             assert!(matches!(err, BackupError::JsonEngineDisabled));
         })
     }
@@ -565,12 +627,9 @@ mod tests {
     #[test]
     fn test_resolve_domain_scope_single_engine() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _, _dir1) = make_kv_registry().await;
-            let (json, _dir2) = make_json_engine().await;
-            kv.create_domain("only-kv").await.unwrap();
-            let resolved = resolve_scope(&BackupScope::Domain("only-kv".to_string()), &kv, &Some(Arc::clone(&json)))
-                .await
-                .unwrap();
+            let fx = fixture(true).await;
+            fx.create(Engine::Kv, "only-kv").await;
+            let resolved = resolve_scope(&BackupScope::Domain("only-kv".to_string()), &fx.control).unwrap();
             assert_eq!(resolved.kv_domains.len(), 1);
             assert!(resolved.json_domains.is_empty());
         })
@@ -580,44 +639,27 @@ mod tests {
     #[test]
     fn test_resolve_domain_scope_missing_everywhere() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, _, _dir1) = make_kv_registry().await;
-            let (json, _dir2) = make_json_engine().await;
-            let err = resolve_scope(&BackupScope::Domain("nope".to_string()), &kv, &Some(json))
-                .await
-                .unwrap_err();
+            let fx = fixture(true).await;
+            let err = resolve_scope(&BackupScope::Domain("nope".to_string()), &fx.control).unwrap_err();
             assert!(matches!(err, BackupError::DomainNotFound(_)));
         })
     }
 
     // 6. run_backup: kv-only roundtrip produces a well-formed, checksummed
-    //    NDJSON file with the expected line shapes and section order.
+    //    NDJSON file with the expected line shapes and section order, under
+    //    a version 2 manifest that names the shard count and the cut.
     #[test]
     fn test_run_backup_kv_only_writes_valid_ndjson() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            kv.create_domain("shop").await.unwrap();
-            let store = kv.store("shop").await.unwrap();
+            let fx = fixture(false).await;
+            fx.create(Engine::Kv, "shop").await;
+            let store = fx.kv.store("shop").await.unwrap();
             store.put(b"order:1", b"hello").await.unwrap();
             store.put_with_ttl(b"session", b"tok", 3600).await.unwrap();
             store.set_null(b"nulled").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
-            let scope = BackupScope::KvDomain("shop".to_string());
-            let params = BackupParams {
-                dir: out_dir.path(),
-                id: "bk_test",
-                scope: &scope,
-                include_auth: false,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &None,
-                system_store: &system,
-                scan_batch_size: 500,
-                scan_pause_ms: 0,
-            };
-            run_backup(params).await.unwrap();
+            backup(&fx.control, out_dir.path(), "bk_test", BackupScope::KvDomain("shop".to_string()), false).await;
 
             let content = std::fs::read_to_string(out_dir.path().join("bk_test.ndjson")).unwrap();
             assert!(!out_dir.path().join("bk_test.ndjson.part").exists());
@@ -627,8 +669,13 @@ mod tests {
 
             let manifest: ManifestLine = serde_json::from_str(raw_lines[0]).unwrap();
             assert_eq!(manifest.t, "manifest");
+            assert_eq!(manifest.format_version, 2);
             assert_eq!(manifest.scope, "kv:shop");
             assert_eq!(manifest.encoding, "hex");
+            assert_eq!(manifest.shards, 1);
+            assert!(manifest.lsn_cut.kv >= 3, "three writes are in the log: {:?}", manifest.lsn_cut);
+            assert_eq!(manifest.lsn_cut.json, 0, "no JSON domain in the scope");
+            assert!(manifest.kv_snapshot_ts > 0);
 
             let dom: KvDomainLine = serde_json::from_str(raw_lines[1]).unwrap();
             assert_eq!(dom.name, "shop");
@@ -653,23 +700,22 @@ mod tests {
     }
 
     // 7. Snapshot consistency: a write committed after run_backup has
-    //    already acquired its snapshot (but is still mid-export) must not
-    //    appear in the output (spec general/006 consistency guarantee). Uses
-    //    scan_batch_size=1 + a real pause to open a window mid-export in
-    //    which a concurrent write is injected.
+    //    already taken its cut (but is still mid-export) must not appear in
+    //    the output. Uses scan_batch_size=1 + a real pause to open a window
+    //    mid-export in which a concurrent write is injected.
     #[test]
     fn test_run_backup_snapshot_excludes_writes_during_export() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            kv.create_domain("shop").await.unwrap();
-            let store = kv.store("shop").await.unwrap();
+            let fx = fixture(false).await;
+            fx.create(Engine::Kv, "shop").await;
+            let store = fx.kv.store("shop").await.unwrap();
             store.put(b"a1", b"v1").await.unwrap();
             store.put(b"a2", b"v2").await.unwrap();
 
-            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
+            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &fx.control).unwrap();
             let out_dir = tempfile::TempDir::new().unwrap();
             let out_path = out_dir.path().to_path_buf();
-            let kv_for_task = Arc::clone(&kv);
+            let control = Arc::clone(&fx.control);
 
             let backup_task = compio::runtime::spawn(async move {
                 let scope = BackupScope::KvDomain("shop".to_string());
@@ -680,16 +726,14 @@ mod tests {
                     include_auth: false,
                     schedule: None,
                     resolved: &resolved,
-                    kv_registry: &kv_for_task,
-                    json_engine: &None,
-                    system_store: &system,
+                    control: &control,
                     scan_batch_size: 1,
                     scan_pause_ms: 300,
                 };
                 run_backup(params).await.unwrap();
             });
 
-            // Let the job acquire its snapshot and enter its first pause window.
+            // Let the job take its cut and enter its first pause window.
             compio::time::sleep(std::time::Duration::from_millis(100)).await;
             store.put(b"after", b"v3").await.unwrap();
             backup_task.await.unwrap();
@@ -709,29 +753,12 @@ mod tests {
     #[test]
     fn test_include_auth_ignored_for_domain_scope() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            kv.create_domain("shop").await.unwrap();
-            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
+            let fx = fixture(false).await;
+            fx.create(Engine::Kv, "shop").await;
             let out_dir = tempfile::TempDir::new().unwrap();
-            let scope = BackupScope::KvDomain("shop".to_string());
-            let params = BackupParams {
-                dir: out_dir.path(),
-                id: "bk_authflag",
-                scope: &scope,
-                include_auth: true,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &None,
-                system_store: &system,
-                scan_batch_size: 500,
-                scan_pause_ms: 0,
-            };
-            run_backup(params).await.unwrap();
+            backup(&fx.control, out_dir.path(), "bk_authflag", BackupScope::KvDomain("shop".to_string()), true).await;
             let content = std::fs::read_to_string(out_dir.path().join("bk_authflag.ndjson")).unwrap();
-            let manifest_line = content.lines().next().unwrap();
-            let manifest: ManifestLine = serde_json::from_str(manifest_line).unwrap();
-            assert!(!manifest.include_auth, "kv:<domain> must not export auth even if requested");
+            assert!(!manifest_of(&content).include_auth, "kv:<domain> must not export auth even if requested");
         })
     }
 
@@ -740,8 +767,8 @@ mod tests {
     #[test]
     fn test_backup_include_auth_true_exports_auth_lines() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            let engine = &system;
+            let fx = fixture(false).await;
+            let engine = fx.control.system_store();
             let record = UserRecord {
                 name: "carol".to_string(),
                 api_key_hash: "abc123".to_string(),
@@ -759,27 +786,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
             let out_dir = tempfile::TempDir::new().unwrap();
-            let scope = BackupScope::All;
-            let params = BackupParams {
-                dir: out_dir.path(),
-                id: "bk_authtrue",
-                scope: &scope,
-                include_auth: true,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &None,
-                system_store: &system,
-                scan_batch_size: 500,
-                scan_pause_ms: 0,
-            };
-            run_backup(params).await.unwrap();
+            backup(&fx.control, out_dir.path(), "bk_authtrue", BackupScope::All, true).await;
 
             let content = std::fs::read_to_string(out_dir.path().join("bk_authtrue.ndjson")).unwrap();
-            let manifest: ManifestLine = serde_json::from_str(content.lines().next().unwrap()).unwrap();
-            assert!(manifest.include_auth);
+            assert!(manifest_of(&content).include_auth);
 
             let user_line = content.lines().find(|l| l.contains("\"auth-user\"")).expect("auth-user line must be present");
             let restored: UserRecord = serde_json::from_str(user_line).unwrap();
@@ -801,38 +812,25 @@ mod tests {
     #[test]
     fn test_backup_exports_auth_without_any_kv_domain() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            kv.delete_domain("default").await.unwrap();
+            let fx = fixture(false).await;
+            fx.control.delete_domain(Engine::Kv, "default").await.unwrap();
             let record = UserRecord {
                 name: "erin".to_string(),
                 api_key_hash: "cafe".to_string(),
                 role: crate::auth::UserRole::Admin,
                 created_at: 1_700_000_000,
             };
-            system
+            fx.control
+                .system_store()
                 .put(format!("{PREFIX_USER}erin").as_bytes(), &serde_json::to_vec(&record).unwrap())
                 .await
                 .unwrap();
 
-            let resolved = resolve_scope(&BackupScope::All, &kv, &None).await.unwrap();
+            let resolved = resolve_scope(&BackupScope::All, &fx.control).unwrap();
             assert!(resolved.kv_domains.is_empty(), "test setup: no domain must be left");
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let scope = BackupScope::All;
-            let params = BackupParams {
-                dir: out_dir.path(),
-                id: "bk_authnodomain",
-                scope: &scope,
-                include_auth: true,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &None,
-                system_store: &system,
-                scan_batch_size: 500,
-                scan_pause_ms: 0,
-            };
-            run_backup(params).await.unwrap();
+            backup(&fx.control, out_dir.path(), "bk_authnodomain", BackupScope::All, true).await;
 
             let content = std::fs::read_to_string(out_dir.path().join("bk_authnodomain.ndjson")).unwrap();
             let user_line = content.lines().find(|l| l.contains("\"auth-user\"")).expect("auth-user line must be present");
@@ -846,78 +844,44 @@ mod tests {
     #[test]
     fn test_run_backup_json_domain_with_index_and_docs() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            let (json, _dir2) = make_json_engine().await;
-            json.create_domain("catalog").await.unwrap();
-            json.create_index("catalog", "city", IndexFieldType::String).await.unwrap();
-            json.put_document("catalog", "d1", json!({"city": "Essen"})).await.unwrap();
+            let fx = fixture(true).await;
+            fx.create(Engine::Json, "catalog").await;
+            fx.json().create_index("catalog", "city", IndexFieldType::String).await.unwrap();
+            fx.json().put_document("catalog", "d1", json!({"city": "Lyon"})).await.unwrap();
 
-            let resolved =
-                resolve_scope(&BackupScope::JsonDomain("catalog".to_string()), &kv, &Some(Arc::clone(&json)))
-                    .await
-                    .unwrap();
             let out_dir = tempfile::TempDir::new().unwrap();
-            let scope = BackupScope::JsonDomain("catalog".to_string());
-            let json_engine_opt = Some(json);
-            let params = BackupParams {
-                dir: out_dir.path(),
-                id: "bk_json",
-                scope: &scope,
-                include_auth: false,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &json_engine_opt,
-                system_store: &system,
-                scan_batch_size: 500,
-                scan_pause_ms: 0,
-            };
-            run_backup(params).await.unwrap();
+            backup(&fx.control, out_dir.path(), "bk_json", BackupScope::JsonDomain("catalog".to_string()), false).await;
             let content = std::fs::read_to_string(out_dir.path().join("bk_json.ndjson")).unwrap();
             assert!(content.contains("\"t\":\"json-domain\""));
             assert!(content.contains("\"t\":\"json-index\""));
             assert!(content.contains("\"t\":\"doc\""));
             assert!(content.contains("\"field_type\":\"string\""));
+            let manifest = manifest_of(&content);
+            assert!(manifest.lsn_cut.json >= 1 && manifest.json_snapshot_ts > 0, "{:?}", manifest.lsn_cut);
+            assert_eq!((manifest.lsn_cut.kv, manifest.kv_snapshot_ts), (0, 0), "no KV domain in the scope");
         })
     }
 
-    // 9b. Binding section order (spec general/006 backup format): kv
-    //     sections, then json sections, then auth, then the checksum line.
+    // 9b. Binding section order: kv sections, then json sections, then auth,
+    //     then the checksum line.
     #[test]
     fn test_backup_section_order_kv_json_auth_checksum() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            let (json, _dir2) = make_json_engine().await;
-            kv.create_domain("shop").await.unwrap();
-            kv.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
-            json.create_domain("catalog").await.unwrap();
-            json.put_document("catalog", "d1", serde_json::json!({"n": 1})).await.unwrap();
+            let fx = fixture(true).await;
+            fx.create(Engine::Kv, "shop").await;
+            fx.kv.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
+            fx.create(Engine::Json, "catalog").await;
+            fx.json().put_document("catalog", "d1", serde_json::json!({"n": 1})).await.unwrap();
             let record = UserRecord {
                 name: "dave".to_string(),
                 api_key_hash: "beef".to_string(),
                 role: crate::auth::UserRole::User,
                 created_at: 1,
             };
-            system.put(b"__sys:auth:user:dave", &serde_json::to_vec(&record).unwrap()).await.unwrap();
+            fx.control.system_store().put(b"__sys:auth:user:dave", &serde_json::to_vec(&record).unwrap()).await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
-            let json_opt = Some(Arc::clone(&json));
-            let resolved = resolve_scope(&BackupScope::All, &kv, &json_opt).await.unwrap();
-            let scope = BackupScope::All;
-            let params = BackupParams {
-                dir: out_dir.path(),
-                id: "bk_order",
-                scope: &scope,
-                include_auth: true,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &json_opt,
-                system_store: &system,
-                scan_batch_size: 500,
-                scan_pause_ms: 0,
-            };
-            run_backup(params).await.unwrap();
+            backup(&fx.control, out_dir.path(), "bk_order", BackupScope::All, true).await;
 
             let content = std::fs::read_to_string(out_dir.path().join("bk_order.ndjson")).unwrap();
             let kinds: Vec<String> = content
@@ -937,29 +901,14 @@ mod tests {
     #[test]
     fn test_checksum_line_is_valid() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
-            kv.create_domain("shop").await.unwrap();
-            let store = kv.store("shop").await.unwrap();
+            let fx = fixture(false).await;
+            fx.create(Engine::Kv, "shop").await;
+            let store = fx.kv.store("shop").await.unwrap();
             store.put(b"k1", b"v1").await.unwrap();
             store.put(b"k2", b"v2").await.unwrap();
 
-            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &kv, &None).await.unwrap();
             let out_dir = tempfile::TempDir::new().unwrap();
-            let scope = BackupScope::KvDomain("shop".to_string());
-            let params = BackupParams {
-                dir: out_dir.path(),
-                id: "bk_sum",
-                scope: &scope,
-                include_auth: false,
-                schedule: None,
-                resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &None,
-                system_store: &system,
-                scan_batch_size: 500,
-                scan_pause_ms: 0,
-            };
-            run_backup(params).await.unwrap();
+            backup(&fx.control, out_dir.path(), "bk_sum", BackupScope::KvDomain("shop".to_string()), false).await;
 
             let bytes = std::fs::read(out_dir.path().join("bk_sum.ndjson")).unwrap();
             let text = String::from_utf8(bytes.clone()).unwrap();
@@ -981,13 +930,13 @@ mod tests {
     #[test]
     fn test_run_backup_cleans_up_part_file_on_error() {
         crate::core::engine_runtime::block_on(async {
-            let (kv, system, _dir1) = make_kv_registry().await;
+            let fx = fixture(false).await;
             // A scope resolving to a KV domain that was deleted right after
-            // resolution simulates a mid-job failure: `store()` on a Deleting/
-            // gone domain errors out inside the writer.
-            kv.create_domain("gone").await.unwrap();
-            let resolved = resolve_scope(&BackupScope::KvDomain("gone".to_string()), &kv, &None).await.unwrap();
-            kv.delete_domain("gone").await.unwrap();
+            // resolution simulates a mid-job failure: `store()` on a Deleting
+            // domain errors out inside the writer.
+            fx.create(Engine::Kv, "gone").await;
+            let resolved = resolve_scope(&BackupScope::KvDomain("gone".to_string()), &fx.control).unwrap();
+            fx.control.delete_domain(Engine::Kv, "gone").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
             let scope = BackupScope::KvDomain("gone".to_string());
@@ -998,15 +947,126 @@ mod tests {
                 include_auth: false,
                 schedule: None,
                 resolved: &resolved,
-                kv_registry: &kv,
-                json_engine: &None,
-                system_store: &system,
+                control: &fx.control,
                 scan_batch_size: 500,
                 scan_pause_ms: 0,
             };
             assert!(run_backup(params).await.is_err());
             assert!(!out_dir.path().join("bk_fail.ndjson.part").exists());
             assert!(!out_dir.path().join("bk_fail.ndjson").exists());
+        })
+    }
+
+    /// The (domain, key) pairs of the KV lines of an archive.
+    fn exported_pairs(content: &str) -> std::collections::HashSet<(String, String)> {
+        content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<KvLine>(l).ok().filter(|l| l.t == "kv"))
+            .map(|l| (l.domain, String::from_utf8(hex::decode(&l.k).unwrap()).unwrap()))
+            .collect()
+    }
+
+    // Round after round, a writer confirms a write to a domain of shard 0 and
+    // then makes one to a domain of shard 1 while a backup runs: an archive
+    // that holds the second write holds the first. Round 0 backs up between
+    // the two writes, round 1 while the second is held in flight, the rest
+    // after a varying number of yields from a fixed seed. The domains of
+    // both shards come in name order.
+    #[test]
+    fn an_archive_with_a_later_write_holds_every_write_confirmed_before_it() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::engine::TestHook;
+            const ROUNDS: usize = 40;
+            let dir = tempfile::TempDir::new().unwrap();
+            let hub = crate::core::storage_thread::TestHub::start(&[(
+                crate::core::storage_thread::WalTarget::Kv,
+                &dir.path().join("kv.wal"),
+            )]);
+            let [a, b] = [0, 1].map(|shard| slots::domain_name_for_shard(shard, 2, 31));
+            let held = [format!("d:{:016x}:", fnv64(b.as_bytes())).as_bytes(), b"b-1"].concat();
+            let hook = Arc::new(TestHook::default());
+            let owners = testing::kv_shards(dir.path(), &hub, 2, |k, engine| {
+                if k == 1 {
+                    engine.hooks.before_kv_pair_apply = Some((held.clone(), Arc::clone(&hook)));
+                }
+            })
+            .await;
+            let registries: Vec<_> = owners.iter().map(|owners| Arc::clone(&owners.kv)).collect();
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
+            let (control, _) = testing::start_shards(dir.path(), owners, bus).await;
+            for name in [&a, &b] {
+                control.create_domain(Engine::Kv, name, false).await.unwrap();
+            }
+            let stores = [registries[0].store(&a).await.unwrap(), registries[1].store(&b).await.unwrap()];
+            let stores = Arc::new(stores);
+
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let (mut a_only, mut both) = (0, 0);
+            let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+            for i in 0..ROUNDS {
+                let id = format!("bk_cut_{i}");
+                let (a_done, a_confirmed) = tokio::sync::oneshot::channel();
+                let (go, gate) = tokio::sync::oneshot::channel::<()>();
+                let writer = compio::runtime::spawn({
+                    let stores = Arc::clone(&stores);
+                    async move {
+                        stores[0].put(format!("a-{i}").as_bytes(), b"v").await.unwrap();
+                        let _ = a_done.send(());
+                        gate.await.unwrap();
+                        stores[1].put(format!("b-{i}").as_bytes(), b"v").await.unwrap();
+                    }
+                });
+                if i == 0 {
+                    a_confirmed.await.unwrap();
+                    backup(&control, out_dir.path(), &id, BackupScope::Kv, false).await;
+                    go.send(()).unwrap();
+                } else if i == 1 {
+                    go.send(()).unwrap();
+                    hook.reached.notified().await;
+                    let job = compio::runtime::spawn({
+                        let (control, out, id) = (Arc::clone(&control), out_dir.path().to_path_buf(), id.clone());
+                        async move { backup(&control, &out, &id, BackupScope::Kv, false).await }
+                    });
+                    for _ in 0..50 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(!job.is_finished(), "the backup's cut waits for the write in flight");
+                    hook.release.notify_one();
+                    job.await.unwrap();
+                } else {
+                    go.send(()).unwrap();
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    for _ in 0..state % 16 {
+                        tokio::task::yield_now().await;
+                    }
+                    backup(&control, out_dir.path(), &id, BackupScope::Kv, false).await;
+                }
+                writer.await.unwrap();
+
+                let content = std::fs::read_to_string(out_dir.path().join(format!("{id}.ndjson"))).unwrap();
+                let pairs = exported_pairs(&content);
+                let has_a = pairs.contains(&(a.clone(), format!("a-{i}")));
+                let has_b = pairs.contains(&(b.clone(), format!("b-{i}")));
+                assert!(has_a || !has_b, "round {i}: b-{i} without a-{i}");
+                a_only += usize::from(has_a && !has_b);
+                both += usize::from(has_a && has_b);
+                if i == 0 {
+                    let names: Vec<String> = content
+                        .lines()
+                        .filter_map(|l| serde_json::from_str::<KvDomainLine>(l).ok().filter(|l| l.t == "kv-domain"))
+                        .map(|l| l.name)
+                        .collect();
+                    let mut sorted = names.clone();
+                    sorted.sort();
+                    assert_eq!(names, sorted);
+                    assert!(names.contains(&a) && names.contains(&b), "{names:?}");
+                    assert_eq!(manifest_of(&content).shards, 2);
+                }
+            }
+            assert!(a_only > 0, "no backup fell between the two writes");
+            assert!(both > 0, "no backup held both writes");
         })
     }
 }

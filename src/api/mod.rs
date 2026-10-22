@@ -61,7 +61,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.9.0";
+pub const API_VERSION: &str = "0.10.0";
 
 struct VersionInfo;
 
@@ -455,6 +455,7 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             backup::RunningBackupInfo,
             backup::BackupListResponse,
             backup::BackupDetailResponse,
+            backup::LsnCutResponse,
             backup::RestoreRequest,
             backup::RestoreAcceptedResponse,
             backup::RestoreErrorEntry,

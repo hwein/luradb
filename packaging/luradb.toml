@@ -86,7 +86,8 @@ frontend_workers = 0
 # domains assigned to it. The data directory layout depends on it: 0 keeps
 # the count an existing data directory was written with, and gives a new one
 # cores / 4, 1 to 8. A set count that differs from the one the data was
-# written with refuses the start.
+# written with refuses the start; `luradb --migrate-shards N` changes the
+# count of a data directory while the server is stopped.
 shards = 0
 # Requests one data shard takes at once, running or waiting; further requests
 # are answered with 503 and Retry-After: 1. At least 1.

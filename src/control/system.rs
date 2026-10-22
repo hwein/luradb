@@ -1,5 +1,6 @@
 //! System store: an LSM instance of its own, under `storage.system_dir`, for
 //! the keys that belong to no domain — auth records and the store's markers.
+//! Beside it lies the lock that keeps a second process off the data.
 
 use crate::auth::{PREFIX_PERM, PREFIX_USER};
 use crate::core::wal::WriteAheadLog;
@@ -26,6 +27,65 @@ const AUTH_MIGRATED_KEY: &[u8] = b"__sys:meta:auth_migrated";
 /// Data directory layout; `2` keeps each data shard's files in `shard_<k>/`.
 const LAYOUT_KEY: &[u8] = b"__sys:meta:layout";
 const SHARDED_LAYOUT: &[u8] = b"2";
+/// Set while a shard-count migration moves its new layout into place.
+const MIGRATION_KEY: &[u8] = b"__sys:meta:migration";
+/// Locked by the one process that uses the data directories.
+const LOCK_FILE: &str = "lock";
+
+/// Exclusive use of the data directories, held until it drops: the open
+/// descriptor holds the lock.
+pub struct DataLock {
+    _file: std::fs::File,
+}
+
+/// Takes the lock in `dir`, the system store's directory, for this process;
+/// fails while another process holds it.
+pub fn lock_data_dir(dir: &Path) -> Result<DataLock> {
+    use std::os::fd::AsRawFd;
+    let path = dir.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!("{} is in use by another LuraDB process", dir.display());
+        }
+        anyhow::bail!("lock {}: {e}", path.display());
+    }
+    Ok(DataLock { _file: file })
+}
+
+/// The marker of a shard-count migration that has not finished.
+pub async fn pending_migration(sys: &LsmStorageEngine) -> Result<Option<Vec<u8>>> {
+    sys.get(MIGRATION_KEY).await
+}
+
+pub async fn mark_migration(sys: &LsmStorageEngine, marker: &[u8]) -> Result<()> {
+    sys.put(MIGRATION_KEY, marker).await
+}
+
+/// Records `shards` as the shard count and drops the migration marker, in
+/// one write.
+pub async fn complete_migration(sys: &LsmStorageEngine, shards: u16) -> Result<()> {
+    sys.write_batch(vec![
+        BatchOp::Put { key: SHARDS_KEY.to_vec(), value: shards.to_string().into_bytes() },
+        BatchOp::Delete { key: MIGRATION_KEY.to_vec() },
+    ])
+    .await
+}
+
+/// Refuses to start while a shard-count migration has not finished.
+pub async fn refuse_pending_migration(sys: &LsmStorageEngine) -> Result<()> {
+    if pending_migration(sys).await?.is_some() {
+        anyhow::bail!("shard migration incomplete — rerun the migration tool");
+    }
+    Ok(())
+}
 
 /// Opens (or creates) the system store in `dir` with `wal`, the log at
 /// `<dir>/wal`, and recovers it.
@@ -70,7 +130,7 @@ pub async fn check_shard_count(sys: &LsmStorageEngine, configured: u16) -> Resul
         None => sys.put(SHARDS_KEY, configured.to_string().as_bytes()).await,
         Some(stored) if stored == configured => Ok(()),
         Some(stored) => anyhow::bail!(
-            "shard count changed (stored {stored}, configured {configured}) — run the shard migration tool"
+            "shard count changed (stored {stored}, configured {configured}) — run `luradb --migrate-shards {configured}`"
         ),
     }
 }
@@ -193,7 +253,7 @@ mod tests {
             check_shard_count(&sys, 1).await.unwrap();
 
             let err = check_shard_count(&sys, 2).await.unwrap_err().to_string();
-            assert_eq!(err, "shard count changed (stored 1, configured 2) — run the shard migration tool");
+            assert_eq!(err, "shard count changed (stored 1, configured 2) — run `luradb --migrate-shards 2`");
             assert_eq!(stored_shard_count(&sys).await.unwrap(), Some(1), "the stored count stays");
         })
     }

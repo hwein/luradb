@@ -173,7 +173,7 @@ mod tests {
             dir: backup_dir.path().to_string_lossy().into_owned(),
             schedule: Vec::new(),
         };
-        let manager = BackupManager::new(&config, registry, None, control).unwrap();
+        let manager = BackupManager::new(&config, control).unwrap();
         (manager, engine_dir, backup_dir)
     }
 
@@ -374,6 +374,8 @@ mod tests {
             json_snapshot_ts: 0,
             encoding: "hex".to_string(),
             schedule: schedule.map(|s| s.to_string()),
+            shards: 1,
+            lsn_cut: writer::LsnCut::default(),
         };
         let mut content = serde_json::to_string(&manifest).unwrap();
         content.push('\n');

@@ -20,6 +20,8 @@ All notable changes to LuraDB are documented in this file.
 - New `[storage].wal_queue_capacity` config key sets how many writes may wait for the storage thread.
 - New `[multicore].shard_queue_capacity` config key.
 - Multi-shard mode: `[multicore].shards` spreads domain writes over N engine threads; `0` keeps the count a data directory was written with, a new directory gets cores / 4 (at most 8).
+- `luradb --migrate-shards N` changes the shard count of a data directory offline.
+- The server refuses to start on a data directory that another LuraDB process uses.
 
 ### Changed
 
@@ -48,6 +50,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: Watch/event stream ids carry the shard in their epoch; existing cursors resync once after the upgrade.
 - `[io_engine].enabled` has no effect with more than one shard.
 - SHM snapshots are published from a consistent cut across all shards.
+- **BREAKING** API: Backup archives use manifest format v2 (shard count, LSN cut); v1 archives remain restorable.
 
 ### Removed
 

@@ -4,7 +4,7 @@ use luradb::{
     config::{resolve_config_path, LuraConfig},
     core::coop,
     logging,
-    server::Server,
+    server::{self, Server},
 };
 use std::sync::Arc;
 use tokio::signal;
@@ -21,6 +21,12 @@ struct Cli {
     /// Prints the OpenAPI contract as JSON to stdout and exits.
     #[arg(long)]
     dump_openapi: bool,
+
+    /// Changes the number of data shards of the data directory to N, or
+    /// finishes such a change that was interrupted, and exits. The server
+    /// must be stopped.
+    #[arg(long, value_name = "N")]
+    migrate_shards: Option<u16>,
 }
 
 async fn shutdown_signal() {
@@ -73,6 +79,12 @@ fn main() -> anyhow::Result<()> {
     config.shm.validate_registration_socket(&config.server)?;
     config.multicore.validate(coop::available_cores())?;
     let _log_guard = logging::init_logging(&config.log)?;
+
+    if let Some(shards) = cli.migrate_shards {
+        server::migrate_shards(&config, shards)?;
+        println!("The data directory has {shards} data shards.");
+        return Ok(());
+    }
 
     tracing::info!("Starting LuraDB...");
     if config_path.exists() {

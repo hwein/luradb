@@ -27,7 +27,7 @@ use crate::{
     engines::json::JsonEngine,
     engines::lsm::{
         compaction::CompactionConfig,
-        domain::{DomainConfig, DomainRegistry},
+        domain::DomainConfig,
         engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine},
         janitor::JanitorConfig,
     },
@@ -99,6 +99,8 @@ struct Cluster {
     shm_manager: Option<Arc<ShmManager>>,
     shm: Option<ShmServices>,
     storage_thread: StorageThread,
+    /// Released last, once every file is closed.
+    lock: system::DataLock,
     #[cfg(test)]
     system_dir: String,
 }
@@ -107,11 +109,12 @@ impl Cluster {
     /// Stops shared memory, then drains every shard — the shard's requests
     /// end first — and truncates the write-ahead log of each engine whose
     /// final flush succeeded on all shards; then shuts the system store
-    /// down, stops the storage hub, once, and joins the shard threads.
+    /// down, stops the storage hub, once, joins the shard threads and only
+    /// then lets go of the data directories.
     async fn shutdown(self) {
         #[cfg(test)]
         let system_dir = self.system_dir.clone();
-        let Cluster { shards, loops, wals, system_store, shm_manager, shm, mut storage_thread, .. } = self;
+        let Cluster { shards, loops, wals, system_store, shm_manager, shm, mut storage_thread, lock, .. } = self;
         loops.store(true, Ordering::Relaxed);
 
         // The publisher and the dispatcher take cuts and write through the
@@ -168,6 +171,7 @@ impl Cluster {
                 tracing::error!("A data shard thread panicked.");
             }
         }
+        drop((system_store, lock));
         tracing::info!("Shutdown complete.");
     }
 
@@ -185,7 +189,7 @@ impl Cluster {
 }
 
 /// How the fixed memory budgets split across the data shards.
-struct MemorySplit {
+pub(super) struct MemorySplit {
     /// Block cache of each engine instance; an engine's budget splits evenly.
     block_cache_bytes: usize,
     /// Pages of each shard's buffer pool.
@@ -193,7 +197,7 @@ struct MemorySplit {
 }
 
 impl MemorySplit {
-    fn of(config: &LuraConfig, shards: u16) -> Self {
+    pub(super) fn of(config: &LuraConfig, shards: u16) -> Self {
         let shards = usize::from(shards);
         Self {
             block_cache_bytes: BlockCacheConfig::default().capacity_bytes / shards,
@@ -201,7 +205,7 @@ impl MemorySplit {
         }
     }
 
-    fn block_cache(&self) -> BlockCacheConfig {
+    pub(super) fn block_cache(&self) -> BlockCacheConfig {
         BlockCacheConfig { capacity_bytes: self.block_cache_bytes, ..BlockCacheConfig::default() }
     }
 
@@ -250,12 +254,14 @@ async fn bootstrap(
     compio::fs::create_dir_all(&config.storage.system_dir)
         .await
         .with_context(|| format!("create storage.system_dir {}", config.storage.system_dir))?;
+    let lock = system::lock_data_dir(Path::new(&config.storage.system_dir))?;
     let (storage_thread, hub) = start_storage_thread(config)?;
 
     // The system store before the engines: data laid out for another shard
-    // count must not be opened at all.
+    // count, or halfway through a change of it, must not be opened at all.
     let system_wal = WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Sys);
     let system_store = system::open_with_wal(Path::new(&config.storage.system_dir), system_wal).await?;
+    system::refuse_pending_migration(&system_store).await?;
     let shards = layout::shard_count(config, &system_store, auto_shards).await?;
     layout::migrate(config, &system_store, shards).await?;
     system::check_shard_count(&system_store, shards).await?;
@@ -369,6 +375,7 @@ async fn bootstrap(
         shm_manager,
         shm: None,
         storage_thread,
+        lock,
         #[cfg(test)]
         system_dir: config.storage.system_dir.clone(),
     };
@@ -439,7 +446,7 @@ async fn prepare_control(
     let control = ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus).await?;
 
     let loops = spawn_loops(config);
-    let backup_manager = init_backup(config, &owners[0].kv, &owners[0].json, &control, &loops);
+    let backup_manager = init_backup(config, &control, &loops);
     let log_access = init_log_access(config);
     let trusted_cidrs = crate::api::middleware::parse_cidrs(&config.proxy.trusted_proxies)
         .map_err(|e| anyhow::anyhow!("Invalid trusted_proxies config: {}", e));
@@ -495,7 +502,7 @@ pub(super) fn domain_config(cfg: &LuraConfig) -> DomainConfig {
 }
 
 /// Options of the key-value engine's LSM instances.
-fn kv_options(cfg: &LuraConfig, memory: &MemorySplit) -> LsmEngineOptions {
+pub(super) fn kv_options(cfg: &LuraConfig, memory: &MemorySplit) -> LsmEngineOptions {
     LsmEngineOptions {
         engine: LsmEngineConfig {
             vlog_inline_threshold: cfg.lsm.vlog_inline_threshold,
@@ -529,7 +536,7 @@ fn kv_options(cfg: &LuraConfig, memory: &MemorySplit) -> LsmEngineOptions {
 /// The storage hub: a dedicated OS thread driving a SQPOLL io_uring ring. It
 /// owns the WAL file of every enabled engine and writes them all; no engine
 /// runs without it.
-fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageThread, StorageHandle)> {
+pub(super) fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageThread, StorageHandle)> {
     let st_config = StorageThreadConfig {
         sqpoll_enabled: storage_thread::SQPOLL_ENABLED,
         sqpoll_idle_ms: storage_thread::SQPOLL_IDLE_MS,
@@ -563,11 +570,9 @@ fn spawn_loops(cfg: &LuraConfig) -> Arc<AtomicBool> {
 }
 
 /// The backup manager, with its scheduler on the control-plane thread.
-/// Backups read and restore the engines of shard 0.
+/// Backups and restores reach every data shard through the control plane.
 fn init_backup(
     cfg: &LuraConfig,
-    registry: &Arc<DomainRegistry>,
-    json_engine: &Option<Arc<JsonEngine>>,
     control: &Arc<ControlPlane>,
     shutdown_flag: &Arc<AtomicBool>,
 ) -> anyhow::Result<Option<Arc<backup::BackupManager>>> {
@@ -581,8 +586,7 @@ fn init_backup(
             "backup.enabled is true but auth.enabled is false — any client that reaches this port can create and download full backups."
         );
     }
-    let manager =
-        backup::BackupManager::new(&cfg.backup, Arc::clone(registry), json_engine.clone(), Arc::clone(control))?;
+    let manager = backup::BackupManager::new(&cfg.backup, Arc::clone(control))?;
     let scheduler = Arc::new(backup::scheduler::BackupScheduler::new(
         Arc::clone(&manager),
         &cfg.backup.schedule,

@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.9.0",
+    "version": "0.10.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -631,7 +631,8 @@
         "tags": [
           "Backup"
         ],
-        "summary": "Streams the archive (`ServeFile`/tower-http `fs`) with HTTP Range support\nfor resumable downloads (spec general/006).",
+        "summary": "Streams the archive with HTTP Range support for resumable downloads.",
+        "description": "The archive is NDJSON. Its first line is the manifest, format version 2:\n`format_version`, `id`, `created_at`, `luradb_version`, `scope`,\n`include_auth`, `encoding`, `schedule`, and\n- `shards`: data shards of the server that wrote it. Informational only:\n  a restore places every domain by the shard count of the server it runs\n  on, so an archive restores into any shard count.\n- `lsn_cut`: `{kv, json}`, per engine a write-ahead-log position that\n  every write in the archive is at or below (a lower bound of the cut);\n  0 for an engine outside the scope. Positions restart at 1 after a clean\n  shutdown, so they compare only within one run of the server.\n- `kv_snapshot_ts`, `json_snapshot_ts`: per engine, the newest\n  read-snapshot stamp among the data shards; 0 for an engine outside the\n  scope.\n\nAll shards of one engine are read at one consistent cut: an archive that\nholds a write holds every write confirmed before it. Domain lines carry\ntheir domain's name; auth records form a section of their own; the last\nline is the checksum. Archives of format version 1, which lack `shards`\nand `lsn_cut`, remain restorable.",
         "operationId": "download_backup",
         "parameters": [
           {
@@ -5175,6 +5176,7 @@
               "null"
             ],
             "format": "int64",
+            "description": "The newest read-snapshot stamp of the JSON engine among the data shards.",
             "minimum": 0
           },
           "kv_snapshot_ts": {
@@ -5183,7 +5185,18 @@
               "null"
             ],
             "format": "int64",
+            "description": "The newest read-snapshot stamp of the KV engine among the data shards.",
             "minimum": 0
+          },
+          "lsn_cut": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LsnCutResponse"
+              }
+            ]
           },
           "luradb_version": {
             "type": [
@@ -5199,6 +5212,15 @@
           },
           "scope": {
             "type": "string"
+          },
+          "shards": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Data shards of the server that wrote the archive; 0 for format\nversion 1. Informational: a restore places every domain by the shard\ncount of the server it runs on.",
+            "minimum": 0
           },
           "size_bytes": {
             "type": [
@@ -5976,6 +5998,26 @@
           "truncated": {
             "type": "boolean",
             "description": "`true` iff the scan budget was exhausted before `lines` matches and before file start."
+          }
+        }
+      },
+      "LsnCutResponse": {
+        "type": "object",
+        "description": "Per engine, a write-ahead-log position that every write in the archive is\nat or below; 0 for an engine outside the scope and for format version 1.\nPositions restart at 1 after a clean shutdown, so they compare only within\none run of the server.",
+        "required": [
+          "kv",
+          "json"
+        ],
+        "properties": {
+          "json": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kv": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

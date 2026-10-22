@@ -340,9 +340,8 @@ impl SSTableReader {
     }
 
     /// Like [`Self::get_with_cache`], but also returns the matched entry's
-    /// write timestamp, un-inverted back to HLC form (spec kv/022
-    /// `last_modified_at`) — the encoded key stores it inverted
-    /// (`Timestamp::inverted`) for newest-first sort order.
+    /// write timestamp, un-inverted back to HLC form (the encoded key stores
+    /// it inverted for newest-first sort order).
     pub fn get_with_cache_and_ts(
         &self,
         key: &[u8],
@@ -353,7 +352,6 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        // ── 1. Exact-match path ───────────────────────────────────────────────
         let block_idx = self.find_block(key)?;
         if let Some(idx) = block_idx {
             let block_handle = &self.index.entries[idx].1;
@@ -372,66 +370,59 @@ impl SSTableReader {
             }
         }
 
-        // ── 2. MVCC fallback ──────────────────────────────────────────────────
         if key.len() >= 8 {
-            return self.get_mvcc_prefix_cached(key, cache);
+            return self.newest_visible_version(
+                key,
+                |handle| {
+                    let cache_key = BlockCacheKey { file_id: self.file_id, block_offset: u64::from(handle.offset) };
+                    self.get_or_cache_block(handle, &cache_key, cache)
+                },
+                |raw| {
+                    rkyv::access::<Archived<DataBlock>, rancor::Error>(raw.as_bytes())
+                        .map_err(|e| anyhow::anyhow!("DataBlock validation failed: {}", e))
+                },
+                |raw, value, ts| (cached_value_from_archived(raw, value), ts),
+            );
         }
 
         Ok(None)
     }
 
-    /// MVCC prefix scan with block cache integration; also returns the
-    /// matched entry's un-inverted write timestamp (see
-    /// [`Self::get_with_cache_and_ts`]).
-    fn get_mvcc_prefix_cached(
+    /// The newest version of `key`'s user key `u` visible at `key`'s
+    /// timestamp. Every visible version of `u` is encoded at or after `key`
+    /// and at most `u‖FF…FF`; longer keys between them are skipped. `load`
+    /// fetches a block, `view` opens it, `hit` maps the matching entry.
+    fn newest_visible_version<B, R>(
         &self,
         key: &[u8],
-        cache: &StripedBlockCache,
-    ) -> Result<Option<(CachedValue, Timestamp)>> {
-        let search_user_key = mvcc_user_key(key);
+        mut load: impl FnMut(&Archived<BlockHandle>) -> Result<B>,
+        view: impl Fn(&B) -> Result<&Archived<DataBlock>>,
+        hit: impl FnOnce(&B, &ArchivedDataBlockValue, Timestamp) -> R,
+    ) -> Result<Option<R>> {
+        let user_key = mvcc_user_key(key);
         let search_inv_ts = mvcc_inv_ts(key);
+        let hi = [user_key, [0xFF; 8].as_slice()].concat();
 
-        let start_idx = self.find_block_by_user_key(search_user_key)?.map_or(0, |i| i.saturating_sub(1));
-
-        // Every version of the user key sorts before any entry whose user key
-        // is behind the run of keys that start with it. A longer key with
-        // that prefix may still sort first (`ab`+stamp before `a`+stamp).
-        for bi in start_idx..self.index.entries.len() {
-            let (first_key, block_handle) = (&self.index.entries[bi].0, &self.index.entries[bi].1);
-            if !not_behind_prefix_run(mvcc_user_key(first_key.as_slice()), search_user_key) {
+        let start = self.find_block(key)?.unwrap_or(0);
+        for (first_key, handle) in self.index.entries[start..].iter().map(|entry| (&entry.0, &entry.1)) {
+            if first_key.as_slice() > hi.as_slice() {
                 break;
             }
-            let block_offset = u64::from(block_handle.offset);
-            let cache_key = BlockCacheKey { file_id: self.file_id, block_offset };
-
-            let raw = self.get_or_cache_block(block_handle, &cache_key, cache)?;
-            let data_block = rkyv::access::<Archived<DataBlock>, rancor::Error>(raw.as_bytes())
-                .map_err(|e| anyhow::anyhow!("DataBlock validation failed: {}", e))?;
-
-            let mut passed_user_key = false;
-
-            for entry in data_block.entries.iter() {
-                let bk = entry.0.as_slice();
-                let bk_user = mvcc_user_key(bk);
-
-                if bk_user != search_user_key {
-                    if passed_user_key || !not_behind_prefix_run(bk_user, search_user_key) {
-                        return Ok(None);
-                    }
+            let block = load(handle)?;
+            for entry in view(&block)?.entries.iter() {
+                let entry_key = entry.0.as_slice();
+                if entry_key > hi.as_slice() {
+                    return Ok(None);
+                }
+                if mvcc_user_key(entry_key) != user_key {
                     continue;
                 }
-
-                passed_user_key = true;
-                let stored_inv_ts = mvcc_inv_ts(bk);
-
-                if stored_inv_ts >= search_inv_ts {
-                    let ts = Timestamp::from_inverted(stored_inv_ts);
-                    return Ok(Some((cached_value_from_archived(&raw, &entry.1), ts)));
+                // Inverted: at least the search stamp means written at or before the snapshot.
+                let inv_ts = mvcc_inv_ts(entry_key);
+                if inv_ts >= search_inv_ts {
+                    return Ok(Some(hit(&block, &entry.1, Timestamp::from_inverted(inv_ts))));
                 }
             }
-
-            // User key seen in this block but no visible version yet —
-            // might continue into the next block.
         }
 
         Ok(None)
@@ -500,8 +491,8 @@ impl SSTableReader {
     ///
     /// Supports both exact key lookup (non-MVCC) and MVCC-aware lookup where the
     /// search key carries a snapshot timestamp that may differ from the stored
-    /// write timestamp.  For MVCC keys (len >= 8), the method falls back to a
-    /// user-key prefix scan if the exact match misses.
+    /// write timestamp.  For MVCC keys (len >= 8), the method falls back to
+    /// the newest version visible at the snapshot if the exact match misses.
     pub fn get(&self, key: &[u8]) -> Result<Option<DataBlockValue>> {
         // Bloom filter is keyed on user_key (timestamp stripped) so check accordingly.
         let bloom_key = mvcc_user_key(key);
@@ -509,7 +500,6 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        // ── 1. Exact-match path (works when snapshot timestamp == write timestamp) ──
         let block_idx = self.find_block(key)?;
         if let Some(idx) = block_idx {
             let block_handle = &self.index.entries[idx].1;
@@ -521,65 +511,23 @@ impl SSTableReader {
             }
         }
 
-        // ── 2. MVCC-fallback (snapshot timestamp differs from write timestamp) ─────
         // Keys >= 8 bytes are treated as MVCC-encoded: [user_key][inv_ts_be_8_bytes].
         // A snapshot taken AFTER the write has a smaller inv_ts than the stored key,
-        // so the exact block search misses. We search by user_key prefix instead.
+        // so the exact block search misses.
         if key.len() >= 8 {
-            return self.get_mvcc_prefix(key);
-        }
-
-        Ok(None)
-    }
-
-    /// MVCC-aware lookup: find the most recent version of user_key that is
-    /// visible under the given snapshot timestamp.
-    ///
-    /// `key` must be an MVCC-encoded key: `[user_key][inv_snapshot_ts_be_8_bytes]`.
-    /// An entry is visible iff `stored_inv_ts >= search_inv_ts`
-    /// (equivalent to `T_stored <= T_snapshot`).
-    fn get_mvcc_prefix(&self, key: &[u8]) -> Result<Option<DataBlockValue>> {
-        let search_user_key = mvcc_user_key(key);
-        let search_inv_ts = mvcc_inv_ts(key);
-
-        // Find the last block whose first user_key <= search_user_key.
-        // Start one block earlier to cover entries that span block boundaries.
-        let start_idx = self.find_block_by_user_key(search_user_key)?.map_or(0, |i| i.saturating_sub(1));
-
-        for bi in start_idx..self.index.entries.len() {
-            let block_handle = &self.index.entries[bi].1;
-            let data_block = self.read_data_block(block_handle)?;
-            let mut passed_user_key = false;
-
-            for entry in data_block.entries.iter() {
-                let bk = entry.0.as_slice();
-                let bk_user = mvcc_user_key(bk);
-
-                if bk_user != search_user_key {
-                    if passed_user_key {
-                        // We've iterated past all versions of this user_key.
-                        return Ok(None);
-                    }
-                    continue;
-                }
-
-                passed_user_key = true;
-                let stored_inv_ts = mvcc_inv_ts(bk);
-
-                // stored_inv_ts >= search_inv_ts  ↔  T_stored <= T_snapshot (visible)
-                if stored_inv_ts >= search_inv_ts {
-                    return Ok(Some(archived_to_owned_dbv(&entry.1)));
-                }
-                // stored_inv_ts < search_inv_ts  ↔  T_stored > T_snapshot (too new)
-                // Keep iterating — next entries are older versions.
-            }
+            return self.newest_visible_version(
+                key,
+                |handle| self.read_data_block(handle),
+                |block| Ok(*block),
+                |_, value, _| archived_to_owned_dbv(value),
+            );
         }
 
         Ok(None)
     }
 
     /// Binary search: returns the index of the last block whose first full key
-    /// is ≤ `key`.  Used for exact-match lookups.
+    /// is ≤ `key`.
     fn find_block(&self, key: &[u8]) -> Result<Option<usize>> {
         if self.index.entries.is_empty() {
             return Ok(None);
@@ -594,33 +542,6 @@ impl SSTableReader {
             let block_first_key = &self.index.entries[mid].0;
 
             if block_first_key.as_slice() <= key {
-                result = Some(mid);
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Binary search: returns the index of the last block whose first
-    /// **user_key** (MVCC timestamp stripped) is ≤ `user_key`.
-    fn find_block_by_user_key(&self, user_key: &[u8]) -> Result<Option<usize>> {
-        if self.index.entries.is_empty() {
-            return Ok(None);
-        }
-
-        let mut left = 0;
-        let mut right = self.index.entries.len();
-        let mut result = None;
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let bfk = &self.index.entries[mid].0;
-            let bfk_user = mvcc_user_key(bfk.as_slice());
-
-            if bfk_user <= user_key {
                 result = Some(mid);
                 left = mid + 1;
             } else {
@@ -1570,8 +1491,6 @@ mod tests {
         Ok(())
     }
 
-    // ── Point reads cost the table that holds the key, not the newer ones ────
-
     fn spaced_key(n: usize) -> Vec<u8> {
         format!("k:{n:07}").into_bytes()
     }
@@ -1642,6 +1561,76 @@ mod tests {
 
         let (_, ts) = reader.get_with_cache_and_ts(&encode(b"m", 15), &cache)?.expect("m@10 is visible at 15");
         assert_eq!(ts, Timestamp::new(10));
+        Ok(())
+    }
+
+    /// `ab@20` ends the first block and the older `ab@10`, a tombstone, opens
+    /// the second; the third opens with `a`, which sorts behind both.
+    fn table_with_versions_across_a_block_boundary() -> anyhow::Result<SSTableReader> {
+        let mut versions = numbered("aa", ENTRIES_PER_BLOCK - 1);
+        versions.extend([version("ab", 20, true), version("ab", 10, false)]);
+        versions.extend(numbered("ac", ENTRIES_PER_BLOCK - 1));
+        versions.push(version("a", 10, true));
+        let reader = build_table(versions)?;
+        assert_eq!(reader.index.entries.len(), 3, "layout precondition");
+        assert_eq!(reader.index.entries[1].0.as_slice(), encode(b"ab", 10), "layout precondition");
+        assert_eq!(reader.index.entries[2].0.as_slice(), encode(b"a", 10), "layout precondition");
+        Ok(reader)
+    }
+
+    #[test]
+    fn test_point_read_finds_the_newest_visible_version_in_an_earlier_block() -> anyhow::Result<()> {
+        let reader = table_with_versions_across_a_block_boundary()?;
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+
+        let (_, ts) = reader.get_with_cache_and_ts(&encode(b"ab", 25), &cache)?.expect("ab@20 is visible at 25");
+        assert_eq!(ts, Timestamp::new(20));
+        Ok(())
+    }
+
+    #[test]
+    fn test_uncached_point_read_finds_the_newest_visible_version_in_an_earlier_block() -> anyhow::Result<()> {
+        let reader = table_with_versions_across_a_block_boundary()?;
+
+        let value = reader.get(&encode(b"ab", 25))?;
+        assert_eq!(value, Some(DataBlockValue::Inline { data: b"v".to_vec(), expire_at: 0 }));
+        Ok(())
+    }
+
+    /// Two versions of `a` with stamps whose inverted form starts with 0xFE,
+    /// and a longer key `a\xFE\x80` that sorts between them. Returns the
+    /// reader and the older version's timestamp.
+    fn table_with_a_longer_key_between_versions() -> anyhow::Result<(SSTableReader, u64)> {
+        let newer = Timestamp::from_inverted(0xFE10_0000_0000_0000).as_u64();
+        let older = Timestamp::from_inverted(0xFEF0_0000_0000_0000).as_u64();
+        let longer = b"a\xFE\x80".to_vec();
+        assert!(encode(b"a", newer) < encode(&longer, 10), "layout precondition");
+        assert!(encode(&longer, 10) < encode(b"a", older), "layout precondition");
+        let reader = build_table(vec![
+            version("a", newer, true),
+            version("a", older, true),
+            (longer, 10, true),
+        ])?;
+        Ok((reader, older))
+    }
+
+    #[test]
+    fn test_point_read_passes_a_longer_key_between_two_versions() -> anyhow::Result<()> {
+        let (reader, older) = table_with_a_longer_key_between_versions()?;
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+
+        let (_, ts) = reader
+            .get_with_cache_and_ts(&encode(b"a", older + 1), &cache)?
+            .expect("the older version is visible");
+        assert_eq!(ts, Timestamp::new(older));
+        Ok(())
+    }
+
+    #[test]
+    fn test_uncached_point_read_passes_a_longer_key_between_two_versions() -> anyhow::Result<()> {
+        let (reader, older) = table_with_a_longer_key_between_versions()?;
+
+        assert!(reader.get(&encode(b"a", older + 1))?.is_some(), "the older version is visible");
         Ok(())
     }
 

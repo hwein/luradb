@@ -59,6 +59,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Fixed
 
+- Snapshot reads no longer miss an older version when the key is a prefix of another key or contains bytes above 0xFD.
 - Point reads no longer slow down with the size of newer SSTables that do not hold the key.
 - Reads no longer miss keys while a MemTable flush or a compaction installs its result.
 - Reads no longer fail or return stale values when vLog garbage collection overlaps a MemTable flush or a compaction.

@@ -46,8 +46,6 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    // ── token stream primitives ─────────────────────────────────────────────
-
     fn at_eof(&self) -> bool {
         self.pos >= self.tokens.len()
     }
@@ -141,8 +139,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ── statement dispatch ───────────────────────────────────────────────────
-
     fn parse_statement(&mut self) -> Result<Statement, RelStoreError> {
         match self.peek() {
             Some(Token::Keyword(Keyword::Create)) => self.parse_create(),
@@ -199,8 +195,6 @@ impl<'a> Parser<'a> {
             )))
         }
     }
-
-    // ── CREATE TABLE ─────────────────────────────────────────────────────────
 
     fn parse_create_table_body(&mut self) -> Result<Statement, RelStoreError> {
         let name = self.expect_ident()?;
@@ -298,8 +292,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ── ALTER TABLE ──────────────────────────────────────────────────────────
-
     fn parse_alter_table(&mut self) -> Result<Statement, RelStoreError> {
         self.expect_kw(Keyword::Alter)?;
         self.expect_kw(Keyword::Table)?;
@@ -329,8 +321,6 @@ impl<'a> Parser<'a> {
         Ok(Statement::AlterTable(AlterTable { table, action }))
     }
 
-    // ── CREATE/DROP INDEX ────────────────────────────────────────────────────
-
     fn parse_create_index_body(&mut self, unique: bool) -> Result<Statement, RelStoreError> {
         let name = self.expect_ident()?;
         self.expect_kw(Keyword::On)?;
@@ -346,8 +336,6 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    // ── CREATE VIEW ──────────────────────────────────────────────────────────
-
     fn parse_create_view_body(&mut self) -> Result<Statement, RelStoreError> {
         let name = self.expect_ident()?;
         self.expect_kw(Keyword::As)?;
@@ -362,8 +350,6 @@ impl<'a> Parser<'a> {
             select_offset,
         }))
     }
-
-    // ── INSERT ───────────────────────────────────────────────────────────────
 
     fn parse_insert(&mut self) -> Result<Statement, RelStoreError> {
         self.expect_kw(Keyword::Insert)?;
@@ -409,8 +395,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ── UPDATE ───────────────────────────────────────────────────────────────
-
     fn parse_update(&mut self) -> Result<Statement, RelStoreError> {
         self.expect_kw(Keyword::Update)?;
         let table = self.expect_ident()?;
@@ -434,8 +418,6 @@ impl<'a> Parser<'a> {
         Ok(Assignment { column, value })
     }
 
-    // ── DELETE ───────────────────────────────────────────────────────────────
-
     fn parse_delete(&mut self) -> Result<Statement, RelStoreError> {
         self.expect_kw(Keyword::Delete)?;
         self.expect_kw(Keyword::From)?;
@@ -451,8 +433,6 @@ impl<'a> Parser<'a> {
             Ok(None)
         }
     }
-
-    // ── SELECT ───────────────────────────────────────────────────────────────
 
     fn parse_select(&mut self) -> Result<Select, RelStoreError> {
         self.expect_kw(Keyword::Select)?;
@@ -576,8 +556,6 @@ impl<'a> Parser<'a> {
         };
         Ok(Some(Limit { limit, offset }))
     }
-
-    // ── WHERE expressions: OR < AND < NOT < predicate/paren ────
 
     fn parse_expr(&mut self) -> Result<Expr, RelStoreError> {
         self.parse_or_expr()

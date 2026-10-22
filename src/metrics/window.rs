@@ -11,8 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{DomainWindowMetrics, EngineWindowMetrics};
 
-// ── Latency bucket helpers ────────────────────────────────────────────────────
-
 /// Maps a latency in microseconds to one of 7 exponential buckets.
 ///
 /// | Index | Range      |
@@ -44,8 +42,6 @@ fn latency_bucket(us: u64) -> usize {
 
 /// Representative midpoint for each bucket (µs) — used for P-value estimation.
 const MIDPOINTS: [u64; 7] = [5, 50, 500, 5_000, 50_000, 500_000, 2_000_000];
-
-// ── BucketSnapshot ────────────────────────────────────────────────────────────
 
 pub struct BucketSnapshot {
     pub timestamp_secs: u64,
@@ -262,8 +258,6 @@ fn percentile(buckets: &[u64; 7], total: u64, pct: u64) -> u64 {
     }
     MIDPOINTS[6]
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

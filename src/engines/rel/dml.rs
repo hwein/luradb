@@ -24,8 +24,6 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-// ── Per-table write lock ────────────────────────────────────────
-
 type LockMap = HashMap<(Vec<u8>, u32), Arc<tokio::sync::Mutex<()>>>;
 
 /// Lazily-filled map of `(system_prefix, table_id)` → async mutex. A tokio
@@ -45,8 +43,6 @@ impl TableLocks {
             .clone()
     }
 }
-
-// ── Execution results ────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct DmlResult {
@@ -161,8 +157,6 @@ impl RelEngine {
         }
     }
 
-    // ── INSERT ──────────────────────────────────────────────────
-
     async fn exec_insert(
         &self,
         domain: &str,
@@ -268,8 +262,6 @@ impl RelEngine {
         ops.push(BatchOp::Put { key: row_key, value: row_bytes });
         Ok(pk_v)
     }
-
-    // ── UPDATE ───────────────────────────────────────────────────
 
     async fn exec_update(
         &self,
@@ -388,8 +380,6 @@ impl RelEngine {
         Ok(())
     }
 
-    // ── DELETE ───────────────────────────────────────────────────
-
     async fn exec_delete(
         &self,
         domain: &str,
@@ -424,8 +414,6 @@ impl RelEngine {
         self.metrics.record_rel_dml_statement("delete");
         Ok(DmlResult { affected: candidates.len() as u64, last_pk: None })
     }
-
-    // ── Candidate acquisition ─────────────────────────────────────
 
     async fn acquire_candidates(
         &self,
@@ -476,8 +464,6 @@ impl RelEngine {
         self.metrics.record_rel_dml_scanned_rows(scanned);
         Ok(out)
     }
-
-    // ── Validation helpers ──────────────────────────────────────
 
     fn validate_not_null_and_text(
         &self,
@@ -705,8 +691,6 @@ impl RelEngine {
         Ok(())
     }
 }
-
-// ── Column/value binding ──────────────────────────────────────────
 
 fn resolve_insert_columns(
     schema: &TableSchema,
@@ -937,8 +921,6 @@ fn timestamp_mismatch(ctx: &str) -> RelStoreError {
         actual: "unparseable".to_string(),
     }
 }
-
-// ── WHERE binding ───────────────────────────────────────────────
 
 /// Table name plus SELECT alias — the qualifiers a column ref may carry.
 ///
@@ -1188,8 +1170,6 @@ pub(super) fn is_value(op: &Operand) -> bool {
     matches!(op, Operand::Literal(_) | Operand::Param(_))
 }
 
-// ── Row helpers ──────────────────────────────────────────────────────────────
-
 fn values_by_col_id(schema: &TableSchema, values: &[ScalarValue]) -> HashMap<u16, ScalarValue> {
     schema.columns.iter().zip(values).map(|(c, v)| (c.col_id, v.clone())).collect()
 }
@@ -1220,8 +1200,6 @@ fn row_index_keys(
     }
     out
 }
-
-// ── Time helpers (no new crate) ────────────────────────────────────
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now()

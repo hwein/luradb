@@ -26,8 +26,6 @@ const CAT_PREFIX: &[u8] = b"CAT:";
 const SYS_CATALOG_SEQ_PREFIX: &[u8] = b"__sys:rel_catalog_seq:";
 pub(crate) const MAX_IDENTIFIER_LEN: usize = 50;
 
-// ── Identifier rules ─────────────────────────────────────────────
-
 /// Normalizes (lowercases) and validates a table/view/column/index identifier:
 /// `[a-z_][a-z0-9_]{0,49}`. Stricter than the domain-name rule (no `-`).
 fn normalize_identifier(name: &str) -> Result<String, RelStoreError> {
@@ -54,8 +52,6 @@ fn normalize_identifier(name: &str) -> Result<String, RelStoreError> {
     }
     Ok(lower)
 }
-
-// ── LSM keys ───────────────────────────────────────────────────────────────────
 
 /// `CAT:{system_prefix}:{name}` — both parts are colon-free, so the key is
 /// unambiguously parseable.
@@ -87,8 +83,6 @@ fn parse_cat_key(key: &[u8]) -> Option<(Vec<u8>, String)> {
     let name = std::str::from_utf8(&rest[pos + 1..]).ok()?.to_string();
     Some((rest[..pos].to_vec(), name))
 }
-
-// ── Data model ─────────────────────────────────────────────────────────────────
 
 /// `None` = no clause; `Null` = explicit `DEFAULT NULL`; `Literal` = a typed
 /// constant; `CurrentTimestamp` = `CURRENT_TIMESTAMP` (Timestamp columns only).
@@ -181,8 +175,6 @@ impl CatalogEntry {
     }
 }
 
-// ── Create-table input (no ids yet; the catalog assigns them) ──────────────────
-
 #[derive(Debug, Clone)]
 pub struct ColumnInput {
     pub name: String,
@@ -269,8 +261,6 @@ impl Drop for IndexReservationGuard {
         }
     }
 }
-
-// ── RelCatalog ─────────────────────────────────────────────────────────────────
 
 pub struct RelCatalog {
     /// system_prefix → (object name → entry). Keyed by prefix so recovery is
@@ -638,8 +628,6 @@ impl RelCatalog {
         }
     }
 
-    // ── internals ──────────────────────────────────────────────────────────────
-
     /// The highest live table/index id under `prefix` (`0` if none).
     fn max_live_id(&self, prefix: &[u8]) -> u32 {
         self.entries.read().get(prefix).map_or(0, |m| {
@@ -909,12 +897,11 @@ impl RelCatalog {
         })
     }
 
-    // ── DDL primitives beyond CREATE TABLE ────────────────
-    //
-    // Each is self-validating and atomic under `ddl_lock`, mirroring
-    // `create_table`'s established shape: resolve the domain, re-check
-    // everything from a consistent cache snapshot, mutate, persist, update
-    // the cache. `schema_version` only moves on ADD/DROP COLUMN.
+    // The DDL primitives beyond CREATE TABLE are each self-validating and
+    // atomic under `ddl_lock`, mirroring `create_table`'s established shape:
+    // resolve the domain, re-check everything from a consistent cache
+    // snapshot, mutate, persist, update the cache. `schema_version` only
+    // moves on ADD/DROP COLUMN.
 
     /// `ALTER TABLE ... ADD COLUMN` — appends one column. Rejects
     /// `PRIMARY KEY`/`AUTOINCREMENT`/`UNIQUE` (v1: a unique column is added
@@ -1824,8 +1811,6 @@ mod tests {
         })
     }
 
-    // ── DDL primitives beyond CREATE TABLE ────────────────────
-
     // 19. add_column: col_id is "highest existing + 1", never reused after a
     //     DROP COLUMN + ADD COLUMN cycle; schema_version bumps only on
     //     ADD/DROP COLUMN (not RENAME COLUMN/RENAME TO/CREATE|DROP INDEX).
@@ -2108,8 +2093,6 @@ mod tests {
         })
     }
 
-    // ── recover's tolerant skip paths ─────────────
-
     // 27. A CAT: key with no ':' after the prefix cannot be split into
     //     (system_prefix, name) -> skipped (tracing::warn), other entries
     //     recover normally.
@@ -2232,8 +2215,6 @@ mod tests {
         })
     }
 
-    // ── validate_columns/check_default error paths ─
-
     // 30. Two columns normalizing to the same name -> InvalidSchema("duplicate
     //     column ..."), before any other column check runs.
     #[test]
@@ -2289,8 +2270,6 @@ mod tests {
             }
         })
     }
-
-    // ── Fixes ───────────────────────────────────────────────────────────────────
 
     // 33. An index id is reserved across create_index_reserve→commit;
     //     a backfill abort (guard drop) frees it, and so does commit — the

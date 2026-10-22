@@ -30,8 +30,6 @@ fn check_budget(engine: &RelEngine, state: &AppState, domain: &str) -> Result<()
     }
 }
 
-// ── DTOs ─────────────────────────────────────────────────────────────────────
-
 #[derive(Serialize, ToSchema)]
 pub struct CreateFromFileColumn {
     pub name: String,
@@ -56,8 +54,6 @@ pub struct CreateFromFileResponse {
     pub failed: u64,
     pub errors: Vec<CreateFromFileErrorEntry>,
 }
-
-// ── Handler ──────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     post,

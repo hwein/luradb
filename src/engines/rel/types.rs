@@ -6,8 +6,6 @@
 
 use serde::{Deserialize, Serialize};
 
-// ── ColumnType ─────────────────────────────────────────────────────────────────
-
 /// The five canonical value types plus the two reference tags. `KvRef`/`JsonRef`
 /// are physically TEXT; they are only type tags here — validation and
 /// resolution live in `cross_engine.rs`.
@@ -49,8 +47,6 @@ impl ColumnType {
     }
 }
 
-// ── ScalarValue ────────────────────────────────────────────────────────────────
-
 /// A canonical scalar value — the shared basis for defaults and encoding.
 /// `KvRef`/`JsonRef` values live as `Text`; the tag stays in `ColumnType`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,8 +73,6 @@ impl ScalarValue {
         ) || matches!(self, ScalarValue::Null)
     }
 }
-
-// ── Memcomparable encoding ─────────────────────────────────────────────────────
 
 /// Order-preserving, self-terminating encoding of a scalar value. `Null` yields
 /// `None` (not indexed). The byte order of the result matches the natural order
@@ -133,9 +127,7 @@ fn encode_text(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-// ── Wire serialization ────────────────────────────────────
-//
-// Placed here (not `src/api/rel.rs`):
+// `scalar_to_json` lives here, not in `src/api/rel.rs`:
 // `RelEngine::execute_sql`'s `ExpandedBlock` already builds its
 // `serde_json::Value` objects at the engine layer, before the REST handler
 // ever sees the result — so the engine needs this conversion too. Making the
@@ -290,8 +282,6 @@ mod tests {
     fn test_encode_null_is_none() {
         assert_eq!(encode_sortable(&ScalarValue::Null), None);
     }
-
-    // ── scalar_to_json / ISO-8601 formatter ───────────────
 
     #[test]
     fn test_scalar_to_json_all_variants() {

@@ -9,8 +9,6 @@
 
 use super::error::RelStoreError;
 
-// ── Keywords ───────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     Create,
@@ -249,8 +247,6 @@ impl Keyword {
     }
 }
 
-// ── Tokens ─────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Keyword(Keyword),
@@ -308,8 +304,6 @@ fn syntax_err(pos: usize, msg: impl Into<String>) -> RelStoreError {
         msg: msg.into(),
     }
 }
-
-// ── Tokenizer ────────────────────────────────────────────────────────────────
 
 /// Lexes `sql` into `(Token, byte_pos)` pairs. `max_statement_len` is checked
 /// first — over the limit, no token is produced at all.
@@ -687,8 +681,6 @@ mod tests {
         let sql = "x".repeat(64);
         assert!(tokenize(&sql, 64).is_ok());
     }
-
-    // ── tokenize/scan_number error paths ─────────
 
     // A lone '!' (no following '=') is a syntax error, not silently consumed.
     #[test]

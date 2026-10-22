@@ -29,8 +29,6 @@ pub(crate) fn is_supported_format(format_version: u32) -> bool {
 /// Keys exported between two yields.
 const EXPORT_KEY_YIELD_INTERVAL: u32 = 1024;
 
-// ── Wire format (shared with `restore`) ─────────────────────────────────
-
 /// The first line of an archive. Fields a version 1 archive lacks read as 0.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ManifestLine {
@@ -122,8 +120,6 @@ struct AuthPermLine<'a> {
     perm: &'a DomainPermission,
 }
 
-// ── Scope resolution ─────────────────────────────────────────────────────
-
 /// The concrete domains a scope resolves to, from the directory of every
 /// data shard, each engine's in name order and only `Active` ones. Either
 /// list can be empty for any scope — every domain of an engine may be
@@ -172,8 +168,6 @@ pub(crate) fn resolve_scope(scope: &BackupScope, control: &ControlPlane) -> Resu
         }
     }
 }
-
-// ── Backup job ────────────────────────────────────────────────────────────
 
 pub(crate) struct BackupParams<'a> {
     pub dir: &'a Path,

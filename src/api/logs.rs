@@ -34,8 +34,6 @@ pub struct LogAccessState {
 const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const CHUNK_SIZE: usize = 64 * 1024;
 
-// ── DTOs ─────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize, ToSchema)]
 pub struct LogQuery {
     /// Tail line count from the file end (default 100, capped at 1000). `0` is rejected.
@@ -88,8 +86,6 @@ fn log_access_state(state: &AppState) -> Result<&LogAccessState, ApiError> {
         )
     })
 }
-
-// ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     get,
@@ -184,8 +180,6 @@ pub async fn list_files(State(state): State<AppState>) -> Result<Json<LogFilesRe
     Ok(Json(LogFilesResponse { files }))
 }
 
-// ── File listing & selection ────────────────────────────────────────────────
-
 /// Whitelist for the `file` query param: must start with `luradb.log` and
 /// stay a single path segment -- structurally excludes traversal. Same
 /// prefix rule as `LogJanitor`.
@@ -219,8 +213,6 @@ async fn list_log_files(dir: &Path) -> io::Result<Vec<LogFileInfo>> {
     files.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.file.cmp(&a.file)));
     Ok(files)
 }
-
-// ── Backward tail ────────────────────────────────────────────────────────────
 
 struct TailResult {
     lines: Vec<String>,
@@ -337,8 +329,6 @@ fn push_if_match(bytes: &[u8], q: Option<&str>, out: &mut Vec<String>) {
         out.push(line);
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

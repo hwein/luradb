@@ -21,8 +21,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
-// --- I/O Commands ---
-
 /// Represents a command sent to the dedicated I/O task.
 enum IoCommand {
     /// A request to read a page from disk.
@@ -37,8 +35,6 @@ enum IoCommand {
         responder: oneshot::Sender<Result<()>>,
     },
 }
-
-// --- DiskManager ---
 
 /// Manages reading and writing pages to and from the database file on disk.
 /// It sends I/O commands to a dedicated background task.
@@ -56,7 +52,6 @@ impl DiskManager {
     pub async fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel(128);
 
-        // --- File setup ---
         let path = db_path.as_ref().to_path_buf();
         let std_file = std::fs::OpenOptions::new()
             .read(true)
@@ -69,8 +64,7 @@ impl DiskManager {
         // SAFETY: the descriptor is `std_file`'s, whose ownership moves here.
         let db_file = unsafe { File::from_raw_fd(std_file.into_raw_fd()) };
 
-        // --- Spawn I/O Task --- one command at a time, each as an I/O task
-        // that runs to its end.
+        // One command at a time, each as an I/O task that runs to its end.
         compio::runtime::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 let db_file = db_file.clone();
@@ -124,8 +118,6 @@ impl DiskManager {
         let new_page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
         PageId(new_page_id)
     }
-
-    // --- Private I/O task functions ---
 
     async fn perform_read(db_file: &File, page_id: PageId) -> Result<Page> {
         let offset = page_id.0 * PAGE_SIZE as u64;

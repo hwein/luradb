@@ -925,8 +925,6 @@ mod tests {
         })
     }
 
-    // ── Doorbell wakeup ──────────────────────────────────────
-
     /// What a doorbell-aware client does after each cmd-ring send.
     fn ring(doorbell: &OwnedFd) {
         // Safe: a 1-byte write from a live local to a pipe end we own.
@@ -1045,8 +1043,6 @@ mod tests {
             assert!(dispatcher.poll_doorbells(&mut cx).is_pending(), "a retired doorbell must stay silent");
         })
     }
-
-    // ── UTF-8 key invariant ───────────────────────────────
 
     // Test 4: a "400 "-prefixed engine error maps to code 400 over SHM.
     #[test]

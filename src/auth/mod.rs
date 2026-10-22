@@ -19,8 +19,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-// ── Key helpers ───────────────────────────────────────────────────────────────
-
 pub(crate) const PREFIX_USER: &str = "__sys:auth:user:";
 pub(crate) const PREFIX_PERM: &str = "__sys:auth:perm:";
 
@@ -51,8 +49,6 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-
-// ── Domain types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum UserRole {
@@ -85,8 +81,6 @@ pub struct DomainPermission {
     pub domain: String,
     pub access: AccessLevel,
 }
-
-// ── AuthCache ─────────────────────────────────────────────────────────────────
 
 pub struct AuthCache {
     /// api_key_hash → UserRecord
@@ -273,8 +267,6 @@ impl AuthCache {
     }
 }
 
-// ── Admin reconciliation ──────────────────────────────────────────────────────
-
 /// Reconciles the admin list from config with what is stored in the engine.
 ///
 /// 1. Upserts all admins from config (hash of key stored, plaintext discarded).
@@ -322,8 +314,6 @@ pub async fn reconcile_admins(
 
     Ok(())
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

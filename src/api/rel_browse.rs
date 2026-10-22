@@ -46,8 +46,6 @@ fn check_budget(engine: &RelEngine, state: &AppState, domain: &str, write: bool)
     }
 }
 
-// ── Catalog Browsing ─────────────────────────────────────────────────────────
-
 #[derive(Serialize, ToSchema)]
 pub struct TableLinks {
     #[serde(rename = "self")]
@@ -241,8 +239,6 @@ pub async fn list_views(
         .collect();
     Ok(Json(out))
 }
-
-// ── Row-Browse ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize, ToSchema)]
 pub struct RowsResponse {
@@ -474,8 +470,6 @@ pub async fn count_rows(
     Ok(Json(CountResponse { count }))
 }
 
-// ── Row-Writes ───────────────────────────────────────────────────────────────
-
 /// PK value for the `Location` header's final path segment:
 /// INTEGER as plain decimal, TEXT percent-encoded (it may contain `/`,
 /// spaces, non-ASCII, …). The PK is always INTEGER or TEXT.
@@ -641,8 +635,6 @@ mod tests {
     use axum::http::{Method, Request};
     use std::sync::Arc;
     use tower::util::ServiceExt;
-
-    // ── Harness (mirrors src/api/rel.rs's own test harness) ─────────────────
 
     async fn make_state(rel_config: Option<RelStoreConfig>, auth_enabled: bool) -> (AppState, tempfile::TempDir) {
         make_tuned_state(rel_config, auth_enabled, |_| {}).await
@@ -1399,8 +1391,6 @@ mod tests {
             assert_eq!(rest_status, StatusCode::CONFLICT, "same error code as the equivalent /sql INSERT");
         })
     }
-
-    // ── Rel object-count endpoint ────────────────────────────────────────────
 
     // Test 6: empty table -> 0; after 3 INSERT -> 3; after 1 DELETE -> 2.
     #[test]

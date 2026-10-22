@@ -21,8 +21,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-// ── Error mapping ────────────────────────────────────────────────────────────
-
 impl From<RelStoreError> for ApiError {
     fn from(e: RelStoreError) -> Self {
         let status = match &e {
@@ -139,8 +137,6 @@ pub(crate) async fn compute_link_auth(
     }
 }
 
-// ── DTOs ─────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize, ToSchema)]
 pub struct SqlRequest {
     /// Exactly one LuraSQL statement (more → 400 `MultipleStatements`).
@@ -155,8 +151,6 @@ pub struct SqlRequest {
     #[serde(default)]
     pub expand: Vec<String>,
 }
-
-// ── Wire serialization ──────────────────────────────────────────────────────
 
 /// Canonical wire type name (`ColumnType` → `columns[i].type`).
 /// `pub(super)`: reused by the catalog-browse DTOs (`rel_browse.rs`).
@@ -220,8 +214,6 @@ pub(super) fn dml_result_json(r: &DmlResult) -> Value {
         "last_pk": r.last_pk.as_ref().map(scalar_to_json).unwrap_or(Value::Null),
     })
 }
-
-// ── Handler ──────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     post,

@@ -43,8 +43,6 @@ log()  { printf '%s\n' "$*"; }
 step() { printf -- '-- %s\n' "$*"; }
 die()  { printf 'release.sh: %s\n' "$*" >&2; exit 1; }
 
-# --- Git/Cargo helpers -------------------------------------------------
-
 current_branch() { git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD; }
 
 resolve_repo_url() {
@@ -87,8 +85,6 @@ version_gt() {
     done
     return 1
 }
-
-# --- Preflight checks ----------------------------------------------
 
 check_branch() {
     local branch="$1" current
@@ -148,8 +144,6 @@ check_tag_free() {
     return 0
 }
 
-# --- Version proposal --------------------------------------------
-
 # Categories in the [Unreleased] section -> bump kind (0.x vs. 1.0+ rules).
 bump_kind() {
     local base="$1" body="$2" major has_breaking=0 has_feature=0
@@ -198,8 +192,6 @@ confirm_version() {
     fi
     printf '%s' "$final"
 }
-
-# --- CHANGELOG.md / Cargo.toml mutations -------------------------------
 
 # Removes category blocks ("### Name" + content) that have no bullet content.
 filter_empty_categories() {
@@ -341,8 +333,6 @@ push_atomic() {
     fi
 }
 
-# --- final mode --------------------------------------------------
-
 # Detects: commit/merge/tag/dev-bump already ran, only the push is still
 # missing. Prints the affected tag on a match.
 detect_pending_push_final() {
@@ -410,8 +400,6 @@ run_final() {
     push_atomic main next "$tag"
 }
 
-# --- rc mode ------------------------------------------------------
-
 detect_pending_push_rc() {
     [ "$(current_branch)" = "next" ] || return 1
     local head tag
@@ -456,8 +444,6 @@ run_rc() {
     create_tag "$tag" "LuraDB $tag"
     push_atomic next "$tag"
 }
-
-# --- --hotfix mode ------------------------------------------------
 
 detect_pending_push_hotfix() {
     local version="$1"
@@ -521,8 +507,6 @@ run_hotfix() {
     log "  cargo run --quiet -- --dump-openapi > api/openapi.json   (restore dev version)"
     log "Then delete $branch: git branch -d $branch"
 }
-
-# --- Arguments & dispatch --------------------------------------------------
 
 for arg in "$@"; do
     case "$arg" in

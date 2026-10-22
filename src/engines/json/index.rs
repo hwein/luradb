@@ -59,8 +59,6 @@ fn validate_field_path(field: &str) -> Result<(), JsonStoreError> {
     Ok(())
 }
 
-// ── IndexDefinition ───────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexFieldType {
@@ -76,8 +74,6 @@ pub struct IndexDefinition {
     pub domain: String,
     pub created_at: u64,
 }
-
-// ── Field extraction & value encoding ─────────────────────────────────────────
 
 /// Resolves `path` (dot notation) against `doc`. `None` if any segment is
 /// missing or an intermediate value is not an object.
@@ -115,8 +111,6 @@ pub fn encode_index_value(value: &Value, field_type: IndexFieldType) -> Option<V
         _ => None,
     }
 }
-
-// ── Index LSM keys ────────────────────────────────────────────
 
 pub(crate) const IDX_PREFIX: &[u8] = b"IDX:";
 
@@ -180,8 +174,6 @@ pub fn parse_index_key(lsm_key: &[u8]) -> Option<(String, String, Vec<u8>, Strin
         document_key.to_string(),
     ))
 }
-
-// ── IndexRegistry ─────────────────────────────────────────────────────────────
 
 /// Manages index definitions per domain (in-memory cache + LSM persistence).
 pub struct IndexRegistry {

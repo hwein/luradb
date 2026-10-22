@@ -21,8 +21,6 @@ use super::error::RelStoreError;
 use super::types::ScalarValue;
 use serde_json::Value;
 
-// ── Bound statement / DDL plan ──────────────────────────────────────────────────
-
 /// Result of binding: either a fully translated table/index DDL operation
 /// ready for `ddl.rs`, or a statement that passed the front-end guards and
 /// carries its AST on to `mod.rs` for execution (DML, SELECT, and CREATE/DROP
@@ -57,8 +55,6 @@ pub enum DdlPlan {
     },
     DropIndex { name: String },
 }
-
-// ── bind ─────────────────────────────────────────────────────────────────────
 
 /// `param_count` is the number of `?` placeholders the lexer counted
 /// (`lexer::count_params`); `params` is the caller-supplied bind list.
@@ -97,9 +93,7 @@ pub fn bind(
     })
 }
 
-// ── NULL-bind guard ───────────────────────────────────────────
-//
-// Walks WHERE expression trees only — the only place `Expr` occurs in the AST
+// The NULL-bind guard walks WHERE expression trees only — the only place `Expr` occurs in the AST
 // (a `JOIN ... ON` is always `column_ref = column_ref`, never a general
 // `Expr`, so there is nothing to guard there). `INSERT VALUES`/`UPDATE SET`
 // use the separate `value_expr`/`Operand` slot, never `Expr`, so a `NULL`
@@ -183,8 +177,6 @@ fn null_comparison_err() -> RelStoreError {
         hint: "use `col IS NULL` / `col IS NOT NULL` instead of comparing to NULL".to_string(),
     }
 }
-
-// ── DDL translation: AST → catalog inputs ───────────────────────────────────────
 
 fn translate_create_table(ct: CreateTable) -> TableInput {
     TableInput {

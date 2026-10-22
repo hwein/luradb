@@ -260,8 +260,6 @@ pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> 
     Some(crate::auth::hash_api_key(token))
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,8 +370,6 @@ mod tests {
         assert!(enforce_sql_level(false, None, Ddl).is_ok());
         assert!(enforce_sql_level(true, None, Ddl).is_err());
     }
-
-    // ── HTTP-level: /version handshake + /health regression ──
 
     use axum::body::Body;
     use axum::http::Request;
@@ -503,8 +499,6 @@ mod tests {
         })
     }
 
-    // ── /store-api/config admin-only ──────────────────────
-
     // Regression-critical: /store-api/config carries no `{domain}` segment, so
     // its admin-only protection is entirely implicit -- it falls out of
     // extract_domain's None branch above, same as /metrics, /events,
@@ -572,8 +566,6 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
         })
     }
-
-    // ── Docs routes behind auth ──────────────────────────
 
     #[test]
     fn docs_routes_require_key_when_auth_enabled() {

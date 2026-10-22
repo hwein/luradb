@@ -38,8 +38,6 @@ impl RelDomainPurger {
         Ok(())
     }
 
-    // ── Job (a): fully purge Deleting domains ──────────────────────────
-
     async fn purge_deleting_domains(&self) -> anyhow::Result<()> {
         for domain in self.engine.domains.list_deleting_domains() {
             if let Err(e) = self.purge_one_deleting(&domain).await {
@@ -89,8 +87,6 @@ impl RelDomainPurger {
         tracing::info!("[RelDomainPurger] domain '{}' fully purged", domain.name);
         Ok(())
     }
-
-    // ── Job (b): reap orphaned ranges of active domains ────────────────
 
     async fn sweep_active_domains(&self) -> anyhow::Result<()> {
         for domain in self.engine.domains.list_domains() {

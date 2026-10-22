@@ -20,8 +20,6 @@ use crate::metrics::MetricsStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// ── Resolver result types ──────────────────────────────────────────
-
 /// State of the same-named target domain in the target engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetDomain {
@@ -96,8 +94,6 @@ impl CrossEngineResolver {
         self.json.is_some()
     }
 
-    // ── Domain status ────────────────────────────────────────────────
-
     /// KV `get_domain` is async (cache-first, cold-cache engine fallback);
     /// `None` (disabled) → `EngineDisabled`, missing/`Deleting` → `GoneOrDeleting`.
     pub async fn kv_domain_status(&self, name: &str) -> anyhow::Result<TargetDomain> {
@@ -116,8 +112,6 @@ impl CrossEngineResolver {
             None => TargetDomain::GoneOrDeleting,
         }
     }
-
-    // ── Point lookups ───────────────────────────────────────────────────
 
     /// KVREF point lookup **directly on the KV LSM instance** (not via
     /// `DomainStore`): governance is already charged once at the rel REST edge
@@ -160,8 +154,6 @@ impl CrossEngineResolver {
         }
     }
 
-    // ── Metrics ─────────────────────────────────────────────────────────
-
     pub(crate) fn record_expand_lookup(&self, engine: &str) {
         self.metrics.record_rel_cross_engine_expand_lookup(engine);
     }
@@ -174,8 +166,6 @@ impl CrossEngineResolver {
         self.metrics.record_rel_cross_engine_swept_cells(n);
     }
 }
-
-// ── Authorization ──────────────────────────────────────────────
 
 /// Per-request cross-engine read rights, resolved by the REST handlers from
 /// the caller's KV/JSON permissions and threaded down to `compute_link_mask`
@@ -194,8 +184,6 @@ impl LinkAuth {
         Self { kv_read: true, json_read: true }
     }
 }
-
-// ── Read masking ────────────────────────────────────────────────────
 
 /// Per-query masking flags: a set flag means every column of that link type is
 /// materialized as `NULL` (the same-named target domain is gone/`Deleting` or
@@ -276,8 +264,6 @@ impl RelEngine {
     }
 }
 
-// ── Base64 (no crate — hand-written standard-alphabet encoder) ───────
-
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub(crate) fn base64_encode(input: &[u8]) -> String {
@@ -294,8 +280,6 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
     }
     out
 }
-
-// ── Physical sweep ──────────────────────────────────────────────────
 
 /// Seconds between sweep ticks and the max cells nulled per (domain,
 /// column, tick): a gentler cadence than the domain purger, since it
@@ -538,8 +522,6 @@ mod tests {
     use serde_json::{json, Value};
     use std::path::Path;
 
-    // ── Harness: three real, separate LSM instances (kv/json/rel) ────────────
-
     async fn make_lsm(dir: &Path, tag: &str) -> Arc<LsmStorageEngine> {
         let wal = Arc::new(WriteAheadLog::new(&dir.join(format!("{tag}.wal"))).await.unwrap());
         let vlog = Arc::new(VLog::new(&dir.join(format!("{tag}.vlog"))).await.unwrap());
@@ -697,16 +679,12 @@ mod tests {
             .unwrap();
     }
 
-    // ── Base64 ──────────────────────────────────────────────────────────
-
     #[test]
     fn test_base64_encoder() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"hi"), "aGk=");
         assert_eq!(base64_encode(&[0xFF, 0xFE, 0xFD]), "//79");
     }
-
-    // ── 1. Write validation KVREF ok ─────────────────────────────────────────
 
     #[test]
     fn test_write_kvref_ok() {
@@ -721,8 +699,6 @@ mod tests {
             );
         })
     }
-
-    // ── 2. Write validation KVREF missing + multi-row atomicity ──────────────
 
     #[test]
     fn test_write_kvref_missing_and_atomic() {
@@ -741,8 +717,6 @@ mod tests {
         })
     }
 
-    // ── 3. Write validation JSONREF ok/missing ───────────────────────────────
-
     #[test]
     fn test_write_jsonref_ok_and_missing() {
         crate::core::engine_runtime::block_on(async {
@@ -754,8 +728,6 @@ mod tests {
             assert!(matches!(err, RelStoreError::CrossEngineLinkMissing { .. }), "got: {err}");
         })
     }
-
-    // ── 4. Target domain gone/deleting → 409 unavailable ─────────────────────
 
     #[test]
     fn test_write_target_domain_gone() {
@@ -777,8 +749,6 @@ mod tests {
         })
     }
 
-    // ── 5. Engine disabled: DDL 409, and value 409 when domain absent ────────
-
     #[test]
     fn test_engine_disabled_ddl_and_value() {
         crate::core::engine_runtime::block_on(async {
@@ -797,8 +767,6 @@ mod tests {
         })
     }
 
-    // ── 6. NULL link unchecked (no cross-engine read) ───────────────────────
-
     #[test]
     fn test_null_link_unchecked() {
         crate::core::engine_runtime::block_on(async {
@@ -815,8 +783,6 @@ mod tests {
             );
         })
     }
-
-    // ── 7. UPDATE re-validates only changed link columns ─────────────────────
 
     #[test]
     fn test_update_only_changed_links() {
@@ -837,8 +803,6 @@ mod tests {
         })
     }
 
-    // ── 8. Expand KVREF utf8 (incl. empty) ───────────────────────────────────
-
     #[test]
     fn test_expand_kvref_utf8_and_empty() {
         crate::core::engine_runtime::block_on(async {
@@ -855,8 +819,6 @@ mod tests {
         })
     }
 
-    // ── 9. Expand KVREF base64 (non-UTF-8 bytes) ─────────────────────────────
-
     #[test]
     fn test_expand_kvref_base64() {
         crate::core::engine_runtime::block_on(async {
@@ -868,8 +830,6 @@ mod tests {
             assert_eq!(colv(&exp, "payload")[0], json!({ "exists": true, "value": "//79", "encoding": "base64" }));
         })
     }
-
-    // ── 10. Expand KVREF hanging / domain gone → exists:false ────────────────
 
     #[test]
     fn test_expand_kvref_hanging_and_domain_gone() {
@@ -897,8 +857,6 @@ mod tests {
         })
     }
 
-    // ── 10b. Expand KVREF of a nulled key ──────────────────────
-
     #[test]
     fn test_expand_kvref_null_value() {
         crate::core::engine_runtime::block_on(async {
@@ -912,8 +870,6 @@ mod tests {
             assert_eq!(colv(&exp, "payload")[0], json!({ "exists": true, "value": null }));
         })
     }
-
-    // ── 11. Expand JSONREF ───────────────────────────────────────────────────
 
     #[test]
     fn test_expand_jsonref() {
@@ -932,8 +888,6 @@ mod tests {
         })
     }
 
-    // ── 12. rel-NULL vs. target-gone (three-states) ──────────────────────────
-
     #[test]
     fn test_expand_rel_null_vs_gone() {
         crate::core::engine_runtime::block_on(async {
@@ -948,8 +902,6 @@ mod tests {
             assert_eq!(v[1], json!({ "exists": false, "value": null }), "gone target → exists:false");
         })
     }
-
-    // ── 13. Wildcard resolves REFERENCES *and* KVREF/JSONREF ─────────────────
 
     #[test]
     fn test_expand_wildcard_references_and_links() {
@@ -974,8 +926,6 @@ mod tests {
         })
     }
 
-    // ── 14. Explicit link expand resolves (no more 400) ──────────────────────
-
     #[test]
     fn test_expand_explicit_link_resolves() {
         crate::core::engine_runtime::block_on(async {
@@ -997,8 +947,6 @@ mod tests {
         })
     }
 
-    // ── 15. max_join_depth counts link expand columns ────────────────────────
-
     #[test]
     fn test_expand_max_join_depth() {
         crate::core::engine_runtime::block_on(async {
@@ -1015,8 +963,6 @@ mod tests {
         })
     }
 
-    // ── 16. Large KV value flows into the expand block (413 backstop input) ──
-
     #[test]
     fn test_expand_large_kv_value_in_block() {
         crate::core::engine_runtime::block_on(async {
@@ -1031,8 +977,6 @@ mod tests {
             assert_eq!(colv(&exp, "payload")[0]["value"].as_str().unwrap().len(), 4096);
         })
     }
-
-    // ── 17. Read masking (KV gone) leaves JSONREF untouched ──────────────────
 
     #[test]
     fn test_read_masking_kv_only() {
@@ -1052,8 +996,6 @@ mod tests {
             assert_eq!(r[0][1], ScalarValue::Text("j1".into()), "JSONREF untouched");
         })
     }
-
-    // ── 18. Masking + WHERE + index-path guard ───────────────────────────────
 
     #[test]
     fn test_masking_where_and_index_guard() {
@@ -1076,8 +1018,6 @@ mod tests {
             assert_eq!(rows(&e.rel, "d", "SELECT id FROM t WHERE payload IS NOT NULL").await.len(), 0);
         })
     }
-
-    // ── 19. Sweep physically nulls; recreate does not restore ────────────────
 
     #[test]
     fn test_sweep_physically_nulls() {
@@ -1104,8 +1044,6 @@ mod tests {
         })
     }
 
-    // ── 20. Sweep is optimistic: recreate + fresh valid link survives ────────
-
     #[test]
     fn test_sweep_optimistic_recreate() {
         crate::core::engine_runtime::block_on(async {
@@ -1128,8 +1066,6 @@ mod tests {
             assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Text("k2".into()));
         })
     }
-
-    // ── 21. Sweep via index vs. table scan; co-residents untouched ───────────
 
     #[test]
     fn test_sweep_index_vs_table_scan() {
@@ -1154,8 +1090,6 @@ mod tests {
             assert_eq!(raw_cell(&e.rel, "d", "plain", 1, "s").await, ScalarValue::Text("untouched".into()), "other table untouched");
         })
     }
-
-    // ── 22. Sweep convergence, budget, and metric ────────────────────────────
 
     #[test]
     fn test_sweep_convergence_and_budget() {
@@ -1202,8 +1136,6 @@ mod tests {
         n
     }
 
-    // ── 23. Expand-lookup metrics per engine (not on null/masked) ────────────
-
     #[test]
     fn test_metrics_expand_lookups() {
         crate::core::engine_runtime::block_on(async {
@@ -1223,11 +1155,10 @@ mod tests {
         })
     }
 
-    // ── 24. Disabled-handle smoke: pre-existing links masked, writes 409 ─────
-    //
     // A link *column* can only be created while its engine is enabled, so
     // the disabled case is a restart: build the schema+rows with engines on,
     // then reboot the same rel data with a fully-disabled resolver.
+    // Disabled handle: existing links are masked, writes answer 409.
     #[test]
     fn test_disabled_smoke() {
         crate::core::engine_runtime::block_on(async {
@@ -1295,8 +1226,6 @@ mod tests {
             );
         })
     }
-
-    // ── LinkAuth ────────────────────────────────────────────
 
     // 26. (a)+(b) missing read right masks only that engine's link columns —
     // identical to "target domain gone" — the other engine stays untouched;
@@ -1409,8 +1338,6 @@ mod tests {
         })
     }
 
-    // ── Per-engine ops/s + latency percentiles ─────────────
-
     // Tests 3+4: one op per engine (KV put+get, JSON create+get, rel
     // INSERT+SELECT) increments exactly that engine's read_ops/write_ops and
     // fills its latency buckets, while the other two engines stay at 0.
@@ -1459,8 +1386,6 @@ mod tests {
             assert_eq!(rel_m.write_ops, 0);
         })
     }
-
-    // ── A disabled target engine is not "gone" for the sweep ───
 
     // Tests 1+2 (JSONREF): masked while JSON is disabled, sweeper ticks must
     // not physically null the cell, and the reference is back once JSON is

@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 const ROOT_PAGE_ID: PageId = PageId(0);
 
-// --- Constants for the Slotted Page Layout ---
 // The header at the start of the page's data section.
 const SLOTS_COUNT_HEADER_SIZE: usize = 4; // u32 for number of slots
 // Each slot entry at the end of the page.

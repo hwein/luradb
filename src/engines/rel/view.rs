@@ -39,8 +39,6 @@ use std::sync::Arc;
 /// the defensive recursion cap against manual catalog corruption.
 const MAX_VIEW_DEPTH: usize = 3;
 
-// ── CREATE/DROP VIEW execution ─────────────────────────────────
-
 /// Executes `CREATE VIEW`: validates the subset, then binds
 /// and stores the *raw* SELECT text atomically under the catalog's
 /// `ddl_lock` (via `create_view_checked`'s `validate` closure) — so no
@@ -91,8 +89,6 @@ pub(super) async fn execute_drop_view(
     engine.metrics.record_rel_ddl_view_op("drop_view");
     Ok(DdlOutcome::ViewDropped { name: dv.name })
 }
-
-// ── The allowed view-definition subset ──────────────────────────────────
 
 /// Rejects the disallowed view-body shapes: `?`
 /// parameters, `ORDER BY`, `LIMIT`/`OFFSET`, a bare `COUNT(*)` projection, and
@@ -163,8 +159,6 @@ fn extract_view_sql(sql: &str, offset: usize) -> String {
     }
 }
 
-// ── Catalog lookup abstraction (live vs. a prospective in-memory map) ───────
-
 type Lookup<'a> = dyn Fn(&str) -> Result<CatalogEntry, RelStoreError> + 'a;
 
 /// Looks up against the live catalog (SELECT-time inlining, CREATE VIEW's
@@ -204,8 +198,6 @@ fn parse_view_sql(sql: &str) -> Result<Select, RelStoreError> {
         _ => unreachable!("a stored view body is always a bare SELECT (validated at CREATE VIEW time)"),
     }
 }
-
-// ── The inliner ─────────────────────────────────────────────────
 
 /// Per-source output-name map: `output name -> the flat, fully-qualified
 /// ColumnRef it resolves to`. A plain table source gets the
@@ -608,8 +600,6 @@ fn and_opt(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
     }
 }
 
-// ── CREATE-time full bind-and-discard (needs RelEngine: index requirement) ─
-
 /// Builds (and discards) the flat plan for an already-inlined `flat` select,
 /// reusing the exact binder SELECT/JOIN execution would use
 /// (building performs all checks) — including, for joins, the
@@ -697,8 +687,6 @@ fn check_no_duplicate_names(proj: &[ProjectedColumn]) -> Result<(), RelStoreErro
     }
     Ok(())
 }
-
-// ── DDL dependency check (structural bind only, no RelEngine) ──────────
 
 /// The `check` guard `ddl.rs`'s DROP TABLE / DROP COLUMN / RENAME COLUMN /
 /// RENAME TABLE arms and this module's own `DROP VIEW` pass to the catalog's

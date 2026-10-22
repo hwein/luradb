@@ -11,7 +11,7 @@ readme = "README.md"
 exclude = ["/.github/**", "/docs/**"]
 
 [dependencies]
-# --- Core: Async Runtime & Web Interface ---
+# Core: async runtime & web interface
 # Axum is our "driver"
 axum = { version = "0.7", features = ["macros", "http2"] }
 # Direct access to the HTTP conn machinery for the UDS listener;
@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
 
-# --- The "Lura" Power: Linux I/O ---
+# Linux I/O
 # Raw io_uring ring for the SQPOLL storage thread.
 io-uring = "0.6"
 # Runtime of the engine thread; pinned, minor releases break.
@@ -44,7 +44,7 @@ libc = "0.2"
 # Efficient byte handling for zero-copy strategies
 bytes = "1.5"
 
-# --- Storage & Data Engines ---
+# Storage & data engines
 # Serde for everything (JSON engine & API responses)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,14 +54,14 @@ memmap2 = "0.9"
 # order across architectures; validation (bytecheck) is a default feature.
 rkyv = { version = "0.8.17", features = ["little_endian"] }
 
-# --- Concurrency & Safety ---
+# Concurrency & safety
 # DashMap for high-performance, lock-free maps in RAM
 dashmap = "5.5"
 crossbeam-skiplist = "0.1"
 crossbeam-utils = "0.8"
 parking_lot = "0.12"
 
-# --- Utils ---
+# Utils
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"

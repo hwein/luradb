@@ -253,8 +253,6 @@ impl RelEngine {
         self.engine.shutdown().await;
     }
 
-    // ── Domain management ───────────────────────────────────────
-
     /// Creates a new rel domain.
     pub(crate) async fn create_domain(&self, name: &str) -> Result<RelDomain, RelStoreError> {
         self.domains.create_domain(name).await
@@ -309,8 +307,6 @@ impl RelEngine {
         self.write_guard.lock().await
     }
 
-    // ── Catalog ─────────────────────────────────────────────────
-
     /// Programmatic catalog API for the DDL/REST layers.
     pub fn catalog(&self) -> &Arc<RelCatalog> {
         &self.catalog
@@ -349,8 +345,6 @@ impl RelEngine {
     pub async fn drop_object(&self, domain: &str, name: &str) -> Result<(), RelStoreError> {
         self.catalog.drop_object(&self.domains, domain, name).await
     }
-
-    // ── REST-edge limits ───────────────────────────────────
 
     /// `max_response_bytes` getter: the `/sql` handler checks the
     /// serialized response length against this after building it.
@@ -394,8 +388,6 @@ impl RelEngine {
         self.max_response_bytes = bytes;
     }
 
-    // ── Cross-engine links ───────────────────────────────────────
-
     /// Whether at least one target engine is wired — the sweeper is only worth
     /// spawning at startup then.
     pub fn cross_engine_has_target(&self) -> bool {
@@ -425,8 +417,6 @@ impl RelEngine {
         };
         Err(RelStoreError::CrossEngineTargetUnavailable { engine: engine.to_string(), domain: None })
     }
-
-    // ── SQL frontend & DDL ───────────────────────────────────────
 
     /// Runs one LuraSQL statement end to end: `max_statement_len` guard →
     /// lex → parse → bind (front-end guards for every class; full AST →
@@ -689,8 +679,6 @@ mod tests {
             rel.shutdown().await;
         })
     }
-
-    // ── SQL frontend & DDL end-to-end ────────────────────────────
 
     // 2. max_statement_len guard fires end-to-end, before lexing.
     #[test]
@@ -979,8 +967,6 @@ mod tests {
             rel.shutdown().await;
         })
     }
-
-    // ── Global lifecycle event bus ────────────────────────
 
     async fn make_engine_with_bus() -> (Arc<RelEngine>, Arc<crate::core::events::GlobalEventBus>, tempfile::TempDir) {
         let (rel, dir) = make_engine().await;

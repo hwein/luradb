@@ -13,8 +13,6 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-// ── DomainQuota ───────────────────────────────────────────────────────────────
-
 /// Per-domain resource limits.
 #[derive(Clone, Copy)]
 pub struct DomainQuota {
@@ -35,8 +33,6 @@ impl Default for DomainQuota {
         }
     }
 }
-
-// ── TokenBucket ───────────────────────────────────────────────────────────────
 
 /// Single-rate token bucket with lazy refill.
 ///
@@ -118,8 +114,6 @@ impl TokenBucket {
     }
 }
 
-// ── RateLimiter ───────────────────────────────────────────────────────────────
-
 /// Holds the read and write token buckets for one domain.
 pub struct RateLimiter {
     pub read_bucket: TokenBucket,
@@ -144,8 +138,6 @@ impl RateLimiter {
         self.write_bucket.try_consume()
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

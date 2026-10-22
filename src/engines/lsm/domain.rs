@@ -30,8 +30,6 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
 const SYS_DOMAIN_PREFIX: &[u8] = b"__sys:domain:";
 
 /// Keys the post-scan loops of one method process between two yields; they
@@ -91,8 +89,6 @@ async fn count_and_release(keys: Vec<Vec<u8>>, coop: &mut YieldEvery) -> u64 {
     count
 }
 
-// ── DomainConfig ──────────────────────────────────────────────────────────────
-
 /// Configuration for the domain management layer.
 pub struct DomainConfig {
     pub max_name_length: usize,
@@ -121,8 +117,6 @@ impl Default for DomainConfig {
         }
     }
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -184,16 +178,12 @@ fn deleting_error(name: &str) -> anyhow::Error {
     anyhow!("410 Gone: Domain '{}' is being deleted", name)
 }
 
-// ── DomainState ───────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum DomainState {
     #[default]
     Active,
     Deleting,
 }
-
-// ── Domain ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Domain {
@@ -220,8 +210,6 @@ impl Domain {
         }
     }
 }
-
-// ── DomainRuntime ─────────────────────────────────────────────────────────────
 
 /// Non-serializable, per-domain in-memory state.
 struct DomainRuntime {
@@ -257,8 +245,6 @@ impl DomainRuntime {
         &self.key_write_locks[(fnv64(user_key) % KEY_WRITE_SHARDS as u64) as usize]
     }
 }
-
-// ── DomainRegistry ────────────────────────────────────────────────────────────
 
 /// Holds the domains: lookup, listing and recovery. Creates and deletes run
 /// through the control plane, one at a time.
@@ -527,8 +513,6 @@ impl DomainRegistry {
         self.store(&self.config.default_domain).await
     }
 }
-
-// ── DomainStore ───────────────────────────────────────────────────────────────
 
 /// Domain-scoped facade over `LsmStorageEngine`.
 ///
@@ -1019,8 +1003,6 @@ impl DomainStore {
     }
 }
 
-// ── DomainPurger ──────────────────────────────────────────────────────────────
-
 /// Background task that tombstones all keys belonging to `Deleting` domains.
 ///
 /// Operates in batches to avoid starving normal I/O. After all keys of a
@@ -1061,8 +1043,6 @@ impl DomainPurger {
         Ok(())
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1414,8 +1394,6 @@ mod tests {
         })
     }
 
-    // ── UTF-8 key invariant ─────────────────────────────────────────────────
-
     // Test 1a: all five DomainStore operations reject a non-UTF-8 key with a
     // "400 "-prefixed error.
     #[test]
@@ -1495,8 +1473,6 @@ mod tests {
         })
     }
 
-    // ── Snapshot-pinned reads/scans (backup export) ─────────────────────────
-
     // get_with_snapshot/scan_keys_with_snapshot must strip the domain prefix
     // like their unpinned counterparts and stay isolated between domains.
     #[test]
@@ -1544,8 +1520,6 @@ mod tests {
             assert_eq!(store.get(b"k1").await.unwrap(), GetResult::Present(b"new".to_vec()));
         })
     }
-
-    // ── Watch event ids, resume & gap signal ────────────────────────────────
 
     // Test 1: 10 writes, disconnect after event 3, reconnect with its id ->
     // exactly events 4..=10, in order, as a gapless Replay (no reset).
@@ -1780,8 +1754,6 @@ mod tests {
             }
         })
     }
-
-    // ── Prefix bulk-delete ───────────────────────────────────────────────────
 
     /// Reopens an `LsmStorageEngine` on `dir`'s existing WAL/VLog/SSTable
     /// files (same file names as `make_setup`) — mirrors `engine.rs`'s own

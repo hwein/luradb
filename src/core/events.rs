@@ -188,8 +188,6 @@ impl<T: Clone> SeqRing<T> {
     }
 }
 
-// ── Global lifecycle/DDL event stream ────────────────────
-
 /// Tag for `GET /store-api/events` ids — distinguishes them from `WATCH_TAG`
 /// (`w`), which shares the same epoch/sequence format but is a
 /// separate stream with its own sequence.
@@ -462,8 +460,6 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(received, sorted, "broadcast order must equal sequence order: {received:?}");
     }
-
-    // ── GlobalEventBus ───────────────────────────────────
 
     #[test]
     fn test_global_event_bus_publish_populates_fields_and_advances_head() {

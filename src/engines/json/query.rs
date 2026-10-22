@@ -62,8 +62,6 @@ pub struct SearchResult {
     pub limit: u32,
 }
 
-// ── Unfiltered listing ────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub struct ListOptions {
     pub limit: u32,
@@ -511,8 +509,6 @@ mod tests {
             assert!(matches!(err, JsonStoreError::InvalidFilter(_)), "got: {err}");
         })
     }
-
-    // ── Listing & counting ───────────────────────────────────
 
     async fn seed(json: &Arc<JsonEngine>, n: usize) {
         for i in 0..n {

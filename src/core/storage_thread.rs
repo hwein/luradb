@@ -200,8 +200,6 @@ impl Drop for StorageThread {
     }
 }
 
-// ── Thread internals ────────────────────────────────────────────────────────
-
 /// One engine's WAL file and its append cursor.
 struct WalFile {
     engine: WalTarget,
@@ -901,8 +899,6 @@ fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     Ok(())
 }
 
-// ── Log header ──────────────────────────────────────────────────────────────
-
 /// Starts an empty log with the header and completes a torn one; returns
 /// whether the log has the header — `false` for a log of the earlier format,
 /// which stays as it is.
@@ -936,8 +932,6 @@ pub(crate) fn appends_refused() -> std::io::Error {
         "the write-ahead log still has the format of an earlier version; it takes appends once the start has truncated it",
     )
 }
-
-// ── Unsafe-end marker ───────────────────────────────────────────────────────
 
 /// The file beside the WAL at `log` that holds the cursor (8 bytes,
 /// big-endian) while a failed cut leaves bytes past it; the next start cuts
@@ -1040,8 +1034,6 @@ fn cut_to_marker(log: &Path, file: &File, marker: &Path, cursor: u64) -> std::io
     }
     unmark_unsafe_end(marker)
 }
-
-// ── Raw io_uring helpers ────────────────────────────────────────────────────
 
 /// Builds the SQPOLL ring; on `EPERM` (missing `CAP_SYS_NICE`) or when disabled,
 /// falls back to the standard ring. Returns `(ring, sqpoll_active)`.

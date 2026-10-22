@@ -51,10 +51,6 @@ use tokio::sync::watch;
 pub type FlushBarrier =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 /// Tuning parameters for the Janitor background task.
 #[derive(Debug, Clone)]
 pub struct JanitorConfig {
@@ -82,10 +78,6 @@ impl Default for JanitorConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GC statistics
-// ---------------------------------------------------------------------------
-
 /// Outcome of a single Janitor GC cycle.
 #[derive(Debug, Default)]
 pub struct GcStats {
@@ -108,10 +100,6 @@ impl GcStats {
         Self { ran: false, ..Default::default() }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Janitor
-// ---------------------------------------------------------------------------
 
 /// Background garbage collector for the Value Log.
 pub struct Janitor {
@@ -241,10 +229,6 @@ impl Janitor {
         self.before_manifest_swap_hook = Some(hook);
     }
 
-    // -----------------------------------------------------------------------
-    // Background loop
-    // -----------------------------------------------------------------------
-
     /// Runs the Janitor's periodic GC loop.
     ///
     /// Intended to be spawned as a task of the engine runtime. `shutdown_rx`
@@ -272,10 +256,6 @@ impl Janitor {
         self.delete_retired_generations(true).await;
     }
 
-    // -----------------------------------------------------------------------
-    // GC cycle
-    // -----------------------------------------------------------------------
-
     /// Runs one GC cycle.
     ///
     /// Returns [`GcStats`] describing what happened.  If the dead-byte ratio
@@ -290,8 +270,6 @@ impl Janitor {
             (version.vlog_ids(), version.vlog_size())
         };
 
-        // ── Decide whether to run ────────────────────────────────────────
-        //
         // Trigger heuristic only: values that are still MemTable-resident count
         // as dead here, which can make the GC run earlier but never costs data
         // (the authoritative live set is collected after the barrier below).
@@ -330,8 +308,6 @@ impl Janitor {
             None => None,
         };
 
-        // ── Roll forward to a fresh generation ───────────────────────────
-        //
         // New writes land here from now on; `u32` overflow needs 4 billion GC
         // cycles on one store and is unreachable in practice.
         let new_id = source_ids.iter().max().copied().unwrap_or(0) + 1;
@@ -391,15 +367,12 @@ impl Janitor {
             self.reload_level_readers().await?
         };
 
-        // ── Persist manifest ───────────────────────────────────────────────
         let manifest_for_save = self.manifest.read().clone();
         self.manifest_manager.save(&manifest_for_save).await?;
 
         self.retire_old_sstables(&retired, &old_file_ids).await;
 
-        // ── Drop the source generations ────────────────────────────────────
-        //
-        // No SSTable references them anymore. A reader's version that still
+        // No SSTable references the source generations anymore. A reader's version that still
         // holds one keeps its file until that version is dropped.
         let live_bytes_by_generation = live_bytes_per_generation(&source_ids, &live);
         let live_bytes: u64 = live_bytes_by_generation.iter().map(|(_, b)| *b).sum();
@@ -427,10 +400,6 @@ impl Janitor {
             new_generation: new_id,
         })
     }
-
-    // -----------------------------------------------------------------------
-    // GC phases (helpers of run_gc)
-    // -----------------------------------------------------------------------
 
     /// Installs `vlog` as the active generation with a fresh MemTable, under
     /// the engine's write drain (see [`Self::write_drain`]).

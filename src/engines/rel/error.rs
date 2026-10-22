@@ -13,7 +13,6 @@ pub enum RelStoreError {
     #[error("invalid domain name: {0}")]
     InvalidDomainName(String),
 
-    // ── Catalog ──────────────────────────────────────────────
     /// Table/view/column/index name violates the identifier rules (→ 400).
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
@@ -32,7 +31,6 @@ pub enum RelStoreError {
     #[error("catalog id space exhausted for domain '{0}'")]
     IdSpaceExhausted(String),
 
-    // ── SQL frontend & DDL ───────────────────────────────────
     /// `sql.len()` exceeds `max_statement_len` — checked before lexing (→ 400).
     #[error("statement length {len} exceeds maximum of {max} bytes")]
     StatementTooLong { len: usize, max: usize },
@@ -82,7 +80,6 @@ pub enum RelStoreError {
     /// `DROP COLUMN` on the primary key or an indexed column (→ 409).
     #[error("column '{column}' of table '{table}' is the primary key or is indexed")]
     ColumnIndexedOrPrimaryKey { table: String, column: String },
-    // ── DML write path ───────────────────────────────────────
     /// DML/SELECT target is a view, not a table (→ 400).
     #[error("'{name}' is a view and is not writable")]
     NotWritable { name: String },
@@ -114,19 +111,16 @@ pub enum RelStoreError {
     #[error("AUTOINCREMENT sequence of table '{table}' is exhausted")]
     SequenceExhausted { table: String },
 
-    // ── SELECT executor ──────────────────────────────────────
     /// In-memory ORDER BY sort buffer exceeded `max_sort_rows` (→ 400).
     #[error("sort buffer of {rows} rows exceeds maximum of {max}; narrow the result with WHERE/LIMIT or add a matching index")]
     SortBufferExceeded { rows: usize, max: usize },
 
-    // ── LIKE matcher ───────────────────────────────────────────
     /// `like_match`'s per-row step counter exceeded its budget — pattern and
     /// value are pathologically self-similar (`%` backtracking) (→ 400,
     /// propagates before negation: `NOT LIKE` over budget is the same error).
     #[error("LIKE match aborted after {steps} steps (budget {max}): pattern and value are pathologically self-similar")]
     LikeBudgetExceeded { steps: usize, max: usize },
 
-    // ── LEFT JOIN ─────────────────────────────────────────────
     /// `select.joins.len()` (plus any already-consumed expand stages)
     /// exceeds `max_join_depth` (→ 400).
     #[error("join depth {depth} exceeds the maximum of {max}")]
@@ -143,13 +137,11 @@ pub enum RelStoreError {
     #[error("column '{name}' is ambiguous across the tables in this query")]
     AmbiguousColumn { name: String },
 
-    // ── Views ─────────────────────────────────────────────────
     /// DROP TABLE / DROP COLUMN / RENAME COLUMN / RENAME TO / DROP VIEW would
     /// invalidate a view that (transitively) references the changed object (→ 409).
     #[error("'{object}' is referenced by view(s) {views:?} and cannot be changed")]
     ViewDependencyConflict { object: String, views: Vec<String> },
 
-    // ── REST I: domains & /sql ───────────────────────────────
     /// Per-domain request budget exhausted — checked before any
     /// execution I/O (→ 429, `Retry-After` set by `ApiError`).
     #[error("rate limit exceeded for domain '{domain}'")]
@@ -160,7 +152,6 @@ pub enum RelStoreError {
     #[error("invalid expand: {0}")]
     InvalidExpand(String),
 
-    // ── Cross-engine links ───────────────────────────────────
     /// DML: the target KV/JSON engine is disabled, or the same-named target
     /// domain is missing/`Deleting`. DDL: a link column is declared but its
     /// target engine is disabled (`domain` = `None`). `engine ∈ {"kv","json"}` (→ 409).

@@ -16,8 +16,6 @@ use axum::{
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-// ── ApiError ──────────────────────────────────────────────────────────────────
-
 /// Unified API error that maps anyhow errors to HTTP responses.
 /// Extra headers are boxed so the error stays small on every `Result` path.
 pub struct ApiError(StatusCode, String, Option<Box<HeaderMap>>);
@@ -91,8 +89,6 @@ impl IntoResponse for ApiError {
         resp
     }
 }
-
-// ── Trusted Proxy Middleware ──────────────────────────────────────────────────
 
 /// The resolved real client IP address, set by [`proxy_fn`] on every request.
 /// Downstream handlers and loggers can read this from request extensions.
@@ -224,8 +220,6 @@ pub async fn proxy_fn(
     next.run(request).await
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,8 +236,6 @@ mod tests {
         h.insert("x-real-ip", HeaderValue::from_str(ip).unwrap());
         h
     }
-
-    // ── CIDR matching ──────────────────────────────────────────────────────
 
     #[test]
     fn cidr_v4_exact() {
@@ -265,8 +257,6 @@ mod tests {
         assert!(c.contains("::1".parse().unwrap()));
         assert!(!c.contains("::2".parse().unwrap()));
     }
-
-    // ── Test 1: trusted proxy → client_ip from X-Forwarded-For ────────────
 
     #[test]
     fn trusted_proxy_xff_gives_real_ip() {
@@ -298,8 +288,6 @@ mod tests {
         assert_eq!(client_ip, "5.6.7.8".parse::<IpAddr>().unwrap());
     }
 
-    // ── Test 2: non-trusted peer → headers ignored ────────────────────────
-
     #[test]
     fn non_trusted_proxy_xff_ignored() {
         let peer: IpAddr = "5.6.7.8".parse().unwrap();
@@ -315,8 +303,6 @@ mod tests {
         assert_eq!(client_ip, peer);
     }
 
-    // ── Test 3: empty trusted_proxies → headers never evaluated ────────────
-
     #[test]
     fn empty_trusted_proxies_uses_peer_ip() {
         let peer: IpAddr = "127.0.0.1".parse().unwrap();
@@ -331,8 +317,6 @@ mod tests {
 
         assert_eq!(client_ip, peer);
     }
-
-    // ── Error mapping ───────────────────────────────────────────────────────
 
     #[test]
     fn api_error_maps_400_prefix_to_bad_request() {

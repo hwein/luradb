@@ -75,8 +75,6 @@ mod tests {
         }
     }
 
-    // ── build_layer (Test 2) ────────────────────────────────────────────────
-
     #[test]
     fn disabled_yields_no_layer() {
         assert!(build_layer(&CorsConfig::default()).is_none());
@@ -87,8 +85,6 @@ mod tests {
         // AllowOrigin::list panics on "*" — this proves any() is used instead.
         let _ = build_layer(&cors_cfg(&["*"])).expect("enabled config yields a layer");
     }
-
-    // ── HTTP-level (Tests 3-9) ───────────────────────────────────────────────
 
     async fn make_state(auth_enabled: bool) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();

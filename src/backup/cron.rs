@@ -150,10 +150,8 @@ fn parse_bound(part: &str, min: u32, max: u32, name: &str) -> Result<u32> {
     Ok(v)
 }
 
-// ── Civil calendar time ──────────────────────────────────────────────────
-//
-// Shared by backup/restore ID timestamps and, in the
-// scheduler follow-up, the cron minute-match against "now". This project has
+// `CivilTime` and `civil_from_unix` are shared by backup/restore ID timestamps
+// and the scheduler's cron minute-match against "now". This project has
 // no chrono/time dependency, so date math is done by hand: proleptic
 // Gregorian civil-from-days (Howard Hinnant's algorithm,
 // http://howardhinnant.github.io/date_algorithms.html).
@@ -373,8 +371,6 @@ mod tests {
     fn test_reject_empty_list_items() {
         assert!(CronSchedule::parse("1,,2 * * * *").is_err());
     }
-
-    // ── civil_from_unix / format_utc_timestamp ───────────────────────────
 
     #[test]
     fn test_civil_from_unix_epoch() {

@@ -18,8 +18,6 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-// ── Query param types ─────────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 pub struct EventsParams {
     /// Fallback resume id for callers that cannot set headers (e.g. `curl`,
@@ -27,8 +25,6 @@ pub struct EventsParams {
     /// are present.
     pub last_event_id: Option<String>,
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Resolves the effective `Last-Event-ID`: the header — what a native
 /// `EventSource`'s auto-reconnect sets — wins when both the header and
@@ -100,8 +96,6 @@ fn global_live_item(
     }
 }
 
-// ── Handler ───────────────────────────────────────────────────────────────────
-
 #[utoipa::path(
     get,
     path = "/store-api/events",
@@ -166,8 +160,6 @@ pub async fn get_events(
 
     Sse::new(leading_stream.chain(live_stream)).keep_alive(KeepAlive::default())
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -651,8 +643,6 @@ mod tests {
             assert_eq!(serde_json::from_str::<serde_json::Value>(&data).unwrap()["reason"], "unknown_id");
         })
     }
-
-    // ── Pure global_live_item branches (mirrors kv.rs's watch_item_tests) ────
 
     mod global_live_item_tests {
         use super::*;

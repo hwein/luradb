@@ -31,8 +31,6 @@ pub(super) const ROW_YIELD_INTERVAL: u32 = 256;
 /// Scanned keys post-processed between two yields.
 const KEY_YIELD_INTERVAL: u32 = 4096;
 
-// ── PlanRow / SourceBinding ────────────────────────────────────────
-//
 // A single-table SELECT fills exactly one `SourceBinding`. The join operator
 // appends one binding per join stage; `Filter`/`Sort`/`OffsetLimit`/projection all
 // go through `PlanRow` rather than a flat `Vec<ScalarValue>`, so they need no
@@ -60,8 +58,6 @@ impl PlanRow {
     }
 }
 
-// ── Volcano operator interface ─────────────────────────────────────
-//
 // `async fn` in a trait is not `dyn`-compatible; this
 // project's established pattern for async traits (`StorageEngine`,
 // `src/engines/mod.rs`) is RPITIT (`fn(&mut self) -> impl Future<...> + Send`),
@@ -323,8 +319,6 @@ impl RowPipeline {
     }
 }
 
-// ── Access-path key resolution ─────────────────────────────────────
-
 /// Resolves `access` to its candidate ROW keys, in the path's natural
 /// ascending key order (byte order == value order), plus the
 /// number of underlying LSM keys visited (I/O-budget metric).
@@ -511,8 +505,6 @@ fn encode_text_prefix(literal: &str) -> Vec<u8> {
     full
 }
 
-// ── SELECT-specific binding ────────────────────────────────────────
-
 pub(super) struct ProjectedColumn {
     pub(super) name: String,
     pub(super) col_type: ColumnType,
@@ -603,8 +595,6 @@ pub(super) fn bind_limit(
         }
     }
 }
-
-// ── Executor entry point ───────────────────────────────────────────
 
 impl RelEngine {
     /// Runs a single-table SELECT/COUNT(*) end to end: plan the access path

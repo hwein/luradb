@@ -7,8 +7,6 @@
 
 use super::types::ColumnType;
 
-// ── Statement classification (auth) ───────────────────────
-
 /// Coarse statement class for the two-stage auth enforcement.
 /// `Ddl` covers table/index/view DDL alike; every DDL statement parses, binds,
 /// and executes downstream (view DDL included).
@@ -18,8 +16,6 @@ pub enum StatementClass {
     Write,
     Ddl,
 }
-
-// ── Top-level statement ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -53,8 +49,6 @@ impl Statement {
         }
     }
 }
-
-// ── DDL: tables & indexes ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTable {
@@ -119,8 +113,6 @@ pub struct DropIndex {
     pub name: String,
 }
 
-// ── DDL: views ───────────
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateView {
     pub name: String,
@@ -135,8 +127,6 @@ pub struct CreateView {
 pub struct DropView {
     pub name: String,
 }
-
-// ── DML ──────
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insert {
@@ -165,8 +155,6 @@ pub struct Delete {
     pub table: String,
     pub where_clause: Option<Expr>,
 }
-
-// ── SELECT ─
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
@@ -219,8 +207,6 @@ pub struct Limit {
     pub limit: i64,
     pub offset: Option<i64>,
 }
-
-// ── Expressions (WHERE) ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {

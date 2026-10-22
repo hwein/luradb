@@ -237,8 +237,6 @@ pub async fn get_domain_metrics(
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,8 +255,6 @@ mod tests {
             assert_eq!(resp.api_version, crate::api::API_VERSION);
         })
     }
-
-    // ── Per-engine metrics, HTTP level ───────────────────────────────────────
 
     /// The body of a `GET /store-api/metrics` against `state`.
     async fn scrape(state: AppState) -> Value {
@@ -413,8 +409,6 @@ mod tests {
         })
     }
 
-    // ── compaction_runs/janitor_runs/memtable_size_bytes ─────────────────────
-
     // Test 3: memtable_size_bytes is a live gauge read from the engine's
     // active MemTable -- grows after a write, and shrinks back once
     // flush_all_memtables drains it.
@@ -506,8 +500,6 @@ mod tests {
             assert_eq!(shm["clients_kicked_total"], 1);
         })
     }
-
-    // ── GET /store-api/config ────────────────────────────────────────────────
 
     use axum::body::{to_bytes, Body};
     use axum::http::Request;

@@ -21,8 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-// ── Error mapping ─────────────────────────────────────────────────────────────
-
 impl From<JsonStoreError> for ApiError {
     fn from(e: JsonStoreError) -> Self {
         // A failed precondition carries the current ETag, if the document exists.
@@ -70,8 +68,6 @@ pub(crate) fn json_engine(state: &AppState) -> Result<&Arc<JsonEngine>, ApiError
         )
     })
 }
-
-// ── DTOs ─────────────────────────────────────────────────────────────────────
 
 /// A document as returned by the store: `_key`/`_version` metadata merged
 /// into the user's fields.
@@ -228,8 +224,6 @@ fn parse_preconditions(headers: &HeaderMap) -> Result<Vec<Precondition>, ApiErro
     }
     Ok(preconditions)
 }
-
-// ── Document CRUD ─────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     post,
@@ -433,8 +427,6 @@ pub async fn count_documents(
     Ok(Json(CountResponse { count }))
 }
 
-// ── Index management ─────────────────────────────────────────────────────────
-
 #[utoipa::path(
     post,
     path = "/store-api/json/{domain}/indexes",
@@ -519,8 +511,6 @@ pub async fn delete_index(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── Search ────────────────────────────────────────────────────────────────────
-
 #[utoipa::path(
     post,
     path = "/store-api/json/{domain}/search",
@@ -596,8 +586,6 @@ fn build_search_query(req: SearchRequest) -> Result<SearchQuery, ApiError> {
     })
 }
 
-// ── Bulk operations ───────────────────────────────────────────────────────────
-
 #[utoipa::path(
     post,
     path = "/store-api/json/{domain}/bulk",
@@ -665,8 +653,6 @@ pub async fn export_documents(
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(response)
 }
-
-// ── Re-indexing ───────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     post,
@@ -1272,8 +1258,6 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "a failed precondition must not write");
         })
     }
-
-    // ── Create-only precondition ─────────────────────────────────────────────
 
     // 18. If-None-Match: * on a free key succeeds (201, fresh document).
     #[test]

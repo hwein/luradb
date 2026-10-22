@@ -1023,10 +1023,6 @@ mod merge_iterator_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot Registry
-// ---------------------------------------------------------------------------
-
 /// Tracks active MVCC snapshots to compute the compaction low watermark.
 ///
 /// The *low watermark* is the timestamp of the oldest active snapshot.

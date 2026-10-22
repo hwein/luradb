@@ -455,8 +455,6 @@ mod tests {
         })
     }
 
-    // ── Snapshot-pinned export (backup export) ─────────────
-
     // A document created/updated after the snapshot must not appear via the
     // pinned scan/read pair, while the live (unpinned) read sees the update.
     #[test]
@@ -686,8 +684,6 @@ mod tests {
             }
         })
     }
-
-    // ── Per-engine metrics ─────────────────────────────────
 
     // Test 6: bulk_load with N documents increments json.write_ops by
     // exactly 1, not N, with exactly one latency sample -- proof of the

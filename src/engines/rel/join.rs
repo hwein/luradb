@@ -30,8 +30,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-// ── Dynamic RowSource boxing ──────────────────────────
-//
 // `RowSource::next` is RPITIT, which is not `dyn`-safe.
 // A join chain has dynamic depth (`max_join_depth` stages), so the left input
 // of an `IndexNestedLoopJoin` cannot be a single fixed generic type the way
@@ -53,8 +51,6 @@ impl<T: RowSource + Send> DynRowSource for T {
         Box::pin(RowSource::next(self))
     }
 }
-
-// ── Probe strategy & JoinProbe ─────────────────────────────────────
 
 #[derive(Clone, Copy)]
 enum ProbeStrategy {
@@ -214,8 +210,6 @@ impl JoinProbe {
     }
 }
 
-// ── IndexNestedLoopJoin ────────────────────────────────────────────
-
 /// Sits above its left source (a base scan or a shallower join). Streaming:
 /// buffers only the current left row's right-hand hits, never the whole
 /// input.
@@ -298,8 +292,6 @@ impl JoinRowPipeline {
         }
     }
 }
-
-// ── Multi-binding column resolution ────────────────────────────────
 
 /// One FROM-/JOIN-chain source: its binding key (`AS` alias, else table name)
 /// and schema, in statement order (base first).
@@ -417,8 +409,6 @@ fn resolve_on_side(
     }
 }
 
-// ── WHERE split: base-driving vs. residual-over-the-chain ─
-
 /// True iff every column referenced anywhere in `expr` resolves — unambiguously
 /// — to the base binding (`bindings[0]`) alone. Such a conjunct is the only
 /// kind that may drive the base access path; anything else (join-table
@@ -467,9 +457,7 @@ fn fold_and_exprs(conjuncts: Vec<&Expr>) -> Option<Expr> {
     Some(it.fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e.clone()))))
 }
 
-// ── Flat multi-binding WHERE binder ────────────────────────────────
-//
-// Mirrors `dml::bind_predicate`/`bind_compare`/`bind_pred_operand` exactly,
+// `bind_flat_predicate` mirrors `dml::bind_predicate`/`bind_compare`/`bind_pred_operand` exactly,
 // but resolves columns via `resolve_multi` (multi-binding) instead of
 // `dml::resolve_column` (single-table), and binds `PredOperand::Column` to a
 // *flat* position (flattening the `PlanRow`
@@ -584,8 +572,6 @@ fn bind_flat_operand(
         }
     }
 }
-
-// ── Projection & ORDER BY over multiple bindings ───────────────
 
 /// `*` → all columns of all bindings in binding order (duplicate names
 /// allowed); an explicit list resolves each column via
@@ -718,8 +704,6 @@ pub(super) fn resolve_join_on(
     Ok((value_source, right_col_pos, widen_int_to_real))
 }
 
-// ── Probe-build environment ────────────
-
 /// The four statement-wide constants every join stage's `build_join_probe`
 /// call needs, bundled to stay under Clippy's argument-count threshold. Pure
 /// data bundling of what `JoinProbe` already carries as fields — no new
@@ -730,8 +714,6 @@ pub(super) struct ProbeEnv<'a> {
     pub(super) fallback_budget: &'a Arc<AtomicU64>,
     pub(super) mask: LinkMask,
 }
-
-// ── exec_select_joined helpers ─────────────────────────────────────
 
 /// WHERE split: base-only top-level conjuncts (may drive the base
 /// scan) vs. everything else (residual over the chain).
@@ -811,8 +793,6 @@ async fn count_join_rows(chain: IndexNestedLoopJoin, residual: Option<Pred>) -> 
     }
     Ok(count)
 }
-
-// ── Planner & executor entry point ──────────────────────────────
 
 impl RelEngine {
     /// Resolves one FROM-/JOIN-chain table reference. `select::exec_select`'s

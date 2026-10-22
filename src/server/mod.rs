@@ -723,8 +723,6 @@ mod tests {
         })
     }
 
-    // ── In-process E2E (Server::start) ───────────────────────────────────────
-
     /// Data shards of the in-process servers: `LURADB_TEST_SHARDS`, 1 when
     /// unset, so the suite runs once per shard count.
     fn test_shards() -> u16 {

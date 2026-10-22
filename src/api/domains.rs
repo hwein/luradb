@@ -15,8 +15,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-// ── DTOs ─────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize, ToSchema)]
 pub struct CreateDomainRequest {
     /// User-visible domain name (max 50 chars, [a-zA-Z0-9_-]).
@@ -56,8 +54,6 @@ impl From<&DomainEntry> for DomainResponse {
         }
     }
 }
-
-// ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     post,

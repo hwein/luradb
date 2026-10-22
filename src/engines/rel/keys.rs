@@ -58,8 +58,6 @@ pub fn seq_key(system_prefix: &[u8], table_id: u32) -> Vec<u8> {
     k
 }
 
-// ── Domain-wide scan prefixes (purger) ─────────────────────────────────
-//
 // `{family}:{system_prefix}:` — spans every table/index of the domain. The
 // purger tombstones a deleting domain's data through these.
 

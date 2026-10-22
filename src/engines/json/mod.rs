@@ -188,8 +188,6 @@ impl JsonEngine {
         self.engine.shutdown().await;
     }
 
-    // ── Domain management ─────────────────────────────────────
-
     /// Creates a new JSON domain, bypassing the control plane.
     #[cfg(test)]
     pub(crate) async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
@@ -252,8 +250,6 @@ impl JsonEngine {
         self.doc_write_locks[Self::shard(domain, key)].lock().await
     }
 
-    // ── Index management ──────────────────────────────────────
-
     /// Creates an index definition on `field` for an existing domain.
     ///
     /// Existing documents are NOT back-indexed here (that is re-indexing);
@@ -308,8 +304,6 @@ impl JsonEngine {
         Ok(())
     }
 
-    // ── Document write locks ──────────────────────────────────
-
     /// Lock shard of a document reference. Domain and key both feed the hash,
     /// so equal keys of different domains need not share a shard.
     fn shard(domain: &str, key: &str) -> usize {
@@ -334,8 +328,6 @@ impl JsonEngine {
         }
         guards
     }
-
-    // ── Core CRUD (domain-aware) ────────────────
 
     /// Stores `content` under a system-generated UUIDv4 key.
     pub async fn create_document(
@@ -1068,8 +1060,6 @@ mod tests {
         })
     }
 
-    // ── Optimistic concurrency ───────────────────────────────
-
     // 30. Conditional update with the correct version succeeds; the
     //     generation stays stable across updates.
     #[test]
@@ -1236,8 +1226,6 @@ mod tests {
         })
     }
 
-    // ── Create-only precondition ─────────────────────────────
-
     // 39. Two parallel create-only-PUTs on the same free key → exactly one
     //     creates, the other sees DocumentAlreadyExists; the key's write
     //     shard serializes the race (same pattern as test 33).
@@ -1276,8 +1264,6 @@ mod tests {
             assert_eq!(exists, 1);
         })
     }
-
-    // ── Sharded document-write locks ─────────────────────────
 
     // 40. A held write shard blocks only keys of that shard: a put on a key
     //     of another shard runs through, one on the same shard waits.
@@ -1334,8 +1320,6 @@ mod tests {
             assert!(differs, "domain must feed the hash");
         })
     }
-
-    // ── Synchronous indexing ─────────────────────────────────
 
     async fn default_prefix(json: &JsonEngine) -> Vec<u8> {
         json.get_domain("default").unwrap().system_prefix
@@ -1581,8 +1565,6 @@ mod tests {
         })
     }
 
-    // ── Global lifecycle event bus ────────────────────────
-
     // Test 5: create_index/delete_index publish index_created/index_dropped
     // with engine "json" and the field name as `object`.
     #[test]
@@ -1620,8 +1602,6 @@ mod tests {
             json.delete_domain("no-bus").await.unwrap();
         })
     }
-
-    // ── Per-engine metrics — no double counting ───────────
 
     // Test 7: put_document (-> put_document_with_version -> write_document)
     // is exactly 1 write_op; a conditional put_document_with_version (which

@@ -43,8 +43,6 @@ use tokio::sync::{broadcast, watch, Notify};
 const MAX_KEY_LENGTH: usize = 256;
 const MAX_VALUE_SIZE_LIMIT: usize = 512 * 1024;
 
-// ── Engine configuration ─────────────────────────────────────────────────────
-
 /// Per-instance tuning parameters for the LSM storage engine.
 #[derive(Debug, Clone)]
 pub struct LsmEngineConfig {
@@ -636,8 +634,6 @@ impl LsmStorageEngine {
         Ok(())
     }
 
-    // ── Recovery ────────────────────────────────────────────────────────────
-
     /// A version over every vLog generation that exists next to `vlog_path`;
     /// the highest id becomes the active one. `vlog` is the
     /// caller's handle on the canonical path, which is generation 1 — a store
@@ -778,8 +774,6 @@ impl LsmStorageEngine {
         }
         Ok(levels)
     }
-
-    // ── Background tasks ────────────────────────────────────────────────────
 
     /// Starts the flush loop, compaction loop, and Janitor GC loop, keeping
     /// their `JoinHandle`s so [`Self::shutdown`] can join them.
@@ -977,8 +971,6 @@ impl LsmStorageEngine {
         }
     }
 
-    // ── Version ─────────────────────────────────────────────────────────────
-
     /// The current sources as one value; holding it costs no lock.
     pub(crate) fn version(&self) -> Arc<Version> {
         self.version.get()
@@ -989,8 +981,6 @@ impl LsmStorageEngine {
     pub(crate) fn install(&self, f: impl FnOnce(&Version) -> Version) {
         self.version.install(f)
     }
-
-    // ── MVCC helpers ────────────────────────────────────────────────────────
 
     /// Draws the next stamp. While the clock's logical counter is saturated,
     /// yields to the runtime until the wall clock moves on.
@@ -1059,8 +1049,6 @@ impl LsmStorageEngine {
     pub(super) fn raise_change_epoch(&self) {
         self.change_epoch.fetch_add(1, Ordering::Release);
     }
-
-    // ── Read path ───────────────────────────────────────────────────────────
 
     /// Reader over the current version.
     pub(crate) fn build_reader(&self) -> LsmReader<'_> {
@@ -1191,8 +1179,6 @@ impl LsmStorageEngine {
         self.block_cache.metrics()
     }
 
-    // ── Write path helpers ──────────────────────────────────────────────────
-
     /// Rotates the active MemTable once it reached the size threshold.
     ///
     /// Drains in-flight writes first and holds the drain across the swap:
@@ -1236,8 +1222,6 @@ impl LsmStorageEngine {
     pub(crate) async fn in_flight_write_for_test(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.in_flight_writes.read().await
     }
-
-    // ── Core write helpers ───────────────────────────────────────────────────
 
     /// Highest LSN of a WAL record whose write reached the MemTable.
     pub fn last_applied_lsn(&self) -> u64 {
@@ -1595,8 +1579,6 @@ impl LsmStorageEngine {
         Ok(())
     }
 
-    // ── Public high-level API ────────────────────────────────────────────────
-
     /// Validated upsert without TTL.
     pub fn put<'a>(
         &'a self,
@@ -1654,8 +1636,6 @@ impl LsmStorageEngine {
             self.write_null(key).await
         }
     }
-
-    // ── Discovery ────────────────────────────────────────────────────────────
 
     /// Returns all live (non-expired, non-tombstoned) user-keys that start with
     /// `prefix`, scanning only SSTable index/data blocks and the MemTables —
@@ -1773,8 +1753,6 @@ impl LsmStorageEngine {
         Ok(keys)
     }
 
-    // ── Watch ────────────────────────────────────────────────────────────────
-
     /// Returns a receiver that is notified for every WAL-confirmed write.
     ///
     /// Each event carries the key, operation type (`Set` / `Delete`), and its
@@ -1809,8 +1787,6 @@ impl LsmStorageEngine {
     pub fn watch_epoch(&self) -> u64 {
         self.watch_epoch
     }
-
-    // ── Flush ───────────────────────────────────────────────────────────────
 
     /// Test-only: freezes the active MemTable so `flush_memtable` persists it.
     /// Deliberately without the in-flight drain every production rotation runs
@@ -1992,8 +1968,6 @@ impl LsmStorageEngine {
         Ok(file_id)
     }
 
-    // ── IoEngine registration (scaffolding) ──────────────────────────────────
-    //
     // `IoEngine` is not on the hot path yet and cannot be
     // stored as a field here: it is `!Send`/`!Sync` (its buffers and files
     // are confined to the engine thread's ring), while `LsmStorageEngine` is
@@ -2026,8 +2000,6 @@ impl LsmStorageEngine {
         }
         Ok(())
     }
-
-    // ── Compaction ──────────────────────────────────────────────────────────
 
     /// Compacts the level that most urgently needs it.
     pub async fn compact_next_level(&self) -> Result<()> {
@@ -2258,8 +2230,6 @@ impl LsmStorageEngine {
         Ok(())
     }
 
-    // ── Heartbeat data ───────────────────────────────────────────────────────
-
     /// Returns the data needed for the `/health` heartbeat response.
     pub fn heartbeat_data(&self) -> EngineHeartbeatData {
         let version = self.version();
@@ -2271,8 +2241,6 @@ impl LsmStorageEngine {
             l0_sstable_count: version.level(0).len(),
         }
     }
-
-    // ── Stats ────────────────────────────────────────────────────────────────
 
     /// Number of successfully completed `compact_next_level` calls since
     /// process start.
@@ -2311,16 +2279,12 @@ pub struct EngineStats {
     pub total_sstables: usize,
 }
 
-// ── Batch operations ─────────────────────────────────────────────────────────
-
 /// A single operation inside an atomic [`LsmStorageEngine::write_batch`].
 #[derive(Debug, Clone)]
 pub enum BatchOp {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
 }
-
-// ── StorageEngine trait ──────────────────────────────────────────────────────
 
 impl StorageEngine for LsmStorageEngine {
     // Generic two-valued contract (shared with the unrelated `KvStore` engine):
@@ -2345,8 +2309,6 @@ impl StorageEngine for LsmStorageEngine {
         }
     }
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -2819,8 +2781,6 @@ mod tests {
         })
     }
 
-    // ── HLC seeding from recovered state ─────────────────────────────────────
-    //
     // A backwards step of the system clock, reproduced deterministically: the
     // HLC is pushed ahead of the wall clock before the writes, so a restarted
     // engine seeding its clock from nothing would take snapshots older than
@@ -3105,8 +3065,6 @@ mod tests {
         })
     }
 
-    // ── Lifecycle tests ──────────────────────────────────────────────────────
-
     #[test]
     fn test_put_get_basic() {
         crate::core::engine_runtime::block_on(async {
@@ -3150,8 +3108,6 @@ mod tests {
             assert_eq!(result, Some(b"value3".to_vec()));
         })
     }
-
-    // ── set_null semantics: an Update, never a delete ────────────────────────
 
     #[test]
     fn test_set_null_is_update_not_delete() {
@@ -3262,8 +3218,6 @@ mod tests {
         })
     }
 
-    // ── Validation tests ─────────────────────────────────────────────────────
-
     #[test]
     fn test_empty_key_rejected() {
         crate::core::engine_runtime::block_on(async {
@@ -3292,8 +3246,6 @@ mod tests {
             assert!(err.is_err(), "value exceeding MAX_VALUE_SIZE_LIMIT must be rejected");
         })
     }
-
-    // ── TTL tests ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_ttl_key_readable_before_expiry() {
@@ -3388,8 +3340,6 @@ mod tests {
             }
         })
     }
-
-    // ── scan_keys tests ──────────────────────────────────────────────────────
 
     #[test]
     fn test_scan_keys_prefix() {
@@ -3514,8 +3464,6 @@ mod tests {
         })
     }
 
-    // ── scan_keys_with_snapshot tests (backup export) ───────────────────────
-
     // Writes after the snapshot (put, delete, set_null) must not change what
     // the pinned scan sees, while the unpinned scan_keys sees the new state.
     #[test]
@@ -3599,9 +3547,6 @@ mod tests {
             assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
         })
     }
-
-    // ── scan_keys_limited_with_snapshot tests (SELECT fast-limit snapshot
-    // consistency) ───────────────────────────────────────────────────────────
 
     // Test 1 (the core case): a key that only starts existing after the
     // snapshot must never occupy one of the capped slots, even when it sorts
@@ -3724,7 +3669,6 @@ mod tests {
         })
     }
 
-    // ── MemTable prefix scan by range ────────────────────────────────────────
     // All keys stay in the active MemTable (no flush).
 
     // Test 1: keys before, inside and behind the range, one a prefix of others.
@@ -3834,8 +3778,6 @@ mod tests {
         })
     }
 
-    // ── Point-read MVCC ordering tests (overlapping L0 / frozen MemTables) ───
-
     // Regression: with two overlapping L0 tables, get must return the newest
     // version, not the one in the oldest (first-flushed) table.
     #[test]
@@ -3900,8 +3842,6 @@ mod tests {
             assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
         })
     }
-
-    // ── get_with_expiry tests (backup export) ───────────────────────────────
 
     // expire_at is 0 for a plain put, and the absolute TTL deadline for
     // put_with_ttl -- both against an externally acquired snapshot.
@@ -3972,8 +3912,6 @@ mod tests {
         })
     }
 
-    // ── Watcher tests ─────────────────────────────────────────────────────────
-
     #[test]
     fn test_watcher_receives_set_event() {
         crate::core::engine_runtime::block_on(async {
@@ -4012,8 +3950,6 @@ mod tests {
         })
     }
 
-    // ── Inline-value flush test ───────────────────────────────────────────────
-
     #[test]
     fn test_small_value_flush_no_vlog_growth() {
         crate::core::engine_runtime::block_on(async {
@@ -4047,8 +3983,6 @@ mod tests {
             assert_eq!(result, Some(b"tiny_value".to_vec()));
         })
     }
-
-    // ── Block-cache file-id stamping (compaction / Janitor rebuild) ──────────
 
     async fn freeze_and_flush(engine: &LsmStorageEngine) {
         engine.freeze_active_memtable();
@@ -5033,8 +4967,6 @@ mod tests {
         })
     }
 
-    // ── IoEngine integration ─────────────────────────────────────────────────
-    //
     // Runs on the engine runtime's test harness: `IoEngine` registers its
     // buffers with that runtime's ring.
 
@@ -5089,8 +5021,6 @@ mod tests {
             assert!(io_engine.get_file(file_id).is_some());
         });
     }
-
-    // ── Watch-stream sequence assignment ─────────────────────────────────────
 
     // Test 7: put, delete, set_null (-> Set) and write_batch all
     // publish through the same choke point (`publish_change`/`publish_many`)
@@ -5166,8 +5096,6 @@ mod tests {
         })
     }
 
-    // ── Watch events after MemTable apply ────────────────────────────────────
-
     // A Set/Delete race on one key. Before the fix, `publish_change` ran right
     // after the WAL fsync, before `memtable.set` -- a subscriber could receive
     // an event for a write that was not yet applied (and, on a crash, might
@@ -5215,8 +5143,6 @@ mod tests {
             }
         })
     }
-
-    // ── Atomic install at flush and compaction ───────────────────────────────
 
     /// Parks the next `flush_memtable` right before its SSTable write.
     fn hook_flush_write(engine: &mut LsmStorageEngine) -> Arc<TestHook> {
@@ -5441,8 +5367,6 @@ mod tests {
         })
     }
 
-    // ── Cooperative yields in the scan path ─────────────────────────────────
-
     use crate::core::coop::completion_order;
 
     /// 20 000 keys under `k:` in one batch — enough scan work that a missing
@@ -5531,8 +5455,6 @@ mod tests {
         })
     }
 
-    // ── Yields follow the scan's work ────────────────────────────────────────
-
     /// 600 keys under `a:` among 20 000 under `b:` — fewer `a:` entries than
     /// one yield interval, yet enough work that the scan must yield.
     async fn fill_dense_range_among_foreign_keys(engine: &LsmStorageEngine) {
@@ -5579,8 +5501,6 @@ mod tests {
         })
     }
 
-    // ── Yields cover the result materialization ──────────────────────────────
-
     // 300 keys only in the active MemTable tick 600 times in the source loop,
     // under one yield interval: only collecting the result (300) and draining
     // the decided set (300) reaches it.
@@ -5603,8 +5523,6 @@ mod tests {
             assert_eq!(order, ["small", "long"]);
         })
     }
-
-    // ── SSTable scans seek to the prefix range ───────────────────────────────
 
     /// The plain, limited and snapshot scans of `prefix`.
     async fn scan_results(
@@ -5664,8 +5582,6 @@ mod tests {
             assert_eq!(in_sstable, in_memtable);
         })
     }
-
-    // ── Maintenance against a concurrent flush ───────────────────────────────
 
     /// Gives every other task room to run, without ever asserting on
     /// wall-clock time: a fixed yield budget, no deadline.
@@ -6110,8 +6026,6 @@ mod tests {
         })
     }
 
-    // ── Every write path raises the change epoch ────────────────────────────
-
     async fn assert_raises_change_epoch(
         engine: &LsmStorageEngine,
         write: impl std::future::Future<Output = Result<()>>,
@@ -6166,8 +6080,6 @@ mod tests {
             assert_raises_change_epoch(&engine, engine.write_batch(ops)).await;
         })
     }
-
-    // ── Thread-safe read path ────────────────────────────────────────────────
 
     /// Sources a reader over `version` searches: MemTables plus SSTables.
     fn source_count(version: &Version) -> usize {
@@ -6750,8 +6662,6 @@ mod tests {
         })
     }
 
-    // ── Drops only on the bottommost level ───────────────────────────────────
-
     /// Writes `key` and moves it down to L2, leaving L0 and L1 empty.
     async fn put_into_l2(engine: &LsmStorageEngine, key: &[u8], value: &[u8]) {
         engine.put(key, value).await.unwrap();
@@ -6835,8 +6745,6 @@ mod tests {
             assert_eq!(engine.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
         })
     }
-
-    // ── A batch whole or not at all for other threads ────────────────────────
 
     /// Ends of a hook that parks `write_batch` after its first MemTable insert.
     type BatchHook = (std::sync::mpsc::Receiver<std::thread::ThreadId>, std::sync::mpsc::Sender<()>);

@@ -25,8 +25,6 @@ use std::sync::{
     Arc,
 };
 
-// ── Public types ─────────────────────────────────────────────────────────────
-
 /// Cache key: identifies a data block by its SSTable file and byte offset.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub struct BlockCacheKey {
@@ -37,8 +35,6 @@ pub struct BlockCacheKey {
 /// A cached data block — zero-copy view into a memory-mapped SSTable or
 /// owned aligned bytes. Defined in the storage layer.
 pub use crate::storage::format::CachedBlock;
-
-// ── Metrics ──────────────────────────────────────────────────────────────────
 
 pub struct BlockCacheMetrics {
     pub hits: AtomicU64,
@@ -65,8 +61,6 @@ impl Default for BlockCacheMetrics {
     }
 }
 
-// ── Internal index entry ──────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Location {
     Small,
@@ -80,8 +74,6 @@ struct IndexEntry {
     block: CachedBlock,
     block_size: usize,
 }
-
-// ── BlockCache ────────────────────────────────────────────────────────────────
 
 /// S3-FIFO block cache.
 ///
@@ -129,8 +121,6 @@ impl BlockCache {
         Arc::clone(&self.metrics)
     }
 
-    // ── Read ─────────────────────────────────────────────────────────────────
-
     /// Looks up a block. Returns the cached bytes on hit, `None` on miss.
     ///
     /// Increments the access frequency of the entry (capped at 3) so that hot
@@ -158,8 +148,6 @@ impl BlockCache {
             }
         }
     }
-
-    // ── Write ─────────────────────────────────────────────────────────────────
 
     /// Inserts a block into the cache.
     ///
@@ -207,8 +195,6 @@ impl BlockCache {
         self.enforce_capacity();
     }
 
-    // ── Invalidation ─────────────────────────────────────────────────────────
-
     /// Removes all cache entries (Small, Main, and Ghost) that belong to
     /// `file_id`. Called after an SSTable file is deleted by compaction.
     pub fn invalidate_file(&mut self, file_id: u64) {
@@ -241,8 +227,6 @@ impl BlockCache {
 
         self.metrics.current_bytes.store(self.current_bytes as u64, Ordering::Relaxed);
     }
-
-    // ── Eviction helpers ──────────────────────────────────────────────────────
 
     fn enforce_capacity(&mut self) {
         let small_cap = (self.capacity_bytes as f32 * self.small_ratio) as usize;
@@ -343,8 +327,6 @@ impl BlockCache {
         }
     }
 
-    // ── Ghost Buffer helpers ──────────────────────────────────────────────────
-
     fn add_to_ghost(&mut self, key: BlockCacheKey) {
         // Trim ghost to its capacity (evict oldest active ghost entry first).
         while self.ghost_set.len() >= self.ghost_capacity {
@@ -369,8 +351,6 @@ impl BlockCache {
         self.ghost_set.remove(key);
     }
 }
-
-// ── StripedBlockCache ─────────────────────────────────────────────────────────
 
 /// Number of independently locked parts of a [`StripedBlockCache`].
 const STRIPES: usize = 16;
@@ -432,8 +412,6 @@ fn stripe_index(key: &BlockCacheKey) -> usize {
     let hash = (key.file_id.rotate_left(32) ^ key.block_offset).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (hash >> (u64::BITS - STRIPES.trailing_zeros())) as usize
 }
-
-// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -653,8 +631,6 @@ mod tests {
         assert_eq!(cache.metrics.main_evictions.load(Ordering::Relaxed), 0);
         assert!(!cache.main.contains(&stale), "stale key is consumed");
     }
-
-    // ── StripedBlockCache ────────────────────────────────────────────────────
 
     /// Block `n` of `file_id`, at a real block-size offset.
     fn block_key(file_id: u64, n: u64) -> BlockCacheKey {

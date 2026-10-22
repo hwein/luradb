@@ -35,8 +35,6 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::{openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme}, Modify, OpenApi, ToSchema};
 
-// ── Security scheme (Modify hook) ─────────────────────────────────────────────
-
 struct BearerAuth;
 
 impl Modify for BearerAuth {
@@ -55,8 +53,6 @@ impl Modify for BearerAuth {
         );
     }
 }
-
-// ── API contract version (Modify hook) ────────────────────────────────────────
 
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Breaking bumps the middle digit, anything else the last. Single source of
@@ -78,8 +74,6 @@ impl Modify for VersionInfo {
             );
     }
 }
-
-// ── AppState ──────────────────────────────────────────────────────────────────
 
 /// Shared application state injected into every Axum handler.
 #[derive(Clone)]
@@ -113,8 +107,6 @@ pub struct AppState {
     pub config_file_loaded: bool,
 }
 
-// ── Shared DTOs ───────────────────────────────────────────────────────────────
-
 /// Generic `{"count": N}` response, shared by JSON's `count_documents`, KV's
 /// `count_keys`, and rel's `count_rows` — one schema
 /// instead of three identical ones.
@@ -122,8 +114,6 @@ pub struct AppState {
 pub struct CountResponse {
     pub count: u64,
 }
-
-// ── Router ────────────────────────────────────────────────────────────────────
 
 /// Builds the full domain + KV + auth router with the given app state — the
 /// routes only; the per-request layers come from [`frontend_layers`].
@@ -314,8 +304,6 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     frontend_layers(create_router(state), auth_cache, trusted_cidrs)
 }
 
-// ── OpenAPI / Swagger ─────────────────────────────────────────────────────────
-
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -494,8 +482,6 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     )
 )]
 pub struct ApiDoc;
-
-// ── Contract drift gate ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod contract_tests {
@@ -682,8 +668,6 @@ mod contract_tests {
         assert_eq!(schema["type"], serde_json::json!("string"), "{schema}");
     }
 
-    // ── Error-body typing gate ───────────────────────────────────────────────
-
     /// Every documented response with status >= 400, anywhere in the API,
     /// must declare a `text/plain` string body — otherwise a codegen client
     /// sees `content?: never` on that error, a contract lie. No exception
@@ -742,8 +726,6 @@ mod contract_tests {
         }
     }
 }
-
-// ── Router↔Contract coverage gate ─────────────────────────────────────────────
 
 #[cfg(test)]
 mod router_coverage_tests {

@@ -17,8 +17,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-// ── DTOs ─────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize, ToSchema)]
 pub struct CreateRelDomainRequest {
     /// Domain name (max 50 chars, `[a-zA-Z0-9_-]`; `"domains"` is reserved).
@@ -51,8 +49,6 @@ impl From<&DomainEntry> for RelDomainResponse {
         RelDomainResponse { name: d.name.clone(), created_at: d.created_at, state: d.state.as_str().to_string() }
     }
 }
-
-// ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     post,

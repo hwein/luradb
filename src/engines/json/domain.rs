@@ -60,8 +60,6 @@ fn validate_domain_name(name: &str) -> Result<(), JsonStoreError> {
     Ok(())
 }
 
-// ── JsonDomain ────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum JsonDomainState {
     #[default]
@@ -95,8 +93,6 @@ impl JsonDomain {
         }
     }
 }
-
-// ── JsonDomainRegistry ────────────────────────────────────────────────────────
 
 /// Holds the JSON domains: lookup, listing, recovery. Creates and deletes
 /// run through the control plane, one at a time.

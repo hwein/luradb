@@ -1288,8 +1288,6 @@ mod tests {
         Ok(())
     }
 
-    // ── Prefix scans seek through the block index ─────────────
-
     /// The builder closes a data block at this many entries.
     const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE_TARGET / 16 + 1;
 

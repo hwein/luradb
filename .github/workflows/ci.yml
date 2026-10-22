@@ -17,9 +17,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
       # The section sign is written as bytes so this file does not match itself.
-      - name: No internal spec references
+      - name: No internal references or marker lines
         run: |
-          ! git grep -nE '\b(general|perf|kv|json|dist|rel|quality)/[0-9]{3}|\b(spec|concept) [0-9]{3}\b|'$'\xc2\xa7' -- . ':!CHANGELOG.md'
+          ! git grep -nE '\b(general|perf|kv|json|dist|rel|quality)/[0-9]{3}|\b(spec|concept) [0-9]{3}\b|^\s*(//[/!]?|#)\s*(-|=|\*|#|─){3,}\s*$|^\s*(//[/!]?|#)\s*(-|=|\*|─){2,}\s*[^-=*[:space:]].*\s(-|=|\*|─){2,}\s*$|'$'\xc2\xa7' -- . ':!CHANGELOG.md'
 
       # io_uring needs the runner VM, not a container (Docker's default
       # seccomp blocks it) - uname -r is the acceptance proof.

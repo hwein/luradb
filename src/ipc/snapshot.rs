@@ -558,8 +558,6 @@ impl SnapshotPublisher {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1124,8 +1122,6 @@ mod tests {
         })
     }
 
-    // ── Publisher step ─────────────────────────────────────────────
-
     const ARENA_LEN: usize = 1 << 20;
 
     /// Step time for tests without TTL entries.
@@ -1386,8 +1382,6 @@ mod tests {
             assert!(default_entry(&arena.read(), b"ttl").is_none(), "expired entry must be gone");
         })
     }
-
-    // ── Publish metrics and the kick of blocking clients ─────────────────────────
 
     const SKIPPED_ON_B: Tick = Tick::Rebuilt(PublishOutcome::SkippedBusy { buffer: 1 });
 

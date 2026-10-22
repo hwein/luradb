@@ -32,10 +32,6 @@ use crate::storage::manifest::{Manifest, SSTableMetadata};
 use anyhow::Result;
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 /// Configuration for the leveled compaction strategy.
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -78,10 +74,6 @@ impl Default for CompactionConfig {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Compaction Job
-// ---------------------------------------------------------------------------
 
 /// A single compaction job that merges two adjacent levels.
 ///
@@ -288,10 +280,6 @@ impl CompactionJob {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trigger helpers
-// ---------------------------------------------------------------------------
-
 /// Maximum allowed total byte size for `level`. Returns `None` for L0 (file-count driven).
 pub fn level_max_size(level: usize, config: &CompactionConfig) -> Option<u64> {
     match level {
@@ -328,20 +316,12 @@ pub fn select_level_to_compact(manifest: &Manifest, config: &CompactionConfig) -
     (0..manifest.levels.len()).find(|&lvl| should_compact_for_level(lvl, manifest, config))
 }
 
-// ---------------------------------------------------------------------------
-// IoEngine deregistration
-// ---------------------------------------------------------------------------
-
 /// File ids deleted by a compaction that merges `src_metas` into `tgt_metas`
 /// -- used by the caller to deregister them from the `IoEngine`.
 /// Compaction always replaces both inputs wholesale, so this is simply their union.
 pub fn deleted_file_ids(src_metas: &[SSTableMetadata], tgt_metas: &[SSTableMetadata]) -> Vec<u64> {
     src_metas.iter().chain(tgt_metas.iter()).map(|m| m.file_id).collect()
 }
-
-// ---------------------------------------------------------------------------
-// SSTable selection
-// ---------------------------------------------------------------------------
 
 /// Selects SSTables to compact from L0 into L1 (convenience wrapper).
 pub fn select_sstables_for_compaction(
@@ -388,10 +368,6 @@ pub fn select_sstables_for_level_compaction(
 
     (selected, target_tables)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

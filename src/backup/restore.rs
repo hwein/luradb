@@ -117,8 +117,6 @@ fn json_of<'c>(control: &'c ControlPlane, domain: &str) -> anyhow::Result<&'c Ar
     control.owners_of(domain).json.as_ref().ok_or_else(|| BackupError::JsonEngineDisabled.into())
 }
 
-// ── Pass 1: checksum verification + domain-name collection ─────────────
-
 pub(crate) struct ArchiveScan {
     kv_domains: Vec<String>,
     json_domains: Vec<String>,
@@ -362,8 +360,6 @@ fn remapped<'a>(remap: &'a Option<(String, String)>, archived_name: &'a str) -> 
     }
 }
 
-// ── Domain preparation ───────────────────────────────────────────────────
-
 /// Phase A (checks / replace-deletes only, no domain is created yet) then
 /// Phase B (create every target domain) — kept as two full sweeps so
 /// `fail_if_exists` truly aborts before the first write: if any domain in
@@ -468,8 +464,6 @@ async fn wait_for_purge(name: &str, timeout: Duration, is_gone: impl Fn() -> boo
         compio::time::sleep(PURGE_POLL_INTERVAL).await;
     }
 }
-
-// ── Pass 2: streaming apply ─────────────────────────────────────────────
 
 /// Streams the archive top to bottom and applies each line. Domains/indexes
 /// are already prepared, so `kv-domain`/`json-domain`/`manifest`/`checksum`

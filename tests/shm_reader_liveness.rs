@@ -55,8 +55,6 @@ const SNAPSHOT_PINNED: &[u8] = b"snapshot-1: the child pins this one";
 const SNAPSHOT_FREE: &[u8] = b"snapshot-2: lands on the free buffer";
 const SNAPSHOT_BLOCKED: &[u8] = b"snapshot-3: wants the pinned buffer";
 
-// ── Parent ────────────────────────────────────────────────────────────────────
-
 #[test]
 fn shm_reader_liveness_across_processes() {
     luradb::core::engine_runtime::block_on(async {
@@ -256,8 +254,6 @@ async fn publish_until_published(writer: &SnapshotWriter<'_>, data: &[u8]) -> bo
         compio::time::sleep(Duration::from_millis(20)).await;
     }
 }
-
-// ── Child role ────────────────────────────────────────────────────────────────
 
 /// The client process of the test above. `#[ignore]`d and gated on `ROLE_ENV`:
 /// a plain `cargo test -- --ignored` runs it as a no-op.

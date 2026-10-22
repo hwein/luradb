@@ -26,8 +26,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
-// ── Shared handler state ──────────────────────────────────────────────────────
-
 #[derive(Clone)]
 pub struct AuthState {
     pub cache: Arc<AuthCache>,
@@ -44,8 +42,6 @@ pub struct AuthState {
     /// disabled. Backs `set_permission`'s domain existence check.
     pub rel_engine: Option<Arc<RelEngine>>,
 }
-
-// ── Request / response types ──────────────────────────────────────────────────
 
 /// Caller identity. `role` is the only discriminator between the four cases —
 /// see `whoami` for the full mapping; `name` is `null` whenever no
@@ -146,8 +142,6 @@ pub(crate) fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-// ── Error helper ──────────────────────────────────────────────────────────────
-
 fn err(status: StatusCode, msg: &str) -> Response {
     (status, msg.to_string()).into_response()
 }
@@ -158,8 +152,6 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-
-// ── Handlers ──────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     get,
@@ -506,8 +498,6 @@ mod tests {
         assert!(matches!(parse_store_type(&Some("rel".to_string())), Ok(StoreType::Rel)));
         assert!(parse_store_type(&Some("xxx".to_string())).is_err());
     }
-
-    // ── list_users permissions ───────────────────────────
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
@@ -867,8 +857,6 @@ mod tests {
         })
     }
 
-    // ── whoami ────────────────────────────────────────────
-
     // Test 1: admin key -> 200 with its own name and role "Admin".
     #[test]
     fn whoami_admin_key_returns_name_and_role() {
@@ -1015,8 +1003,6 @@ mod tests {
     // Test 7 (/version still reachable, whitelist not broken) is covered by
     // `version_requires_valid_key_any_role` in middleware.rs, which exercises
     // the exact same whitelist branch whoami uses.
-
-    // ── set_permission domain validation ─────────────────
 
     /// POSTs a permission grant; returns only the status (body is irrelevant
     /// to every test below). `allow_missing` becomes `?allow_missing=` when `Some`.

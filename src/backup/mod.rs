@@ -99,8 +99,6 @@ fn validate_scope_domain(name: &str) -> anyhow::Result<&str> {
     Ok(name)
 }
 
-// ── Errors ───────────────────────────────────────────────────────────────
-
 /// Typed errors the HTTP layer (later step) maps to specific status codes.
 /// Anything not worth a dedicated variant collapses into `Other`.
 #[derive(Debug, Error)]
@@ -145,8 +143,6 @@ pub(crate) fn validate_backup_id(id: &str) -> Result<(), BackupError> {
     }
 }
 
-// ── Job slot ─────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
     Backup,
@@ -172,8 +168,6 @@ impl Drop for SlotGuard {
     }
 }
 
-// ── Backup listing ───────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupState {
     Complete,
@@ -193,8 +187,6 @@ pub struct BackupSummary {
     /// given here. Internal only — not part of the API response.
     pub uploaded: bool,
 }
-
-// ── Restore status registry ─────────────────────────────────────────────
 
 /// Cap on retained restore statuses — the registry lives in RAM for the
 /// whole process lifetime, and each entry carries its full `errors` list.
@@ -219,8 +211,6 @@ pub struct RestoreStatus {
     pub started_at: u64,
     pub finished_at: Option<u64>,
 }
-
-// ── Metrics ──────────────────────────
 
 /// Lifetime backup counters, updated by `start_backup`'s job task on
 /// completion. Held directly on `BackupManager` (not `MetricsStore`) so the
@@ -258,8 +248,6 @@ pub struct BackupMetricsSnapshot {
     pub failed_total: u64,
     pub last_success_at_by_schedule: HashMap<String, u64>,
 }
-
-// ── BackupManager ────────────────────────────────────────────────────────
 
 /// Entries scanned per batch and the pause between batches; keeps the
 /// foreground latency impact small.
@@ -334,8 +322,6 @@ impl BackupManager {
     pub fn running_job(&self) -> Option<RunningJobInfo> {
         self.slot.lock().clone()
     }
-
-    // ── Backup jobs ─────────────────────────────────────────────────────
 
     /// Validates the scope, allocates an id, marks the slot busy, and spawns
     /// the export. Scope validation is synchronous (unlike restore) because
@@ -415,8 +401,6 @@ impl BackupManager {
     fn backup_id_taken(&self, id: &str) -> bool {
         self.dir.join(format!("{id}.ndjson")).exists() || self.dir.join(format!("{id}.ndjson.part")).exists()
     }
-
-    // ── Restore jobs ─────────────────────────────────────────────────────
 
     /// Marks the slot busy, records a `running` status entry, and spawns the
     /// restore. Beyond "does the backup file exist", validation (checksum,
@@ -532,13 +516,9 @@ impl BackupManager {
         self.restores.read().get(restore_id).cloned()
     }
 
-    // ── Listing, detail, deletion ────────────────────────────────────────
-
     pub(crate) fn ndjson_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.ndjson"))
     }
-
-    // ── Upload (POST /backups/upload) ──────────────────
 
     /// Collision-safe scratch path for a streamed upload, before its
     /// identity (checksum-verified manifest -> allocated id) is known. Named
@@ -844,8 +824,6 @@ mod tests {
         assert!(BackupScope::parse("domain:sh/op").is_err());
         assert!(BackupScope::parse("json:sh.op").is_err());
     }
-
-    // ── as_string / slug ─────────────────────────────────────────────────
 
     #[test]
     fn test_as_string_round_trips_through_parse() {

@@ -23,11 +23,7 @@ use std::sync::{
 };
 use window::{MetricsWindow, WindowTotals};
 
-// ── Version string ────────────────────────────────────────────────────────────
-
 pub const LURADB_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-// ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Width of the rolling window in seconds.
 const WINDOW_SECS: u64 = 60;
@@ -72,8 +68,6 @@ pub struct ShardHealth {
     pub id: u16,
     pub status: &'static str,
 }
-
-// ── SystemMetrics ─────────────────────────────────────────────────────────────
 
 pub struct SystemMetrics {
     pub total_reads: AtomicU64,
@@ -172,8 +166,6 @@ impl Default for SystemMetrics {
     }
 }
 
-// ── DomainWindowMetrics ───────────────────────────────────────────────────────
-
 #[derive(Serialize)]
 pub struct DomainWindowMetrics {
     pub domain: String,
@@ -185,8 +177,6 @@ pub struct DomainWindowMetrics {
     pub rate_limit_rejections: u64,
     pub window_secs: u64,
 }
-
-// ── EngineWindowMetrics ────────────────────────────────────
 
 /// Which storage engine an aggregate op/latency window belongs to; indexes
 /// `MetricsStore::engines`.
@@ -289,8 +279,6 @@ impl MetricsStore {
         })
     }
 
-    // ── Relational catalog metrics ────────────────────────────
-
     pub fn record_rel_ddl_create(&self) {
         self.system.rel_ddl_create_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -310,8 +298,6 @@ impl MetricsStore {
     pub fn rel_catalog_objects(&self, domain: &str) -> Option<u64> {
         self.rel_catalog_objects.read().get(domain).copied()
     }
-
-    // ── SQL frontend & DDL metrics ────────────────────────
 
     /// Counts a parsed+bound statement by class: `"read"`/`"write"`/`"ddl"`.
     pub fn record_rel_frontend_statement(&self, class: &str) {
@@ -343,8 +329,6 @@ impl MetricsStore {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── DML write-path metrics ────────────────────────────
-
     /// Counts an executed DML statement by op (`"insert"`/`"update"`/`"delete"`).
     pub fn record_rel_dml_statement(&self, op: &str) {
         let counter = match op {
@@ -368,8 +352,6 @@ impl MetricsStore {
             .fetch_add(n, Ordering::Relaxed);
     }
 
-    // ── SELECT executor metrics ───────────────────────────
-
     /// Counts one executed single-table SELECT/COUNT statement.
     pub fn record_rel_select_statement(&self) {
         self.system.rel_select_statements_total.fetch_add(1, Ordering::Relaxed);
@@ -386,14 +368,10 @@ impl MetricsStore {
         self.system.rel_sort_fallback_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── LEFT JOIN metrics ──────────────────────────────────
-
     /// Counts one executed join probe (non-NULL ON value; NULL never probes).
     pub fn record_rel_join_probes(&self, n: u64) {
         self.system.rel_join_probes_total.fetch_add(n, Ordering::Relaxed);
     }
-
-    // ── View metrics ──────────────────────────────────────
 
     /// Adds `n` view references substituted by the inliner (recursive ones
     /// included), at SELECT execution time.
@@ -410,8 +388,6 @@ impl MetricsStore {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-
-    // ── Cross-engine link metrics ──────────────────────────
 
     /// Counts one actual cross-engine expand point-lookup by `{engine}`
     /// (`"kv"`/`"json"`); NULL/masked entries never reach here.
@@ -449,7 +425,6 @@ impl MetricsStore {
         self.system.rel_orphan_ranges_purged_total.fetch_add(n, Ordering::Relaxed);
     }
 
-    // ── SHM snapshot publisher metrics ───────────────────────────────────────
     // The publisher task is the only writer, so the run gauge needs no CAS.
 
     /// Counts a published snapshot and ends the current skip run.
@@ -600,8 +575,6 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-
-// ── MetricsTicker ─────────────────────────────────────────────────────────────
 
 /// Background task: ticks all domain windows once per `config.ticker_interval_ms`.
 pub struct MetricsTicker {

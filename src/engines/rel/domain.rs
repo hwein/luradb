@@ -58,8 +58,6 @@ fn validate_domain_name(name: &str) -> Result<(), RelStoreError> {
     Ok(())
 }
 
-// ── RelDomain ────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum RelDomainState {
     #[default]
@@ -89,8 +87,6 @@ impl RelDomain {
         }
     }
 }
-
-// ── RelDomainRegistry ──────────────────────────────────────────────────────────
 
 /// Holds the rel domains: lookup, listing, recovery. Creates and deletes run
 /// through the control plane, one at a time.

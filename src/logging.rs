@@ -95,8 +95,6 @@ pub(crate) fn level_to_str(level: &LogLevel) -> &'static str {
     }
 }
 
-// ── LogJanitor ────────────────────────────────────────────────────────────────
-
 pub struct LogJanitor {
     log_path: PathBuf,
     retention_days: u64,

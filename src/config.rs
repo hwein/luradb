@@ -236,8 +236,6 @@ pub fn resolve_config_path(cli_arg: Option<PathBuf>, exists: impl Fn(&Path) -> b
     dev_default
 }
 
-// ── Server ────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -311,8 +309,6 @@ impl ServerConfig {
     }
 }
 
-// ── Storage ───────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
@@ -358,8 +354,6 @@ impl StorageConfig {
     }
 }
 
-// ── IO Engine ──────────────────────────────────────────────────────────────────
-
 /// Registered-buffer I/O on the engine thread's io_uring ring.
 ///
 /// Scaffolding only — not yet used on the data path. Disabled by default.
@@ -370,8 +364,6 @@ pub struct IoEngineConfig {
     /// thread runs either way.
     pub enabled: bool,
 }
-
-// ── Buffer Pool ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -384,8 +376,6 @@ impl Default for BufferPoolConfig {
         Self { pool_size: 1024 }
     }
 }
-
-// ── Block Cache ─────────────────────────────────────────────────────
 
 /// Block-cache sizing of one LSM instance. A parameter type, not a config
 /// section: the engines pass fixed values.
@@ -408,8 +398,6 @@ impl Default for BlockCacheConfig {
         }
     }
 }
-
-// ── LSM Engine ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -517,8 +505,6 @@ impl RelLsmConfig {
     }
 }
 
-// ── Compaction ────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CompactionCfg {
@@ -539,8 +525,6 @@ impl Default for CompactionCfg {
     }
 }
 
-// ── Janitor ───────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JanitorCfg {
@@ -558,8 +542,6 @@ impl Default for JanitorCfg {
         }
     }
 }
-
-// ── TTL sweeper ───────────────────────────────────────────────────────────────
 
 /// Background task that tombstones TTL-expired keys and emits their delete
 /// events. Only the KV instance runs one.
@@ -582,8 +564,6 @@ impl Default for TtlSweeperCfg {
         }
     }
 }
-
-// ── Domains ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -613,8 +593,6 @@ impl Default for DomainsConfig {
     }
 }
 
-// ── Rate Limiting ─────────────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RateLimitConfig {
@@ -633,8 +611,6 @@ impl Default for RateLimitConfig {
         }
     }
 }
-
-// ── Auth ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -678,8 +654,6 @@ pub struct AdminEntry {
     #[serde(skip_serializing)]
     pub api_key: String,
 }
-
-// ── Logging ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -750,8 +724,6 @@ pub struct LogModulesConfig {
     pub storage: Option<LogLevel>,
 }
 
-// ── Proxy ─────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProxyConfig {
@@ -759,8 +731,6 @@ pub struct ProxyConfig {
     /// Empty = no trusted-header evaluation (direct mode).
     pub trusted_proxies: Vec<String>,
 }
-
-// ── JSON Store ────────────────────────────────────────────────
 
 /// Config for the JSON engine's dedicated LSM instance (own paths & limits).
 #[derive(Debug, Deserialize, Serialize)]
@@ -799,8 +769,6 @@ impl JsonStoreConfig {
         self.lsm.validate()
     }
 }
-
-// ── Relational Store ───────────────────────────────────────────
 
 /// Config for the relational engine's dedicated LSM instance (own paths &
 /// limits). No `db_path` — like the JSON engine, this LSM instance has no
@@ -869,8 +837,6 @@ impl RelStoreConfig {
         self.lsm.validate()
     }
 }
-
-// ── Shared Memory IPC ─────────────────────────────────────────
 
 /// POSIX shared-memory segments for the local IPC bypass. Wire protocols on
 /// top of these segments: state header, ringbuffer, RCU.
@@ -950,8 +916,6 @@ impl ShmConfig {
         Ok(())
     }
 }
-
-// ── Backup & Restore ───────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -1051,8 +1015,6 @@ impl BackupConfig {
     }
 }
 
-// ── Global event stream ────────────────────────────────────
-
 /// Config for the `GlobalEventBus` behind `GET /store-api/events`: lifecycle/
 /// DDL events across the KV, JSON and relational engines. A section of its
 /// own rather than an `[lsm]` extension, since the bus belongs to no engine.
@@ -1075,8 +1037,6 @@ impl Default for EventsConfig {
         }
     }
 }
-
-// ── CORS ───────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -1233,8 +1193,6 @@ impl MulticoreConfig {
         Ok(())
     }
 }
-
-// ── Key set ────────────────────────────────────────────────
 
 /// Every leaf key the server reads, e.g. `auth.admins.api_key`, taken from
 /// the field lists serde passes while deserializing the config types.
@@ -1953,8 +1911,6 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("luradb.toml"));
     }
 
-    // ── Backup & Restore ────────────────────────────────────────────────────
-
     #[test]
     fn test_backup_defaults() {
         let config = LuraConfig::default();
@@ -2174,8 +2130,6 @@ mod tests {
         assert_invalid(config.backup.validate(), &format!("backup.schedule.name ('{name}')"), "1-50 characters");
     }
 
-    // ── Log HTTP access ──────────────────────────────────
-
     #[test]
     fn test_log_http_access_disabled_by_default() {
         let config = LuraConfig::default();
@@ -2200,8 +2154,6 @@ mod tests {
         let log = LogConfig::default();
         assert!(log.validate().is_ok());
     }
-
-    // ── Auth fail-closed ─────────────────────────────────
 
     #[test]
     fn test_server_default_bind_address_is_loopback() {
@@ -2268,8 +2220,6 @@ mod tests {
         assert!(config.auth.validate(&config.server).is_err());
     }
 
-    // ── Global event stream ──────────────────────────────
-
     #[test]
     fn test_events_defaults() {
         let config = LuraConfig::default();
@@ -2299,8 +2249,6 @@ mod tests {
         assert!(!config.auth.enabled);
         assert!(config.auth.validate(&config.server).is_ok());
     }
-
-    // ── CORS ──────────────────────────────────────────────
 
     #[test]
     fn test_cors_disabled_by_default() {
@@ -2484,8 +2432,6 @@ mod tests {
         assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
     }
 
-    // ── Data path collisions via real locations ──────────
-
     #[test]
     fn test_validate_data_paths_dot_segment_collision() {
         // Test 1: `x` and `./x` resolve to the same location.
@@ -2635,8 +2581,6 @@ mod tests {
         assert!(err.contains("symlink hops"), "{err}");
     }
 
-    // ── Startup checks of the remaining keys ─────────────
-
     // Runs even with the JSON engine disabled.
     #[test]
     fn test_json_validate_bulk_body_limit() {
@@ -2715,8 +2659,6 @@ mod tests {
         assert!(parse("[rel.lsm]\nmax_key_length = 73\n").rel.validate().is_ok());
         assert!(parse(&format!("[rel.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).rel.validate().is_ok());
     }
-
-    // ── Key set, unknown keys and config-file gate ───────
 
     // Test 3: optional fields and list elements count, section paths and
     // removed keys do not.

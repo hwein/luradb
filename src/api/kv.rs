@@ -38,8 +38,6 @@ use utoipa::ToSchema;
 const DEFAULT_SCAN_LIMIT: usize = 1000;
 const MAX_SCAN_LIMIT: usize = 10_000;
 
-// ── Query param types ─────────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 pub struct TtlParams {
     pub ttl: Option<u64>,
@@ -76,8 +74,6 @@ pub struct WatchParams {
     /// are present.
     pub last_event_id: Option<String>,
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn resolve(
     state: &AppState,
@@ -225,8 +221,6 @@ fn watch_item(
     }
 }
 
-// ── Handlers ─────────────────────────────────────────────────────────────────
-
 #[utoipa::path(
     put,
     path = "/store-api/kv/{domain}/keys/{key}",
@@ -313,8 +307,6 @@ pub async fn get_key(
     resp.headers_mut().insert(header::ETAG, etag(stamp));
     Ok(resp)
 }
-
-// ── KeyMetaResponse DTO ────────────────────────────────────────────────────────
 
 #[derive(Serialize, ToSchema)]
 pub struct KeyMetaResponse {
@@ -428,8 +420,6 @@ pub async fn set_null(
     Ok(StatusCode::OK)
 }
 
-// ── KeyScanResponse DTO ──────────────────────────────────────────────────────
-
 #[derive(Serialize, ToSchema)]
 pub struct KeyScanResponse {
     /// The page, in scan order (sorted).
@@ -478,8 +468,6 @@ pub async fn scan_keys(
         raw.into_iter().map(|k| String::from_utf8_lossy(&k).into_owned()).collect();
     Ok(Json(KeyScanResponse { keys, total, offset, limit }))
 }
-
-// ── BulkDeleteResponse DTO ───────────────────────────────────────────────────
 
 #[derive(Serialize, ToSchema)]
 pub struct BulkDeleteResponse {
@@ -625,8 +613,6 @@ pub async fn watch(
     Ok(Sse::new(leading_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,8 +720,6 @@ mod tests {
             assert_eq!(body.as_ref(), b"world");
         })
     }
-
-    // ── REST contract for the NULL value state ──────────────────────────────
 
     async fn send(app: &axum::Router, method: Method, uri: &str, body: Body) -> axum::http::Response<Body> {
         app.clone()
@@ -891,8 +875,6 @@ mod tests {
         })
     }
 
-    // ── REST roundtrip with a UTF-8 key ─────────────────────────────────────
-
     /// Percent-encodes every non-unreserved byte — enough to embed an arbitrary
     /// UTF-8 key (umlaut, emoji) in a URL path segment for tests.
     fn percent_encode(s: &str) -> String {
@@ -958,8 +940,6 @@ mod tests {
             );
         })
     }
-
-    // ── TTL observability & key metadata ─────────────────────────────────────
 
     async fn body_json(body: Body) -> serde_json::Value {
         let bytes = to_bytes(body, usize::MAX).await.unwrap();
@@ -1185,8 +1165,6 @@ mod tests {
         })
     }
 
-    // ── KV object-count endpoint ─────────────────────────────────────────────
-
     // Tests 1-3: empty domain -> 0; a mix of prefixed/unprefixed keys counts
     // exactly, with and without a `prefix` filter, cross-checked against the
     // exact key list `scan_keys` returns for the same prefix (same
@@ -1367,8 +1345,6 @@ mod tests {
             assert_eq!(body_json(resp.into_body()).await["count"].as_u64().unwrap(), 10_000);
         })
     }
-
-    // ── Prefix bulk-delete ───────────────────────────────────────────────────
 
     // Test 1: 5 keys sharing a prefix + 2 foreign keys -> deleting the prefix
     // removes exactly the 5, the 2 foreign keys stay reachable via GET.
@@ -1679,8 +1655,6 @@ mod tests {
         })
     }
 
-    // ── Watch event ids, resume & gap signal ────────────────────────────────
-
     // Test 2: the Last-Event-ID header wins over `?last_event_id=` when both
     // are present; either one alone is used as-is.
     #[test]
@@ -1893,8 +1867,6 @@ mod tests {
         })
     }
 
-    // ── GET …/keys pagination & contains filter ─────────────────────────────
-
     // Test 1: 25 keys, limit=10 -> page 1 (offset=0) and page 2 (offset=10)
     // are disjoint, each in sorted scan order, `total=25` on every page;
     // page 3 (offset=20) holds the remaining 5; offset=30 is past the end
@@ -2031,8 +2003,6 @@ mod tests {
             assert_eq!(body["total"].as_u64().unwrap(), 3);
         })
     }
-
-    // ── Conditional writes: ETag, If-Match, If-None-Match, 428 ──────────────
 
     async fn send_with(
         app: &axum::Router,

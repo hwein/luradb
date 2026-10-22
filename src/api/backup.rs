@@ -29,8 +29,6 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use utoipa::ToSchema;
 
-// ── Error mapping ────────────────────────────────────────────────────────────
-
 /// Maps every `BackupError` variant to its HTTP status and a plaintext
 /// `ApiError` body (project-wide convention). Matched by variant, not by
 /// parsing `Display`, so wire text stays independent of `BackupError`'s
@@ -96,8 +94,6 @@ fn backup_manager(state: &AppState) -> Result<&Arc<BackupManager>, ApiError> {
     })
 }
 
-// ── Audit logging (exfiltration awareness) ─────────────────────────────────
-
 /// Best-effort caller identity for the audit log. Independently resolves the
 /// same Bearer key the auth middleware already validated this request
 /// against: the middleware only forwards a coarse `AuthOutcome` (Full /
@@ -116,8 +112,6 @@ fn log_audit(admin: &Option<String>, action: &str, backup_id: &str) {
         None => tracing::info!(backup_id = %backup_id, "{action}"),
     }
 }
-
-// ── DTOs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateBackupRequest {
@@ -347,8 +341,6 @@ fn parse_restore_mode(s: &str) -> Result<restore::RestoreMode, ApiError> {
         )),
     }
 }
-
-// ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     post,
@@ -670,8 +662,6 @@ pub async fn get_restore_status(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "404 Not Found: restore not found"))?;
     Ok(Json(status.into()))
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

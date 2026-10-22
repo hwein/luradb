@@ -244,19 +244,9 @@ impl ShardRouter {
     /// The data shard of the domain `path` names; `None` for a path without
     /// a domain.
     fn shard_of(&self, path: &str) -> Option<usize> {
-        let domain = extract_domain(path).map(|(_, domain, _)| domain).or_else(|| managed_domain(path))?;
+        let domain = extract_domain(path).map(|(_, domain, _)| domain)?;
         let shards = self.shards.len() as u16;
         Some(usize::from(slots::shard_of_domain(domain, shards)))
-    }
-}
-
-/// The JSON or relational domain a domain-management path names; auth
-/// treats these paths as admin-only and so sees no domain in them.
-fn managed_domain(path: &str) -> Option<&str> {
-    let mut segments = path.strip_prefix("/store-api/")?.split('/');
-    match (segments.next(), segments.next(), segments.next()) {
-        (Some("json" | "rel"), Some("domains"), Some(name)) if !name.is_empty() => Some(name),
-        _ => None,
     }
 }
 

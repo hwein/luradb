@@ -50,7 +50,7 @@ fn validate_domain_name(name: &str) -> Result<(), JsonStoreError> {
             name
         )));
     }
-    // Shadowed by the static /json/domains admin routes: data endpoints of
+    // Shadowed by the static /json/domains routes: data endpoints of
     // such a domain would answer 404/405 (matchit prefers static segments).
     if name == "domains" {
         return Err(JsonStoreError::InvalidDomainName(

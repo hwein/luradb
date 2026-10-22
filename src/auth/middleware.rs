@@ -32,18 +32,26 @@ pub(crate) enum StoreType {
 ///   /store-api/json/{domain}/…           → (Json, domain, false)
 ///   /store-api/rel/{domain}/…            → (Rel, domain, false)
 ///   /store-api/domains/{domain}[/…]      → (Kv, domain, true)   KV domain management
+///   /store-api/json/domains/{domain}     → (Json, domain, true) JSON domain management
+///   /store-api/rel/domains/{domain}      → (Rel, domain, true)  rel domain management
 ///   /store-api/metrics/domains/{domain}  → (Kv, domain, false)  domain metrics
-/// `/store-api/json/domains/…`, `/store-api/rel/domains/…` and everything
-/// else → None (admin-only).
+/// The domain listings (`/store-api/{,json/,rel/}domains`) and everything
+/// else → None.
 pub(crate) fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
         ["store-api", "kv", domain, ..] if !domain.is_empty() => {
             Some((StoreType::Kv, domain, false))
         }
+        ["store-api", "json", "domains", domain] if !domain.is_empty() => {
+            Some((StoreType::Json, domain, true))
+        }
         ["store-api", "json", "domains", ..] => None,
         ["store-api", "json", domain, ..] if !domain.is_empty() => {
             Some((StoreType::Json, domain, false))
+        }
+        ["store-api", "rel", "domains", domain] if !domain.is_empty() => {
+            Some((StoreType::Rel, domain, true))
         }
         ["store-api", "rel", "domains", ..] => None,
         ["store-api", "rel", domain, ..] if !domain.is_empty() => {
@@ -57,6 +65,10 @@ pub(crate) fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
         }
         _ => None,
     }
+}
+
+fn is_domain_listing(path: &str) -> bool {
+    matches!(path, "/store-api/domains" | "/store-api/json/domains" | "/store-api/rel/domains")
 }
 
 /// POST counts as a write except for the read-only `/search` endpoint and
@@ -113,11 +125,12 @@ pub enum AuthOutcome {
     Scoped(AccessLevel),
 }
 
-/// Username of a Scoped user, set into the request extensions alongside
-/// `AuthOutcome::Scoped`. Additive — `AuthOutcome` itself is
-/// unchanged (`backup.rs` depends on its exact shape). Lets handlers that
-/// need a per-engine permission lookup (cross-engine link authorization)
-/// resolve the caller's username without re-deriving it from the request.
+/// Username of a regular user, set into the request extensions alongside
+/// `AuthOutcome::Scoped`, or alone on the domain listings. Additive —
+/// `AuthOutcome` itself is unchanged (`backup.rs` depends on its exact shape).
+/// Lets handlers that need a per-engine permission lookup (cross-engine link
+/// authorization, domain listings) resolve the caller's username without
+/// re-deriving it from the request.
 #[derive(Clone, Debug)]
 pub struct AuthUser(pub String);
 
@@ -185,12 +198,19 @@ pub async fn auth_layer(
         return next.run(request).await;
     }
 
+    // Domain listings are open to every user; the handler filters them by the
+    // user's permissions. Creating a domain (POST) stays admin-only.
+    if is_domain_listing(&path) && matches!(*request.method(), Method::GET | Method::HEAD) {
+        request.extensions_mut().insert(AuthUser(user.name.clone()));
+        return next.run(request).await;
+    }
+
     // Regular user: check domain permission
     let (store_type, domain, management) = match extract_domain(&path) {
         Some(x) => x,
         None => {
-            // Path doesn't include a domain (e.g. /auth/* or /json/domains/*
-            // management routes). Only admins can reach those.
+            // Path doesn't include a domain (e.g. /auth/*, /metrics, /config).
+            // Only admins can reach those.
             return forbidden();
         }
     };
@@ -279,7 +299,12 @@ mod tests {
             Some((StoreType::Json, "users", false))
         );
         assert_eq!(extract_domain("/store-api/json/domains"), None);
-        assert_eq!(extract_domain("/store-api/json/domains/users"), None);
+        assert_eq!(
+            extract_domain("/store-api/json/domains/users"),
+            Some((StoreType::Json, "users", true))
+        );
+        assert_eq!(extract_domain("/store-api/json/domains/users/extra"), None);
+        assert_eq!(extract_domain("/store-api/json/domains/"), None);
         assert_eq!(
             extract_domain("/store-api/rel/sales/sql"),
             Some((StoreType::Rel, "sales", false))
@@ -293,7 +318,12 @@ mod tests {
             Some((StoreType::Rel, "sales", false))
         );
         assert_eq!(extract_domain("/store-api/rel/domains"), None);
-        assert_eq!(extract_domain("/store-api/rel/domains/sales"), None);
+        assert_eq!(
+            extract_domain("/store-api/rel/domains/sales"),
+            Some((StoreType::Rel, "sales", true))
+        );
+        assert_eq!(extract_domain("/store-api/rel/domains/sales/extra"), None);
+        assert_eq!(extract_domain("/store-api/rel/domains/"), None);
         assert_eq!(
             extract_domain("/store-api/domains/analytics"),
             Some((StoreType::Kv, "analytics", true))

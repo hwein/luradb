@@ -1553,7 +1553,8 @@ mod tests {
             let resp = send(Method::POST, "/store-api/json/default/bulk",
                 Some(r#"{"_key": "a", "n": 1}"#), user_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            let resp = send(Method::GET, "/store-api/json/domains", None, user_key).await.unwrap();
+            let resp = send(Method::POST, "/store-api/json/domains",
+                Some(r#"{"name": "own"}"#), user_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
             // Admin has full access everywhere.

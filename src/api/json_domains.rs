@@ -2,15 +2,17 @@
 //!
 //! POST   /store-api/json/domains          → create_domain  (201 | 409 | 400)
 //! GET    /store-api/json/domains          → list_domains   (200)
-//! GET    /store-api/json/domains/{name}   → get_domain     (200 | 404)
+//! GET    /store-api/json/domains/{name}   → get_domain     (200 | 403 | 404 | 410)
 //! DELETE /store-api/json/domains/{name}   → delete_domain  (202 | 404)
 
+use crate::api::domains::DomainFilter;
 use crate::api::json::json_engine;
 use crate::api::{middleware::ApiError, AppState};
+use crate::auth::middleware::{AuthOutcome, AuthUser, StoreType};
 use crate::control::{DomainEntry, Engine};
 use crate::engines::json::{JsonDomain, JsonDomainState};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::Json,
 };
@@ -97,17 +99,23 @@ pub async fn create_domain(
     get,
     path = "/store-api/json/domains",
     responses(
-        (status = 200, description = "List of active JSON domains", body = Vec<JsonDomainResponse>),
+        (status = 200, description = "List of the active JSON domains the key may access", body = Vec<JsonDomainResponse>),
         (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
-/// Returns all active JSON domains.
+/// Returns the active JSON domains. Admin keys see all of them; any other key
+/// sees only the JSON domains it has a permission on (an empty list without any).
 pub async fn list_domains(
     State(state): State<AppState>,
+    outcome: Option<Extension<AuthOutcome>>,
+    user: Option<Extension<AuthUser>>,
 ) -> Result<Json<Vec<JsonDomainResponse>>, ApiError> {
     json_engine(&state)?;
-    Ok(Json(state.control.directory().domains(Engine::Json).map(Into::into).collect()))
+    let filter = DomainFilter::for_caller(&state, outcome, user, StoreType::Json).await?;
+    let directory = state.control.directory();
+    let visible = directory.domains(Engine::Json).filter(|d| filter.allows(&d.name));
+    Ok(Json(visible.map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -116,6 +124,7 @@ pub async fn list_domains(
     params(("name" = String, Path, description = "JSON domain name")),
     responses(
         (status = 200, description = "Domain found", body = JsonDomainResponse),
+        (status = 403, description = "Forbidden — no permission on the domain (also when it does not exist)", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted (background purge running)", body = String, content_type = "text/plain"),
         (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
@@ -123,7 +132,7 @@ pub async fn list_domains(
     tag = "JSON Document Store"
 )]
 /// Returns metadata for a single JSON domain, including its document count.
-/// Domains in `deleting` state answer with 410 Gone.
+/// Needs a permission on the domain (admin keys always pass). Domains in `deleting` state answer with 410 Gone.
 pub async fn get_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,

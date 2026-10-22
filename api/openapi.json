@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.11.0",
+    "version": "0.12.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -835,11 +835,11 @@
         "tags": [
           "Domains"
         ],
-        "summary": "Returns all active domains with their names and creation timestamps.",
+        "summary": "Returns the active domains with their names and creation timestamps.\nAdmin keys see all of them; any other key sees only the domains it has a\npermission on (an empty list without any).",
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "List of active domains",
+            "description": "List of the active domains the key may access",
             "content": {
               "application/json": {
                 "schema": {
@@ -1044,11 +1044,11 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Returns all active JSON domains.",
+        "summary": "Returns the active JSON domains. Admin keys see all of them; any other key\nsees only the JSON domains it has a permission on (an empty list without any).",
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "List of active JSON domains",
+            "description": "List of the active JSON domains the key may access",
             "content": {
               "application/json": {
                 "schema": {
@@ -1137,7 +1137,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Returns metadata for a single JSON domain, including its document count.\nDomains in `deleting` state answer with 410 Gone.",
+        "summary": "Returns metadata for a single JSON domain, including its document count.\nNeeds a permission on the domain (admin keys always pass). Domains in `deleting` state answer with 410 Gone.",
         "operationId": "get_domain",
         "parameters": [
           {
@@ -1157,6 +1157,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/JsonDomainResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — no permission on the domain (also when it does not exist)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -3634,11 +3644,11 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Returns all active relational domains.",
+        "summary": "Returns the active relational domains. Admin keys see all of them; any\nother key sees only the relational domains it has a permission on (an empty\nlist without any).",
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "List of active relational domains",
+            "description": "List of the active relational domains the key may access",
             "content": {
               "application/json": {
                 "schema": {
@@ -3727,7 +3737,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Returns metadata for a single relational domain. A domain in `deleting`\nstate answers 410 Gone (a background purge removes the data later).",
+        "summary": "Returns metadata for a single relational domain. Needs a permission on the\ndomain (admin keys always pass). A domain in `deleting` state answers 410\nGone (a background purge removes the data later).",
         "operationId": "get_domain",
         "parameters": [
           {
@@ -3747,6 +3757,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RelDomainResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — no permission on the domain (also when it does not exist)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }

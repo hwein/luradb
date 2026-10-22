@@ -6,14 +6,53 @@
 //! DELETE /store-api/domains/{name}       → delete_domain  (202 Accepted | 404)
 
 use crate::api::{middleware::ApiError, AppState};
+use crate::auth::middleware::{split_permission_domain, AuthOutcome, AuthUser, StoreType};
 use crate::control::{DomainEntry, Engine, Lifecycle};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use utoipa::ToSchema;
+
+/// Which domains of one engine a caller may see in a domain listing.
+pub(crate) struct DomainFilter(Option<HashSet<String>>);
+
+impl DomainFilter {
+    /// Admins, trusted peers and auth-off setups see every domain; a user sees
+    /// the domains of `store_type` they hold any permission on. Auth on with
+    /// neither outcome nor user is a middleware bug: fail closed.
+    pub(crate) async fn for_caller(
+        state: &AppState,
+        outcome: Option<Extension<AuthOutcome>>,
+        user: Option<Extension<AuthUser>>,
+        store_type: StoreType,
+    ) -> Result<Self, ApiError> {
+        if !state.auth_enabled || matches!(outcome, Some(Extension(AuthOutcome::Full))) {
+            return Ok(Self(None));
+        }
+        let Some(Extension(AuthUser(name))) = user else {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "403 Forbidden: no authenticated user"));
+        };
+        let names = state
+            .auth_cache
+            .permissions_for_user(&name)
+            .await
+            .iter()
+            .filter_map(|permission| match split_permission_domain(&permission.domain) {
+                (kind, domain) if kind == store_type => Some(domain.to_string()),
+                _ => None,
+            })
+            .collect();
+        Ok(Self(Some(names)))
+    }
+
+    pub(crate) fn allows(&self, name: &str) -> bool {
+        self.0.as_ref().is_none_or(|names| names.contains(name))
+    }
+}
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateDomainRequest {
@@ -82,16 +121,23 @@ pub async fn create_domain(
     get,
     path = "/store-api/domains",
     responses(
-        (status = 200, description = "List of active domains", body = Vec<DomainResponse>),
+        (status = 200, description = "List of the active domains the key may access", body = Vec<DomainResponse>),
     ),
     tag = "Domains"
 )]
-/// Returns all active domains with their names and creation timestamps.
+/// Returns the active domains with their names and creation timestamps.
+/// Admin keys see all of them; any other key sees only the domains it has a
+/// permission on (an empty list without any).
 pub async fn list_domains(
     State(state): State<AppState>,
+    outcome: Option<Extension<AuthOutcome>>,
+    user: Option<Extension<AuthUser>>,
 ) -> Result<Json<Vec<DomainResponse>>, ApiError> {
+    let filter = DomainFilter::for_caller(&state, outcome, user, StoreType::Kv).await?;
     let directory = state.control.directory();
-    let active = directory.domains(Engine::Kv).filter(|d| d.state == Lifecycle::Active);
+    let active = directory
+        .domains(Engine::Kv)
+        .filter(|d| d.state == Lifecycle::Active && filter.allows(&d.name));
     Ok(Json(active.map(DomainResponse::from).collect()))
 }
 

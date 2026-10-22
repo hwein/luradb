@@ -1232,4 +1232,202 @@ mod tests {
             assert_eq!(set_perm(&app, "frank", "doomed2", "rel", None).await, StatusCode::NOT_FOUND);
         })
     }
+
+    const LISTING_ADMIN_KEY: &str = "lura_listing_admin";
+    const LISTING_USER_KEY: &str = "lura_listing_worker";
+    const DOMAIN_LISTINGS: [&str; 3] = ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"];
+
+    /// Auth-on app with an admin, the user `worker` (no grants yet) and the
+    /// domains KV `a`, `x` / JSON `a`, `b`, `x` / rel `c`, `x`, beside
+    /// the built-in `default` of each engine.
+    async fn listing_fixture() -> (axum::Router, Arc<AuthCache>, tempfile::TempDir) {
+        let (app, cache, _json, _rel, dir) = make_app_with_engines(true, true, true).await;
+        add_user(&cache, "boss", LISTING_ADMIN_KEY, UserRole::Admin).await;
+        add_user(&cache, "worker", LISTING_USER_KEY, UserRole::User).await;
+        let domains = [
+            (DOMAIN_LISTINGS[0], ["a", "x"].as_slice()),
+            (DOMAIN_LISTINGS[1], ["a", "b", "x"].as_slice()),
+            (DOMAIN_LISTINGS[2], ["c", "x"].as_slice()),
+        ];
+        for (uri, names) in domains {
+            for name in names {
+                let body = serde_json::json!({ "name": name }).to_string();
+                let resp = authed(&app, LISTING_ADMIN_KEY, Method::POST, uri, Some(&body)).await;
+                assert_eq!(resp.status(), StatusCode::CREATED, "{uri} {name}");
+            }
+        }
+        (app, cache, dir)
+    }
+
+    async fn grant(cache: &AuthCache, domain: &str, access: AccessLevel) {
+        let permission = DomainPermission { username: "worker".to_string(), domain: domain.to_string(), access };
+        cache.set_permission(permission).await.unwrap();
+    }
+
+    async fn listed_names(app: &axum::Router, key: &str, uri: &str) -> Vec<String> {
+        let resp = authed(app, key, Method::GET, uri, None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = json_body(resp).await;
+        body.as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn domain_listings_return_only_the_domains_the_user_may_access() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, cache, _dir) = listing_fixture().await;
+            grant(&cache, "a", AccessLevel::Read).await;
+            grant(&cache, "json:b", AccessLevel::Write).await;
+            grant(&cache, "rel:c", AccessLevel::Ddl).await;
+
+            // JSON `a` exists too, but the KV grant on `a` does not cover it.
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTINGS[0]).await, ["a"]);
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTINGS[1]).await, ["b"]);
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTINGS[2]).await, ["c"]);
+
+            grant(&cache, "json:a", AccessLevel::Read).await;
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTINGS[1]).await, ["a", "b"]);
+
+            let resp = authed(&app, LISTING_USER_KEY, Method::GET, DOMAIN_LISTINGS[1], None).await;
+            let body = json_body(resp).await;
+            assert_eq!(body[1]["name"], "b");
+            assert_eq!(body[1]["state"], "active");
+            assert_eq!(body[1]["require_conditional_writes"], false);
+            assert!(body[1]["created_at"].is_u64());
+        })
+    }
+
+    #[test]
+    fn domain_listings_are_empty_without_matching_permissions() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, cache, _dir) = listing_fixture().await;
+
+            for uri in DOMAIN_LISTINGS {
+                assert!(listed_names(&app, LISTING_USER_KEY, uri).await.is_empty(), "{uri}");
+            }
+
+            // Grants on domains that do not exist add no entries.
+            grant(&cache, "ghost", AccessLevel::Read).await;
+            grant(&cache, "json:ghost", AccessLevel::Read).await;
+            grant(&cache, "rel:ghost", AccessLevel::Read).await;
+            for uri in DOMAIN_LISTINGS {
+                assert!(listed_names(&app, LISTING_USER_KEY, uri).await.is_empty(), "{uri}");
+            }
+        })
+    }
+
+    #[test]
+    fn domain_listing_omits_a_deleted_domain_with_a_grant() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, cache, _dir) = listing_fixture().await;
+            grant(&cache, "a", AccessLevel::Read).await;
+            grant(&cache, "x", AccessLevel::Read).await;
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTINGS[0]).await, ["a", "x"]);
+
+            let resp = authed(&app, LISTING_ADMIN_KEY, Method::DELETE, "/store-api/domains/x", None).await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTINGS[0]).await, ["a"]);
+        })
+    }
+
+    #[test]
+    fn domain_listings_show_everything_to_admin_and_trusted_peer() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = listing_fixture().await;
+
+            let expected = [vec!["a", "default", "x"], vec!["a", "b", "default", "x"], vec!["c", "default", "x"]];
+            for (uri, expected) in DOMAIN_LISTINGS.into_iter().zip(expected) {
+                assert_eq!(listed_names(&app, LISTING_ADMIN_KEY, uri).await, expected, "{uri}");
+
+                let resp = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).extension(TrustedPeer).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                assert_eq!(json_body(resp).await.as_array().unwrap().len(), expected.len(), "{uri}");
+            }
+        })
+    }
+
+    #[test]
+    fn domain_listings_are_unfiltered_when_auth_is_off() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _json, _rel, _dir) = make_app_with_engines(false, true, true).await;
+            create_domain(&app, "json", "b").await;
+            create_domain(&app, "rel", "c").await;
+
+            for (uri, name) in [(DOMAIN_LISTINGS[1], "b"), (DOMAIN_LISTINGS[2], "c")] {
+                let resp = send(&app, Method::GET, uri, Body::empty()).await;
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                let body = json_body(resp).await;
+                assert!(body.as_array().unwrap().iter().any(|d| d["name"] == name), "{uri}");
+            }
+        })
+    }
+
+    #[test]
+    fn domain_listings_need_a_key_and_stay_read_only_for_users() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, cache, _dir) = listing_fixture().await;
+            grant(&cache, "a", AccessLevel::Ddl).await;
+            grant(&cache, "json:b", AccessLevel::Ddl).await;
+            grant(&cache, "rel:c", AccessLevel::Ddl).await;
+
+            for uri in DOMAIN_LISTINGS {
+                let resp = send(&app, Method::GET, uri, Body::empty()).await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+
+                let resp = authed(&app, LISTING_USER_KEY, Method::HEAD, uri, None).await;
+                assert_eq!(resp.status(), StatusCode::OK, "HEAD {uri}");
+
+                let resp = authed(&app, LISTING_USER_KEY, Method::POST, uri, Some(r#"{"name": "own"}"#)).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "POST {uri}");
+            }
+
+            // The rest of the management surface stays admin-only.
+            let resp = authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/metrics", None).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let resp = authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/config", None).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+            assert_eq!(listed_names(&app, LISTING_ADMIN_KEY, DOMAIN_LISTINGS[0]).await, ["a", "default", "x"]);
+        })
+    }
+
+    #[test]
+    fn json_and_rel_domain_details_follow_the_domain_permission() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, cache, _dir) = listing_fixture().await;
+            grant(&cache, "a", AccessLevel::Write).await;
+            grant(&cache, "json:b", AccessLevel::Read).await;
+            grant(&cache, "rel:c", AccessLevel::Read).await;
+
+            let status = |method: Method, uri: &'static str| {
+                let app = app.clone();
+                async move { authed(&app, LISTING_USER_KEY, method, uri, None).await.status() }
+            };
+
+            assert_eq!(status(Method::GET, "/store-api/json/domains/b").await, StatusCode::OK);
+            assert_eq!(status(Method::GET, "/store-api/rel/domains/c").await, StatusCode::OK);
+
+            // No grant: 403, whether or not the domain exists (the KV grant on `a` is no JSON grant).
+            for uri in [
+                "/store-api/json/domains/x",
+                "/store-api/json/domains/a",
+                "/store-api/json/domains/ghost",
+                "/store-api/rel/domains/x",
+                "/store-api/rel/domains/ghost",
+            ] {
+                assert_eq!(status(Method::GET, uri).await, StatusCode::FORBIDDEN, "{uri}");
+            }
+
+            // Deleting stays admin-only, even with a Write grant.
+            grant(&cache, "json:b", AccessLevel::Write).await;
+            grant(&cache, "rel:c", AccessLevel::Write).await;
+            assert_eq!(status(Method::DELETE, "/store-api/json/domains/b").await, StatusCode::FORBIDDEN);
+            assert_eq!(status(Method::DELETE, "/store-api/rel/domains/c").await, StatusCode::FORBIDDEN);
+            assert_eq!(status(Method::GET, "/store-api/json/domains/b").await, StatusCode::OK);
+            assert_eq!(status(Method::GET, "/store-api/rel/domains/c").await, StatusCode::OK);
+        })
+    }
 }

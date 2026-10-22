@@ -850,7 +850,7 @@ mod tests {
     }
 
     // 13. Invalid domain names → InvalidDomainName. "domains" is reserved:
-    //     the static /json/domains admin routes shadow such a domain.
+    //     the static /json/domains routes shadow such a domain.
     #[test]
     fn test_invalid_domain_name_rejected() {
         crate::core::engine_runtime::block_on(async {

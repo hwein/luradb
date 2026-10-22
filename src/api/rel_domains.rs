@@ -2,15 +2,17 @@
 //!
 //! POST   /store-api/rel/domains          → create_domain  (201 | 409 | 400)
 //! GET    /store-api/rel/domains          → list_domains   (200)
-//! GET    /store-api/rel/domains/{name}   → get_domain     (200 | 404 | 410)
+//! GET    /store-api/rel/domains/{name}   → get_domain     (200 | 403 | 404 | 410)
 //! DELETE /store-api/rel/domains/{name}   → delete_domain  (202 | 404 | 410)
 
+use crate::api::domains::DomainFilter;
 use crate::api::rel::rel_engine;
 use crate::api::{middleware::ApiError, AppState};
+use crate::auth::middleware::{AuthOutcome, AuthUser, StoreType};
 use crate::control::{DomainEntry, Engine};
 use crate::engines::rel::{RelDomain, RelDomainState};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::Json,
 };
@@ -77,15 +79,24 @@ pub async fn create_domain(
     get,
     path = "/store-api/rel/domains",
     responses(
-        (status = 200, description = "List of active relational domains", body = Vec<RelDomainResponse>),
+        (status = 200, description = "List of the active relational domains the key may access", body = Vec<RelDomainResponse>),
         (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]
-/// Returns all active relational domains.
-pub async fn list_domains(State(state): State<AppState>) -> Result<Json<Vec<RelDomainResponse>>, ApiError> {
+/// Returns the active relational domains. Admin keys see all of them; any
+/// other key sees only the relational domains it has a permission on (an empty
+/// list without any).
+pub async fn list_domains(
+    State(state): State<AppState>,
+    outcome: Option<Extension<AuthOutcome>>,
+    user: Option<Extension<AuthUser>>,
+) -> Result<Json<Vec<RelDomainResponse>>, ApiError> {
     rel_engine(&state)?;
-    Ok(Json(state.control.directory().domains(Engine::Rel).map(Into::into).collect()))
+    let filter = DomainFilter::for_caller(&state, outcome, user, StoreType::Rel).await?;
+    let directory = state.control.directory();
+    let visible = directory.domains(Engine::Rel).filter(|d| filter.allows(&d.name));
+    Ok(Json(visible.map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -94,14 +105,16 @@ pub async fn list_domains(State(state): State<AppState>) -> Result<Json<Vec<RelD
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
         (status = 200, description = "Domain found", body = RelDomainResponse),
+        (status = 403, description = "Forbidden — no permission on the domain (also when it does not exist)", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted (background purge running)", body = String, content_type = "text/plain"),
         (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]
-/// Returns metadata for a single relational domain. A domain in `deleting`
-/// state answers 410 Gone (a background purge removes the data later).
+/// Returns metadata for a single relational domain. Needs a permission on the
+/// domain (admin keys always pass). A domain in `deleting` state answers 410
+/// Gone (a background purge removes the data later).
 pub async fn get_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,

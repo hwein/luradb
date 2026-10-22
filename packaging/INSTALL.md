@@ -76,6 +76,8 @@ The shard count belongs to the data directory: with `shards = 0` the service kee
 
 ## Changing the shard count
 
+After an update the service keeps the shard count the data directory was written with. If this host would use a different count, the start log (`journalctl -u luradb`) warns and prints the migration command.
+
 The migration tool rewrites the data directory for another number of data shards, more or fewer, down to 1. It works offline, on a stopped service, and moves the key-value, JSON and relational data alike:
 
 ```bash

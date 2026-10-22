@@ -33,7 +33,14 @@ pub(super) async fn shard_count(config: &LuraConfig, sys: &LsmStorageEngine, aut
         None if !system::layout_is_sharded(sys).await? && !legacy_files(config).await?.is_empty() => 1,
         None => return Ok(auto),
     };
-    tracing::info!("Data shards: {stored}, as the data directory was written; `luradb --migrate-shards N` changes it.");
+    if stored != auto {
+        tracing::warn!(
+            "Data shards: {stored}, as the data directory was written; this host would use {auto}. \
+             Writes stay on {stored} core(s) until you stop the server and run: luradb --migrate-shards {auto}"
+        );
+    } else {
+        tracing::info!("Data shards: {stored}, as the data directory was written.");
+    }
     Ok(stored)
 }
 

@@ -57,7 +57,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Breaking bumps the middle digit, anything else the last. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.10.1";
+pub const API_VERSION: &str = "0.10.2";
 
 struct VersionInfo;
 
@@ -133,45 +133,45 @@ pub fn create_router(state: AppState) -> Router {
         .route("/config", get(metrics::get_config))
         // Metrics (admin / domain user)
         .route("/metrics", get(metrics::get_metrics))
-        .route("/metrics/domains/:name", get(metrics::get_domain_metrics))
+        .route("/metrics/domains/{name}", get(metrics::get_domain_metrics))
         // Domain management
         .route("/domains", post(domains::create_domain).get(domains::list_domains))
-        .route("/domains/:name", get(domains::get_domain).delete(domains::delete_domain))
+        .route("/domains/{name}", get(domains::get_domain).delete(domains::delete_domain))
         // KV operations (engine → domain → resource)
         .route(
-            "/kv/:domain/keys/:key",
+            "/kv/{domain}/keys/{key}",
             put(kv::put_key).get(kv::get_key).delete(kv::delete_key),
         )
-        .route("/kv/:domain/keys/:key/null", patch(kv::set_null))
-        .route("/kv/:domain/keys/:key/meta", get(kv::get_key_meta))
-        .route("/kv/:domain/keys", get(kv::scan_keys).delete(kv::delete_keys_by_prefix))
-        .route("/kv/:domain/count", get(kv::count_keys))
-        .route("/kv/:domain/watch", get(kv::watch))
+        .route("/kv/{domain}/keys/{key}/null", patch(kv::set_null))
+        .route("/kv/{domain}/keys/{key}/meta", get(kv::get_key_meta))
+        .route("/kv/{domain}/keys", get(kv::scan_keys).delete(kv::delete_keys_by_prefix))
+        .route("/kv/{domain}/count", get(kv::count_keys))
+        .route("/kv/{domain}/watch", get(kv::watch))
         // JSON document store (handlers answer 503 when the engine is disabled)
         .route(
             "/json/domains",
             post(json_domains::create_domain).get(json_domains::list_domains),
         )
         .route(
-            "/json/domains/:name",
+            "/json/domains/{name}",
             get(json_domains::get_domain).delete(json_domains::delete_domain),
         )
         .route(
-            "/json/:domain/documents",
+            "/json/{domain}/documents",
             post(json::create_document).get(json::list_documents),
         )
-        .route("/json/:domain/documents/count", get(json::count_documents))
+        .route("/json/{domain}/documents/count", get(json::count_documents))
         .route(
-            "/json/:domain/documents/:key",
+            "/json/{domain}/documents/{key}",
             put(json::put_document).get(json::get_document).delete(json::delete_document),
         )
-        .route("/json/:domain/indexes", post(json::create_index).get(json::list_indexes))
-        .route("/json/:domain/indexes/:field", delete(json::delete_index))
-        .route("/json/:domain/search", post(json::search_documents))
+        .route("/json/{domain}/indexes", post(json::create_index).get(json::list_indexes))
+        .route("/json/{domain}/indexes/{field}", delete(json::delete_index))
+        .route("/json/{domain}/search", post(json::search_documents))
         // Bulk imports exceed axum's 2 MB default body limit; when the JSON
         // engine is disabled the safe default stays (route answers 503).
         .route(
-            "/json/:domain/bulk",
+            "/json/{domain}/bulk",
             post(json::bulk_load).layer(DefaultBodyLimit::max(
                 state
                     .json_engine
@@ -179,19 +179,19 @@ pub fn create_router(state: AppState) -> Router {
                     .map_or(2 * 1024 * 1024, |e| e.bulk_body_limit_bytes()),
             )),
         )
-        .route("/json/:domain/export", get(json::export_documents))
-        .route("/json/:domain/reindex", post(json::trigger_reindex))
-        .route("/json/:domain/reindex/:task_id", get(json::reindex_status))
+        .route("/json/{domain}/export", get(json::export_documents))
+        .route("/json/{domain}/reindex", post(json::trigger_reindex))
+        .route("/json/{domain}/reindex/{task_id}", get(json::reindex_status))
         // Backup & Restore. Always registered — like the
         // JSON engine (and unlike rel), `backup.enabled = false` is a
         // handler-level 503, not a router-level absence, so on/off never
         // changes the contract's route surface.
         .route("/backups", post(backup::create_backup).get(backup::list_backups))
         .route("/backups/upload", post(backup::upload_backup))
-        .route("/backups/:id", get(backup::get_backup).delete(backup::delete_backup))
-        .route("/backups/:id/download", get(backup::download_backup))
-        .route("/backups/:id/restore", post(backup::restore_backup))
-        .route("/restores/:id", get(backup::get_restore_status))
+        .route("/backups/{id}", get(backup::get_backup).delete(backup::delete_backup))
+        .route("/backups/{id}/download", get(backup::download_backup))
+        .route("/backups/{id}/restore", post(backup::restore_backup))
+        .route("/restores/{id}", get(backup::get_restore_status))
         // Log Access. Always registered — like backup and
         // the JSON engine — so `log.http_access = false` stays a handler-level
         // 503, keeping 404 free for "wrong URL / old server".
@@ -216,35 +216,35 @@ pub fn create_router(state: AppState) -> Router {
                 post(rel_domains::create_domain).get(rel_domains::list_domains),
             )
             .route(
-                "/rel/domains/:name",
+                "/rel/domains/{name}",
                 get(rel_domains::get_domain).delete(rel_domains::delete_domain),
             )
-            .route("/rel/:domain/sql", post(rel::execute_sql))
+            .route("/rel/{domain}/sql", post(rel::execute_sql))
             // CSV/TSV file import: a body-size cap analogous
             // to the JSON bulk route below, sized from the engine config.
             .route(
-                "/rel/:domain/tables/from-file",
+                "/rel/{domain}/tables/from-file",
                 post(rel_import::create_table_from_file).layer(DefaultBodyLimit::max(
                     state.rel_engine.as_ref().map_or(64 * 1024 * 1024, |e| e.import_body_limit_bytes()),
                 )),
             )
             // Browse/Row REST surface: registered in this
             // same conditional sub-router, not a second merge point.
-            .route("/rel/:domain/tables", get(rel_browse::list_tables))
-            .route("/rel/:domain/tables/:table", get(rel_browse::get_table))
-            .route("/rel/:domain/views", get(rel_browse::list_views))
+            .route("/rel/{domain}/tables", get(rel_browse::list_tables))
+            .route("/rel/{domain}/tables/{table}", get(rel_browse::get_table))
+            .route("/rel/{domain}/views", get(rel_browse::list_views))
             .route(
-                "/rel/:domain/tables/:table/rows",
+                "/rel/{domain}/tables/{table}/rows",
                 get(rel_browse::browse_rows).post(rel_browse::insert_row),
             )
             .route(
-                "/rel/:domain/tables/:table/rows/:pk",
+                "/rel/{domain}/tables/{table}/rows/{pk}",
                 get(rel_browse::get_row).put(rel_browse::update_row).delete(rel_browse::delete_row),
             )
             // Object counter: a level above the `rows`
             // collection, not a static child of it — `/tables/count` still
-            // matches `:table`, so a table literally named `count` stays reachable.
-            .route("/rel/:domain/tables/:table/count", get(rel_browse::count_rows))
+            // matches `{table}`, so a table literally named `count` stays reachable.
+            .route("/rel/{domain}/tables/{table}/count", get(rel_browse::count_rows))
             .with_state(state.clone());
         store_router = store_router.merge(rel_routes);
     }
@@ -255,17 +255,17 @@ pub fn create_router(state: AppState) -> Router {
             "/auth/users",
             post(crate::auth::handlers::create_user).get(crate::auth::handlers::list_users),
         )
-        .route("/auth/users/:name", delete(crate::auth::handlers::delete_user))
+        .route("/auth/users/{name}", delete(crate::auth::handlers::delete_user))
         .route(
-            "/auth/users/:name/permissions",
+            "/auth/users/{name}/permissions",
             post(crate::auth::handlers::set_permission),
         )
         .route(
-            "/auth/users/:name/permissions/:domain",
+            "/auth/users/{name}/permissions/{domain}",
             delete(crate::auth::handlers::remove_permission),
         )
         .route(
-            "/auth/users/:name/rotate-key",
+            "/auth/users/{name}/rotate-key",
             post(crate::auth::handlers::rotate_key),
         )
         .with_state(auth_state);
@@ -831,17 +831,6 @@ mod router_coverage_tests {
         found
     }
 
-    /// axum `:param` → OpenAPI `{param}`.
-    fn normalize_path(path: &str) -> String {
-        path.split('/')
-            .map(|seg| match seg.strip_prefix(':') {
-                Some(name) => format!("{{{name}}}"),
-                None => seg.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("/")
-    }
-
     /// All `.route("<path>", …)` registrations of a source-text section,
     /// as (method, prefix+path) pairs.
     fn route_pairs(section: &str, prefix: &str) -> BTreeSet<(String, String)> {
@@ -852,7 +841,7 @@ mod router_coverage_tests {
             let args = &rest[..paren_end(rest)];
             let path_start = args.find('"').expect(".route without a path literal") + 1;
             let path_end = path_start + args[path_start..].find('"').expect("path literal not terminated");
-            let path = format!("{prefix}{}", normalize_path(&args[path_start..path_end]));
+            let path = format!("{prefix}{}", &args[path_start..path_end]);
             let methods = http_methods(args);
             assert!(!methods.is_empty(), "no HTTP method detected in .route({path:?}, …)");
             for method in methods {

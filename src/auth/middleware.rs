@@ -573,7 +573,7 @@ mod tests {
             let (app, _auth_cache, _dir) = make_docs_app(true).await;
 
             // openapi.json, the bare swagger_url (redirects to .../), and an
-            // asset sub-path under it — the `*rest` wildcard SwaggerUi
+            // asset sub-path under it — the `{*rest}` wildcard SwaggerUi
             // registers for its own static assets is part of the same
             // sub-router, so it's covered by the same layer too, no path list
             // needed.

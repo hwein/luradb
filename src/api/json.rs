@@ -676,9 +676,7 @@ pub async fn trigger_reindex(
     body: Bytes,
 ) -> Result<(StatusCode, Json<ReindexAcceptedResponse>), ApiError> {
     let engine = json_engine(&state)?;
-    // Parsed manually: Option<Json<T>> (axum 0.7) maps EVERY rejection —
-    // broken JSON, wrong types, missing content-type — to None, silently
-    // turning a bad field-specific request into a full re-index.
+    // Option<Json<T>> would turn every rejection into None, so the body is parsed by hand.
     let request: ReindexRequest = if body.iter().all(u8::is_ascii_whitespace) {
         ReindexRequest::default()
     } else {

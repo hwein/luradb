@@ -13,7 +13,7 @@ exclude = ["/.github/**", "/docs/**"]
 [dependencies]
 # Core: async runtime & web interface
 # Axum is our "driver"
-axum = { version = "0.7", features = ["macros", "http2"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 # Direct access to the HTTP conn machinery for the UDS listener;
 # both are already transitive dependencies of Axum.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
@@ -23,9 +23,9 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tokio-rustls = "0.26"
 # PEM cert/key loading; replaces the retired rustls-pemfile (RUSTSEC-2025-0134).
 rustls-pki-types = "1"
-utoipa = { version = "5", features = ["axum_extras"] }
-# 8.1.0 is the last utoipa-swagger-ui version before the axum-0.8 jump (9.x) — matches utoipa 5 + axum 0.7.
-utoipa-swagger-ui = { version = "8.1.0", features = ["axum"] }
+utoipa = { version = "6", features = ["axum_extras"] }
+# 10.0.2 is the first utoipa-swagger-ui version that builds with zip 9.
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 # Tokio as the base runtime (required by Axum)
 tokio = { version = "1", features = ["full"] }
 # Middleware for tracing and CORS

@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.10.1",
+    "version": "0.10.2",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -5191,10 +5191,10 @@
           "lsn_cut": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/LsnCutResponse"
               },
               {
-                "$ref": "#/components/schemas/LsnCutResponse"
+                "type": "null"
               }
             ]
           },
@@ -5258,10 +5258,10 @@
           "running": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RunningBackupInfo"
               },
               {
-                "$ref": "#/components/schemas/RunningBackupInfo"
+                "type": "null"
               }
             ]
           }

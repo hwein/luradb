@@ -722,7 +722,7 @@ mod tests {
         let late = Arc::new(std::sync::Mutex::new(None::<Lane>));
         let (handler_log, handler_late) = (Arc::clone(&log), Arc::clone(&late));
         let router = Router::new().route(
-            "/step/:name",
+            "/step/{name}",
             get(move |axum::extract::Path(name): axum::extract::Path<String>| {
                 let (log, late) = (Arc::clone(&handler_log), Arc::clone(&handler_late));
                 async move {
@@ -813,7 +813,7 @@ mod tests {
     }
 
     /// A router whose only route answers with `body`, built fresh per call.
-    fn body_route(path: &str, body: impl Fn() -> Body + Clone + Send + 'static) -> Router {
+    fn body_route(path: &str, body: impl Fn() -> Body + Clone + Send + Sync + 'static) -> Router {
         Router::new().route(path, get(move || { let body = body(); async move { body } }))
     }
 
@@ -957,10 +957,10 @@ mod tests {
     fn shard_router(shard: &'static str) -> Router {
         let answer = move || async move { format!("{shard} {}", std::thread::current().name().unwrap_or_default()) };
         Router::new()
-            .route("/store-api/kv/:domain/keys/:key", get(answer).put(answer))
-            .route("/store-api/kv/:domain/keys", get(answer))
+            .route("/store-api/kv/{domain}/keys/{key}", get(answer).put(answer))
+            .route("/store-api/kv/{domain}/keys", get(answer))
             .route("/store-api/domains", get(answer).post(answer))
-            .route("/store-api/json/domains/:name", get(answer).delete(answer))
+            .route("/store-api/json/domains/{name}", get(answer).delete(answer))
     }
 
     /// `serve_engine` with `router` on a thread named `name`.
@@ -1043,8 +1043,8 @@ mod tests {
             format!("{} {:?}", current.name().unwrap_or_default(), current.id())
         };
         let router = Router::new()
-            .route("/store-api/kv/:domain/keys/:key", get(thread).put(thread))
-            .route("/store-api/kv/:domain/keys/:key/meta", get(thread));
+            .route("/store-api/kv/{domain}/keys/{key}", get(thread).put(thread))
+            .route("/store-api/kv/{domain}/keys/{key}/meta", get(thread));
         let (engine_tx, engine) = engine_thread(router.clone());
         let engine_id = format!("{:?}", engine.thread().id());
         let (reader_tx, reader) = reader_pool(router.clone(), EngineDispatch::Engine(engine_tx.clone()));
@@ -1084,7 +1084,7 @@ mod tests {
         let gave_up = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&gave_up);
         let router = Router::new().route(
-            "/store-api/kv/:domain/keys/:key",
+            "/store-api/kv/{domain}/keys/{key}",
             get(move |Extension(caller): Extension<Caller>, headers: HeaderMap| {
                 let counter = Arc::clone(&counter);
                 async move {
@@ -1137,7 +1137,7 @@ mod tests {
         let engine_router = Router::new().nest(
             "/store-api",
             Router::new().route(
-                "/rel/:domain/sql",
+                "/rel/{domain}/sql",
                 post(
                     |Path(domain): Path<String>,
                      OriginalUri(uri): OriginalUri,
@@ -1154,7 +1154,7 @@ mod tests {
         let reader_router = Router::new().nest(
             "/store-api",
             Router::new().route(
-                "/rel/:domain/sql",
+                "/rel/{domain}/sql",
                 post(|Extension(forward): Extension<EngineForward>, body: Bytes| forward.send(body)),
             ),
         );

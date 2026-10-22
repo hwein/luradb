@@ -201,11 +201,12 @@ fn real_ip_from_headers(headers: &axum::http::HeaderMap, fallback: IpAddr) -> Ip
 /// - Sets [`ClientIp`] in request extensions for downstream use.
 pub async fn proxy_fn(
     State(cidrs): State<Arc<Vec<ParsedCidr>>>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let peer_ip = connect_info
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
         .unwrap_or_else(|| IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 

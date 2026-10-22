@@ -59,8 +59,7 @@ pub struct RegistrationConfig {
     pub auth_enabled: bool,
     /// UIDs allowed to register while `auth_enabled` (from `auth.trusted_uids`).
     pub trusted_uids: Arc<Vec<u32>>,
-    /// Reader slots the snapshot publisher scans; one lease per live client
-    /// (spec perf/012 §7).
+    /// Reader slots the snapshot publisher scans; one lease per live client.
     pub readers: Arc<ReaderRegistry>,
 }
 
@@ -141,7 +140,7 @@ async fn handle_connection(
         return;
     }
 
-    // 2. Trust gate (spec perf/008; same UID check as serve_uds). The ring
+    // 2. Trust gate (same UID check as serve_uds). The ring
     // protocol has no API-key path, so with auth on only trusted_uids may mint a
     // quartet; reject everyone else without touching shm.
     if !peer_trusted {
@@ -173,15 +172,15 @@ async fn handle_connection(
         return; // dispatcher gone (shutdown); the channel dropped `conn`, unlinking
     }
 
-    // 5. Register the reader slot — strictly before the reply (spec perf/012
-    // §7): the client may pin as soon as it has read the `OK`, and a pin the
+    // 5. Register the reader slot — strictly before the reply:
+    // the client may pin as soon as it has read the `OK`, and a pin the
     // publisher cannot see would let it flip a buffer that is being read. The
     // event channel above is asynchronous and therefore no substitute. `lease`
     // frees the slot on every exit below, cancellation at an `.await` included.
     let lease = config.readers.register(slot_handle);
 
-    // 6. Reply with the segment names, the doorbell's write end attached (spec
-    // perf/014). Ours closes right after: only the client's copy stays open.
+    // 6. Reply with the segment names, the doorbell's write end attached.
+    // Ours closes right after: only the client's copy stays open.
     let reply = format!("OK {} {} {} {} {}\n", client_id, names[0], names[1], names[2], names[3]);
     let sent = send_with_fd(&write_half, reply.as_bytes(), doorbell.as_fd()).await;
     drop(doorbell);
@@ -495,7 +494,7 @@ mod tests {
         }
     }
 
-    /// Registers like a doorbell-aware client (spec perf/014): the reply line
+    /// Registers like a doorbell-aware client: the reply line
     /// via `recvmsg`, plus the doorbell pipe's write end attached to it.
     async fn register_with_doorbell(stream: &mut UnixStream) -> (String, OwnedFd) {
         stream.write_all(b"REGISTER\n").await.unwrap();
@@ -670,7 +669,7 @@ mod tests {
         })
     }
 
-    // Spec perf/012 §7: the slot is in the registry before the client can read
+    // The slot is in the registry before the client can read
     // the `OK` (and therefore before it can pin), and EOF on the registration
     // socket reclaims it — the next publish onto the pinned buffer goes through
     // without the server ever writing into the client's page.
@@ -707,7 +706,7 @@ mod tests {
         })
     }
 
-    // Spec perf/012 test 7: a connection task cancelled at an `.await` (what the
+    // A connection task cancelled at an `.await` (what the
     // shutdown path does: the listener drops the compio handles of its
     // connection tasks) never reaches the code behind its EOF loop — only the
     // lease's Drop frees the slot.
@@ -798,7 +797,7 @@ mod tests {
     // Full loop: register, open the segments, drive Put+Get over the rings, then
     // disconnect and watch the segments get unlinked. A legacy client: it reads
     // the reply with `read_line`, never sees the doorbell fd and is served by
-    // the fallback tick (spec perf/014 test 2).
+    // the fallback tick.
     #[test]
     fn test_e2e_put_get_roundtrip_and_cleanup() {
         crate::core::engine_runtime::block_on(async {
@@ -867,7 +866,7 @@ mod tests {
         })
     }
 
-    // Spec perf/014: a doorbell-aware client receives the doorbell's write end
+    // A doorbell-aware client receives the doorbell's write end
     // with the `OK` line and rings it after every cmd-ring send; Put+Get
     // round-trip.
     #[test]
@@ -907,7 +906,7 @@ mod tests {
         })
     }
 
-    // Spec perf/014 test 4: the disconnect teardown closes the server's doorbell
+    // The disconnect teardown closes the server's doorbell
     // fds, cycle after cycle. Counted per pipe: a plain fd count would include
     // the fds of tests running in parallel.
     #[test]

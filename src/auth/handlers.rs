@@ -38,10 +38,10 @@ pub struct AuthState {
     /// isn't in the router at all.
     pub auth_enabled: bool,
     /// Mirrors `AppState::json_engine` — `None` when the JSON engine is
-    /// disabled. Backs `set_permission`'s domain existence check (spec general/021).
+    /// disabled. Backs `set_permission`'s domain existence check.
     pub json_engine: Option<Arc<JsonEngine>>,
     /// Mirrors `AppState::rel_engine` — `None` when the relational engine is
-    /// disabled. Backs `set_permission`'s domain existence check (spec general/021).
+    /// disabled. Backs `set_permission`'s domain existence check.
     pub rel_engine: Option<Arc<RelEngine>>,
 }
 
@@ -54,7 +54,7 @@ pub struct AuthState {
 pub struct WhoamiResponse {
     pub name: Option<String>,
     /// `"Admin"`, `"User"`, or a pseudo-role: `"TrustedPeer"` (UDS peer
-    /// authenticated by the kernel, spec perf/001) or `"Disabled"`
+    /// authenticated by the kernel) or `"Disabled"`
     /// (`auth.enabled = false`).
     pub role: String,
 }
@@ -98,9 +98,9 @@ pub struct PermissionItem {
 pub struct SetPermissionRequest {
     /// Domain name.
     pub domain: String,
-    /// Access level: `"read"`, `"write"` or `"ddl"` (spec rel/011).
+    /// Access level: `"read"`, `"write"` or `"ddl"`.
     pub access: String,
-    /// Store type of the domain: `"kv"` (default), `"json"` (spec json/012) or `"rel"` (spec rel/011).
+    /// Store type of the domain: `"kv"` (default), `"json"` or `"rel"`.
     pub store_type: Option<String>,
 }
 
@@ -175,7 +175,7 @@ fn now_secs() -> u64 {
 /// `auth_layer` middleware whitelists this path, see `middleware.rs`).
 ///
 /// Checked in order: `auth.enabled = false` → `Disabled`; a `TrustedPeer`
-/// (UDS peer authenticated by the kernel, spec perf/001) → `TrustedPeer`;
+/// (UDS peer authenticated by the kernel) → `TrustedPeer`;
 /// otherwise the Bearer key is resolved to its `UserRecord` → `Admin`/`User`.
 /// A `401` past the `auth_layer` middleware (which already validates the key)
 /// can only mean a middleware bug — fail-closed, analogous to `enforce_sql_level`.
@@ -292,7 +292,7 @@ fn store_type_str(store_type: StoreType) -> &'static str {
 /// permission matrix. API keys are not included.
 ///
 /// For `role == "Admin"`, `permissions` is meaningless for access control:
-/// admins have unconditional access regardless of its contents (kv/012). It
+/// admins have unconditional access regardless of its contents. It
 /// is usually empty for an admin but not guaranteed to be — e.g. a user
 /// promoted to admin via `luradb.toml` keeps any permissions set before the
 /// promotion. Never read an empty array as "no access" or a non-empty one as
@@ -507,7 +507,7 @@ mod tests {
         assert!(parse_store_type(&Some("xxx".to_string())).is_err());
     }
 
-    // ── list_users permissions (spec general/015) ───────────────────────────
+    // ── list_users permissions ───────────────────────────
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
@@ -643,7 +643,7 @@ mod tests {
             .unwrap();
     }
 
-    // Spec general/026 test 2 (auth sample): a real 404 (unknown user)
+    // Auth sample: a real 404 (unknown user)
     // carries a non-empty plaintext body — schema and reality agree.
     #[test]
     fn test_delete_missing_user_404_has_nonempty_plaintext_body() {
@@ -804,8 +804,8 @@ mod tests {
         })
     }
 
-    // Test 7: a non-admin key is still forbidden on GET /auth/users (unchanged
-    // by this spec -- extract_domain("/store-api/auth/users") stays None).
+    // Test 7: a non-admin key is still forbidden on GET /auth/users
+    // (extract_domain("/store-api/auth/users") stays None).
     #[test]
     fn list_users_forbidden_for_non_admin_key() {
         crate::core::engine_runtime::block_on(async {
@@ -867,7 +867,7 @@ mod tests {
         })
     }
 
-    // ── whoami (spec general/016) ────────────────────────────────────────────
+    // ── whoami ────────────────────────────────────────────
 
     // Test 1: admin key -> 200 with its own name and role "Admin".
     #[test]
@@ -1014,9 +1014,9 @@ mod tests {
 
     // Test 7 (/version still reachable, whitelist not broken) is covered by
     // `version_requires_valid_key_any_role` in middleware.rs, which exercises
-    // the exact same whitelist branch this spec extends.
+    // the exact same whitelist branch whoami uses.
 
-    // ── set_permission domain validation (spec general/021) ─────────────────
+    // ── set_permission domain validation ─────────────────
 
     /// POSTs a permission grant; returns only the status (body is irrelevant
     /// to every test below). `allow_missing` becomes `?allow_missing=` when `Some`.
@@ -1130,7 +1130,7 @@ mod tests {
     // Test 5: invalid domain name -> 400 for json/rel always; for kv only
     // with allow_missing=true (no lookup there to catch it otherwise); kv
     // without allow_missing keeps answering 404 -- the name is never
-    // validated on that branch (spec general/021 §4).
+    // validated on that branch.
     #[test]
     fn set_permission_invalid_name_rules_per_store_type() {
         crate::core::engine_runtime::block_on(async {
@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     // Test 7: allow_missing=true pre-provisions a permission that becomes
-    // effective once the domain is created -- json/012 §6's workflow keeps
+    // effective once the domain is created -- grant-before-create keeps
     // working, now as an explicit opt-in instead of a side effect of missing
     // validation.
     #[test]

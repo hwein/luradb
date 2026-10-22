@@ -1,5 +1,4 @@
-//! SHM state header and wait-free double-buffer protocol (spec perf/007,
-//! reader liveness per spec perf/012).
+//! SHM state header, wait-free double-buffer protocol and reader liveness.
 //!
 //! One writer (the LuraDB process) publishes snapshots into two alternating
 //! data buffers; many reader processes read lock-free. The `state` segment
@@ -17,18 +16,18 @@ use thiserror::Error;
 use super::readers::{ReaderRegistry, ReaderSlotHandle};
 use super::ringbuffer::RingbufferHeader;
 
-/// Recommended default for the writer's wait on a busy inactive buffer
-/// (spec §2 step 2). The spec calls this "configurable"; it is a
+/// Recommended default for the writer's wait on a busy inactive buffer.
+/// The wait is configurable: it is a
 /// [`SnapshotWriter::new`] parameter and this constant is the server default.
 pub const PUBLISH_WAIT_TIMEOUT_US: u64 = 1000;
 
-/// Reader retry budget for the acquire handshake (spec §3). One retry is the
+/// Reader retry budget for the acquire handshake. One retry is the
 /// realistic maximum (nanosecond flip window); the small budget only bounds a
 /// pathological publish storm before giving up with `None`.
 const ACQUIRE_MAX_RETRIES: usize = 5;
 
 /// Byte offset of the [`ReaderSlot`] inside a client's `cmd_hdr` segment: right
-/// behind the ring header, on its own cache line (spec perf/012 §1).
+/// behind the ring header, on its own cache line.
 pub const READER_SLOT_OFFSET: usize = RingbufferHeader::SIZE;
 
 /// Errors specific to the SHM state protocol.
@@ -57,7 +56,7 @@ pub enum PublishOutcome {
 ///
 /// `repr(C)` (shared across processes) and 64-byte aligned: one cache line,
 /// written only by the publisher. Clients map this segment `PROT_READ`
-/// (spec perf/012 §10) — nothing a client writes lives here.
+/// — nothing a client writes lives here.
 #[repr(C, align(64))]
 pub struct StateHeader {
     /// Bit 0: active buffer index (0 = data_a, 1 = data_b).
@@ -66,7 +65,7 @@ pub struct StateHeader {
     /// flips (the sequence never repeats).
     pub version: AtomicU64,
     /// Valid byte length of buffer A's / buffer B's snapshot. Per-buffer, not a
-    /// single field as the spec sketches: a global size is briefly ahead of
+    /// single field: a global size is briefly ahead of
     /// `version` during a publish (size stored before the flip), so a reader on
     /// the still-active old buffer would read the new, larger size and tear.
     pub data_size_a: AtomicU64,
@@ -77,9 +76,9 @@ pub struct StateHeader {
     /// Unix-epoch nanoseconds of the last publish or idle confirmation
     /// (monitoring only).
     pub last_update_ns: AtomicU64,
-    /// Wire-protocol version (compatibility gate, spec §6). A dedicated field
+    /// Wire-protocol version (compatibility gate). A dedicated field
     /// rather than bits of `version`, so `version` keeps pure flip/sequence
-    /// semantics (resolves the §1/§6 contradiction).
+    /// semantics.
     pub protocol_version: AtomicU32,
     _pad0: [u8; 20],
 }
@@ -87,7 +86,7 @@ pub struct StateHeader {
 impl StateHeader {
     /// `LURADBSH` in ASCII.
     pub const MAGIC: u64 = 0x4C55_5241_4442_5348;
-    /// Current wire-protocol version. Bumped to 2 by spec perf/012: the reader
+    /// Current wire-protocol version. Bumped to 2 when the reader
     /// counters left `StateHeader` for the per-client [`ReaderSlot`], so a
     /// version-1 client must fail the gate instead of writing into `state`.
     pub const PROTOCOL_VERSION: u16 = 0x0002;
@@ -121,7 +120,7 @@ impl StateHeader {
         &*ptr.cast::<Self>()
     }
 
-    /// Initializes the header (spec §7): zero the protocol fields, then publish
+    /// Initializes the header: zero the protocol fields, then publish
     /// `magic` last with `Release`.
     pub fn init(&self) {
         self.version.store(0, Ordering::Relaxed);
@@ -136,7 +135,7 @@ impl StateHeader {
         self.protocol_version.load(Ordering::Acquire) as u16
     }
 
-    /// Client compatibility gate (spec §6): initialized and matching protocol.
+    /// Client compatibility gate: initialized and matching protocol.
     pub fn check_compatible(&self) -> Result<(), ProtocolError> {
         let magic = self.magic.load(Ordering::Acquire);
         if magic != Self::MAGIC {
@@ -151,7 +150,7 @@ impl StateHeader {
 }
 
 /// One client's reader counters, living at [`READER_SLOT_OFFSET`] in that
-/// client's `cmd_hdr` segment (spec perf/012 §1).
+/// client's `cmd_hdr` segment.
 ///
 /// Own cache line: the publisher reads it during its scan while client and
 /// dispatcher hammer the ring indices on the lines before it. Both counters
@@ -201,7 +200,7 @@ fn now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
-/// Server-side snapshot publisher (spec §2, §4). Holds the header by shared
+/// Server-side snapshot publisher. Holds the header by shared
 /// reference and the two data buffers as raw pointers, so `publish(&self)` can
 /// write through them without a long-lived `&mut` on the mapped segment.
 pub struct SnapshotWriter<'a> {
@@ -238,7 +237,7 @@ impl<'a> SnapshotWriter<'a> {
     }
 
     /// Publishes a snapshot: pick the inactive buffer, wait for it to drain,
-    /// copy, then flip the version (spec §2 steps 1–6).
+    /// copy, then flip the version.
     pub fn publish(&self, data: &[u8]) -> anyhow::Result<PublishOutcome> {
         if data.len() > self.buf_len {
             return Err(ProtocolError::DataTooLarge { len: data.len(), capacity: self.buf_len }.into());
@@ -266,17 +265,17 @@ impl<'a> SnapshotWriter<'a> {
         Ok(PublishOutcome::Published)
     }
 
-    /// Idle confirmation (spec perf/028 A3): the active snapshot is still
+    /// Idle confirmation: the active snapshot is still
     /// current. Refreshes `last_update_ns` only — no flip, no buffer write.
     pub fn confirm_unchanged(&self) {
         self.header.last_update_ns.store(now_ns(), Ordering::Relaxed);
     }
 
     /// Spins until no registered client pins buffer `idx`, or the timeout
-    /// elapses (spec perf/012 §4).
+    /// elapses.
     fn wait_drained(&self, idx: usize) -> bool {
         // Handle list cloned once, then scanned lock-free. A client registering
-        // or leaving mid-scan is harmless (spec §7).
+        // or leaving mid-scan is harmless.
         let handles = self.readers.snapshot();
         // Full barrier so this scan and the preceding flip cannot both be missed
         // against a reader's counter bump + version re-read (StoreLoad/Dekker).
@@ -303,7 +302,7 @@ fn drained(handles: &[ReaderSlotHandle], idx: usize) -> bool {
     handles.iter().all(|h| h.slot().counter(idx).load(Ordering::Acquire) == 0)
 }
 
-/// Client-side snapshot reader (spec §3, §4). Pins its buffer in the client's
+/// Client-side snapshot reader. Pins its buffer in the client's
 /// own [`ReaderSlot`] for its lifetime and releases it on `Drop`, keeping the
 /// writer off that buffer.
 pub struct SnapshotGuard<'a> {
@@ -322,7 +321,7 @@ impl<'a> SnapshotGuard<'a> {
     /// Acquires the active snapshot, or `None` if the header is uninitialized
     /// (bad magic) or no consistent snapshot could be captured within the retry
     /// budget. `slot` must be the caller's *registered* slot — an unregistered
-    /// pin is invisible to the writer and therefore unprotected (spec §3).
+    /// pin is invisible to the writer and therefore unprotected.
     pub fn acquire(
         header: &'a StateHeader,
         slot: &'a ReaderSlot,
@@ -444,7 +443,7 @@ mod tests {
         }
     }
 
-    /// One registered client (= one slot, spec teststrategy preamble) plus the
+    /// One registered client (= one slot) plus the
     /// registry the writer scans. The slot allocation is the handle's `_owner`.
     struct Arena {
         header: Box<StateHeader>,
@@ -489,13 +488,13 @@ mod tests {
             Arc::clone(&self.registry)
         }
 
-        /// Deregisters the client — the reclamation path of spec §7.
+        /// Deregisters the client — the slot reclamation path.
         fn drop_lease(&mut self) {
             self.lease = None;
         }
     }
 
-    // 1. Layout of the per-client reader slot (spec perf/012 §1).
+    // 1. Layout of the per-client reader slot.
     #[test]
     fn test_reader_slot_layout() {
         assert_eq!(ReaderSlot::SIZE, 64);
@@ -552,7 +551,7 @@ mod tests {
         ));
     }
 
-    // 3. Overlapping guards on one slot (invariant §2): nesting is legal, and the
+    // 3. Overlapping guards on one slot: nesting is legal, and the
     // writer stays off the buffer until the last of them is gone.
     #[test]
     fn test_overlapping_guards_on_one_slot() {
@@ -787,7 +786,7 @@ mod tests {
         assert!(err.to_string().contains("exceeds buffer capacity"), "{err}");
     }
 
-    // Protocol compatibility gate (spec §6).
+    // Protocol compatibility gate.
     #[test]
     fn test_check_compatible() {
         let header = StateHeader::zeroed();

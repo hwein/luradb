@@ -1,7 +1,7 @@
 //! `ttl_sweeper` module
 //!
 //! Background task that removes TTL-expired keys proactively instead of
-//! waiting for a compaction to happen over them (spec kv/025). Each removed
+//! waiting for a compaction to happen over them. Each removed
 //! key gets a real tombstone plus the `delete` event of the ordinary write
 //! path — the KV instance only, since JSON and rel never write an `expire_at`.
 
@@ -15,9 +15,9 @@ use std::sync::Arc;
 /// Periodic TTL sweeper over one KV engine.
 pub struct TtlSweeper {
     engine: Arc<LsmStorageEngine>,
-    /// Candidates *checked* per tick — discarded ones count too (spec §6).
+    /// Candidates *checked* per tick — discarded ones count too.
     batch_size: usize,
-    /// Scan cursor kept across ticks, not persisted (spec kv/025 §3): the
+    /// Scan cursor kept across ticks, not persisted: the
     /// largest key checked last tick. It is what guarantees progress — a chunk
     /// consisting purely of false positives still moves it forward instead of
     /// blocking the lid for good. Empty means "start from the beginning".
@@ -29,11 +29,11 @@ impl TtlSweeper {
         Self { engine, batch_size, cursor: Mutex::new(Vec::new()) }
     }
 
-    /// One sweep cycle (spec kv/025 §3).
+    /// One sweep cycle.
     pub async fn sweep_tick(&self) -> Result<()> {
         // 1./2. One freeze check, then pin — after this the tick never causes
         // a freeze itself, so no tombstone can land in a newer source than a
-        // concurrent write to the same key (§4.2).
+        // concurrent write to the same key.
         self.engine.maybe_freeze_memtable().await?;
         let memtable = self.engine.pin_memtable();
 
@@ -51,11 +51,11 @@ impl TtlSweeper {
         let mut written = 0usize;
         for key in &candidates {
             // 4. Authoritative re-check: `Live`, `Tombstone` and "absent"
-            // discard the candidate without write and without event (§5).
+            // discard the candidate without write and without event.
             if let Some((ts, VersionState::Expired)) = self.engine.newest_version(key).await? {
                 // 5. Dated on the *re-check* stamp, never the scan's: the
                 // smallest value above the version it displaces, so every
-                // other write of this key beats it (§4.1). `Timestamp: Ord` is
+                // other write of this key beats it. `Timestamp: Ord` is
                 // inverted — arithmetic goes through `as_u64` only.
                 let tombstone_ts = Timestamp::new(ts.as_u64() + 1);
                 self.engine.write_tombstone_at(&memtable, key, tombstone_ts).await?;
@@ -148,7 +148,7 @@ mod tests {
         })
     }
 
-    // 2. Mechanism A without the sweeper: a tombstone dated on the expired
+    // 2. Without the sweeper: a tombstone dated on the expired
     // version loses against a newer write, in the MemTable ...
     #[test]
     fn test_dated_tombstone_loses_against_newer_write() {
@@ -191,7 +191,7 @@ mod tests {
         })
     }
 
-    // 3. Mechanism B: the tombstone goes into the pinned (now immutable)
+    // 3. The tombstone goes into the pinned (now immutable)
     // MemTable while the client value lands in the new active one — the freeze
     // inversion the pin rules out.
     #[test]
@@ -281,7 +281,7 @@ mod tests {
         })
     }
 
-    // 8. Keys without a TTL, NULL keys (kv/018) and already tombstoned ones
+    // 8. Keys without a TTL, NULL keys and already tombstoned ones
     // are never candidates.
     #[test]
     fn test_no_candidates_without_expiry() {
@@ -370,7 +370,7 @@ mod tests {
     }
 
     // The re-check reports state, not just presence: expired and absent are
-    // distinguishable, which `get_with_metadata` cannot do (spec kv/025 §3.1).
+    // distinguishable, which `get_with_metadata` cannot do.
     #[test]
     fn test_newest_version_distinguishes_expired_from_absent() {
         crate::core::engine_runtime::block_on(async {
@@ -392,7 +392,7 @@ mod tests {
         })
     }
 
-    // Spec kv/032 test 1: a client write that drew the tombstone's stamp
+    // A client write that drew the tombstone's stamp
     // (`ts + 1`) and landed first keeps its entry; tombstone and event drop.
     #[test]
     fn test_tombstone_on_identical_internal_key_keeps_client_value() {
@@ -410,7 +410,7 @@ mod tests {
         })
     }
 
-    // Spec kv/032 test 2 (regression): the tombstone landed first, the client
+    // Regression: the tombstone landed first, the client
     // write with the same stamp replaces it.
     #[test]
     fn test_client_write_replaces_tombstone_on_identical_internal_key() {
@@ -495,7 +495,7 @@ mod tests {
         })
     }
 
-    // Spec kv/032 test 5: the dropped tombstone adds no bytes (general/032).
+    // The dropped tombstone adds no bytes to the MemTable size.
     #[test]
     fn test_dropped_tombstone_adds_no_bytes() {
         crate::core::engine_runtime::block_on(async {

@@ -1,5 +1,5 @@
 # The engine thread runs a compio runtime inside the frontend runtime's tokio
-# handle (spec perf/020): a tokio spawn or timer there would quietly land on the
+# handle: a tokio spawn or timer there would quietly land on the
 # frontend runtime. Frontend and reader-pool code allows them where it runs.
 disallowed-methods = [
     { path = "tokio::spawn", reason = "engine-thread tasks use compio::runtime::spawn" },

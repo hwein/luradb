@@ -24,7 +24,7 @@ pub const WAL_HEADER_LEN: u64 = WAL_MAGIC.len() as u64;
 /// Hard ceiling on any single length-prefixed WAL field (a key or a value)
 /// read during recovery. Without it, a corrupt tail turns garbage bytes into
 /// a u32 length up to 4 GiB and `read_len_prefixed` allocates that much
-/// before `read_exact` ever reaches EOF (spec kv/026 Spec-Review F7).
+/// before `read_exact` ever reaches EOF.
 ///
 /// Derived, not guessed, from the largest a legitimate write path can hand
 /// to one field: axum's default per-request body cap is 2 MiB (see
@@ -58,7 +58,7 @@ pub enum WalEntry {
         timestamp: u64,
         key: Vec<u8>,
         /// An op of a BATCH record (type 3), not a single DELETE record
-        /// (type 2): batch ops share one stamp and replay in order (spec kv/032).
+        /// (type 2): batch ops share one stamp and replay in order.
         in_batch: bool,
     },
     SetNull {
@@ -1012,9 +1012,8 @@ mod tests {
     }
 
     // A length field beyond WAL_MAX_FIELD_LEN must fail recovery immediately
-    // -- not attempt an allocation up to 4 GiB (spec kv/026 Spec-Review F7,
-    // kv/027 §B). No key bytes follow; the cap check must reject this before
-    // read_exact ever runs.
+    // -- not attempt an allocation up to 4 GiB. No key bytes follow; the cap
+    // check must reject this before read_exact ever runs.
     #[test]
     fn test_recover_rejects_wal_field_length_exceeding_cap() {
         crate::core::engine_runtime::block_on(async {

@@ -1,4 +1,4 @@
-//! Read-scaling measurement for spec kv/031: point reads on one engine
+//! Read-scaling measurement: point reads on one engine
 //! instance from 1/2/4/8 threads, each thread on its own current-thread
 //! runtime. Prints ops/s and p50 per thread count; asserts nothing about
 //! speed. `#[ignore]`d -- run explicitly, in release and without parallel
@@ -7,7 +7,7 @@
 //!
 //! Measured once, 2026-09-11, WSL2 on an AMD Ryzen 9 7945HX (32 threads),
 //! rustc 1.97.0; before = the tree of this test's first commit, after = the
-//! finished spec. ops/s over all threads, p50 per read:
+//! finished change. ops/s over all threads, p50 per read:
 //!
 //! | threads | before ops/s | before p50 | after ops/s | after p50 |
 //! |---------|--------------|------------|-------------|-----------|

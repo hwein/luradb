@@ -16,7 +16,7 @@ RuntimeDirectory=luradb
 RuntimeDirectoryMode=0750
 UMask=0027
 LimitNOFILE=65536
-# io_uring registered buffers (perf/004/005) need memlock.
+# io_uring registered buffers need memlock.
 LimitMEMLOCK=infinity
 Restart=on-failure
 RestartSec=2

@@ -32,7 +32,7 @@ use std::convert::Infallible;
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
-// Caps the wire response of a keys scan (spec kv/028); the underlying scan
+// Caps the wire response of a keys scan; the underlying scan
 // itself stays unbounded — same server cost as today, documented at
 // `count_keys`. `count_keys` keeps using `ScanParams` unchanged.
 const DEFAULT_SCAN_LIMIT: usize = 1000;
@@ -53,13 +53,13 @@ pub struct ScanParams {
 #[derive(Deserialize)]
 pub struct KeyScanParams {
     pub prefix: Option<String>,
-    /// Case-sensitive substring filter on the user key, applied before `total`/offset/limit (kv/023 §2 semantics).
+    /// Case-sensitive substring filter on the user key, applied before `total`/offset/limit.
     pub contains: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
 
-/// `prefix` is required and rejected empty-string (spec kv/023 §2) — plain
+/// `prefix` is required and rejected empty-string — plain
 /// `String`, not `Option`, so a missing `?prefix=` is an axum `Query`
 /// rejection (400) before the handler ever runs.
 #[derive(Deserialize)]
@@ -73,7 +73,7 @@ pub struct WatchParams {
     pub prefix: Option<String>,
     /// Fallback resume id for callers that cannot set headers (e.g. `curl`,
     /// or a `fetch`-based reader); the `Last-Event-ID` header wins when both
-    /// are present (spec kv/024 §4.1).
+    /// are present.
     pub last_event_id: Option<String>,
 }
 
@@ -93,7 +93,7 @@ fn etag(stamp: u64) -> HeaderValue {
 }
 
 /// The write preconditions of a single-key write request in evaluation
-/// order (RFC 9110 §13.2.2): `If-Match` with an ETag from a prior read,
+/// order (RFC 9110 section 13.2.2): `If-Match` with an ETag from a prior read,
 /// then `If-None-Match: *` — the only `If-None-Match` form supported.
 fn write_preconditions(headers: &HeaderMap) -> Result<Vec<Precondition>, ApiError> {
     let mut preconditions = Vec::new();
@@ -142,7 +142,7 @@ fn write_error(e: anyhow::Error) -> ApiError {
     }
 }
 
-/// Resolves the effective `Last-Event-ID` (spec kv/024 §4.1): the header —
+/// Resolves the effective `Last-Event-ID`: the header —
 /// what a native `EventSource`'s auto-reconnect sets — wins when both the
 /// header and `?last_event_id=` are present.
 fn resolve_last_event_id(headers: &HeaderMap, params: &WatchParams) -> Option<String> {
@@ -176,7 +176,7 @@ fn watch_event_item(event: &WalEvent, epoch: u64) -> SseItem {
     SseItem { id: format_event_id(WATCH_TAG, epoch, event.seq), event: op_str, data: key_str }
 }
 
-/// Builds `event: reset` (spec kv/024 §5): `id:` carries the current
+/// Builds `event: reset`: `id:` carries the current
 /// sequence head, so a reconnect right after a reset resumes gaplessly from
 /// there; `data:` is JSON (not plain text) so the reason vocabulary can grow
 /// without breaking the wire format. Serialized manually (`serde_json`
@@ -194,11 +194,11 @@ enum WatchStep {
     Stop,
 }
 
-/// Maps one raw relay receive to a live-stream outcome (spec kv/024 §4.3,
-/// §6): suppresses `seq <= suppress_upto` (the overlap between an initial
-/// replay's snapshot and the live relay picking up), and turns a `Gap` or
-/// the receiver's own `Lagged` into `reset(lagged)` — never a silent
-/// `continue`, which is exactly the defect this spec fixes. Pure (no I/O),
+/// Maps one raw relay receive to a live-stream outcome: suppresses
+/// `seq <= suppress_upto` (the overlap between an initial replay's
+/// snapshot and the live relay picking up), and turns a `Gap` or the
+/// receiver's own `Lagged` into `reset(lagged)` — never a silent
+/// `continue`, which would drop events unnoticed. Pure (no I/O),
 /// so every branch is unit-testable without real timing.
 fn watch_item(
     msg: Result<WatchMessage, broadcast::error::RecvError>,
@@ -565,7 +565,7 @@ pub async fn count_keys(
 /// Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.
 /// The connection stays open until the client disconnects; a keep-alive ping is sent automatically.
 ///
-/// A `Last-Event-ID` (header or `?last_event_id=`, spec kv/024) resumes gaplessly from an in-memory
+/// A `Last-Event-ID` (header or `?last_event_id=`) resumes gaplessly from an in-memory
 /// replay ring when possible; otherwise the server emits `event: reset` before continuing live. A
 /// client that ignores `id:`/`reset` behaves exactly as before this was added.
 pub async fn watch(
@@ -583,8 +583,8 @@ pub async fn watch(
 
     let WatchStart { resume, rx, epoch } = store.watch_from(last_event_id.as_deref());
 
-    // Leading items served up front (never through the relay channel, see
-    // spec kv/024 §4.3): 0 or 1 `reset`, or a domain-/prefix-filtered replay.
+    // Leading items served up front (never through the relay channel):
+    // 0 or 1 `reset`, or a domain-/prefix-filtered replay.
     // `suppress_upto` carries the replay's `head` so the live loop below can
     // discard the live re-deliveries of what was just replayed (the
     // subscribe-before-snapshot ordering guarantees overlap, never a gap).
@@ -655,7 +655,7 @@ mod tests {
         (app, dir)
     }
 
-    // Spec general/017 test 10 (auth scoping) needs `auth_enabled: true` and
+    // The count test 10 (auth scoping) needs `auth_enabled: true` and
     // a live handle to `auth_cache` before the state is consumed by
     // `create_router` — factored out of `make_app_with_config` for that.
     async fn make_state(
@@ -735,7 +735,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/018: REST contract for the NULL value state ─────────────────
+    // ── REST contract for the NULL value state ──────────────────────────────
 
     async fn send(app: &axum::Router, method: Method, uri: &str, body: Body) -> axum::http::Response<Body> {
         app.clone()
@@ -744,7 +744,7 @@ mod tests {
             .unwrap()
     }
 
-    // Spec general/026 test 2 (kv sample): a real 404 carries a non-empty
+    // A real 404 carries a non-empty
     // plaintext body — schema (text/plain string) and reality agree.
     #[test]
     fn test_get_missing_key_404_has_nonempty_plaintext_body() {
@@ -891,7 +891,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/007 test 3: REST roundtrip with a UTF-8 key ────────────
+    // ── REST roundtrip with a UTF-8 key ─────────────────────────────────────
 
     /// Percent-encodes every non-unreserved byte — enough to embed an arbitrary
     /// UTF-8 key (umlaut, emoji) in a URL path segment for tests.
@@ -959,7 +959,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/022: TTL observability & key metadata ────────────────────────
+    // ── TTL observability & key metadata ─────────────────────────────────────
 
     async fn body_json(body: Body) -> serde_json::Value {
         let bytes = to_bytes(body, usize::MAX).await.unwrap();
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     // Test 4: PATCH …/null -> GET 204 without X-Expires-At; …/meta 200 with
-    // expires_at: null (set_null never carries a TTL, kv/018 §3.8).
+    // expires_at: null (set_null never carries a TTL).
     #[test]
     fn test_null_key_meta_has_null_expires_at() {
         crate::core::engine_runtime::block_on(async {
@@ -1086,7 +1086,7 @@ mod tests {
     // Test 6: last_modified_at sits near the write time, and a second PUT on
     // the same key must INCREASE it — proof it tracks the newest version,
     // not a creation time, and a regression guard against reading the
-    // sstable's inverted on-disk timestamp verbatim (spec kv/022 §4.3).
+    // sstable's inverted on-disk timestamp verbatim.
     #[test]
     fn test_last_modified_at_near_write_time_and_increases_on_overwrite() {
         crate::core::engine_runtime::block_on(async {
@@ -1185,13 +1185,13 @@ mod tests {
         })
     }
 
-    // ── Spec general/017: KV object-count endpoint ───────────────────────────
+    // ── KV object-count endpoint ─────────────────────────────────────────────
 
     // Tests 1-3: empty domain -> 0; a mix of prefixed/unprefixed keys counts
     // exactly, with and without a `prefix` filter, cross-checked against the
-    // exact key list `scan_keys` returns for the same prefix (spec §1: same
+    // exact key list `scan_keys` returns for the same prefix (same
     // codepath, so count == keys.len()); a deleted key stops counting, a
-    // NULL-state key keeps counting (it's still visible to a scan, kv/018).
+    // NULL-state key keeps counting (it's still visible to a scan).
     #[test]
     fn test_count_keys_basic_prefix_and_liveness() {
         crate::core::engine_runtime::block_on(async {
@@ -1279,7 +1279,7 @@ mod tests {
         })
     }
 
-    // Test 5 (shadow counter-proof, spec §2): a key literally named "count"
+    // Test 5 (shadow counter-proof): a key literally named "count"
     // stays reachable via GET …/keys/count — proof that the count endpoint
     // lives a level above `keys`, not as a `keys/count` sibling of `{key}`.
     #[test]
@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     // Test 10: a Read grant on the domain allows the count; no grant -> 403
-    // (the generic domain-scoped auth path, spec general/007 — exercised here
+    // (the generic domain-scoped auth path — exercised here
     // for the new route specifically).
     #[test]
     fn test_count_keys_auth_scoping() {
@@ -1368,7 +1368,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/023: prefix bulk-delete ──────────────────────────────────────
+    // ── Prefix bulk-delete ───────────────────────────────────────────────────
 
     // Test 1: 5 keys sharing a prefix + 2 foreign keys -> deleting the prefix
     // removes exactly the 5, the 2 foreign keys stay reachable via GET.
@@ -1520,7 +1520,7 @@ mod tests {
         })
     }
 
-    // Test 9 (spec §3.2 order): the write token is checked before the scan
+    // Test 9: the write token is checked before the scan
     // runs. `read_iops = 1` makes this provable — draining only the write
     // bucket must 429 the bulk-delete without ever touching the sole read
     // token, so a GET right after must still succeed.
@@ -1582,7 +1582,7 @@ mod tests {
         })
     }
 
-    // Test 12: a key in the NULL state (kv/018) is a live key -- it appears
+    // Test 12: a key in the NULL state is a live key -- it appears
     // in the scan and gets deleted like any other; afterward it reads 404
     // (deleted), never 204 (NULL-but-present).
     #[test]
@@ -1603,7 +1603,7 @@ mod tests {
 
     // Test 13: auth scoping -- a Read-only grant is not enough (403), a
     // Write grant is (200), and an admin passes regardless (200). DELETE is
-    // unconditionally a write per `is_write_request` (spec §5).
+    // unconditionally a write per `is_write_request`.
     #[test]
     fn test_bulk_delete_auth_scoping() {
         crate::core::engine_runtime::block_on(async {
@@ -1679,7 +1679,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/024: watch event ids, resume & gap signal ───────────────────
+    // ── Watch event ids, resume & gap signal ────────────────────────────────
 
     // Test 2: the Last-Event-ID header wins over `?last_event_id=` when both
     // are present; either one alone is used as-is.
@@ -1701,8 +1701,8 @@ mod tests {
         assert_eq!(resolve_last_event_id(&empty_headers, &params(None)), None);
     }
 
-    // watch_item: the pure per-message mapping the live loop uses (spec
-    // kv/024 §4.3/§6) — every branch, without any real timing. Asserts on
+    // watch_item: the pure per-message mapping the live loop uses — every
+    // branch, without any real timing. Asserts on
     // `SseItem`'s plain fields rather than the rendered `axum::sse::Event`
     // (which exposes no accessors of its own).
     mod watch_item_tests {
@@ -1742,7 +1742,7 @@ mod tests {
         }
 
         // seq <= suppress_upto is a re-delivery of the initial replay; seq >
-        // suppress_upto is new and must be emitted (spec kv/024 §4.3).
+        // suppress_upto is new and must be emitted.
         #[test]
         fn test_suppress_upto_boundary() {
             let msg = || Ok(WatchMessage::Event(set_event(10, b"k")));
@@ -1893,7 +1893,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/028: GET …/keys pagination & contains filter ────────────────
+    // ── GET …/keys pagination & contains filter ─────────────────────────────
 
     // Test 1: 25 keys, limit=10 -> page 1 (offset=0) and page 2 (offset=10)
     // are disjoint, each in sorted scan order, `total=25` on every page;
@@ -1973,7 +1973,7 @@ mod tests {
     }
 
     // Test 4: `contains` is case-sensitive and counts toward `total` -- same
-    // scenario as the bulk-delete contains filter (kv/023 test 2):
+    // scenario as the bulk-delete contains filter (bulk-delete test 2):
     // `contains=Log` matches `app:Log:1`, not `app:log:2`.
     #[test]
     fn test_scan_keys_contains_filter_is_case_sensitive_and_counts_in_total() {
@@ -2176,7 +2176,7 @@ mod tests {
     }
 
     // Both headers together: If-Match is evaluated first, then If-None-Match
-    // (RFC 9110 §13.2.2) — on a free key the failing If-Match decides (412
+    // (RFC 9110 section 13.2.2) — on a free key the failing If-Match decides (412
     // without ETag, nothing created); on an existing key with a matching
     // If-Match, the following If-None-Match: * fails (412 with ETag).
     #[test]

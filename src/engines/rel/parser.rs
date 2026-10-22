@@ -1,5 +1,5 @@
-//! Recursive-descent parser for the full LuraSQL grammar (spec rel/004 §4,
-//! concept 004 ch. 4.1). It builds the AST for every statement class; the
+//! Recursive-descent parser for the full LuraSQL grammar. It builds the
+//! AST for every statement class; the
 //! binder and `mod.rs` then translate and execute each of them downstream.
 //!
 //! Error positions: every `expect_*`/`parse_*` helper reports a `Syntax`
@@ -25,7 +25,7 @@ const MAX_EXPR_DEPTH: usize = 100;
 /// Parses one full statement (with an optional single trailing `;`) from
 /// already-lexed `(Token, byte_pos)` pairs. Empty input → `EmptyStatement`;
 /// leftover tokens after the statement (and its optional `;`) →
-/// `MultipleStatements` (spec rel/004 §1).
+/// `MultipleStatements`.
 pub fn parse(tokens: &[(Token, usize)]) -> Result<Statement, RelStoreError> {
     if tokens.is_empty() {
         return Err(RelStoreError::EmptyStatement);
@@ -223,9 +223,9 @@ impl<'a> Parser<'a> {
         Ok(AstColumnDef { name, ty, constraints })
     }
 
-    /// `type_name` (grammar §4): canonical types, aliases, and `VARCHAR`/`CHAR`
+    /// `type_name`: canonical types, aliases, and `VARCHAR`/`CHAR`
     /// with an optional, ignored `(n)` length. Delegates alias resolution to
-    /// `ColumnType::from_sql_name` (rel/003) so the alias table lives once.
+    /// `ColumnType::from_sql_name` so the alias table lives once.
     fn parse_type_name(&mut self) -> Result<ColumnType, RelStoreError> {
         let kw = match self.peek() {
             Some(Token::Keyword(k)) if k.is_type_name() => *k,
@@ -233,7 +233,7 @@ impl<'a> Parser<'a> {
         };
         self.pos += 1;
         if matches!(kw, Keyword::Varchar | Keyword::Char) && self.eat_punct(&Token::LParen) {
-            self.expect_integer()?; // length ignored (documented, spec §4)
+            self.expect_integer()?; // length ignored (documented)
             self.expect_punct(Token::RParen)?;
         }
         Ok(ColumnType::from_sql_name(kw.as_str()).expect("every type keyword maps to a ColumnType"))
@@ -352,7 +352,7 @@ impl<'a> Parser<'a> {
         let name = self.expect_ident()?;
         self.expect_kw(Keyword::As)?;
         // The next token's byte offset is where the raw view SELECT text
-        // starts (rel/008 §3): the caller slices the original SQL string
+        // starts: the caller slices the original SQL string
         // from here instead of re-serializing the AST, preserving it verbatim.
         let select_offset = self.peek_pos();
         let select = self.parse_select()?;
@@ -577,7 +577,7 @@ impl<'a> Parser<'a> {
         Ok(Some(Limit { limit, offset }))
     }
 
-    // ── WHERE expressions: OR < AND < NOT < predicate/paren (grammar §4) ────
+    // ── WHERE expressions: OR < AND < NOT < predicate/paren ────
 
     fn parse_expr(&mut self) -> Result<Expr, RelStoreError> {
         self.parse_or_expr()
@@ -687,7 +687,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `IS`/`IN`/`LIKE` all require their subject to be a bare column
-    /// reference (grammar §4), not a literal or `?`.
+    /// reference, not a literal or `?`.
     fn require_column(&self, operand: Operand, ctx: &str) -> Result<ColumnRef, RelStoreError> {
         match operand {
             Operand::Column(c) => Ok(c),
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(parse_sql("CREATE VIEW v AS SELECT * FROM t").unwrap().class(), StatementClass::Ddl);
     }
 
-    // Depth guard (004-F1): pathological nesting yields a clean Syntax error
+    // Depth guard: pathological nesting yields a clean Syntax error
     // instead of recursing until the stack overflows and the process aborts.
     #[test]
     fn test_deeply_nested_parens_rejected_not_overflow() {

@@ -1,17 +1,17 @@
-//! Views (spec rel/008): `CREATE`/`DROP VIEW` execution, the AST-inlining
+//! Views: `CREATE`/`DROP VIEW` execution, the AST-inlining
 //! pre-stage for `FROM`/`JOIN` view references, and the DDL dependency check.
 //!
 //! No new executor operator: a SELECT touching a view is rewritten into a
 //! flat statement over base tables only (`inline`/`expand`), then handed
-//! unchanged to the existing rel/006/007 planner/executor. `CREATE VIEW`
+//! unchanged to the existing SELECT/JOIN planner/executor. `CREATE VIEW`
 //! validates by building (and discarding) that same flat plan — reusing the
-//! rel/006/007 binder (`select::bind_projection`, `dml::bind_predicate`,
+//! SELECT/JOIN binder (`select::bind_projection`, `dml::bind_predicate`,
 //! `join::{check_unique_aliases, resolve_join_on, bind_flat_predicate,
 //! bind_join_projection}`, `RelEngine::build_join_probe`) rather than
-//! duplicating it. The DDL dependency check (§7) reuses the same binder
+//! duplicating it. The DDL dependency check reuses the same binder
 //! again, but against a hypothetical *prospective* catalog map instead of
 //! the live catalog, and deliberately skips the join index requirement (an
-//! execution-time concern per §7) and stops needing `RelEngine` entirely.
+//! execution-time concern) and stops needing `RelEngine` entirely.
 
 use super::ast::{
     ColumnRef, CreateView, DropView, Expr, Join, Operand, OrderItem, Select, SelectItem, Statement,
@@ -31,17 +31,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-/// View-over-view depth limit (spec §5): `depth(view) = 1 + max(depth of the
+/// View-over-view depth limit: `depth(view) = 1 + max(depth of the
 /// referenced views)`, a view referencing only tables has depth 1. A plain
-/// constant, not a config knob (concept ch. 8 defines none for this) — and,
+/// constant, not a config knob — and,
 /// since an already-stored view's own depth is guaranteed valid by
-/// construction (no cycles, no forward references — spec §5), it doubles as
+/// construction (no cycles, no forward references), it doubles as
 /// the defensive recursion cap against manual catalog corruption.
 const MAX_VIEW_DEPTH: usize = 3;
 
-// ── CREATE/DROP VIEW execution (spec §3/§7) ─────────────────────────────────
+// ── CREATE/DROP VIEW execution ─────────────────────────────────
 
-/// Executes `CREATE VIEW` (spec §3): validates the subset (§2), then binds
+/// Executes `CREATE VIEW`: validates the subset, then binds
 /// and stores the *raw* SELECT text atomically under the catalog's
 /// `ddl_lock` (via `create_view_checked`'s `validate` closure) — so no
 /// concurrent DDL can invalidate the view between validation and storage.
@@ -68,7 +68,7 @@ pub(super) async fn execute_create_view(
     Ok(DdlOutcome::ViewCreated(view))
 }
 
-/// Executes `DROP VIEW` (spec §7): the dependency check and the delete run
+/// Executes `DROP VIEW`: the dependency check and the delete run
 /// atomically under the same `ddl_lock` acquisition (`drop_object_checked`).
 pub(super) async fn execute_drop_view(
     engine: &RelEngine,
@@ -92,14 +92,14 @@ pub(super) async fn execute_drop_view(
     Ok(DdlOutcome::ViewDropped { name: dv.name })
 }
 
-// ── §2: the allowed view-definition subset ──────────────────────────────────
+// ── The allowed view-definition subset ──────────────────────────────────
 
-/// Rejects the view-body shapes concept 6.4 disallows (spec §2): `?`
+/// Rejects the disallowed view-body shapes: `?`
 /// parameters, `ORDER BY`, `LIMIT`/`OFFSET`, a bare `COUNT(*)` projection, and
 /// duplicate *explicit* output names. `*`-driven duplicates can only be
 /// detected once the projection is actually resolved against the catalog —
 /// that half of the check lives in `check_no_duplicate_names`, run as part
-/// of the deep bind (§3).
+/// of the deep bind.
 fn validate_view_subset(sel: &Select) -> Result<(), RelStoreError> {
     if !sel.order_by.is_empty() {
         return Err(RelStoreError::InvalidSchema(
@@ -151,7 +151,7 @@ fn operand_has_param(op: &Operand) -> bool {
 }
 
 /// Slices the raw, unparsed view SELECT text out of the original SQL string
-/// (spec §3: the stored `sql` must be byte-identical to what the client
+/// (the stored `sql` must be byte-identical to what the client
 /// submitted, not a re-serialized AST): from `offset` (the first token past
 /// `AS`, set by the parser) to end of statement, trimming trailing
 /// whitespace and the one optional statement-terminating `;`.
@@ -174,7 +174,7 @@ fn live_lookup<'a>(engine: &'a RelEngine, domain: &'a str) -> impl Fn(&str) -> R
 }
 
 /// Looks up against a hypothetical prospective per-domain map (the DDL
-/// dependency check, spec §7) — same error shape as `RelCatalog::get`, so
+/// dependency check) — same error shape as `RelCatalog::get`, so
 /// downstream `ObjectNotFound` → `TableNotFound` mapping works unchanged.
 fn map_lookup(map: &HashMap<String, CatalogEntry>) -> impl Fn(&str) -> Result<CatalogEntry, RelStoreError> + '_ {
     move |name| {
@@ -194,8 +194,8 @@ fn require_entry(lookup: &Lookup, name: &str) -> Result<CatalogEntry, RelStoreEr
     }
 }
 
-/// Re-parses a stored view body (spec §4: re-parsed on every use, v1 — a
-/// cache is an allowed but non-mandatory optimization). `usize::MAX`: the
+/// Re-parses a stored view body (on every use; a cache would be an
+/// optional optimization). `usize::MAX`: the
 /// text already passed `max_statement_len` once, at its own CREATE VIEW time.
 fn parse_view_sql(sql: &str) -> Result<Select, RelStoreError> {
     let tokens = lexer::tokenize(sql, usize::MAX)?;
@@ -205,10 +205,10 @@ fn parse_view_sql(sql: &str) -> Result<Select, RelStoreError> {
     }
 }
 
-// ── The inliner (spec §4/§5) ─────────────────────────────────────────────────
+// ── The inliner ─────────────────────────────────────────────────
 
 /// Per-source output-name map: `output name -> the flat, fully-qualified
-/// ColumnRef it resolves to` (spec §4.3). A plain table source gets the
+/// ColumnRef it resolves to`. A plain table source gets the
 /// identity map (every catalog column, qualified by the source's own kept
 /// alias); a view source maps each of its *projected* output names onto the
 /// underlying (already recursively flattened and freshly re-aliased) base column.
@@ -231,8 +231,8 @@ fn identity_source_map(schema: &super::catalog::TableSchema, alias: &str) -> Sou
 }
 
 /// A flattened select's own projection is always fully resolved to explicit
-/// `Column` items by `rewrite_projection` (never `Star`/`CountStar`, spec
-/// §4.5) — this turns that resolved list back into a `SourceMap` for the
+/// `Column` items by `rewrite_projection` (never `Star`/`CountStar`)
+/// — this turns that resolved list back into a `SourceMap` for the
 /// *next* level up, once this select is itself substituted as a view.
 fn view_projection_map(items: &[SelectItem]) -> SourceMap {
     SourceMap(
@@ -259,7 +259,7 @@ struct InlineCtx<'a> {
 
 impl InlineCtx<'_> {
     /// A collision-free alias, reserved immediately. Only a view's *own*
-    /// internal aliases ever need one (spec §4.1) — a name kept from a plain
+    /// internal aliases ever need one — a name kept from a plain
     /// table reference never collides because it is reserved up front (or,
     /// for a nested view's transient internal names, thrown away by the very
     /// next `realias` call before it could ever reach the final output).
@@ -274,9 +274,9 @@ impl InlineCtx<'_> {
     }
 }
 
-/// SELECT-time entry point (rel/008 §1/§4), called from `select::exec_select`
-/// before the rel/006/007 planner ever sees the statement. A select touching
-/// no view returns `sel` unchanged at no cost (spec §1).
+/// SELECT-time entry point, called from `select::exec_select`
+/// before the SELECT/JOIN planner ever sees the statement. A select touching
+/// no view returns `sel` unchanged at no cost.
 pub(super) fn inline_views(engine: &RelEngine, domain: &str, sel: Select) -> Result<Select, RelStoreError> {
     let lookup = live_lookup(engine, domain);
     let (flat, substitutions) = inline(&lookup, &sel, 0)?;
@@ -295,8 +295,8 @@ fn touches_any_view(lookup: &Lookup, sel: &Select) -> bool {
     is_view(&sel.from.name) || sel.joins.iter().any(|j| is_view(&j.table.name))
 }
 
-/// Recursively expands every view reference in `sel`'s `FROM`/`JOIN` chain
-/// (spec §4/§5). `depth` is `sel`'s own assumed view-nesting depth, were it
+/// Recursively expands every view reference in `sel`'s `FROM`/`JOIN` chain.
+/// `depth` is `sel`'s own assumed view-nesting depth, were it
 /// registered as a view right now (1 for CREATE VIEW's own body, 0 for an
 /// ad-hoc query) — `MAX_VIEW_DEPTH` is enforced against it before recursing
 /// into any further view.
@@ -393,7 +393,7 @@ fn view_depth_exceeded() -> RelStoreError {
     RelStoreError::LimitExceeded { which: "view_depth".to_string(), max: MAX_VIEW_DEPTH }
 }
 
-/// Alias hygiene (spec §4.1): renames *all* of an already-fully-flattened
+/// Alias hygiene: renames *all* of an already-fully-flattened
 /// view body's own `FROM`/`JOIN` aliases to fresh, collision-free names —
 /// unconditionally, regardless of whether they were already fresh (from a
 /// deeper substitution) or literal table names (a view with no further
@@ -435,7 +435,7 @@ fn rename_colref(cref: &ColumnRef, rename: &HashMap<String, String>) -> ColumnRe
 }
 
 /// Rewrites a fully-flattened inner select's own WHERE by remapping its
-/// column refs' qualifiers through `rename` (spec §4.1) — every ref is
+/// column refs' qualifiers through `rename` — every ref is
 /// already fully qualified (an `expand()` output invariant), so only the
 /// qualifier string changes, never the resolution itself.
 fn rewrite_expr(expr: &Expr, rename: &HashMap<String, String>) -> Expr {
@@ -475,8 +475,8 @@ fn rewrite_items_via_rename(items: &[SelectItem], rename: &HashMap<String, Strin
 /// Resolves one ON operand of the join stage currently substituting `new_map`
 /// (the source not yet appended to `known`): if it qualifies into (or, when
 /// unqualified, uniquely matches) the new source, resolve through its own
-/// map; otherwise it must resolve against an already-known source (spec §3,
-/// mirrored at the pre-flattening level).
+/// map; otherwise it must resolve against an already-known source
+/// (mirroring join.rs at the pre-flattening level).
 fn rewrite_on_against_new_source(
     left: &ColumnRef,
     right: &ColumnRef,
@@ -509,7 +509,7 @@ fn resolve_on_operand(
 }
 
 /// Qualified/unqualified/ambiguous resolution against the declared outer
-/// sources (spec §5, mirrored at the pre-flattening level): each source
+/// sources (mirroring join.rs at the pre-flattening level): each source
 /// contributes its *output* name list (a view's projection, or a table's
 /// catalog columns) rather than a `TableSchema` directly.
 fn resolve_via_sources(cref: &ColumnRef, sources: &[(String, SourceMap)]) -> Result<ColumnRef, RelStoreError> {
@@ -561,9 +561,9 @@ fn rewrite_operand(op: &Operand, sources: &[(String, SourceMap)]) -> Result<Oper
     })
 }
 
-/// Projection rewriting (spec §4.3/§4.5): `*` expands per source in
+/// Projection rewriting: `*` expands per source in
 /// declaration order (a view source → its own projection, a table source →
-/// its catalog columns, spec §4.5); an explicit item is resolved via
+/// its catalog columns); an explicit item is resolved via
 /// `resolve_via_sources` — the output name is *always* pinned to an explicit
 /// alias (the original `AS`, or else the reference's own bare name) so
 /// rewriting the underlying qualifier never silently changes the wire name a
@@ -608,12 +608,12 @@ fn and_opt(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
     }
 }
 
-// ── §3: CREATE-time full bind-and-discard (needs RelEngine: index requirement) ─
+// ── CREATE-time full bind-and-discard (needs RelEngine: index requirement) ─
 
 /// Builds (and discards) the flat plan for an already-inlined `flat` select,
-/// reusing the exact rel/006/007 binder rel/006/007 execution would use
-/// (spec §3: "building performs all checks") — including, for joins, the
-/// rel/007 index requirement and `max_join_depth`. No engine I/O: no
+/// reusing the exact binder SELECT/JOIN execution would use
+/// (building performs all checks) — including, for joins, the
+/// index requirement and `max_join_depth`. No engine I/O: no
 /// snapshot read ever happens, `build_join_probe`'s `JoinProbe` is built on
 /// `snap` and immediately dropped.
 fn validate_flat_select_full(
@@ -698,14 +698,14 @@ fn check_no_duplicate_names(proj: &[ProjectedColumn]) -> Result<(), RelStoreErro
     Ok(())
 }
 
-// ── §7: DDL dependency check (structural bind only, no RelEngine) ──────────
+// ── DDL dependency check (structural bind only, no RelEngine) ──────────
 
 /// The `check` guard `ddl.rs`'s DROP TABLE / DROP COLUMN / RENAME COLUMN /
 /// RENAME TABLE arms and this module's own `DROP VIEW` pass to the catalog's
-/// `*_checked` primitives (spec §7): re-binds every view still present in
+/// `*_checked` primitives: re-binds every view still present in
 /// the prospective post-DDL map; any that fails to resolve is dependent on
-/// `object`. Brute-force (KISS, v1: up to `max_tables_per_domain` small
-/// re-binds — no reverse-dependency index, spec §7's own cost argument).
+/// `object`. Brute-force (KISS: up to `max_tables_per_domain` small
+/// re-binds are cheap enough — no reverse-dependency index).
 pub(super) fn check_view_dependents(
     prospective: &HashMap<String, CatalogEntry>,
     object: &str,
@@ -735,7 +735,7 @@ fn rebind_structural(domain: &str, prospective: &HashMap<String, CatalogEntry>, 
 
 /// Structural-only counterpart of `validate_flat_select_full`: name/type
 /// resolution (columns, ON operands) with no engine access — deliberately
-/// skips the join index requirement and `max_join_depth` (spec §7: those are
+/// skips the join index requirement and `max_join_depth` (those are
 /// execution-time concerns; a dropped index alone must not block an
 /// unrelated `DROP COLUMN`).
 fn validate_flat_select_structural(
@@ -875,8 +875,8 @@ mod tests {
         })
     }
 
-    // 1b. Views count against max_tables_per_domain (rel/003, invariant confirmed
-    // through the SQL/execute() path rel/008 adds).
+    // 1b. Views count against max_tables_per_domain (catalog invariant,
+    // confirmed through the SQL/execute() path).
     #[test]
     fn test_create_view_counts_against_max_tables_per_domain() {
         crate::core::engine_runtime::block_on(async {
@@ -1227,7 +1227,7 @@ mod tests {
     }
 
     // 18. DROP INDEX is never blocked by a view; a subsequent SELECT through
-    // that view then fails at *execution* time with the rel/007 index
+    // that view then fails at *execution* time with the join index
     // requirement message, not at DROP time.
     #[test]
     fn test_drop_index_not_blocked_but_join_fails_at_execution_time() {
@@ -1248,7 +1248,7 @@ mod tests {
         })
     }
 
-    // 19. DML on a view -> NotWritable (rel/005 guard; test only, per spec §8).
+    // 19. DML on a view -> NotWritable (existing DML guard; test only).
     #[test]
     fn test_dml_on_view_not_writable() {
         crate::core::engine_runtime::block_on(async {

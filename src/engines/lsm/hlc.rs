@@ -165,7 +165,7 @@ impl HybridLogicalClock {
     }
 
     /// Raises the clock to at least `value` (raw HLC encoding); never lowers
-    /// it. Used at startup to seed from recovered state (spec kv/026 M3).
+    /// it. Used at startup to seed from recovered state.
     pub fn seed(&self, value: u64) {
         self.last_timestamp.fetch_max(value, Ordering::SeqCst);
     }

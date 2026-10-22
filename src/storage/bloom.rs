@@ -217,7 +217,7 @@ mod tests {
         assert!(!restored.contains(b"nonexistent"));
     }
 
-    // kv/021: from_bytes(empty, num_hashes >= 1) must not panic (division by
+    // from_bytes(empty, num_hashes >= 1) must not panic (division by
     // zero in hash()) -- degrades to "always contains" instead.
     #[test]
     fn test_from_bytes_empty_bits_does_not_panic() {

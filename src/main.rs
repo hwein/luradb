@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     }
     // `config.auth.validate` already rejected a non-loopback bind above,
     // so reaching here with auth disabled means the dev-mode loopback
-    // case (spec general/013) — allowed, but not silent.
+    // case — allowed, but not silent.
     if !config.auth.enabled {
         tracing::warn!(
             "auth.enabled is false — the server is unauthenticated. Allowed only because server.bind_address ({}) is loopback-only.",

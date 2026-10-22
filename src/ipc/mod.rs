@@ -1,9 +1,8 @@
 //! Shared-memory infrastructure for the local IPC bypass: segment lifecycle,
-//! crash recovery and lock management (spec perf/006), the state header and
-//! wait-free double-buffer protocol (spec perf/007), the SPSC command
-//! ringbuffer with its dispatcher (spec perf/008), the RCU read snapshots
-//! published into the double buffer (spec perf/009), and the per-client reader
-//! slots with their registration lifecycle (spec perf/012).
+//! crash recovery and lock management, the state header and wait-free
+//! double-buffer protocol, the SPSC command ringbuffer with its dispatcher,
+//! the RCU read snapshots published into the double buffer, and the
+//! per-client reader slots with their registration lifecycle.
 
 mod commands;
 mod dispatcher;

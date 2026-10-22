@@ -62,9 +62,9 @@ pub struct LsmEngineConfig {
     pub compaction_check_interval_ms: u64,
     /// Capacity of the WAL-event broadcast channel.
     pub wal_event_channel_capacity: usize,
-    /// Access SSTables via mmap instead of loading them fully (perf/003).
+    /// Access SSTables via mmap instead of loading them fully.
     pub use_mmap: bool,
-    /// Capacity of the KV watch replay ring (spec kv/024 §3). `0` disables
+    /// Capacity of the KV watch replay ring. `0` disables
     /// resume (every reconnect with a `Last-Event-ID` gets `reset`), but
     /// `id:` fields are still assigned. json/rel set this to `0` — they have
     /// no watch endpoint.
@@ -144,22 +144,22 @@ fn now_secs() -> u64 {
 /// Scans one MemTable for keys starting with `prefix`.
 ///
 /// Encoded keys lead with the user key, so a prefix's entries are contiguous:
-/// the scan starts at `prefix` and ends at the first encoded key without it
-/// (spec perf/029). Inside, the user key is still checked — a shorter one
-/// plus its stamp bytes can start with `prefix`.
+/// the scan starts at `prefix` and ends at the first encoded key without it.
+/// Inside, the user key is still checked — a shorter one plus its stamp bytes
+/// can start with `prefix`.
 ///
 /// Callers process sources newest-first, so the first version seen for a
 /// user-key anywhere is its newest and decides for good (`decided`): live
 /// versions land in `live`, tombstoned or TTL-expired ones suppress the key.
 /// A version of the batch `applying_batch` names does not decide; the next
-/// older one does (spec kv/034). Stops early once `live` holds `limit` keys.
+/// older one does. Stops early once `live` holds `limit` keys.
 ///
 /// `snapshot` of `None` matches every version (today's `scan_keys`
 /// behavior); `Some` skips versions newer than the snapshot instead of
 /// deciding the key, so an older, visible version further along can still
-/// decide it (spec general/006 backup export).
+/// decide it (backup export).
 ///
-/// `coop` counts across all sources of one scan (spec perf/017 A2).
+/// `coop` counts across all sources of one scan.
 async fn scan_memtable_for_prefix(
     mt: &MemTable,
     prefix: &[u8],
@@ -204,7 +204,7 @@ async fn scan_memtable_for_prefix(
 ///
 /// A `Sealed` error means the Janitor swapped the active generation between the
 /// lookup and the append; it publishes the new generation before sealing the
-/// old one, so a single retry converges (spec kv/017).
+/// old one, so a single retry converges.
 async fn append_to_active(versions: &VersionCell, value: &[u8]) -> Result<(u32, u64)> {
     loop {
         let active = Arc::clone(&versions.get().active_vlog);
@@ -224,17 +224,16 @@ fn is_live_version(value: &Value, now: u64) -> bool {
     value.version_state(now) == VersionState::Live
 }
 
-/// Ticks between two yield points of a prefix scan (spec perf/017 A2): one
-/// per visited entry, one more per decided key, which copies the key into
-/// the result sets (spec perf/030); the result's collection and the release
-/// of the decided set tick once per key (spec perf/033).
+/// Ticks between two yield points of a prefix scan: one per visited entry,
+/// one more per decided key, which copies the key into the result sets; the
+/// result's collection and the release of the decided set tick once per key.
 const SCAN_KEYS_YIELD_INTERVAL: u32 = 1024;
 
-/// Entries the expiry scan checks between two yield points (spec kv/025 §7).
+/// Entries the expiry scan checks between two yield points.
 const SCAN_EXPIRED_YIELD_INTERVAL: usize = 1024;
 
 /// Counts one checked entry and hands the worker back every
-/// [`SCAN_EXPIRED_YIELD_INTERVAL`] entries (spec kv/025 §7) — the SSTable
+/// [`SCAN_EXPIRED_YIELD_INTERVAL`] entries — the SSTable
 /// phase is synchronous and would otherwise block a worker for a whole file.
 async fn scan_expired_yield(checked: &mut usize) {
     *checked += 1;
@@ -245,7 +244,7 @@ async fn scan_expired_yield(checked: &mut usize) {
 
 /// Adds `key` and drops the largest entry once the set exceeds `limit`, so it
 /// always holds the `limit` smallest candidates seen — independent of the
-/// order the sources deliver them in (spec kv/025 §3). Memory is
+/// order the sources deliver them in. Memory is
 /// O(`batch_size`), never O(keys of the instance).
 fn push_expired_candidate(candidates: &mut BTreeSet<Vec<u8>>, limit: usize, key: Vec<u8>) {
     candidates.insert(key);
@@ -256,7 +255,7 @@ fn push_expired_candidate(candidates: &mut BTreeSet<Vec<u8>>, limit: usize, key:
 
 /// A batch's resolved ops reduced to each key's last one, in batch order —
 /// the state that applying all of them in order leaves, as WAL replay does.
-/// Phase 2 inserts each key once (spec kv/034): a reader on another thread
+/// Phase 2 inserts each key once: a reader on another thread
 /// that found a key's first insert might load the batch slot only after the
 /// batch and keep the superseded value.
 fn last_op_per_key(ops: Vec<(Vec<u8>, Value)>) -> impl Iterator<Item = (Vec<u8>, Value)> {
@@ -301,7 +300,7 @@ async fn scan_sstable_for_prefix(
     Ok(false)
 }
 
-/// Test-only rendezvous for the install-window tests (spec general/028): the
+/// Test-only rendezvous for the install-window tests: the
 /// paused path signals `reached`, then waits for `release`.
 #[cfg(test)]
 #[derive(Default)]
@@ -345,7 +344,7 @@ impl ThreadHook {
     }
 }
 
-/// Test-only pause points inside the engine (spec general/028) — set before
+/// Test-only pause points inside the engine — set before
 /// the engine is shared, never in a release build.
 #[cfg(test)]
 #[derive(Default)]
@@ -371,8 +370,8 @@ pub(crate) struct TestHooks {
 /// All long-lived background tasks (flush, compaction, Janitor GC) are spawned
 /// via [`start_background_tasks`] and stopped gracefully via [`shutdown`].
 pub struct LsmStorageEngine {
-    /// MemTables, SSTable levels and vLog generations as one value (spec
-    /// kv/031 A1): readers clone it, every change installs a successor.
+    /// MemTables, SSTable levels and vLog generations as one value: readers
+    /// clone it, every change installs a successor.
     /// Shared with the Janitor, which installs its GC results itself.
     version: Arc<VersionCell>,
 
@@ -405,46 +404,45 @@ pub struct LsmStorageEngine {
     shutdown: Arc<AtomicBool>,
 
     /// Wakes background loops immediately on shutdown instead of leaving them
-    /// to sleep out their poll interval (M2) — `watch::Receiver::changed` has
+    /// to sleep out their poll interval — `watch::Receiver::changed` has
     /// no lost-wakeup between a loop's flag check and going to sleep, unlike
     /// `Notify::notify_waiters`.
     shutdown_tx: watch::Sender<bool>,
 
     /// Handles of the three background loops; joined by [`Self::shutdown`]
-    /// before it touches MemTables/WAL (M1).
+    /// before it touches MemTables/WAL.
     background_tasks: Mutex<Vec<compio::runtime::JoinHandle<()>>>,
 
-    /// S3-FIFO block cache shared across all read operations, striped
-    /// (spec kv/031 A2).
+    /// S3-FIFO block cache shared across all read operations, striped.
     block_cache: Arc<StripedBlockCache>,
 
     /// Number of successfully completed `compact_next_level` calls since
-    /// process start (spec general/024) -- `/metrics` system block.
+    /// process start -- `/metrics` system block.
     compaction_runs: AtomicU64,
 
     /// Number of Janitor GC cycles that actually ran (`GcStats::ran == true`)
-    /// since process start (spec general/024) -- `/metrics` system block.
+    /// since process start -- `/metrics` system block.
     /// `Arc` because the Janitor is built as its own object and carries this
     /// counter into its background task.
     janitor_runs: Arc<AtomicU64>,
 
     /// Notified after every MemTable flush — an extra tick of the SHM snapshot
-    /// publisher (spec perf/009 §4) besides its interval.
+    /// publisher besides its interval.
     flush_notify: Arc<Notify>,
 
     /// Raised after every visible change: each MemTable write and each domain
-    /// create/delete (spec perf/028 A1). Flush, compaction and vLog GC leave
+    /// create/delete. Flush, compaction and vLog GC leave
     /// it alone.
     change_epoch: AtomicU64,
 
-    /// In-flight guard for the client write sequence (spec kv/020, widened by
-    /// kv/029). Every client write path holds the `read()` side from before its
+    /// In-flight guard for the client write sequence. Every client write path
+    /// holds the `read()` side from before its
     /// timestamp through `memtable.set`; every production MemTable rotation
     /// drains by taking `write()` and holding it across the swap. Two
     /// guarantees follow: no vLog pointer into a generation the Janitor just
-    /// sealed is still on its way into a MemTable (kv/020), and no rotation
+    /// sealed is still on its way into a MemTable, and no rotation
     /// falls between a writer's stamp and its apply, which would strand an
-    /// older stamp in the newer MemTable (kv/029). `tokio::sync::RwLock` is
+    /// older stamp in the newer MemTable. `tokio::sync::RwLock` is
     /// task-fair (write-preferring), so a drain waits only for guards already
     /// in flight, never for ones started after it — no starvation under
     /// sustained write load, and no deadlock: the drain holds no other lock a
@@ -454,7 +452,7 @@ pub struct LsmStorageEngine {
     in_flight_writes: Arc<tokio::sync::RwLock<()>>,
 
     /// Stamp of the batch whose Phase 2 is applying it to the MemTable, 0
-    /// when none (spec kv/034): readers skip MemTable versions with this
+    /// when none: readers skip MemTable versions with this
     /// stamp, so a reader on another thread sees a batch whole or not at
     /// all. One slot suffices — Phase 2 is await-free and only the owner
     /// thread runs it.
@@ -466,15 +464,14 @@ pub struct LsmStorageEngine {
 
     /// Held by a flush from its claim to its install, so L0 and the manifest
     /// carry the SSTables in MemTable age order and whoever takes this lock
-    /// knows that no flush claimed before it is still in flight (spec
-    /// general/029). Lock order is `flush_lock` → `manifest` / `version`,
-    /// never the other way round; `Arc` because the Janitor's GC install takes
-    /// it too.
+    /// knows that no flush claimed before it is still in flight. Lock order
+    /// is `flush_lock` → `manifest` / `version`, never the other way round;
+    /// `Arc` because the Janitor's GC install takes it too.
     flush_lock: Arc<tokio::sync::Mutex<()>>,
 
     /// Held by a whole GC cycle and by a whole compaction, so neither of the
     /// two jobs that rewrite entire levels enters the manifest while the other
-    /// is running (spec general/029). Lock order is `maintenance_lock` →
+    /// is running. Lock order is `maintenance_lock` →
     /// `flush_lock`; the flush path never takes it, so a GC cycle cannot stall
     /// a write.
     maintenance_lock: Arc<tokio::sync::Mutex<()>>,
@@ -523,7 +520,7 @@ impl LsmStorageEngine {
 
         let manifest = manifest_manager.load().await?;
 
-        // High-water mark of everything already persisted (spec kv/026 M3).
+        // High-water mark of everything already persisted (seeds the HLC).
         let manifest_max_ts = manifest
             .levels
             .iter()
@@ -578,7 +575,7 @@ impl LsmStorageEngine {
             hooks: TestHooks::default(),
         };
 
-        // Spec kv/026 M3: a fresh HLC only reads the wall clock, so after a
+        // A fresh HLC only reads the wall clock, so after a
         // backwards clock step every snapshot would be older than the data on
         // disk and hide it. Seeding from recovered state fixes the read side
         // and keeps new writes above existing versions. Must happen before the
@@ -642,7 +639,7 @@ impl LsmStorageEngine {
     // ── Recovery ────────────────────────────────────────────────────────────
 
     /// A version over every vLog generation that exists next to `vlog_path`;
-    /// the highest id becomes the active one (spec kv/017). `vlog` is the
+    /// the highest id becomes the active one. `vlog` is the
     /// caller's handle on the canonical path, which is generation 1 — a store
     /// without further generations therefore starts exactly as before.
     async fn discover_vlog_generations(vlog: Arc<VLog>, vlog_path: &Path) -> Result<Version> {
@@ -759,7 +756,7 @@ impl LsmStorageEngine {
     }
 
     /// An unopenable SSTable that the manifest still lists is a startup
-    /// error (spec kv/026 M2), not a warning: silently installing a partial
+    /// error, not a warning: silently installing a partial
     /// level would start the database without a part of its data.
     async fn recover_sstables(
         manifest: &Manifest,
@@ -785,7 +782,7 @@ impl LsmStorageEngine {
     // ── Background tasks ────────────────────────────────────────────────────
 
     /// Starts the flush loop, compaction loop, and Janitor GC loop, keeping
-    /// their `JoinHandle`s so [`Self::shutdown`] can join them (M1).
+    /// their `JoinHandle`s so [`Self::shutdown`] can join them.
     pub fn start_background_tasks(self: &Arc<Self>) {
         let mut tasks = self.background_tasks.lock();
 
@@ -804,7 +801,7 @@ impl LsmStorageEngine {
     }
 
     /// Builds a Janitor over this engine's state, wired with the flush barrier
-    /// its GC needs before the SSTables are the complete live set (kv/017).
+    /// its GC needs before the SSTables are the complete live set.
     pub(crate) fn build_janitor(self: &Arc<Self>, config: JanitorConfig) -> Janitor {
         let engine = Arc::clone(self);
         let flush_barrier: FlushBarrier = Arc::new(move || {
@@ -839,7 +836,7 @@ impl LsmStorageEngine {
                     eprintln!("[Engine] Flush error: {e}");
                 }
             }
-            // M2: woken immediately on shutdown instead of sleeping out the
+            // Woken immediately on shutdown instead of sleeping out the
             // full interval; `changed()` cannot miss a signal sent while this
             // loop was doing the work above (no lost-wakeup, unlike Notify).
             tokio::select! {
@@ -871,7 +868,7 @@ impl LsmStorageEngine {
     /// Freezes the active MemTable and flushes every immutable one, leaving no
     /// vLog pointer MemTable-resident. Used by the Janitor's flush barrier.
     pub async fn flush_all_memtables(&self) -> Result<()> {
-        // Drain (spec kv/020). Order anchor: Seal (Janitor, before it calls this
+        // Drain. Order anchor: Seal (Janitor, before it calls this
         // barrier) -> Drain (here) -> Freeze/Flush (below). The write side waits
         // out every write that acquired its read guard before this point -- each
         // has, by the time it releases the guard, already applied its
@@ -880,8 +877,8 @@ impl LsmStorageEngine {
         // sealed generation is now MemTable-resident and gets picked up by the
         // freeze/flush below.
         //
-        // Held across the rotation instead of dropped right after the wait
-        // (spec kv/029): a writer admitted in between could draw its stamp
+        // Held across the rotation instead of dropped right after the wait:
+        // a writer admitted in between could draw its stamp
         // before the swap and apply it after, stranding an older stamp in the
         // new MemTable. Everything below the guard is synchronous -- no await.
         {
@@ -894,7 +891,7 @@ impl LsmStorageEngine {
             }
             // The barrier: `flush_lock` is free only once every flush claimed
             // before this point has installed its SSTable or, failed, handed
-            // its MemTable back to the immutables (spec general/029). Acquired
+            // its MemTable back to the immutables. Acquired
             // after the drain loop, never around it — `flush_memtable` takes
             // the same lock and `tokio::sync::Mutex` is not reentrant. The
             // check belongs under the guard: released first, the flush loop
@@ -980,7 +977,7 @@ impl LsmStorageEngine {
         }
     }
 
-    // ── Version (spec kv/031 A1) ────────────────────────────────────────────
+    // ── Version ─────────────────────────────────────────────────────────────
 
     /// The current sources as one value; holding it costs no lock.
     pub(crate) fn version(&self) -> Arc<Version> {
@@ -1007,7 +1004,7 @@ impl LsmStorageEngine {
     }
 
     /// Stamp of a point read: the last one the clock issued, raised to the
-    /// wall clock, without issuing one (spec kv/031 A4). A confirmed write
+    /// wall clock, without issuing one. A confirmed write
     /// drew its stamp before its confirmation, so every later read sees it;
     /// the wall clock covers stored stamps no seed knows of (a manifest
     /// written before `max_timestamp`), as a drawn stamp did.
@@ -1046,13 +1043,13 @@ impl LsmStorageEngine {
         &self.hlc
     }
 
-    /// Handle to the flush-notification (spec perf/009 §4). The SHM snapshot
+    /// Handle to the flush-notification. The SHM snapshot
     /// publisher awaits it as an extra tick right after a MemTable flush.
     pub fn flush_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.flush_notify)
     }
 
-    /// Monotonic change epoch (spec perf/028 A1). Every change counted in a
+    /// Monotonic change epoch. Every change counted in a
     /// loaded value is visible to reads started after the load.
     pub fn change_epoch(&self) -> u64 {
         self.change_epoch.load(Ordering::Acquire)
@@ -1070,8 +1067,8 @@ impl LsmStorageEngine {
         LsmReader::new(self.version(), Arc::clone(&self.block_cache), &self.applying_batch)
     }
 
-    /// Reader and snapshot of an unregistered point read at the current state
-    /// (spec kv/031 A3). The version is taken before the stamp: compaction
+    /// Reader and snapshot of an unregistered point read at the current
+    /// state. The version is taken before the stamp: compaction
     /// and GC only drop what every registered snapshot sees as shadowed, and
     /// the reader keeps its own sources as `Arc`s, so they still hold the
     /// newest version of every key at that stamp. A stamp taken first could
@@ -1103,7 +1100,7 @@ impl LsmStorageEngine {
         reader.get_with_metadata(key, &snapshot).await
     }
 
-    /// MVCC-aware point read. Three-valued (spec kv/018): a live value, an
+    /// MVCC-aware point read. Three-valued: a live value, an
     /// explicit NULL (`set_null`), or absent.
     pub async fn get_with_snapshot(
         &self,
@@ -1124,7 +1121,7 @@ impl LsmStorageEngine {
     }
 
     /// Like [`Self::get_with_snapshot`], but also returns `expire_at`
-    /// (absolute Unix seconds, 0 = no TTL) — spec general/006 backup export,
+    /// (absolute Unix seconds, 0 = no TTL) — for the backup export,
     /// which needs the remaining TTL alongside the value. Unlike
     /// [`Self::get_with_metadata`], VLog pointers are dereferenced.
     pub async fn get_with_expiry(
@@ -1136,10 +1133,10 @@ impl LsmStorageEngine {
     }
 
     /// Newest version of `key` as (write stamp, liveness) — the TTL sweeper's
-    /// authoritative re-check (spec kv/025 §3.1). Takes no snapshot argument:
+    /// authoritative re-check. Takes no snapshot argument:
     /// the sweeper always wants the current state, so it is pulled internally
     /// and cannot accidentally be a stale one. It draws a fresh stamp instead
-    /// of peeking (spec kv/031 A4): the sweeper dates its tombstone one above
+    /// of peeking: the sweeper dates its tombstone one above
     /// the version found, and the draw keeps that date within the clock.
     pub(super) async fn newest_version(&self, key: &[u8]) -> Result<Option<(Timestamp, VersionState)>> {
         let reader = self.build_reader();
@@ -1148,9 +1145,9 @@ impl LsmStorageEngine {
     }
 
     /// Collects the `limit` smallest user-keys above `after` that carry *some*
-    /// expired version (spec kv/025 §3). Deliberately a superset: no
+    /// expired version. Deliberately a superset: no
     /// cross-source newest-first resolution happens here (no `decided` set
-    /// over all keys, §7) — [`Self::newest_version`] decides authoritatively.
+    /// over all keys) — [`Self::newest_version`] decides authoritatively.
     /// Key-only, no vLog I/O.
     pub(super) async fn scan_expired(&self, after: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
         let mut candidates: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -1198,8 +1195,8 @@ impl LsmStorageEngine {
 
     /// Rotates the active MemTable once it reached the size threshold.
     ///
-    /// Drains in-flight writes first and holds the drain across the swap (spec
-    /// kv/029): every writer that already drew its stamp has applied it before
+    /// Drains in-flight writes first and holds the drain across the swap:
+    /// every writer that already drew its stamp has applied it before
     /// the rotation, every later one stamps after it. Otherwise a slow writer
     /// could apply its older stamp into the fresh MemTable — a newer source
     /// holding an older version, which the source-ordered read path resolves
@@ -1254,9 +1251,9 @@ impl LsmStorageEngine {
     }
 
     /// Assigns the next watch-stream sequence, rings it, and broadcasts it
-    /// (spec kv/024 §2) — the single choke point every non-batch write path
+    /// — the single choke point every non-batch write path
     /// goes through. Every caller invokes this only after its own
-    /// `memtable.set` (spec kv/030): a crash between the two now drops the
+    /// `memtable.set`: a crash between the two now drops the
     /// event instead of describing a write a replay might still undo.
     fn publish_change(&self, key: &[u8], op: OpType) {
         self.watch_log.publish(&self.change_tx, |seq| WalEvent { seq, key: key.to_vec(), op });
@@ -1280,11 +1277,11 @@ impl LsmStorageEngine {
         expire_at: Option<u64>,
         admit: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        // Freeze check first (spec kv/029): its drain takes the write side of
+        // Freeze check first: its drain takes the write side of
         // `in_flight_writes`, which would deadlock under the guard below.
         self.maybe_freeze_memtable().await?;
 
-        // In-flight guard (spec kv/020, widened by kv/029): held from before
+        // In-flight guard: held from before
         // the stamp through `memtable.set`, so no rotation can fall into that
         // window and no pointer into a generation the Janitor just sealed is
         // still on its way into a MemTable. Inline values carry no generation
@@ -1335,7 +1332,7 @@ impl LsmStorageEngine {
     }
 
     /// Serialises one DELETE record (WAL type 2): [type=2][ts:u64][key_len:u32][key].
-    /// Shared by the client delete path and the TTL sweeper (spec kv/025 §3.2).
+    /// Shared by the client delete path and the TTL sweeper.
     fn encode_tombstone_wal_record(timestamp: Timestamp, key: &[u8]) -> Vec<u8> {
         let mut log_entry = Vec::new();
         log_entry.push(2u8);
@@ -1375,7 +1372,7 @@ impl LsmStorageEngine {
     }
 
     /// Pins the active MemTable — every tombstone of one sweep tick goes into
-    /// exactly this one (spec kv/025 §3 step 2, §4.2).
+    /// exactly this one, never a newer one.
     pub(super) fn pin_memtable(&self) -> Arc<MemTable> {
         Arc::clone(&self.version().memtable)
     }
@@ -1384,7 +1381,7 @@ impl LsmStorageEngine {
     /// TTL sweeper's pinned one. Deliberately without
     /// `maybe_freeze_memtable` and without re-reading the active MemTable: a
     /// tombstone that ends up in a newer source than the value it dates
-    /// against would win despite its older stamp (§4.2). A write that drew
+    /// against would win despite its older stamp. A write that drew
     /// the same stamp and is already in that MemTable keeps its entry; the
     /// tombstone and its event are then dropped.
     /// Sweeper-exclusive — [`Self::write_tombstone`] does not delegate here.
@@ -1413,7 +1410,7 @@ impl LsmStorageEngine {
     }
 
     /// Appends a SET_NULL entry to the WAL and inserts a NULL marker into the
-    /// MemTable (spec kv/018): an update, not a delete — the key stays
+    /// MemTable: an update, not a delete — the key stays
     /// visible and overwrites older versions like a Put. Writes without
     /// expiry (`set_null` never carries a TTL).
     pub(super) async fn write_null(&self, key: &[u8]) -> Result<()> {
@@ -1492,10 +1489,9 @@ impl LsmStorageEngine {
 
     /// Assigns `ops.len()` consecutive sequences in one lock section
     /// (`publish_many`), so a concurrent single-op write can never
-    /// interleave into the middle of this batch's stream slice (spec
-    /// kv/024 §2). Called only after the batch's MemTable apply (spec
-    /// kv/030), on `events` pre-extracted from the ops before
-    /// `resolve_batch_values` consumes them — see `write_batch`.
+    /// interleave into the middle of this batch's stream slice. Called only
+    /// after the batch's MemTable apply, on `events` pre-extracted from the
+    /// ops before `resolve_batch_values` consumes them — see `write_batch`.
     fn broadcast_batch_events(&self, events: &[(Vec<u8>, OpType)]) {
         let mut events = events.iter();
         self.watch_log.publish_many(&self.change_tx, events.len(), |seq| {
@@ -1527,9 +1523,9 @@ impl LsmStorageEngine {
 
     /// Writes all `ops` as ONE WAL record (type 3, single fsync) sharing one
     /// timestamp, then applies them to the MemTable. Recovery replays the
-    /// record all-or-nothing, so the batch is atomic (spec json/005); while
+    /// record all-or-nothing, so the batch is atomic; while
     /// the apply runs, `applying_batch` hides it from readers on other
-    /// threads (spec kv/034).
+    /// threads.
     pub async fn write_batch(&self, ops: Vec<BatchOp>) -> Result<()> {
         self.write_batch_admitted(ops, || Ok(())).await
     }
@@ -1549,7 +1545,7 @@ impl LsmStorageEngine {
         // Freeze check before the guard — see `write_kv_pair_admitted`.
         self.maybe_freeze_memtable().await?;
 
-        // In-flight guard (spec kv/020, widened by kv/029), held across the
+        // In-flight guard, held across the
         // whole batch: batches are bounded, so one guard per batch is simpler
         // than tracking which individual ops end up pointer-creating. Acquired
         // before the shared stamp and held through every `memtable.set` in
@@ -1579,7 +1575,7 @@ impl LsmStorageEngine {
 
         // Phase 2 (infallible): apply the whole batch to the MemTable. The
         // slot is set before the first insert and cleared before the batch
-        // counts as visible (spec kv/034).
+        // counts as visible.
         let applied = last_op_per_key(resolved);
         let memtable = Arc::clone(&self.version().memtable);
         self.applying_batch.store(timestamp.as_u64(), Ordering::SeqCst);
@@ -1647,7 +1643,7 @@ impl LsmStorageEngine {
         }
     }
 
-    /// Sets `key` to the technical NULL state (spec kv/018): an update, not a
+    /// Sets `key` to the technical NULL state: an update, not a
     /// delete. Upserts a non-existent key into the NULL state.
     pub fn set_null<'a>(
         &'a self,
@@ -1682,7 +1678,7 @@ impl LsmStorageEngine {
     }
 
     /// Like [`Self::scan_keys`], but against an externally supplied MVCC
-    /// `snapshot` instead of "now" (spec general/006 backup export): a write
+    /// `snapshot` instead of "now" (backup export): a write
     /// committed after the snapshot was acquired never appears, matching
     /// [`Self::get_with_snapshot`]'s consistency guarantee for point reads.
     pub async fn scan_keys_with_snapshot(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
@@ -1690,8 +1686,8 @@ impl LsmStorageEngine {
     }
 
     /// Combines [`Self::scan_keys_limited`] and [`Self::scan_keys_with_snapshot`]:
-    /// stops once `limit` keys visible under `snapshot` were found (spec
-    /// rel/014 SELECT fast-limit path). A key that only starts existing
+    /// stops once `limit` keys visible under `snapshot` were found (rel
+    /// SELECT fast-limit path). A key that only starts existing
     /// after `snapshot` never counts toward the cap, so it can never
     /// displace a snapshot-visible key the way it could under the
     /// unsnapshotted [`Self::scan_keys_limited`]. Like that method, the
@@ -1740,8 +1736,8 @@ impl LsmStorageEngine {
         let now = now_secs();
         let mut coop = YieldEvery::new(SCAN_KEYS_YIELD_INTERVAL);
 
-        // One version for the whole scan: its yields hold an `Arc`, no guard
-        // (spec perf/017 A3), and every source comes from the same state.
+        // One version for the whole scan: its yields hold an `Arc`, no guard,
+        // and every source comes from the same state.
         let version = self.version();
         for mt in version.memtables_newest_first() {
             scan_memtable_for_prefix(
@@ -1765,8 +1761,7 @@ impl LsmStorageEngine {
             }
         }
 
-        // Collecting and releasing are O(keys) too; they tick like the sources
-        // (spec perf/033).
+        // Collecting and releasing are O(keys) too; they tick like the sources.
         let mut keys = Vec::with_capacity(live.len());
         for key in live {
             coop.tick().await;
@@ -1783,7 +1778,7 @@ impl LsmStorageEngine {
     /// Returns a receiver that is notified for every WAL-confirmed write.
     ///
     /// Each event carries the key, operation type (`Set` / `Delete`), and its
-    /// watch-stream sequence (spec kv/024 §1-2). The caller is responsible
+    /// watch-stream sequence. The caller is responsible
     /// for filtering by prefix if needed. Events may be dropped if the
     /// receiver is too slow (lagged) — use [`Self::watch_decide_resume`] to
     /// recover from that via the replay ring.
@@ -1791,14 +1786,14 @@ impl LsmStorageEngine {
         self.change_tx.subscribe()
     }
 
-    /// Capacity of the live WAL-event broadcast (and, per spec kv/024 §3,
-    /// every per-domain relay channel too).
+    /// Capacity of the live WAL-event broadcast (and of every per-domain
+    /// relay channel too).
     pub fn wal_event_channel_capacity(&self) -> usize {
         self.engine_config.wal_event_channel_capacity
     }
 
     /// Current head of the watch-stream sequence — the `id:` a `reset`
-    /// event carries (spec kv/024 §5).
+    /// event carries.
     pub fn watch_head(&self) -> u64 {
         self.watch_log.head()
     }
@@ -1819,7 +1814,7 @@ impl LsmStorageEngine {
 
     /// Test-only: freezes the active MemTable so `flush_memtable` persists it.
     /// Deliberately without the in-flight drain every production rotation runs
-    /// (spec kv/029 §Verifikationspflicht 2) — it is the lever tests use to
+    /// — it is the lever tests use to
     /// build the stranded-stamp state the drain now prevents.
     #[cfg(test)]
     pub fn freeze_active_memtable(&self) {
@@ -1837,10 +1832,10 @@ impl LsmStorageEngine {
     /// The claim moves the MemTable from the immutables into the flush slot
     /// in one install: the removal still keeps concurrent callers from
     /// flushing it twice, while readers keep seeing it until its SSTable is
-    /// installed (spec general/028).
+    /// installed.
     ///
     /// [`Self::flush_lock`] spans claim and install, so the SSTables enter L0
-    /// and the manifest in MemTable age order (spec general/029).
+    /// and the manifest in MemTable age order.
     pub async fn flush_memtable(&self) -> Result<Option<u64>> {
         let _flush = self.flush_lock.lock().await;
         let mut claimed = None;
@@ -1866,7 +1861,7 @@ impl LsmStorageEngine {
 
     /// Returns a failed flush's MemTable to the head of the immutables, so the
     /// next call is its retry. A no-op once the SSTable was installed — the
-    /// flush slot no longer holds it then (spec general/028).
+    /// flush slot no longer holds it then.
     fn abort_flush(&self, memtable: &Arc<MemTable>) {
         self.install(|v| {
             let mut next = v.clone();
@@ -1965,7 +1960,7 @@ impl LsmStorageEngine {
         sstable.set_file_id(file_id);
         let sstable = Arc::new(sstable);
         // One install: the SSTable enters L0 as the MemTable leaves the flush
-        // slot (spec kv/031 A1).
+        // slot.
         self.install(|v| {
             let mut next = v.clone();
             if next.levels.is_empty() {
@@ -1991,21 +1986,21 @@ impl LsmStorageEngine {
         let snap = self.manifest.read().clone();
         self.manifest_manager.save(&snap).await?;
 
-        // Event trigger for the SHM snapshot publisher (spec perf/009 §4): a
+        // Event trigger for the SHM snapshot publisher: a
         // stored permit means a flush that races the publisher is not missed.
         self.flush_notify.notify_one();
         Ok(file_id)
     }
 
-    // ── IoEngine registration (spec perf/004 scaffolding) ────────────────────
+    // ── IoEngine registration (scaffolding) ──────────────────────────────────
     //
-    // `IoEngine` is not on the hot path yet (see spec perf/004) and cannot be
+    // `IoEngine` is not on the hot path yet and cannot be
     // stored as a field here: it is `!Send`/`!Sync` (its buffers and files
     // are confined to the engine thread's ring), while `LsmStorageEngine` is
     // shared via `Arc` with the reader pool. These
     // methods are additive and only run where a caller has direct, unspawned
     // access to both -- startup recovery here, and explicit calls from tests
-    // or (in spec 005) the dedicated Storage Thread.
+    // or the storage thread.
 
     /// Registers every currently loaded SSTable with `io_engine` -- called
     /// once at startup, after recovery.
@@ -2047,19 +2042,19 @@ impl LsmStorageEngine {
         self.compact_level(source_level).await?;
         // Only a level that actually got compacted counts -- mirrors the
         // Janitor's `GcStats::ran` distinction so this stays an activity
-        // signal instead of a poll-interval counter (spec general/024).
+        // signal instead of a poll-interval counter.
         self.compaction_runs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Compacts `source_level` into `source_level + 1`, returning the file ids
     /// removed from the working set (the merged source + target inputs) so the
-    /// caller can deregister exactly those from the `IoEngine` (perf/004).
+    /// caller can deregister exactly those from the `IoEngine`.
     pub async fn compact_level(&self, source_level: usize) -> Result<Vec<u64>> {
         // Whole run under the maintenance lock: a GC cycle either sees this
         // compaction's output from its start or not at all, so it can neither
         // orphan the vLog pointers the output copied nor re-enter the SSTables
-        // it merged away (spec general/029).
+        // it merged away.
         let _maintenance = self.maintenance_lock.lock().await;
 
         // Inject the current low watermark so tombstones below it can be GC'd.
@@ -2100,7 +2095,7 @@ impl LsmStorageEngine {
         let retired = {
             // Under the flush lock the manifest cannot gain an L0 table
             // between the rebuild's read and its swap, which would drop that
-            // table from the read path (spec general/029).
+            // table from the read path.
             let _flush = self.flush_lock.lock().await;
             self.rebuild_levels_from_manifest([source_level, target_level], use_mmap).await?
         };
@@ -2191,7 +2186,7 @@ impl LsmStorageEngine {
     /// holds keeps its reader (see [`Self::level_readers`]).
     ///
     /// Both levels keep their old readers until every new one is open, then
-    /// change in one install (spec general/028, kv/031 A1).
+    /// change in one install.
     async fn rebuild_levels_from_manifest(
         &self,
         levels: [usize; 2],
@@ -2241,8 +2236,8 @@ impl LsmStorageEngine {
     }
 
     /// Compacts `source_level` (see [`Self::compact_level`]) and deregisters
-    /// the deleted source/target SSTables from `io_engine` (spec perf/004
-    /// scaffolding -- see the note above [`Self::register_sstables_with_io_engine`]).
+    /// the deleted source/target SSTables from `io_engine` (scaffolding --
+    /// see the note above [`Self::register_sstables_with_io_engine`]).
     pub async fn compact_level_and_deregister(
         &self,
         source_level: usize,
@@ -2268,7 +2263,7 @@ impl LsmStorageEngine {
     /// Returns the data needed for the `/health` heartbeat response.
     pub fn heartbeat_data(&self) -> EngineHeartbeatData {
         let version = self.version();
-        // A flush in flight is still MemTable-resident (spec general/028).
+        // A flush in flight is still MemTable-resident.
         let memtable_keys: u64 = version.memtables_newest_first().map(|m| m.len() as u64).sum();
         EngineHeartbeatData {
             estimated_memtable_keys: memtable_keys,
@@ -2280,13 +2275,12 @@ impl LsmStorageEngine {
     // ── Stats ────────────────────────────────────────────────────────────────
 
     /// Number of successfully completed `compact_next_level` calls since
-    /// process start (spec general/024).
+    /// process start.
     pub fn compaction_runs(&self) -> u64 {
         self.compaction_runs.load(Ordering::Relaxed)
     }
 
-    /// Number of Janitor GC cycles that actually ran since process start
-    /// (spec general/024).
+    /// Number of Janitor GC cycles that actually ran since process start.
     pub fn janitor_runs(&self) -> u64 {
         self.janitor_runs.load(Ordering::Relaxed)
     }
@@ -2295,7 +2289,7 @@ impl LsmStorageEngine {
         let version = self.version();
         EngineStats {
             memtable_size: version.memtable.size_bytes(),
-            // A flush in flight is still MemTable-resident (spec general/028).
+            // A flush in flight is still MemTable-resident.
             num_immutable_memtables: version.immutables.len() + version.flushing.len(),
             num_levels: version.levels.len(),
             total_sstables: version.levels.iter().map(Vec::len).sum(),
@@ -2317,7 +2311,7 @@ pub struct EngineStats {
     pub total_sstables: usize,
 }
 
-// ── Batch operations (spec json/005) ─────────────────────────────────────────
+// ── Batch operations ─────────────────────────────────────────────────────────
 
 /// A single operation inside an atomic [`LsmStorageEngine::write_batch`].
 #[derive(Debug, Clone)]
@@ -2330,8 +2324,8 @@ pub enum BatchOp {
 
 impl StorageEngine for LsmStorageEngine {
     // Generic two-valued contract (shared with the unrelated `KvStore` engine):
-    // collapses `Null` into `None`, like every caller outside the KV engine
-    // (spec kv/018). Callers that must distinguish Null use `get_with_snapshot`.
+    // collapses `Null` into `None`, like every caller outside the KV engine.
+    // Callers that must distinguish Null use `get_with_snapshot`.
     fn get(&self, key: &[u8]) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
         async move { Ok(self.get_latest_with_expiry(key).await?.0.into_option()) }
     }
@@ -2368,8 +2362,8 @@ mod tests {
     use crate::engines::lsm::watcher::OpType;
     use std::os::unix::fs::PermissionsExt;
 
-    // Spec general/030: the JSON and rel instances run on these defaults, so
-    // they must stay the spec's fixed tuning.
+    // The JSON and rel instances run on these defaults, so they must stay
+    // this fixed tuning.
     #[test]
     fn test_defaults_match_fixed_json_and_rel_tuning() {
         let engine = LsmEngineConfig::default();
@@ -2446,7 +2440,7 @@ mod tests {
     }
 
     /// Like `engine_on`, but with the SSTable directory split out from `dir`
-    /// so a test can make it unwritable (spec kv/026 M1 fault injection)
+    /// so a test can make it unwritable (fault injection)
     /// without touching the WAL/manifest paths too.
     async fn engine_with_sstable_dir(dir: &tempfile::TempDir, sstable_dir: &Path) -> LsmStorageEngine {
         let wal_path = dir.path().join("wal.log");
@@ -2464,7 +2458,7 @@ mod tests {
     }
 
     /// Like `engine_on`, but with a custom MemTable freeze threshold in bytes
-    /// (spec kv/029, general/032 tests). Every entry counts at least its
+    /// (freeze and size-accounting tests). Every entry counts at least its
     /// 8-byte stamp, so a threshold of 1 rotates on every write after the first.
     async fn engine_with_threshold(dir: &tempfile::TempDir, threshold: usize) -> LsmStorageEngine {
         let wal_path = dir.path().join("wal.log");
@@ -2503,10 +2497,10 @@ mod tests {
         engine
     }
 
-    // Spec general/023 test 1 (wake + join): without M2 the Janitor's
-    // default 60s sleep would blow this timeout; without M1 nothing here
-    // would prove the loops actually stopped. Bound chosen generously on
-    // purpose (lesson from general/008: no tight time windows).
+    // Wake + join: without the shutdown wake-up the Janitor's default 60s
+    // sleep would blow this timeout; without the join nothing here would
+    // prove the loops actually stopped. Bound chosen generously on purpose
+    // (no tight time windows).
     #[test]
     fn test_shutdown_wakes_and_joins_background_tasks_promptly() {
         crate::core::engine_runtime::block_on(async {
@@ -2519,11 +2513,11 @@ mod tests {
         })
     }
 
-    // Spec general/023 test 2 (restart determinism): the test_disabled_smoke
+    // Restart determinism: the test_disabled_smoke
     // pattern at the LSM level, now overlap-free by construction -- a
     // shutdown that returns before its tasks fully stop would let the old
     // instance's flush/compaction/GC race the new instance's recovery on the
-    // same directory (spec general/023 §A2).
+    // same directory.
     #[test]
     fn test_restart_determinism_with_background_tasks() {
         crate::core::engine_runtime::block_on(async {
@@ -2553,7 +2547,7 @@ mod tests {
         })
     }
 
-    // Spec general/023 test 3 (idempotency): a second shutdown() finds an
+    // Idempotency: a second shutdown() finds an
     // empty handle list and an already-flushed, already-truncated WAL --
     // must not panic or return an error.
     #[test]
@@ -2568,7 +2562,7 @@ mod tests {
         })
     }
 
-    // Spec general/023 test 5 (no task leak): shutdown's mem::take leaves no
+    // No task leak: shutdown's mem::take leaves no
     // dangling JoinHandles behind -- checkable directly since the field is
     // private to this module.
     #[test]
@@ -2583,8 +2577,8 @@ mod tests {
         })
     }
 
-    // Spec kv/026 M1: a failed SSTable write persists nothing (the MemTable
-    // goes back among the immutables, spec general/028), so the WAL is
+    // A failed SSTable write persists nothing (the MemTable
+    // goes back among the immutables), so the WAL is
     // the only durable copy -- shutdown() must not truncate it in that case.
     // The SSTable directory is split out from the
     // WAL/manifest one so making it read-only fails only the flush, not the
@@ -2683,7 +2677,7 @@ mod tests {
         })
     }
 
-    // Spec kv/032 test 3: a sweeper DELETE record sharing a client write's
+    // A sweeper DELETE record sharing a client write's
     // stamp replays as it applied live — the client value stays.
     #[test]
     fn test_replayed_sweeper_tombstone_keeps_identical_internal_key() {
@@ -2702,7 +2696,7 @@ mod tests {
         })
     }
 
-    // Spec kv/032 test 4 (regression): a batch Delete still replaces the Put
+    // Regression: a batch Delete still replaces the Put
     // of the same batch (shared stamp) on replay — the later op wins.
     #[test]
     fn test_replayed_batch_delete_replaces_put_of_same_batch() {
@@ -2781,7 +2775,7 @@ mod tests {
         })
     }
 
-    // Spec kv/026 M2: an SSTable the manifest still lists but that can no
+    // An SSTable the manifest still lists but that can no
     // longer be opened must fail `new()` instead of silently installing a
     // partial level.
     #[test]
@@ -2825,7 +2819,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/026 M3: HLC seeding from recovered state ─────────────────────
+    // ── HLC seeding from recovered state ─────────────────────────────────────
     //
     // A backwards step of the system clock, reproduced deterministically: the
     // HLC is pushed ahead of the wall clock before the writes, so a restarted
@@ -3043,7 +3037,7 @@ mod tests {
         })
     }
 
-    // Test 4: a manifest written before M3 has no `max_timestamp` field; it
+    // Test 4: an older manifest has no `max_timestamp` field; it
     // must still load (serde default 0) with the WAL seed doing the work.
     #[test]
     fn test_manifest_without_max_timestamp_loads_and_wal_seed_applies() {
@@ -3056,7 +3050,7 @@ mod tests {
             put_range(&engine, 5..10).await;
             drop(engine); // crash: the WAL still holds every key
 
-            // Rewrite the manifest in the pre-M3 format.
+            // Rewrite the manifest in the older format.
             let manifest_path = dir.path().join("MANIFEST");
             let mut json: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
@@ -3076,7 +3070,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 A4: point reads peek at the clock, raised to the wall
+    // Point reads peek at the clock, raised to the wall
     // clock. A store whose manifest predates `max_timestamp` and whose WAL
     // is empty seeds nothing, yet once the wall clock has passed its data,
     // reads before the first write see every key, as a drawn stamp did.
@@ -3157,7 +3151,7 @@ mod tests {
         })
     }
 
-    // ── set_null semantics (spec kv/018 §1): an Update, never a delete ───────
+    // ── set_null semantics: an Update, never a delete ────────────────────────
 
     #[test]
     fn test_set_null_is_update_not_delete() {
@@ -3322,7 +3316,7 @@ mod tests {
             wait_past_ttl(1).await;
             // Bounded retry instead of a single probe: a backwards wall-clock
             // step between the wait above and get()'s own now_secs() briefly
-            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            // un-expires the key (observed on WSL2).
             let mut value = engine.get(b"ttl_key").await.unwrap();
             for _ in 0..100 {
                 if value.is_none() {
@@ -3354,9 +3348,9 @@ mod tests {
         assert!(!crate::storage::format::is_expired(expire_at, WRITE_SECS + 2), "a 2s TTL must survive 1.1s");
     }
 
-    // spec kv/025 §2/§9.11: format::is_expired treats `Some(0)` as "no TTL",
+    // format::is_expired treats `Some(0)` as "no TTL",
     // not "expired" -- this only stays correct because no write path ever
-    // produces it. Covers all three paths named in the spec: `put` (None),
+    // produces it. Covers all three write paths: `put` (None),
     // `put_with_ttl` (including ttl_secs == 0), and WAL replay.
     #[test]
     fn test_ttl_paths_never_produce_some_zero_expire_at() {
@@ -3506,7 +3500,7 @@ mod tests {
             wait_past_ttl(1).await;
             // Bounded retry instead of a single probe: a backwards wall-clock
             // step between the wait above and the scan's own now_secs() briefly
-            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            // un-expires the key (observed on WSL2).
             let mut keys = engine.scan_keys(b"user:").await.unwrap();
             for _ in 0..100 {
                 if !keys.contains(&b"user:1".to_vec()) {
@@ -3520,7 +3514,7 @@ mod tests {
         })
     }
 
-    // ── scan_keys_with_snapshot tests (spec general/006 backup export) ──────
+    // ── scan_keys_with_snapshot tests (backup export) ───────────────────────
 
     // Writes after the snapshot (put, delete, set_null) must not change what
     // the pinned scan sees, while the unpinned scan_keys sees the new state.
@@ -3569,7 +3563,7 @@ mod tests {
         })
     }
 
-    // NULL keys count as live under a pinned snapshot too (kv/018).
+    // NULL keys count as live under a pinned snapshot too.
     #[test]
     fn test_scan_keys_with_snapshot_includes_null() {
         crate::core::engine_runtime::block_on(async {
@@ -3593,7 +3587,7 @@ mod tests {
             wait_past_ttl(1).await;
             // Bounded retry instead of a single probe: a backwards wall-clock
             // step between the wait above and the scan's own now_secs() briefly
-            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            // un-expires the key (observed on WSL2).
             let mut keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
             for _ in 0..100 {
                 if keys.is_empty() {
@@ -3606,8 +3600,8 @@ mod tests {
         })
     }
 
-    // ── scan_keys_limited_with_snapshot tests (spec rel/014 SELECT fast-limit
-    // snapshot consistency) ──────────────────────────────────────────────────
+    // ── scan_keys_limited_with_snapshot tests (SELECT fast-limit snapshot
+    // consistency) ───────────────────────────────────────────────────────────
 
     // Test 1 (the core case): a key that only starts existing after the
     // snapshot must never occupy one of the capped slots, even when it sorts
@@ -3700,7 +3694,7 @@ mod tests {
             wait_past_ttl(1).await;
             // Bounded retry instead of a single probe: a backwards wall-clock
             // step between the wait above and the scan's own now_secs() briefly
-            // un-expires the key (observed on WSL2, spec kv/026 analysis).
+            // un-expires the key (observed on WSL2).
             let mut keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
             for _ in 0..100 {
                 if keys == vec![b"user:2".to_vec()] {
@@ -3717,7 +3711,7 @@ mod tests {
         })
     }
 
-    // Test 4b: a NULL key (kv/018 -- present, not deleted) counts as live and
+    // Test 4b: a NULL key (present, not deleted) counts as live and
     // does occupy a cap slot.
     #[test]
     fn test_scan_keys_limited_with_snapshot_includes_null() {
@@ -3730,7 +3724,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/029: MemTable prefix scan by range ─────────────────────────
+    // ── MemTable prefix scan by range ────────────────────────────────────────
     // All keys stay in the active MemTable (no flush).
 
     // Test 1: keys before, inside and behind the range, one a prefix of others.
@@ -3907,7 +3901,7 @@ mod tests {
         })
     }
 
-    // ── get_with_expiry tests (spec general/006 backup export) ──────────────
+    // ── get_with_expiry tests (backup export) ───────────────────────────────
 
     // expire_at is 0 for a plain put, and the absolute TTL deadline for
     // put_with_ttl -- both against an externally acquired snapshot.
@@ -3992,7 +3986,7 @@ mod tests {
         })
     }
 
-    // kv/018 §2: set_null is an update — watchers receive a Set event.
+    // set_null is an update — watchers receive a Set event.
     #[test]
     fn test_watcher_receives_set_event_on_set_null() {
         crate::core::engine_runtime::block_on(async {
@@ -4105,7 +4099,7 @@ mod tests {
         })
     }
 
-    // Regression (perf/004 finding 3): flush_memtable returns the flushed
+    // Regression: flush_memtable returns the flushed
     // SSTable's own file_id (not a positional guess into L0), and None when
     // there is nothing to flush -- so registration can't pick the wrong table.
     #[test]
@@ -4125,7 +4119,7 @@ mod tests {
         })
     }
 
-    // Regression (perf/004 finding 2): compact_level returns exactly the file
+    // Regression: compact_level returns exactly the file
     // ids it deleted (merged source + target), so deregistration deregisters
     // the real deletions instead of a separately-selected, racy guess.
     #[test]
@@ -4171,7 +4165,7 @@ mod tests {
         })
     }
 
-    // Test 1 (spec general/024): compaction_runs counts successfully
+    // compaction_runs counts successfully
     // completed compact_next_level calls -- 0 before any compaction runs,
     // >= 1 once should_compact's own trigger condition (L0 at the default
     // threshold of 4) has actually been acted on.
@@ -4253,8 +4247,8 @@ mod tests {
     }
 
     /// Every vLog-pointer `file_id` reachable from any MemTable (active,
-    /// immutable, flushing) or any SSTable at any level — a full scan (spec
-    /// kv/020 test 3), not just a read-back, so a dangling pointer into a
+    /// immutable, flushing) or any SSTable at any level — a full scan,
+    /// not just a read-back, so a dangling pointer into a
     /// retired generation would show up here even if no test happens to read
     /// that key.
     fn all_pointer_generations(engine: &LsmStorageEngine) -> Vec<u32> {
@@ -4284,7 +4278,7 @@ mod tests {
         ids
     }
 
-    // Spec kv/017 test 1 (window A): a large value whose pointer lives only in
+    // A large value whose pointer lives only in
     // the active MemTable — no flush ran — must survive a GC cycle.
     #[test]
     fn test_gc_preserves_memtable_resident_vlog_value() {
@@ -4303,7 +4297,7 @@ mod tests {
         })
     }
 
-    // Spec kv/017 test 2 (write path): with the old generation sealed and a
+    // Write path: with the old generation sealed and a
     // new one published, a write lands in — and is stamped with — the new one.
     #[test]
     fn test_write_after_generation_swap_uses_new_generation() {
@@ -4328,7 +4322,7 @@ mod tests {
         })
     }
 
-    // Spec kv/017 test 3 (window B): values written while the GC runs must all
+    // Values written while the GC runs must all
     // survive — the seal makes racing appends retry against the new generation.
     // The writers interleave with the GC at their await points, as they do on
     // the engine thread.
@@ -4370,7 +4364,7 @@ mod tests {
         })
     }
 
-    // Spec kv/020 test 1: a held writer guard blocks the barrier's drain step;
+    // A held writer guard blocks the barrier's drain step;
     // dropping it unblocks immediately. Exercises the guard mechanism directly
     // (not the public write path) since the real race window is instruction-
     // width and cannot be hit deterministically. Timeout-guarded so a bug that
@@ -4398,7 +4392,7 @@ mod tests {
 
     /// Highest-stamped version of `user_key` across the active and all
     /// immutable MemTables -- the stamp-ordered oracle the source-ordered read
-    /// path has to agree with (spec kv/029). Inline values only; its callers
+    /// path has to agree with. Inline values only; its callers
     /// write no pointers.
     fn newest_memtable_version(engine: &LsmStorageEngine, user_key: &[u8]) -> Option<(u64, Vec<u8>)> {
         let version = engine.version();
@@ -4426,7 +4420,7 @@ mod tests {
         newest
     }
 
-    // Spec kv/029 test 1, before-state: the point read resolves by source, not
+    // Without the write barrier: the point read resolves by source, not
     // by stamp, so an older stamp in the newer MemTable wins over the newer
     // version below it. Built with the test-only rotation lever (the one
     // rotation without a drain) because no production path can produce this
@@ -4454,7 +4448,7 @@ mod tests {
         })
     }
 
-    // Spec kv/029 test 1, after-state: concurrent writers on one key with a
+    // With the write barrier: concurrent writers on one key with a
     // threshold that rotates on nearly every write. The read must always
     // resolve to the newest stamp the engine holds -- what the source-ordered
     // read path can only deliver while the freeze barrier holds.
@@ -4490,9 +4484,9 @@ mod tests {
         })
     }
 
-    // Spec kv/029 test 2: a held writer guard blocks the freeze until the
+    // A held writer guard blocks the freeze until the
     // in-flight apply is through; afterwards the rotation goes ahead. Same
-    // shape as the kv/020 drain test, now for the regular freeze path.
+    // shape as the drain test above, now for the regular freeze path.
     #[test]
     fn test_freeze_waits_for_held_writer_guard_then_rotates() {
         crate::core::engine_runtime::block_on(async {
@@ -4519,7 +4513,7 @@ mod tests {
         })
     }
 
-    // Spec general/032 test 1: each entry contributes its encoded internal key
+    // Each entry contributes its encoded internal key
     // (user key + 8-byte stamp) plus its stored value bytes; TTL is not counted.
     #[test]
     fn test_memtable_size_is_the_sum_of_entry_bytes() {
@@ -4540,7 +4534,7 @@ mod tests {
         })
     }
 
-    // Spec general/032 test 2: every write is its own version, and each one
+    // Every write is its own version, and each one
     // counts on its own.
     #[test]
     fn test_memtable_size_counts_every_version_of_a_key() {
@@ -4555,7 +4549,7 @@ mod tests {
         })
     }
 
-    // Spec general/032 test 3: a tombstone contributes only its internal key.
+    // A tombstone contributes only its internal key.
     #[test]
     fn test_memtable_size_counts_a_tombstone_by_its_internal_key() {
         crate::core::engine_runtime::block_on(async {
@@ -4567,8 +4561,8 @@ mod tests {
         })
     }
 
-    // Spec general/032 test 4: the freeze trigger compares real bytes, not an
-    // entry count. The check runs before each write (kv/029), so the write
+    // The freeze trigger compares real bytes, not an
+    // entry count. The check runs before each write, so the write
     // that crosses the threshold still lands in the active MemTable and the
     // next write rotates it.
     #[test]
@@ -4597,7 +4591,7 @@ mod tests {
         })
     }
 
-    // Spec general/032 test 4, large values: the same threshold is crossed
+    // Large values: the same threshold is crossed
     // after a few entries. 600 bytes stay inline (below vlog_inline_threshold).
     #[test]
     fn test_large_inline_values_freeze_after_fewer_entries() {
@@ -4615,7 +4609,7 @@ mod tests {
         })
     }
 
-    // Spec general/032 test 5: an offloaded value counts with its vLog pointer,
+    // An offloaded value counts with its vLog pointer,
     // the only part of it held in memory.
     #[test]
     fn test_memtable_size_counts_an_offloaded_value_by_its_pointer() {
@@ -4630,7 +4624,7 @@ mod tests {
         })
     }
 
-    // Spec general/032 test 6: the MemTable created by a freeze starts at 0,
+    // The MemTable created by a freeze starts at 0,
     // so it reports only the writes that land in it.
     #[test]
     fn test_memtable_size_starts_at_zero_after_a_freeze() {
@@ -4647,8 +4641,8 @@ mod tests {
         })
     }
 
-    // Spec general/032: a batch shares one stamp, so [Delete k, Put k v]
-    // resolves to one insert of the Put (spec kv/034), which counts once.
+    // A batch shares one stamp, so [Delete k, Put k v]
+    // resolves to one insert of the Put, which counts once.
     #[test]
     fn test_memtable_size_counts_a_key_written_twice_in_a_batch_once() {
         crate::core::engine_runtime::block_on(async {
@@ -4666,11 +4660,11 @@ mod tests {
         })
     }
 
-    // Spec kv/020 tests 2+3: sharpens test_gc_keeps_values_written_concurrently
-    // (kv/017) for the in-flight guard introduced here -- that test is left
+    // Sharpens test_gc_keeps_values_written_concurrently
+    // for the in-flight guard -- that test is left
     // unchanged and must stay green on its own. Adds two properties the guard
-    // must not break: (2) the GC cycle terminates under concurrent write load
-    // instead of deadlocking against the drain, and (3) once everything has
+    // must not break: the GC cycle terminates under concurrent write load
+    // instead of deadlocking against the drain, and once everything has
     // settled, no stored pointer names a generation the GC retired -- checked
     // via a full MemTable/SSTable scan, not just successful reads.
     #[test]
@@ -4738,7 +4732,7 @@ mod tests {
         })
     }
 
-    // Spec kv/017 test 4: values from before and after a GC are both readable,
+    // Values from before and after a GC are both readable,
     // and a reference to the retired generation taken before the GC keeps
     // reading correctly from its already-open descriptor.
     #[test]
@@ -4763,7 +4757,7 @@ mod tests {
         })
     }
 
-    // Spec kv/017 test 5: startup registers every generation found on disk and
+    // Startup registers every generation found on disk and
     // activates the highest id; a store with only the canonical file starts as
     // generation 1, and an orphaned empty generation does not disturb it.
     #[test]
@@ -5039,7 +5033,7 @@ mod tests {
         })
     }
 
-    // ── IoEngine integration (spec perf/004) ─────────────────────────────────
+    // ── IoEngine integration ─────────────────────────────────────────────────
     //
     // Runs on the engine runtime's test harness: `IoEngine` registers its
     // buffers with that runtime's ring.
@@ -5096,9 +5090,9 @@ mod tests {
         });
     }
 
-    // ── Spec kv/024 tests 7/8: watch-stream sequence assignment ──────────────
+    // ── Watch-stream sequence assignment ─────────────────────────────────────
 
-    // Test 7: put, delete, set_null (-> Set, kv/018) and write_batch all
+    // Test 7: put, delete, set_null (-> Set) and write_batch all
     // publish through the same choke point (`publish_change`/`publish_many`)
     // -> sequences are gapless and non-decreasing across every write path.
     #[test]
@@ -5109,7 +5103,7 @@ mod tests {
 
             engine.put(b"a", b"1").await.unwrap(); // Set
             engine.delete(b"a").await.unwrap(); // Delete
-            engine.set_null(b"b").await.unwrap(); // Set (kv/018: an update, not a delete)
+            engine.set_null(b"b").await.unwrap(); // Set (an update, not a delete)
             engine
                 .write_batch(vec![
                     BatchOp::Put { key: b"c".to_vec(), value: b"1".to_vec() },
@@ -5172,19 +5166,19 @@ mod tests {
         })
     }
 
-    // ── Spec kv/030 test 1: watch events after MemTable apply ────────────────
+    // ── Watch events after MemTable apply ────────────────────────────────────
 
     // A Set/Delete race on one key. Before the fix, `publish_change` ran right
     // after the WAL fsync, before `memtable.set` -- a subscriber could receive
     // an event for a write that was not yet applied (and, on a crash, might
-    // never be, kv/025 §5 Restfenster A). After the fix, every write path
+    // never be). After the fix, every write path
     // calls `memtable.set` before `publish_change` with no `.await` between
     // them, and the broadcast channel's send/recv synchronizes with that
     // apply -- so a read taken right after receiving any event from this
     // round must already see a state newer than the pre-race baseline.
     // Deterministic on purpose, not a hit-rate sample: this ordering is
     // unconditional, unlike the residual stream-vs-timestamp ordering gap
-    // between two different writers that stays open (spec kv/030 §2) and is
+    // between two different writers that stays open and is
     // not exercised here.
     #[test]
     fn test_watch_event_is_never_seen_before_its_own_apply() {
@@ -5222,7 +5216,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/028: atomic install at flush and compaction ─────────────
+    // ── Atomic install at flush and compaction ───────────────────────────────
 
     /// Parks the next `flush_memtable` right before its SSTable write.
     fn hook_flush_write(engine: &mut LsmStorageEngine) -> Arc<TestHook> {
@@ -5231,7 +5225,7 @@ mod tests {
         hook
     }
 
-    // Spec general/028 test 1: a MemTable claimed by a flush in flight stays
+    // A MemTable claimed by a flush in flight stays
     // readable. Task B reads while the flush is parked between its claim and
     // the SSTable write -- before the fix the MemTable was in neither the
     // immutables nor L0, so every key read as absent.
@@ -5276,11 +5270,12 @@ mod tests {
         })
     }
 
-    // Spec general/028 test 2: a failed flush hands its MemTable back to the
+    // A failed flush hands its MemTable back to the
     // immutables and leaves the flush slot empty, so the next call
     // is its retry -- the keys stay readable throughout and end up in exactly
     // one L0 file. The fault is a read-only SSTable directory (same lever as
-    // the kv/026 M1 test above), which fails the write before the install.
+    // test_shutdown_skips_wal_truncate_after_failed_flush), which fails the
+    // write before the install.
     #[test]
     fn test_failed_flush_returns_its_memtable_for_the_retry() {
         crate::core::engine_runtime::block_on(async {
@@ -5310,9 +5305,9 @@ mod tests {
         })
     }
 
-    // Spec general/028 test 3: the claim stays exclusive -- a second call
-    // never flushes the same MemTable, and only one L0 file results. Since
-    // spec general/029 it waits for the flush lock instead of returning right
+    // The claim stays exclusive -- a second call
+    // never flushes the same MemTable, and only one L0 file results. It
+    // waits for the flush lock instead of returning right
     // away, so it runs as its own task.
     #[test]
     fn test_concurrent_flush_calls_claim_the_memtable_once() {
@@ -5349,7 +5344,7 @@ mod tests {
         })
     }
 
-    // Spec general/028 test 4: a compaction installs both levels at once. Task
+    // A compaction installs both levels at once. Task
     // B reads while the compaction is parked after opening its new readers --
     // before the fix the source level was already emptied while the target
     // level still carried the old versions, so `a` and `b` read as `old`.
@@ -5399,7 +5394,7 @@ mod tests {
         })
     }
 
-    // Spec general/028 test 5: the Janitor installs every rebuilt level at
+    // The Janitor installs every rebuilt level at
     // once. Task B reads across both levels while the GC is parked after
     // opening its new readers -- level by level, a reader could otherwise
     // catch a mix of rebuilt and retired ones.
@@ -5446,7 +5441,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/017: cooperative yields in the scan path ──────────────────
+    // ── Cooperative yields in the scan path ─────────────────────────────────
 
     use crate::core::coop::completion_order;
 
@@ -5459,7 +5454,7 @@ mod tests {
         engine.write_batch(ops).await.unwrap();
     }
 
-    // Spec perf/017 test 3 (MemTable branch): a 20 000-key `scan_keys` hands
+    // MemTable branch: a 20 000-key `scan_keys` hands
     // the thread back, so a point `get` spawned after it answers first.
     #[test]
     fn test_scan_keys_interleaves_with_get_in_memtable() {
@@ -5479,7 +5474,7 @@ mod tests {
         })
     }
 
-    // Spec perf/017 test 3 (SSTable branch): same, with the keys flushed to
+    // SSTable branch: same, with the keys flushed to
     // L0 so the scan runs through `scan_sstable_for_prefix`.
     #[test]
     fn test_scan_keys_interleaves_with_get_in_sstable() {
@@ -5501,7 +5496,7 @@ mod tests {
         })
     }
 
-    // Spec perf/017 test 8 (A3): a MemTable rotation runs while the scan sits
+    // A MemTable rotation runs while the scan sits
     // in a yield *inside its frozen-list iteration* — where a read guard on
     // the frozen list used to be held. No `parking_lot` guard survives a
     // yield, so the rotation gets its write lock instead of deadlocking the
@@ -5536,7 +5531,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/030: yields follow the scan's work ─────────────────────────
+    // ── Yields follow the scan's work ────────────────────────────────────────
 
     /// 600 keys under `a:` among 20 000 under `b:` — fewer `a:` entries than
     /// one yield interval, yet enough work that the scan must yield.
@@ -5559,7 +5554,7 @@ mod tests {
         .await
     }
 
-    // MemTable branch: the range seek (perf/029) skips the foreign keys, so
+    // MemTable branch: the range seek skips the foreign keys, so
     // every visited entry but the last is a decided key and ticks twice.
     #[test]
     fn test_scan_keys_yields_within_a_dense_range_in_memtable() {
@@ -5584,7 +5579,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/033: yields cover the result materialization ───────────────
+    // ── Yields cover the result materialization ──────────────────────────────
 
     // 300 keys only in the active MemTable tick 600 times in the source loop,
     // under one yield interval: only collecting the result (300) and draining
@@ -5609,7 +5604,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/032: SSTable scans seek to the prefix range ────────────────
+    // ── SSTable scans seek to the prefix range ───────────────────────────────
 
     /// The plain, limited and snapshot scans of `prefix`.
     async fn scan_results(
@@ -5670,17 +5665,17 @@ mod tests {
         })
     }
 
-    // ── Spec general/029: maintenance against a concurrent flush ─────────────
+    // ── Maintenance against a concurrent flush ───────────────────────────────
 
     /// Gives every other task room to run, without ever asserting on
-    /// wall-clock time (spec general/029): a fixed yield budget, no deadline.
+    /// wall-clock time: a fixed yield budget, no deadline.
     async fn yield_repeatedly() {
         for _ in 0..1000 {
             tokio::task::yield_now().await;
         }
     }
 
-    // Spec general/029 test 1 (B1): the flush barrier must not return while a
+    // The flush barrier must not return while a
     // flush claimed before it is still in flight -- the GC behind it would
     // otherwise scan a manifest that is missing that MemTable's SSTable.
     #[test]
@@ -5720,7 +5715,7 @@ mod tests {
         })
     }
 
-    // Spec general/029 test 2 (B1): a GC cycle must not retire the generation
+    // A GC cycle must not retire the generation
     // a flush in flight still points into -- before the fix its barrier
     // returned early, the live scan missed that SSTable, and the key came back
     // as a pointer into a deleted generation.
@@ -5822,7 +5817,7 @@ mod tests {
         })
     }
 
-    // Spec general/029 test 3 (B2): L0 follows claim order, not completion
+    // L0 follows claim order, not completion
     // order. A second flush cannot claim while the first is in flight, so the
     // older MemTable's SSTable always lands first -- before the fix both ran
     // at once and whoever finished last counted as the newest source.
@@ -5873,7 +5868,7 @@ mod tests {
         })
     }
 
-    // Spec general/029 test 4 (B3): no flush may install while the GC swaps
+    // No flush may install while the GC swaps
     // manifest and levels -- before the fix one could, and the GC then rebuilt
     // every level from its own snapshot, so that SSTable kept its manifest
     // entry but lost its reader and every key with it.
@@ -5922,7 +5917,7 @@ mod tests {
         })
     }
 
-    // Spec general/029 test 4, the wider window (A3): a flush that completes
+    // The wider window: a flush that completes
     // between the GC's manifest snapshot and its install must survive that
     // install -- with its reader, because the reload reads the current
     // manifest and not the snapshot, and as the newest L0 source, because
@@ -5977,7 +5972,7 @@ mod tests {
         })
     }
 
-    // Spec general/029 test 5 (A4): the same for a compaction install -- it
+    // The same for a compaction install -- it
     // reads its levels from the manifest, so a flush landing in L0 between
     // that read and the swap would be replaced away.
     #[test]
@@ -6026,7 +6021,7 @@ mod tests {
 
     /// A level below L0 must be free of overlaps: the read path iterates it in
     /// undefined order, so one user key in two of its SSTables makes the
-    /// winning version a coin toss (spec general/029 B4).
+    /// winning version a coin toss.
     fn assert_levels_below_l0_are_disjoint(engine: &LsmStorageEngine) {
         for (lvl, readers) in engine.version().levels.iter().enumerate().skip(1) {
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -6049,7 +6044,7 @@ mod tests {
         }
     }
 
-    // Spec general/029 test 6 (B4): a compaction must not run inside a GC
+    // A compaction must not run inside a GC
     // cycle -- it would copy vLog pointers into the generations the cycle is
     // about to delete, and its manifest swap would make the GC re-enter the
     // very SSTables the compaction merged away.
@@ -6115,7 +6110,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/028 test 7: every write path raises the change epoch ──────
+    // ── Every write path raises the change epoch ────────────────────────────
 
     async fn assert_raises_change_epoch(
         engine: &LsmStorageEngine,
@@ -6172,14 +6167,14 @@ mod tests {
         })
     }
 
-    // ── Spec kv/031: thread-safe read path ───────────────────────────────────
+    // ── Thread-safe read path ────────────────────────────────────────────────
 
     /// Sources a reader over `version` searches: MemTables plus SSTables.
     fn source_count(version: &Version) -> usize {
         version.memtables_newest_first().count() + version.sstables_newest_first().count()
     }
 
-    // Spec kv/031 test 1: an install is one swap. While an install is parked
+    // An install is one swap. While an install is parked
     // mid-build -- the claimed MemTable already out of the immutables, not
     // yet in the flush slot -- a reader holding the old version still reads
     // it whole; after the swap the new version is whole. No reader can meet
@@ -6233,7 +6228,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 test 5: point reads peek at the clock instead of advancing
+    // Point reads peek at the clock instead of advancing
     // it -- a thousand of them leave it where it was -- while each registered
     // snapshot draws a stamp of its own; a write confirmed on one thread is
     // visible to a read that follows on another.
@@ -6289,7 +6284,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 test 6: point reads leave the snapshot registry alone; a
+    // Point reads leave the snapshot registry alone; a
     // scan pinned to a registered snapshot keeps exactly that one entry while
     // it yields, a point read in between adds none, and the entry leaves with
     // the guard.
@@ -6374,7 +6369,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 test 7: a version holding a retired generation keeps its
+    // A version holding a retired generation keeps its
     // file -- a reader on it still gets the value -- until the version is
     // dropped; the Janitor's next run deletes the file.
     #[test]
@@ -6640,7 +6635,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 test 3: four reader threads, each on its own runtime, read
+    // Four reader threads, each on its own runtime, read
     // while the engine runtime writes 20 000 vLog-sized keys, then
     // overwrites the first 5 000 in two more phases, through forced rotations,
     // flushes, compactions and a vLog GC. A read of a confirmed key always
@@ -6718,7 +6713,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 A5: a new active generation comes with a fresh MemTable, so
+    // A new active generation comes with a fresh MemTable, so
     // a version taken before the switch never meets a pointer into the new
     // generation -- the write after it lands in a MemTable that version does
     // not hold.
@@ -6755,7 +6750,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/033: drops only on the bottommost level ──────────────────────
+    // ── Drops only on the bottommost level ───────────────────────────────────
 
     /// Writes `key` and moves it down to L2, leaving L0 and L1 empty.
     async fn put_into_l2(engine: &LsmStorageEngine, key: &[u8], value: &[u8]) {
@@ -6767,7 +6762,7 @@ mod tests {
         assert_eq!(engine.version().level(2).len(), 1);
     }
 
-    // Spec kv/033 test 1: dropping the expired version on its way to L1
+    // Dropping the expired version on its way to L1
     // would bring back the older one in L2.
     #[test]
     fn test_compaction_keeps_expired_value_over_an_older_one_below() {
@@ -6783,7 +6778,7 @@ mod tests {
         })
     }
 
-    // Spec kv/033 test 2: the same for a tombstone below the watermark of a
+    // The same for a tombstone below the watermark of a
     // registered snapshot.
     #[test]
     fn test_compaction_keeps_tombstone_over_an_older_version_below() {
@@ -6801,7 +6796,7 @@ mod tests {
         })
     }
 
-    // Spec kv/033 test 4: with no level below the target, both still go.
+    // With no level below the target, both still go.
     #[test]
     fn test_bottommost_compaction_drops_tombstone_and_expired_value() {
         crate::core::engine_runtime::block_on(async {
@@ -6818,7 +6813,7 @@ mod tests {
         })
     }
 
-    // Spec kv/033 test 3: the L1 table starts with an older version of the
+    // The L1 table starts with an older version of the
     // L0 selection's largest user key, which sorts behind the selection's
     // largest internal key; it must join the job all the same.
     #[test]
@@ -6841,7 +6836,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/034: a batch whole or not at all for other threads ───────────
+    // ── A batch whole or not at all for other threads ────────────────────────
 
     /// Ends of a hook that parks `write_batch` after its first MemTable insert.
     type BatchHook = (std::sync::mpsc::Receiver<std::thread::ThreadId>, std::sync::mpsc::Sender<()>);
@@ -6884,7 +6879,7 @@ mod tests {
         BatchOp::Put { key: key.to_vec(), value: value.to_vec() }
     }
 
-    // Spec kv/034 test 1: Phase 2 parked after `a` -- a reader on another
+    // Phase 2 parked after `a` -- a reader on another
     // thread reads `a` and `b` old through the point-read entries, although a
     // reader blind to the batch slot already meets the new `a`; once the
     // batch is through, both are new.
@@ -6926,7 +6921,7 @@ mod tests {
         })
     }
 
-    // Spec kv/034 test 2: the batch of a prefix delete -- three tombstones,
+    // The batch of a prefix delete -- three tombstones,
     // parked after the first -- leaves all three keys present for a reader
     // on another thread; once it is through, all three are gone.
     #[test]
@@ -6955,7 +6950,7 @@ mod tests {
         })
     }
 
-    // Spec kv/034 test 3: a key the batch writes twice never shows its first
+    // A key the batch writes twice never shows its first
     // value -- neither to a reader while Phase 2 is parked nor to one blind
     // to the slot, which stands for a reader that found the key mid-batch but
     // loaded the slot only after the batch.
@@ -6981,7 +6976,7 @@ mod tests {
         })
     }
 
-    // Spec kv/034 test 4: a scan on another thread while Phase 2 is parked
+    // A scan on another thread while Phase 2 is parked
     // after its first insert -- `p:new`, or the tombstone of `p:old` -- lists
     // `p:old` and not `p:new`, with and without a snapshot; once the batch is
     // through, it lists only `p:new`.
@@ -7012,7 +7007,7 @@ mod tests {
         })
     }
 
-    // Spec kv/034 test 5: a batch confirmed on thread A is whole for the
+    // A batch confirmed on thread A is whole for the
     // point reads and the scan that follow on thread B -- the slot no longer
     // names it once the batch is confirmed.
     #[test]

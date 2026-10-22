@@ -1,11 +1,10 @@
-//! SELECT executor (spec rel/006): Volcano pull-model operators, LIMIT/OFFSET,
+//! SELECT executor: Volcano pull-model operators, LIMIT/OFFSET,
 //! ORDER BY (index order or in-memory sort), COUNT(*). Access-path selection
-//! lives in `plan.rs`; the WHERE residual is bound via the rel/005 evaluator
-//! (`dml::bind_predicate`/`eval::eval`), reused unchanged (spec §0 contract).
+//! lives in `plan.rs`; the WHERE residual is bound via the DML evaluator
+//! (`dml::bind_predicate`/`eval::eval`), reused unchanged.
 //!
-//! The rel/005 PK-point SELECT is now just one access path (`AccessPath::PkPoint`,
-//! §3) among several — this module replaces `dml.rs`'s old `exec_select`
-//! entirely; there is exactly one SELECT path (spec §1).
+//! A PK-point SELECT is just one access path (`AccessPath::PkPoint`)
+//! among several; there is exactly one SELECT path.
 
 use super::ast::{Limit, OrderItem, Select, SelectItem};
 use super::catalog::{CatalogEntry, TableSchema};
@@ -26,21 +25,21 @@ use std::cmp::Ordering;
 use std::future::Future;
 use std::sync::Arc;
 
-/// Rows one operator consumes between two yields (spec perf/017 A2).
+/// Rows one operator consumes between two yields.
 pub(super) const ROW_YIELD_INTERVAL: u32 = 256;
 
-/// Scanned keys post-processed between two yields (spec perf/017 A2).
+/// Scanned keys post-processed between two yields.
 const KEY_YIELD_INTERVAL: u32 = 4096;
 
-// ── PlanRow / SourceBinding (spec §2) ────────────────────────────────────────
+// ── PlanRow / SourceBinding ────────────────────────────────────────
 //
-// v1 always fills exactly one `SourceBinding` (the one table). rel/007 appends
-// a second binding per join stage; `Filter`/`Sort`/`OffsetLimit`/projection all
+// A single-table SELECT fills exactly one `SourceBinding`. The join operator
+// appends one binding per join stage; `Filter`/`Sort`/`OffsetLimit`/projection all
 // go through `PlanRow` rather than a flat `Vec<ScalarValue>`, so they need no
-// change when that lands.
+// join-specific code.
 
-/// One source table's contribution to a `PlanRow` (spec §2). `Clone` is
-/// needed by the rel/007 join operator: fan-out (n right-hand hits for one
+/// One source table's contribution to a `PlanRow`. `Clone` is
+/// needed by the join operator: fan-out (n right-hand hits for one
 /// left row) clones the shared left bindings once per output row.
 #[derive(Debug, Clone)]
 pub struct SourceBinding {
@@ -61,29 +60,28 @@ impl PlanRow {
     }
 }
 
-// ── Volcano operator interface (spec §2) ─────────────────────────────────────
+// ── Volcano operator interface ─────────────────────────────────────
 //
-// `async fn` in a trait is not `dyn`-compatible (spec's Rust note); this
+// `async fn` in a trait is not `dyn`-compatible; this
 // project's established pattern for async traits (`StorageEngine`,
 // `src/engines/mod.rs`) is RPITIT (`fn(&mut self) -> impl Future<...> + Send`),
-// used here too. v1 needs no dynamic dispatch (no join yet), so the finitely
+// used here too. A single-table pipeline needs no dynamic dispatch, so the finitely
 // many pipeline shapes (Filter/Sort present or not) are composed statically
 // via generics and wrapped in the small `RowPipeline` enum below — this also
 // sidesteps the "recursive async fn" sizing problem a `Box<dyn RowSource>`
-// chain would need `Pin<Box<dyn Future>>` boxing for. rel/007's join operator
-// will need `Box<dyn RowSource>` for its left input (per spec); since RPITIT
-// is not `dyn`-safe, that will need its own boxed-future trait (or an
-// operator enum) at that point — the seam is conceptual, not literal (spec §2).
-// `pub(super)`: the rel/007 join operator (`join.rs`) composes over this same
-// trait — the sanctioned single mechanism (spec rel/006 §2 Rust note).
+// chain would need `Pin<Box<dyn Future>>` boxing for. The join operator
+// needs a dynamic left input; since RPITIT is not `dyn`-safe, `join.rs`
+// adds its own boxed-future trait for exactly that edge.
+// `pub(super)`: the join operator (`join.rs`) composes over this same
+// trait — the single sanctioned mechanism.
 pub(super) trait RowSource {
     fn next(&mut self) -> impl Future<Output = Result<Option<PlanRow>, RelStoreError>> + Send;
 }
 
-/// Unified `SeqScan`/`PkLookup`/`IndexScan` leaf (spec §2): the candidate ROW
+/// Unified `SeqScan`/`PkLookup`/`IndexScan` leaf: the candidate ROW
 /// keys are already resolved (by `resolve_candidate_keys`, planner-driven);
 /// this operator only does the per-row `get_with_snapshot` + `decode_row`,
-/// lazily, so `OffsetLimit` can stop it early (spec §6).
+/// lazily, so `OffsetLimit` can stop it early.
 pub(super) struct RowScan {
     pub(super) engine: Arc<LsmStorageEngine>,
     pub(super) snapshot: Snapshot,
@@ -91,7 +89,7 @@ pub(super) struct RowScan {
     pub(super) table_id: u32,
     pub(super) alias: String,
     pub(super) keys: std::vec::IntoIter<Vec<u8>>,
-    /// Read masking (spec rel/012 §3): masked link cells decode as `NULL`.
+    /// Read masking: masked link cells decode as `NULL`.
     pub(super) mask: LinkMask,
     pub(super) coop: YieldEvery,
 }
@@ -103,8 +101,7 @@ impl RowSource for RowScan {
                 self.coop.tick().await;
                 let Some(key) = self.keys.next() else { return Ok(None) };
                 // A key live during the key-list scan but gone at the
-                // snapshot fetch is a ghost (spec §2 "Snapshot &
-                // Ghosts") — skip it, not an error.
+                // snapshot fetch is a ghost — skip it, not an error.
                 if let Some(bytes) = self.engine.get_with_snapshot(&key, &self.snapshot).await?.into_option() {
                     let mut values = decode_row(&bytes, &self.schema);
                     self.mask.apply(&mut values, &self.schema);
@@ -115,9 +112,9 @@ impl RowSource for RowScan {
     }
 }
 
-/// Wraps a source, keeping only rows where `eval(residual) == True` (rel/005
-/// evaluator, spec §4). Evaluates over the *flattened* row (spec rel/007 §5:
-/// all bindings concatenated in binding order) — for the v1 single-binding
+/// Wraps a source, keeping only rows where `eval(residual) == True`.
+/// Evaluates over the *flattened* row (all bindings concatenated in
+/// binding order) — for the single-binding
 /// case this is exactly `bindings[0].values`, so no behavior changes there.
 pub(super) struct Filter<S> {
     input: S,
@@ -152,13 +149,13 @@ impl<S: RowSource + Send> RowSource for Filter<S> {
 
 /// Concatenates every binding's values in binding order — the flat position
 /// space that WHERE/ORDER BY/projection resolve into once a join adds more
-/// than one binding (spec rel/007 §5). For a single binding this is just a
+/// than one binding. For a single binding this is just a
 /// clone of its values.
 pub(super) fn flatten(bindings: &[SourceBinding]) -> Vec<ScalarValue> {
     bindings.iter().flat_map(|b| b.values.iter().cloned()).collect()
 }
 
-/// Materializing ORDER BY (spec §5): drains the source into a buffer (hard
+/// Materializing ORDER BY: drains the source into a buffer (hard
 /// capped at `max_rows` — `SortBufferExceeded`, no spill), sorts it, then
 /// serves from the buffer.
 pub(super) struct Sort<S> {
@@ -200,7 +197,7 @@ impl<S: RowSource + Send> RowSource for Sort<S> {
 }
 
 /// NULL sorts as the largest element (NULLS LAST on ASC, NULLS FIRST on
-/// DESC — spec §5/§8, PostgreSQL convention).
+/// DESC — PostgreSQL convention).
 fn scalar_cmp_nulls_last(a: &ScalarValue, b: &ScalarValue) -> Ordering {
     match (a, b) {
         (ScalarValue::Null, ScalarValue::Null) => Ordering::Equal,
@@ -211,7 +208,7 @@ fn scalar_cmp_nulls_last(a: &ScalarValue, b: &ScalarValue) -> Ordering {
 }
 
 /// Lexicographic multi-column comparison; each item carries its own ASC/DESC
-/// (and, through `scalar_cmp_nulls_last`, its own NULL placement — spec §5).
+/// (and, through `scalar_cmp_nulls_last`, its own NULL placement).
 fn row_cmp(a: &[ScalarValue], b: &[ScalarValue], items: &[(usize, bool)]) -> Ordering {
     for &(pos, desc) in items {
         let ord = scalar_cmp_nulls_last(&a[pos], &b[pos]);
@@ -223,9 +220,9 @@ fn row_cmp(a: &[ScalarValue], b: &[ScalarValue], items: &[(usize, bool)]) -> Ord
     Ordering::Equal
 }
 
-/// Skips `offset`, yields up to `limit` rows, then stops the source (spec
-/// §6). Peeks exactly one extra row once `limit` is reached to learn whether
-/// more matching rows existed (`limit_applied`, spec §10), without ever
+/// Skips `offset`, yields up to `limit` rows, then stops the source.
+/// Peeks exactly one extra row once `limit` is reached to learn whether
+/// more matching rows existed (`limit_applied`), without ever
 /// re-peeking on subsequent calls.
 pub(super) struct OffsetLimitOp<S> {
     input: S,
@@ -295,7 +292,7 @@ impl<S: RowSource + Send> RowSource for OffsetLimitOp<S> {
 }
 
 /// The finitely many v1 pipeline shapes (Filter/Sort each present or absent),
-/// composed statically over `RowScan` (spec §2 pipeline: `Scan → Filter? →
+/// composed statically over `RowScan` (pipeline: `Scan → Filter? →
 /// Sort? → OffsetLimit`). A closed enum instead of `Box<dyn RowSource>` avoids
 /// both the dyn-incompatibility of RPITIT and the recursive-async-fn sizing
 /// problem a self-referential operator tree would hit.
@@ -326,21 +323,21 @@ impl RowPipeline {
     }
 }
 
-// ── Access-path key resolution (spec §3) ─────────────────────────────────────
+// ── Access-path key resolution ─────────────────────────────────────
 
 /// Resolves `access` to its candidate ROW keys, in the path's natural
-/// ascending key order (byte order == value order, spec §3/§5), plus the
-/// number of underlying LSM keys visited (I/O-budget metric, §9).
+/// ascending key order (byte order == value order), plus the
+/// number of underlying LSM keys visited (I/O-budget metric).
 ///
-/// Every branch reads *at* `snapshot` (spec rel/018): a row deleted after
+/// Every branch reads *at* `snapshot`: a row deleted after
 /// the snapshot was taken still yields its key here, just like a point read
 /// via `get_with_snapshot` would still find it — candidate acquisition and
 /// row fetch now agree on the same point in time on every access path.
 ///
 /// `fast_limit`: only consulted for `AccessPath::FullScan` — the
 /// `scan_keys_limited_with_snapshot` shortcut is sound *only* for "full
-/// scan, no residual, no ORDER BY, LIMIT set" (spec §6); its caller enforces
-/// that. The cap counts only snapshot-visible keys (spec rel/014), so a key
+/// scan, no residual, no ORDER BY, LIMIT set"; its caller enforces
+/// that. The cap counts only snapshot-visible keys, so a key
 /// that only starts existing after the snapshot can never occupy one of the
 /// capped slots. Every other case of FullScan (and every other path) sees
 /// the full, correctly ordered, snapshot-visible key set via
@@ -451,7 +448,7 @@ fn index_column_physical_type(schema: &TableSchema, index: &super::catalog::Inde
         .unwrap_or(ColumnType::Integer)
 }
 
-/// Byte-comparison range check (spec §3): the sortable encoding makes byte
+/// Byte-comparison range check: the sortable encoding makes byte
 /// order equal value order, so no value decoding is needed (json/query.rs
 /// pattern).
 fn bounds_match(val_enc: &[u8], bounds: &RangeBounds) -> bool {
@@ -474,8 +471,8 @@ fn bounds_match(val_enc: &[u8], bounds: &RangeBounds) -> bool {
 
 /// Splits the bytes after an index's `IDX:…:{index_id}:` prefix (`val_enc ++
 /// pk_enc`) at the value/PK boundary — pure byte-boundary logic, no value
-/// decoding (spec §3): fixed 8/1 bytes for Integer/Timestamp/Real/Boolean,
-/// scan-for-terminator for Text (rel/003 `encode_text` escapes content
+/// decoding: fixed 8/1 bytes for Integer/Timestamp/Real/Boolean,
+/// scan-for-terminator for Text (`encode_text` escapes content
 /// `0x00` as `0x00 0xFF`, so an unescaped `0x00 0x00` is unambiguously the
 /// terminator).
 fn split_val_enc(phys: ColumnType, rest: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -507,22 +504,21 @@ fn split_val_enc(phys: ColumnType, rest: &[u8]) -> Option<(&[u8], &[u8])> {
 
 /// The escaped-but-unterminated bytes of a LIKE literal prefix:
 /// `encode_sortable` minus its trailing `0x00 0x00` terminator, so the result
-/// is a *prefix* scan key matching any text value starting with `literal`
-/// (spec §3).
+/// is a *prefix* scan key matching any text value starting with `literal`.
 fn encode_text_prefix(literal: &str) -> Vec<u8> {
     let mut full = encode_sortable(&ScalarValue::Text(literal.to_string())).unwrap_or_default();
     full.truncate(full.len().saturating_sub(2));
     full
 }
 
-// ── SELECT-specific binding (spec §1) ────────────────────────────────────────
+// ── SELECT-specific binding ────────────────────────────────────────
 
 pub(super) struct ProjectedColumn {
     pub(super) name: String,
     pub(super) col_type: ColumnType,
     pub(super) pos: usize,
-    /// The source column's `REFERENCES` target table name, if any (rel/009
-    /// §5 `expand`); carried through so `SelectResult::column_refs` can be
+    /// The source column's `REFERENCES` target table name, if any (for
+    /// `expand`); carried through so `SelectResult::column_refs` can be
     /// built without re-resolving the projection.
     pub(super) references: Option<String>,
 }
@@ -530,7 +526,7 @@ pub(super) struct ProjectedColumn {
 /// Binds the SELECT list to output columns: `*` → all columns in catalog
 /// order; a column list → each resolved column (alias or name), in
 /// projection order. `CountStar` is handled by the caller before this runs.
-/// `pub(super)`: reused by the view CREATE-time bind-and-discard (rel/008 `view.rs`).
+/// `pub(super)`: reused by the view CREATE-time bind-and-discard (`view.rs`).
 pub(super) fn bind_projection(
     items: &[SelectItem],
     schema: &TableSchema,
@@ -562,7 +558,7 @@ pub(super) fn bind_projection(
                 });
             }
             SelectItem::Star | SelectItem::CountStar => {
-                unreachable!("grammar: Star/CountStar are only ever alone (rel/004)")
+                unreachable!("grammar: Star/CountStar are only ever alone")
             }
         }
     }
@@ -580,7 +576,7 @@ fn bind_order_by(
     items.iter().map(|o| resolve_column(&o.col, schema, quals).map(|(pos, _)| (pos, o.desc))).collect()
 }
 
-/// Binds LIMIT/OFFSET (spec §6): negative → `InvalidSchema`; effective limit
+/// Binds LIMIT/OFFSET: negative → `InvalidSchema`; effective limit
 /// `L = min(explicit LIMIT or default_limit, max_limit)`. Returns `(offset,
 /// L, capped_by_max_limit)`.
 pub(super) fn bind_limit(
@@ -608,15 +604,14 @@ pub(super) fn bind_limit(
     }
 }
 
-// ── Executor entry point (spec §1) ───────────────────────────────────────────
+// ── Executor entry point ───────────────────────────────────────────
 
 impl RelEngine {
     /// Runs a single-table SELECT/COUNT(*) end to end: plan the access path
     /// (`plan::plan_access`), resolve its candidate keys, build the Volcano
-    /// pipeline, drive it to completion (spec §2 pipeline: `Scan|PkLookup|
+    /// pipeline, drive it to completion (pipeline: `Scan|PkLookup|
     /// IndexScan → Filter(residual) → Sort? → OffsetLimit → Project`).
-    /// Replaces the rel/005 PK-point-only `exec_select` (§1: PK-point is now
-    /// the `PkPoint` access path, not a separate code path).
+    /// A PK-point lookup is the `PkPoint` access path, not a separate code path.
     pub(super) async fn exec_select(
         &self,
         domain: &str,
@@ -624,7 +619,7 @@ impl RelEngine {
         params: &[Value],
         auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
-        // View-inlining pre-stage (spec rel/008 §1/§4): replaces every FROM/JOIN
+        // View-inlining pre-stage: replaces every FROM/JOIN
         // view reference with its definition, recursively, *before* the rest of
         // this function (or exec_select_joined) ever sees the statement. A
         // select touching no view pays nothing (returns `sel` unchanged).
@@ -654,7 +649,7 @@ impl RelEngine {
         let prefix = dom.system_prefix.clone();
         self.metrics.record_rel_select_statement();
 
-        // One registry lookup per query (spec rel/012 §3), reused for the
+        // One registry lookup per query, reused for the
         // planner guard and the RowScan materialization.
         let mask = self.compute_link_mask(domain, &[&schema], auth).await?;
 
@@ -674,8 +669,8 @@ impl RelEngine {
             && sel.limit.is_some();
         let fast_cap = use_fast_limit.then(|| (offset + limit + 1) as usize);
 
-        // Register the snapshot *before* scanning for candidate keys (spec
-        // rel/018 §4): every branch below reads *at* this snapshot
+        // Register the snapshot *before* scanning for candidate keys:
+        // every branch below reads *at* this snapshot
         // (`scan_keys_with_snapshot`), so what registering first buys is a
         // stable read horizon — the guard must stay alive across the whole
         // scan+fetch episode so compaction/GC cannot advance past a version
@@ -744,7 +739,7 @@ impl RelEngine {
         }))
     }
 
-    /// COUNT(*) (spec §7): counts over the chosen access path without
+    /// COUNT(*): counts over the chosen access path without
     /// materializing rows. ORDER BY/LIMIT are ignored (meaningless for a count).
     /// No residual ⇒ pure key count (`resolve_candidate_keys` never decodes
     /// a row); a residual ⇒ fetch+decode+`eval` per candidate, as usual.
@@ -758,7 +753,7 @@ impl RelEngine {
         mask: LinkMask,
     ) -> Result<ExecOutcome, RelStoreError> {
         let plan = plan::plan_access(schema, &sel.where_clause, quals, params, &[], mask)?;
-        // Registered before the key scan (spec rel/018 §2): every branch
+        // Registered before the key scan: every branch
         // below, including the no-residual key-count path, now reads at
         // this snapshot — see the identical note in `exec_select`.
         let snapshot_guard = self.engine.snapshot().await;
@@ -769,7 +764,7 @@ impl RelEngine {
 
         let n: i64 = match plan.residual {
             // PkPoint constructs its single key without scanning — its
-            // existence must be verified (spec §7: "0/1 at a point"). Every
+            // existence must be verified (0 or 1 at a point). Every
             // other path derives keys from a live scan, so len() is the count.
             None if matches!(plan.access, AccessPath::PkPoint(_)) => {
                 match row_keys.first() {
@@ -885,8 +880,8 @@ mod tests {
         rel.metrics.system.rel_sort_fallback_total.load(Ordering::Relaxed)
     }
 
-    // 1. PK-point (generalized): identical to the rel/005 behavior, now
-    // running through the new access-path executor.
+    // 1. PK-point (generalized): same result as a direct point read,
+    // running through the access-path executor.
     #[test]
     fn test_pk_point_regression() {
         crate::core::engine_runtime::block_on(async {
@@ -921,7 +916,7 @@ mod tests {
     }
 
     // 3. Full scan with a residual WHERE: AND/OR/NOT/parens, IN, LIKE, IS NULL
-    // all filter correctly through the rel/005 evaluator.
+    // all filter correctly through the WHERE evaluator.
     #[test]
     fn test_full_scan_residual_operators() {
         crate::core::engine_runtime::block_on(async {
@@ -1361,13 +1356,13 @@ mod tests {
         })
     }
 
-    // 25. Spec rel/014 §5 (wiring regression): a table with generous headroom
+    // 25. Wiring regression: a table with generous headroom
     // over LIMIT (comfortably >= limit + 1 committed rows) must keep
     // returning a full page under concurrent inserts of early-sorting rows.
     // The deterministic proof that ghosts never occupy a cap slot is engine
     // test 1 (engine.rs); this only proves the rel-level wiring doesn't
     // regress under real interleaving. Bounded, no tight timing window as
-    // the test condition (general/008-line): any short page or `false` here
+    // the test condition: any short page or `false` here
     // is a genuine bug, not a flake.
     #[test]
     fn test_fast_limit_snapshot_consistent_under_concurrent_inserts() {
@@ -1398,7 +1393,7 @@ mod tests {
         })
     }
 
-    // 26. Spec rel/014 §6 (limit_applied discriminator): exactly `limit + 1`
+    // 26. limit_applied discriminator: exactly `limit + 1`
     // committed rows -- the minimal count for which `limit_applied = true`
     // is correct -- racing concurrent early-sorting inserts. This is the
     // exact configuration that used to separate old from new: the old
@@ -1431,11 +1426,11 @@ mod tests {
         })
     }
 
-    // 27. Spec rel/018 §Test 1 (delete side, Full Scan): a key deleted
+    // 27. Delete side, Full Scan: a key deleted
     // *after* the snapshot was taken must still be a candidate -- the
     // engine-level delete mirrors a concurrent DELETE racing the SELECT's
     // snapshot registration. Direct unit test against the function, no HTTP
-    // (the deterministic engine-level proof is rel/014 engine test 2; this
+    // (the deterministic engine-level proof lives in engine.rs; this
     // only proves the rel-level wiring passes the snapshot through).
     #[test]
     fn test_resolve_candidate_keys_full_scan_sees_snapshot_deleted_row() {
@@ -1466,12 +1461,12 @@ mod tests {
         })
     }
 
-    // 28. Spec rel/018 §Test 2 (delete side, index branches): a concurrent
+    // 28. Delete side, index branches: a concurrent
     // UPDATE of an indexed column tombstones the *old* IDX entry, not the
     // ROW key -- a live index scan loses the row even though its snapshot
     // version (the old value) still satisfies the predicate.
     // IndexPoint/IndexRange/IndexPrefix must still return it when resolved
-    // at the snapshot; a fresh (post-tombstone) snapshot must not (Gegenprobe:
+    // at the snapshot; a fresh (post-tombstone) snapshot must not (control:
     // proves the difference is the snapshot, not a scan bug).
     #[test]
     fn test_resolve_candidate_keys_index_paths_see_snapshot_deleted_index_entry() {
@@ -1551,7 +1546,7 @@ mod tests {
             .unwrap();
             assert_eq!(prefix_hits, vec![row_key], "IndexPrefix must still see the snapshot-visible entry");
 
-            // Gegenprobe: a fresh snapshot taken after the tombstone must NOT
+            // Control: a fresh snapshot taken after the tombstone must NOT
             // see the vanished index entry -- proves the assertions above
             // exercise the snapshot, not a scan that ignores deletes outright.
             let now_guard = rel.engine().snapshot().await;

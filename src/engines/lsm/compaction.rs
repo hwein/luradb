@@ -8,14 +8,14 @@
 //! `SnapshotRegistry`, and the job is bottommost: no level below its target
 //! level holds SSTables. The first guarantees that no live reader can still
 //! observe the pre-deletion state of the key, the second that no older
-//! version below the job resurfaces (spec kv/033).
+//! version below the job resurfaces.
 //!
 //! # Version safety rule
 //! Older versions may only be dropped behind a version at `T <= low_watermark`:
 //! that one is visible to the oldest active snapshot and therefore shadows
 //! everything older for every registered reader. Versions above the watermark
 //! may still be the newest visible version of a pinned snapshot — e.g. a
-//! running backup export (spec general/006), which would otherwise silently
+//! running backup export, which would otherwise silently
 //! miss the key. A TTL-expired version is dropped only as the oldest one kept
 //! and only by a bottommost job; otherwise it stays until the TTL sweeper
 //! replaces it with a tombstone.
@@ -62,7 +62,7 @@ pub struct CompactionConfig {
 
     /// Whether no level below the job's target level holds SSTables. Only
     /// then may tombstones and expired values be dropped: otherwise an older
-    /// version of the key down there would resurface (spec kv/033).
+    /// version of the key down there would resurface.
     pub bottommost: bool,
 }
 
@@ -107,8 +107,8 @@ impl CompactionJob {
     ///
     /// Tables enter the merge newest first, in the read path's order: the
     /// sources reversed, then the targets, which sit one level below and are
-    /// older than every source. Of identical internal keys (a stamp tie, spec
-    /// kv/032) only the newest source's entry is kept, the one reads see.
+    /// older than every source. Of identical internal keys (a stamp tie) only
+    /// the newest source's entry is kept, the one reads see.
     pub fn compact(&self) -> Result<Vec<Vec<u8>>> {
         let mut all_entries: Vec<(Vec<u8>, DataBlockValue)> = Vec::new();
 
@@ -200,7 +200,7 @@ impl CompactionJob {
     ) -> Option<(Vec<u8>, DataBlockValue)> {
         // Tombstones are only represented as Pointer entries with the sentinel
         // values. Inline entries are never tombstones. The NULL sentinel
-        // (NULL_OFFSET, kv/018) is data: it falls through to the live path
+        // (NULL_OFFSET) is data: it falls through to the live path
         // below — overwrites older versions, is never GC'd, has no TTL.
         let is_tombstone = matches!(
             &dbv,
@@ -329,11 +329,11 @@ pub fn select_level_to_compact(manifest: &Manifest, config: &CompactionConfig) -
 }
 
 // ---------------------------------------------------------------------------
-// IoEngine deregistration (spec perf/004)
+// IoEngine deregistration
 // ---------------------------------------------------------------------------
 
 /// File ids deleted by a compaction that merges `src_metas` into `tgt_metas`
-/// -- used by the caller to deregister them from the `IoEngine` (perf/004).
+/// -- used by the caller to deregister them from the `IoEngine`.
 /// Compaction always replaces both inputs wholesale, so this is simply their union.
 pub fn deleted_file_ids(src_metas: &[SSTableMetadata], tgt_metas: &[SSTableMetadata]) -> Vec<u64> {
     src_metas.iter().chain(tgt_metas.iter()).map(|m| m.file_id).collect()
@@ -372,7 +372,7 @@ pub fn select_sstables_for_level_compaction(
     };
 
     // Bounds in internal key order, the one the tables are sorted in; their
-    // user keys span the source (spec kv/033).
+    // user keys span the source.
     let mut min_key = selected[0].smallest_key.clone();
     let mut max_key = selected[0].largest_key.clone();
     for meta in &selected[1..] {
@@ -445,7 +445,7 @@ mod tests {
         Ok(())
     }
 
-    // general/006: while an export snapshot is pinned, the version it can still
+    // While an export snapshot is pinned, the version it can still
     // read must survive — keeping only the newest one loses the key silently.
     #[test]
     fn test_keeps_version_visible_at_low_watermark() -> Result<()> {
@@ -572,7 +572,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/018: a NULL record is data — it suppresses older live versions and
+    // A NULL record is data — it suppresses older live versions and
     // is never dropped, even below the tombstone-GC low watermark.
     #[test]
     fn test_null_record_survives_compaction_and_suppresses_older() -> Result<()> {
@@ -594,7 +594,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/033: above a non-empty deeper level, the tombstone below the
+    // Above a non-empty deeper level, the tombstone below the
     // watermark stays to shadow the older versions down there; the older
     // ones in the job still go.
     #[test]
@@ -615,7 +615,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/033: likewise an expired newest version, which the TTL sweeper later
+    // Likewise an expired newest version, which the TTL sweeper later
     // turns into a tombstone.
     #[test]
     fn test_expired_value_kept_when_not_bottommost() -> Result<()> {
@@ -733,7 +733,7 @@ mod tests {
         tgt.iter().map(|m| m.file_id).collect()
     }
 
-    // kv/033: an older version of the source's largest user key sorts behind
+    // An older version of the source's largest user key sorts behind
     // the source's largest internal key, yet its table must join the job.
     #[test]
     fn test_select_includes_target_starting_with_older_version_of_largest_key() {
@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(targets_selected(&l0, &l1), vec![1]);
     }
 
-    // kv/033: stamped, `user:1` sorts after its extensions such as `user:15`;
+    // Stamped, `user:1` sorts after its extensions such as `user:15`;
     // comparing bare user keys would miss this target table ...
     #[test]
     fn test_select_includes_target_spanning_a_key_and_its_extensions() {

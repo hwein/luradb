@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release automation (spec dist/003 §3). Modes: final (default), rc, --hotfix.
+# Release automation. Modes: final (default), rc, --hotfix.
 # Principle: all checks first, then mutations; --dry-run shows the plan
 # without changing anything (checks incl. cargo/git-fetch still run for real).
 set -euo pipefail
@@ -35,8 +35,6 @@ Usage: scripts/release.sh [rc|--hotfix] [--dry-run]
   rc               rc mode: prerelease tag vX.Y.Z-rc.N on next
   --hotfix         hotfix mode: on hotfix/vX.Y.Z, merge into main, tag vX.Y.Z
   --dry-run        shows the full plan without changing anything
-
-Details: concepts/specs/dist/003_versioning_changelog_release.md
 EOF
     exit "$exit_code"
 }
@@ -90,7 +88,7 @@ version_gt() {
     return 1
 }
 
-# --- Preflight checks (§3.1) ----------------------------------------------
+# --- Preflight checks ----------------------------------------------
 
 check_branch() {
     local branch="$1" current
@@ -139,7 +137,7 @@ check_unreleased_nonempty() {
 }
 
 # Runs unconditionally, even under --dry-run: changelog-json.sh only reads
-# CHANGELOG.md, it mutates nothing (spec dist/010 §Umsetzung).
+# CHANGELOG.md, it mutates nothing.
 check_changelog_json() {
     "$CHANGELOG_JSON" unreleased | jq empty || die "changelog-json.sh unreleased did not produce valid JSON"
 }
@@ -150,7 +148,7 @@ check_tag_free() {
     return 0
 }
 
-# --- Version proposal (§1) --------------------------------------------
+# --- Version proposal --------------------------------------------
 
 # Categories in the [Unreleased] section -> bump kind (0.x vs. 1.0+ rules).
 bump_kind() {
@@ -214,7 +212,7 @@ filter_empty_categories() {
 }
 
 # Rebuilds CHANGELOG.md: [Unreleased] -> [$1] - today, fresh empty
-# [Unreleased], reference block regenerated from scratch (§2).
+# [Unreleased], reference block regenerated from scratch.
 _rewrite_changelog_for_release() {
     local version="$1" date body repo_url tmp
     date=$(date +%F)
@@ -343,10 +341,10 @@ push_atomic() {
     fi
 }
 
-# --- final mode (§3.2) --------------------------------------------------
+# --- final mode --------------------------------------------------
 
 # Detects: commit/merge/tag/dev-bump already ran, only the push is still
-# missing (§3.5). Prints the affected tag on a match.
+# missing. Prints the affected tag on a match.
 detect_pending_push_final() {
     [ "$(current_branch)" = "next" ] || return 1
     local parent tag main_tip
@@ -412,7 +410,7 @@ run_final() {
     push_atomic main next "$tag"
 }
 
-# --- rc mode (§3.3) ------------------------------------------------------
+# --- rc mode ------------------------------------------------------
 
 detect_pending_push_rc() {
     [ "$(current_branch)" = "next" ] || return 1
@@ -451,7 +449,7 @@ run_rc() {
     tag="v$version-rc.$n"
     check_tag_free "$tag"
 
-    # Mutations start here. Changelog stays unfinalized (§3.3.2).
+    # Mutations start here. Changelog stays unfinalized.
     set_cargo_version "$version-rc.$n"
     regenerate_openapi
     commit_paths "chore(release): $tag" Cargo.toml Cargo.lock api/openapi.json
@@ -459,7 +457,7 @@ run_rc() {
     push_atomic next "$tag"
 }
 
-# --- --hotfix mode (§3.4) ------------------------------------------------
+# --- --hotfix mode ------------------------------------------------
 
 detect_pending_push_hotfix() {
     local version="$1"

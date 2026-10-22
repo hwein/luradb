@@ -1,5 +1,5 @@
-//! DML deep-binder, atomic write path, and PK-point SELECT (spec rel/005
-//! §5-12). INSERT/UPDATE/DELETE run under a per-table write lock (held across
+//! DML deep-binder and atomic write path. INSERT/UPDATE/DELETE run under a
+//! per-table write lock (held across
 //! candidate acquisition and the single `WriteBatch`), an MVCC snapshot for
 //! all check-reads. Value binding, the hand-written ISO-8601 parser and
 //! `now_millis` live here; the WHERE predicate is bound to a `Pred` (eval.rs).
@@ -24,7 +24,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-// ── Per-table write lock (spec §8.1) ────────────────────────────────────────
+// ── Per-table write lock ────────────────────────────────────────
 
 type LockMap = HashMap<(Vec<u8>, u32), Arc<tokio::sync::Mutex<()>>>;
 
@@ -46,7 +46,7 @@ impl TableLocks {
     }
 }
 
-// ── Execution results (spec §14) ────────────────────────────────────────────
+// ── Execution results ────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct DmlResult {
@@ -59,10 +59,10 @@ pub struct SelectResult {
     pub columns: Vec<(String, ColumnType)>,
     pub rows: Vec<Vec<ScalarValue>>,
     /// `true` iff the effective LIMIT was reduced by `max_limit`, or more
-    /// matching rows existed past OFFSET+LIMIT than were returned (rel/006
-    /// §6/§10). Always `false` for COUNT(*).
+    /// matching rows existed past OFFSET+LIMIT than were returned.
+    /// Always `false` for COUNT(*).
     pub limit_applied: bool,
-    /// REFERENCES target table name per output column (rel/009 §5 `expand`),
+    /// REFERENCES target table name per output column (for `expand`),
     /// parallel to `columns`; `None` where the column isn't a projected
     /// REFERENCES/KVREF/JSONREF link (always `None` for COUNT(*)'s single
     /// column). Engine-internal wiring for `expand`, not part of any public
@@ -70,13 +70,13 @@ pub struct SelectResult {
     pub(crate) column_refs: Vec<Option<String>>,
     /// Number of `LEFT JOIN` stages the statement itself used (0 outside
     /// join.rs). `expand` columns are charged against `max_join_depth` on
-    /// top of this count (rel/007 §8, rel/009 §5).
+    /// top of this count.
     pub(crate) joins_used: usize,
-    /// The registered MVCC snapshot the rows were read at (rel/005/006
-    /// `snapshot()` + `get_with_snapshot`). `expand` resolution (rel/009 §5)
+    /// The registered MVCC snapshot the rows were read at
+    /// (`snapshot()` + `get_with_snapshot`). `expand` resolution
     /// reads through it so referenced rows come from the same point in time as
     /// the driving SELECT; as a guard it keeps that horizon registered until
-    /// the result drops (rel/021). `None` for COUNT(*), which is never
+    /// the result drops. `None` for COUNT(*), which is never
     /// expand-eligible (`column_refs` is all-`None` there).
     pub(crate) snapshot: Option<RegistrySnapshot>,
 }
@@ -97,7 +97,7 @@ pub(super) struct RowPlan {
 
 impl RowPlan {
     /// Builds an already-resolved row (no AUTOINCREMENT fill-in needed) — the
-    /// shape `rel/019`'s from-file import stages via [`RelEngine::stage_insert_row`].
+    /// shape the from-file import stages via [`RelEngine::stage_insert_row`].
     pub(super) fn new(values: HashMap<u16, ScalarValue>) -> Self {
         Self { values, needs_auto: false }
     }
@@ -107,7 +107,7 @@ impl RelEngine {
     /// Dispatches a bound DML/SELECT statement. Table/index DDL is handled
     /// before this point (`ddl.rs`); `CREATE`/`DROP VIEW` are intercepted even
     /// earlier, in `RelEngine::execute`, since they need the raw SQL text
-    /// (rel/008 `view.rs`) — they can never reach here.
+    /// (`view.rs`) — they can never reach here.
     pub(super) async fn execute_dml(
         &self,
         domain: &str,
@@ -115,7 +115,7 @@ impl RelEngine {
         params: &[Value],
         auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
-        // Spec general/019: one op with one latency sample per call, read for
+        // One op with one latency sample per call, read for
         // Select and write for Insert/Update/Delete -- DDL never reaches here.
         let is_read = matches!(stmt, Statement::Select(_));
         let start = std::time::Instant::now();
@@ -125,7 +125,7 @@ impl RelEngine {
             Statement::Delete(d) => self.exec_delete(domain, d, params).await.map(ExecOutcome::Dml),
             Statement::Select(s) => self.exec_select(domain, s, params, auth).await,
             Statement::CreateView(_) | Statement::DropView(_) => {
-                unreachable!("CREATE/DROP VIEW are dispatched in RelEngine::execute (rel/008 view.rs)")
+                unreachable!("CREATE/DROP VIEW are dispatched in RelEngine::execute (view.rs)")
             }
             _ => unreachable!("DDL is dispatched before execute_dml"),
         };
@@ -141,9 +141,9 @@ impl RelEngine {
     }
 
     /// Resolves a DML target to a table: view → `NotWritable`, missing →
-    /// `TableNotFound`, deleting/unknown domain → 410/404 (spec §1).
+    /// `TableNotFound`, deleting/unknown domain → 410/404.
     /// `pub(super)`: reused by the Row-Browse/Row-Write REST entry points
-    /// (rel/010 `rest_browse.rs`/`rest_write.rs`) to resolve the table schema
+    /// (`rest_browse.rs`/`rest_write.rs`) to resolve the table schema
     /// before synthesizing a bound Select/DML statement.
     pub(super) fn require_table(
         &self,
@@ -161,7 +161,7 @@ impl RelEngine {
         }
     }
 
-    // ── INSERT (spec §8-9) ──────────────────────────────────────────────────
+    // ── INSERT ──────────────────────────────────────────────────
 
     async fn exec_insert(
         &self,
@@ -217,7 +217,7 @@ impl RelEngine {
         Ok(DmlResult { affected: rows.len() as u64, last_pk })
     }
 
-    /// One INSERT row's checks and batch ops (spec §8-9): NOT NULL/text size
+    /// One INSERT row's checks and batch ops: NOT NULL/text size
     /// → PK dup → row size → UNIQUE → REFERENCES → cross-engine links → index
     /// entries → row `Put`. Returns the row's PK, for `exec_insert`'s
     /// single-row `last_pk`.
@@ -269,7 +269,7 @@ impl RelEngine {
         Ok(pk_v)
     }
 
-    // ── UPDATE (spec §10) ───────────────────────────────────────────────────
+    // ── UPDATE ───────────────────────────────────────────────────
 
     async fn exec_update(
         &self,
@@ -328,7 +328,7 @@ impl RelEngine {
     }
 
     /// Re-validates every SET'd REFERENCES/KVREF/JSONREF cell against its
-    /// target (spec rel/012 §2); unchanged link cells stay "valid enough".
+    /// target; unchanged link cells stay "valid enough".
     async fn check_updated_references(
         &self,
         domain: &str,
@@ -350,7 +350,7 @@ impl RelEngine {
         Ok(())
     }
 
-    /// Diffs only indexes over changed columns (spec §8): UNIQUE re-check,
+    /// Diffs only indexes over changed columns: UNIQUE re-check,
     /// then delete-old/put-new index entries.
     async fn diff_update_indexes(
         &self,
@@ -388,7 +388,7 @@ impl RelEngine {
         Ok(())
     }
 
-    // ── DELETE (spec §11) ───────────────────────────────────────────────────
+    // ── DELETE ───────────────────────────────────────────────────
 
     async fn exec_delete(
         &self,
@@ -425,7 +425,7 @@ impl RelEngine {
         Ok(DmlResult { affected: candidates.len() as u64, last_pk: None })
     }
 
-    // ── Candidate acquisition (spec §7) ─────────────────────────────────────
+    // ── Candidate acquisition ─────────────────────────────────────
 
     async fn acquire_candidates(
         &self,
@@ -477,7 +477,7 @@ impl RelEngine {
         Ok(out)
     }
 
-    // ── Validation helpers (spec §8.4) ──────────────────────────────────────
+    // ── Validation helpers ──────────────────────────────────────
 
     fn validate_not_null_and_text(
         &self,
@@ -592,11 +592,11 @@ impl RelEngine {
         Ok(())
     }
 
-    /// Cross-engine link validation (spec rel/012 §2): every non-NULL
+    /// Cross-engine link validation: every non-NULL
     /// KVREF/JSONREF cell must resolve to an existing key/document in the
-    /// same-named target domain. Runs inside the rel/005 §8 chain, before the
+    /// same-named target domain. Runs inside the DML check chain, before the
     /// `WriteBatch`, under the held table write lock — but the cross-engine
-    /// read is *not* part of the rel batch (no cross-engine atomicity, §6).
+    /// read is *not* part of the rel batch (no cross-engine atomicity).
     async fn check_row_cross_engine_links(
         &self,
         domain: &str,
@@ -617,12 +617,12 @@ impl RelEngine {
 
     /// Validates one non-NULL link value against its same-named target domain
     /// (existence suffices — a null-value key *exists*). Missing read access
-    /// (`auth`, spec rel/016) is rejected first, before any existence lookup
+    /// (`auth`) is rejected first, before any existence lookup
     /// and without charging the write-validation metric — otherwise an
-    /// unauthorized caller could distinguish an existing from a missing key,
-    /// exactly the oracle this spec closes. `DomainUnavailable`
+    /// unauthorized caller could distinguish an existing from a missing key
+    /// (an existence oracle). `DomainUnavailable`
     /// (disabled/gone/`Deleting`) and `Absent` (active but missing) map to the
-    /// two 409 variants (spec §2/§7).
+    /// two 409 variants.
     async fn validate_cross_engine_link(
         &self,
         domain: &str,
@@ -692,7 +692,7 @@ impl RelEngine {
     }
 
     /// Commits a DML `WriteBatch` under the engine-global write guard, first
-    /// re-checking the domain is still active (spec rel/013 §3). A writer that
+    /// re-checking the domain is still active. A writer that
     /// passed `require_active` before a concurrent `delete_domain` must abort
     /// with 410/404 here rather than land keys after the purger finalized the
     /// domain — otherwise an orphan `ROW:` key could resurrect under a recreated
@@ -706,7 +706,7 @@ impl RelEngine {
     }
 }
 
-// ── Column/value binding (spec §5) ──────────────────────────────────────────
+// ── Column/value binding ──────────────────────────────────────────
 
 fn resolve_insert_columns(
     schema: &TableSchema,
@@ -786,7 +786,7 @@ fn build_row_plans(
     Ok(out)
 }
 
-/// AUTOINCREMENT high-water (spec §9): assigns the next sequence value to
+/// AUTOINCREMENT high-water: assigns the next sequence value to
 /// every row still needing one, raises the high-water for explicit larger
 /// PKs. Returns the new high-water for the caller's seq-key write-back.
 fn assign_autoincrement(
@@ -815,7 +815,7 @@ fn assign_autoincrement(
 }
 
 /// Binds every UPDATE assignment's target column and value, rejecting a SET
-/// on the PK column immediately (spec §10).
+/// on the PK column immediately.
 fn bind_update_assignments(
     schema: &TableSchema,
     assignments: &[Assignment],
@@ -842,13 +842,13 @@ fn bind_update_assignments(
     Ok(sets)
 }
 
-/// `pub(super)`: reused by the SELECT planner (rel/006 `plan.rs`) to bind a
+/// `pub(super)`: reused by the SELECT planner (`plan.rs`) to bind a
 /// sargable conjunct's literal/param side against its resolved column.
 pub(super) fn bind_value(col: &ColumnDef, op: &Operand, params: &[Value]) -> Result<ScalarValue, RelStoreError> {
     bind_operand_value(col.col_type, op, params, &col.name)
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn bind_operand_value(
     t: ColumnType,
     op: &Operand,
@@ -867,7 +867,7 @@ pub(super) fn bind_operand_value(
     }
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn coerce_literal(t: ColumnType, lit: &Literal, ctx: &str) -> Result<ScalarValue, RelStoreError> {
     match lit {
         Literal::Null => Ok(ScalarValue::Null),
@@ -938,11 +938,11 @@ fn timestamp_mismatch(ctx: &str) -> RelStoreError {
     }
 }
 
-// ── WHERE binding (spec §5-6) ───────────────────────────────────────────────
+// ── WHERE binding ───────────────────────────────────────────────
 
 /// Table name plus SELECT alias — the qualifiers a column ref may carry.
 ///
-/// `pub(super)`: reused by the SELECT executor (rel/006 `select.rs`/`plan.rs`).
+/// `pub(super)`: reused by the SELECT executor (`select.rs`/`plan.rs`).
 pub(super) fn accepted_quals(schema: &TableSchema, sel: &Select) -> Vec<String> {
     let mut q = vec![schema.name.clone()];
     if let Some(alias) = &sel.from.alias {
@@ -951,7 +951,7 @@ pub(super) fn accepted_quals(schema: &TableSchema, sel: &Select) -> Vec<String> 
     q
 }
 
-/// `pub(super)`: reused by the SELECT executor (rel/006 `select.rs`/`plan.rs`)
+/// `pub(super)`: reused by the SELECT executor (`select.rs`/`plan.rs`)
 /// for projection/ORDER BY binding and sargable-conjunct column resolution.
 pub(super) fn resolve_column<'a>(
     cref: &super::ast::ColumnRef,
@@ -972,8 +972,8 @@ pub(super) fn resolve_column<'a>(
     Ok((pos, &schema.columns[pos]))
 }
 
-/// `pub(super)`: the SELECT executor (rel/006 §4) reuses this WHERE binder
-/// unchanged for its residual predicate — rel/005's evaluator/binder is not
+/// `pub(super)`: the SELECT executor reuses this WHERE binder
+/// unchanged for its residual predicate — the evaluator/binder is not
 /// duplicated.
 pub(super) fn bind_predicate(
     expr: &Expr,
@@ -1073,7 +1073,7 @@ fn bind_pred_operand(
     }
 }
 
-/// WHERE-only (spec §6): a REAL-natured literal/param compared against an
+/// WHERE-only: a REAL-natured literal/param compared against an
 /// INTEGER-hinted column keeps its own REAL type instead of a lossy coercion
 /// down to INTEGER — `comparable`/`eval::cmp_scalars` widen the INTEGER side
 /// to `f64` at runtime instead (the one implicit widening). Every other hint
@@ -1083,8 +1083,8 @@ fn bind_pred_operand(
 /// operand binding does, so a REAL value written into an INTEGER column is
 /// still rejected as lossy.
 ///
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007
-/// `join.rs`), which mirrors this predicate binding for joined tables.
+/// `pub(super)`: reused by the multi-binding join WHERE binder
+/// (`join.rs`), which mirrors this predicate binding for joined tables.
 pub(super) fn widen_predicate_hint(hint: ColumnType, is_real_valued: bool) -> ColumnType {
     if hint == ColumnType::Integer && is_real_valued {
         ColumnType::Real
@@ -1093,7 +1093,7 @@ pub(super) fn widen_predicate_hint(hint: ColumnType, is_real_valued: bool) -> Co
     }
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn natural_type(op: &Operand, params: &[Value]) -> ColumnType {
     match op {
         Operand::Literal(Literal::Real(_)) => ColumnType::Real,
@@ -1116,7 +1116,7 @@ fn effective_type(op: &PredOperand, schema: &TableSchema) -> Option<ColumnType> 
     }
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn scalar_physical_type(v: &ScalarValue) -> Option<ColumnType> {
     match v {
         ScalarValue::Integer(_) => Some(ColumnType::Integer),
@@ -1129,7 +1129,7 @@ pub(super) fn scalar_physical_type(v: &ScalarValue) -> Option<ColumnType> {
 }
 
 /// `pub(super)`: reused by the ON type-check and the multi-binding join
-/// WHERE binder (rel/007 `join.rs`).
+/// WHERE binder (`join.rs`).
 pub(super) fn comparable(a: Option<ColumnType>, b: Option<ColumnType>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => {
@@ -1144,7 +1144,7 @@ pub(super) fn comparable(a: Option<ColumnType>, b: Option<ColumnType>) -> bool {
 }
 
 /// Recognizes `pk = literal|param` (either operand order); returns the bound PK
-/// value or `None` if the shape does not match (spec §7/§12).
+/// value or `None` if the shape does not match.
 fn try_pk_point(
     schema: &TableSchema,
     expr: &Expr,
@@ -1183,7 +1183,7 @@ fn is_pk_column(op: &Operand, pk: &ColumnDef, quals: &[String]) -> bool {
     }
 }
 
-/// `pub(super)`: reused by the SELECT planner (rel/006 `plan.rs`).
+/// `pub(super)`: reused by the SELECT planner (`plan.rs`).
 pub(super) fn is_value(op: &Operand) -> bool {
     matches!(op, Operand::Literal(_) | Operand::Param(_))
 }
@@ -1221,7 +1221,7 @@ fn row_index_keys(
     out
 }
 
-// ── Time helpers (spec §5, no new crate) ────────────────────────────────────
+// ── Time helpers (no new crate) ────────────────────────────────────
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -1601,7 +1601,7 @@ mod tests {
 
     // 12. REFERENCES: present target ok; missing → 409; NULL link unchecked.
     //     (Cross-engine KVREF/JSONREF validation needs real target engines —
-    //     covered by the rel/012 tests in cross_engine.rs, not here.)
+    //     covered by the tests in cross_engine.rs, not here.)
     #[test]
     fn test_references() {
         crate::core::engine_runtime::block_on(async {
@@ -1636,7 +1636,7 @@ mod tests {
         })
     }
 
-    // Spec general/030 test 7: the storage value limit is the larger of
+    // The storage value limit is the larger of
     // 512 KiB and max_row_size, so rows above 512 KiB need only max_row_size
     // and a tiny max_row_size leaves the catalog its room.
     #[test]
@@ -1716,7 +1716,7 @@ mod tests {
     }
 
     // UPDATE -> UniqueViolation: a SET introduces a UNIQUE-column collision
-    // with another row (quality/007 prep work).
+    // with another row.
     #[test]
     fn test_update_unique_violation() {
         crate::core::engine_runtime::block_on(async {
@@ -1731,7 +1731,7 @@ mod tests {
     }
 
     // UPDATE -> LinkTargetMissing: the FK re-check runs over changed
-    // REFERENCES columns, not just at INSERT time (quality/007 prep work).
+    // REFERENCES columns, not just at INSERT time.
     #[test]
     fn test_update_link_target_missing() {
         crate::core::engine_runtime::block_on(async {
@@ -1748,7 +1748,7 @@ mod tests {
     }
 
     // UPDATE -> TextTooLong / RowTooLarge: the same size guards as INSERT
-    // apply on the UPDATE path (quality/007 prep work).
+    // apply on the UPDATE path.
     #[test]
     fn test_update_size_guards() {
         crate::core::engine_runtime::block_on(async {
@@ -1762,7 +1762,7 @@ mod tests {
             ));
 
             // Row encoding is a fixed 32 bytes for this schema with `s` NULL, and
-            // 37 once `s` holds "hello" (rel/005 row.rs: 4B version+count + 2×2B
+            // 37 once `s` holds "hello" (row.rs: 4B version+count + 2×2B
             // col_dir + 1B bitmap padded to slots_start=16 + 2×8B slots, +5B var).
             let dir2 = tempfile::TempDir::new().unwrap();
             let rel2 = boot(RelStoreConfig { max_row_size: 34, ..config_in(dir2.path()) }).await;
@@ -1859,9 +1859,9 @@ mod tests {
         })
     }
 
-    // 005-F1: a REAL literal/param/IN-element compared against an INTEGER
+    // A REAL literal/param/IN-element compared against an INTEGER
     // column keeps its own REAL type and widens at eval time instead of
-    // being lossily forced to INTEGER and rejected (spec §6: INTEGER<->REAL
+    // being lossily forced to INTEGER and rejected (INTEGER<->REAL
     // is the one implicit widening, and it applies to literals/params too,
     // not only column-vs-column comparisons).
     #[test]
@@ -1897,7 +1897,7 @@ mod tests {
         })
     }
 
-    // ISO-8601 parser corner cases (spec §5).
+    // ISO-8601 parser corner cases.
     #[test]
     fn test_iso8601_parser() {
         assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00Z"), Some(0));
@@ -1911,7 +1911,7 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
     }
 
-    // 005-F2: an absurdly large ISO year must not overflow i64 (debug:
+    // An absurdly large ISO year must not overflow i64 (debug:
     // arithmetic-overflow panic ~ 500; release: wraps to a garbage
     // timestamp) — it must cleanly fail to parse instead. A normal date is
     // unaffected.

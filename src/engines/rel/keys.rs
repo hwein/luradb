@@ -1,8 +1,8 @@
-//! `ROW:` / `IDX:` / `SEQ:` key builders (spec rel/005 §2, concept 5.2).
+//! `ROW:` / `IDX:` / `SEQ:` key builders.
 //!
 //! `table_id`/`index_id` are written as 4-byte big-endian, so the literal `:`
 //! separators to their neighbours are unambiguous. `pk_enc`/`val_enc` (from
-//! `encode_sortable`, rel/003) are the only variable-length, tail-standing
+//! `encode_sortable`) are the only variable-length, tail-standing
 //! parts — both self-terminating, so in the `IDX:` key `pk_enc` follows
 //! `val_enc` directly (no `:`). No back-decoding of `pk_enc`/`val_enc` is
 //! needed (the PK travels inside the LuraRow) and is a non-goal.
@@ -36,7 +36,7 @@ pub fn index_key(system_prefix: &[u8], index_id: u32, val_enc: &[u8], pk_enc: &[
     k
 }
 
-/// `IDX:{prefix}:{index_id}:{val_enc}` — value-search prefix (rel/006).
+/// `IDX:{prefix}:{index_id}:{val_enc}` — value-search prefix.
 pub fn index_value_prefix(system_prefix: &[u8], index_id: u32, val_enc: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(IDX_PREFIX.len() + system_prefix.len() + 6 + val_enc.len());
     k.extend_from_slice(IDX_PREFIX);
@@ -58,7 +58,7 @@ pub fn seq_key(system_prefix: &[u8], table_id: u32) -> Vec<u8> {
     k
 }
 
-// ── Domain-wide scan prefixes (rel/013 purger) ─────────────────────────────────
+// ── Domain-wide scan prefixes (purger) ─────────────────────────────────
 //
 // `{family}:{system_prefix}:` — spans every table/index of the domain. The
 // purger tombstones a deleting domain's data through these.

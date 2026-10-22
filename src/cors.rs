@@ -1,4 +1,4 @@
-//! CORS layer for browser clients (spec general/020). Opt-in via `[cors]` —
+//! CORS layer for browser clients. Opt-in via `[cors]` —
 //! `build_layer` returns `None` when disabled, so the router carries no
 //! `CorsLayer` at all and behavior is unchanged from before this module
 //! existed.
@@ -8,7 +8,7 @@ use axum::http::{header, HeaderName, HeaderValue, Method};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Builds the `CorsLayer` from config, or `None` when `cors.enabled = false`.
-/// Methods/headers/max_age are fixed (spec general/020 §Feste Layer-Defaults)
+/// Methods/headers/max_age are fixed
 /// — not configurable, since they follow from the API surface, not from
 /// operations. `allowed_origins` is assumed already validated by
 /// `CorsConfig::validate` (called at startup): every entry parses as a
@@ -134,7 +134,7 @@ mod tests {
     }
 
     // Mirrors `server::build_router`: the CorsLayer goes on top of the
-    // fully merged router (spec general/020 §Platzierung), not inside
+    // fully merged router, not inside
     // `frontend_layers` — this is what puts it outside `auth_layer`.
     async fn make_app(
         cors: CorsConfig,

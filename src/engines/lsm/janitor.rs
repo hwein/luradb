@@ -116,7 +116,7 @@ impl GcStats {
 /// Background garbage collector for the Value Log.
 pub struct Janitor {
     /// The engine's version: the GC reads the vLog generations from it and
-    /// installs every change it makes (spec kv/031 A1).
+    /// installs every change it makes.
     version: Arc<VersionCell>,
 
     /// Canonical vLog path — generation 1 and base for every later generation.
@@ -145,7 +145,7 @@ pub struct Janitor {
 
     /// Incremented once per GC cycle that actually ran (`GcStats::ran ==
     /// true`) -- shared with `LsmStorageEngine::janitor_runs` for the
-    /// `/metrics` system block (spec general/024).
+    /// `/metrics` system block.
     janitor_runs: Arc<AtomicU64>,
 
     /// Drains all MemTables before the live scan. `None` only for fixtures
@@ -154,31 +154,31 @@ pub struct Janitor {
 
     /// The engine's flush lock: held over the manifest swap and the level
     /// install, it keeps a flush from installing an SSTable the reload would
-    /// not see (spec general/029). `None` only for fixtures without an engine.
+    /// not see. `None` only for fixtures without an engine.
     flush_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 
     /// The engine's maintenance lock: held over a whole GC cycle, it keeps a
     /// compaction from entering the manifest between the live scan and the
-    /// retire (spec general/029). `None` only for fixtures without an engine.
+    /// retire. `None` only for fixtures without an engine.
     maintenance_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 
     /// The engine's write drain (`in_flight_writes`): held while a new active
     /// generation and its fresh MemTable are installed, so no writer sits
-    /// between its stamp and its apply across that rotation (spec kv/029).
+    /// between its stamp and its apply across that rotation.
     /// `None` only for fixtures without writers.
     write_drain: Option<Arc<tokio::sync::RwLock<()>>>,
 
     /// Generations already out of the current version whose files wait until
-    /// no older version holds them (spec kv/031 A5).
+    /// no older version holds them.
     retired: Mutex<Vec<Arc<VLog>>>,
 
     /// Test-only pause point between opening the rebuilt readers and
-    /// installing them (spec general/028).
+    /// installing them.
     #[cfg(test)]
     install_hook: Option<Arc<TestHook>>,
 
     /// Test-only pause point after the rebuild and before the flush lock —
-    /// the window a whole flush fits into (spec general/029).
+    /// the window a whole flush fits into.
     #[cfg(test)]
     before_manifest_swap_hook: Option<Arc<TestHook>>,
 }
@@ -227,7 +227,7 @@ impl Janitor {
     }
 
     /// Parks the next [`Self::reload_level_readers`] right before it installs
-    /// the rebuilt levels (spec general/028).
+    /// the rebuilt levels.
     #[cfg(test)]
     pub(crate) fn set_install_hook(&mut self, hook: Arc<TestHook>) {
         self.install_hook = Some(hook);
@@ -235,7 +235,7 @@ impl Janitor {
 
     /// Parks the next [`Self::run_gc`] after its rebuild, before it takes the
     /// flush lock — a flush released here reaches the manifest in full, which
-    /// the snapshot the rebuild worked on never listed (spec general/029).
+    /// the snapshot the rebuild worked on never listed.
     #[cfg(test)]
     pub(crate) fn set_before_manifest_swap_hook(&mut self, hook: Arc<TestHook>) {
         self.before_manifest_swap_hook = Some(hook);
@@ -248,7 +248,7 @@ impl Janitor {
     /// Runs the Janitor's periodic GC loop.
     ///
     /// Intended to be spawned as a task of the engine runtime. `shutdown_rx`
-    /// wakes the loop immediately on shutdown (spec general/023 M2) instead of
+    /// wakes the loop immediately on shutdown instead of
     /// sleeping out the full `check_interval_secs`, which defaults to 60s.
     pub async fn run_background(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
         let interval = Duration::from_secs(self.config.check_interval_secs);
@@ -323,7 +323,7 @@ impl Janitor {
         // Whole cycle under the maintenance lock, barrier included: no
         // compaction can enter the manifest between the live scan below and
         // the retire at the end, so nothing the scan never saw survives into
-        // the generations this cycle deletes (spec general/029). Taken before
+        // the generations this cycle deletes. Taken before
         // the flush lock, never after it.
         let _maintenance = match &self.maintenance_lock {
             Some(lock) => Some(lock.lock().await),
@@ -382,8 +382,7 @@ impl Janitor {
         let retired = {
             // Manifest swap and level install under the flush lock: what the
             // reload reads from the manifest is exactly what the read path
-            // ends up with, an SSTable flushed since the snapshot included
-            // (spec general/029).
+            // ends up with, an SSTable flushed since the snapshot included.
             let _flush = match &self.flush_lock {
                 Some(lock) => Some(lock.lock().await),
                 None => None,
@@ -414,7 +413,7 @@ impl Janitor {
 
         // Counts actually-run cycles only (mirrors `GcStats::ran`), not
         // threshold checks that skipped -- otherwise this would be an uptime
-        // counter instead of an activity signal (spec general/024). Placed
+        // counter instead of an activity signal. Placed
         // here rather than only in the background loop so direct `run_gc`
         // callers (tests, future triggers) count too.
         self.janitor_runs.fetch_add(1, Ordering::Relaxed);
@@ -473,7 +472,7 @@ impl Janitor {
             let (_, dbv) = entry?;
             // Only Pointer entries reference the vLog; Inline entries do not.
             if let DataBlockValue::Pointer(vp) = dbv {
-                // Skip the tombstone/NULL sentinels (both file_id == 0, kv/018)
+                // Skip the tombstone/NULL sentinels (both file_id == 0)
                 // — neither references vLog bytes.
                 if vp.file_id != 0 && vp.value_offset != u64::MAX && vp.value_len > 0 {
                     live.push((vp.file_id, vp.value_offset, vp.value_len));
@@ -626,7 +625,7 @@ impl Janitor {
     ///
     /// Every rebuild carries the content of a snapshot table and is therefore
     /// older than anything flushed since; L0 is read newest-last, so they go in
-    /// front of what the level gained meanwhile (spec general/029).
+    /// front of what the level gained meanwhile.
     fn apply_manifest_update(
         &self,
         old_file_ids: &[(usize, u64)],
@@ -647,7 +646,7 @@ impl Janitor {
     /// keeps its reader (see [`LsmStorageEngine::level_readers`]).
     ///
     /// Every level keeps its old readers until all new ones are open, then
-    /// they change in one install (spec general/028, kv/031 A1).
+    /// they change in one install.
     async fn reload_level_readers(&self) -> Result<Vec<Arc<SSTableReader>>> {
         let current = self.version.get();
         let num_levels = self.manifest.read().levels.len();

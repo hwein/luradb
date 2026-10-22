@@ -1,5 +1,5 @@
 //! POSIX shared-memory segments (`shm_open`/`ftruncate`/`mmap`) and their
-//! lifecycle manager (spec perf/006).
+//! lifecycle manager.
 
 use anyhow::{Context, Result};
 use memmap2::{Mmap, MmapMut};
@@ -16,13 +16,13 @@ use crate::config::ShmConfig;
 
 /// A single mmap'd POSIX shared-memory segment (`/dev/shm/<name>`), mapped
 /// read/write. Clients map `state`/`data_a`/`data_b` through
-/// [`ShmSegment::open_readonly`] instead (spec perf/012 §10).
+/// [`ShmSegment::open_readonly`] instead.
 pub struct ShmSegment {
     name: String,
     mmap: MmapMut,
     size: usize,
     /// Owns the fd (closed exactly once, on drop). Kept beyond setup for
-    /// spec perf/010's client hand-off (`SCM_RIGHTS`).
+    /// the client hand-off (`SCM_RIGHTS`).
     file: File,
 }
 
@@ -55,7 +55,7 @@ impl ShmSegment {
         };
         // A freshly shm_open(O_EXCL)+ftruncate'd segment is all-zero pages
         // already (kernel guarantee) — no memset (would fault in every page
-        // of what defaults to 256 MB, for nothing; spec §2.4).
+        // of what defaults to 256 MB, for nothing).
 
         Ok(Self { name: name.to_string(), mmap, size, file })
     }
@@ -82,7 +82,7 @@ impl ShmSegment {
     }
 
     /// Opens an existing segment `O_RDONLY` / `PROT_READ` — the mandatory client
-    /// mapping for `state`, `data_a` and `data_b` (spec perf/012 §10). A write
+    /// mapping for `state`, `data_a` and `data_b`. A write
     /// through the returned mapping faults, which is the point: reader counters
     /// live in the client's own `cmd_hdr` page, not in `state`.
     pub fn open_readonly(name: &str) -> Result<ReadOnlySegment> {
@@ -122,7 +122,7 @@ impl ShmSegment {
         &self.name
     }
 
-    /// Raw fd — retained for spec perf/010's `SCM_RIGHTS` client hand-off.
+    /// Raw fd — retained for the `SCM_RIGHTS` client hand-off.
     pub fn fd(&self) -> RawFd {
         self.file.as_raw_fd()
     }
@@ -175,7 +175,7 @@ fn errno_context(context: String) -> anyhow::Error {
 }
 
 /// Standard segment purposes created at startup. The command/response
-/// ringbuffers are no longer global: spec perf/008's multi-client support
+/// ringbuffers are no longer global: multi-client support
 /// mints a dedicated `ClientShm` quartet per client instead.
 const SEGMENT_PURPOSES: &[&str] = &["state", "data_a", "data_b"];
 
@@ -184,7 +184,7 @@ const STATE_SEGMENT_SIZE: usize = 4096;
 const _: () = assert!(STATE_SEGMENT_SIZE >= crate::ipc::StateHeader::SIZE);
 
 /// Filesystem mode of every SHM segment; fixed so it cannot be loosened to
-/// foreign users (spec general/030).
+/// foreign users.
 pub const SEGMENT_MODE: u32 = 0o660;
 
 /// Owns every SHM segment and the instance lock file for one LuraDB process.
@@ -254,7 +254,7 @@ impl ShmManager {
 
     /// Unlinks every segment and the lock file. Idempotent (safe to call
     /// explicitly and then again from `Drop`); cleanup errors are logged,
-    /// not propagated (spec §5).
+    /// not propagated.
     pub fn shutdown(&self) {
         if self.shut_down.swap(true, Ordering::SeqCst) {
             return;
@@ -283,8 +283,8 @@ impl Drop for ShmManager {
     }
 }
 
-/// Header segment size for a per-client ring — one page, minimal (spec §2).
-/// `cmd_hdr` also carries the client's `ReaderSlot` (spec perf/012 §1).
+/// Header segment size for a per-client ring — one page, minimal.
+/// `cmd_hdr` also carries the client's `ReaderSlot`.
 pub const CLIENT_HDR_SIZE: usize = 4096;
 
 /// Size of each per-client cmd/resp ring. `DoubleMmapRegion` needs a
@@ -292,7 +292,7 @@ pub const CLIENT_HDR_SIZE: usize = 4096;
 pub const CLIENT_RING_SIZE: usize = 4 * 1024 * 1024;
 const _: () = assert!(CLIENT_RING_SIZE.is_power_of_two() && CLIENT_RING_SIZE >= 4096);
 
-/// The four per-client ring segments (spec perf/008 Multi-Client): a cmd ring
+/// The four per-client ring segments: a cmd ring
 /// (client→server) and a resp ring (server→client), each a data segment plus a
 /// one-page header segment. Owns all four and unlinks them on drop.
 ///
@@ -303,7 +303,7 @@ pub struct ClientShm {
     cmd: ShmSegment,
     /// Behind an `Arc` because the publisher's `ReaderSlotHandle` holds a clone:
     /// the slot page must stay mapped even if the dispatcher drops this
-    /// connection mid-scan (spec perf/012 §6).
+    /// connection mid-scan.
     cmd_hdr: Arc<ShmSegment>,
     resp: ShmSegment,
     resp_hdr: ShmSegment,
@@ -384,7 +384,7 @@ fn client_segment_names(instance_id: &str, client_id: u64) -> [String; 4] {
 }
 
 /// Scans `/dev/shm` for segments left behind by a crashed previous run of
-/// this `instance_id` and unlinks them (spec §5.1). Only reached once the
+/// this `instance_id` and unlinks them. Only reached once the
 /// instance lock is held, so any match here is guaranteed stale.
 fn cleanup_stale_segments(instance_id: &str) -> Result<()> {
     let prefix = format!("luradb_{instance_id}_");
@@ -663,7 +663,7 @@ mod tests {
         }
     }
 
-    // Spec perf/012 test 8: the mandatory client mapping modes (§10) —
+    // The mandatory client mapping modes —
     // state/data_a/data_b `PROT_READ`, the ReaderSlot page read/write. Reading a
     // published snapshot through the read-only mappings must work and must show
     // the pin in the slot; a write to `state` would fault here exactly as it

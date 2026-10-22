@@ -1,4 +1,4 @@
-//! Cross-engine links (spec rel/012): the `CrossEngineResolver` bridge from
+//! Cross-engine links: the `CrossEngineResolver` bridge from
 //! the rel engine to the same-named KV/JSON domains, the per-query read
 //! `LinkMask`, and the background `RelCrossEngineSweeper` that physically nulls
 //! orphaned link cells. This is the **only** rel module that imports `kv`/`json`
@@ -20,7 +20,7 @@ use crate::metrics::MetricsStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// ── Resolver result types (spec §1) ──────────────────────────────────────────
+// ── Resolver result types ──────────────────────────────────────────
 
 /// State of the same-named target domain in the target engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,14 +36,14 @@ impl TargetDomain {
     }
 
     /// Only a gone/`Deleting` domain is swept, never a disabled engine: its
-    /// data stays on disk and is visible again once re-enabled (spec rel/020).
+    /// data stays on disk and is visible again once re-enabled.
     fn should_sweep(self) -> bool {
         matches!(self, TargetDomain::GoneOrDeleting)
     }
 }
 
 /// Outcome of a KVREF point lookup (raw KV value = bytes). `NullValue` is a
-/// key that exists in the explicit NULL state (spec kv/018).
+/// key that exists in the explicit NULL state.
 pub enum KvResolution {
     DomainUnavailable,
     Absent,
@@ -60,7 +60,7 @@ pub enum JsonResolution {
 
 /// Bridge from the rel engine to the same-named KV/JSON domains. Both handles
 /// are optional: an engine can be disabled by config. Reads and writes treat a
-/// disabled engine like a gone target; the sweep does not (spec rel/020).
+/// disabled engine like a gone target; the sweep does not.
 pub struct CrossEngineResolver {
     kv: Option<Arc<DomainRegistry>>,
     json: Option<Arc<JsonEngine>>,
@@ -96,7 +96,7 @@ impl CrossEngineResolver {
         self.json.is_some()
     }
 
-    // ── Domain status (§1/§3) ────────────────────────────────────────────────
+    // ── Domain status ────────────────────────────────────────────────
 
     /// KV `get_domain` is async (cache-first, cold-cache engine fallback);
     /// `None` (disabled) → `EngineDisabled`, missing/`Deleting` → `GoneOrDeleting`.
@@ -117,12 +117,12 @@ impl CrossEngineResolver {
         }
     }
 
-    // ── Point lookups (§1) ───────────────────────────────────────────────────
+    // ── Point lookups ───────────────────────────────────────────────────
 
     /// KVREF point lookup **directly on the KV LSM instance** (not via
     /// `DomainStore`): governance is already charged once at the rel REST edge
-    /// against the rel domain (§1), so a second KV rate-limit hit is wrong.
-    /// Authorization is likewise handled upstream, not here (spec rel/016): a
+    /// against the rel domain, so a second KV rate-limit hit is wrong.
+    /// Authorization is likewise handled upstream, not here: a
     /// caller lacking KV read access never reaches this function — the read
     /// path masks the link cell to `NULL` before expand ever resolves it, and
     /// the write path rejects the link before `validate_cross_engine_link`
@@ -146,7 +146,7 @@ impl CrossEngineResolver {
     /// JSONREF point lookup via the rate-limit-free `get_document` primitive.
     /// A key that is not a valid document key cannot reference a document →
     /// `Absent` (a clean 409/`exists:false`, never a 500). Authorization is
-    /// handled upstream, same as `kv_lookup` above (spec rel/016).
+    /// handled upstream, same as `kv_lookup` above.
     pub async fn json_lookup(&self, domain: &str, key: &str) -> anyhow::Result<JsonResolution> {
         let Some(json) = &self.json else { return Ok(JsonResolution::DomainUnavailable) };
         match json.get_document(domain, key).await {
@@ -160,7 +160,7 @@ impl CrossEngineResolver {
         }
     }
 
-    // ── Metrics (§8) ─────────────────────────────────────────────────────────
+    // ── Metrics ─────────────────────────────────────────────────────────
 
     pub(crate) fn record_expand_lookup(&self, engine: &str) {
         self.metrics.record_rel_cross_engine_expand_lookup(engine);
@@ -175,7 +175,7 @@ impl CrossEngineResolver {
     }
 }
 
-// ── Authorization (spec rel/016) ──────────────────────────────────────────────
+// ── Authorization ──────────────────────────────────────────────
 
 /// Per-request cross-engine read rights, resolved by the REST handlers from
 /// the caller's KV/JSON permissions and threaded down to `compute_link_mask`
@@ -195,7 +195,7 @@ impl LinkAuth {
     }
 }
 
-// ── Read masking (spec §3) ────────────────────────────────────────────────────
+// ── Read masking ────────────────────────────────────────────────────
 
 /// Per-query masking flags: a set flag means every column of that link type is
 /// materialized as `NULL` (the same-named target domain is gone/`Deleting` or
@@ -219,7 +219,7 @@ impl LinkMask {
 
     /// Overwrites masked link cells (in `schema.columns` order) with `NULL`
     /// in place — the single materialization seam every read path funnels
-    /// through (§3).
+    /// through.
     pub(crate) fn apply(&self, values: &mut [ScalarValue], schema: &TableSchema) {
         if !self.any() {
             return;
@@ -237,7 +237,7 @@ impl RelEngine {
     /// same rel domain): one KV status read (async) and one JSON status read
     /// (sync), each only when a column of that type is actually present. A
     /// missing `auth` right masks the column outright without even checking
-    /// the target domain's status (spec rel/016) — indistinguishable from
+    /// the target domain's status — indistinguishable from
     /// "target domain gone", so no new read-side oracle is introduced.
     pub(crate) async fn compute_link_mask(
         &self,
@@ -257,7 +257,7 @@ impl RelEngine {
         Ok(LinkMask { kvref, jsonref })
     }
 
-    /// All KVREF/JSONREF columns of a domain's tables (sweeper candidate set, §5).
+    /// All KVREF/JSONREF columns of a domain's tables (sweeper candidate set).
     pub(crate) fn link_columns(
         &self,
         domain: &str,
@@ -276,7 +276,7 @@ impl RelEngine {
     }
 }
 
-// ── Base64 (spec §4; no crate — hand-written standard-alphabet encoder) ───────
+// ── Base64 (no crate — hand-written standard-alphabet encoder) ───────
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -295,17 +295,17 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-// ── Physical sweep (spec §5) ──────────────────────────────────────────────────
+// ── Physical sweep ──────────────────────────────────────────────────
 
 /// Seconds between sweep ticks and the max cells nulled per (domain,
-/// column, tick): a gentler cadence than the rel/013 purger, since it
+/// column, tick): a gentler cadence than the domain purger, since it
 /// rewrites live rows.
 pub const SWEEP_INTERVAL_SECS: u64 = 10;
 pub const SWEEP_BATCH_SIZE: usize = 100;
 
 /// Background task that physically nulls link cells whose same-named target
 /// domain vanished in a foreign engine — the durable half of "nulled stays
-/// nulled". Distinct from the rel/013 purger (which tombstones a rel domain's
+/// nulled". Distinct from the domain purger (which tombstones a rel domain's
 /// own orphaned prefix ranges); this one rewrites cells in *live* tables.
 pub struct RelCrossEngineSweeper {
     engine: Arc<RelEngine>,
@@ -319,8 +319,8 @@ impl RelCrossEngineSweeper {
 
     pub async fn sweep_tick(&self) -> anyhow::Result<()> {
         for dom in self.engine.domains.list_domains() {
-            // rel/013 made `list_domains` surface `Deleting` domains too; the
-            // rel/013 purger owns those (it tombstones every row), so the
+            // `list_domains` surfaces `Deleting` domains too; the domain
+            // purger owns those (it tombstones every row), so the
             // cross-engine sweeper must skip them — rewriting a cell here could
             // resurrect a row the purger already reaped.
             if dom.state != RelDomainState::Active {
@@ -383,8 +383,8 @@ impl RelCrossEngineSweeper {
                 continue;
             };
             let ops = null_cell_ops(table, col, ix, prefix, &pk_enc, row_key, &now_bytes, &v_now);
-            // rel/013 §3 guard: commit under the engine write guard and re-check
-            // the rel domain is still active. If the rel/013 purger is
+            // Purge guard: commit under the engine write guard and re-check
+            // the rel domain is still active. If the domain purger is
             // finalizing this domain, stop — otherwise this row rewrite could
             // land after the domain was emptied and orphan a `ROW:` key.
             {
@@ -450,7 +450,7 @@ impl RelCrossEngineSweeper {
             return Ok(None);
         }
         // v_now: latest committed. Only null it if untouched since the snapshot
-        // (a fresh valid link against a recreated domain must survive, §5).
+        // (a fresh valid link against a recreated domain must survive).
         let now_guard = engine.snapshot().await;
         let Some(now_bytes) = engine.get_with_snapshot(row_key, now_guard.snapshot()).await?.into_option() else {
             return Ok(None);
@@ -504,7 +504,7 @@ fn null_cell_ops(
 
 /// Splits `val_enc ++ pk_enc` (after an index's `IDX:…:{index_id}:` prefix) at
 /// the text value's `0x00 0x00` terminator, honoring `0x00 0xFF` escapes
-/// (rel/003 text encoding); returns `pk_enc`. KVREF/JSONREF are physically TEXT.
+/// (sortable text encoding); returns `pk_enc`. KVREF/JSONREF are physically TEXT.
 fn split_text_val_pk(rest: &[u8]) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < rest.len() {
@@ -697,7 +697,7 @@ mod tests {
             .unwrap();
     }
 
-    // ── Base64 (§4) ──────────────────────────────────────────────────────────
+    // ── Base64 ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_base64_encoder() {
@@ -897,7 +897,7 @@ mod tests {
         })
     }
 
-    // ── 10b. Expand KVREF of a nulled key (spec kv/018) ──────────────────────
+    // ── 10b. Expand KVREF of a nulled key ──────────────────────
 
     #[test]
     fn test_expand_kvref_null_value() {
@@ -1027,7 +1027,7 @@ mod tests {
             ok(&e.rel, "default", "INSERT INTO t VALUES (1, 'k')").await;
             let exp = expand_block(&e.rel, "default", "SELECT * FROM t", &["payload"]).await;
             // The full KV value is carried into the response the handler's 413 cap
-            // measures (the cap itself is the unchanged rel/009 handler check).
+            // measures (the cap itself is the unchanged handler check).
             assert_eq!(colv(&exp, "payload")[0]["value"].as_str().unwrap().len(), 4096);
         })
     }
@@ -1225,7 +1225,7 @@ mod tests {
 
     // ── 24. Disabled-handle smoke: pre-existing links masked, writes 409 ─────
     //
-    // A link *column* can only be created while its engine is enabled (§2), so
+    // A link *column* can only be created while its engine is enabled, so
     // the disabled case is a restart: build the schema+rows with engines on,
     // then reboot the same rel data with a fully-disabled resolver.
     #[test]
@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     // 25. sweep_tick skip: a rel-Deleting domain is left untouched even though
-    // its KV target is gone — the rel/013 purger owns it, not the sweeper.
+    // its KV target is gone — the domain purger owns it, not the sweeper.
     #[test]
     fn test_sweep_skips_deleting_rel_domain() {
         crate::core::engine_runtime::block_on(async {
@@ -1296,7 +1296,7 @@ mod tests {
         })
     }
 
-    // ── LinkAuth (spec rel/016) ────────────────────────────────────────────
+    // ── LinkAuth ────────────────────────────────────────────
 
     // 26. (a)+(b) missing read right masks only that engine's link columns —
     // identical to "target domain gone" — the other engine stays untouched;
@@ -1338,7 +1338,7 @@ mod tests {
             assert_eq!(colv(&expanded, "payload")[0], json!({ "exists": true, "value": "v", "encoding": "utf8" }));
             assert_eq!(colv(&expanded, "doc")[0], Value::Null, "masked column expands to null");
 
-            // Both rights present: unchanged from the rel/012 baseline.
+            // Both rights present: unchanged from the unmasked baseline.
             let out = e
                 .rel
                 .execute_sql("default", "SELECT * FROM t", &[], &["*".to_string()], LinkAuth::full())
@@ -1409,7 +1409,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/019: per-engine ops/s + latency percentiles ─────────────
+    // ── Per-engine ops/s + latency percentiles ─────────────
 
     // Tests 3+4: one op per engine (KV put+get, JSON create+get, rel
     // INSERT+SELECT) increments exactly that engine's read_ops/write_ops and
@@ -1460,7 +1460,7 @@ mod tests {
         })
     }
 
-    // ── Spec rel/020: a disabled target engine is not "gone" for the sweep ───
+    // ── A disabled target engine is not "gone" for the sweep ───
 
     // Tests 1+2 (JSONREF): masked while JSON is disabled, sweeper ticks must
     // not physically null the cell, and the reference is back once JSON is
@@ -1592,7 +1592,7 @@ mod tests {
             assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Null, "cell physically NULL");
 
             // Finalize the deletion (a document is present -> two ticks, mirrors
-            // json/013 purger tests) before recreating the domain same-named.
+            // the JSON purger tests) before recreating the domain same-named.
             let purger = JsonDomainPurger::new(Arc::clone(&e.json), 100);
             purger.purge_tick().await.unwrap();
             purger.purge_tick().await.unwrap();

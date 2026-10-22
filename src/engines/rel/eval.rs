@@ -1,10 +1,10 @@
-//! Three-valued WHERE predicate evaluator (spec rel/005 §6, concept 3.7).
+//! Three-valued WHERE predicate evaluator.
 //!
 //! `eval` runs a `Pred` (a WHERE expression bound to a table by the deep-binder
 //! in `dml.rs`: columns resolved to row positions, literals/params pre-typed
 //! against their column) against one decoded row and yields Kleene
 //! `Bool3`. WHERE/UPDATE/DELETE keep only `True` rows. The NULL-bind guard
-//! (rel/004) already rejected NULL comparison operands, so the evaluator sees
+//! (binder) already rejected NULL comparison operands, so the evaluator sees
 //! `NULL` only as a column value.
 
 use super::ast::CompareOp;
@@ -57,7 +57,7 @@ pub enum Pred {
 
 /// Evaluates `pred` against `row` (values in `TableSchema.columns` order).
 ///
-/// Fallible (rel/017): a pathologically self-similar LIKE pattern aborts
+/// Fallible: a pathologically self-similar LIKE pattern aborts
 /// `like_match` after its step budget instead of pinning a CPU core; that
 /// error propagates through `?` before `maybe_negate` runs, so `NOT LIKE`
 /// over budget is the same error, never a silent negation. `And`/`Or` keep
@@ -108,7 +108,7 @@ fn resolve<'a>(op: &'a PredOperand, row: &'a [ScalarValue]) -> &'a ScalarValue {
 /// widens to Real (the single implicit widening); Timestamp/Text/Boolean only
 /// compare among themselves (Integer↔Timestamp share the i64 domain).
 ///
-/// `pub(super)`: reused by the ORDER BY sort comparator (rel/006 `select.rs`)
+/// `pub(super)`: reused by the ORDER BY sort comparator (`select.rs`)
 /// so the widening/ordering rules stay in one place.
 pub(super) fn cmp_scalars(a: &ScalarValue, b: &ScalarValue) -> Option<Ordering> {
     use ScalarValue::*;
@@ -143,14 +143,13 @@ fn apply_op(op: CompareOp, ord: Option<Ordering>) -> Bool3 {
 /// SQL `LIKE`: `%` = any (incl. empty) run, `_` = exactly one char, fully
 /// anchored, no `ESCAPE` (KISS).
 ///
-/// Greedy two-pointer scan backtracking to the last unresolved `%` (rel/015):
+/// Greedy two-pointer scan backtracking to the last unresolved `%`:
 /// O(1) extra space instead of the former O(np·nt) DP table. Time stays
-/// O(np·nt) in the worst case (one `%` plus a long near-matching literal);
-/// measured bound in rel/015's implementation note.
+/// O(np·nt) in the worst case (one `%` plus a long near-matching literal).
 ///
-/// rel/017: that worst case is bounded by a step budget proportional to the
+/// That worst case is bounded by a step budget proportional to the
 /// input size (`64·(np+nt) + 4096` — massive headroom over any legitimate
-/// pattern, derivation in the spec), counted once per main-loop iteration.
+/// pattern), counted once per main-loop iteration.
 /// Exceeding it aborts loudly (`LikeBudgetExceeded`) rather than silently
 /// returning `false`, which would be a silent false negative.
 fn like_match(pattern: &str, text: &str) -> Result<bool, RelStoreError> {
@@ -310,7 +309,7 @@ mod tests {
         assert_eq!(eval(&gt, &row).unwrap(), Bool3::True);
     }
 
-    // like_match semantics beyond test_in_like_isnull above (rel/015): empty
+    // like_match semantics beyond test_in_like_isnull above: empty
     // pattern/text, bare/doubled '%', leading/middle/trailing '%', '_' at the
     // edge and repeated, '%_' combinations, a wildcard-free pattern, and
     // multi-byte chars (char, not byte, semantics).
@@ -372,7 +371,7 @@ mod tests {
         assert_eq!(eval(&not_like("%"), &null_row).unwrap(), Bool3::Unknown);
     }
 
-    // Memory-/runtime proof (rel/015): a ~64Ki-char pattern against a
+    // Memory-/runtime proof: a ~64Ki-char pattern against a
     // ~64Ki-char text used to allocate an ~4.3 GiB DP table before this fix;
     // the greedy matcher needs O(1) extra space and returns well under a
     // second.
@@ -386,13 +385,12 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_millis(500), "took {elapsed:?}");
     }
 
-    // rel/017 budget stops the rel/015 worst case (spec §Tests 2): one '%'
+    // The step budget stops the worst case: one '%'
     // plus a long self-similar literal that never actually matches (the text
     // has no trailing 'b') aborts with LikeBudgetExceeded. No wall-clock
     // assertion: the step count is capped deterministically (boundary pair
     // below pins the formula), and a timing bound flaked on slower CI
-    // hardware. Measured once: ~90 ms debug vs ~9.2 s unbounded (rel/015
-    // as-built note, check 1).
+    // hardware. Measured once: ~90 ms debug vs ~9.2 s unbounded.
     #[test]
     fn test_like_budget_exceeded() {
         let pattern = format!("%{}b", "a".repeat(32 * 1024));
@@ -401,11 +399,11 @@ mod tests {
         assert!(matches!(err, RelStoreError::LikeBudgetExceeded { .. }), "{err:?}");
     }
 
-    // rel/017 budget spares legitimate patterns (spec §Tests 3): the rel/015
+    // The step budget spares legitimate patterns: the large-pattern
     // measurement case — %-heavy but linear, each '%' only ever backtracks
     // against the next character — stays Ok at the same 64 Ki/64 Ki scale.
     // Staying inside the budget is the assertion; a wall-clock bound would be
-    // CI-hardware dependent (general/008).
+    // CI-hardware dependent.
     #[test]
     fn test_like_budget_spares_linear_pattern() {
         let pattern = format!("{}b", "%a".repeat(32 * 1024));
@@ -413,7 +411,7 @@ mod tests {
         assert!(like_match(&pattern, &text).unwrap());
     }
 
-    // rel/017 NOT LIKE over budget (spec §Tests 4): the budget error
+    // NOT LIKE over budget: the budget error
     // propagates through eval() before maybe_negate — same error, never a
     // silently negated success.
     #[test]
@@ -425,7 +423,7 @@ mod tests {
         assert!(matches!(err, RelStoreError::LikeBudgetExceeded { .. }), "{err:?}");
     }
 
-    // rel/017 Grenzverhalten (spec §Tests 6): steps == budget still matches;
+    // Budget boundary: steps == budget still matches;
     // only a strictly greater count aborts. pattern = '%' + 64 'a's (np=65),
     // text = 12351 'a's (nt=12351): like_match's step count for this shape
     // is exactly nt + 1 + 64*(nt-64) = 798720, equal to the budget
@@ -449,7 +447,7 @@ mod tests {
         assert!(matches!(err, RelStoreError::LikeBudgetExceeded { .. }), "{err:?}");
     }
 
-    // End-to-end (rel/015): SELECT ... WHERE txt LIKE '%...' over
+    // End-to-end: SELECT ... WHERE txt LIKE '%...' over
     // execute_sql against a table holding a large TEXT row runs through.
     #[test]
     fn test_like_end_to_end_large_text() {

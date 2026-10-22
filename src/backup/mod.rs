@@ -1,4 +1,4 @@
-//! Logical backup & restore (spec general/006).
+//! Logical backup & restore.
 //!
 //! `BackupManager` owns the global backup/restore job slot, ID assignment,
 //! the on-disk backup listing, retention, and the in-RAM restore-status
@@ -24,7 +24,7 @@ use thiserror::Error;
 /// keeps a newline-free file from being read into RAM whole.
 pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Which data a backup covers (spec general/006 scope syntax). Parsing is
+/// Which data a backup covers (scope syntax). Parsing is
 /// syntax-only — domain existence is checked when a backup job actually runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupScope {
@@ -82,7 +82,7 @@ impl BackupScope {
     }
 
     /// Filesystem/ID-safe slug used in `bk_<timestamp>_<slug>` when no
-    /// schedule name overrides it (spec general/006 backup IDs).
+    /// schedule name overrides it.
     pub fn slug(&self) -> String {
         self.as_string().replace(':', "-")
     }
@@ -133,7 +133,7 @@ pub enum BackupError {
 
 /// Validates the client-facing backup id charset (`^bk_[A-Za-z0-9_-]+$`) —
 /// the only input that ever turns into a path under `backup.dir`, so this is
-/// the traversal guard (spec general/006, "no path from client data").
+/// the traversal guard (no path from client data).
 pub(crate) fn validate_backup_id(id: &str) -> Result<(), BackupError> {
     let valid = id.len() > 3
         && id.starts_with("bk_")
@@ -220,7 +220,7 @@ pub struct RestoreStatus {
     pub finished_at: Option<u64>,
 }
 
-// ── Metrics (spec general/006 metrics section) ──────────────────────────
+// ── Metrics ──────────────────────────
 
 /// Lifetime backup counters, updated by `start_backup`'s job task on
 /// completion. Held directly on `BackupManager` (not `MetricsStore`) so the
@@ -249,7 +249,7 @@ impl BackupMetrics {
     }
 }
 
-/// `GET /store-api/metrics` "backup" block projection (spec general/006).
+/// `GET /store-api/metrics` "backup" block projection.
 #[derive(Debug, Clone, Default)]
 pub struct BackupMetricsSnapshot {
     pub last_success_at: u64,
@@ -284,8 +284,8 @@ pub struct BackupManager {
     control: Arc<ControlPlane>,
     slot: parking_lot::Mutex<Option<RunningJobInfo>>,
     restores: parking_lot::RwLock<HashMap<String, RestoreStatus>>,
-    /// Serializes upload id-allocation + finalize-rename (spec general/006
-    /// POST /backups/upload) — uploads don't take the job `slot` (pure file
+    /// Serializes upload id-allocation + finalize-rename (POST
+    /// /backups/upload) — uploads don't take the job `slot` (pure file
     /// I/O, no engine access), so this narrower lock is the only thing
     /// preventing two concurrent uploads from racing onto the same id.
     upload_lock: parking_lot::Mutex<()>,
@@ -318,7 +318,7 @@ impl BackupManager {
         self.scan_pause_ms = pause_ms;
     }
 
-    /// `GET /store-api/metrics` "backup" block (spec general/006 metrics section).
+    /// `GET /store-api/metrics` "backup" block.
     pub fn metrics_snapshot(&self) -> BackupMetricsSnapshot {
         BackupMetricsSnapshot {
             last_success_at: self.metrics.last_success_at.load(Ordering::Relaxed),
@@ -421,8 +421,8 @@ impl BackupManager {
     /// Marks the slot busy, records a `running` status entry, and spawns the
     /// restore. Beyond "does the backup file exist", validation (checksum,
     /// remap, domain-exists) happens inside the job and surfaces only via
-    /// [`Self::get_restore_status`] — matching the spec's restore response,
-    /// which is always `202 running`.
+    /// [`Self::get_restore_status`] — the restore response itself is always
+    /// `202 running`.
     pub async fn start_restore(
         self: &Arc<Self>,
         backup_id: &str,
@@ -527,7 +527,7 @@ impl BackupManager {
         unreachable!("the restore registry is finite")
     }
 
-    /// Snapshot of a restore job's status (spec general/006 `GET /restores/{id}`).
+    /// Snapshot of a restore job's status (`GET /restores/{id}`).
     pub fn get_restore_status(&self, restore_id: &str) -> Option<RestoreStatus> {
         self.restores.read().get(restore_id).cloned()
     }
@@ -538,7 +538,7 @@ impl BackupManager {
         self.dir.join(format!("{id}.ndjson"))
     }
 
-    // ── Upload (spec general/006 POST /backups/upload) ──────────────────
+    // ── Upload (POST /backups/upload) ──────────────────
 
     /// Collision-safe scratch path for a streamed upload, before its
     /// identity (checksum-verified manifest -> allocated id) is known. Named
@@ -549,7 +549,7 @@ impl BackupManager {
     }
 
     /// Allocates the server-assigned `bk_..._upload[_N]` id and atomically
-    /// renames the validated scratch file onto it (spec: the manifest's own
+    /// renames the validated scratch file onto it (the manifest's own
     /// id is never adopted). Locked so two concurrent uploads can never race
     /// onto the same id (uploads don't take the job `slot`).
     pub(crate) fn finalize_upload(&self, temp_path: &Path) -> Result<String, BackupError> {
@@ -564,7 +564,7 @@ impl BackupManager {
     }
 
     /// Full manifest-line read for `GET /backups/{id}` and the upload
-    /// response (spec general/006: full manifest fields), alongside the same
+    /// response (full manifest fields), alongside the same
     /// cheap Complete/Incomplete classification `list_backups`/`get_backup`
     /// use (no full SHA-256 pass).
     pub(crate) fn get_backup_manifest(&self, id: &str) -> Result<(writer::ManifestLine, BackupState, u64), BackupError> {
@@ -620,7 +620,7 @@ impl BackupManager {
     /// `DELETE /backups/{id}`. Refuses while the id is the active job, while
     /// a running restore reads this archive (the slot's id is then the
     /// restore id and the archive id sits in `scope`), or while a `.part`
-    /// file for it exists — spec general/006 `backup_running`.
+    /// file for it exists — error `backup_running`.
     pub fn delete_backup(&self, id: &str) -> Result<(), BackupError> {
         validate_backup_id(id)?;
         let blocked = self
@@ -641,7 +641,7 @@ impl BackupManager {
         std::fs::remove_file(&path).map_err(|e| BackupError::Other(e.into()))
     }
 
-    /// Retention (spec general/006 Scheduler step 3): keeps the `keep_last`
+    /// Retention: keeps the `keep_last`
     /// most recent **complete** backups of `schedule_name`, deletes the
     /// rest. On-demand backups (`schedule = null`) never match the
     /// caller-supplied name; uploaded archives are excluded explicitly,
@@ -726,8 +726,8 @@ fn read_backup_manifest_raw(path: &Path) -> anyhow::Result<(writer::ManifestLine
 }
 
 /// Reads a backup's manifest line (first line) plus a cheap tail-peek to
-/// classify it `Complete`/`Incomplete` without a full SHA-256 pass (spec
-/// general/006: the real verification runs only in the restore/upload path).
+/// classify it `Complete`/`Incomplete` without a full SHA-256 pass (the
+/// real verification runs only in the restore/upload path).
 fn read_backup_summary(path: &Path) -> anyhow::Result<BackupSummary> {
     let (manifest, is_complete, size_bytes) = read_backup_manifest_raw(path)?;
 
@@ -989,8 +989,8 @@ mod manager_tests {
             let (manager, _e, backup_dir) = make_manager().await;
             // Occupy the base id for this second AND the next, so the assertion
             // holds even when the wall clock rolls over between this now_secs()
-            // call and the one inside allocate_backup_id (spec general/008:
-            // no time-flaky tests).
+            // call and the one inside allocate_backup_id (no time-flaky
+            // tests).
             let now = now_secs();
             for ts in [now, now + 1] {
                 let base_id = format!("bk_{}_kv", cron::format_utc_timestamp(ts));

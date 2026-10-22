@@ -26,7 +26,7 @@ pub(crate) fn is_supported_format(format_version: u32) -> bool {
     (1..=FORMAT_VERSION).contains(&format_version)
 }
 
-/// Keys exported between two yields (spec perf/017 A2).
+/// Keys exported between two yields.
 const EXPORT_KEY_YIELD_INTERVAL: u32 = 1024;
 
 // ── Wire format (shared with `restore`) ─────────────────────────────────
@@ -191,7 +191,7 @@ pub(crate) struct BackupParams<'a> {
 
 /// Runs the full export: `<id>.ndjson.part` -> fsync -> rename to
 /// `<id>.ndjson` -> fsync of the directory. On any error the `.part` file is
-/// removed (spec general/006 job flow step 5) and the error propagates for
+/// removed and the error propagates for
 /// the caller to log.
 pub(crate) async fn run_backup(params: BackupParams<'_>) -> anyhow::Result<()> {
     let part_path = params.dir.join(format!("{}.ndjson.part", params.id));
@@ -457,8 +457,7 @@ async fn write_json_section(
 }
 
 /// Serializes one line, appends `\n`, writes it, and feeds the exact bytes,
-/// including the trailing newline, into the running checksum (spec
-/// general/006 backup format).
+/// including the trailing newline, into the running checksum.
 async fn write_line(
     out: &mut PartFile,
     hasher: &mut Sha256,

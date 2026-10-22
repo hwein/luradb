@@ -83,7 +83,7 @@ impl IntoResponse for ApiError {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, "1".parse().unwrap());
         }
-        // RFC 6585 §3: a 428 must not be stored by a cache.
+        // RFC 6585 section 3: a 428 must not be stored by a cache.
         if self.0 == StatusCode::PRECONDITION_REQUIRED {
             resp.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -266,7 +266,7 @@ mod tests {
         assert!(!c.contains("::2".parse().unwrap()));
     }
 
-    // ── Spec test 1: trusted proxy → client_ip from X-Forwarded-For ───────
+    // ── Test 1: trusted proxy → client_ip from X-Forwarded-For ────────────
 
     #[test]
     fn trusted_proxy_xff_gives_real_ip() {
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(client_ip, "5.6.7.8".parse::<IpAddr>().unwrap());
     }
 
-    // ── Spec test 2: non-trusted peer → headers ignored ───────────────────
+    // ── Test 2: non-trusted peer → headers ignored ────────────────────────
 
     #[test]
     fn non_trusted_proxy_xff_ignored() {
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(client_ip, peer);
     }
 
-    // ── Spec test 3: empty trusted_proxies → headers never evaluated ───────
+    // ── Test 3: empty trusted_proxies → headers never evaluated ────────────
 
     #[test]
     fn empty_trusted_proxies_uses_peer_ip() {
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(client_ip, peer);
     }
 
-    // ── Spec general/007 test 4: error-mapping ──────────────────────────────
+    // ── Error mapping ───────────────────────────────────────────────────────
 
     #[test]
     fn api_error_maps_400_prefix_to_bad_request() {

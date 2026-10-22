@@ -1,4 +1,4 @@
-//! On-disk/wire format break rkyv 0.7 → 0.8 (spec general-010 §5).
+//! On-disk/wire format break rkyv 0.7 → 0.8.
 //!
 //! The fixtures under `tests/fixtures/rkyv07/` were serialized with rkyv 0.7
 //! and are frozen. They pin down empirically which of our archived types

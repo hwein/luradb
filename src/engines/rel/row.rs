@@ -1,10 +1,10 @@
-//! LuraRow binary row codec (spec rel/005 §3-4, concept 5.4).
+//! LuraRow binary row codec.
 //!
 //! Compact per-column format with an 8-byte-aligned slot array (zero-copy
-//! preparation, perf/002). Header/slot fields are little-endian; the var
+//! preparation). Header/slot fields are little-endian; the var
 //! region is raw bytes. Each slot carries its `col_id` in the `col_dir`, so a
 //! row is bound to columns by *id*, not position — ADD/DROP/RENAME COLUMN are
-//! readable without a row rewrite (§4).
+//! readable without a row rewrite.
 //!
 //! ```text
 //! 0 : schema_version u16 LE
@@ -68,7 +68,7 @@ pub fn encode_row(schema: &TableSchema, values_by_col_id: &HashMap<u16, ScalarVa
     out
 }
 
-/// Decodes every column of `schema` from `row` (schema-evolution read path §4).
+/// Decodes every column of `schema` from `row` (schema-evolution read path).
 pub fn decode_row(row: &[u8], schema: &TableSchema) -> Vec<ScalarValue> {
     match RowView::new(row) {
         Some(v) => schema.columns.iter().map(|c| v.get(c)).collect(),
@@ -76,7 +76,7 @@ pub fn decode_row(row: &[u8], schema: &TableSchema) -> Vec<ScalarValue> {
     }
 }
 
-/// Decodes a single column's value from `row` (schema-evolution read path §4).
+/// Decodes a single column's value from `row` (schema-evolution read path).
 pub fn decode_value(row: &[u8], col: &ColumnDef) -> ScalarValue {
     match RowView::new(row) {
         Some(v) => v.get(col),
@@ -85,7 +85,7 @@ pub fn decode_value(row: &[u8], col: &ColumnDef) -> ScalarValue {
 }
 
 /// A column absent from the row's `col_dir` (ADD COLUMN newer than the row):
-/// a `Literal` default fills it, everything else reads as `NULL` (§4).
+/// a `Literal` default fills it, everything else reads as `NULL`.
 fn read_fill(col: &ColumnDef) -> ScalarValue {
     match &col.default {
         DefaultValue::Literal(v) => v.clone(),

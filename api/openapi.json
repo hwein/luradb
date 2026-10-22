@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.10.0",
+    "version": "0.10.1",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -55,7 +55,7 @@
           "Auth"
         ],
         "summary": "Returns all created users (admins and regular users) with their domain\npermission matrix. API keys are not included.",
-        "description": "For `role == \"Admin\"`, `permissions` is meaningless for access control:\nadmins have unconditional access regardless of its contents (kv/012). It\nis usually empty for an admin but not guaranteed to be — e.g. a user\npromoted to admin via `luradb.toml` keeps any permissions set before the\npromotion. Never read an empty array as \"no access\" or a non-empty one as\na restriction on an Admin row.\n\nThe list reflects the permission table as stored — it is not cross-checked\nagainst existing domains, so an entry for a since-deleted (or not-yet-created)\ndomain is shown unchanged.",
+        "description": "For `role == \"Admin\"`, `permissions` is meaningless for access control:\nadmins have unconditional access regardless of its contents. It\nis usually empty for an admin but not guaranteed to be — e.g. a user\npromoted to admin via `luradb.toml` keeps any permissions set before the\npromotion. Never read an empty array as \"no access\" or a non-empty one as\na restriction on an Admin row.\n\nThe list reflects the permission table as stored — it is not cross-checked\nagainst existing domains, so an entry for a since-deleted (or not-yet-created)\ndomain is shown unchanged.",
         "operationId": "list_users",
         "responses": {
           "200": {
@@ -323,7 +323,7 @@
           "Auth"
         ],
         "summary": "Returns the caller's own identity. Unlike every other endpoint under this\ntag, reachable by any authenticated caller — not admin-only (the\n`auth_layer` middleware whitelists this path, see `middleware.rs`).",
-        "description": "Checked in order: `auth.enabled = false` → `Disabled`; a `TrustedPeer`\n(UDS peer authenticated by the kernel, spec perf/001) → `TrustedPeer`;\notherwise the Bearer key is resolved to its `UserRecord` → `Admin`/`User`.\nA `401` past the `auth_layer` middleware (which already validates the key)\ncan only mean a middleware bug — fail-closed, analogous to `enforce_sql_level`.",
+        "description": "Checked in order: `auth.enabled = false` → `Disabled`; a `TrustedPeer`\n(UDS peer authenticated by the kernel) → `TrustedPeer`;\notherwise the Bearer key is resolved to its `UserRecord` → `Admin`/`User`.\nA `401` past the `auth_layer` middleware (which already validates the key)\ncan only mean a middleware bug — fail-closed, analogous to `enforce_sql_level`.",
         "operationId": "whoami",
         "responses": {
           "200": {
@@ -383,7 +383,7 @@
         "tags": [
           "Backup"
         ],
-        "summary": "Starts an on-demand backup job (spec general/006 scope syntax for `scope`).",
+        "summary": "Starts an on-demand backup job.",
         "operationId": "create_backup",
         "requestBody": {
           "content": {
@@ -789,7 +789,7 @@
           "Metrics"
         ],
         "summary": "`GET /config` — effective configuration of the running process. Admin only.",
-        "description": "The path carries no `{domain}` segment, so `extract_domain` returns `None`\nand the auth layer's None-branch requires an admin role (spec\ngeneral/022). The admin API key never appears in the body — redaction\nhappens at the field level (`AdminEntry.api_key`'s `#[serde(skip_serializing)]`\nin config.rs), not in this handler.",
+        "description": "The path carries no `{domain}` segment, so `extract_domain` returns `None`\nand the auth layer's None-branch requires an admin role. The admin API\nkey never appears in the body — redaction happens at the field level\n(`AdminEntry.api_key`'s `#[serde(skip_serializing)]` in config.rs), not\nin this handler.",
         "operationId": "get_config",
         "responses": {
           "200": {
@@ -983,7 +983,7 @@
         "tags": [
           "Events"
         ],
-        "summary": "Opens a Server-Sent Events stream of global lifecycle/DDL events: domains created, deleted and\npurged across all three engines, plus relational table/view/index DDL and JSON index DDL.\nAdmin-only — the path carries no domain segment, so the standard auth middleware rejects any\nnon-admin caller (spec general/018 §3).",
+        "summary": "Opens a Server-Sent Events stream of global lifecycle/DDL events: domains created, deleted and\npurged across all three engines, plus relational table/view/index DDL and JSON index DDL.\nAdmin-only — the path carries no domain segment, so the standard auth middleware rejects any\nnon-admin caller.",
         "description": "A `Last-Event-ID` (header or `?last_event_id=`, header wins) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. This\nstream has its own tag (`g`) and sequence, entirely independent of `GET /store-api/kv/{domain}/watch`'s\n(`w`) — an id from one stream is `unknown_id` at the other.",
         "operationId": "get_events",
         "parameters": [
@@ -1560,7 +1560,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Reads a document; `_key`/`_version` are top-level fields and an opaque\n`ETag` is exposed for use with `If-Match` (json/011).",
+        "summary": "Reads a document; `_key`/`_version` are top-level fields and an opaque\n`ETag` is exposed for use with `If-Match`.",
         "operationId": "get_document",
         "parameters": [
           {
@@ -1930,7 +1930,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Streams all documents of a domain as NDJSON without full buffering. A\ndocument written before json/017 that still carries a top-level\n`_key`/`_version`/`_content` field exports lossy, same as before — no\nmigration reshapes existing data.",
+        "summary": "Streams all documents of a domain as NDJSON without full buffering. A\nlegacy document that still carries a top-level\n`_key`/`_version`/`_content` field exports lossy, same as before — no\nmigration reshapes existing data.",
         "operationId": "export_documents",
         "parameters": [
           {
@@ -3331,7 +3331,7 @@
           "Key-Value Store"
         ],
         "summary": "Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.\nThe connection stays open until the client disconnects; a keep-alive ping is sent automatically.",
-        "description": "A `Last-Event-ID` (header or `?last_event_id=`, spec kv/024) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. A\nclient that ignores `id:`/`reset` behaves exactly as before this was added.",
+        "description": "A `Last-Event-ID` (header or `?last_event_id=`) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. A\nclient that ignores `id:`/`reset` behaves exactly as before this was added.",
         "operationId": "watch",
         "parameters": [
           {
@@ -3399,7 +3399,7 @@
         "tags": [
           "Logs"
         ],
-        "summary": "Reads the last N lines of a log file (spec general/005).",
+        "summary": "Reads the last N lines of a log file.",
         "operationId": "get_logs",
         "parameters": [
           {
@@ -3490,7 +3490,7 @@
         "tags": [
           "Logs"
         ],
-        "summary": "Lists every `luradb.log*` file in the log directory (spec general/005).\n`files[0]` is exactly the file `GET /logs` reads without a `file` param.",
+        "summary": "Lists every `luradb.log*` file in the log directory.\n`files[0]` is exactly the file `GET /logs` reads without a `file` param.",
         "operationId": "list_files",
         "responses": {
           "200": {
@@ -3727,7 +3727,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Returns metadata for a single relational domain. A domain in `deleting`\nstate answers 410 Gone (rel/013 finishes the physical purge).",
+        "summary": "Returns metadata for a single relational domain. A domain in `deleting`\nstate answers 410 Gone (a background purge removes the data later).",
         "operationId": "get_domain",
         "parameters": [
           {
@@ -3787,7 +3787,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Marks a relational domain as deleting. Its tables/views become\ninaccessible immediately; physical cleanup follows in rel/013.",
+        "summary": "Marks a relational domain as deleting. Its tables/views become\ninaccessible immediately; physical cleanup follows in the background.",
         "operationId": "delete_domain",
         "parameters": [
           {
@@ -3802,7 +3802,7 @@
         ],
         "responses": {
           "202": {
-            "description": "Deletion accepted — background purge follows (rel/013)"
+            "description": "Deletion accepted — background purge follows"
           },
           "404": {
             "description": "Domain not found",
@@ -3887,7 +3887,7 @@
             }
           },
           "403": {
-            "description": "Access level too low for this statement (rel/011)",
+            "description": "Access level too low for this statement",
             "content": {
               "text/plain": {
                 "schema": {
@@ -4039,7 +4039,7 @@
         "tags": [
           "Relational Import"
         ],
-        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column (spec §5.1), then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues (spec §5.2). Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement (rel/011 pattern).",
+        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column, then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues. Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement.",
         "operationId": "create_table_from_file",
         "parameters": [
           {
@@ -4488,7 +4488,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Inserts one row from a JSON object body (`{column: value, …}`). An omitted\nAUTOINCREMENT primary key is assigned the next sequence value (rel/005\n§9); this compiles onto the exact same bound INSERT plan `/sql` would use.",
+        "summary": "Inserts one row from a JSON object body (`{column: value, …}`). An omitted\nAUTOINCREMENT primary key is assigned the next sequence value; this\ncompiles onto the exact same bound INSERT plan `/sql` would use.",
         "operationId": "insert_row",
         "parameters": [
           {
@@ -4542,7 +4542,7 @@
             }
           },
           "403": {
-            "description": "Missing read access to a linked KV/JSON domain (rel/016)",
+            "description": "Missing read access to a linked KV/JSON domain",
             "content": {
               "text/plain": {
                 "schema": {
@@ -4726,7 +4726,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Partially updates a row by primary key: only the columns named in the\nbody are set, everything else stays unchanged (spec §5). Not an upsert —\na PK the table doesn't have answers 404, never a create.",
+        "summary": "Partially updates a row by primary key: only the columns named in the\nbody are set, everything else stays unchanged. Not an upsert —\na PK the table doesn't have answers 404, never a create.",
         "operationId": "update_row",
         "parameters": [
           {
@@ -4789,7 +4789,7 @@
             }
           },
           "403": {
-            "description": "Missing read access to a linked KV/JSON domain (rel/016)",
+            "description": "Missing read access to a linked KV/JSON domain",
             "content": {
               "text/plain": {
                 "schema": {
@@ -4854,7 +4854,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Deletes a row by primary key. Hanging REFERENCES from other tables are\nnot blocked by this (rel/005 §11) — they resolve to `null` afterwards.",
+        "summary": "Deletes a row by primary key. Hanging REFERENCES from other tables are\nnot blocked by this — they resolve to `null` afterwards.",
         "operationId": "delete_row",
         "parameters": [
           {
@@ -5029,7 +5029,7 @@
         "tags": [
           "Backup"
         ],
-        "summary": "Live status of a restore job. Lives in RAM only (spec general/006) — gone\nafter a restart; the outcome is also in the log.",
+        "summary": "Live status of a restore job. Lives in RAM only — gone\nafter a restart; the outcome is also in the log.",
         "operationId": "get_restore_status",
         "parameters": [
           {
@@ -5132,7 +5132,7 @@
       },
       "BackupDetailResponse": {
         "type": "object",
-        "description": "Manifest fields + state + size (spec general/006 GET /backups/{id} and\nPOST /backups/upload). Everything but `id`/`state`/`scope` is optional:\nthe currently-running-job shape (`running`) only fills `started_at`; the\ncomplete/incomplete shape fills the rest instead.",
+        "description": "Manifest fields + state + size (GET /backups/{id} and\nPOST /backups/upload). Everything but `id`/`state`/`scope` is optional:\nthe currently-running-job shape (`running`) only fills `started_at`; the\ncomplete/incomplete shape fills the rest instead.",
         "required": [
           "id",
           "state",
@@ -5406,7 +5406,7 @@
       },
       "CountResponse": {
         "type": "object",
-        "description": "Generic `{\"count\": N}` response, shared by JSON's `count_documents`, KV's\n`count_keys`, and rel's `count_rows` (spec general/017) — one schema\ninstead of three identical ones.",
+        "description": "Generic `{\"count\": N}` response, shared by JSON's `count_documents`, KV's\n`count_keys`, and rel's `count_rows` — one schema\ninstead of three identical ones.",
         "required": [
           "count"
         ],
@@ -6085,7 +6085,7 @@
           },
           "state": {
             "type": "string",
-            "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running, rel/013).\nAlways present — so rel/013's later `list_domains` visibility change\n(surfacing `Deleting` domains too) needs no REST-contract change."
+            "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running).\nAlways present — so a later `list_domains` visibility change\n(surfacing `Deleting` domains too) needs no REST-contract change."
           }
         }
       },
@@ -6248,7 +6248,7 @@
             "items": {
               "type": "object"
             },
-            "description": "One JSON object per row (catalog column order in principle; `serde_json`'s\ndefault map is unordered/alphabetical here, see rel_browse.rs module docs),\nwith an optional `_expanded` block (spec §6)."
+            "description": "One JSON object per row (catalog column order in principle; `serde_json`'s\ndefault map is unordered/alphabetical here, see rel_browse.rs module docs),\nwith an optional `_expanded` block."
           }
         }
       },
@@ -6340,7 +6340,7 @@
         "properties": {
           "access": {
             "type": "string",
-            "description": "Access level: `\"read\"`, `\"write\"` or `\"ddl\"` (spec rel/011)."
+            "description": "Access level: `\"read\"`, `\"write\"` or `\"ddl\"`."
           },
           "domain": {
             "type": "string",
@@ -6351,7 +6351,7 @@
               "string",
               "null"
             ],
-            "description": "Store type of the domain: `\"kv\"` (default), `\"json\"` (spec json/012) or `\"rel\"` (spec rel/011)."
+            "description": "Store type of the domain: `\"kv\"` (default), `\"json\"` or `\"rel\"`."
           }
         }
       },
@@ -6384,18 +6384,18 @@
             "items": {
               "type": "string"
             },
-            "description": "REFERENCES columns to resolve into embedded objects, or `[\"*\"]` for\nall of them (§5). Only valid for SELECT; non-empty on DML/DDL → 400."
+            "description": "REFERENCES columns to resolve into embedded objects, or `[\"*\"]` for\nall of them. Only valid for SELECT; non-empty on DML/DDL → 400."
           },
           "params": {
             "type": "array",
             "items": {
               "type": "object"
             },
-            "description": "Positional parameters (JSON array), bound to the `?` placeholders\n(rel/004/005). Omitted ⇒ empty array."
+            "description": "Positional parameters (JSON array), bound to the `?` placeholders.\nOmitted ⇒ empty array."
           },
           "sql": {
             "type": "string",
-            "description": "Exactly one LuraSQL statement (more → 400 `MultipleStatements`, rel/004)."
+            "description": "Exactly one LuraSQL statement (more → 400 `MultipleStatements`)."
           }
         }
       },
@@ -6546,7 +6546,7 @@
           },
           "role": {
             "type": "string",
-            "description": "`\"Admin\"`, `\"User\"`, or a pseudo-role: `\"TrustedPeer\"` (UDS peer\nauthenticated by the kernel, spec perf/001) or `\"Disabled\"`\n(`auth.enabled = false`)."
+            "description": "`\"Admin\"`, `\"User\"`, or a pseudo-role: `\"TrustedPeer\"` (UDS peer\nauthenticated by the kernel) or `\"Disabled\"`\n(`auth.enabled = false`)."
           }
         }
       }

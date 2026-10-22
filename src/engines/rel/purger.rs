@@ -1,4 +1,4 @@
-//! Background cleanup for the relational engine (spec rel/013).
+//! Background cleanup for the relational engine.
 //!
 //! Two jobs per tick: (a) fully purge `Deleting` domains — tombstone their
 //! `ROW:`/`IDX:`/`SEQ:` data, then drop the `CAT:` definitions + catalog id
@@ -38,7 +38,7 @@ impl RelDomainPurger {
         Ok(())
     }
 
-    // ── Job (a): fully purge Deleting domains (§3) ──────────────────────────
+    // ── Job (a): fully purge Deleting domains ──────────────────────────
 
     async fn purge_deleting_domains(&self) -> anyhow::Result<()> {
         for domain in self.engine.domains.list_deleting_domains() {
@@ -90,7 +90,7 @@ impl RelDomainPurger {
         Ok(())
     }
 
-    // ── Job (b): reap orphaned ranges of active domains (§4) ────────────────
+    // ── Job (b): reap orphaned ranges of active domains ────────────────
 
     async fn sweep_active_domains(&self) -> anyhow::Result<()> {
         for domain in self.engine.domains.list_domains() {
@@ -109,12 +109,12 @@ impl RelDomainPurger {
     /// Reaps orphaned `ROW:`/`SEQ:`/`IDX:` ranges of one active domain: the
     /// prefix ranges of `table_id`/`index_id`s that were allocated (`≤` the
     /// high-water mark) but are no longer catalog-live (dropped tables/indexes;
-    /// ids are never reused, rel/003). Candidates are re-derived fresh each
+    /// ids are never reused). Candidates are re-derived fresh each
     /// tick from `high-water mark \ live` and confirmed by a prefix probe, so
     /// the sweep is crash-trivial and idempotent. Bounded by the per-tick
     /// delete budget; drained candidates yield cheap empty probes that consume
     /// none of it, so progress is guaranteed and steady-state ticks are near
-    /// no-ops (§4). No write guard: dropped ids never re-enter `live`, so a
+    /// no-ops. No write guard: dropped ids never re-enter `live`, so a
     /// late writer on a dropped id is harmless and reaped on a later tick.
     async fn sweep_one_active(&self, domain: &RelDomain) -> anyhow::Result<()> {
         let prefix = &domain.system_prefix;
@@ -130,7 +130,7 @@ impl RelDomainPurger {
             if live.contains(id) {
                 continue;
             }
-            // A reserved index id (in-flight CREATE INDEX, rel/013 F1) is not an
+            // A reserved index id (in-flight CREATE INDEX) is not an
             // orphan yet — its backfilled IDX bytes must survive this sweep.
             if self.engine.catalog.is_id_reserved(prefix, id) {
                 continue;
@@ -496,7 +496,7 @@ mod tests {
         })
     }
 
-    // 12. Regression (§3): an in-flight writer parked on the write guard before
+    // 12. Regression: an in-flight writer parked on the write guard before
     //     delete_domain must abort (410/404) instead of landing keys after the
     //     purger finalized — no orphan ROW keys survive.
     #[test]
@@ -612,7 +612,7 @@ mod tests {
         })
     }
 
-    // 15. Regression (rel/013 F1): the orphan sweep must spare an index id that
+    // 15. Regression: the orphan sweep must spare an index id that
     //     is reserved by an in-flight CREATE INDEX (the
     //     create_index_reserve→commit window). The reserved id is past the
     //     high-water mark but not yet catalog-live, so without the reservation
@@ -653,7 +653,7 @@ mod tests {
         })
     }
 
-    // 16. Regression (rel/009 F2): finalizing a deleting domain drops its
+    // 16. Regression: finalizing a deleting domain drops its
     //     rate-limiter bucket, so a recreated same-name domain cannot inherit
     //     the old (possibly drained) bucket state.
     #[test]

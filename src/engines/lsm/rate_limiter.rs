@@ -15,7 +15,7 @@ fn now_millis() -> u64 {
 
 // ── DomainQuota ───────────────────────────────────────────────────────────────
 
-/// Per-domain resource limits (spec §2c).
+/// Per-domain resource limits.
 #[derive(Clone, Copy)]
 pub struct DomainQuota {
     /// Max read operations per second.
@@ -107,8 +107,7 @@ impl TokenBucket {
 
     /// Drains the bucket and locks out lazy refill (`last_refill` pushed far
     /// into the future) — stays deterministically empty no matter how much
-    /// real time passes before the next `try_consume` (flaky-test fix, spec
-    /// general/008).
+    /// real time passes before the next `try_consume` (avoids flaky tests).
     #[cfg(test)]
     pub fn drain_for_test(&self) {
         // Order matters: lock refill first, then drain — the other way

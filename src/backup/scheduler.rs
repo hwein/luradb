@@ -1,4 +1,4 @@
-//! Backup scheduler (spec general/006 "Scheduler"): an engine task that ticks
+//! Backup scheduler: an engine task that ticks
 //! once a minute, matches every configured schedule's cron expression against
 //! the current UTC minute, and starts a backup job on a match. Retention runs
 //! after a scheduled job completes successfully.
@@ -73,10 +73,9 @@ impl BackupScheduler {
     }
 
     /// One minute tick: evaluates every schedule's cron against `now`'s UTC
-    /// calendar fields (spec general/006 "Scheduler" — match against the
-    /// current minute, not next-fire computation; no catch-up of missed
-    /// ticks). Pure/callable so tests can drive it directly without a real
-    /// 60s sleep loop.
+    /// calendar fields (match against the current minute, not next-fire
+    /// computation; no catch-up of missed ticks). Pure/callable so tests can
+    /// drive it directly without a real 60s sleep loop.
     pub async fn tick(&self, now: u64) {
         let t = cron::civil_from_unix(now);
         for entry in &self.entries {
@@ -95,7 +94,7 @@ impl BackupScheduler {
                     ))
                     .detach();
                 }
-                // Spec step 1: slot busy -> skip this tick, warn, no catch-up.
+                // Slot busy -> skip this tick, warn, no catch-up.
                 Err(BackupError::Busy) => {
                     tracing::warn!(
                         "[Backup Scheduler] job slot busy, skipping this tick for schedule '{}'",
@@ -104,8 +103,7 @@ impl BackupScheduler {
                 }
                 // A schedule pointing at a missing domain (or any other
                 // synchronous rejection) fails at runtime and is logged —
-                // spec general/006 startup validation — the scheduler
-                // itself must never abort on one bad schedule.
+                // the scheduler itself must never abort on one bad schedule.
                 Err(e) => {
                     tracing::warn!("[Backup Scheduler] schedule '{}' failed to start: {e}", entry.name);
                 }
@@ -115,7 +113,7 @@ impl BackupScheduler {
 }
 
 /// Waits for a scheduled backup job to finish, then applies retention
-/// (spec general/006 Scheduler step 3) if — and only if — it actually
+/// if — and only if — it actually
 /// produced a complete backup. Split out from `tick` so tests can await it
 /// directly instead of racing a detached task.
 async fn retain_after_success(
@@ -199,9 +197,8 @@ mod tests {
         }
     }
 
-    // 1. Tick skips a matching schedule while the job slot is busy (spec
-    //    general/006 Scheduler step 1) -- the pre-existing running job must
-    //    be left completely undisturbed.
+    // 1. Tick skips a matching schedule while the job slot is busy -- the
+    //    pre-existing running job must be left completely undisturbed.
     #[test]
     fn test_tick_skips_matching_schedule_when_slot_busy() {
         crate::core::engine_runtime::block_on(async {
@@ -225,7 +222,7 @@ mod tests {
     }
 
     // 2. Tick starts a backup when a schedule's cron matches and the slot is
-    //    free (spec general/006 Scheduler step 2).
+    //    free.
     #[test]
     fn test_tick_starts_backup_when_cron_matches_and_slot_free() {
         crate::core::engine_runtime::block_on(async {
@@ -279,7 +276,7 @@ mod tests {
             scheduler.tick(now_secs()).await;
 
             let job = manager.running_job().expect("the first schedule must have started a job");
-            // ID suffix carries the schedule name (spec: "ID-Suffix = Schedule-Name").
+            // ID suffix carries the schedule name.
             assert!(job.id.ends_with("_first"), "the first schedule must have won the slot, got id '{}'", job.id);
         })
     }

@@ -1,7 +1,7 @@
-//! Index definitions and management for the JSON store (spec json/004).
+//! Index definitions and management for the JSON store.
 //!
 //! An index definition declares *which* field of a domain gets indexed;
-//! writing the actual `IDX:` entries happens on the write path (spec 005).
+//! writing the actual `IDX:` entries happens on the write path.
 
 use super::domain::JsonDomainRegistry;
 use super::error::JsonStoreError;
@@ -116,7 +116,7 @@ pub fn encode_index_value(value: &Value, field_type: IndexFieldType) -> Option<V
     }
 }
 
-// ── Index LSM keys (spec json/005) ────────────────────────────────────────────
+// ── Index LSM keys ────────────────────────────────────────────
 
 pub(crate) const IDX_PREFIX: &[u8] = b"IDX:";
 
@@ -185,11 +185,11 @@ pub fn parse_index_key(lsm_key: &[u8]) -> Option<(String, String, Vec<u8>, Strin
 
 /// Manages index definitions per domain (in-memory cache + LSM persistence).
 pub struct IndexRegistry {
-    /// Domain name → definitions. Read on every document write (spec 005).
+    /// Domain name → definitions. Read on every document write.
     indexes: RwLock<HashMap<String, Vec<IndexDefinition>>>,
     engine: Arc<LsmStorageEngine>,
     /// Serializes index DDL (create/delete/purge) — check-then-act spans an
-    /// await (general/003).
+    /// await.
     ddl_lock: Mutex<()>,
 }
 
@@ -261,7 +261,7 @@ impl IndexRegistry {
     }
 
     /// Removes ALL index definitions of a domain — persistence and cache.
-    /// Used by the domain purger (spec json/013).
+    /// Used by the domain purger.
     pub(crate) async fn purge_domain_definitions(&self, domain: &str) -> Result<(), JsonStoreError> {
         let _guard = self.ddl_lock.lock().await;
         let mut prefix = SYS_INDEX_PREFIX.to_vec();
@@ -320,7 +320,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // Spec general/030: an index-definition key at a maximal domain name and
+    // An index-definition key at a maximal domain name and
     // a 1-byte field fits the startup lower bound of json.lsm.max_key_length.
     #[test]
     fn test_sys_index_key_at_max_domain_fits_key_limit_lower_bound() {

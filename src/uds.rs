@@ -1,4 +1,4 @@
-//! Unix Domain Socket transport (spec perf/001).
+//! Unix Domain Socket transport.
 //!
 //! Serves the same Axum router as the TCP listener. Local processes skip the
 //! kernel TCP/IP stack entirely; peers whose UID is in `auth.trusted_uids`

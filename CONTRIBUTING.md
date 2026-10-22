@@ -35,12 +35,12 @@ differently) — "it would make me happy" is not a benefit.
 - **Bug reports** — open an issue with the server version (`GET /version`
   or `luradb --version`), reproduction steps, expected vs. observed
   behavior, and relevant logs.
-- **Feature contributions** — open a PR (see §3) and argue the feature bar
-  from §1 in writing.
+- **Feature contributions** — open a PR (see Code contributions & CLA) and
+  argue the feature bar from Project philosophy & scope in writing.
 - **Documentation fixes** — open a PR.
 
 The maintainer does not hold design discussions. The written case for the
-feature bar from §1 belongs in the PR description (or an issue it links
+feature bar above belongs in the PR description (or an issue it links
 to). It gets read and decided, not debated.
 
 ## 3. Code contributions & CLA

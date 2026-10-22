@@ -1,9 +1,9 @@
-//! Domain management for the JSON store (spec json/003).
+//! Domain management for the JSON store.
 //!
 //! Self-hosting pattern like the KV `DomainRegistry`: metadata lives in the
 //! JSON LSM instance under `__sys:json_domain:{name}`, separate from document
-//! data. Deletion only marks the domain `Deleting`; physical cleanup follows
-//! in spec json/013.
+//! data. Deletion only marks the domain `Deleting`; the background purger
+//! does the physical cleanup.
 
 use super::error::JsonStoreError;
 use crate::engines::lsm::domain::{fnv64, now_secs};
@@ -24,7 +24,7 @@ fn sys_key(name: &str) -> Vec<u8> {
     k
 }
 
-/// Lower bound of `json.lsm.max_key_length` (spec general/030): the longest
+/// Lower bound of `json.lsm.max_key_length`: the longest
 /// management key, `__sys:json_domain:{name}` at a maximal name, plus 1 byte.
 pub(crate) const MIN_LSM_KEY_LENGTH: usize = SYS_JSON_DOMAIN_PREFIX.len() + MAX_DOMAIN_NAME_LEN + 1;
 
@@ -181,7 +181,7 @@ impl JsonDomainRegistry {
     }
 
     /// Lists all domains including `Deleting` ones (state is part of the
-    /// returned model, spec json/013).
+    /// returned model).
     pub fn list_domains(&self) -> Vec<JsonDomain> {
         self.domains.read().values().cloned().collect()
     }
@@ -197,7 +197,7 @@ impl JsonDomainRegistry {
     }
 
     /// Marks the domain `Deleting` and persists the change. Documents and
-    /// indexes stay on disk until the purger (spec json/013) cleans them up.
+    /// indexes stay on disk until the purger cleans them up.
     pub(crate) async fn delete_domain(&self, name: &str) -> Result<(), JsonStoreError> {
         let mut domain = match self.get_domain_any(name) {
             None => return Err(JsonStoreError::DomainNotFound(name.to_string())),
@@ -238,7 +238,7 @@ impl JsonDomainRegistry {
 mod tests {
     use super::*;
 
-    // Spec general/030: the domain key at a maximal name stays below the
+    // The domain key at a maximal name stays below the
     // startup lower bound of json.lsm.max_key_length.
     #[test]
     fn test_sys_key_at_max_name_fits_key_limit_lower_bound() {

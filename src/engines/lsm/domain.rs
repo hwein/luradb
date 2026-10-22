@@ -4,12 +4,12 @@
 //! deterministic system prefix derived from its name via FNV-64a; all KV operations
 //! are transparently prefixed so keys from different domains never collide.
 //!
-//! Spec 009 additions:
+//! Lifecycle and runtime state:
 //! - `DomainState`: active vs. deleting (lazy background purge).
 //! - `DomainRuntime`: non-serializable per-domain state (rate limiter).
 //! - `DomainPurger`: background task that tombstones keys of deleting domains.
 //!
-//! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
+//! Per-domain statistics are recorded in the `MetricsStore`.
 
 use crate::control::{ControlPlane, Engine};
 use crate::core::coop::YieldEvery;
@@ -35,7 +35,7 @@ use tokio::sync::broadcast;
 const SYS_DOMAIN_PREFIX: &[u8] = b"__sys:domain:";
 
 /// Keys the post-scan loops of one method process between two yields; they
-/// share one counter (spec perf/017 A2, perf/033).
+/// share one counter.
 const KEY_LOOP_YIELD_INTERVAL: u32 = 4096;
 
 /// Single-key write lock shards per domain. Not configurable — the number
@@ -52,9 +52,9 @@ async fn strip_domain_prefix(raw_keys: Vec<Vec<u8>>, prefix_len: usize, coop: &m
     out
 }
 
-/// Keeps the user-keys containing `needle` (case-sensitive, spec kv/023). A
-/// non-UTF-8 key would be an invariant break (general/007 guarantees UTF-8
-/// keys) — skip it rather than fail the request.
+/// Keeps the user-keys containing `needle` (case-sensitive). A non-UTF-8 key
+/// would be an invariant break (key validation guarantees UTF-8 keys) — skip
+/// it rather than fail the request.
 async fn filter_contains(keys: Vec<Vec<u8>>, needle: &str, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for key in keys {
@@ -67,7 +67,7 @@ async fn filter_contains(keys: Vec<Vec<u8>>, needle: &str, coop: &mut YieldEvery
 }
 
 /// Takes the page `offset..offset + limit` of `keys`; every key it skips or
-/// leaves over ticks `coop`, so dropping them yields too (spec perf/033).
+/// leaves over ticks `coop`, so dropping them yields too.
 async fn take_page(keys: Vec<Vec<u8>>, offset: usize, limit: usize, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
     let mut page = Vec::with_capacity(keys.len().saturating_sub(offset).min(limit));
     for (i, key) in keys.into_iter().enumerate() {
@@ -81,7 +81,7 @@ async fn take_page(keys: Vec<Vec<u8>>, offset: usize, limit: usize, coop: &mut Y
 }
 
 /// Counts `keys`, releasing them one by one; every key ticks `coop`, so
-/// dropping the list yields too (spec perf/034).
+/// dropping the list yields too.
 async fn count_and_release(keys: Vec<Vec<u8>>, coop: &mut YieldEvery) -> u64 {
     let mut count = 0;
     for _ in keys {
@@ -543,7 +543,7 @@ pub struct DomainStore {
     metrics: Arc<MetricsStore>,
 }
 
-/// Key metadata without the value bytes (spec kv/022): TTL expiry and the
+/// Key metadata without the value bytes: TTL expiry and the
 /// write time of the newest visible version. Backs `GET …/{key}/meta`;
 /// never dereferences a VLog pointer.
 #[derive(Debug, Clone, PartialEq)]
@@ -728,7 +728,7 @@ impl DomainStore {
         self.engine.write_kv_pair_admitted(&self.prefixed_key(key), value, Some(1), || self.admit()).await
     }
 
-    /// Reads a value by user key — three-valued (spec kv/018): `Present`,
+    /// Reads a value by user key — three-valued: `Present`,
     /// `Null` (key exists in the NULL state), or `Absent`. Records latency
     /// and hit/miss in MetricsStore (a `Null` read counts as a hit).
     pub async fn get(&self, key: &[u8]) -> Result<GetResult> {
@@ -755,7 +755,7 @@ impl DomainStore {
     }
 
     /// Reads a key's TTL expiry and last-modified time without its value
-    /// bytes (spec kv/022) — backs `GET …/{key}/meta`; never dereferences a
+    /// bytes — backs `GET …/{key}/meta`; never dereferences a
     /// VLog pointer. Same validation and rate-limiting as `get`, including
     /// the same hit/miss rule (a `Null` key is a hit, only an absent key is
     /// a miss) — the read still spends a rate-limit token on the domain path.
@@ -799,7 +799,7 @@ impl DomainStore {
     /// `prefix`, optionally narrowed by a case-sensitive `contains`
     /// substring filter on the user key — same filter semantics as
     /// `delete_by_prefix` (a non-UTF-8 key is skipped, not an error). One
-    /// read token per call (spec kv/028): the scan itself stays unbounded,
+    /// read token per call: the scan itself stays unbounded,
     /// same server cost as `scan_keys`/`count_keys` — only the wire response
     /// is capped. `total` counts the filtered set before `offset`/`limit`
     /// are applied; returns `(page, total)`.
@@ -827,9 +827,8 @@ impl DomainStore {
     }
 
     /// Counts live user-keys whose raw form starts with `prefix` — same scan
-    /// as `scan_keys` (spec general/017), without materializing the stripped
-    /// key strings; the scanned list is released key by key with yield points
-    /// (spec perf/034).
+    /// as `scan_keys`, without materializing the stripped key strings; the
+    /// scanned list is released key by key with yield points.
     pub async fn count_keys(&self, prefix: &[u8]) -> Result<u64> {
         if !self.runtime.rate_limiter.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
@@ -841,8 +840,8 @@ impl DomainStore {
     }
 
     /// Deletes every live user-key matching `prefix`, optionally narrowed by
-    /// a case-sensitive `contains` substring filter on the user key (spec
-    /// kv/023). Order is binding (spec §3): the write token is checked
+    /// a case-sensitive `contains` substring filter on the user key. Order
+    /// is binding: the write token is checked
     /// before the scan runs, so a request that will fail the write limit
     /// never pays for scan work; the scan itself pulls its own read token
     /// (`scan_keys`). Atomic — one `write_batch` call for the whole
@@ -883,7 +882,7 @@ impl DomainStore {
 
     /// Test-only: drains and locks this domain's read bucket so the next
     /// read deterministically answers 429 — no refill race no matter how
-    /// slow the test runs (flaky-test fix, spec general/008 pattern).
+    /// slow the test runs (avoids flaky tests).
     #[cfg(test)]
     pub fn drain_read_budget_for_test(&self) {
         self.runtime.rate_limiter.read_bucket.drain_for_test();
@@ -891,20 +890,19 @@ impl DomainStore {
 
     /// Test-only: write-bucket counterpart of
     /// [`Self::drain_read_budget_for_test`] — used to prove the write-token
-    /// check in [`Self::delete_by_prefix`] runs before the scan (spec kv/023
-    /// §3.2): draining only the write bucket leaves the read bucket
+    /// check in [`Self::delete_by_prefix`] runs before the scan: draining
+    /// only the write bucket leaves the read bucket
     /// untouched, so a following read still succeeds.
     #[cfg(test)]
     pub fn drain_write_budget_for_test(&self) {
         self.runtime.rate_limiter.write_bucket.drain_for_test();
     }
 
-    /// Restore-path upsert (spec general/006): same key validation as
+    /// Restore-path upsert: same key validation as
     /// [`Self::put`]/[`Self::put_with_ttl`] but takes the absolute
     /// `expire_at` directly (no now-relative round trip) and bypasses the
-    /// rate limiter (admin maintenance operation, per spec general/006's
-    /// authorization section — the restore throttle is `scan_batch_size`/
-    /// `scan_pause_ms`).
+    /// rate limiter (admin-only maintenance operation — the restore throttle
+    /// is `scan_batch_size`/`scan_pause_ms`).
     pub(crate) async fn put_unthrottled(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
         self.validate_user_key(key)?;
         let start = std::time::Instant::now();
@@ -924,18 +922,17 @@ impl DomainStore {
     }
 
     /// Reads a value against an externally held snapshot, with `expire_at`
-    /// (spec general/006 backup export) instead of reading the current state
+    /// (backup export) instead of reading the current state
     /// like [`Self::get`] — lets the backup writer pin every read
     /// of a domain export to the same point in time. Bypasses the rate
-    /// limiter (admin maintenance operation, per spec general/006's
-    /// authorization section).
+    /// limiter (admin-only maintenance operation).
     pub async fn get_with_snapshot(&self, key: &[u8], snapshot: &Snapshot) -> Result<(GetResult, u64)> {
         self.validate_user_key(key)?;
         self.engine.get_with_expiry(&self.prefixed_key(key), snapshot).await
     }
 
     /// Returns all user-keys (raw form) visible under `snapshot` and
-    /// starting with `prefix` (spec general/006 backup export) — the
+    /// starting with `prefix` (backup export) — the
     /// snapshot-pinned counterpart of [`Self::scan_keys`]. Bypasses the rate
     /// limiter (admin maintenance operation).
     pub async fn scan_keys_with_snapshot(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
@@ -946,9 +943,9 @@ impl DomainStore {
     }
 
     /// Subscribes to write events for this domain (domain prefix already
-    /// stripped), optionally resuming from `last_event_id` (spec kv/024 §4).
+    /// stripped), optionally resuming from `last_event_id`.
     ///
-    /// Step order is binding (spec kv/024 §4.3): subscribing to the raw
+    /// Step order is binding: subscribing to the raw
     /// engine broadcast happens *before* the ring snapshot, so nothing can
     /// be lost between the snapshot and the relay task picking up live
     /// traffic — only overlap, which the caller suppresses using the
@@ -980,8 +977,7 @@ impl DomainStore {
                     }
                     // A silent `continue` would hide the gap forever — the
                     // domain-filtered stream isn't sequence-contiguous by
-                    // construction, so the client can't infer it either
-                    // (spec kv/024 §6).
+                    // construction, so the client can't infer it either.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if tx.send(WatchMessage::Gap).is_err() {
                             break;
@@ -995,7 +991,7 @@ impl DomainStore {
         WatchStart { resume, rx, epoch: self.engine.watch_epoch() } // step 4
     }
 
-    /// Current head of the engine's watch-stream sequence (spec kv/024 §5)
+    /// Current head of the engine's watch-stream sequence
     /// — stamps a `reset` triggered by a live lag, as opposed to one from
     /// the initial resume decision, which already carries its own `head`.
     pub fn watch_head(&self) -> u64 {
@@ -1004,7 +1000,7 @@ impl DomainStore {
 
     /// Filters a resume's replay list to this domain's keys and strips the
     /// domain prefix — the ring holds raw (prefixed) keys across every
-    /// domain (spec kv/024 §2.1); `head` and non-`Replay` variants pass
+    /// domain; `head` and non-`Replay` variants pass
     /// through unchanged.
     fn strip_domain_prefix(&self, resume: Resume<WalEvent>) -> Resume<WalEvent> {
         match resume {
@@ -1084,7 +1080,7 @@ mod tests {
         make_setup_with_engine_config(LsmEngineConfig::default()).await
     }
 
-    // Spec kv/024 tests 3/5/11 need a non-default `watch_replay_buffer_size`
+    // Some watch tests need a non-default `watch_replay_buffer_size`
     // or `wal_event_channel_capacity` — every other test keeps using the
     // default-config `make_setup` above.
     async fn make_setup_with_engine_config(
@@ -1150,7 +1146,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 A3: KV point reads (value and meta) register no snapshot.
+    // KV point reads (value and meta) register no snapshot.
     #[test]
     fn test_point_reads_register_no_snapshot() {
         crate::core::engine_runtime::block_on(async {
@@ -1166,7 +1162,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 test 8: after a domain's first read the read path looks up
+    // After a domain's first read the read path looks up
     // no map -- the window hangs off the domain's runtime -- and the numbers
     // `/metrics` reports stay what they were.
     #[test]
@@ -1418,7 +1414,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/007: UTF-8 key invariant ───────────────────────────────
+    // ── UTF-8 key invariant ─────────────────────────────────────────────────
 
     // Test 1a: all five DomainStore operations reject a non-UTF-8 key with a
     // "400 "-prefixed error.
@@ -1447,7 +1443,7 @@ mod tests {
         })
     }
 
-    // Test 1b: valid UTF-8 keys (umlaut, 4-byte emoji codepoint) are unaffected.
+    // Test 1b: valid UTF-8 keys (accent, 4-byte emoji codepoint) are unaffected.
     #[test]
     fn test_valid_utf8_keys_unaffected() {
         crate::core::engine_runtime::block_on(async {
@@ -1499,7 +1495,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/006: snapshot-pinned reads/scans (backup export) ───────
+    // ── Snapshot-pinned reads/scans (backup export) ─────────────────────────
 
     // get_with_snapshot/scan_keys_with_snapshot must strip the domain prefix
     // like their unpinned counterparts and stay isolated between domains.
@@ -1527,7 +1523,7 @@ mod tests {
     }
 
     // Writes after the snapshot are invisible to the pinned domain read/scan,
-    // while the domain's live view has moved on (spec general/006, consistency section).
+    // while the domain's live view has moved on.
     #[test]
     fn test_domain_snapshot_consistency() {
         crate::core::engine_runtime::block_on(async {
@@ -1549,7 +1545,7 @@ mod tests {
         })
     }
 
-    // ── Spec kv/024: watch event ids, resume & gap signal ───────────────────
+    // ── Watch event ids, resume & gap signal ────────────────────────────────
 
     // Test 1: 10 writes, disconnect after event 3, reconnect with its id ->
     // exactly events 4..=10, in order, as a gapless Replay (no reset).
@@ -1699,8 +1695,8 @@ mod tests {
     }
 
     // Test 11: watch_replay_buffer_size = 0 -> id: still assigned, and even
-    // an immediate reconnect with the just-received id resets (spec §4.2:
-    // the cap == 0 row is checked before the window-arithmetic rows).
+    // an immediate reconnect with the just-received id resets (cap == 0 is
+    // checked before the window arithmetic).
     #[test]
     fn test_watch_cap_zero_ids_present_but_every_resume_is_window_exceeded() {
         crate::core::engine_runtime::block_on(async {
@@ -1728,8 +1724,8 @@ mod tests {
         })
     }
 
-    // Test 12: an id tagged for a different stream (general/018's "g") must
-    // reset as unknown_id, never silently succeed.
+    // Test 12: an id tagged for a different stream (the events stream's
+    // "g") must reset as unknown_id, never silently succeed.
     #[test]
     fn test_watch_foreign_tag_is_unknown_id() {
         crate::core::engine_runtime::block_on(async {
@@ -1748,7 +1744,7 @@ mod tests {
     }
 
     // Replay is filtered to this domain's keys and prefix-stripped, exactly
-    // like the live relay (spec kv/024 §2.1/§4.3) -- a foreign domain's
+    // like the live relay -- a foreign domain's
     // events in the same engine-wide ring must never surface here.
     #[test]
     fn test_watch_replay_is_isolated_and_stripped_per_domain() {
@@ -1785,12 +1781,12 @@ mod tests {
         })
     }
 
-    // ── Spec kv/023: prefix bulk-delete ──────────────────────────────────────
+    // ── Prefix bulk-delete ───────────────────────────────────────────────────
 
     /// Reopens an `LsmStorageEngine` on `dir`'s existing WAL/VLog/SSTable
     /// files (same file names as `make_setup`) — mirrors `engine.rs`'s own
     /// `engine_on` test helper; needed here to prove `delete_by_prefix`'s
-    /// batch survives a real restart (spec kv/023 §8 test 11).
+    /// batch survives a real restart.
     async fn reopen_engine(dir: &tempfile::TempDir) -> Arc<LsmStorageEngine> {
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -1810,8 +1806,8 @@ mod tests {
 
     // Test 11: delete_by_prefix's write_batch is atomic across a restart —
     // every key of the deleted selection stays gone after WAL recovery, the
-    // same property the existing engine-level write_batch tests prove
-    // (json/005), exercised here through the domain-scoped bulk-delete path.
+    // same property the existing engine-level write_batch tests prove,
+    // exercised here through the domain-scoped bulk-delete path.
     #[test]
     fn test_delete_by_prefix_atomic_and_recovered() {
         crate::core::engine_runtime::block_on(async {
@@ -1843,7 +1839,7 @@ mod tests {
         })
     }
 
-    // Spec perf/017 test 4: a 20 000-key `scan_keys_page` with a `contains`
+    // A 20 000-key `scan_keys_page` with a `contains`
     // filter hands the thread back, so a point `get` spawned after it
     // answers first.
     #[test]
@@ -1878,7 +1874,7 @@ mod tests {
         })
     }
 
-    // Spec perf/033: dropping the keys a page skips or leaves over hands the
+    // Dropping the keys a page skips or leaves over hands the
     // thread back — one key above a yield interval leaves exactly one
     // interval of keys to drop for `limit = 1`.
     #[test]
@@ -1919,7 +1915,7 @@ mod tests {
         })
     }
 
-    // Spec perf/034: releasing the counted keys hands the thread back — one
+    // Releasing the counted keys hands the thread back — one
     // key above a yield interval gives exactly one yield.
     #[test]
     fn test_count_and_release_yields_while_dropping_keys() {

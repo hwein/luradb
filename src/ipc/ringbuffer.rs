@@ -1,4 +1,4 @@
-//! Double-mmap SPSC command ringbuffer (spec perf/008 §1–4, §6).
+//! Double-mmap SPSC command ringbuffer.
 //!
 //! The data segment is mapped twice, back-to-back, so a length-prefixed frame
 //! straddling the physical end wraps with no branch or modulo. Two monotonic
@@ -140,7 +140,7 @@ pub enum RingSendError {
 }
 
 /// The framing written by an untrusted producer is inconsistent. The caller
-/// logs it and stops this ring (spec §6, orchestrator note 2).
+/// logs it and stops this ring.
 #[derive(Debug, Error, PartialEq)]
 #[error("ring corrupt: {0}")]
 pub struct RingCorrupt(&'static str);

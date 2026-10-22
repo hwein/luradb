@@ -1,7 +1,7 @@
-//! LEFT JOIN execution (spec rel/007): `IndexNestedLoopJoin` operator, ON
+//! LEFT JOIN execution: `IndexNestedLoopJoin` operator, ON
 //! resolution + probe-strategy selection, multi-binding column resolution,
 //! left-deep join-chain planning. Reuses `RowScan`/`Filter`/`Sort`/
-//! `OffsetLimitOp`/`RowSource` (select.rs), the rel/005 evaluator (eval.rs)
+//! `OffsetLimitOp`/`RowSource` (select.rs), the WHERE evaluator (eval.rs)
 //! and key builders (keys.rs) unchanged — this module only adds the join
 //! layer between the base scan and the residual filter.
 
@@ -30,13 +30,13 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-// ── Dynamic RowSource boxing (spec §2 Rust note) ──────────────────────────
+// ── Dynamic RowSource boxing ──────────────────────────
 //
-// `RowSource::next` is RPITIT (rel/006 §2 pattern), which is not `dyn`-safe.
+// `RowSource::next` is RPITIT, which is not `dyn`-safe.
 // A join chain has dynamic depth (`max_join_depth` stages), so the left input
 // of an `IndexNestedLoopJoin` cannot be a single fixed generic type the way
 // v1's finitely-many pipeline shapes are (`RowPipeline` enum). This trait is
-// the one sanctioned boxing seam (rel/006 §2 comment): it boxes exactly the
+// the one sanctioned boxing seam (see `RowSource`): it boxes exactly the
 // recursive edge (the left input's `next()` future), not the whole operator
 // tree — Filter/Sort/OffsetLimit above the join still compose statically via
 // generics over `IndexNestedLoopJoin`, unchanged from v1's mechanism.
@@ -54,7 +54,7 @@ impl<T: RowSource + Send> DynRowSource for T {
     }
 }
 
-// ── Probe strategy & JoinProbe (spec §3) ─────────────────────────────────────
+// ── Probe strategy & JoinProbe ─────────────────────────────────────
 
 #[derive(Clone, Copy)]
 enum ProbeStrategy {
@@ -63,10 +63,10 @@ enum ProbeStrategy {
     ScanFallback,
 }
 
-/// The right-hand sonde of one join stage: how to turn a left ON-value into
-/// 0..n right `SourceBinding`s (spec §2/§3). `pub(super)`: named (though never
+/// The right-hand probe of one join stage: how to turn a left ON-value into
+/// 0..n right `SourceBinding`s. `pub(super)`: named (though never
 /// constructed or inspected) in `build_join_probe`'s `pub(super)` return type,
-/// used by rel/008 `view.rs`'s CREATE-time bind-and-discard.
+/// used by `view.rs`'s CREATE-time bind-and-discard.
 pub(super) struct JoinProbe {
     engine: Arc<LsmStorageEngine>,
     snapshot: Snapshot,
@@ -80,21 +80,21 @@ pub(super) struct JoinProbe {
     value_source: (usize, usize),
     strategy: ProbeStrategy,
     /// The left value's declared type is INTEGER while the right column is
-    /// REAL — the one implicit widening (spec §3); the probe value must be
+    /// REAL — the one implicit widening; the probe value must be
     /// converted before `encode_sortable`.
     widen_int_to_real: bool,
     /// Statement-wide cumulative `ScanFallback` row-visit counter, shared
-    /// across every fallback-using join stage (spec §3).
+    /// across every fallback-using join stage.
     fallback_budget: Arc<AtomicU64>,
     max_fallback_scan: usize,
-    /// Read masking (spec rel/012 §3): the right side shares the query's rel
+    /// Read masking of link cells: the right side shares the query's rel
     /// domain, so its link cells mask by the same flags as the left.
     mask: LinkMask,
 }
 
 impl JoinProbe {
     /// The LEFT-preserved binding: all-NULL, used for "no match" and "NULL ON
-    /// value" alike (spec §4).
+    /// value" alike.
     fn null_binding(&self) -> SourceBinding {
         SourceBinding {
             table_id: self.right_table.table_id,
@@ -103,7 +103,7 @@ impl JoinProbe {
         }
     }
 
-    /// A matched right-hand row. Masking (spec rel/012 §3) is applied to the
+    /// A matched right-hand row. Link masking is applied to the
     /// materialized output only — the physical join match (by key/eval)
     /// already happened, so a hanging link still joins but reads as `NULL`.
     fn row_binding(&self, mut values: Vec<ScalarValue>) -> SourceBinding {
@@ -111,19 +111,19 @@ impl JoinProbe {
         SourceBinding { table_id: self.right_table.table_id, alias: self.right_alias.clone(), values }
     }
 
-    /// Executes one probe for a non-NULL left value `v` (spec §3/§9): returns
+    /// Executes one probe for a non-NULL left value `v`: returns
     /// the right-hand hits (0..n `SourceBinding`s); the caller turns an empty
-    /// result into the LEFT-preserved all-NULL binding (spec §4).
+    /// result into the LEFT-preserved all-NULL binding.
     async fn probe(&self, v: &ScalarValue) -> Result<Vec<SourceBinding>, RelStoreError> {
         self.metrics.record_rel_join_probes(1);
-        // spec rel/012: a masked right ON-column reads NULL for every row;
+        // A masked right ON-column reads NULL for every row;
         // NULL never matches under 3-valued ON equality, so skip storage.
         if self.mask.masks(self.right_table.columns[self.right_col_pos].col_type) {
             return Ok(Vec::new());
         }
         let v = self.widened(v);
-        // NULL is already excluded by the caller (spec §2); every other
-        // ScalarValue encodes to `Some` (rel/003).
+        // NULL is already excluded by the caller; every other
+        // ScalarValue encodes to `Some`.
         let Some(val_enc) = encode_sortable(&v) else { return Ok(Vec::new()) };
 
         match self.strategy {
@@ -133,7 +133,7 @@ impl JoinProbe {
         }
     }
 
-    /// The one implicit widening (spec §3): an INTEGER left value probing a
+    /// The one implicit widening: an INTEGER left value probing a
     /// REAL right column.
     fn widened(&self, v: &ScalarValue) -> ScalarValue {
         if self.widen_int_to_real {
@@ -151,7 +151,7 @@ impl JoinProbe {
         self.metrics.record_rel_select_scanned_keys(1);
         match self.engine.get_with_snapshot(&key, &self.snapshot).await?.into_option() {
             Some(bytes) => Ok(vec![self.row_binding(decode_row(&bytes, &self.right_table))]),
-            None => Ok(Vec::new()), // ghost or never existed — not a hit (spec §2 Snapshot & Ghosts)
+            None => Ok(Vec::new()), // ghost or never existed — not a hit
         }
     }
 
@@ -168,17 +168,17 @@ impl JoinProbe {
             self.metrics.record_rel_select_scanned_keys(1);
             if let Some(bytes) = self.engine.get_with_snapshot(&row_key, &self.snapshot).await?.into_option() {
                 out.push(self.row_binding(decode_row(&bytes, &self.right_table)));
-            } // ghost: skip, not a hit (spec §2)
+            } // ghost: skip, not a hit
         }
         Ok(out)
     }
 
     async fn probe_scan_fallback(&self, v: &ScalarValue) -> Result<Vec<SourceBinding>, RelStoreError> {
         let row_prefix = keys::row_table_prefix(&self.right_prefix, self.right_table.table_id);
-        // Cap the scan itself (spec rel/007 F1): scan only the remaining
+        // Cap the scan itself: scan only the remaining
         // budget + 1, so a right table bigger than the cap is never fully
         // materialized before the cap check below ever runs. Saturating, so a
-        // budget of usize::MAX does not overflow (spec general/030).
+        // budget of usize::MAX does not overflow.
         let consumed = self.fallback_budget.load(Ordering::Relaxed);
         let remaining = (self.max_fallback_scan as u64).saturating_sub(consumed);
         let scan_keys = self
@@ -214,11 +214,11 @@ impl JoinProbe {
     }
 }
 
-// ── IndexNestedLoopJoin (spec §2) ────────────────────────────────────────────
+// ── IndexNestedLoopJoin ────────────────────────────────────────────
 
 /// Sits above its left source (a base scan or a shallower join). Streaming:
 /// buffers only the current left row's right-hand hits, never the whole
-/// input (spec §2).
+/// input.
 struct IndexNestedLoopJoin {
     left: Box<dyn DynRowSource>,
     probe: JoinProbe,
@@ -242,7 +242,7 @@ impl RowSource for IndexNestedLoopJoin {
             };
             let (bi, vi) = self.probe.value_source;
             let v = lrow.bindings[bi].values[vi].clone();
-            // Three-valued ON (spec §4/concept 3.7): NULL never probes.
+            // Three-valued ON: NULL never probes.
             let right_bindings = if matches!(v, ScalarValue::Null) {
                 vec![self.probe.null_binding()]
             } else {
@@ -268,8 +268,8 @@ impl RowSource for IndexNestedLoopJoin {
     }
 }
 
-/// The finitely many SELECT pipeline shapes over a join chain (spec §6 step
-/// 5), mirroring v1's `RowPipeline` (select.rs) but based on
+/// The finitely many SELECT pipeline shapes over a join chain,
+/// mirroring v1's `RowPipeline` (select.rs) but based on
 /// `IndexNestedLoopJoin` instead of `RowScan` — same Filter/Sort/OffsetLimit,
 /// no new mechanism.
 enum JoinRowPipeline {
@@ -299,12 +299,12 @@ impl JoinRowPipeline {
     }
 }
 
-// ── Multi-binding column resolution (spec §5) ────────────────────────────────
+// ── Multi-binding column resolution ────────────────────────────────
 
 /// One FROM-/JOIN-chain source: its binding key (`AS` alias, else table name)
-/// and schema, in statement order (base first, spec §5).
+/// and schema, in statement order (base first).
 /// `pub(super)`: reused by the view CREATE-time/dependency structural bind
-/// (rel/008 `view.rs`), which builds these directly from base tables once
+/// (`view.rs`), which builds these directly from base tables once
 /// the inliner has fully flattened a (possibly view-touching) SELECT.
 pub(super) struct BindingInfo {
     pub(super) alias: String,
@@ -313,7 +313,7 @@ pub(super) struct BindingInfo {
 
 /// Flat position of each binding's first column — the position space WHERE
 /// residual/ORDER BY/projection resolve into once bindings are concatenated
-/// via `select::flatten` (spec §5/§7.1). `pub(super)`: reused by rel/008 `view.rs`.
+/// via `select::flatten`. `pub(super)`: reused by `view.rs`.
 pub(super) fn flat_offsets(bindings: &[BindingInfo]) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(bindings.len());
     let mut acc = 0usize;
@@ -324,7 +324,7 @@ pub(super) fn flat_offsets(bindings: &[BindingInfo]) -> Vec<usize> {
     offsets
 }
 
-/// `pub(super)`: reused by rel/008 `view.rs` (structural bind over a fully
+/// `pub(super)`: reused by `view.rs` (structural bind over a fully
 /// flattened statement).
 pub(super) fn check_unique_aliases(bindings: &[BindingInfo]) -> Result<(), RelStoreError> {
     let mut seen = HashSet::new();
@@ -373,9 +373,9 @@ fn try_resolve_in_many(
     Ok(hit)
 }
 
-/// General column resolution (spec §5: WHERE residual/ORDER BY/projection)
+/// General column resolution (WHERE residual/ORDER BY/projection)
 /// against the *full* binding list — qualified/unqualified, ambiguous, or
-/// not-found all become hard errors here. `pub(super)`: reused by rel/008 `view.rs`.
+/// not-found all become hard errors here. `pub(super)`: reused by `view.rs`.
 pub(super) fn resolve_multi(cref: &ColumnRef, bindings: &[BindingInfo]) -> Result<(usize, usize), RelStoreError> {
     match try_resolve_in_many(cref, bindings)? {
         Some(hit) => Ok(hit),
@@ -390,7 +390,7 @@ pub(super) fn resolve_multi(cref: &ColumnRef, bindings: &[BindingInfo]) -> Resul
     }
 }
 
-/// Which side of the binding split an ON operand resolved into (spec §3).
+/// Which side of the binding split an ON operand resolved into.
 enum OnSide {
     Known(usize, usize),
     New(usize),
@@ -398,7 +398,7 @@ enum OnSide {
 
 /// Resolves one ON operand against the two disjoint sets a join stage sees:
 /// the already-established bindings and the newly-joined table. Exactly one
-/// must hit (spec §3's "violations" list; ambiguity/no-match are hard errors).
+/// must hit (ambiguity/no-match are hard errors).
 fn resolve_on_side(
     cref: &ColumnRef,
     known: &[BindingInfo],
@@ -417,7 +417,7 @@ fn resolve_on_side(
     }
 }
 
-// ── WHERE split: base-driving vs. residual-over-the-chain (spec §6 step 2/4) ─
+// ── WHERE split: base-driving vs. residual-over-the-chain ─
 
 /// True iff every column referenced anywhere in `expr` resolves — unambiguously
 /// — to the base binding (`bindings[0]`) alone. Such a conjunct is the only
@@ -467,18 +467,18 @@ fn fold_and_exprs(conjuncts: Vec<&Expr>) -> Option<Expr> {
     Some(it.fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e.clone()))))
 }
 
-// ── Flat multi-binding WHERE binder (spec §5) ────────────────────────────────
+// ── Flat multi-binding WHERE binder ────────────────────────────────
 //
 // Mirrors `dml::bind_predicate`/`bind_compare`/`bind_pred_operand` exactly,
 // but resolves columns via `resolve_multi` (multi-binding) instead of
 // `dml::resolve_column` (single-table), and binds `PredOperand::Column` to a
-// *flat* position (spec rel/007 orchestrator note: flattening the `PlanRow`
+// *flat* position (flattening the `PlanRow`
 // into one values list and binding to flat positions is the option that
-// leaves `eval.rs` and rel/006's single-table `Pred`/`PredOperand` completely
+// leaves `eval.rs` and the single-table `Pred`/`PredOperand` completely
 // untouched — the alternative, lifting `PredOperand::Column` to a
 // `(binding_idx, value_idx)` pair, would instead have to change `eval.rs`'s
 // public types and every existing call site).
-/// `pub(super)`: reused by rel/008 `view.rs` (structural bind over a fully
+/// `pub(super)`: reused by `view.rs` (structural bind over a fully
 /// flattened statement).
 pub(super) fn bind_flat_predicate(
     expr: &Expr,
@@ -585,12 +585,12 @@ fn bind_flat_operand(
     }
 }
 
-// ── Projection & ORDER BY over multiple bindings (spec §5/§7) ───────────────
+// ── Projection & ORDER BY over multiple bindings ───────────────
 
-/// `*` → all columns of all bindings in binding order (spec §5/§7.1,
-/// duplicate names allowed); an explicit list resolves each column via
+/// `*` → all columns of all bindings in binding order (duplicate names
+/// allowed); an explicit list resolves each column via
 /// `resolve_multi` to a flat position.
-/// `pub(super)`: reused by rel/008 `view.rs` (structural bind over a fully
+/// `pub(super)`: reused by `view.rs` (structural bind over a fully
 /// flattened statement, and the `*`-expansion inside the inliner itself).
 pub(super) fn bind_join_projection(
     items: &[SelectItem],
@@ -625,7 +625,7 @@ pub(super) fn bind_join_projection(
                 });
             }
             SelectItem::Star | SelectItem::CountStar => {
-                unreachable!("grammar: Star/CountStar are only ever alone (rel/004)")
+                unreachable!("grammar: Star/CountStar are only ever alone")
             }
         }
     }
@@ -643,10 +643,10 @@ fn bind_join_order_by(
         .collect()
 }
 
-/// Depth guard (spec §8): `already_used` lets a future caller (rel/009 expand
-/// columns, which count against the same limit) feed in an already-consumed
-/// starting depth — this spec always passes 0 (signature prep only, no logic).
-/// `pub(super)`: reused by rel/008 `view.rs`'s CREATE-time full bind.
+/// Depth guard: `already_used` lets the expand path (whose columns count
+/// against the same limit) feed in an already-consumed starting depth; the
+/// SELECT path passes 0.
+/// `pub(super)`: reused by `view.rs`'s CREATE-time full bind.
 pub(super) fn check_join_depth(joins_len: usize, already_used: usize, max_join_depth: usize) -> Result<(), RelStoreError> {
     let depth = joins_len + already_used;
     if depth > max_join_depth {
@@ -655,13 +655,13 @@ pub(super) fn check_join_depth(joins_len: usize, already_used: usize, max_join_d
     Ok(())
 }
 
-/// ON resolution + type check for one join stage (spec §3) — the *structural*
+/// ON resolution + type check for one join stage — the *structural*
 /// half of `RelEngine::build_join_probe`, deliberately engine-free (no
 /// index-requirement/probe-strategy decision): exactly one ON operand must
 /// bind into `new_binding`, the other into an earlier binding (`known`,
 /// arbitrarily deep). Returns `(value_source, right_col_pos, widen_int_to_real)`.
-/// `pub(super)`: reused by rel/008 `view.rs`'s dependency re-bind (spec §7,
-/// which explicitly excludes the index requirement — a dropped index alone
+/// `pub(super)`: reused by `view.rs`'s dependency re-bind (which
+/// explicitly excludes the index requirement — a dropped index alone
 /// must not block unrelated DDL) *and* by `build_join_probe` below (which
 /// layers the probe-strategy selection on top for CREATE-time/execution binding).
 pub(super) fn resolve_join_on(
@@ -702,7 +702,7 @@ pub(super) fn resolve_join_on(
             actual: format!("{rt:?}"),
         });
     }
-    // The only implicit widening is INTEGER -> REAL (spec §3); the reverse
+    // The only implicit widening is INTEGER -> REAL; the reverse
     // (a REAL probe value against an INTEGER column) is a forbidden narrowing.
     if lt == ColumnType::Real && rt == ColumnType::Integer {
         return Err(RelStoreError::TypeMismatch {
@@ -718,7 +718,7 @@ pub(super) fn resolve_join_on(
     Ok((value_source, right_col_pos, widen_int_to_real))
 }
 
-// ── Probe-build environment (spec §7 too_many_arguments finding) ────────────
+// ── Probe-build environment ────────────
 
 /// The four statement-wide constants every join stage's `build_join_probe`
 /// call needs, bundled to stay under Clippy's argument-count threshold. Pure
@@ -731,9 +731,9 @@ pub(super) struct ProbeEnv<'a> {
     pub(super) mask: LinkMask,
 }
 
-// ── exec_select_joined helpers (spec §6) ─────────────────────────────────────
+// ── exec_select_joined helpers ─────────────────────────────────────
 
-/// WHERE split (step 2/4): base-only top-level conjuncts (may drive the base
+/// WHERE split: base-only top-level conjuncts (may drive the base
 /// scan) vs. everything else (residual over the chain).
 fn split_where<'a>(where_clause: &'a Option<Expr>, bindings: &[BindingInfo]) -> (Vec<&'a Expr>, Vec<&'a Expr>) {
     let mut base_conjuncts: Vec<&Expr> = Vec::new();
@@ -753,7 +753,7 @@ fn split_where<'a>(where_clause: &'a Option<Expr>, bindings: &[BindingInfo]) -> 
 }
 
 /// ANDs the base access path's own residual together with every join-touching
-/// WHERE conjunct, bound at flat positions (step 4).
+/// WHERE conjunct, bound at flat positions.
 fn fold_residual(
     base_residual: Option<Pred>,
     other: Vec<&Expr>,
@@ -772,7 +772,7 @@ fn fold_residual(
     Ok(residual)
 }
 
-/// ORDER BY free-order special case (spec §7): only a single ORDER BY item on
+/// ORDER BY free-order special case: only a single ORDER BY item on
 /// a *base* column can possibly ride the base access path's key order for
 /// free; anything else (including COUNT, which has no output order) forces
 /// the Sort path regardless.
@@ -787,7 +787,7 @@ fn base_order_hint(sel: &Select, bindings: &[BindingInfo], is_count: bool) -> Ve
     }
 }
 
-/// No key-count shortcut over a join (spec §7): fan-out and LEFT preservation
+/// No key-count shortcut over a join: fan-out and LEFT preservation
 /// change the count vs. the raw key set, so this always iterates the
 /// pipeline (residual-filtered, if any).
 async fn count_join_rows(chain: IndexNestedLoopJoin, residual: Option<Pred>) -> Result<i64, RelStoreError> {
@@ -812,11 +812,11 @@ async fn count_join_rows(chain: IndexNestedLoopJoin, residual: Option<Pred>) -> 
     Ok(count)
 }
 
-// ── Planner & executor entry point (spec §1/§6) ──────────────────────────────
+// ── Planner & executor entry point ──────────────────────────────
 
 impl RelEngine {
     /// Resolves one FROM-/JOIN-chain table reference. `select::exec_select`'s
-    /// `view::inline_views` pre-pass (rel/008 §1) runs before this ever does,
+    /// `view::inline_views` pre-pass runs before this ever does,
     /// so a view can no longer reach here; missing → `TableNotFound`.
     fn require_table_for_join(&self, domain: &str, name: &str) -> Result<TableSchema, RelStoreError> {
         match self.catalog.get(&self.domains, domain, name) {
@@ -832,10 +832,10 @@ impl RelEngine {
         }
     }
 
-    /// ON resolution + probe-strategy selection for one join stage (spec §3):
+    /// ON resolution + probe-strategy selection for one join stage:
     /// exactly one ON operand must bind into `new_binding`, the other into an
     /// earlier binding (`known`, arbitrarily deep — not just the previous stage).
-    /// `pub(super)`: reused by rel/008 `view.rs`'s CREATE-time full bind (which
+    /// `pub(super)`: reused by `view.rs`'s CREATE-time full bind (which
     /// needs the index requirement too, unlike the DDL dependency check —
     /// see `resolve_join_on`).
     pub(super) fn build_join_probe(
@@ -885,12 +885,12 @@ impl RelEngine {
         })
     }
 
-    /// Runs a `LEFT JOIN` SELECT/COUNT end to end (spec §1/§6): depth guard →
-    /// resolve every table ref (a view can no longer appear here — rel/008's
+    /// Runs a `LEFT JOIN` SELECT/COUNT end to end: depth guard →
+    /// resolve every table ref (a view can no longer appear here — the
     /// `view::inline_views` pre-pass already replaced it) → split WHERE into
     /// base-driving vs. residual-over-the-chain → plan the base access path
-    /// (rel/006 §3, unchanged) → build one `JoinProbe` per stage (§3) → stack
-    /// `IndexNestedLoopJoin`s left-deep (§6) → `Filter`? → `Sort`? →
+    /// (single-table planner, unchanged) → build one `JoinProbe` per stage → stack
+    /// `IndexNestedLoopJoin`s left-deep → `Filter`? → `Sort`? →
     /// `OffsetLimit` → project (or count).
     pub(super) async fn exec_select_joined(
         &self,
@@ -915,28 +915,28 @@ impl RelEngine {
         check_unique_aliases(&bindings)?;
         let offsets = flat_offsets(&bindings);
 
-        // One masking lookup for the whole query (spec rel/012 §3): every
+        // One masking lookup for the whole query: every
         // binding shares this rel domain, so one KV/JSON status pair covers all.
         let schemas: Vec<&TableSchema> = bindings.iter().map(|b| b.schema.as_ref()).collect();
         let mask = self.compute_link_mask(domain, &schemas, auth).await?;
 
         self.metrics.record_rel_select_statement();
 
-        // One snapshot for the whole statement — base *and* every join fetch
-        // (spec §2 Snapshot & Ghosts). Kept alive so compaction cannot advance
+        // One snapshot for the whole statement — base *and* every join fetch.
+        // Kept alive so compaction cannot advance
         // past it mid-pipeline; moves into the result so `expand` is covered
-        // too (rel/021).
+        // too.
         let snapshot_guard = self.engine.snapshot().await;
         let snap = snapshot_guard.snapshot().clone();
 
         let is_count = sel.items.len() == 1 && matches!(sel.items[0], SelectItem::CountStar);
 
-        // WHERE split (spec §6 step 2/4): only base-only top-level conjuncts
+        // WHERE split: only base-only top-level conjuncts
         // may drive the base scan; everything else is residual over the chain.
         let (base_conjuncts, other_conjuncts) = split_where(&sel.where_clause, &bindings);
         let base_where = fold_and_exprs(base_conjuncts);
 
-        // ORDER BY free-order special case (spec §7): only a single ORDER BY
+        // ORDER BY free-order special case: only a single ORDER BY
         // item on a *base* column can possibly ride the base access path's key
         // order for free; anything else forces the Sort path regardless.
         let base_order_local = base_order_hint(&sel, &bindings, is_count);
@@ -970,7 +970,7 @@ impl RelEngine {
             coop: YieldEvery::new(ROW_YIELD_INTERVAL),
         };
 
-        // One JoinProbe per stage, in statement order (left-deep, spec §6).
+        // One JoinProbe per stage, in statement order (left-deep).
         let fallback_budget = Arc::new(AtomicU64::new(0));
         let env = ProbeEnv { prefix: &prefix, snap: &snap, fallback_budget: &fallback_budget, mask };
         let mut probes = Vec::with_capacity(sel.joins.len());
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     // 2. INNER-emulation: WHERE b.id IS NOT NULL drops the unmatched rows,
-    // through the unchanged rel/005 evaluator.
+    // through the unchanged WHERE evaluator.
     #[test]
     fn test_inner_emulation_via_is_not_null() {
         crate::core::engine_runtime::block_on(async {
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     // 6. Dangling link: the referenced row is gone -> all-NULL binding
-    // (tolerant, concept 3.4), not an error.
+    // (tolerant), not an error.
     #[test]
     fn test_dangling_link_tolerant() {
         crate::core::engine_runtime::block_on(async {
@@ -1316,7 +1316,7 @@ mod tests {
         })
     }
 
-    // Spec general/030 test 8: the fallback's scan budget derived from
+    // The fallback's scan budget derived from
     // max_sort_rows saturates, so usize::MAX (not reachable via TOML) still
     // finds the matches.
     #[test]
@@ -1561,7 +1561,7 @@ mod tests {
         })
     }
 
-    // 22 (superseded by rel/008): a view touching the join (base or join
+    // 22: a view touching the join (base or join
     // side) is inlined to its base table before the join planner ever runs
     // — see view.rs for the dedicated view-in-join test coverage.
     #[test]
@@ -1585,7 +1585,7 @@ mod tests {
     // 23. MVCC/Ghost on the right side: a key live at scan time but gone at
     // the (older) snapshot is skipped, not surfaced as a hit. Driving this
     // through the SQL surface would need an externally-injected snapshot,
-    // which `execute()` does not expose (same reasoning as rel/006's own
+    // which `execute()` does not expose (same reasoning as select.rs's own
     // ghost test) — exercised white-box on `JoinProbe` directly instead.
     #[test]
     fn test_right_side_ghost_skipped_white_box() {
@@ -1644,7 +1644,7 @@ mod tests {
 
     // 25. COUNT(*) over a join with a WHERE residual (a join-table conjunct,
     // so `other_conjuncts` is non-empty): the `Some(pred)` arm in the COUNT
-    // branch (quality/007 prep work).
+    // branch.
     #[test]
     fn test_count_star_over_join_with_residual() {
         crate::core::engine_runtime::block_on(async {
@@ -1658,7 +1658,7 @@ mod tests {
         })
     }
 
-    // 26 (007-F1 regression): the scan-fallback cap must bound the storage
+    // 26 (regression): the scan-fallback cap must bound the storage
     // scan itself, not just the reported cumulative total. (a) a right table
     // within the cap still yields the same join result as before; (b) a
     // right table over the cap reports `scanned` bounded by `max + 1` — the
@@ -1686,7 +1686,7 @@ mod tests {
             ok(&rel2, "INSERT INTO a VALUES (100, 1)").await;
 
             // `scanned` comes straight from the same `n` the scanned-keys metric
-            // is recorded with (spec rel/007 F1) — asserting it is capped at
+            // is recorded with — asserting it is capped at
             // max+1 proves both the scan and the metric reflect the capped read,
             // not b's full (10-row) table.
             let e = err(&rel2, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag").await;
@@ -1700,7 +1700,7 @@ mod tests {
         })
     }
 
-    // 27 (012-F1 regression): a masked right ON-column (its link target
+    // 27 (regression): a masked right ON-column (its link target
     // domain gone) must probe empty — under 3-valued ON equality NULL never
     // matches, and a masked column reads NULL on every row — without ever
     // touching storage. DDL can't declare a real KVREF/JSONREF column here
@@ -1748,8 +1748,8 @@ mod tests {
         })
     }
 
-    // 27. WHERE over a join (finding 005-F1): a REAL literal / param / IN element
-    // compared against an INTEGER column widens per spec §6 instead of 400. The
+    // 27. WHERE over a join: a REAL literal / param / IN element
+    // compared against an INTEGER column widens instead of a 400. The
     // predicate sits on the right (joined) table, so it is bound by the flat
     // join binder (`bind_flat_operand`/`bind_flat_predicate`), not the base-scan
     // path — exercising the join-side mirror of the fix.
@@ -1777,7 +1777,7 @@ mod tests {
         })
     }
 
-    // 28. Spec rel/018 §Test 3 (join fallback cap, exact): a right table
+    // 28. Join fallback cap, exact: a right table
     // with exactly `max_fallback_scan` snapshot-visible rows plus ghosts
     // inserted after the snapshot must not trip `UnindexedJoinScanExceeded`
     // -- pre-fix, the live (unsnapshotted) fallback scan counted the ghosts

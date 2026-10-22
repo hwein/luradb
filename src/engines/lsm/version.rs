@@ -1,4 +1,4 @@
-//! Superversion of an LSM instance (spec kv/031 A1): every source a read
+//! Superversion of an LSM instance: every source a read
 //! needs — MemTables, SSTable levels, vLog generations — as one immutable
 //! value. A reader clones the current `Arc` and works on it alone; every
 //! change installs a complete successor in one swap.
@@ -18,7 +18,7 @@ pub(crate) struct Version {
     /// Frozen MemTables waiting for their flush, oldest first.
     pub(crate) immutables: Vec<Arc<MemTable>>,
     /// MemTables claimed by a flush in flight, oldest first — the handover
-    /// slot between `immutables` and L0 (spec general/028), older than every
+    /// slot between `immutables` and L0, older than every
     /// entry of `immutables`.
     pub(crate) flushing: Vec<Arc<MemTable>>,
     /// SSTables per level: L0 in flush order (newest last, key ranges may

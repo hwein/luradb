@@ -13,13 +13,13 @@ use axum::{
 use std::sync::Arc;
 
 /// Marker set by the UDS accept loop for connections whose kernel-verified
-/// peer UID is in `auth.trusted_uids` (spec perf/001). Grants admin access.
+/// peer UID is in `auth.trusted_uids`. Grants admin access.
 /// Clients cannot forge request extensions, so its presence is trustworthy.
 #[derive(Clone, Copy, Debug)]
 pub struct TrustedPeer;
 
 /// Store type of a domain-scoped request — KV, JSON and rel domains are
-/// separate permission namespaces (spec json/012, rel/011).
+/// separate permission namespaces.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum StoreType {
     Kv,
@@ -60,7 +60,7 @@ pub(crate) fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
 }
 
 /// POST counts as a write except for the read-only `/search` endpoint and
-/// `/sql` (rel/011 §4): its required level depends on the statement, so the
+/// `/sql`: its required level depends on the statement, so the
 /// handler enforces it after parsing — the middleware only demands `Read`.
 fn is_write_request(method: &Method, path: &str) -> bool {
     match *method {
@@ -103,7 +103,7 @@ fn forbidden() -> Response {
 }
 
 /// Result of the middleware auth check for a domain-scoped request, handed to
-/// handlers that need a finer check than the path allows (rel/009 `/sql`).
+/// handlers that need a finer check than the path allows (`/sql`).
 /// Set by `auth_layer` into the request extensions.
 #[derive(Clone, Copy, Debug)]
 pub enum AuthOutcome {
@@ -114,14 +114,14 @@ pub enum AuthOutcome {
 }
 
 /// Username of a Scoped user, set into the request extensions alongside
-/// `AuthOutcome::Scoped` (spec rel/016). Additive — `AuthOutcome` itself is
+/// `AuthOutcome::Scoped`. Additive — `AuthOutcome` itself is
 /// unchanged (`backup.rs` depends on its exact shape). Lets handlers that
 /// need a per-engine permission lookup (cross-engine link authorization)
 /// resolve the caller's username without re-deriving it from the request.
 #[derive(Clone, Debug)]
 pub struct AuthUser(pub String);
 
-/// Enforces the statement-exact level in the `/sql` handler (rel/011 §4).
+/// Enforces the statement-exact level in the `/sql` handler.
 /// `required` is mapped by the caller from `StatementClass`. `auth_enabled`
 /// comes from `AppState`: a missing outcome may only pass when auth is
 /// globally off — otherwise fail-closed (403), since a missing outcome while
@@ -154,7 +154,7 @@ pub async fn auth_layer(
         return next.run(request).await;
     }
 
-    // UDS peers with a trusted UID are authenticated by the kernel (perf/001).
+    // UDS peers with a trusted UID are authenticated by the kernel.
     if request.extensions().get::<TrustedPeer>().is_some() {
         request.extensions_mut().insert(AuthOutcome::Full);
         return next.run(request).await;
@@ -170,7 +170,7 @@ pub async fn auth_layer(
         None => return unauthorized(),
     };
 
-    // Whitelist (spec 004 §7 for /version, general/016 for whoami): any valid
+    // Whitelist (/version handshake, whoami): any valid
     // key passes for these paths, no domain permission or admin role
     // required. Must come after user resolution (so an invalid key still
     // 401s) but before the admin/domain logic below — extract_domain(…) is
@@ -195,7 +195,7 @@ pub async fn auth_layer(
         }
     };
 
-    // Domain lifecycle (create/delete) is admin-only (spec kv/012); GET on
+    // Domain lifecycle (create/delete) is admin-only; GET on
     // management paths stays open to users with a permission on the domain.
     if management
         && matches!(
@@ -208,9 +208,9 @@ pub async fn auth_layer(
 
     let perm_domain = permission_domain(store_type, domain);
     let perm = cache.get_permission(&user.name, &perm_domain).await;
-    // Ddl > Write > Read (spec rel/011 §3): a higher grant covers path-based
+    // Ddl > Write > Read: a higher grant covers path-based
     // writes too. `/sql` never requires more than Read here — the exact
-    // statement level is the handler's job (`enforce_sql_level`, §4).
+    // statement level is the handler's job (`enforce_sql_level`).
     let required_min = if is_write_request(request.method(), &path) {
         AccessLevel::Write
     } else {
@@ -226,9 +226,9 @@ pub async fn auth_layer(
     }
 }
 
-/// Axum middleware for the OpenAPI/Swagger docs routes (spec general/014).
+/// Axum middleware for the OpenAPI/Swagger docs routes.
 /// Applied only to the Swagger sub-router in `build_router` — never merged
-/// into `create_router`'s route surface, which would trip the general/009
+/// into `create_router`'s route surface, which would trip the
 /// router-contract coverage gate. Same "any valid key, no domain permission"
 /// rule as the `/version` handshake in `auth_layer` above, since docs routes
 /// aren't domain-scoped either.
@@ -373,7 +373,7 @@ mod tests {
         assert!(enforce_sql_level(true, None, Ddl).is_err());
     }
 
-    // ── HTTP-level: /version handshake + /health regression (spec 004 §7) ──
+    // ── HTTP-level: /version handshake + /health regression ──
 
     use axum::body::Body;
     use axum::http::Request;
@@ -381,7 +381,7 @@ mod tests {
     use utoipa::OpenApi;
 
     /// Shared engine/state bootstrap for `make_app_with_auth` and
-    /// `make_docs_app` below (spec general/014).
+    /// `make_docs_app` below.
     async fn make_test_state(auth_enabled: bool) -> (crate::api::AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
@@ -439,7 +439,7 @@ mod tests {
 
     /// Builds the Swagger/docs sub-router + `docs_auth_layer`, merged with the
     /// regular API router — the docs part of the frontend router
-    /// (`server::build_router`, spec general/014), without the engine bridge.
+    /// (`server::build_router`), without the engine bridge.
     async fn make_docs_app(auth_enabled: bool) -> (axum::Router, Arc<crate::auth::AuthCache>, tempfile::TempDir) {
         let (state, dir) = make_test_state(auth_enabled).await;
         let auth_cache = Arc::clone(&state.auth_cache);
@@ -503,7 +503,7 @@ mod tests {
         })
     }
 
-    // ── /store-api/config admin-only (spec general/022) ──────────────────────
+    // ── /store-api/config admin-only ──────────────────────
 
     // Regression-critical: /store-api/config carries no `{domain}` segment, so
     // its admin-only protection is entirely implicit -- it falls out of
@@ -573,7 +573,7 @@ mod tests {
         })
     }
 
-    // ── Docs routes behind auth (spec general/014) ──────────────────────────
+    // ── Docs routes behind auth ──────────────────────────
 
     #[test]
     fn docs_routes_require_key_when_auth_enabled() {
@@ -581,10 +581,10 @@ mod tests {
             let (app, _auth_cache, _dir) = make_docs_app(true).await;
 
             // openapi.json, the bare swagger_url (redirects to .../), and an
-            // asset sub-path under it (spec general/014: asset sub-paths under
-            // swagger_url) — the `*rest` wildcard SwaggerUi registers for its own
-            // static assets is part of the same sub-router, so it's covered by
-            // the same layer too, no path list needed.
+            // asset sub-path under it — the `*rest` wildcard SwaggerUi
+            // registers for its own static assets is part of the same
+            // sub-router, so it's covered by the same layer too, no path list
+            // needed.
             for uri in ["/api-docs/openapi.json", "/test-ui", "/test-ui/does-not-exist.js"] {
                 let resp = app
                     .clone()

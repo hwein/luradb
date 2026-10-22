@@ -1,6 +1,6 @@
 //! Document model and LSM key mapping for the JSON store.
 //!
-//! Blob-storage pattern (spec json/002): the whole document is serialized
+//! Blob-storage pattern: the whole document is serialized
 //! under the composite LSM key `DOC:{domain}:{key}`; the LSM layer treats
 //! the payload as opaque bytes.
 
@@ -13,12 +13,12 @@ pub(crate) const DOC_PREFIX: &[u8] = b"DOC:";
 /// Top-level field names reserved for store metadata: `_key`/`_version` are
 /// merged onto the document by `bulk::document_to_value`, `_content` wraps a
 /// non-object document. Colliding with them made a document unreadable or
-/// roundtrip-corruptible (spec json/017); nested occurrences collide with
+/// roundtrip-corruptible; nested occurrences collide with
 /// nothing and stay allowed.
 const RESERVED_FIELDS: [&str; 3] = ["_key", "_version", "_content"];
 
 /// Fixed composite-key overhead of [`doc_key`]: `DOC:` + 16-hex system
-/// prefix (json/003) + `:`.
+/// prefix + `:`.
 pub(crate) const DOC_KEY_OVERHEAD: usize = DOC_PREFIX.len() + 16 + 1;
 
 /// A JSON document as returned by the engine (transport object).
@@ -29,7 +29,7 @@ pub struct Document {
     pub content: Value,
     pub version: u64,
     /// Random incarnation id: fresh on create, stable across updates, so
-    /// stale ETags never match a recreated document (OCC/ABA, json/011).
+    /// stale ETags never match a recreated document (OCC/ABA).
     /// 0 = legacy data written before this field existed.
     #[serde(default)]
     pub generation: u64,
@@ -73,7 +73,7 @@ pub(crate) fn new_generation() -> u64 {
 }
 
 /// Builds the composite LSM key `DOC:{system_prefix}:{key}`. The prefix is
-/// the domain's colon-free hex prefix, not the user-facing name (json/003).
+/// the domain's colon-free hex prefix, not the user-facing name.
 pub fn doc_key(system_prefix: &[u8], key: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(DOC_PREFIX.len() + system_prefix.len() + 1 + key.len());
     k.extend_from_slice(DOC_PREFIX);
@@ -197,7 +197,7 @@ mod tests {
 
     // 5. reject_reserved_fields: top-level _key/_version/_content are
     //    rejected by name on an object; a nested occurrence and every
-    //    non-object always pass (spec json/017 §1).
+    //    non-object always pass.
     #[test]
     fn test_reject_reserved_fields() {
         for field in RESERVED_FIELDS {

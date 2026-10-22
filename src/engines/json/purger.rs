@@ -1,4 +1,4 @@
-//! Background cleanup for deleted JSON domains (spec json/013).
+//! Background cleanup for deleted JSON domains.
 //!
 //! Purge order per tick: `DOC:` entries first, then `IDX:` entries, then the
 //! index definitions and the domain metadata — so a crash mid-purge simply
@@ -265,7 +265,7 @@ mod tests {
         })
     }
 
-    // Regression (json/013): a writer that passed require_active before the
+    // Regression: a writer that passed require_active before the
     // domain was deleted must not land its write after the purger finalized —
     // orphan DOC keys would resurrect in a recreated same-name domain.
     #[test]
@@ -317,7 +317,7 @@ mod tests {
         })
     }
 
-    // Regression (json/013): bulk_load re-checks the domain state per batch
+    // Regression: bulk_load re-checks the domain state per batch
     // flush, so no import batch lands after the domain started deleting.
     #[test]
     fn test_bulk_flush_aborts_when_domain_deleted_mid_import() {

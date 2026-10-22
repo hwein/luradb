@@ -6,7 +6,7 @@
 //! Values below the inline threshold live directly in the MemTable;
 //! everything larger is written here and referenced via a `ValuePointer`.
 //!
-//! The log is split into *generations* (spec kv/017): exactly one generation is
+//! The log is split into *generations*: exactly one generation is
 //! active and takes appends, older ones are sealed and read-only until the
 //! Janitor has copied their live values forward. A pointer therefore carries
 //! the generation id (`file_id`) it was written to, and reads resolve it
@@ -235,7 +235,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    // Spec kv/017 test 2: a sealed generation rejects appends but stays readable.
+    // A sealed generation rejects appends but stays readable.
     #[test]
     fn test_sealed_vlog_rejects_append_but_reads() {
         crate::core::engine_runtime::block_on(async {
@@ -276,7 +276,7 @@ mod tests {
         })
     }
 
-    // Spec kv/031 test 7: reads are positional on the generation's own
+    // Reads are positional on the generation's own
     // descriptor -- two threads read one generation at once, each gets
     // exactly its bytes, and neither moves the append cursor.
     #[test]

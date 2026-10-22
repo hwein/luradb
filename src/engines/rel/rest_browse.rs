@@ -1,7 +1,7 @@
-//! Row-Browse engine entry points (spec rel/010 §3/§4/§6): `?col=` filters
-//! and the path PK compile to the same bound `Statement::Select` (rel/006)
+//! Row-Browse engine entry points: `?col=` filters
+//! and the path PK compile to the same bound `Statement::Select`
 //! `/sql` would use for the equivalent `SELECT * FROM t WHERE … LIMIT …` —
-//! no second query path. Expand reuses the rel/009 resolver unchanged.
+//! no second query path. Expand reuses the `/sql` resolver unchanged.
 
 use super::ast::{ColumnRef, CompareOp, Expr, Limit, Operand, Select, SelectItem, TableRef};
 use super::catalog::{CatalogEntry, TableSchema};
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 impl RelEngine {
     /// Read-side table resolution for the browse endpoints: a view is simply
-    /// "no such table" (404, matching `GET tables/{t}`, spec §2) — not the
+    /// "no such table" (404, matching `GET tables/{t}`) — not the
     /// write path's `NotWritable` (400), which would be nonsense on a GET.
     /// Views have no `/rows` resource in v1.
     fn browse_table(&self, domain: &str, name: &str) -> Result<TableSchema, RelStoreError> {
@@ -37,10 +37,10 @@ impl RelEngine {
     }
     /// Compiles `filters` (already stripped of `expand`/`limit`/`offset`) and
     /// `limit`/`offset` into a bound `*`-SELECT and runs it through the
-    /// rel/006 executor, then resolves `expand` (rel/009 §5) against the same
+    /// SELECT executor, then resolves `expand` against the same
     /// result. Returns the applied `(limit, offset)` alongside the result —
     /// `SelectResult` itself only carries whether the limit was capped, not
-    /// the numeric values the REST response echoes (spec §3).
+    /// the numeric values the REST response echoes.
     pub(crate) async fn browse_rows(
         &self,
         domain: &str,
@@ -61,9 +61,8 @@ impl RelEngine {
         let mut names: Vec<&String> = filters.keys().collect();
         names.sort();
         for name in names {
-            // Normalize to the lexer's column casing (rel/004 §1) so
-            // `?Amount=` resolves like the equivalent `/sql` WHERE clause
-            // (spec rel/010, fix 010-F1).
+            // Normalize to the lexer's column casing so
+            // `?Amount=` resolves like the equivalent `/sql` WHERE clause.
             let lower = name.to_ascii_lowercase();
             let col = schema.columns.iter().find(|c| c.name == lower).ok_or_else(|| {
                 RelStoreError::InvalidSchema(format!("unknown filter column '{name}'"))
@@ -120,7 +119,7 @@ impl RelEngine {
         Ok((result, expanded, applied_limit, applied_offset))
     }
 
-    /// PK-point SELECT + expand (spec §4): `None` when no row matches
+    /// PK-point SELECT + expand: `None` when no row matches
     /// (handler maps that to 404); the SELECT itself never errors on a
     /// missing key, it just returns zero rows.
     pub(crate) async fn get_row(
@@ -166,7 +165,7 @@ impl RelEngine {
         Ok(Some((result, expanded)))
     }
 
-    /// Row count for `table` (spec general/017 §3): the residual-free branch
+    /// Row count for `table`: the residual-free branch
     /// of `exec_count` (`select.rs`) — no WHERE clause, so the planner always
     /// picks `AccessPath::FullScan` with no residual, making this a pure key
     /// count with no row decode. A view resolves via `browse_table` like the
@@ -181,8 +180,8 @@ impl RelEngine {
         let dom = self.domains.require_active(domain)?;
         let mask = self.compute_link_mask(domain, &[&schema], auth).await?;
         let plan = plan::plan_access(&schema, &None, &[], &[], &[], mask)?;
-        // Registered before the key scan (spec rel/018 §2, `exec_count`
-        // pattern): a point-in-time count, not a live key count.
+        // Registered before the key scan (`exec_count` pattern): a
+        // point-in-time count, not a live key count.
         let snapshot_guard = self.engine.snapshot().await;
         let snap = snapshot_guard.snapshot().clone();
         let (row_keys, _scanned) = resolve_candidate_keys(
@@ -204,7 +203,7 @@ impl RelEngine {
 /// an upfront shape fix-up (a bare numeric/bool string isn't valid JSON
 /// number/bool syntax by itself once quoted). TEXT/KVREF/JSONREF pass through
 /// raw; TIMESTAMP tries millis first, then falls back to a string so
-/// `coerce_json`'s ISO-8601 parser (rel/005) can take over — same rule set as
+/// `coerce_json`'s ISO-8601 parser can take over — same rule set as
 /// `/sql`'s `params` binding, just fed from a string instead of a JSON body.
 pub(super) fn parse_raw_value(col_type: ColumnType, raw: &str) -> Result<Value, RelStoreError> {
     let mismatch = || RelStoreError::TypeMismatch {
@@ -267,7 +266,7 @@ mod tests {
         rel.insert_row("default", "orders", &mk_body(json!({"id": 2, "amount": 99})), LinkAuth::full()).await.unwrap();
     }
 
-    // 010-F1(c): a mixed-case `?col=` filter name must resolve against the
+    // A mixed-case `?col=` filter name must resolve against the
     // (always-lowercase) catalog column, same as the equivalent /sql WHERE.
     // Pre-fix: "Amount" != "amount" -> InvalidSchema("unknown filter column").
     #[test]

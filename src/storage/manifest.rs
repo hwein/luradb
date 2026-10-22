@@ -32,7 +32,7 @@ pub struct SSTableMetadata {
     pub file_size: u64,
 
     /// Highest MVCC write timestamp (raw HLC value) stored in this SSTable.
-    /// Read at startup to seed the HLC (spec kv/026 M3); the inverted key
+    /// Read at startup to seed the HLC; the inverted key
     /// order makes it underivable from `largest_key`. Manifests written
     /// before this field load as 0.
     #[serde(default)]
@@ -146,7 +146,7 @@ impl Manifest {
 pub struct ManifestManager {
     /// Path to the manifest file
     manifest_path: PathBuf,
-    /// Highest `Manifest.version` durably saved so far (spec kv/027 §A).
+    /// Highest `Manifest.version` durably saved so far.
     /// `version` only grows under the caller's manifest write lock, so a
     /// save at or below this is a stale snapshot losing a race against a
     /// newer save already on disk -- guards against a lost update between
@@ -188,7 +188,7 @@ impl ManifestManager {
     ///
     /// A no-op if `manifest.version` is at or below the last version saved
     /// here: the newer state is already persisted, so overwriting it with
-    /// this stale snapshot would be the bug, not skipping it (spec kv/027 §A).
+    /// this stale snapshot would be the bug, not skipping it.
     pub async fn save(&self, manifest: &Manifest) -> Result<()> {
         let mut last_saved = Arc::clone(&self.last_saved_version).lock_owned().await;
         if manifest.version <= *last_saved {
@@ -373,8 +373,7 @@ mod tests {
     }
 
     // Interleaving: an older snapshot (v_n) saved after a newer one (v_{n+1})
-    // must not overwrite it -- v_{n+1} is a superset of v_n's mutations
-    // (spec kv/027 §A).
+    // must not overwrite it -- v_{n+1} is a superset of v_n's mutations.
     #[test]
     fn test_save_rejects_stale_version_after_interleaving() -> Result<()> {
         crate::core::engine_runtime::block_on(async {
@@ -432,7 +431,7 @@ mod tests {
     }
 
     // A save whose caller is dropped once its I/O has started (a cancelled
-    // request, the A6 shutdown) still finishes before the next save starts:
+    // request, a shutdown) still finishes before the next save starts:
     // the newer save succeeds and is what ends up on disk.
     #[test]
     fn a_save_dropped_mid_io_does_not_race_the_next_save() -> Result<()> {

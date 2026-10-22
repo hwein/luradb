@@ -55,7 +55,7 @@ impl YieldEvery {
 static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Resolves the configured permit count: `0` means auto — every core beyond
-/// the request-path thread and one core of headroom (spec perf/017 A5).
+/// the request-path thread and one core of headroom.
 pub(crate) fn permit_count(configured: usize, cores: usize) -> usize {
     if configured > 0 {
         configured
@@ -83,7 +83,7 @@ pub fn init(configured: usize) {
 }
 
 /// Runs a `Send`-able pure computation on the blocking pool, bounded by a
-/// process-wide permit count (spec perf/017 A4 / concept 007 §4.9). Callers
+/// process-wide permit count. Callers
 /// above the cap wait for a permit — there is no error path.
 pub async fn offload<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     run_bounded(Arc::clone(permits()), f).await
@@ -99,7 +99,7 @@ async fn run_bounded<T: Send + 'static>(
     tokio::task::spawn_blocking(f).await.expect("offloaded closure panicked")
 }
 
-/// Test-only interleaving harness (spec perf/017 §Tests): spawns `long` and
+/// Test-only interleaving harness: spawns `long` and
 /// then `small` onto the engine runtime and returns their completion order.
 /// `small` can only finish first if `long` hands the thread back.
 #[cfg(test)]
@@ -212,7 +212,7 @@ mod tests {
         assert!(!would_block());
     }
 
-    // A5: `0` resolves to the auto count, anything else is taken verbatim.
+    // `0` resolves to the auto count, anything else is taken verbatim.
     #[test]
     fn test_permit_count_auto_and_explicit() {
         assert_eq!(permit_count(0, 32), 30);

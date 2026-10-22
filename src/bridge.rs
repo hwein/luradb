@@ -513,7 +513,7 @@ async fn handle(job: Job, router: Router) {
                     return;
                 }
                 Ok(data) => first = Some(Ok(data)),
-                // Trailers are not relayed (A2); the rest still is.
+                // Trailers are not relayed; the rest still is.
                 Err(_) => {}
             },
             Poll::Ready(Some(Err(e))) => first = Some(Err(e)),
@@ -711,7 +711,7 @@ mod tests {
     // handlers keep yielding starts in the runtime's next scheduling round,
     // long before they are done. compio queues it behind the tasks that are
     // ready by then (at most 61 per round), unlike tokio, whose deferred
-    // yields let it run before their next slice (spec perf/020).
+    // yields let it run before their next slice.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::disallowed_methods, reason = "the callers play the frontend runtime")]
     async fn a_request_arriving_mid_round_starts_while_yielding_handlers_run() {
@@ -929,7 +929,7 @@ mod tests {
         String::from_utf8(frames_of(resp.into_body()).await.concat()).unwrap()
     }
 
-    // Spec perf/018b A1.3: with a reader pool, reads run on its workers and
+    // With a reader pool, reads run on its workers and
     // writes still on the engine thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reads_run_on_the_reader_pool_and_writes_on_the_engine_thread() {
@@ -1123,7 +1123,7 @@ mod tests {
         engine.join().unwrap();
     }
 
-    // Spec perf/018b A3: a pool handler sends its request on to the engine
+    // A pool handler sends its request on to the engine
     // thread as the pool received it — URI, path parameters, extensions and
     // body — and relays the answer unchanged; the engine side gets no way
     // to forward again.
@@ -1174,7 +1174,7 @@ mod tests {
         engine.join().unwrap();
     }
 
-    // Spec perf/018b A3: of the reads, only POSTs carry the way on to the
+    // Of the reads, only POSTs carry the way on to the
     // engine thread — the SQL route, the only one that forwards, is a POST.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn only_post_reads_carry_an_engine_forward() {
@@ -1197,7 +1197,7 @@ mod tests {
         reader.join().unwrap();
     }
 
-    // Spec perf/018b test 6: a closed reader channel answers 503 like the
+    // A closed reader channel answers 503 like the
     // engine channel does.
     #[tokio::test]
     async fn closed_reader_channel_answers_503_text_plain() {
@@ -1346,7 +1346,7 @@ mod tests {
         });
     }
 
-    // A6: the engine loop ends once the last sender is gone and drops the
+    // The engine loop ends once the last sender is gone and drops the
     // requests still in flight before it returns, so none of them can reach
     // the engines during their shutdown; their callers get 503.
     #[test]

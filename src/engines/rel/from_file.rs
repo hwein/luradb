@@ -1,10 +1,9 @@
 //! CSV/TSV file import: CREATE TABLE + bulk INSERT with inferred column
-//! types (spec rel/019) -- the rel counterpart of the JSON bulk load
-//! (json/007). Two passes over the fully-buffered file (no sampling, no
-//! streaming, per spec §5): Pass 1 infers one LuraDB type per column; Pass 2
-//! creates the table through the existing catalog path (`RelEngine::create_table`)
-//! and inserts rows in batches through the existing per-row DML staging
-//! (`dml.rs`'s `stage_insert_row`) -- no SQL text is ever built from file data.
+//! types -- the rel counterpart of the JSON bulk load. Two passes over the
+//! fully-buffered file (no sampling, no streaming): Pass 1 infers one
+//! LuraDB type per column; Pass 2 creates the table through the existing catalog path
+//! (`RelEngine::create_table`) and inserts rows in batches through the existing per-row
+//! DML staging (`dml.rs`'s `stage_insert_row`) -- no SQL text is ever built from file data.
 
 use super::catalog::{ColumnInput, TableInput, MAX_IDENTIFIER_LEN};
 use super::cross_engine::LinkAuth;
@@ -20,14 +19,14 @@ use csv::{ReaderBuilder, StringRecord};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-/// Rows staged per `write_batch` group (spec §5), mirroring the DDL backfill
+/// Rows staged per `write_batch` group, mirroring the DDL backfill
 /// chunk size (`ddl.rs`'s `BACKFILL_CHUNK`) rather than a new config knob.
 const IMPORT_BATCH_SIZE: usize = 500;
 
-/// Rows staged between two yields (spec perf/017 A2).
+/// Rows staged between two cooperative yields.
 const IMPORT_ROW_YIELD_INTERVAL: u32 = 64;
 
-/// Server-side file formats (spec §2 decision 2 -- no Excel/ODS/Sheets here).
+/// Server-side file formats (no Excel/ODS/Sheets here).
 #[derive(Debug, Clone, Copy)]
 pub enum FileFormat {
     Csv,
@@ -43,7 +42,7 @@ impl FileFormat {
     }
 }
 
-/// One column of the created table (spec §5 response summary).
+/// One column of the created table (response summary).
 #[derive(Debug)]
 pub struct ImportColumn {
     pub name: String,
@@ -54,7 +53,7 @@ pub struct ImportColumn {
     pub source_header: Option<String>,
 }
 
-/// One row-level import failure (spec §5).
+/// One row-level import failure.
 #[derive(Debug)]
 pub struct ImportRowError {
     pub row: u64,
@@ -86,11 +85,11 @@ struct PlannedColumn {
 }
 
 impl RelEngine {
-    /// Creates a table from an uploaded CSV/TSV file and imports its rows
-    /// (spec rel/019 §1-§5). `pk` is the caller's raw query value, if any;
-    /// matched against the normalized column names case-insensitively.
+    /// Creates a table from an uploaded CSV/TSV file and imports its rows.
+    /// `pk` is the caller's raw query value, if any; matched against the
+    /// normalized column names case-insensitively.
     /// Parsing, header normalization and Pass-1 inference are pure CPU work
-    /// and run on the blocking pool (spec perf/017 A4), which is why the body
+    /// and run on the blocking pool, which is why the body
     /// arrives owned; the insert pass below stays on the engine thread.
     pub async fn create_table_from_file(
         &self,
@@ -109,7 +108,7 @@ impl RelEngine {
                 .await?;
         let column_count = raw_headers.len();
 
-        // Column plan, in the table's final column order (spec §4): a
+        // Column plan, in the table's final column order: a
         // synthetic `_row` PK when none was requested, else the CSV columns
         // in their natural order with the requested one marked as PK.
         let mut planned: Vec<PlannedColumn> = Vec::with_capacity(column_count + 1);
@@ -124,7 +123,7 @@ impl RelEngine {
             planned.push(PlannedColumn { source: ColumnSource::Csv(i), input, header: raw_headers[i].clone() });
         }
 
-        // Pass 2, part 1 (spec §5.2): CREATE TABLE through the existing
+        // Pass 2, part 1: CREATE TABLE through the existing
         // catalog path -- nothing is persisted if this fails (400/404/409/410).
         let table_input =
             TableInput { name: table.to_string(), columns: planned.iter().map(|p| p.input.clone()).collect() };
@@ -144,7 +143,7 @@ impl RelEngine {
         // Pass 2, part 2: insert rows in `IMPORT_BATCH_SIZE` groups through
         // the same per-row staging (NOT NULL/PK-dup/size/UNIQUE/REFERENCES
         // checks, index entries) the SQL/REST write paths use -- a row that
-        // fails is logged and the import continues (spec §5).
+        // fails is logged and the import continues.
         let dom = self.domains.require_active(domain)?;
         let prefix = dom.system_prefix.clone();
         let lock = self.table_locks.get(&prefix, schema.table_id);
@@ -248,7 +247,7 @@ struct ParsedFile {
     col_types: Vec<ColumnType>,
 }
 
-/// The whole file-derived half of the import (spec perf/017 A4): read, column
+/// The whole file-derived half of the import: read, column
 /// cap, header normalization, `_row`/PK checks and Pass-1 inference. Pure —
 /// it touches no engine state, so it runs on the blocking pool.
 fn parse_file(
@@ -262,7 +261,7 @@ fn parse_file(
     let column_count = raw_headers.len();
     // Cap first: normalization and inference below are per-column work, so
     // a header far past the limit must be rejected before paying for it —
-    // `create_table` would reject the schema anyway (spec §1/§3).
+    // `create_table` would reject the schema anyway.
     if column_count > max_columns {
         return Err(RelStoreError::LimitExceeded {
             which: "max_columns".to_string(),
@@ -271,7 +270,7 @@ fn parse_file(
     }
     let names = normalize_headers(&raw_headers);
 
-    // `_row` reservation (spec §3): only allowed as a file column when it
+    // `_row` reservation: only allowed as a file column when it
     // is itself the chosen PK.
     if let Some(pos) = names.iter().position(|n| n == "_row") {
         if pk != Some("_row") {
@@ -288,7 +287,7 @@ fn parse_file(
         }
     }
 
-    // Pass 1 (spec §5.1): narrowest type per column over every non-empty
+    // Pass 1: narrowest type per column over every non-empty
     // value of the fully-buffered file.
     let col_types: Vec<ColumnType> = (0..column_count)
         .map(|i| {
@@ -304,11 +303,11 @@ fn parse_file(
     Ok(ParsedFile { raw_headers, data_records, names, col_types })
 }
 
-/// Reads the file into `(raw_headers, data_records)` (spec §2/§3): with
+/// Reads the file into `(raw_headers, data_records)`: with
 /// `header=true` the first record supplies `Some(text)` per column; with
 /// `header=false` every entry is `None` (the caller assigns `col_N`). Row
-/// numbering (§4) is 1-based over `data_records`, uniform for both modes.
-/// UTF-8 validation comes from the crate's `StringRecord` (spec §2) -- an
+/// numbering is 1-based over `data_records`, uniform for both modes.
+/// UTF-8 validation comes from the crate's `StringRecord` -- an
 /// invalid header record surfaces here; an invalid *data* record is left as
 /// its `Err` for the per-row loop to report and skip.
 fn read_records(
@@ -342,7 +341,7 @@ fn read_records(
     }
 }
 
-/// Header normalization (spec §3): trim, lowercase, invalid chars -> `_`,
+/// Header normalization: trim, lowercase, invalid chars -> `_`,
 /// leading digit -> prefix `c`, empty -> `col_{i}`, over `MAX_IDENTIFIER_LEN`
 /// -> truncated, collisions (including ones truncation creates) -> `_2`,
 /// `_3`, … suffixed, still within the length cap.
@@ -409,11 +408,11 @@ fn dedupe_names(names: &mut [String]) {
     }
 }
 
-/// Pass-1 type inference (spec §5.1): the narrowest type that parses every
-/// given (already non-empty) value, in the mandated order INTEGER -> REAL ->
+/// Pass-1 type inference: the narrowest type that parses every
+/// given (already non-empty) value, in the fixed order INTEGER -> REAL ->
 /// BOOLEAN -> TIMESTAMP -> TEXT; TEXT always matches, so this never fails.
 /// A column with no values at all (empty iterator: either truly all-empty,
-/// or every value already excluded by the caller) is TEXT (spec §5.1).
+/// or every value already excluded by the caller) is TEXT.
 fn infer_column_type<'a>(values: impl Iterator<Item = &'a str> + Clone) -> ColumnType {
     const CANDIDATES: [ColumnType; 4] =
         [ColumnType::Integer, ColumnType::Real, ColumnType::Boolean, ColumnType::Timestamp];
@@ -436,7 +435,7 @@ fn infer_column_type<'a>(values: impl Iterator<Item = &'a str> + Clone) -> Colum
 
 /// Coerces one raw (non-empty) CSV field into `col_type`'s `ScalarValue`,
 /// reusing the exact `coerce_json` rules DML value binding uses everywhere
-/// else (rel/005) -- in particular its TIMESTAMP parser (millis or
+/// else -- in particular its TIMESTAMP parser (millis or
 /// ISO-8601) and its rejection of non-finite REAL values (`serde_json`'s
 /// `Number` cannot hold NaN/±Inf). A value Pass 1 accepted as REAL but that
 /// doesn't actually fit (e.g. "inf") surfaces here as a normal per-row
@@ -465,7 +464,7 @@ mod tests {
     use crate::metrics::{MetricsConfig, MetricsStore};
     use std::sync::Arc;
 
-    /// A CSV body with `rows` data rows over `id,label` (spec perf/017 tests).
+    /// A CSV body with `rows` data rows over `id,label`.
     fn wide_csv(rows: usize) -> Bytes {
         let mut csv = String::from("id,label\n");
         for i in 0..rows {
@@ -474,7 +473,7 @@ mod tests {
         Bytes::from(csv)
     }
 
-    // Spec perf/017 test 6 (unindexed SELECT vs PK point): the scanning
+    // Unindexed SELECT vs PK point: the scanning
     // statement hands the thread back, so the point read spawned after it
     // answers first.
     #[test]
@@ -510,8 +509,8 @@ mod tests {
         })
     }
 
-    // Spec perf/017 test 6 (import vs SELECT on another table of the same
-    // domain): the import hands the thread back between its row batches.
+    // Import vs SELECT on another table of the same domain: the import
+    // hands the thread back between its row batches.
     #[test]
     fn test_import_interleaves_with_select_on_another_table() {
         crate::core::engine_runtime::block_on(async {
@@ -543,7 +542,7 @@ mod tests {
         })
     }
 
-    // Spec perf/017 test 6 (unindexed UPDATE vs PK point SELECT): the
+    // Unindexed UPDATE vs PK point SELECT: the
     // candidate scan hands the thread back. The UPDATE matches nothing, so
     // it never reaches a commit that would suspend on its own.
     #[test]
@@ -605,7 +604,7 @@ mod tests {
     }
 
     // 1. CSV with header, mixed types -> success; schema as inferred; `_row`
-    //    PK; every row readable via SELECT (spec §7 test 1).
+    //    PK; every row readable via SELECT.
     #[test]
     fn test_csv_header_mixed_types_and_row_pk() {
         crate::core::engine_runtime::block_on(async {
@@ -648,7 +647,7 @@ mod tests {
         })
     }
 
-    // 2. TSV variant -> identical result, delimiter aside (spec §7 test 2).
+    // 2. TSV variant -> identical result, delimiter aside.
     #[test]
     fn test_tsv_variant_identical_result() {
         crate::core::engine_runtime::block_on(async {
@@ -664,7 +663,7 @@ mod tests {
     }
 
     // 3. header=false -> generated names col_1..col_n, no source_header
-    //    anywhere (spec §7 test 3).
+    //    anywhere.
     #[test]
     fn test_header_false_generates_col_names() {
         crate::core::engine_runtime::block_on(async {
@@ -680,7 +679,7 @@ mod tests {
 
     // 4. Header normalization: punctuation -> `_`, source_header preserved,
     //    a collision suffixed, an overlong header truncated to the
-    //    identifier cap (spec §7 test 4).
+    //    identifier cap.
     #[test]
     fn test_header_normalization_and_collisions() {
         crate::core::engine_runtime::block_on(async {
@@ -698,7 +697,7 @@ mod tests {
     }
 
     // 5. Type inference cascade: "1,2,x" -> TEXT; "1,2.5" -> REAL; an empty
-    //    field is nullable and reads back as NULL (spec §7 test 5).
+    //    field is nullable and reads back as NULL.
     #[test]
     fn test_type_inference_cascade_and_nullable() {
         crate::core::engine_runtime::block_on(async {
@@ -717,8 +716,7 @@ mod tests {
     }
 
     // 6. `?pk=id` with a unique column -> adopted as PK, no `_row`; a
-    //    duplicate value fails just that row, the rest still import
-    //    (spec §7 test 6).
+    //    duplicate value fails just that row, the rest still import.
     #[test]
     fn test_pk_query_param_unique_and_duplicate() {
         crate::core::engine_runtime::block_on(async {
@@ -740,8 +738,7 @@ mod tests {
     }
 
     // 7. Row errors: a mismatched column count and an overlong TEXT cell
-    //    each fail just that row (numbered), the import continues past them
-    //    (spec §7 test 7).
+    //    each fail just that row (numbered), the import continues past them.
     #[test]
     fn test_row_errors_continue_import() {
         crate::core::engine_runtime::block_on(async {
@@ -762,7 +759,7 @@ mod tests {
     }
 
     // 7b. Invalid UTF-8 in a data row fails just that row; the import
-    //     continues (spec §7 test 7).
+    //     continues.
     #[test]
     fn test_invalid_utf8_row_fails_but_import_continues() {
         crate::core::engine_runtime::block_on(async {
@@ -834,7 +831,7 @@ mod tests {
         assert_eq!(mixed, vec!["col", "col_2", "col_3"]);
     }
 
-    // 8. Top-level failures (spec §1/§7 test 8): an existing table name, an
+    // 8. Top-level failures: an existing table name, an
     //    empty file, too many columns, and an unknown `?pk=` column each
     //    fail before any table is created.
     #[test]
@@ -872,7 +869,7 @@ mod tests {
 
     // 10. A header column literally named `_row` without `?pk=_row` -> 400
     //     (InvalidSchema); with `?pk=_row` it is accepted and used as-is,
-    //     not replaced by a generated row number (spec §7 test 10).
+    //     not replaced by a generated row number.
     #[test]
     fn test_row_header_conflict_without_pk_row() {
         crate::core::engine_runtime::block_on(async {

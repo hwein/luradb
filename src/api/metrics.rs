@@ -74,10 +74,10 @@ pub async fn version() -> Json<VersionResponse> {
 /// `GET /config` — effective configuration of the running process. Admin only.
 ///
 /// The path carries no `{domain}` segment, so `extract_domain` returns `None`
-/// and the auth layer's None-branch requires an admin role (spec
-/// general/022). The admin API key never appears in the body — redaction
-/// happens at the field level (`AdminEntry.api_key`'s `#[serde(skip_serializing)]`
-/// in config.rs), not in this handler.
+/// and the auth layer's None-branch requires an admin role. The admin API
+/// key never appears in the body — redaction happens at the field level
+/// (`AdminEntry.api_key`'s `#[serde(skip_serializing)]` in config.rs), not
+/// in this handler.
 #[utoipa::path(
     get,
     path = "/store-api/config",
@@ -182,7 +182,7 @@ pub async fn get_metrics(State(state): State<AppState>) -> Result<Json<Value>, A
         "clients_kicked_total":         sample.shm_clients_kicked_total,
     });
 
-    // Backup block (spec general/006 metrics section) — null when backup.enabled = false.
+    // Backup block — null when backup.enabled = false.
     let backup = state.backup_manager.as_ref().map(|m| {
         let snap = m.metrics_snapshot();
         let running = m
@@ -220,9 +220,8 @@ pub async fn get_metrics(State(state): State<AppState>) -> Result<Json<Value>, A
         (status = 403, description = "Forbidden", body = String, content_type = "text/plain"),
         // 404: get_domain_metrics returns bare `StatusCode::NOT_FOUND` (see
         // handler below), not `ApiError` — a real empty body, not a plaintext
-        // one. Left undocumented as a body per general/026 (reality over
-        // schema); the contract_tests gate below carries the matching,
-        // justified exception.
+        // one. Left undocumented as a body (reality over schema); the
+        // contract_tests gate below carries the matching, justified exception.
         (status = 404, description = "Domain not found or no metrics yet"),
     ),
     security(("bearer_auth" = [])),
@@ -249,7 +248,7 @@ mod tests {
     use crate::storage::{file_manager::FileManager, manifest::ManifestManager, vlog::VLog};
     use std::sync::Arc;
 
-    // Spec 004 §Output item 4: handler reports the two constants verbatim.
+    // The version handler reports the two constants verbatim.
     #[test]
     fn version_handler_reports_constants() {
         crate::core::engine_runtime::block_on(async {
@@ -259,7 +258,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/019: per-engine metrics, HTTP level ─────────────────────
+    // ── Per-engine metrics, HTTP level ───────────────────────────────────────
 
     /// The body of a `GET /store-api/metrics` against `state`.
     async fn scrape(state: AppState) -> Value {
@@ -274,8 +273,8 @@ mod tests {
         make_state_with_config(crate::config::LuraConfig::default(), "test.toml".to_string(), false).await
     }
 
-    // Parameterized variant for the config-endpoint tests below (spec
-    // general/022), which need to control the config/path/loaded-flag triple.
+    // Parameterized variant for the config-endpoint tests below, which
+    // need to control the config/path/loaded-flag triple.
     async fn make_state_with_config(
         config: crate::config::LuraConfig,
         config_path: String,
@@ -397,7 +396,7 @@ mod tests {
 
             state.registry.delete_domain("gone").await.unwrap();
             // delete_domain only marks the domain Deleting -- the domain purger
-            // removes its metrics window on finalize (kv/013). Call it directly
+            // removes its metrics window on finalize. Call it directly
             // rather than spinning up a full purger cycle in this HTTP-level test.
             state.metrics.remove_domain("gone");
 
@@ -414,7 +413,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/024: compaction_runs/janitor_runs/memtable_size_bytes ───
+    // ── compaction_runs/janitor_runs/memtable_size_bytes ─────────────────────
 
     // Test 3: memtable_size_bytes is a live gauge read from the engine's
     // active MemTable -- grows after a write, and shrinks back once
@@ -508,7 +507,7 @@ mod tests {
         })
     }
 
-    // ── GET /store-api/config (spec general/022) ─────────────────────────────
+    // ── GET /store-api/config ────────────────────────────────────────────────
 
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
@@ -613,7 +612,7 @@ mod tests {
         })
     }
 
-    // Spec general/030 test 9: removed keys and their sections are gone from
+    // Removed keys and their sections are gone from
     // the response, checked on JSON keys (an explicit `null` still counts).
     #[test]
     fn config_endpoint_omits_removed_keys() {

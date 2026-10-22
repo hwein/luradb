@@ -1,9 +1,9 @@
-//! Search & query engine for the JSON store (spec json/006).
+//! Search & query engine for the JSON store.
 //!
 //! Filters run exclusively over index entries (no full table scans): an
 //! `Eq` filter is a prefix scan on `IDX:{prefix}:{field}:{value}:`, range
 //! filters scan the field's entries and compare encoded bytes — the sortable
-//! encoding from spec 004 makes byte order equal value order.
+//! index value encoding makes byte order equal value order.
 
 use super::document::{doc_scan_prefix, parse_doc_key, Document};
 use super::domain::JsonDomain;
@@ -20,10 +20,10 @@ use std::collections::{BTreeSet, HashMap};
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 1000;
 
-/// Documents read between two yields (spec perf/017 A2).
+/// Documents read between two yields.
 const DOC_YIELD_INTERVAL: u32 = 256;
 
-/// Keys post-processed between two yields (spec perf/017 A2).
+/// Keys post-processed between two yields.
 const KEY_YIELD_INTERVAL: u32 = 4096;
 
 #[derive(Debug, Clone)]
@@ -62,7 +62,7 @@ pub struct SearchResult {
     pub limit: u32,
 }
 
-// ── Unfiltered listing (spec json/010) ────────────────────────────────────────
+// ── Unfiltered listing ────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ListOptions {
@@ -102,7 +102,7 @@ impl JsonEngine {
         let dom = self.domains.require_active(domain)?;
         if query.filters.is_empty() {
             return Err(JsonStoreError::InvalidFilter(
-                "at least one filter is required (unfiltered listing: spec json/010)".to_string(),
+                "at least one filter is required".to_string(),
             ));
         }
         let limit = query.limit.min(MAX_LIMIT);
@@ -323,7 +323,7 @@ mod tests {
         (engine, dir)
     }
 
-    // Spec perf/017 test 5 (listing): a 5 000-document `list_documents`
+    // A 5 000-document `list_documents`
     // hands the thread back, so a `get_document` spawned after it answers
     // first.
     #[test]
@@ -499,7 +499,7 @@ mod tests {
         })
     }
 
-    // 10. Empty filter map → InvalidFilter (unfiltered listing is spec 010).
+    // 10. Empty filter map → InvalidFilter (unfiltered listing is `list_documents`).
     #[test]
     fn test_empty_filters_rejected() {
         crate::core::engine_runtime::block_on(async {
@@ -512,7 +512,7 @@ mod tests {
         })
     }
 
-    // ── Listing & counting (spec json/010) ───────────────────────────────────
+    // ── Listing & counting ───────────────────────────────────
 
     async fn seed(json: &Arc<JsonEngine>, n: usize) {
         for i in 0..n {

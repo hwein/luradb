@@ -1,4 +1,4 @@
-//! Block Cache — Spec 015.
+//! Block Cache.
 //!
 //! Implements an S3-FIFO (Simple, Scalable, Scan-resistant FIFO) block cache
 //! that sits between MemTable misses and SSTable I/O.
@@ -35,7 +35,7 @@ pub struct BlockCacheKey {
 }
 
 /// A cached data block — zero-copy view into a memory-mapped SSTable or
-/// owned aligned bytes. Defined in the storage layer (spec perf/003).
+/// owned aligned bytes. Defined in the storage layer.
 pub use crate::storage::format::CachedBlock;
 
 // ── Metrics ──────────────────────────────────────────────────────────────────
@@ -375,8 +375,8 @@ impl BlockCache {
 /// Number of independently locked parts of a [`StripedBlockCache`].
 const STRIPES: usize = 16;
 
-/// The block cache as [`STRIPES`] S3-FIFO caches, each behind its own lock
-/// (spec kv/031 A2): readers of different blocks rarely wait for each other.
+/// The block cache as [`STRIPES`] S3-FIFO caches, each behind its own lock:
+/// readers of different blocks rarely wait for each other.
 pub struct StripedBlockCache {
     stripes: Box<[Mutex<BlockCache>; STRIPES]>,
 }
@@ -654,7 +654,7 @@ mod tests {
         assert!(!cache.main.contains(&stale), "stale key is consumed");
     }
 
-    // ── Spec kv/031 test 4: StripedBlockCache ────────────────────────────────
+    // ── StripedBlockCache ────────────────────────────────────────────────────
 
     /// Block `n` of `file_id`, at a real block-size offset.
     fn block_key(file_id: u64, n: u64) -> BlockCacheKey {

@@ -179,7 +179,7 @@ impl SSTableBuilder {
 }
 
 /// Backing storage of an SSTable: fully loaded bytes (fallback, freshly
-/// built tables) or a memory-mapped file (spec perf/003).
+/// built tables) or a memory-mapped file.
 enum SSTableData {
     Owned(AlignedVec),
     Mapped(std::sync::Arc<memmap2::Mmap>),
@@ -224,7 +224,7 @@ impl SSTableReader {
     }
 
     /// Memory-maps an SSTable file and advises the kernel to pre-fault its
-    /// pages (spec perf/003). The `unsafe` map is sound: SSTables are
+    /// pages. The `unsafe` map is sound: SSTables are
     /// immutable, and an unlinked file stays mapped for every version still
     /// holding its reader.
     pub fn open_mmap(path: &std::path::Path) -> Result<Self> {
@@ -581,7 +581,7 @@ impl SSTableReader {
     }
 
     /// Like [`Self::keys_with_prefix`], but only considers versions visible
-    /// under an MVCC snapshot ceiling (spec general/006 backup export):
+    /// under an MVCC snapshot ceiling (backup export):
     /// `max_inv_ts` is the snapshot timestamp in *inverted* form
     /// (`Timestamp::inverted()`). Entries newer than the snapshot are
     /// skipped instead of deciding the key, so an older, visible version
@@ -682,11 +682,11 @@ impl SSTableReader {
 }
 
 /// Builds a `CachedValue` for a matched entry inside a cached block without
-/// copying value bytes (spec perf/002). Inline values become zero-copy
+/// copying value bytes. Inline values become zero-copy
 /// offsets into the block's `Arc<AlignedVec>` allocation — sound because the
 /// `Arc` pins the allocation and the archived bytes live inside it. The
 /// tombstone (file_id == 0, offset == TOMBSTONE_OFFSET) and NULL (file_id ==
-/// 0, offset == NULL_OFFSET) sentinels are resolved here (spec kv/018).
+/// 0, offset == NULL_OFFSET) sentinels are resolved here.
 fn cached_value_from_archived(block: &CachedBlock, value: &ArchivedDataBlockValue) -> CachedValue {
     match value {
         ArchivedDataBlockValue::Pointer(avp) => {
@@ -787,7 +787,7 @@ mod tests {
     use crate::storage::format::ArchivedDataBlockValue;
     use rkyv::Archived;
 
-    // Zero-copy lookups (spec perf/002): inline values reference the cached
+    // Zero-copy lookups: inline values reference the cached
     // block; pointers and the tombstone sentinel map to their variants.
     #[test]
     fn test_get_with_cache_returns_cached_value_variants() -> anyhow::Result<()> {
@@ -830,7 +830,7 @@ mod tests {
             other => panic!("expected Tombstone, got {other:?}"),
         }
 
-        // kv/018: the NULL sentinel is distinct from the tombstone sentinel.
+        // The NULL sentinel is distinct from the tombstone sentinel.
         match reader.get_with_cache(b"null-key", &cache)? {
             Some(CachedValue::Null) => {}
             other => panic!("expected Null, got {other:?}"),
@@ -840,7 +840,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/022 regression: get_with_cache_and_ts must return the un-inverted
+    // Regression: get_with_cache_and_ts must return the un-inverted
     // write timestamp. The encoded key stores it inverted (newest-first sort
     // order); a naive read of the raw bytes would report a NEWER write as a
     // SMALLER timestamp, decreasing `last_modified_at` on every overwrite.
@@ -874,7 +874,7 @@ mod tests {
         Ok(())
     }
 
-    // mmap-backed reads (spec perf/003): same lookup semantics, zero-copy
+    // mmap-backed reads: same lookup semantics, zero-copy
     // blocks referencing the mapping.
     #[test]
     fn test_open_mmap_roundtrip() -> anyhow::Result<()> {
@@ -1058,7 +1058,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/019: a corrupted footer whose index_handle overflows `offset + size`
+    // A corrupted footer whose index_handle overflows `offset + size`
     // must be rejected with an `Err`, not panic (untrusted on-disk bytes).
     #[test]
     fn test_from_data_rejects_overflowing_index_handle() -> anyhow::Result<()> {
@@ -1092,7 +1092,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/019: analog for bloom_filter_handle.
+    // Analog for bloom_filter_handle.
     #[test]
     fn test_from_data_rejects_overflowing_bloom_filter_handle() -> anyhow::Result<()> {
         let mut builder = SSTableBuilder::new();
@@ -1125,7 +1125,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/019: builds a valid single-block SSTable whose IndexBlock entry
+    // Builds a valid single-block SSTable whose IndexBlock entry
     // points at an overflowing BlockHandle, to exercise the read path
     // (as opposed to the footer handles covered above).
     fn build_sstable_with_corrupt_block_handle() -> anyhow::Result<Vec<u8>> {
@@ -1185,7 +1185,7 @@ mod tests {
         Ok(buf.into_vec())
     }
 
-    // kv/019: get_with_cache → get_or_cache_block must return an `Err` for an
+    // get_with_cache → get_or_cache_block must return an `Err` for an
     // overflowing block handle instead of panicking.
     #[test]
     fn test_get_or_cache_block_rejects_overflowing_block_handle() -> anyhow::Result<()> {
@@ -1197,7 +1197,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/019: get → read_data_block must return an `Err` for an overflowing
+    // get → read_data_block must return an `Err` for an overflowing
     // block handle instead of panicking.
     #[test]
     fn test_read_data_block_rejects_overflowing_block_handle() -> anyhow::Result<()> {
@@ -1208,7 +1208,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/021: builds a valid SSTable whose bloom filter block is structurally
+    // Builds a valid SSTable whose bloom filter block is structurally
     // valid (rkyv::access succeeds) but carries an empty bit array combined
     // with `num_hashes`, to exercise the from_data fail-fast check on a
     // corrupted/crafted bloom block (as opposed to bloom.rs's own unit test
@@ -1275,7 +1275,7 @@ mod tests {
         Ok(())
     }
 
-    // kv/021: num_hashes == 0 is what BloomFilter::new(0, p) legitimately
+    // num_hashes == 0 is what BloomFilter::new(0, p) legitimately
     // produces (NaN-cast); the fail-fast must not reject this combination.
     #[test]
     fn test_from_data_accepts_empty_bloom_block_with_zero_hashes() -> anyhow::Result<()> {
@@ -1288,7 +1288,7 @@ mod tests {
         Ok(())
     }
 
-    // ── Spec perf/032: prefix scans seek through the block index ─────────────
+    // ── Prefix scans seek through the block index ─────────────
 
     /// The builder closes a data block at this many entries.
     const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE_TARGET / 16 + 1;

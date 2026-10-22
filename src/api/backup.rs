@@ -1,4 +1,4 @@
-//! Backup & Restore REST handlers (spec general/006).
+//! Backup & Restore REST handlers.
 //!
 //! Admin-only: `/store-api/backups*` and `/store-api/restores*` carry no
 //! domain segment, so `extract_domain` (`src/auth/middleware.rs`) falls
@@ -7,10 +7,8 @@
 //! behavior for these new routes).
 //!
 //! Errors follow the project-wide plaintext `ApiError` convention
-//! (`src/api/middleware.rs`; general/005 decisions 1+2: plaintext
-//! `"NNN Reason: Detail"` bodies, 503 when the feature is disabled). The
-//! `{"error":"…"}` / 404-disabled examples in general/006 cite that spec's
-//! superseded draft state and no longer apply.
+//! (`src/api/middleware.rs`: plaintext `"NNN Reason: Detail"` bodies,
+//! 503 when the feature is disabled).
 
 use crate::api::{middleware::ApiError, AppState};
 use crate::backup::{
@@ -33,10 +31,10 @@ use utoipa::ToSchema;
 
 // ── Error mapping ────────────────────────────────────────────────────────────
 
-/// Maps every `BackupError` variant to its spec general/006 HTTP status and
-/// a plaintext `ApiError` body (project-wide convention, general/005
-/// decisions 1+2). Matched by variant, not by parsing `Display`, so
-/// wire text stays independent of `BackupError`'s internal `Display`.
+/// Maps every `BackupError` variant to its HTTP status and a plaintext
+/// `ApiError` body (project-wide convention). Matched by variant, not by
+/// parsing `Display`, so wire text stays independent of `BackupError`'s
+/// internal `Display`.
 impl From<BackupError> for ApiError {
     fn from(e: BackupError) -> Self {
         match e {
@@ -86,9 +84,9 @@ impl From<BackupError> for ApiError {
     }
 }
 
-/// Resolves the backup manager or fails with 503 (spec general/005
-/// decision 1: "feature disabled" answers 503 project-wide, same as
-/// the JSON/rel engine guards -- routes are always registered).
+/// Resolves the backup manager or fails with 503 ("feature disabled"
+/// answers 503 project-wide, same as the JSON/rel engine guards --
+/// routes are always registered).
 fn backup_manager(state: &AppState) -> Result<&Arc<BackupManager>, ApiError> {
     state.backup_manager.as_ref().ok_or_else(|| {
         ApiError::new(
@@ -98,7 +96,7 @@ fn backup_manager(state: &AppState) -> Result<&Arc<BackupManager>, ApiError> {
     })
 }
 
-// ── Audit logging (spec general/006 "exfiltration awareness") ──────────────
+// ── Audit logging (exfiltration awareness) ─────────────────────────────────
 
 /// Best-effort caller identity for the audit log. Independently resolves the
 /// same Bearer key the auth middleware already validated this request
@@ -181,7 +179,7 @@ pub struct BackupListResponse {
     pub running: Option<RunningBackupInfo>,
 }
 
-/// Manifest fields + state + size (spec general/006 GET /backups/{id} and
+/// Manifest fields + state + size (GET /backups/{id} and
 /// POST /backups/upload). Everything but `id`/`state`/`scope` is optional:
 /// the currently-running-job shape (`running`) only fills `started_at`; the
 /// complete/incomplete shape fills the rest instead.
@@ -365,7 +363,7 @@ fn parse_restore_mode(s: &str) -> Result<restore::RestoreMode, ApiError> {
     ),
     tag = "Backup"
 )]
-/// Starts an on-demand backup job (spec general/006 scope syntax for `scope`).
+/// Starts an on-demand backup job.
 pub async fn create_backup(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -576,7 +574,7 @@ impl Drop for ScratchGuard {
 }
 
 /// Writes the request body to `path` as it arrives — no full-body buffering
-/// (spec general/006: no RAM copy).
+/// (no RAM copy).
 async fn stream_body_to_file(path: &std::path::Path, body: Body) -> Result<(), ApiError> {
     let mut options = compio::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -622,8 +620,8 @@ pub async fn restore_backup(
     let manager = backup_manager(&state)?;
     let mode = parse_restore_mode(body.mode.as_deref().unwrap_or("fail_if_exists"))?;
 
-    // Synchronous pre-checks (orchestrator hint 1 / spec general/006):
-    // start_restore itself only validates id/existence/slot synchronously.
+    // Synchronous pre-checks: start_restore itself only validates
+    // id/existence/slot synchronously.
     let summary = manager.get_backup(&id)?;
     if !writer::is_supported_format(summary.format_version) {
         return Err(BackupError::UnsupportedFormatVersion(summary.format_version).into());
@@ -660,7 +658,7 @@ pub async fn restore_backup(
     ),
     tag = "Backup"
 )]
-/// Live status of a restore job. Lives in RAM only (spec general/006) — gone
+/// Live status of a restore job. Lives in RAM only — gone
 /// after a restart; the outcome is also in the log.
 pub async fn get_restore_status(
     State(state): State<AppState>,
@@ -821,8 +819,8 @@ mod tests {
         ]
     }
 
-    // 9. backup.enabled=false -> every new route answers 503 (spec
-    // general/005 decision 1: "feature disabled" is 503 project-wide).
+    // 9. backup.enabled=false -> every new route answers 503
+    // ("feature disabled" is 503 project-wide).
     #[test]
     fn test_backup_disabled_returns_503_on_all_routes() {
         crate::core::engine_runtime::block_on(async {
@@ -835,7 +833,7 @@ mod tests {
         })
     }
 
-    // 9b. Mandatory test (spec general/006 authorization section): every
+    // 9b. Mandatory authorization test: every
     // new route rejects non-admins with 403, regardless of method or
     // permissions held elsewhere -- extract_domain has no match arm for
     // backups*/restores*.
@@ -939,7 +937,7 @@ mod tests {
 
     // 11c. Download/DELETE of the currently-running backup's id -> 409 (this
     // backup is still running); GET (detail) of the same id reports
-    // state="running" from the job slot instead of 404 (orchestrator hint 3).
+    // state="running" from the job slot instead of 404.
     #[test]
     fn test_download_and_delete_conflict_while_backup_running() {
         crate::core::engine_runtime::block_on(async {
@@ -1059,7 +1057,7 @@ mod tests {
             assert!(list["backups"].as_array().unwrap().iter().any(|b| b["id"] == json!(id)));
             assert_eq!(list["running"], serde_json::Value::Null);
 
-            // Content-Type + Range support (spec general/006 download).
+            // Download: Content-Type + Range support.
             let req = Request::builder().uri(format!("/store-api/backups/{id}/download")).body(Body::empty()).unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
@@ -1084,7 +1082,7 @@ mod tests {
         })
     }
 
-    // Metrics wiring (spec general/006 metrics section): the /store-api/metrics
+    // Metrics wiring: the /store-api/metrics
     // "backup" block is null when disabled, and reflects a completed backup
     // (last_success_at/last_duration_ms/last_size_bytes/failed_total) plus
     // `running` for an in-progress one when enabled.
@@ -1128,7 +1126,7 @@ mod tests {
     }
 
     // Happy-path wiring proof: upload a real archive's exact bytes back in,
-    // as a raw streamed body (spec: no multipart, no RAM copy) -> 201 with a
+    // as a raw streamed body (no multipart, no RAM copy) -> 201 with a
     // fresh server-assigned id, distinct from the archive's own manifest id.
     #[test]
     fn test_upload_roundtrip() {
@@ -1161,8 +1159,8 @@ mod tests {
         })
     }
 
-    // Invalid uploads are rejected and leave nothing behind (spec: the file
-    // is discarded).
+    // Invalid uploads are rejected and leave nothing behind (the file is
+    // discarded).
     #[test]
     fn test_upload_invalid_archive_rejected_and_discarded() {
         crate::core::engine_runtime::block_on(async {
@@ -1185,8 +1183,8 @@ mod tests {
         })
     }
 
-    // Spec general/006 explicitly calls out that uploads have no body-limit
-    // problem: a body past axum's usual 2 MB `Bytes`/`Json` default must
+    // Uploads have no body-limit problem: a body past axum's usual
+    // 2 MB `Bytes`/`Json` default must
     // still reach the handler (and get a normal 400, not a framework-level
     // rejection) -- proves `body: Body` (raw, streamed) really does bypass
     // that default rather than just being documented to.
@@ -1302,7 +1300,7 @@ mod tests {
         })
     }
 
-    // Synchronous restore pre-checks (orchestrator hint 1): all three must
+    // Synchronous restore pre-checks: all three must
     // be rejected before any job/slot is ever touched.
     #[test]
     fn test_restore_synchronous_prechecks() {
@@ -1350,7 +1348,7 @@ mod tests {
     }
 
     /// Polls `GET /backups/{id}` until it is no longer "running" (bounded,
-    /// direction-stable -- spec general/008 style, not a tight timing window).
+    /// direction-stable, not a tight timing window).
     async fn wait_for_backup_completion(app: &Router, id: &str) -> serde_json::Value {
         for _ in 0..200 {
             let (status, body) = request(app, Method::GET, &format!("/store-api/backups/{id}"), None, None).await;

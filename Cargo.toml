@@ -14,11 +14,11 @@ exclude = ["/.github/**", "/docs/**"]
 # --- Core: Async Runtime & Web Interface ---
 # Axum is our "driver"
 axum = { version = "0.7", features = ["macros", "http2"] }
-# Direct access to the HTTP conn machinery for the UDS listener (perf/001);
+# Direct access to the HTTP conn machinery for the UDS listener;
 # both are already transitive dependencies of Axum.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
-# Native HTTPS listener (spec general/011); rustls itself comes as a re-export
+# Native HTTPS listener; rustls itself comes as a re-export
 # via tokio_rustls::rustls (default provider: aws-lc-rs).
 tokio-rustls = "0.26"
 # PEM cert/key loading; replaces the retired rustls-pemfile (RUSTSEC-2025-0134).
@@ -33,9 +33,9 @@ tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
 
 # --- The "Lura" Power: Linux I/O ---
-# Raw io_uring ring for the SQPOLL storage thread (perf/005).
+# Raw io_uring ring for the SQPOLL storage thread.
 io-uring = "0.6"
-# Runtime of the engine thread (perf/020); pinned, minor releases break.
+# Runtime of the engine thread; pinned, minor releases break.
 compio = { version = "=0.19.2", default-features = false, features = ["runtime", "io-uring", "time", "fs"] }
 # compio-driver's own io-uring version: the registered-buffer ops build its SQE type.
 io-uring-compio = { package = "io-uring", version = "0.7" }
@@ -75,12 +75,12 @@ futures = "0.3.31"
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
-# CSV/TSV parsing for the rel from-file import (spec rel/019).
+# CSV/TSV parsing for the rel from-file import.
 csv = "1"
 
 [dev-dependencies]
 tempfile = "3.10"
-# h2c client for the per-connection ordering test (spec perf/018a).
+# h2c client for the per-connection ordering test.
 hyper = { version = "1", features = ["client", "http2"] }
 
 [lints.clippy]

@@ -1,4 +1,4 @@
-//! The engine thread's runtime (spec perf/020): compio on one io_uring ring
+//! The engine thread's runtime: compio on one io_uring ring
 //! with `SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN | TASKRUN_FLAG`, inside
 //! the handle of a tokio runtime that keeps `coop::offload`, `tokio::fs` and
 //! the IPC sockets working. File I/O runs in [`spawn_io`] tasks, which

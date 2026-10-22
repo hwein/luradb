@@ -1,4 +1,4 @@
-//! Restore pipeline (spec general/006): a full checksum-verification pass,
+//! Restore pipeline: a full checksum-verification pass,
 //! domain preparation (`fail_if_exists`/`replace`), then a streaming apply
 //! pass in archive order (domains already exist by then -> indexes -> data).
 
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 /// Poll interval while waiting for the domain purger to finalize a deletion
 /// in `replace` mode. The purger itself runs as an independent background
-/// task (spec general/003 pattern); this loop only observes its progress.
+/// task; this loop only observes its progress.
 const PURGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Deadline for that wait. Without it a stalled purger parks the restore
@@ -122,21 +122,20 @@ fn json_of<'c>(control: &'c ControlPlane, domain: &str) -> anyhow::Result<&'c Ar
 pub(crate) struct ArchiveScan {
     kv_domains: Vec<String>,
     json_domains: Vec<String>,
-    /// Exposed for the upload endpoint's "manifest fields" response (spec
-    /// general/006 POST /backups/upload) — restore itself only needs the
+    /// Exposed for the "manifest fields" response of POST
+    /// /backups/upload — restore itself only needs the
     /// domain-name lists above.
     pub(crate) manifest: ManifestLine,
 }
 
-/// Full read pass (spec general/006: a complete read pass ahead of any
-/// write): verifies the SHA-256 checksum line and, along the way, collects
-/// every kv-domain/json-domain name — needed up front so `fail_if_exists`/
-/// `replace` and the `into_domain` single-name check can run before any
-/// write in pass 2. Data lines naming an undeclared domain are rejected
-/// here: the apply pass takes its target from the data line, so an archive
-/// could otherwise write past those checks into a live domain. Also reused
-/// as-is by the upload endpoint's validation pass (`crate::api::backup`),
-/// which only needs the checksum/manifest check.
+/// Full read pass ahead of any write: verifies the SHA-256 checksum line
+/// and, along the way, collects every kv-domain/json-domain name — needed
+/// up front so `fail_if_exists`/`replace` and the `into_domain` single-name
+/// check can run before any write in pass 2. Data lines naming an
+/// undeclared domain are rejected here: the apply pass takes its target from
+/// the data line, so an archive could otherwise write past those checks into
+/// a live domain. Also reused as-is by the upload endpoint's validation pass
+/// (`crate::api::backup`), which only needs the checksum/manifest check.
 pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> {
     let mut reader = ArchiveReader::open(path).await?;
 
@@ -335,7 +334,7 @@ async fn read_line_capped(reader: &mut ArchiveReader, buf: &mut Vec<u8>) -> anyh
     Ok(buf.len())
 }
 
-/// Validates `into_domain` (spec general/006: only legal when the archive
+/// Validates `into_domain` (only legal when the archive
 /// contains exactly one domain *name*, counting kv/json together — a
 /// `domain:*` export has the same name in both sections) and returns the
 /// `(archived_name, target_name)` substitution to apply everywhere.
@@ -476,7 +475,7 @@ async fn wait_for_purge(name: &str, timeout: Duration, is_gone: impl Fn() -> boo
 /// are already prepared, so `kv-domain`/`json-domain`/`manifest`/`checksum`
 /// lines are no-ops here. KV writes are throttled individually (a pause
 /// every `scan_batch_size` entries); JSON documents are grouped into
-/// per-domain batches and imported via [`JsonEngine::bulk_load`] (spec:
+/// per-domain batches and imported via [`JsonEngine::bulk_load`] (its
 /// index entries are maintained synchronously, like `load_batch`), flushed
 /// on a domain change, a full batch, or end of stream.
 async fn apply_pass(

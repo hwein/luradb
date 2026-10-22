@@ -59,9 +59,9 @@ impl Modify for BearerAuth {
 // ── API contract version (Modify hook) ────────────────────────────────────────
 
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
-/// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
+/// Breaking bumps the middle digit, anything else the last. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.10.0";
+pub const API_VERSION: &str = "0.10.1";
 
 struct VersionInfo;
 
@@ -92,19 +92,19 @@ pub struct AppState {
     pub json_engine: Option<Arc<JsonEngine>>,
     /// `None` when the relational engine is disabled via `rel.enabled = false`.
     pub rel_engine: Option<Arc<RelEngine>>,
-    /// `None` when `shm.enabled = false` (spec perf/006).
+    /// `None` when `shm.enabled = false`.
     pub shm_manager: Option<Arc<ShmManager>>,
-    /// `None` when `backup.enabled = false` (spec general/006) — routes stay
+    /// `None` when `backup.enabled = false` — routes stay
     /// registered either way; handlers answer 503 (plaintext `ApiError`).
     pub backup_manager: Option<Arc<BackupManager>>,
-    /// `None` when `log.http_access = false` (spec general/005) — routes stay
+    /// `None` when `log.http_access = false` — routes stay
     /// registered either way; handlers answer 503 (plaintext `ApiError`).
     pub log_access: Option<logs::LogAccessState>,
     /// Runs domain creates and deletes and auth changes, lists the domains,
     /// and carries the global event stream behind `GET /store-api/events`.
     pub control: Arc<ControlPlane>,
     /// Effective configuration of the running process, backing
-    /// `GET /store-api/config` (spec general/022) — always present.
+    /// `GET /store-api/config` — always present.
     pub config: Arc<LuraConfig>,
     /// Resolved config path (`resolve_config_path`) — always set, even when
     /// `config_file_loaded` is `false`.
@@ -116,7 +116,7 @@ pub struct AppState {
 // ── Shared DTOs ───────────────────────────────────────────────────────────────
 
 /// Generic `{"count": N}` response, shared by JSON's `count_documents`, KV's
-/// `count_keys`, and rel's `count_rows` (spec general/017) — one schema
+/// `count_keys`, and rel's `count_rows` — one schema
 /// instead of three identical ones.
 #[derive(Serialize, ToSchema)]
 pub struct CountResponse {
@@ -138,7 +138,7 @@ pub fn create_router(state: AppState) -> Router {
     };
 
     let mut store_router = Router::new()
-        // Effective configuration (spec general/022). No `{domain}` segment —
+        // Effective configuration. No `{domain}` segment —
         // admin-only via the same extract_domain None-branch as /metrics.
         .route("/config", get(metrics::get_config))
         // Metrics (admin / domain user)
@@ -192,7 +192,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/json/:domain/export", get(json::export_documents))
         .route("/json/:domain/reindex", post(json::trigger_reindex))
         .route("/json/:domain/reindex/:task_id", get(json::reindex_status))
-        // Backup & Restore (spec general/006). Always registered — like the
+        // Backup & Restore. Always registered — like the
         // JSON engine (and unlike rel), `backup.enabled = false` is a
         // handler-level 503, not a router-level absence, so on/off never
         // changes the contract's route surface.
@@ -202,19 +202,19 @@ pub fn create_router(state: AppState) -> Router {
         .route("/backups/:id/download", get(backup::download_backup))
         .route("/backups/:id/restore", post(backup::restore_backup))
         .route("/restores/:id", get(backup::get_restore_status))
-        // Log Access (spec general/005). Always registered — like backup and
+        // Log Access. Always registered — like backup and
         // the JSON engine — so `log.http_access = false` stays a handler-level
         // 503, keeping 404 free for "wrong URL / old server".
         .route("/logs", get(logs::get_logs))
         .route("/logs/files", get(logs::list_files))
-        // Global lifecycle/DDL event stream (spec general/018). No `{domain}`
+        // Global lifecycle/DDL event stream. No `{domain}`
         // segment — admin-only via the same path-shape rule as `/metrics`,
         // `/backups*` etc. (auth::middleware::extract_domain returns `None`).
         .route("/events", get(events::get_events))
         .with_state(state.clone());
 
-    // Relational store (spec rel/009 §1): registered *only* when the engine
-    // is enabled — unlike json/009, a disabled rel engine means the whole
+    // Relational store: registered *only* when the engine
+    // is enabled — unlike JSON, a disabled rel engine means the whole
     // rel REST surface is absent (axum default 404), not a 503 per handler.
     // A disabled engine means no rel data can exist at all, so conditional
     // registration is the KISS choice: it keeps the router free of routes
@@ -230,7 +230,7 @@ pub fn create_router(state: AppState) -> Router {
                 get(rel_domains::get_domain).delete(rel_domains::delete_domain),
             )
             .route("/rel/:domain/sql", post(rel::execute_sql))
-            // CSV/TSV file import (spec rel/019): a body-size cap analogous
+            // CSV/TSV file import: a body-size cap analogous
             // to the JSON bulk route below, sized from the engine config.
             .route(
                 "/rel/:domain/tables/from-file",
@@ -238,7 +238,7 @@ pub fn create_router(state: AppState) -> Router {
                     state.rel_engine.as_ref().map_or(64 * 1024 * 1024, |e| e.import_body_limit_bytes()),
                 )),
             )
-            // Browse/Row REST surface (spec rel/010): registered in this
+            // Browse/Row REST surface: registered in this
             // same conditional sub-router, not a second merge point.
             .route("/rel/:domain/tables", get(rel_browse::list_tables))
             .route("/rel/:domain/tables/:table", get(rel_browse::get_table))
@@ -251,7 +251,7 @@ pub fn create_router(state: AppState) -> Router {
                 "/rel/:domain/tables/:table/rows/:pk",
                 get(rel_browse::get_row).put(rel_browse::update_row).delete(rel_browse::delete_row),
             )
-            // Object counter (spec general/017): a level above the `rows`
+            // Object counter: a level above the `rows`
             // collection, not a static child of it — `/tables/count` still
             // matches `:table`, so a table literally named `count` stays reachable.
             .route("/rel/:domain/tables/:table/count", get(rel_browse::count_rows))
@@ -283,7 +283,7 @@ pub fn create_router(state: AppState) -> Router {
     let router = Router::new()
         // Heartbeat at root (infra convention for load balancers / k8s probes)
         .route("/health", get(metrics::health).with_state(state.clone()))
-        // Version handshake at root, next to /health (spec 004 §7) — reads
+        // Version handshake at root, next to /health — reads
         // only constants, no engine access, so no state needed.
         .route("/version", get(metrics::version))
         .nest("/store-api", store_router.merge(auth_router));
@@ -292,7 +292,7 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 /// Wraps `router` in the per-request layers that run on the frontend, ahead
-/// of the engine bridge (spec perf/018a A2): trusted-proxy resolution and,
+/// of the engine bridge: trusted-proxy resolution and,
 /// when `auth_cache` is set (auth enabled), auth. Neither calls an engine.
 pub fn frontend_layers(
     router: Router,
@@ -495,7 +495,7 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
 )]
 pub struct ApiDoc;
 
-// ── Contract drift gate (spec 004 §5) ──────────────────────────────────────────
+// ── Contract drift gate ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod contract_tests {
@@ -513,8 +513,7 @@ mod contract_tests {
             generated, committed,
             "api/openapi.json is stale. Regenerate: \
              cargo run -- --dump-openapi > api/openapi.json — and check whether info.version \
-             needs a bump and whether COMPATIBILITY.md in the concepts repo \
-             needs a new line."
+             needs a bump."
         );
     }
 
@@ -555,7 +554,7 @@ mod contract_tests {
         );
     }
 
-    // DocumentResponse schema shape (spec json/015 §1): _key/_version are
+    // DocumentResponse schema shape: _key/_version are
     // fixed required properties, everything else is an open additionalProperties map.
     #[test]
     fn document_response_schema_is_well_formed() {
@@ -573,7 +572,7 @@ mod contract_tests {
         assert_ne!(additional, &serde_json::json!(false), "additionalProperties must not be false: {schema}");
     }
 
-    // DocumentResponse wiring (spec json/015 §3): the four document-CRUD
+    // DocumentResponse wiring: the four document-CRUD
     // responses that carry a body reference the new schema.
     #[test]
     fn document_response_wired_to_all_four_responses() {
@@ -595,10 +594,10 @@ mod contract_tests {
         }
     }
 
-    // 410 coverage (spec json/016 §A, test 1): every document-side JSON
+    // 410 coverage: every document-side JSON
     // endpoint whose engine call reaches `require_active` documents a 410
     // response. Domain-management routes in json_domains.rs document their
-    // own 410 separately (json/013) and reindex_status (task-map lookup
+    // own 410 separately and reindex_status (task-map lookup
     // only, no domain-state check) is deliberately excluded.
     #[test]
     fn json_document_endpoints_document_410_gone() {
@@ -627,9 +626,9 @@ mod contract_tests {
         assert!(status_responses["410"].is_null(), "reindex_status must not document 410");
     }
 
-    // Header parameters (spec json/016 §B, test 2): PUT and DELETE of the
+    // Header parameters: PUT and DELETE of the
     // document route carry If-Match; PUT additionally keeps the
-    // If-None-Match parameter from json/014.
+    // existing If-None-Match parameter.
     #[test]
     fn document_route_carries_if_match_header_parameter() {
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
@@ -646,7 +645,7 @@ mod contract_tests {
         assert!(has_header(doc_path, "delete", "If-Match"), "DELETE must carry If-Match");
     }
 
-    // List/search typing (spec json/016 §C, test 3): both `documents` fields
+    // List/search typing: both `documents` fields
     // reference DocumentResponse instead of the former Vec<Object> placeholder.
     #[test]
     fn document_list_and_search_responses_reference_document_response_items() {
@@ -662,7 +661,7 @@ mod contract_tests {
         }
     }
 
-    // ETag response header (spec json/016 §D1, test 4): GET …/documents/{key}'s
+    // ETag response header: GET …/documents/{key}'s
     // 200 declares the header used for a subsequent If-Match / If-None-Match.
     #[test]
     fn get_document_200_declares_etag_header() {
@@ -672,7 +671,7 @@ mod contract_tests {
         assert!(!header.is_null(), "GET …/documents/{{key}} 200 must declare an ETag header: {header}");
     }
 
-    // Error-body typing sample (spec json/016 §D2, test 5 schema half): a 4xx
+    // Error-body typing sample (schema half): a 4xx
     // response of json.rs declares its body as a plain string. The matching
     // reality check (an actual roundtrip) lives in json::tests.
     #[test]
@@ -683,22 +682,21 @@ mod contract_tests {
         assert_eq!(schema["type"], serde_json::json!("string"), "{schema}");
     }
 
-    // ── Error-body typing gate (spec general/026) ────────────────────────────
+    // ── Error-body typing gate ───────────────────────────────────────────────
 
     /// Every documented response with status >= 400, anywhere in the API,
     /// must declare a `text/plain` string body — otherwise a codegen client
-    /// sees `content?: never` on that error, the contract lie general/004 set
-    /// out to end. No exception list as a starting state (spec §Gate); the
-    /// one exception below is justified, not a loophole, and covers json.rs
-    /// too (json/016 §D2's narrower guarantee, now subsumed).
+    /// sees `content?: never` on that error, a contract lie. No exception
+    /// list as a starting state; the one exception below is justified, not
+    /// a loophole. Covers json.rs too.
     #[test]
     fn every_4xx_5xx_response_declares_text_plain_string_body() {
         const HTTP_METHODS: [&str; 8] =
             ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
         // metrics::get_domain_metrics returns a bare `Result<_, StatusCode>`
         // (see the handler in metrics.rs), not `ApiError` — its 404 is a
-        // real empty body, not a plaintext one. Reality over schema (spec
-        // general/026): documented without a body instead of faking one. The
+        // real empty body, not a plaintext one. Reality over schema:
+        // documented without a body instead of faking one. The
         // only entry here; a new one needs the same proof (a handler path
         // that provably never carries a body).
         const NO_BODY_EXCEPTIONS: &[(&str, &str, &str)] =
@@ -745,7 +743,7 @@ mod contract_tests {
     }
 }
 
-// ── Router↔Contract coverage gate (spec general/009) ──────────────────────────
+// ── Router↔Contract coverage gate ─────────────────────────────────────────────
 
 #[cfg(test)]
 mod router_coverage_tests {
@@ -961,7 +959,7 @@ mod router_coverage_tests {
         ("get", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
     ];
 
-    /// Routes served by the reader pool (spec perf/018b A2). Each handler was
+    /// Routes served by the reader pool. Each handler was
     /// checked for engine writes; one that writes belongs in `WRITE_ROUTES`.
     const READ_ROUTES: &[(&str, &str)] = &[
         ("get", "/store-api/config"),

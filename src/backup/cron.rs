@@ -1,4 +1,4 @@
-//! 5-field cron subset (spec general/006 configuration schema): minute,
+//! 5-field cron subset for backup schedules: minute,
 //! hour, day-of-month, month, weekday. Supports `*`, single values, lists
 //! (`a,b,c`), ranges (`a-b`) and steps (`*/n`, `a-b/n`). No names (`MON`,
 //! `JAN`), no special characters (`@daily`, `L`, `#`).
@@ -152,7 +152,7 @@ fn parse_bound(part: &str, min: u32, max: u32, name: &str) -> Result<u32> {
 
 // ── Civil calendar time ──────────────────────────────────────────────────
 //
-// Shared by backup/restore ID timestamps (spec general/006) and, in the
+// Shared by backup/restore ID timestamps and, in the
 // scheduler follow-up, the cron minute-match against "now". This project has
 // no chrono/time dependency, so date math is done by hand: proleptic
 // Gregorian civil-from-days (Howard Hinnant's algorithm,
@@ -197,7 +197,7 @@ pub fn civil_from_unix(unix_secs: u64) -> CivilTime {
     CivilTime { year, month, day, hour, minute, second, weekday }
 }
 
-/// Formats a Unix timestamp as `YYYYMMDDTHHMMSSZ` (spec general/006 backup/restore IDs).
+/// Formats a Unix timestamp as `YYYYMMDDTHHMMSSZ` (backup/restore IDs).
 pub fn format_utc_timestamp(unix_secs: u64) -> String {
     let t = civil_from_unix(unix_secs);
     format!(
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_nightly_example_from_spec() {
-        // "0 3 * * *" from the spec's [[backup.schedule]] example.
+        // "0 3 * * *": the nightly [[backup.schedule]] example.
         let sched = CronSchedule::parse("0 3 * * *").unwrap();
         assert!(sched.matches(0, 3, 1, 1, 0));
         assert!(sched.matches(0, 3, 15, 7, 4));
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_dom_step_counts_as_restricted_for_the_or_rule() {
         // `*/3` is not literally `*`, so day-of-month and weekday are
-        // OR-combined (spec general/006) -- Vixie cron would AND them here.
+        // OR-combined -- Vixie cron would AND them here.
         let sched = CronSchedule::parse("30 2 */3 * 1").unwrap();
         assert!(sched.matches(30, 2, 4, 6, 5)); // day 4 is in */3, any weekday
         assert!(sched.matches(30, 2, 5, 6, 1)); // Monday, day not in */3

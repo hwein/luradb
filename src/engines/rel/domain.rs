@@ -1,10 +1,10 @@
-//! Domain management for the relational store (spec rel/002).
+//! Domain management for the relational store.
 //!
 //! Self-hosting pattern like the KV/JSON registries: metadata lives in the
 //! dedicated rel LSM instance under `__sys:rel_domain:{name}`, separate from
-//! the catalog (`CAT:`) and row data (`ROW:`/`IDX:`/`SEQ:`) that land in
-//! rel/003 on the same `system_prefix`. Deletion only marks the domain
-//! `Deleting`; physical cleanup follows in spec rel/013.
+//! the catalog (`CAT:`) and row data (`ROW:`/`IDX:`/`SEQ:`) that live
+//! under the same `system_prefix`. Deletion only marks the domain
+//! `Deleting`; a background purger does the physical cleanup.
 
 use super::error::RelStoreError;
 use crate::engines::lsm::domain::{fnv64, now_secs};
@@ -47,7 +47,7 @@ fn validate_domain_name(name: &str) -> Result<(), RelStoreError> {
             name
         )));
     }
-    // Shadowed by the static /store-api/rel/domains routes (rel/009): data
+    // Shadowed by the static /store-api/rel/domains routes: data
     // endpoints of such a domain would answer 404/405 (matchit prefers
     // static segments).
     if name == "domains" {
@@ -72,7 +72,7 @@ pub struct RelDomain {
     pub name: String,
     /// 16 lowercase hex chars (FNV-64a of the name) — colon-free so the
     /// later data keys `CAT:{prefix}:{name}`, `ROW:{prefix}:{table_id}:...`
-    /// etc. (rel/003) split cleanly on `:`.
+    /// etc. split cleanly on `:`.
     pub system_prefix: Vec<u8>,
     pub created_at: u64,
     #[serde(default)]
@@ -120,7 +120,7 @@ impl RelDomainRegistry {
         }
         let registry = Self { domains: RwLock::new(loaded), engine };
         // Any state counts: creating over a Deleting default would fail with
-        // DomainAlreadyExists and abort every boot. The purger (rel/013)
+        // DomainAlreadyExists and abort every boot. The purger
         // finalizes it; the next recover() then recreates it.
         match registry.get_domain_any(DEFAULT_DOMAIN) {
             None if !owns_default => {}
@@ -166,16 +166,15 @@ impl RelDomainRegistry {
     }
 
     /// Lists **all** domains including `Deleting` ones, each carrying its
-    /// `state` (rel/013, pattern: json/013): operators can watch purge
-    /// progress. This deliberately supersedes the rel/002 default (concept
-    /// 3.1 "hidden from get/list") — `get_domain`/`require_active` stay
-    /// active-only, so CRUD resolution is unchanged and the 410 detail path
-    /// remains rel/009's.
+    /// `state` (same pattern as the JSON store): operators can watch purge
+    /// progress. Only listing shows them — `get_domain`/`require_active` stay
+    /// active-only, so CRUD resolution is unchanged and a deleting domain
+    /// still answers 410.
     pub fn list_domains(&self) -> Vec<RelDomain> {
         self.domains.read().values().cloned().collect()
     }
 
-    /// Domains currently in `Deleting` state (rel/013 purger consumer).
+    /// Domains currently in `Deleting` state (purger consumer).
     pub(crate) fn list_deleting_domains(&self) -> Vec<RelDomain> {
         self.domains
             .read()
@@ -186,8 +185,8 @@ impl RelDomainRegistry {
     }
 
     /// Marks the domain `Deleting` and persists the change. Catalog and row
-    /// data (rel/003+) stay on disk under the domain's prefix until the
-    /// purger (spec rel/013) cleans them up.
+    /// data stay on disk under the domain's prefix until the
+    /// purger cleans them up.
     pub(crate) async fn delete_domain(&self, name: &str) -> Result<(), RelStoreError> {
         let mut domain = match self.get_domain_any(name) {
             None => return Err(RelStoreError::DomainNotFound(name.to_string())),
@@ -215,7 +214,7 @@ impl RelDomainRegistry {
 
     /// Resolves an active domain; `DomainDeleting` (→ 410) for deleting ones,
     /// `DomainNotFound` (→ 404) for unknown ones. This is the domain
-    /// resolution every catalog/DML operation calls from rel/003 on.
+    /// resolution every catalog/DML operation calls.
     pub(crate) fn require_active(&self, name: &str) -> Result<RelDomain, RelStoreError> {
         match self.get_domain_any(name) {
             None => Err(RelStoreError::DomainNotFound(name.to_string())),
@@ -266,7 +265,7 @@ mod tests {
         (registry, dir)
     }
 
-    // Spec general/030: the domain key at a maximal name stays below the
+    // The domain key at a maximal name stays below the
     // startup lower bound of rel.lsm.max_key_length.
     #[test]
     fn test_sys_key_at_max_name_fits_key_limit_lower_bound() {
@@ -299,7 +298,7 @@ mod tests {
     }
 
     // 3. Create against a Deleting domain of the same name -> still
-    //    DomainAlreadyExists (name stays reserved until rel/013 purges it).
+    //    DomainAlreadyExists (name stays reserved until the purger runs).
     #[test]
     fn test_create_against_deleting_domain_still_rejected() {
         crate::core::engine_runtime::block_on(async {
@@ -312,7 +311,7 @@ mod tests {
     }
 
     // 4. Invalid names -> InvalidDomainName. "domains" is reserved: the
-    //    static /store-api/rel/domains routes (rel/009) would shadow it.
+    //    static /store-api/rel/domains routes would shadow it.
     #[test]
     fn test_invalid_domain_name_rejected() {
         crate::core::engine_runtime::block_on(async {
@@ -390,8 +389,8 @@ mod tests {
         })
     }
 
-    // 9. list_domains now lists ALL domains incl. Deleting (with state,
-    //    rel/013); get_domain/require_active stay active-only.
+    // 9. list_domains lists ALL domains incl. Deleting (with state);
+    //    get_domain/require_active stay active-only.
     #[test]
     fn test_list_domains_includes_deleting_with_state() {
         crate::core::engine_runtime::block_on(async {
@@ -414,7 +413,7 @@ mod tests {
     }
 
     // 11. recover survives a Deleting default domain without a 409 boot loop;
-    //     it stays invisible/Deleting (until rel/013 purges it).
+    //     it stays invisible/Deleting (until the purger runs).
     #[test]
     fn test_recover_survives_deleting_default_domain() {
         crate::core::engine_runtime::block_on(async {

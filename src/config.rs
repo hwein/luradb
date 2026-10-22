@@ -47,7 +47,7 @@ impl LuraConfig {
     }
 
     /// Parses config text. Also returns the keys it sets that the server does
-    /// not read, sorted and deduplicated; they are ignored (spec general/030).
+    /// not read, sorted and deduplicated; they are ignored.
     pub fn parse(content: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
         let mut config: Self = toml::from_str(content)?;
         let mut keys = Vec::new();
@@ -205,7 +205,7 @@ fn resolve_real_path(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// True if `candidate` is `<vlog_filename>.<digits>`. Any digits count, even
-/// `.0`/`.1`, which the vLog never writes (spec rule 2).
+/// `.0`/`.1`, which the vLog never writes.
 fn matches_generation_name(candidate: Option<&OsStr>, vlog_filename: &OsStr) -> bool {
     let Some(candidate) = candidate else { return false };
     let candidate = candidate.as_bytes();
@@ -242,14 +242,14 @@ pub fn resolve_config_path(cli_arg: Option<PathBuf>, exists: impl Fn(&Path) -> b
 #[serde(default)]
 pub struct ServerConfig {
     /// TCP bind address for the HTTP/HTTPS listeners. Defaults to loopback,
-    /// not `0.0.0.0` (spec general/013: fail-closed with auth disabled).
+    /// not `0.0.0.0` (fail-closed with auth disabled).
     pub bind_address: String,
     pub port: u16,
     /// Set to `true` to enable the Swagger UI + `/api-docs/openapi.json`
     /// (default: `false`, safe for production). When `auth.enabled = true`,
     /// these docs routes require the same "any valid key, no domain
-    /// permission" check as `GET /version` (spec 004 §7; enforced by
-    /// `auth::middleware::docs_auth_layer`, spec general/014) — when auth is
+    /// permission" check as `GET /version` (enforced by
+    /// `auth::middleware::docs_auth_layer`) — when auth is
     /// disabled, they're served openly like everything else.
     pub swagger_enabled: bool,
     /// URL path at which Swagger UI is served (default: `/test-ui`).
@@ -260,9 +260,9 @@ pub struct ServerConfig {
     pub hello_message: String,
     /// Absolute path for the Unix Domain Socket. `None` = UDS disabled.
     pub unix_socket_path: Option<String>,
-    /// Set to `false` to disable the plain HTTP listener (spec general/011).
+    /// Set to `false` to disable the plain HTTP listener.
     pub http_enabled: bool,
-    /// Enables the native HTTPS listener on `tls_port` (spec general/011).
+    /// Enables the native HTTPS listener on `tls_port`.
     pub tls_enabled: bool,
     /// Port for the native HTTPS listener. Must differ from `port`.
     pub tls_port: u16,
@@ -292,7 +292,7 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Startup validation (spec general/011): at least one TCP listener must
+    /// Startup validation: at least one TCP listener must
     /// be enabled, and HTTP/HTTPS cannot share the same port. Cert/key
     /// readability and parsability are checked when the TLS listener is
     /// actually built (`tls::load_tls_acceptor`), not here.
@@ -385,10 +385,10 @@ impl Default for BufferPoolConfig {
     }
 }
 
-// ── Block Cache (Spec 015) ─────────────────────────────────────────────────────
+// ── Block Cache ─────────────────────────────────────────────────────
 
 /// Block-cache sizing of one LSM instance. A parameter type, not a config
-/// section: the engines pass fixed values (spec general/030).
+/// section: the engines pass fixed values.
 #[derive(Debug)]
 pub struct BlockCacheConfig {
     /// Maximum total size of the block cache in bytes (default: 64 MB).
@@ -421,7 +421,7 @@ pub struct LsmConfig {
     pub flush_check_interval_ms: u64,
     pub compaction_check_interval_ms: u64,
     pub wal_event_channel_capacity: usize,
-    /// KV watch replay-ring capacity (spec kv/024). `0` disables resume —
+    /// KV watch replay-ring capacity. `0` disables resume —
     /// every reconnect with a `Last-Event-ID` gets `reset`, but `id:` fields
     /// are still assigned.
     pub watch_replay_buffer_size: usize,
@@ -449,7 +449,7 @@ impl LsmConfig {
     }
 }
 
-/// Startup validation (spec general/025): a key or value limit above
+/// Startup validation: a key or value limit above
 /// `WAL_MAX_FIELD_LEN` would still write today and only fail recovery on the
 /// *next* restart -- reject it at startup instead.
 fn check_wal_field(key: &str, value: usize) -> anyhow::Result<()> {
@@ -460,7 +460,7 @@ fn check_wal_field(key: &str, value: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Startup validation (spec general/030): rejects `value` below `min`.
+/// Startup validation: rejects `value` below `min`.
 fn check_min(key: &str, value: usize, min: usize) -> anyhow::Result<()> {
     anyhow::ensure!(value >= min, "invalid config: {key} ({value}) must be at least {min}");
     Ok(())
@@ -484,7 +484,7 @@ impl Default for JsonLsmConfig {
     }
 }
 
-/// Lower bound of `json.lsm.max_value_size` (spec general/030).
+/// Lower bound of `json.lsm.max_value_size`.
 pub(crate) const JSON_LSM_MIN_VALUE_SIZE: usize = 4096;
 
 impl JsonLsmConfig {
@@ -562,7 +562,7 @@ impl Default for JanitorCfg {
 // ── TTL sweeper ───────────────────────────────────────────────────────────────
 
 /// Background task that tombstones TTL-expired keys and emits their delete
-/// events (spec kv/025). Only the KV instance runs one.
+/// events. Only the KV instance runs one.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TtlSweeperCfg {
@@ -594,7 +594,7 @@ pub struct DomainsConfig {
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
     /// Cap on the number of keys a single `DELETE …/keys?prefix=` bulk
-    /// delete (spec kv/023) may remove; a larger selection is rejected with
+    /// delete may remove; a larger selection is rejected with
     /// 413 and nothing is deleted. `0` rejects every non-empty selection —
     /// not treated as "unlimited".
     pub max_bulk_delete_keys: usize,
@@ -643,12 +643,12 @@ pub struct AuthConfig {
     pub enabled: bool,
     pub admins: Vec<AdminEntry>,
     /// UIDs authenticated via UDS peer credentials without an API key
-    /// (admin access). Empty = UCred bypass disabled (perf/001).
+    /// (admin access). Empty = UCred bypass disabled.
     pub trusted_uids: Vec<u32>,
 }
 
 impl AuthConfig {
-    /// Fail-closed startup check (spec general/013): with auth disabled, the
+    /// Fail-closed startup check: with auth disabled, the
     /// server may only serve loopback — otherwise anyone who reaches the
     /// listener gets unauthenticated full access. `#[serde(default)]` means
     /// a config without an `[auth]` section still reaches this check.
@@ -674,7 +674,7 @@ pub struct AdminEntry {
     /// Secret, read on deserialize but never written back out. Convention:
     /// any new secret field in this file gets `#[serde(skip_serializing)]`
     /// the moment it's introduced — that's the only thing keeping it out of
-    /// `GET /store-api/config` (spec general/022).
+    /// `GET /store-api/config`.
     #[serde(skip_serializing)]
     pub api_key: String,
 }
@@ -710,7 +710,7 @@ pub struct LogConfig {
     /// 0 = never delete.
     pub retention_days: u64,
     pub modules: LogModulesConfig,
-    /// Enables `GET /store-api/logs` + `/logs/files` (spec general/005).
+    /// Enables `GET /store-api/logs` + `/logs/files`.
     /// Requires `path` to be non-empty (stdout is not scrapeable).
     pub http_access: bool,
 }
@@ -730,7 +730,7 @@ impl Default for LogConfig {
 }
 
 impl LogConfig {
-    /// Startup validation (spec general/005, fail fast): HTTP log access
+    /// Startup validation (fail fast): HTTP log access
     /// needs file logging as its source, since stdout isn't scrapeable.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -760,7 +760,7 @@ pub struct ProxyConfig {
     pub trusted_proxies: Vec<String>,
 }
 
-// ── JSON Store (spec json/001) ────────────────────────────────────────────────
+// ── JSON Store ────────────────────────────────────────────────
 
 /// Config for the JSON engine's dedicated LSM instance (own paths & limits).
 #[derive(Debug, Deserialize, Serialize)]
@@ -793,14 +793,14 @@ impl Default for JsonStoreConfig {
 
 impl JsonStoreConfig {
     /// Startup validation of the limits; runs even while the engine is
-    /// disabled, since it can be switched on later (spec general/030).
+    /// disabled, since it can be switched on later.
     pub fn validate(&self) -> anyhow::Result<()> {
         check_min("json.bulk_body_limit_bytes", self.bulk_body_limit_bytes, 1)?;
         self.lsm.validate()
     }
 }
 
-// ── Relational Store (spec rel/001) ───────────────────────────────────────────
+// ── Relational Store ───────────────────────────────────────────
 
 /// Config for the relational engine's dedicated LSM instance (own paths &
 /// limits). No `db_path` — like the JSON engine, this LSM instance has no
@@ -813,21 +813,20 @@ pub struct RelStoreConfig {
     pub wal_path: String,
     pub vlog_path: String,
     pub sstable_dir: String,
-    /// Catalog limit (spec rel/003, concept 8).
+    /// Catalog limit.
     pub max_tables_per_domain: usize,
-    /// DML write-path guard (spec rel/005, concept 8): max encoded LuraRow
-    /// size. The engine's storage value limit is the larger of this and
-    /// 512 KiB (spec general/030).
+    /// DML write-path guard: max encoded LuraRow size. The engine's storage
+    /// value limit is the larger of this and 512 KiB.
     pub max_row_size: usize,
-    /// SELECT executor limits (spec rel/006, concept 8): the hard cap on any
+    /// SELECT executor limits: the hard cap on any
     /// explicit LIMIT, and the hard cap on the in-memory ORDER BY sort buffer.
     pub max_limit: usize,
     pub max_sort_rows: usize,
-    /// JOIN governance (spec rel/007, concept 8): whether an unindexed join
+    /// JOIN governance: whether an unindexed join
     /// column may fall back to a per-row full scan (dev/tiny-table escape
     /// hatch) instead of a 400.
     pub allow_unindexed_joins: bool,
-    /// Body-size cap for `POST .../tables/from-file` (spec rel/019), analogous
+    /// Body-size cap for `POST .../tables/from-file`, analogous
     /// to `json.bulk_body_limit_bytes`.
     pub import_body_limit_bytes: usize,
     pub lsm: RelLsmConfig,
@@ -853,7 +852,7 @@ impl Default for RelStoreConfig {
 
 impl RelStoreConfig {
     /// Startup validation of the limits; runs even while the engine is
-    /// disabled, since it can be switched on later (spec general/030).
+    /// disabled, since it can be switched on later.
     pub fn validate(&self) -> anyhow::Result<()> {
         // Table and index ids are u32.
         let max_tables = u32::MAX as usize;
@@ -871,11 +870,10 @@ impl RelStoreConfig {
     }
 }
 
-// ── Shared Memory IPC (spec perf/006) ─────────────────────────────────────────
+// ── Shared Memory IPC ─────────────────────────────────────────
 
 /// POSIX shared-memory segments for the local IPC bypass. Wire protocols on
-/// top of these segments (state header, ringbuffer, RCU) follow in specs
-/// 007-009.
+/// top of these segments: state header, ringbuffer, RCU.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ShmConfig {
@@ -938,7 +936,7 @@ impl ShmConfig {
         Ok(())
     }
 
-    /// Startup validation (spec general/030), a no-op while SHM is off: the
+    /// Startup validation, a no-op while SHM is off: the
     /// REST listener binds after the registration socket and would replace it.
     pub fn validate_registration_socket(&self, server: &ServerConfig) -> anyhow::Result<()> {
         if !self.enabled {
@@ -953,7 +951,7 @@ impl ShmConfig {
     }
 }
 
-// ── Backup & Restore (spec general/006) ───────────────────────────────────────
+// ── Backup & Restore ───────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -992,11 +990,11 @@ pub struct BackupScheduleConfig {
     pub keep_last: usize,
 }
 
-/// A schedule must fire within 4 years including a leap day (spec general/030).
+/// A schedule must fire within 4 years including a leap day.
 const CRON_HORIZON_DAYS: u64 = 4 * 365 + 1;
 
 impl BackupConfig {
-    /// Startup validation (spec general/006, fail fast). A no-op when
+    /// Startup validation (fail fast). A no-op when
     /// `enabled = false` — a disabled backup config runs no scheduler and
     /// serves no endpoints, so its contents are never acted on.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -1053,7 +1051,7 @@ impl BackupConfig {
     }
 }
 
-// ── Global event stream (spec general/018) ────────────────────────────────────
+// ── Global event stream ────────────────────────────────────
 
 /// Config for the `GlobalEventBus` behind `GET /store-api/events`: lifecycle/
 /// DDL events across the KV, JSON and relational engines. A section of its
@@ -1078,7 +1076,7 @@ impl Default for EventsConfig {
     }
 }
 
-// ── CORS (spec general/020) ───────────────────────────────────────────────────
+// ── CORS ───────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -1092,7 +1090,7 @@ pub struct CorsConfig {
 }
 
 impl CorsConfig {
-    /// Fail-fast startup check (spec general/020 §Start-Validierung). A
+    /// Fail-fast startup check. A
     /// no-op when `enabled = false` — `allowed_origins` is never read then.
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.enabled {
@@ -1130,12 +1128,11 @@ impl CorsConfig {
     }
 }
 
-/// Strict `scheme://host[:port]` shape (spec general/020 §Start-Validierung,
-/// rules 3+5): scheme `[a-z][a-z0-9+.-]*`, non-empty lowercase host of
-/// `[a-z0-9.-]`, optional numeric port, nothing else — no userinfo, path,
-/// query, or fragment. The browser's `Origin` header always has exactly this
-/// shape, and `AllowOrigin::list` compares byte-for-byte, so anything looser
-/// here would silently never match.
+/// Strict `scheme://host[:port]` shape: scheme `[a-z][a-z0-9+.-]*`,
+/// non-empty lowercase host of `[a-z0-9.-]`, optional numeric port, nothing
+/// else — no userinfo, path, query, or fragment. The browser's `Origin`
+/// header always has exactly this shape, and `AllowOrigin::list` compares
+/// byte-for-byte, so anything looser here would silently never match.
 fn is_valid_origin_form(origin: &str) -> bool {
     let Some((scheme, rest)) = origin.split_once("://") else {
         return false;
@@ -1237,7 +1234,7 @@ impl MulticoreConfig {
     }
 }
 
-// ── Key set (spec general/030) ────────────────────────────────────────────────
+// ── Key set ────────────────────────────────────────────────
 
 /// Every leaf key the server reads, e.g. `auth.admins.api_key`, taken from
 /// the field lists serde passes while deserializing the config types.
@@ -1486,7 +1483,7 @@ pub(crate) const REMOVED_KEYS: &[&str] = &[
 mod tests {
     use super::*;
 
-    // Spec general/030: a config that still sets removed keys loads, and the
+    // A config that still sets removed keys loads, and the
     // values have no effect.
     #[test]
     fn test_removed_keys_load_without_effect() {
@@ -1515,7 +1512,7 @@ mod tests {
         assert_eq!(config.multicore.cpu_offload_threads, 0);
     }
 
-    /// Asserts a startup error in the house format (spec general/030): it
+    /// Asserts a startup error in the house format: it
     /// starts with `invalid config: <key> (<value>)` and names the allowed range.
     fn assert_invalid(result: anyhow::Result<()>, key_and_value: &str, allowed: &str) {
         let err = result.unwrap_err().to_string();
@@ -1523,7 +1520,7 @@ mod tests {
         assert!(err.contains(allowed), "{err}");
     }
 
-    // Spec general/030 test 5: 0 (auto) and up to the core count are ok.
+    // 0 (auto) and up to the core count are ok.
     #[test]
     fn test_multicore_validate_offload_threads_against_cores() {
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 0\n").unwrap();
@@ -1599,7 +1596,7 @@ mod tests {
         }
     }
 
-    // Spec perf/018b A6: defaults, then 0 (auto) up to the core count for
+    // Defaults, then 0 (auto) up to the core count for
     // the reader threads, and at least one slot in the reader channel.
     #[test]
     fn test_multicore_reader_threads_and_reader_queue_capacity() {
@@ -1762,7 +1759,7 @@ mod tests {
         assert_eq!(config.server.tls_key_path, "/etc/luradb/tls/server.key");
     }
 
-    // An old config predating spec general/011 has no [server] tls_* or
+    // An old config predating native TLS has no [server] tls_* or
     // http_enabled keys — it must still parse, with the new keys defaulted.
     #[test]
     fn test_tls_old_config_without_new_keys_parses_with_defaults() {
@@ -1800,7 +1797,7 @@ mod tests {
         assert!(ServerConfig::default().validate().is_ok());
     }
 
-    // Spec general/014 test 5: prod-safe default — docs routes stay off
+    // Prod-safe default — docs routes stay off
     // unless explicitly enabled.
     #[test]
     fn test_swagger_disabled_by_default() {
@@ -1889,7 +1886,7 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
-    // Spec general/030 test 5: with SHM on, the resolved registration socket
+    // With SHM on, the resolved registration socket
     // must not take the REST socket's path. The packaged REST socket collides
     // with the default template for instance "luradb".
     #[test]
@@ -2103,7 +2100,7 @@ mod tests {
         assert_invalid(config.backup.validate(), "backup.schedule.cron ('not a cron')", "(schedule 's1')");
     }
 
-    // Spec general/030 test 5: a schedule without a date within 4 years of
+    // A schedule without a date within 4 years of
     // the start is a startup error. 29 February next fires 1461 days minus a
     // minute after 2024-02-29T00:01Z, but not within 4 years of
     // 2096-02-29T00:01Z (2100 is no leap year).
@@ -2177,7 +2174,7 @@ mod tests {
         assert_invalid(config.backup.validate(), &format!("backup.schedule.name ('{name}')"), "1-50 characters");
     }
 
-    // ── Log HTTP access (spec general/005) ──────────────────────────────────
+    // ── Log HTTP access ──────────────────────────────────
 
     #[test]
     fn test_log_http_access_disabled_by_default() {
@@ -2185,7 +2182,7 @@ mod tests {
         assert!(!config.log.http_access);
     }
 
-    // Spec test 2: http_access=true + path="" -> validate() fails.
+    // http_access=true + path="" -> validate() fails.
     #[test]
     fn test_log_validate_rejects_http_access_without_path() {
         let log = LogConfig { http_access: true, path: String::new(), ..Default::default() };
@@ -2204,7 +2201,7 @@ mod tests {
         assert!(log.validate().is_ok());
     }
 
-    // ── Auth fail-closed (spec general/013) ─────────────────────────────────
+    // ── Auth fail-closed ─────────────────────────────────
 
     #[test]
     fn test_server_default_bind_address_is_loopback() {
@@ -2271,7 +2268,7 @@ mod tests {
         assert!(config.auth.validate(&config.server).is_err());
     }
 
-    // ── Global event stream (spec general/018) ──────────────────────────────
+    // ── Global event stream ──────────────────────────────
 
     #[test]
     fn test_events_defaults() {
@@ -2303,7 +2300,7 @@ mod tests {
         assert!(config.auth.validate(&config.server).is_ok());
     }
 
-    // ── CORS (spec general/020) ──────────────────────────────────────────────
+    // ── CORS ──────────────────────────────────────────────
 
     #[test]
     fn test_cors_disabled_by_default() {
@@ -2487,7 +2484,7 @@ mod tests {
         assert!(err.contains(&(WAL_MAX_FIELD_LEN + 1).to_string()), "{err}");
     }
 
-    // ── Data path collisions via real locations (spec general/031) ──────────
+    // ── Data path collisions via real locations ──────────
 
     #[test]
     fn test_validate_data_paths_dot_segment_collision() {
@@ -2638,9 +2635,9 @@ mod tests {
         assert!(err.contains("symlink hops"), "{err}");
     }
 
-    // ── Startup checks of the remaining keys (spec general/030) ─────────────
+    // ── Startup checks of the remaining keys ─────────────
 
-    // Test 5; runs even with the JSON engine disabled (general/025 pattern).
+    // Runs even with the JSON engine disabled.
     #[test]
     fn test_json_validate_bulk_body_limit() {
         let config: LuraConfig = toml::from_str("[json]\nenabled = false\nbulk_body_limit_bytes = 0\n").unwrap();
@@ -2719,7 +2716,7 @@ mod tests {
         assert!(parse(&format!("[rel.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).rel.validate().is_ok());
     }
 
-    // ── Key set, unknown keys and config-file gate (spec general/030) ───────
+    // ── Key set, unknown keys and config-file gate ───────
 
     // Test 3: optional fields and list elements count, section paths and
     // removed keys do not.
@@ -2835,7 +2832,7 @@ flag = true
         assert_eq!(config.storage.system_dir, "luradb_sys");
     }
 
-    /// What the config-file gate finds (spec general/030).
+    /// What the config-file gate finds.
     #[derive(Debug, Default, PartialEq)]
     struct GateFindings {
         /// Known keys absent from the shipped config.

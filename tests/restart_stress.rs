@@ -1,14 +1,14 @@
-//! Amplifier stress harness for spec kv/026 (restart data-loss analysis),
-//! §1 A1+A2. `#[ignore]`d -- run explicitly:
+//! Amplifier stress harness for restart data-loss analysis.
+//! `#[ignore]`d -- run explicitly:
 //! `cargo test --test restart_stress -- --ignored`.
 //!
 //! N independent engine instances each run M shutdown-restart cycles and M
 //! drop-restart cycles while background engines keep flush/compaction/GC
-//! busy, hunting for the still (non-panicking) data loss the spec
-//! describes. Calibrate via env: LURADB_STRESS_N, LURADB_STRESS_M,
+//! busy, hunting for silent (non-panicking) data loss across restarts.
+//! Calibrate via env: LURADB_STRESS_N, LURADB_STRESS_M,
 //! LURADB_STRESS_KEYS, LURADB_STRESS_BG_WRITERS, LURADB_STRESS_ARTIFACT_DIR.
 //!
-//! TempDir trap (spec kv/026 A2): no assert!/unwrap between a restart and
+//! TempDir trap: no assert!/unwrap between a restart and
 //! evidence conservation anywhere below -- every failure becomes a String
 //! finding, snapshots (S1 before reopen, S2 after verify) are conserved
 //! first, and the single panic! happens only at the very end.
@@ -95,8 +95,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 /// Copies `dir`'s complete engine directory into `artifact_root/label`
-/// (spec kv/026 A2 -- the S1/S2 pair is the only surviving evidence once
-/// `new()` has unconditionally truncated the WAL, Fact 3).
+/// (the S1/S2 pair is the only surviving evidence once
+/// `new()` has unconditionally truncated the WAL).
 fn snapshot(dir: &Path, artifact_root: &Path, label: &str) -> Result<PathBuf, String> {
     let dest = artifact_root.join(label);
     copy_dir_recursive(dir, &dest).map(|_| dest).map_err(|e| format!("{label}: snapshot failed: {e}"))
@@ -104,7 +104,7 @@ fn snapshot(dir: &Path, artifact_root: &Path, label: &str) -> Result<PathBuf, St
 
 /// Checks every `expected` (key, value) pair via `get()`. Returns one
 /// human-readable line per mismatch; empty means everything verified.
-/// Assert/unwrap-free by design (spec kv/026 A2 TempDir trap, §Tests 3).
+/// Assert/unwrap-free by design (TempDir trap).
 async fn verify_keys(engine: &LsmStorageEngine, expected: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {
     let mut findings = Vec::new();
     for (key, value) in expected {
@@ -156,9 +156,8 @@ async fn write_cycle_keys(
 
 /// Shared tail of both restart families: verify against the reopened
 /// engine, take S2, then either delete both snapshots immediately (no
-/// finding) or leave them on disk (spec kv/026 A2: "nur im Fehlerfall
-/// behalten"). Called directly by the §Tests 3 self-test below with a
-/// deliberately wrong expectation.
+/// finding) or leave them on disk (kept only on a failure). Called
+/// directly by the self-test below with a deliberately wrong expectation.
 async fn finish_cycle(
     new_engine: &LsmStorageEngine,
     dir: &Path,
@@ -187,7 +186,7 @@ async fn finish_cycle(
     findings
 }
 
-/// Family (a) -- spec kv/026 A1: `write -> shutdown().await -> S1 -> Re-Open
+/// Family (a): `write -> shutdown().await -> S1 -> Re-Open
 /// -> verify -> S2`, background tasks running like every real bootstrap
 /// path. Returns the reopened engine for the next cycle (`None` if reopen
 /// itself failed) plus this cycle's findings.
@@ -228,7 +227,7 @@ async fn run_shutdown_cycle(
     (Some(new_engine), findings)
 }
 
-/// Family (b) -- spec kv/026 A1: `write -> drop -> S1 -> Re-Open -> verify
+/// Family (b): `write -> drop -> S1 -> Re-Open -> verify
 /// -> S2`, no background tasks (mirrors `engine_on` -- the raw-crash path).
 async fn run_drop_cycle(
     engine: LsmStorageEngine,
@@ -243,7 +242,7 @@ async fn run_drop_cycle(
     let (expected, mut findings) =
         write_cycle_keys(&engine, instance, "drop", cycle, key_count, &label_base).await;
 
-    drop(engine); // no shutdown() -- family (b) is the raw-crash path (spec kv/026 A1)
+    drop(engine); // no shutdown() -- family (b) is the raw-crash path
 
     let s1 = match snapshot(dir, artifact_root, &format!("{label_base}-S1")) {
         Ok(p) => Some(p),
@@ -316,7 +315,7 @@ async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_cou
     InstanceOutcome { findings, dir }
 }
 
-/// Pure load generator (spec kv/026 A1: restarts happen while the same
+/// Pure load generator (restarts happen while the same
 /// process keeps producing write/flush load) -- keeps flush/compaction/GC busy on its
 /// own throwaway store while the main instances restart. Its own
 /// correctness is out of scope; errors are swallowed on purpose.
@@ -427,7 +426,7 @@ total_cycles={total_cycles} elapsed={elapsed:?}"
     })
 }
 
-/// Spec kv/026 §Tests 3: plays through the conservation mechanism with an
+/// Plays through the conservation mechanism with an
 /// artificially provoked verify failure (a deliberately wrong expected
 /// value, not a real corruption) and checks the snapshot directories exist
 /// -- and that `finish_cycle` never panics on its way there.
@@ -449,7 +448,7 @@ fn self_test_conserves_evidence_on_verify_mismatch() {
 
         let new_engine = open_engine(dir.path(), &hub, stress_engine_config()).await.unwrap();
 
-        // Deliberately wrong expected value (spec kv/026 §Tests 3) -- forces a
+        // Deliberately wrong expected value -- forces a
         // mismatch without corrupting real engine state. Must not panic: both
         // verify_keys and finish_cycle only ever collect findings.
         let wrong_expected = vec![(key.clone(), b"WRONG-VALUE-INJECTED".to_vec())];

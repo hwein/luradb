@@ -1,7 +1,7 @@
 //! `expand` — link-column resolution for `/sql` and Browse SELECT responses.
 //! REFERENCES columns resolve rel-internally via a PK-point lookup in the
-//! SELECT's own MVCC snapshot (rel/009); KVREF/JSONREF columns resolve
-//! cross-engine via the `CrossEngineResolver` (rel/012 §4) — each a fresh,
+//! SELECT's own MVCC snapshot; KVREF/JSONREF columns resolve
+//! cross-engine via the `CrossEngineResolver` — each a fresh,
 //! committed read on the target engine (no shared snapshot across engines).
 //! Single-stage only (no recursive/nested expand — non-goal).
 
@@ -18,7 +18,7 @@ use super::RelEngine;
 use crate::engines::lsm::reader::{RegistrySnapshot, Snapshot};
 use serde_json::{json, Value};
 
-/// How one projected link column resolves (spec §4).
+/// How one projected link column resolves.
 enum ExpandKind {
     /// rel-internal REFERENCES → target table name.
     Reference(String),
@@ -29,7 +29,7 @@ enum ExpandKind {
 impl RelEngine {
     /// Resolves `expand` against `result` (an already-executed SELECT).
     /// Returns an empty `Vec` when nothing was resolved (wildcard found no
-    /// eligible column) — the caller turns that into "no `expanded` key" (§5).
+    /// eligible column) — the caller turns that into "no `expanded` key".
     pub(super) async fn resolve_expand(
         &self,
         domain: &str,
@@ -45,7 +45,7 @@ impl RelEngine {
             return Ok(Vec::new());
         }
 
-        // max_join_depth accounting (rel/009 §5, spec §4): every resolved link
+        // max_join_depth accounting: every resolved link
         // column — REFERENCES *and* KVREF/JSONREF — counts like a join stage,
         // column-based (a NULL/masked cell still counts, it just skips its lookup).
         join::check_join_depth(result.joins_used, targets.len(), self.max_join_depth)?;
@@ -74,8 +74,8 @@ impl RelEngine {
         Ok(expanded)
     }
 
-    /// REFERENCES resolution (rel/009 §5): per row, `v == NULL` or a missing
-    /// target row (hanging link, concept 3.4) yields `null`; a hit decodes the
+    /// REFERENCES resolution: per row, `v == NULL` or a missing
+    /// target row (hanging link) yields `null`; a hit decodes the
     /// target row into a JSON object keyed by the target table's columns.
     async fn resolve_one_column(
         &self,
@@ -98,7 +98,7 @@ impl RelEngine {
                 Some(pk_enc) => {
                     let key = keys::row_key(prefix, target_schema.table_id, &pk_enc);
                     match self.engine.get_with_snapshot(&key, snap).await?.into_option() {
-                        None => Value::Null, // hanging link (concept 3.4)
+                        None => Value::Null, // hanging link
                         Some(bytes) => {
                             let values = decode_row(&bytes, &target_schema);
                             let mut obj = serde_json::Map::with_capacity(target_schema.columns.len());
@@ -115,7 +115,7 @@ impl RelEngine {
         Ok(out)
     }
 
-    /// KVREF resolution (spec §4): the link value (post-masking) is looked up
+    /// KVREF resolution: the link value (post-masking) is looked up
     /// in the same-named KV domain; three "nothing" states stay distinct.
     async fn resolve_kv_column(
         &self,
@@ -137,7 +137,7 @@ impl RelEngine {
         Ok(out)
     }
 
-    /// JSONREF resolution (spec §4).
+    /// JSONREF resolution.
     async fn resolve_json_column(
         &self,
         domain: &str,
@@ -167,8 +167,8 @@ fn link_key(v: &super::types::ScalarValue) -> Option<&str> {
     }
 }
 
-/// KVREF → JSON (spec §4): valid UTF-8 → `utf8`, else `base64`; a KV
-/// null-value (kv/018 `set_null`) → `exists:true, value:null`;
+/// KVREF → JSON: valid UTF-8 → `utf8`, else `base64`; a KV
+/// null-value (`set_null`) → `exists:true, value:null`;
 /// absent/domain-gone → `exists:false`.
 fn kv_resolution_json(res: KvResolution) -> Value {
     match res {
@@ -181,7 +181,7 @@ fn kv_resolution_json(res: KvResolution) -> Value {
     }
 }
 
-/// JSONREF → JSON (spec §4): document exists with content, or `exists:false`.
+/// JSONREF → JSON: document exists with content, or `exists:false`.
 fn json_resolution_json(res: JsonResolution) -> Value {
     match res {
         JsonResolution::Present(doc) => json!({ "exists": true, "document": doc }),
@@ -201,7 +201,7 @@ fn classify_target(result: &SelectResult, pos: usize) -> Option<ExpandKind> {
     }
 }
 
-/// Wildcard mode (spec §4): every projected link column — REFERENCES *and*
+/// Wildcard mode: every projected link column — REFERENCES *and*
 /// KVREF/JSONREF (no longer skipped).
 fn wildcard_targets(result: &SelectResult) -> Vec<(usize, String, ExpandKind)> {
     result
@@ -212,7 +212,7 @@ fn wildcard_targets(result: &SelectResult) -> Vec<(usize, String, ExpandKind)> {
         .collect()
 }
 
-/// Named mode (spec §4): every requested name must hit exactly one projected
+/// Named mode: every requested name must hit exactly one projected
 /// column, which must be a link column (REFERENCES/KVREF/JSONREF). Duplicate
 /// names collapse to one resolution (output is keyed by name).
 fn named_targets(

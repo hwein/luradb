@@ -1,4 +1,4 @@
-//! Two-process reader-liveness test for spec perf/012 (test strategy 9).
+//! Two-process reader-liveness test.
 //!
 //! The parent runs the server side: `ShmManager`, the registration listener,
 //! the command dispatcher and the publisher's `SnapshotWriter`. The child is a
@@ -283,7 +283,7 @@ fn shm_reader_liveness_child() {
     let parts: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(parts.first().copied(), Some("OK"), "registration failed: {line:?}");
 
-    // Mandatory mapping modes (spec perf/012 §10): state and both data buffers
+    // Mandatory mapping modes: state and both data buffers
     // read-only, our own cmd_hdr — which carries the reader slot — read/write.
     let cmd_hdr = ShmSegment::open(parts[3]).expect("open cmd_hdr read/write");
     let seg = |purpose: &str| {

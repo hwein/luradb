@@ -1,9 +1,8 @@
-//! Create-Table-from-File REST handler (spec rel/019).
+//! Create-Table-from-File REST handler.
 //!
 //! POST /store-api/rel/{domain}/tables/from-file -- uploads a CSV/TSV file,
 //! creates a new relational table with inferred column types, and imports
-//! its rows in one request; the rel counterpart of the JSON bulk load
-//! (json/007).
+//! its rows in one request; the rel counterpart of the JSON bulk load.
 
 use crate::api::rel::{column_type_name, rel_engine};
 use crate::api::{middleware::ApiError, AppState};
@@ -20,7 +19,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
-/// Charges one op against the domain's write budget (spec rel/009 §7), same
+/// Charges one op against the domain's write budget, same
 /// as every other rel handler (`rel_browse.rs`'s own `check_budget`).
 fn check_budget(engine: &RelEngine, state: &AppState, domain: &str) -> Result<(), ApiError> {
     if engine.check_domain_budget(domain, true) {
@@ -31,7 +30,7 @@ fn check_budget(engine: &RelEngine, state: &AppState, domain: &str) -> Result<()
     }
 }
 
-// ── DTOs (spec §5) ───────────────────────────────────────────────────────────
+// ── DTOs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, ToSchema)]
 pub struct CreateFromFileColumn {
@@ -85,10 +84,10 @@ pub struct CreateFromFileResponse {
     tag = "Relational Import"
 )]
 /// Creates a relational table from an uploaded CSV/TSV file: infers one
-/// LuraDB type per column (spec §5.1), then imports every row through the
+/// LuraDB type per column, then imports every row through the
 /// existing DML write path -- a row that fails is logged, the import
-/// continues (spec §5.2). Requires DDL access, enforced the same way the
-/// `/sql` handler enforces a DDL statement (rel/011 pattern).
+/// continues. Requires DDL access, enforced the same way the
+/// `/sql` handler enforces a DDL statement.
 pub async fn create_table_from_file(
     State(state): State<AppState>,
     Path(domain): Path<String>,
@@ -258,7 +257,7 @@ mod tests {
     }
 
     // 1. Success response shape: 201 with `table`/`columns`/`imported`/
-    //    `failed`/`errors`, matching the spec §5 example.
+    //    `failed`/`errors`.
     #[test]
     fn test_upload_success_response_shape() {
         crate::core::engine_runtime::block_on(async {
@@ -300,7 +299,7 @@ mod tests {
     }
 
     // 8. Table already exists -> 409 (existing table untouched); unknown
-    //    domain -> 404 (spec §7 test 8, HTTP half).
+    //    domain -> 404 (HTTP half).
     #[test]
     fn test_conflict_and_domain_not_found() {
         crate::core::engine_runtime::block_on(async {
@@ -329,7 +328,7 @@ mod tests {
     }
 
     // 9. Auth: DDL access is required -- a Write-only grant is rejected, a
-    //    Ddl grant and Admin both succeed (spec §7 test 9, rel/011 pattern).
+    //    Ddl grant and Admin both succeed.
     #[test]
     fn test_auth_requires_ddl() {
         crate::core::engine_runtime::block_on(async {

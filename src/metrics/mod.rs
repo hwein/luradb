@@ -78,11 +78,11 @@ pub struct ShardHealth {
 pub struct SystemMetrics {
     pub total_reads: AtomicU64,
     pub total_writes: AtomicU64,
-    /// Relational DDL counters (spec rel/003).
+    /// Relational DDL counters.
     pub rel_ddl_create_total: AtomicU64,
     pub rel_ddl_drop_total: AtomicU64,
-    /// SQL frontend counters (spec rel/004 §10), one field per `{class}`/`{op}`
-    /// label value — same flat-counter style as the rel/003 fields above.
+    /// SQL frontend counters, one field per `{class}`/`{op}`
+    /// label value — same flat-counter style as the DDL fields above.
     pub rel_frontend_statements_read_total: AtomicU64,
     pub rel_frontend_statements_write_total: AtomicU64,
     pub rel_frontend_statements_ddl_total: AtomicU64,
@@ -92,31 +92,31 @@ pub struct SystemMetrics {
     pub rel_ddl_op_drop_table_total: AtomicU64,
     pub rel_ddl_op_create_index_total: AtomicU64,
     pub rel_ddl_op_drop_index_total: AtomicU64,
-    /// DML write-path counters (spec rel/005 §16), one field per `{op}` label.
+    /// DML write-path counters, one field per `{op}` label.
     pub rel_dml_statements_insert_total: AtomicU64,
     pub rel_dml_statements_update_total: AtomicU64,
     pub rel_dml_statements_delete_total: AtomicU64,
     pub rel_dml_scanned_rows_total: AtomicU64,
     pub rel_index_backfill_entries_total: AtomicU64,
-    /// SELECT executor counters (spec rel/006 §12).
+    /// SELECT executor counters.
     pub rel_select_statements_total: AtomicU64,
     pub rel_select_scanned_keys_total: AtomicU64,
     pub rel_sort_fallback_total: AtomicU64,
-    /// LEFT JOIN counter (spec rel/007 §9): one per executed probe.
+    /// LEFT JOIN counter: one per executed probe.
     pub rel_join_probes_total: AtomicU64,
-    /// View counters (spec rel/008 §10): inlined view references (execution
+    /// View counters: inlined view references (execution
     /// time, recursive substitutions included), and `CREATE`/`DROP VIEW` ops.
     pub rel_view_inlinings_total: AtomicU64,
     pub rel_ddl_view_ops_create_view_total: AtomicU64,
     pub rel_ddl_view_ops_drop_view_total: AtomicU64,
-    /// Cross-engine link counters (spec rel/012 §8), one field per `{engine}`
+    /// Cross-engine link counters, one field per `{engine}`
     /// label value — same flat-counter style as the fields above.
     pub rel_cross_engine_expand_lookups_kv_total: AtomicU64,
     pub rel_cross_engine_expand_lookups_json_total: AtomicU64,
     pub rel_cross_engine_swept_cells_total: AtomicU64,
     pub rel_cross_engine_write_validations_kv_total: AtomicU64,
     pub rel_cross_engine_write_validations_json_total: AtomicU64,
-    /// Domain-purger counters (spec rel/013 §9): tombstoned data keys (both
+    /// Domain-purger counters: tombstoned data keys (both
     /// purger tasks) and fully-reaped orphan id ranges (orphan sweep).
     pub rel_purged_keys_total: AtomicU64,
     pub rel_orphan_ranges_purged_total: AtomicU64,
@@ -186,7 +186,7 @@ pub struct DomainWindowMetrics {
     pub window_secs: u64,
 }
 
-// ── EngineWindowMetrics (spec general/019) ────────────────────────────────────
+// ── EngineWindowMetrics ────────────────────────────────────
 
 /// Which storage engine an aggregate op/latency window belongs to; indexes
 /// `MetricsStore::engines`.
@@ -259,16 +259,16 @@ pub struct MetricsStore {
     pub system: SystemMetrics,
     /// Per-domain windows, created on a domain's first recorded op. `Arc` so
     /// a domain's runtime can keep its own window and record reads without
-    /// a lookup here (spec kv/031 A6).
+    /// a lookup here.
     domains: RwLock<HashMap<String, Arc<MetricsWindow>>>,
-    /// Test-only count of read locks taken on `domains` (spec kv/031 test 8).
+    /// Test-only count of read locks taken on `domains`.
     #[cfg(test)]
     domain_map_reads: AtomicU64,
-    /// Per-engine aggregate windows (spec general/019), indexed by
+    /// Per-engine aggregate windows, indexed by
     /// `EngineKind`. Fixed at construction — no lazy insert, no removal on
     /// domain deletion — so engine windows outlive individual domains.
     engines: [MetricsWindow; 3],
-    /// Per-rel-domain catalog-object count gauge (spec rel/003).
+    /// Per-rel-domain catalog-object count gauge.
     rel_catalog_objects: RwLock<HashMap<String, u64>>,
     started_at: u64,
     config: MetricsConfig,
@@ -289,7 +289,7 @@ impl MetricsStore {
         })
     }
 
-    // ── Relational catalog metrics (spec rel/003) ────────────────────────────
+    // ── Relational catalog metrics ────────────────────────────
 
     pub fn record_rel_ddl_create(&self) {
         self.system.rel_ddl_create_total.fetch_add(1, Ordering::Relaxed);
@@ -311,7 +311,7 @@ impl MetricsStore {
         self.rel_catalog_objects.read().get(domain).copied()
     }
 
-    // ── SQL frontend & DDL metrics (spec rel/004 §10) ────────────────────────
+    // ── SQL frontend & DDL metrics ────────────────────────
 
     /// Counts a parsed+bound statement by class: `"read"`/`"write"`/`"ddl"`.
     pub fn record_rel_frontend_statement(&self, class: &str) {
@@ -343,7 +343,7 @@ impl MetricsStore {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── DML write-path metrics (spec rel/005 §16) ────────────────────────────
+    // ── DML write-path metrics ────────────────────────────
 
     /// Counts an executed DML statement by op (`"insert"`/`"update"`/`"delete"`).
     pub fn record_rel_dml_statement(&self, op: &str) {
@@ -368,7 +368,7 @@ impl MetricsStore {
             .fetch_add(n, Ordering::Relaxed);
     }
 
-    // ── SELECT executor metrics (spec rel/006 §12) ───────────────────────────
+    // ── SELECT executor metrics ───────────────────────────
 
     /// Counts one executed single-table SELECT/COUNT statement.
     pub fn record_rel_select_statement(&self) {
@@ -376,7 +376,7 @@ impl MetricsStore {
     }
 
     /// Adds `n` ROW/IDX keys visited by the chosen access path (I/O budget
-    /// visibility; §9).
+    /// visibility).
     pub fn record_rel_select_scanned_keys(&self, n: u64) {
         self.system.rel_select_scanned_keys_total.fetch_add(n, Ordering::Relaxed);
     }
@@ -386,14 +386,14 @@ impl MetricsStore {
         self.system.rel_sort_fallback_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── LEFT JOIN metrics (spec rel/007 §9) ──────────────────────────────────
+    // ── LEFT JOIN metrics ──────────────────────────────────
 
     /// Counts one executed join probe (non-NULL ON value; NULL never probes).
     pub fn record_rel_join_probes(&self, n: u64) {
         self.system.rel_join_probes_total.fetch_add(n, Ordering::Relaxed);
     }
 
-    // ── View metrics (spec rel/008 §10) ──────────────────────────────────────
+    // ── View metrics ──────────────────────────────────────
 
     /// Adds `n` view references substituted by the inliner (recursive ones
     /// included), at SELECT execution time.
@@ -411,7 +411,7 @@ impl MetricsStore {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── Cross-engine link metrics (spec rel/012 §8) ──────────────────────────
+    // ── Cross-engine link metrics ──────────────────────────
 
     /// Counts one actual cross-engine expand point-lookup by `{engine}`
     /// (`"kv"`/`"json"`); NULL/masked entries never reach here.
@@ -424,7 +424,7 @@ impl MetricsStore {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Adds `n` physically nulled link cells (sweep progress, §5).
+    /// Adds `n` physically nulled link cells (sweep progress).
     pub fn record_rel_cross_engine_swept_cells(&self, n: u64) {
         self.system.rel_cross_engine_swept_cells_total.fetch_add(n, Ordering::Relaxed);
     }
@@ -439,12 +439,12 @@ impl MetricsStore {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Adds `n` tombstoned data keys (both purger tasks, spec rel/013 §9).
+    /// Adds `n` tombstoned data keys (both purger tasks).
     pub fn record_rel_purged_keys(&self, n: u64) {
         self.system.rel_purged_keys_total.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Adds `n` fully-reaped orphan id ranges (orphan sweep, spec rel/013 §9).
+    /// Adds `n` fully-reaped orphan id ranges (orphan sweep).
     pub fn record_rel_orphan_ranges_purged(&self, n: u64) {
         self.system.rel_orphan_ranges_purged_total.fetch_add(n, Ordering::Relaxed);
     }
@@ -495,7 +495,7 @@ impl MetricsStore {
     }
 
     /// KV-only (every current call site is `DomainStore`'s read path) —
-    /// also mirrors into the KV engine-aggregate window (spec general/019).
+    /// also mirrors into the KV engine-aggregate window.
     /// `window` comes from [`Self::domain_window`]. JSON and rel use
     /// `record_engine_read` instead.
     pub fn record_read(&self, window: &MetricsWindow, latency_us: u64, is_hit: bool) {
@@ -512,15 +512,14 @@ impl MetricsStore {
         self.engines[EngineKind::Kv as usize].record_write(latency_us);
     }
 
-    /// Records one read op on `kind`'s engine-aggregate window (spec
-    /// general/019) — the JSON/rel counterpart of KV's `record_read`
-    /// mirroring. Engine windows don't track cache hit/miss.
+    /// Records one read op on `kind`'s engine-aggregate window — the
+    /// JSON/rel counterpart of KV's `record_read` mirroring. Engine windows
+    /// don't track cache hit/miss.
     pub fn record_engine_read(&self, kind: EngineKind, latency_us: u64) {
         self.engines[kind as usize].record_read(latency_us, false);
     }
 
-    /// Records one write op on `kind`'s engine-aggregate window (spec
-    /// general/019).
+    /// Records one write op on `kind`'s engine-aggregate window.
     pub fn record_engine_write(&self, kind: EngineKind, latency_us: u64) {
         self.engines[kind as usize].record_write(latency_us);
     }
@@ -565,8 +564,7 @@ impl MetricsStore {
     /// Advances all per-domain rolling windows by one second.
     ///
     /// Called by `MetricsTicker` once per tick interval. Ticks a copy of the
-    /// window list, so the map is not locked for the whole round (spec
-    /// kv/031 A6).
+    /// window list, so the map is not locked for the whole round.
     pub fn tick_all(&self) {
         let windows: Vec<Arc<MetricsWindow>> = self.domains().values().cloned().collect();
         for w in &windows {
@@ -645,7 +643,7 @@ mod tests {
         assert_eq!(store.rel_catalog_objects("shop"), None);
     }
 
-    // SQL frontend & DDL counters (spec rel/004 §10).
+    // SQL frontend & DDL counters.
     #[test]
     fn test_rel_frontend_metrics() {
         let store = MetricsStore::new(MetricsConfig::default());

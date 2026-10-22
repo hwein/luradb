@@ -42,7 +42,7 @@ pub use purger::RelDomainPurger;
 pub use rest_exec::{ExpandedBlock, SqlOutcome};
 pub use types::{encode_sortable, scalar_to_json, ColumnType, ScalarValue};
 
-/// The result of `RelEngine::execute`, tagged by statement class (spec §14).
+/// The result of `RelEngine::execute`, tagged by statement class.
 #[derive(Debug)]
 pub enum ExecOutcome {
     Ddl(DdlOutcome),
@@ -72,65 +72,65 @@ use std::sync::{Arc, OnceLock};
 /// catalog entries keep their room, and rows may grow past it.
 const LSM_MIN_VALUE_SIZE_LIMIT: usize = 512 * 1024;
 
-/// Catalog limits (spec rel/003).
+/// Catalog limits.
 const MAX_COLUMNS: usize = 128;
 const MAX_INDEXES_PER_TABLE: usize = 16;
-/// Statements longer than this many bytes are rejected before lexing (spec rel/004).
+/// Statements longer than this many bytes are rejected before lexing.
 const MAX_STATEMENT_LEN: usize = 64 * 1024;
-/// Max bytes per TEXT/KVREF/JSONREF value (spec rel/005).
+/// Max bytes per TEXT/KVREF/JSONREF value.
 const MAX_TEXT_LEN: usize = 64 * 1024;
-/// Applied when a SELECT has no explicit LIMIT (spec rel/006).
+/// Applied when a SELECT has no explicit LIMIT.
 const DEFAULT_LIMIT: usize = 1_000;
-/// Max `LEFT JOIN` stages plus expand columns per statement (spec rel/007).
+/// Max `LEFT JOIN` stages plus expand columns per statement.
 const MAX_JOIN_DEPTH: usize = 8;
-/// The REST handlers reject a larger serialized response with 413 (spec rel/009).
+/// The REST handlers reject a larger serialized response with 413.
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Central entry point for all relational-store operations. For now it
-/// wraps the dedicated LSM instance plus domain management (rel/002) —
-/// catalog (rel/003) and the SQL frontend (rel/004+) follow in later specs.
+/// Central entry point for all relational-store operations: wraps the
+/// dedicated LSM instance, domain management, the catalog and the SQL
+/// frontend.
 pub struct RelEngine {
     engine: Arc<LsmStorageEngine>,
     domains: Arc<RelDomainRegistry>,
     catalog: Arc<RelCatalog>,
     metrics: Arc<MetricsStore>,
-    /// Bridge to the same-named KV/JSON domains (spec rel/012). Fixed at
+    /// Bridge to the same-named KV/JSON domains. Fixed at
     /// bootstrap, never hot-swapped; the sole holder of kv/json handles.
     cross_engine: Arc<CrossEngineResolver>,
-    /// SQL frontend guard (spec rel/004 §1): rejects longer statements
+    /// SQL frontend guard: rejects longer statements
     /// before lexing even starts.
     max_statement_len: usize,
-    /// Per-table write locks for the atomic DML path (spec rel/005 §8.1).
+    /// Per-table write locks for the atomic DML path.
     table_locks: dml::TableLocks,
-    /// Engine-global write serialization for the rel/013 finalization guard
-    /// (§3): rel/005 has only per-table locks, so the DML-commit and
+    /// Engine-global write serialization for the domain finalization guard:
+    /// DML has only per-table locks, so the DML-commit and
     /// cross-engine-sweep paths hold this around their `write_batch` + a domain
     /// re-check, and the purger holds it around its emptiness check +
     /// finalization — no in-flight row write can land after a domain is
     /// finalized (which would orphan a `ROW:` key into a recreated same-name
     /// domain sharing the FNV `system_prefix`).
     write_guard: tokio::sync::Mutex<()>,
-    /// DML write-path guards (spec rel/005 §8/§16).
+    /// DML write-path guards.
     max_text_len: usize,
     max_row_size: usize,
     max_key_length: usize,
-    /// SELECT executor limits (spec rel/006 §12).
+    /// SELECT executor limits.
     default_limit: usize,
     max_limit: usize,
     max_sort_rows: usize,
-    /// JOIN governance (spec rel/007 §8/§11).
+    /// JOIN governance.
     max_join_depth: usize,
     allow_unindexed_joins: bool,
-    /// REST response cap (spec rel/009 §6): checked handler-side, after
+    /// REST response cap: checked handler-side, after
     /// serialization, so it stays a plain getter here.
     max_response_bytes: usize,
-    /// Body-size cap for `POST .../tables/from-file` (spec rel/019 §1),
+    /// Body-size cap for `POST .../tables/from-file`,
     /// applied by the handler as a route-level `DefaultBodyLimit`.
     import_body_limit_bytes: usize,
-    /// Lazily-filled per-domain rate limiters (spec rel/009 §7) — mirrors the
+    /// Lazily-filled per-domain rate limiters — mirrors the
     /// KV `DomainRegistry`'s `runtimes` map: a separate, name-keyed structure,
-    /// not a field of the serialized `RelDomain` (rel/002's invariant stays
-    /// intact). `parking_lot::RwLock`: sync-only critical sections, never
+    /// not a field of the serialized `RelDomain` (its persisted format stays
+    /// unchanged). `parking_lot::RwLock`: sync-only critical sections, never
     /// held across an `.await`.
     rate_limiters: RwLock<HashMap<String, Arc<RateLimiter>>>,
     /// Quota every lazily-created limiter is built with.
@@ -253,7 +253,7 @@ impl RelEngine {
         self.engine.shutdown().await;
     }
 
-    // ── Domain management (spec rel/002) ───────────────────────────────────────
+    // ── Domain management ───────────────────────────────────────
 
     /// Creates a new rel domain.
     pub(crate) async fn create_domain(&self, name: &str) -> Result<RelDomain, RelStoreError> {
@@ -265,15 +265,15 @@ impl RelEngine {
         self.domains.get_domain(name)
     }
 
-    /// Looks up a rel domain regardless of its state (spec rel/009 §2): the
+    /// Looks up a rel domain regardless of its state: the
     /// REST detail handler's 410-vs-404 distinction needs `Deleting` domains
     /// too, unlike `get_domain`. Mirrors `JsonEngine::get_domain_any`.
     pub fn get_domain_any(&self, name: &str) -> Option<RelDomain> {
         self.domains.get_domain_any(name)
     }
 
-    /// Lists all rel domains, `Deleting` ones included (each with its `state`,
-    /// spec rel/013 §1); `get_domain`/`require_active` stay active-only.
+    /// Lists all rel domains, `Deleting` ones included (each with its
+    /// `state`); `get_domain`/`require_active` stay active-only.
     pub fn list_domains(&self) -> Vec<RelDomain> {
         self.domains.list_domains()
     }
@@ -309,9 +309,9 @@ impl RelEngine {
         self.write_guard.lock().await
     }
 
-    // ── Catalog (spec rel/003) ─────────────────────────────────────────────────
+    // ── Catalog ─────────────────────────────────────────────────
 
-    /// Programmatic catalog API for the DDL/REST layers (rel/004+).
+    /// Programmatic catalog API for the DDL/REST layers.
     pub fn catalog(&self) -> &Arc<RelCatalog> {
         &self.catalog
     }
@@ -325,7 +325,7 @@ impl RelEngine {
         self.catalog.create_table(&self.domains, domain, input).await
     }
 
-    /// Creates a view storing its raw SELECT text (unvalidated; binding → rel/008).
+    /// Creates a view storing its raw SELECT text (unvalidated; `view.rs` binds).
     pub async fn create_view(
         &self,
         domain: &str,
@@ -350,23 +350,23 @@ impl RelEngine {
         self.catalog.drop_object(&self.domains, domain, name).await
     }
 
-    // ── REST-edge limits (spec rel/009 §6/§7) ───────────────────────────────────
+    // ── REST-edge limits ───────────────────────────────────
 
-    /// `max_response_bytes` getter (spec §6): the `/sql` handler checks the
+    /// `max_response_bytes` getter: the `/sql` handler checks the
     /// serialized response length against this after building it.
     pub fn max_response_bytes(&self) -> usize {
         self.max_response_bytes
     }
 
-    /// `import_body_limit_bytes` getter (spec rel/019 §1): the from-file
+    /// `import_body_limit_bytes` getter: the from-file
     /// route applies this as a `DefaultBodyLimit` layer, mirroring
     /// `JsonEngine::bulk_body_limit_bytes`.
     pub fn import_body_limit_bytes(&self) -> usize {
         self.import_body_limit_bytes
     }
 
-    /// Drops a domain's lazily-created rate limiter (spec rel/009 §7). The
-    /// rel/013 purger calls this once a domain is finalized, mirroring the KV
+    /// Drops a domain's lazily-created rate limiter. The
+    /// domain purger calls this once a domain is finalized, mirroring the KV
     /// registry's `runtimes` cleanup: a recreated same-name domain then starts
     /// with a fresh bucket instead of inheriting the old (possibly drained) one.
     pub(crate) fn drop_domain_rate_limiter(&self, domain: &str) {
@@ -394,15 +394,15 @@ impl RelEngine {
         self.max_response_bytes = bytes;
     }
 
-    // ── Cross-engine links (spec rel/012) ───────────────────────────────────────
+    // ── Cross-engine links ───────────────────────────────────────
 
     /// Whether at least one target engine is wired — the sweeper is only worth
-    /// spawning then (§5 startup integration).
+    /// spawning at startup then.
     pub fn cross_engine_has_target(&self) -> bool {
         self.cross_engine.has_target()
     }
 
-    /// DDL engine-enabled check (spec §2): a `KVREF`/`JSONREF` column may only
+    /// DDL engine-enabled check: a `KVREF`/`JSONREF` column may only
     /// be created when its target engine is enabled (the domain may still be
     /// absent — that first fails at the DML value check). `domain` = `None`
     /// since DDL is domain-agnostic here.
@@ -426,12 +426,12 @@ impl RelEngine {
         Err(RelStoreError::CrossEngineTargetUnavailable { engine: engine.to_string(), domain: None })
     }
 
-    // ── SQL frontend & DDL (spec rel/004) ───────────────────────────────────────
+    // ── SQL frontend & DDL ───────────────────────────────────────
 
     /// Runs one LuraSQL statement end to end: `max_statement_len` guard →
     /// lex → parse → bind (front-end guards for every class; full AST →
     /// catalog-input translation for DDL) → execute. Table/index DDL,
-    /// `CREATE`/`DROP VIEW` (rel/008 `view.rs`, needs the raw SQL text so is
+    /// `CREATE`/`DROP VIEW` (`view.rs`, needs the raw SQL text so is
     /// intercepted here rather than in `execute_dml`), INSERT/UPDATE/DELETE,
     /// and SELECT (incl. `LEFT JOIN` and view-inlining) all execute for real.
     pub async fn execute(
@@ -444,14 +444,14 @@ impl RelEngine {
     }
 
     /// Shared core of [`Self::execute`] and the REST-edge
-    /// [`Self::execute_sql`] (rel/009 `rest_exec.rs`): identical lex/parse/
+    /// [`Self::execute_sql`] (`rest_exec.rs`): identical lex/parse/
     /// bind/dispatch, with one seam — `mid` runs right after classification,
     /// before binding/dispatch ever touches the engine, so a caller can gate
-    /// the statement (rate limit here; rel/011 adds statement-level auth at
-    /// the same seam) without a second parse. `execute` passes a no-op `mid`
+    /// the statement (rate limit, `expand` validity)
+    /// without a second parse. `execute` passes a no-op `mid`
     /// and `LinkAuth::full()`, so its behavior/signature are unchanged.
     /// `auth` flows into `execute_dml` for cross-engine link masking/
-    /// validation (spec rel/016).
+    /// validation.
     pub(crate) async fn execute_checked(
         &self,
         domain: &str,
@@ -477,13 +477,13 @@ impl RelEngine {
 
         mid(class)?;
 
-        // The whole dispatch is captured before returning (spec general/018
-        // §4 point 10): `ExecOutcome::Ddl` arises at three separate arms
+        // The whole dispatch is captured before returning so every DDL
+        // event gets published: `ExecOutcome::Ddl` arises at three separate arms
         // below, so binding the match's value here — rather than a `?` on
         // each arm feeding straight into an early return — is the only way a
         // later fourth arm can't slip past the event publish.
         let outcome = match binder::bind(stmt, param_count, params)? {
-            // CREATE INDEX runs the backfill-aware path (spec rel/005 §13).
+            // CREATE INDEX runs the backfill-aware path.
             binder::BoundStatement::Ddl(DdlPlan::CreateIndex { table, name, column, unique }) => ddl::execute_create_index(
                 &self.engine,
                 &self.catalog,
@@ -505,7 +505,7 @@ impl RelEngine {
                     .await
                     .map(ExecOutcome::Ddl)?
             }
-            // CREATE/DROP VIEW need the raw `sql` text (rel/008 §3: the stored
+            // CREATE/DROP VIEW need the raw `sql` text (the stored
             // view body is the *raw* SELECT substring, not a re-serialized
             // AST) — routed here rather than into `execute_dml`, which only
             // sees the bound `Statement`, not the original source string.
@@ -616,7 +616,7 @@ mod tests {
         })
     }
 
-    // Spec general/030 test 6: with rel.lsm.max_key_length at its startup
+    // With rel.lsm.max_key_length at its startup
     // lower bound, a domain with a maximal name, a table and a row with a
     // 1-byte key work.
     #[test]
@@ -647,7 +647,7 @@ mod tests {
         })
     }
 
-    // 8. Domain management (rel/002) wires through RelEngine's public API:
+    // 8. Domain management wires through RelEngine's public API:
     //    the default domain exists right after bootstrap, and
     //    create/get/list/delete all delegate to the registry.
     #[test]
@@ -666,7 +666,7 @@ mod tests {
         })
     }
 
-    // 9. Catalog (rel/003) wires through RelEngine's public API.
+    // 9. Catalog wires through RelEngine's public API.
     #[test]
     fn test_engine_delegates_catalog() {
         crate::core::engine_runtime::block_on(async {
@@ -690,7 +690,7 @@ mod tests {
         })
     }
 
-    // ── SQL frontend & DDL end-to-end (spec rel/004) ────────────────────────────
+    // ── SQL frontend & DDL end-to-end ────────────────────────────
 
     // 2. max_statement_len guard fires end-to-end, before lexing.
     #[test]
@@ -953,8 +953,8 @@ mod tests {
         })
     }
 
-    // 19 (superseded by rel/006-008): full-table scan/COUNT(*)/ORDER BY/non-PK
-    // WHERE, LEFT JOIN, and now CREATE/DROP VIEW + SELECT-through-a-view all
+    // 19: full-table scan/COUNT(*)/ORDER BY/non-PK
+    // WHERE, LEFT JOIN, and CREATE/DROP VIEW + SELECT-through-a-view all
     // execute for real (see select.rs/join.rs/view.rs for dedicated coverage);
     // this is just a wiring smoke test through the real `execute()` entry point.
     #[test]
@@ -964,23 +964,23 @@ mod tests {
             rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
             rel.execute("default", "CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
 
-            // LEFT JOIN on a PK executes for real (rel/007).
+            // LEFT JOIN on a PK executes for real.
             rel.execute("default", "SELECT * FROM t LEFT JOIN u ON t.id = u.id", &[]).await.unwrap();
 
-            // CREATE VIEW binds/validates and stores the raw text (rel/008).
+            // CREATE VIEW binds/validates and stores the raw text.
             rel.execute("default", "CREATE VIEW v AS SELECT * FROM t", &[]).await.unwrap();
 
-            // SELECT through a view inlines to the base table (rel/008).
+            // SELECT through a view inlines to the base table.
             rel.execute("default", "SELECT * FROM v", &[]).await.unwrap();
 
-            // DROP VIEW removes it (rel/008).
+            // DROP VIEW removes it.
             rel.execute("default", "DROP VIEW v", &[]).await.unwrap();
             assert!(rel.get_object("default", "v").is_err());
             rel.shutdown().await;
         })
     }
 
-    // ── Spec general/018: global lifecycle event bus ────────────────────────
+    // ── Global lifecycle event bus ────────────────────────
 
     async fn make_engine_with_bus() -> (Arc<RelEngine>, Arc<crate::core::events::GlobalEventBus>, tempfile::TempDir) {
         let (rel, dir) = make_engine().await;
@@ -1031,7 +1031,7 @@ mod tests {
 
     // Test 3a: RENAME TABLE publishes exactly two events -- table_dropped
     // (old name) immediately followed by table_created (new name), with
-    // consecutive sequences (spec §2.1).
+    // consecutive sequences.
     #[test]
     fn test_rename_table_publishes_two_consecutive_events() {
         crate::core::engine_runtime::block_on(async {

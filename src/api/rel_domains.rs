@@ -1,4 +1,4 @@
-//! rel-domain REST handlers (spec rel/009 §2, pattern `json_domains.rs`).
+//! rel-domain REST handlers (pattern `json_domains.rs`).
 //!
 //! POST   /store-api/rel/domains          → create_domain  (201 | 409 | 400)
 //! GET    /store-api/rel/domains          → list_domains   (200)
@@ -30,8 +30,8 @@ pub struct RelDomainResponse {
     pub name: String,
     /// Creation timestamp (Unix seconds).
     pub created_at: u64,
-    /// Lifecycle state: "active" or "deleting" (background purge running, rel/013).
-    /// Always present — so rel/013's later `list_domains` visibility change
+    /// Lifecycle state: "active" or "deleting" (background purge running).
+    /// Always present — so a later `list_domains` visibility change
     /// (surfacing `Deleting` domains too) needs no REST-contract change.
     pub state: String,
 }
@@ -105,7 +105,7 @@ pub async fn list_domains(State(state): State<AppState>) -> Result<Json<Vec<RelD
     tag = "Relational Domains"
 )]
 /// Returns metadata for a single relational domain. A domain in `deleting`
-/// state answers 410 Gone (rel/013 finishes the physical purge).
+/// state answers 410 Gone (a background purge removes the data later).
 pub async fn get_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -128,7 +128,7 @@ pub async fn get_domain(
     path = "/store-api/rel/domains/{name}",
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
-        (status = 202, description = "Deletion accepted — background purge follows (rel/013)"),
+        (status = 202, description = "Deletion accepted — background purge follows"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is already being deleted", body = String, content_type = "text/plain"),
         (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
@@ -136,7 +136,7 @@ pub async fn get_domain(
     tag = "Relational Domains"
 )]
 /// Marks a relational domain as deleting. Its tables/views become
-/// inaccessible immediately; physical cleanup follows in rel/013.
+/// inaccessible immediately; physical cleanup follows in the background.
 pub async fn delete_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,

@@ -1,13 +1,13 @@
-//! Catalog for the relational store (spec rel/003).
+//! Catalog for the relational store.
 //!
 //! A `CAT:` entry describes a table **or** a view (shared per-domain namespace).
-//! This is a purely programmatic Rust API — no SQL; the DDL frontend (rel/004)
-//! and the write path (rel/005) call into it. Pattern: `IndexRegistry` (json/004)
+//! This is a purely programmatic Rust API — no SQL; the DDL frontend
+//! and the write path call into it. Pattern: `IndexRegistry` (JSON engine)
 //! — in-memory cache + LSM persistence + `ddl_lock`. Table/index ids come from a
 //! persistent, strictly monotonic per-domain counter whose bump is committed in
 //! the **same** `WriteBatch` as the consuming catalog mutation (crash-safe,
 //! never reused — a fresh id after `DROP`+re-`CREATE` avoids colliding with
-//! orphaned `ROW:`/`IDX:` ranges not yet purged by rel/013).
+//! orphaned `ROW:`/`IDX:` ranges not yet purged).
 
 use super::domain::{RelDomain, RelDomainRegistry};
 use super::error::RelStoreError;
@@ -26,7 +26,7 @@ const CAT_PREFIX: &[u8] = b"CAT:";
 const SYS_CATALOG_SEQ_PREFIX: &[u8] = b"__sys:rel_catalog_seq:";
 pub(crate) const MAX_IDENTIFIER_LEN: usize = 50;
 
-// ── Identifier rules (concept 3.5) ─────────────────────────────────────────────
+// ── Identifier rules ─────────────────────────────────────────────
 
 /// Normalizes (lowercases) and validates a table/view/column/index identifier:
 /// `[a-z_][a-z0-9_]{0,49}`. Stricter than the domain-name rule (no `-`).
@@ -74,7 +74,7 @@ fn seq_key(domain: &str) -> Vec<u8> {
     k
 }
 
-/// Lower bound of `rel.lsm.max_key_length` (spec general/030): the longest
+/// Lower bound of `rel.lsm.max_key_length`: the longest
 /// management key, `__sys:rel_catalog_seq:{domain}` at a maximal name, plus
 /// 1 byte.
 pub(crate) const MIN_LSM_KEY_LENGTH: usize =
@@ -135,8 +135,8 @@ pub struct TableSchema {
     pub created_at: u64,
     /// Next `col_id` to hand out on `ADD COLUMN` — tracked separately from
     /// `columns` so a `DROP COLUMN` (which removes the entry outright) can
-    /// never cause a later `ADD COLUMN` to reuse a retired id (rel/004 §8:
-    /// stale `ROW:` bytes for a dropped column must never be misread as a
+    /// never cause a later `ADD COLUMN` to reuse a retired id (stale
+    /// `ROW:` bytes for a dropped column must never be misread as a
     /// same-numbered new column before the next row rewrite purges them).
     #[serde(default = "default_next_col_id")]
     pub next_col_id: u16,
@@ -156,7 +156,7 @@ impl TableSchema {
 }
 
 /// A view: only the raw SELECT text is stored here. Binding/validation/inlining
-/// land in rel/008. A view has no `table_id` (no rows/indexes).
+/// live in `view.rs`. A view has no `table_id` (no rows/indexes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewSchema {
     pub name: String,
@@ -217,8 +217,8 @@ pub struct TableInput {
     pub columns: Vec<ColumnInput>,
 }
 
-/// Catalog limits (concept 8): `max_tables_per_domain` from the `[rel]`
-/// config, the other two fixed (spec general/030).
+/// Catalog limits: `max_tables_per_domain` from the `[rel]`
+/// config, the other two fixed.
 #[derive(Debug, Clone, Copy)]
 pub struct CatalogLimits {
     pub max_columns: usize,
@@ -227,9 +227,9 @@ pub struct CatalogLimits {
 }
 
 /// The set of catalog-live object ids of a domain — every `table_id` plus
-/// every `index_id` (rel/013 §2 orphan sweep). An id `≤` the high-water mark
+/// every `index_id` (for the orphan sweep). An id `≤` the high-water mark
 /// but absent here is an orphan candidate (a dropped table/index; ids are
-/// never reused, rel/003).
+/// never reused).
 pub(crate) struct LiveIds(HashSet<u32>);
 
 impl LiveIds {
@@ -242,7 +242,7 @@ impl LiveIds {
 type ReservedIds = Arc<parking_lot::Mutex<HashSet<(Vec<u8>, u32)>>>;
 
 /// RAII cleanup for an index id reserved by [`RelCatalog::create_index_reserve`]
-/// but not yet catalog-visible (rel/013 F1). `ddl.rs` holds it across the index
+/// but not yet catalog-visible. `ddl.rs` holds it across the index
 /// backfill: its `Drop` frees the reservation on any early abort (`KeyTooLong`,
 /// `UniqueViolation`, a scan error), so the orphaned `IDX:` bytes become
 /// reapable again. The success path calls [`disarm`](Self::disarm) after
@@ -280,12 +280,12 @@ pub struct RelCatalog {
     seq: RwLock<HashMap<String, u32>>,
     /// `(system_prefix, id)` reserved between `create_index_reserve` and
     /// `create_index_commit`: the id is already past the high-water mark but
-    /// not yet catalog-live, so the rel/013 orphan sweep must spare it and its
-    /// in-flight `IDX:` backfill (rel/013 F1). Never persisted — after a crash
+    /// not yet catalog-live, so the orphan sweep must spare it and its
+    /// in-flight `IDX:` backfill. Never persisted — after a crash
     /// the set is empty and the then-orphaned bytes are reaped normally.
     reserved_ids: ReservedIds,
     engine: Arc<LsmStorageEngine>,
-    /// Serializes check-then-act catalog mutations (general/003).
+    /// Serializes check-then-act catalog mutations.
     ddl_lock: Mutex<()>,
     limits: CatalogLimits,
     metrics: Arc<MetricsStore>,
@@ -416,8 +416,8 @@ impl RelCatalog {
         Ok(schema)
     }
 
-    /// Stores a view's raw SELECT text unvalidated (binding → rel/008). Views
-    /// consume no id. This is the storage primitive rel/008 calls after binding.
+    /// Stores a view's raw SELECT text unvalidated (binding → `view.rs`). Views
+    /// consume no id.
     pub async fn create_view(
         &self,
         domains: &RelDomainRegistry,
@@ -430,7 +430,7 @@ impl RelCatalog {
 
     /// Like [`create_view`], but runs `validate` against the domain's current
     /// object map under the *same* `ddl_lock` acquisition, before the
-    /// collision/limit checks (spec rel/008 §3): CREATE VIEW's deep bind and
+    /// collision/limit checks: CREATE VIEW's deep bind and
     /// its storage thus run in one atomic critical section — no concurrent
     /// DDL can invalidate the view between validation and storage.
     pub async fn create_view_checked(
@@ -514,7 +514,7 @@ impl RelCatalog {
     }
 
     /// Removes a catalog object. Ids are **not** released (the counter only
-    /// moves forward). Physical `ROW:`/`IDX:`/`SEQ:` cleanup → rel/013.
+    /// moves forward). A background purge removes its data later.
     ///
     /// Named `drop_object`, not `drop`: an inherent `drop` is shadowed by
     /// `<Arc<Self> as Drop>::drop` in method resolution (the store is held as
@@ -534,8 +534,8 @@ impl RelCatalog {
     /// removed). The removed entry lets `DROP TABLE`/`DROP VIEW` verify the
     /// object's *kind* atomically with the delete, closing the check-then-lock
     /// TOCTOU where a concurrent re-`CREATE` of the same name as a different
-    /// kind could otherwise be dropped by mistake (004 TOCTOU); the map lets a
-    /// view depending on `name` be caught atomically too (spec rel/008 §7).
+    /// kind could otherwise be dropped by mistake; the map lets a
+    /// view depending on `name` be caught atomically too.
     pub async fn drop_object_checked(
         &self,
         domains: &RelDomainRegistry,
@@ -577,7 +577,7 @@ impl RelCatalog {
     }
 
     /// Removes every `CAT:` entry and the id counter of a domain — called by
-    /// the rel/013 domain purger during finalization, after the data keys are
+    /// the domain purger during finalization, after the data keys are
     /// gone.
     pub(crate) async fn purge_domain_definitions(
         &self,
@@ -597,7 +597,7 @@ impl RelCatalog {
         Ok(())
     }
 
-    /// The live object ids (table + index) of a domain (rel/013 §2 orphan
+    /// The live object ids (table + index) of a domain (for the orphan
     /// sweep). Cache-only read. Empty for an unknown / catalog-empty domain.
     pub(crate) fn live_object_ids(&self, domain: &RelDomain) -> LiveIds {
         let mut ids = HashSet::new();
@@ -613,14 +613,14 @@ impl RelCatalog {
     }
 
     /// The domain's catalog id high-water mark (`__sys:rel_catalog_seq:{name}`),
-    /// the upper bound of all ids ever handed out; `0` if it never allocated one
-    /// (rel/013 §2). Cache-only read.
+    /// the upper bound of all ids ever handed out; `0` if it never allocated one.
+    /// Cache-only read.
     pub(crate) fn allocated_id_high_watermark(&self, domain: &RelDomain) -> u32 {
         self.seq.read().get(&domain.name).copied().unwrap_or(0)
     }
 
     /// Whether `(prefix, id)` is currently reserved by an in-flight
-    /// `create_index_reserve` (rel/013 F1). The rel/013 orphan sweep calls this
+    /// `create_index_reserve`. The orphan sweep calls this
     /// to spare a reserved-but-not-yet-catalog-live index id. Lock held only
     /// for the probe.
     pub(crate) fn is_id_reserved(&self, prefix: &[u8], id: u32) -> bool {
@@ -628,7 +628,7 @@ impl RelCatalog {
     }
 
     /// A cleanup guard for an id already reserved by `create_index_reserve`
-    /// (rel/013 F1) — see [`IndexReservationGuard`]. `ddl.rs` builds one right
+    /// — see [`IndexReservationGuard`]. `ddl.rs` builds one right
     /// after reserving so a backfill abort frees the reservation via `Drop`.
     pub(crate) fn index_reservation_guard(&self, prefix: &[u8], id: u32) -> IndexReservationGuard {
         IndexReservationGuard {
@@ -663,7 +663,7 @@ impl RelCatalog {
     /// a lost or corrupt SEQ value (which `scan_seq_counters` silently skips,
     /// leaving the domain at `0`) unable to reissue an id that a live
     /// `table_id`/`index_id` already occupies — the collision that would smear
-    /// a fresh table over an existing `ROW:`/`IDX:` range (003-F1).
+    /// a fresh table over an existing `ROW:`/`IDX:` range.
     fn last_allocated_id(&self, domain_name: &str, prefix: &[u8]) -> u32 {
         let persisted = self.seq.read().get(domain_name).copied().unwrap_or(0);
         persisted.max(self.max_live_id(prefix))
@@ -678,7 +678,7 @@ impl RelCatalog {
     }
 
     /// The prospective per-domain map for an in-place table-schema change
-    /// (`DROP COLUMN`/`RENAME COLUMN`, spec rel/008 §7): current entries with
+    /// (`DROP COLUMN`/`RENAME COLUMN`): current entries with
     /// `schema`'s own (already-mutated, not yet persisted) form substituted in.
     fn table_prospective(&self, prefix: &[u8], schema: &TableSchema) -> HashMap<String, CatalogEntry> {
         let mut prospective = self.entries.read().get(prefix).cloned().unwrap_or_default();
@@ -717,7 +717,7 @@ impl RelCatalog {
                 pk_count += 1;
             }
             // The PK *is* the row key — a `PRIMARY KEY UNIQUE` column needs no
-            // separate unique index (004-F4).
+            // separate unique index.
             if col.unique && !is_pk {
                 unique_columns.push(cname);
             }
@@ -809,7 +809,7 @@ impl RelCatalog {
 
     /// Resolves and type-checks a `REFERENCES` target — shared by `CREATE
     /// TABLE` and `ALTER TABLE ADD COLUMN`. `KVREF`/`JSONREF` columns skip
-    /// target validation (their existence check lands in rel/012).
+    /// target validation (their existence is checked at DML time).
     fn resolve_references(
         &self,
         prefix: &[u8],
@@ -909,12 +909,12 @@ impl RelCatalog {
         })
     }
 
-    // ── DDL primitives beyond CREATE TABLE (spec rel/004 §8) ────────────────
+    // ── DDL primitives beyond CREATE TABLE ────────────────
     //
     // Each is self-validating and atomic under `ddl_lock`, mirroring
     // `create_table`'s established shape: resolve the domain, re-check
     // everything from a consistent cache snapshot, mutate, persist, update
-    // the cache. `schema_version` only moves on ADD/DROP COLUMN (concept 5.2).
+    // the cache. `schema_version` only moves on ADD/DROP COLUMN.
 
     /// `ALTER TABLE ... ADD COLUMN` — appends one column. Rejects
     /// `PRIMARY KEY`/`AUTOINCREMENT`/`UNIQUE` (v1: a unique column is added
@@ -994,7 +994,7 @@ impl RelCatalog {
 
     /// `ALTER TABLE ... DROP COLUMN` — the column must be neither the primary
     /// key nor indexed (drop the index first). Orphaned row bytes are only
-    /// reclaimed on the next row rewrite (concept 5.4), not here.
+    /// reclaimed on the next row rewrite, not here.
     pub async fn drop_column(
         &self,
         domains: &RelDomainRegistry,
@@ -1007,7 +1007,7 @@ impl RelCatalog {
 
     /// Like [`drop_column`], but runs `check` against the prospective
     /// per-domain map (the column already dropped from the table's schema)
-    /// under the same `ddl_lock` acquisition as the mutation (spec rel/008 §7).
+    /// under the same `ddl_lock` acquisition as the mutation.
     pub async fn drop_column_checked(
         &self,
         domains: &RelDomainRegistry,
@@ -1047,7 +1047,7 @@ impl RelCatalog {
     }
 
     /// `ALTER TABLE ... RENAME COLUMN`. A PK/indexed column may be renamed —
-    /// data keys are addressed by `col_id`, not by name (concept 5.2).
+    /// data keys are addressed by `col_id`, not by name.
     pub async fn rename_column(
         &self,
         domains: &RelDomainRegistry,
@@ -1061,7 +1061,7 @@ impl RelCatalog {
 
     /// Like [`rename_column`], but runs `check` against the prospective
     /// per-domain map (the column already renamed) under the same `ddl_lock`
-    /// acquisition as the mutation (spec rel/008 §7).
+    /// acquisition as the mutation.
     pub async fn rename_column_checked(
         &self,
         domains: &RelDomainRegistry,
@@ -1123,7 +1123,7 @@ impl RelCatalog {
 
     /// Like [`rename_table`], but runs `check` against the prospective
     /// per-domain map (the table already renamed) under the same `ddl_lock`
-    /// acquisition as the mutation (spec rel/008 §7).
+    /// acquisition as the mutation.
     pub async fn rename_table_checked(
         &self,
         domains: &RelDomainRegistry,
@@ -1179,7 +1179,7 @@ impl RelCatalog {
         Ok(schema)
     }
 
-    /// Step 1 of the backfill-aware `CREATE INDEX` (spec rel/005 §13.0):
+    /// Reserve phase of the backfill-aware `CREATE INDEX`:
     /// validates the index, assigns its `index_id`, and **durably commits the
     /// id counter first** — before any `IDX:` entry is backfilled — so a crash
     /// during backfill can only burn the id (harmless orphan bytes the purger
@@ -1231,15 +1231,15 @@ impl RelCatalog {
             }])
             .await?;
         self.seq.write().insert(dom.name.clone(), new_last);
-        // Reserve the id so the rel/013 orphan sweep spares its soon-to-be
-        // backfilled IDX bytes until create_index_commit makes the index live
-        // (rel/013 F1). Inserted only after the seq bump succeeds, so a failed
+        // Reserve the id so the orphan sweep spares its soon-to-be
+        // backfilled IDX bytes until create_index_commit makes the index live.
+        // Inserted only after the seq bump succeeds, so a failed
         // reserve leaks nothing; ddl.rs owns cleanup via the reservation guard.
         self.reserved_ids.lock().insert((prefix.clone(), new_last));
         Ok((dom, schema, meta))
     }
 
-    /// Step 4 of the backfill-aware `CREATE INDEX` (spec rel/005 §13.4): makes
+    /// Commit phase of the backfill-aware `CREATE INDEX`: makes
     /// the index catalog-visible **after** its entries are durably backfilled
     /// — never a visible index with missing entries.
     pub async fn create_index_commit(
@@ -1275,7 +1275,7 @@ impl RelCatalog {
         schema.indexes.push(meta);
         self.persist_table(&prefix, &schema).await?;
         // The index is catalog-live now (live_object_ids covers it), so free
-        // its reservation (rel/013 F1).
+        // its reservation.
         self.reserved_ids.lock().remove(&(prefix, index_id));
         self.metrics.record_rel_ddl_create();
         Ok(schema)
@@ -1309,7 +1309,7 @@ impl RelCatalog {
         // Only the *implicit* constraint index — the one create_table auto-named
         // `{table}_{column}_key` — is tied to a UNIQUE column and undroppable; a
         // separately named explicit UNIQUE index on the same column is droppable
-        // (004-F5: identify it by that name, not by `unique` alone).
+        // (identify it by that name, not by `unique` alone).
         let implicit_name = format!("{}_{}_key", schema.name, ix.column);
         if ix.name == implicit_name && schema.columns.iter().any(|c| c.name == ix.column && c.unique) {
             return Err(RelStoreError::InvalidSchema(format!(
@@ -1407,7 +1407,7 @@ mod tests {
         }
     }
 
-    // Spec general/030: the id counter key at a maximal domain name, the CAT
+    // The id counter key at a maximal domain name, the CAT
     // key at a maximal identifier and the AUTOINCREMENT key fit the startup
     // lower bound of rel.lsm.max_key_length.
     #[test]
@@ -1824,7 +1824,7 @@ mod tests {
         })
     }
 
-    // ── DDL primitives beyond CREATE TABLE (spec rel/004 §8) ────────────────────
+    // ── DDL primitives beyond CREATE TABLE ────────────────────
 
     // 19. add_column: col_id is "highest existing + 1", never reused after a
     //     DROP COLUMN + ADD COLUMN cycle; schema_version bumps only on
@@ -2108,7 +2108,7 @@ mod tests {
         })
     }
 
-    // ── Prep work (spec quality/008): recover's tolerant skip paths ─────────────
+    // ── recover's tolerant skip paths ─────────────
 
     // 27. A CAT: key with no ':' after the prefix cannot be split into
     //     (system_prefix, name) -> skipped (tracing::warn), other entries
@@ -2232,7 +2232,7 @@ mod tests {
         })
     }
 
-    // ── Prep work (spec quality/008): validate_columns/check_default error paths ─
+    // ── validate_columns/check_default error paths ─
 
     // 30. Two columns normalizing to the same name -> InvalidSchema("duplicate
     //     column ..."), before any other column check runs.
@@ -2292,9 +2292,9 @@ mod tests {
 
     // ── Fixes ───────────────────────────────────────────────────────────────────
 
-    // 33. (013-F1) An index id is reserved across create_index_reserve→commit;
+    // 33. An index id is reserved across create_index_reserve→commit;
     //     a backfill abort (guard drop) frees it, and so does commit — the
-    //     rel/013 orphan sweep queries is_id_reserved to spare the id meanwhile.
+    //     orphan sweep queries is_id_reserved to spare the id meanwhile.
     #[test]
     fn test_index_reservation_lifecycle() {
         crate::core::engine_runtime::block_on(async {
@@ -2325,7 +2325,7 @@ mod tests {
         })
     }
 
-    // 34. (004 TOCTOU) drop_object_checked hands `check` the removed entry, so a
+    // 34. (TOCTOU) drop_object_checked hands `check` the removed entry, so a
     //     DROP-TABLE-style guard rejects a view atomically under the ddl_lock
     //     and the view survives — the check-then-lock race can no longer delete
     //     the wrong kind. (This test cannot compile against the pre-fix
@@ -2354,7 +2354,7 @@ mod tests {
         })
     }
 
-    // 35. (003-F1) A lost/corrupt SEQ value must not let recovery reissue a
+    // 35. A lost/corrupt SEQ value must not let recovery reissue a
     //     live id: recover() floors the counter to the highest live id, so the
     //     next CREATE TABLE gets a fresh id, never colliding with existing rows.
     #[test]
@@ -2380,7 +2380,7 @@ mod tests {
         })
     }
 
-    // 36. (004-F4) PRIMARY KEY UNIQUE on one column adds no redundant unique
+    // 36. PRIMARY KEY UNIQUE on one column adds no redundant unique
     //     index (the PK is the row key) and consumes no extra index_id.
     #[test]
     fn test_pk_unique_creates_no_index() {
@@ -2399,7 +2399,7 @@ mod tests {
         })
     }
 
-    // 37. (004-F5) A separately named explicit UNIQUE index on an already-UNIQUE
+    // 37. A separately named explicit UNIQUE index on an already-UNIQUE
     //     column is droppable; only the implicit constraint index (t_e_key) is
     //     protected. Pre-fix, drop_index rejected the explicit one too.
     #[test]

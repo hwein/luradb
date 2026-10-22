@@ -3,25 +3,25 @@ use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::sync::Arc;
 
-/// SSTable `ValuePointer` sentinels for the two "no vLog data" states
-/// (kv/018): a real vLog offset can never reach the top of the `u64` range
+/// SSTable `ValuePointer` sentinels for the two "no vLog data" states:
+/// a real vLog offset can never reach the top of the `u64` range
 /// (no file grows that large), so both values are free to use as markers.
 /// Both carry `file_id == 0`.
 pub const TOMBSTONE_OFFSET: u64 = u64::MAX;
 pub const NULL_OFFSET: u64 = u64::MAX - 1;
 
-/// The single expiry check (spec kv/025 §2): `expire_at` is 0 (no TTL) or a
+/// The single expiry check: `expire_at` is 0 (no TTL) or a
 /// Unix timestamp (seconds); every read/compaction path delegates here
 /// instead of repeating `expire_at != 0 && expire_at <= now`.
 pub fn is_expired(expire_at: u64, now: u64) -> bool {
     expire_at != 0 && expire_at <= now
 }
 
-/// Liveness classification of one stored version at a given `now` (spec
-/// kv/025 §2), built below for [`DataBlockValue`]/[`CachedValue`] and, where
+/// Liveness classification of one stored version at a given `now`,
+/// built below for [`DataBlockValue`]/[`CachedValue`] and, where
 /// `Value` is defined, for the MemTable's own representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VersionState { Live, Expired, Tombstone } // NULL counts as Live (kv/018)
+pub enum VersionState { Live, Expired, Tombstone } // NULL counts as Live
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[rkyv(attr(repr(C)))] // Force C layout on Archived type
@@ -67,7 +67,7 @@ pub enum DataBlockValue {
 }
 
 impl DataBlockValue {
-    /// Classifies this version's liveness at `now` (spec kv/025 §2): the
+    /// Classifies this version's liveness at `now`: the
     /// tombstone sentinel is `Tombstone`; everything else (including the
     /// NULL sentinel, `expire_at == 0`) follows [`is_expired`].
     pub fn version_state(&self, now: u64) -> VersionState {
@@ -101,7 +101,7 @@ pub struct BloomFilter {
     pub num_hashes: u32,
 }
 
-/// A cached data block (spec perf/003): either a zero-copy view into a
+/// A cached data block: either a zero-copy view into a
 /// memory-mapped SSTable or owned aligned bytes (non-mmap fallback).
 /// Cloning is cheap — an `Arc` clone plus offsets, never a data copy.
 #[derive(Debug, Clone)]
@@ -135,7 +135,7 @@ impl CachedBlock {
     }
 }
 
-/// Result of a point lookup (spec perf/002): either a zero-copy reference
+/// Result of a point lookup: either a zero-copy reference
 /// into a cached block or an owned value. `Send + Sync`, no lifetimes —
 /// the backing `Arc` keeps the block alive as long as the value exists.
 #[derive(Debug, Clone)]
@@ -157,7 +157,7 @@ pub enum CachedValue {
     },
     /// Owned bytes (MemTable hits — already in RAM, not rkyv-formatted).
     Owned { data: Vec<u8>, expire_at: u64 },
-    /// Key is explicitly NULL (kv/018): present, no bytes.
+    /// Key is explicitly NULL: present, no bytes.
     Null,
     /// The key was deleted.
     Tombstone,
@@ -196,7 +196,7 @@ impl CachedValue {
             .to_vec()
     }
 
-    /// Classifies this version's liveness at `now` (spec kv/025 §2): mirrors
+    /// Classifies this version's liveness at `now`: mirrors
     /// [`DataBlockValue::version_state`] for the cached read-path
     /// representation.
     pub fn version_state(&self, now: u64) -> VersionState {
@@ -233,7 +233,7 @@ impl From<DataBlockValue> for CachedValue {
 mod tests {
     use super::*;
 
-    // spec kv/025 §9.11: expire_at == 0 (no TTL), == now (expired), > now (not yet).
+    // expire_at == 0 (no TTL), == now (expired), > now (not yet).
     #[test]
     fn test_is_expired_boundaries() {
         assert!(!is_expired(0, 100));
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(CachedValue::Tombstone.expire_at(), 0);
     }
 
-    // 5. Mmap-backed CachedBlock slices the mapped file (spec perf/003).
+    // 5. Mmap-backed CachedBlock slices the mapped file.
     #[test]
     fn test_cached_block_mapped_and_owned() {
         let dir = tempfile::TempDir::new().unwrap();

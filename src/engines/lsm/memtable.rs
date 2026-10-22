@@ -11,8 +11,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Counted size of a vLog-offloaded value: its on-disk vLog pointer (spec
-/// general/032).
+/// Counted size of a vLog-offloaded value: its on-disk vLog pointer.
 const POINTER_SIZE: usize = std::mem::size_of::<ValuePointer>();
 
 /// Represents a value stored in the MemTable.
@@ -25,16 +24,16 @@ const POINTER_SIZE: usize = std::mem::size_of::<ValuePointer>();
 pub enum Value {
     Inline(Vec<u8>, Option<u64>), // data, expire_at
     /// vLog pointer + TTL. `file_id` is the vLog generation the value was
-    /// appended to (spec kv/017).
+    /// appended to.
     Pointer { file_id: u32, offset: u64, len: usize, expire_at: Option<u64> },
-    /// Key explicitly set to NULL (kv/018): present, no bytes, no TTL — an
+    /// Key explicitly set to NULL: present, no bytes, no TTL — an
     /// update, not a delete.
     Null,
     Tombstone,
 }
 
 impl Value {
-    /// Classifies this version's liveness at `now` (spec kv/025 §2): mirrors
+    /// Classifies this version's liveness at `now`: mirrors
     /// `DataBlockValue`/`CachedValue` in `storage::format` for the
     /// MemTable's own value representation.
     pub fn version_state(&self, now: u64) -> VersionState {
@@ -52,7 +51,7 @@ impl Value {
         }
     }
 
-    /// Counted value bytes (spec general/032): inline data without its TTL,
+    /// Counted value bytes: inline data without its TTL,
     /// an offloaded value as its vLog pointer.
     fn stored_size(&self) -> usize {
         match self {
@@ -109,7 +108,7 @@ impl MemTable {
     }
 
     /// Like [`Self::set`], but keeps an existing entry with the identical
-    /// internal key (spec kv/032). Returns whether `value` was inserted.
+    /// internal key. Returns whether `value` was inserted.
     pub fn set_if_absent(&self, user_key: Vec<u8>, timestamp: Timestamp, value: Value) -> bool {
         let encoded_key = InternalKey::new(user_key, timestamp).encode();
         let size = encoded_key.len() + value.stored_size();
@@ -136,7 +135,7 @@ impl MemTable {
     }
 
     /// Like [`Self::get`], but also returns the version's write timestamp
-    /// (spec kv/022 `last_modified_at`) — decoded straight from the encoded
+    /// (`last_modified_at`) — decoded straight from the encoded
     /// key, so already un-inverted.
     ///
     /// # Arguments
@@ -211,15 +210,14 @@ impl MemTable {
         })
     }
 
-    /// Like [`Self::iter`], but starting at the first encoded key `>= start`
-    /// (spec perf/029).
+    /// Like [`Self::iter`], but starting at the first encoded key `>= start`.
     pub fn iter_from<'a>(&'a self, start: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, Value)> + 'a {
         self.map
             .range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
             .map(|entry| (entry.key().clone(), entry.value().clone()))
     }
 
-    /// Payload bytes of all entries (spec general/032).
+    /// Payload bytes of all entries.
     pub fn size_bytes(&self) -> usize {
         self.size_bytes.load(Ordering::Relaxed)
     }
@@ -294,7 +292,7 @@ mod tests {
         assert_eq!(versions.len(), 3);
     }
 
-    // Spec general/032: re-inserting an identical internal key replaces the
+    // Re-inserting an identical internal key replaces the
     // entry, so its old contribution is subtracted.
     #[test]
     fn test_memtable_set_on_identical_internal_key_replaces_its_bytes() {

@@ -32,7 +32,7 @@ fn is_expired(expire_at: Option<u64>) -> bool {
 }
 
 /// Physical (millisecond) component of an MVCC write timestamp — the HLC
-/// packs it into the high 48 bits (spec kv/022 `last_modified_at`).
+/// packs it into the high 48 bits (`last_modified_at`).
 fn hlc_physical_ms(ts: Timestamp) -> u64 {
     HLCTimestamp::new(ts.as_u64()).physical()
 }
@@ -44,8 +44,8 @@ fn with_stamp(result: GetResult, expire_at: u64, ts: Timestamp) -> (GetResult, u
     (result, expire_at, stamp)
 }
 
-/// Whether `ts` stamps the batch the engine is applying right now (spec
-/// kv/034; slot 0 = none). Call it only once a MemTable version stamped `ts`
+/// Whether `ts` stamps the batch the engine is applying right now (slot
+/// 0 = none). Call it only once a MemTable version stamped `ts`
 /// was found: the insert's release then covers the slot store before it.
 pub(crate) fn is_applying(applying_batch: &AtomicU64, ts: Timestamp) -> bool {
     let applying = applying_batch.load(atomic::Ordering::Acquire);
@@ -104,20 +104,20 @@ impl Snapshot {
 /// This reader performs point lookups and scans across multiple levels of the LSM-Tree,
 /// applying MVCC filtering to return only the appropriate version for a given snapshot.
 pub struct LsmReader<'a> {
-    /// Every source of this read, vLog generations included (spec kv/031 A1).
+    /// Every source of this read, vLog generations included.
     version: Arc<Version>,
 
     /// Shared S3-FIFO block cache — checked before every SSTable block read.
     cache: Arc<StripedBlockCache>,
 
-    /// The engine's slot for the batch being applied (spec kv/034): point
+    /// The engine's slot for the batch being applied: point
     /// reads see that batch whole or not at all. `newest_version` ignores
     /// it — the TTL sweeper runs on the owner thread, which never meets a
     /// batch half applied.
     applying_batch: &'a AtomicU64,
 }
 
-/// Three-valued result of a KV point read (spec kv/018): a live value, an
+/// Three-valued result of a KV point read: a live value, an
 /// explicit NULL (key present, no bytes), or nothing at all. Replaces the
 /// former `Option<Vec<u8>>` returned by `get`/`get_with_snapshot` — `Null` is
 /// only ever produced inside the KV engine (via `set_null`); every caller
@@ -151,7 +151,7 @@ pub struct ValueWithMetadata {
     pub data: Vec<u8>,
     pub expire_at: u64,
     pub from_vlog: bool,
-    /// Key is explicitly NULL (kv/018): `data` is empty, `from_vlog` is false.
+    /// Key is explicitly NULL: `data` is empty, `from_vlog` is false.
     pub is_null: bool,
     /// Unix milliseconds of this version's write (`last_modified_at`) — the
     /// HLC physical component of its MVCC timestamp.
@@ -188,7 +188,7 @@ impl<'a> LsmReader<'a> {
 
     /// Resolves a vLog pointer through this reader's own version, never
     /// through a live registry: a generation retired meanwhile stays open for
-    /// as long as the version holds it (spec kv/031 A5).
+    /// as long as the version holds it.
     async fn read_vlog(&self, file_id: u32, offset: u64, len: usize) -> Result<Vec<u8>> {
         let vlog = self
             .version
@@ -212,7 +212,7 @@ impl<'a> LsmReader<'a> {
 
     /// Like [`Self::get`], but also returns `expire_at` (absolute Unix
     /// seconds, 0 = no TTL — only meaningful when the result is `Present`;
-    /// `set_null` never carries a TTL) — spec general/006 backup export.
+    /// `set_null` never carries a TTL) — used by the backup export.
     /// Same newest-first source order and MVCC/TTL/tombstone semantics as
     /// `get`, VLog pointers are dereferenced.
     pub async fn get_with_expiry(&self, user_key: &[u8], snapshot: &Snapshot) -> Result<(GetResult, u64)> {
@@ -469,7 +469,7 @@ impl<'a> LsmReader<'a> {
     }
 
     /// Newest version of `user_key` as (write stamp, liveness) — the TTL
-    /// sweeper's authoritative re-check (spec kv/025 §3.1). Same newest-first
+    /// sweeper's authoritative re-check. Same newest-first
     /// source order as [`Self::get_with_metadata`] and no VLog access, but it
     /// reports an expired or tombstoned version instead of collapsing both
     /// into the same `None` an absent key yields.
@@ -1037,7 +1037,7 @@ mod merge_iterator_tests {
 pub struct SnapshotRegistry {
     active: Arc<parking_lot::Mutex<BTreeSet<u64>>>,
 
-    /// Test-only count of every `acquire_at` (spec kv/031 test 6).
+    /// Test-only count of every `acquire_at`.
     #[cfg(test)]
     acquires: Arc<std::sync::atomic::AtomicU64>,
 }

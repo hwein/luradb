@@ -1,4 +1,4 @@
-//! JSON-store REST handlers (spec json/009): documents, indexes, search,
+//! JSON-store REST handlers: documents, indexes, search,
 //! bulk load/export, re-indexing.
 
 use crate::api::{middleware::ApiError, AppState, CountResponse};
@@ -209,7 +209,7 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<ExpectedVersion>, ApiErr
         })
 }
 
-/// Reads the write preconditions in evaluation order (RFC 9110 §13.2.2):
+/// Reads the write preconditions in evaluation order (RFC 9110 section 13.2.2):
 /// `If-Match`, then `If-None-Match`, of which only the literal `*` is
 /// supported (ETag lists are a deliberate non-goal).
 fn parse_preconditions(headers: &HeaderMap) -> Result<Vec<Precondition>, ApiError> {
@@ -317,7 +317,7 @@ pub async fn put_document(
     tag = "JSON Document Store"
 )]
 /// Reads a document; `_key`/`_version` are top-level fields and an opaque
-/// `ETag` is exposed for use with `If-Match` (json/011).
+/// `ETag` is exposed for use with `If-Match`.
 pub async fn get_document(
     State(state): State<AppState>,
     Path((domain, key)): Path<(String, String)>,
@@ -644,7 +644,7 @@ pub async fn bulk_load(
     tag = "JSON Document Store"
 )]
 /// Streams all documents of a domain as NDJSON without full buffering. A
-/// document written before json/017 that still carries a top-level
+/// legacy document that still carries a top-level
 /// `_key`/`_version`/`_content` field exports lossy, same as before — no
 /// migration reshapes existing data.
 pub async fn export_documents(
@@ -1075,7 +1075,7 @@ mod tests {
         })
     }
 
-    // 11. Listing and counting endpoints (spec json/010).
+    // 11. Listing and counting endpoints.
     #[test]
     fn test_listing_and_count_endpoints() {
         crate::core::engine_runtime::block_on(async {
@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     // 20. If-None-Match values other than the literal '*' are rejected — no
-    //     ETag-list support (§1), including the weak-validator form.
+    //     ETag-list support, including the weak-validator form.
     #[test]
     fn test_if_none_match_non_wildcard_rejected() {
         crate::core::engine_runtime::block_on(async {
@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     // 21. Both headers together: If-Match is evaluated first, then
-    //     If-None-Match (RFC 9110 §13.2.2) — on a free key the failing
+    //     If-None-Match (RFC 9110 section 13.2.2) — on a free key the failing
     //     If-Match decides (412 without ETag, nothing created); on an existing
     //     document with a matching If-Match, the following If-None-Match: *
     //     fails (412 with ETag).
@@ -1459,7 +1459,7 @@ mod tests {
         })
     }
 
-    // 22. Recreate after delete is a legitimate create-only write (§5): the
+    // 22. Recreate after delete is a legitimate create-only write: the
     //     new ETag carries a different generation than before the delete.
     #[test]
     fn test_create_only_put_after_delete_recreate() {
@@ -1492,7 +1492,7 @@ mod tests {
         })
     }
 
-    // 13. Auth scoping: KV permissions do not grant JSON access (spec json/012).
+    // 13. Auth scoping: KV permissions do not grant JSON access.
     #[test]
     fn test_auth_scoping_kv_vs_json() {
         crate::core::engine_runtime::block_on(async {
@@ -1590,7 +1590,7 @@ mod tests {
         })
     }
 
-    // 16. Domain management is admin-only for write methods (spec kv/012):
+    // 16. Domain management is admin-only for write methods:
     //     a write permission on a domain must not allow purging it.
     #[test]
     fn test_auth_scoping_domain_management_admin_only() {
@@ -1730,7 +1730,7 @@ mod tests {
         })
     }
 
-    // 14. TrustedPeer extension (UDS UCred bypass, perf/001) skips bearer auth.
+    // 14. TrustedPeer extension (UDS UCred bypass) skips bearer auth.
     #[test]
     fn test_trusted_peer_bypasses_auth() {
         crate::core::engine_runtime::block_on(async {
@@ -1771,7 +1771,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             let (status, _) = request(&app, Method::DELETE, "/store-api/json/domains/api-dom", None).await;
             assert_eq!(status, StatusCode::ACCEPTED);
-            // While the purge runs, the domain answers 410 Gone (spec json/013).
+            // While the purge runs, the domain answers 410 Gone.
             let (status, body) = request(&app, Method::GET, "/store-api/json/domains/api-dom", None).await;
             assert_eq!(status, StatusCode::GONE, "{body}");
             let (status, _) = request(&app, Method::PUT, "/store-api/json/api-dom/documents/x", Some("{}")).await;
@@ -1779,7 +1779,7 @@ mod tests {
         })
     }
 
-    // 23. DocumentResponse schema sample (spec json/015): a written document's
+    // 23. DocumentResponse schema sample: a written document's
     //     _key/_version/user-field shape matches what the contract now declares.
     #[test]
     fn test_document_response_matches_schema_shape() {
@@ -1799,7 +1799,7 @@ mod tests {
         })
     }
 
-    // 24. _content regression (spec json/015 §2): a non-object document still
+    // 24. _content regression: a non-object document still
     //     wraps under `_content`, unchanged by the new DocumentResponse schema.
     #[test]
     fn test_non_object_document_wraps_in_content_field() {
@@ -1815,7 +1815,7 @@ mod tests {
         })
     }
 
-    // 25. Error-body reality check (spec json/016 §D2 test 5): the contract's
+    // 25. Error-body reality check: the contract's
     //     text/plain schema on 404 matches what the server actually sends — a
     //     real GET on a missing document returns a non-empty plaintext body
     //     with a text/plain content type, not JSON.
@@ -1841,7 +1841,7 @@ mod tests {
 
     // 26. Reserved top-level fields (_key/_version/_content) are rejected
     //     with 400 naming the field, for both POST and PUT; nothing ends up
-    //     stored (spec json/017 test 1).
+    //     stored.
     #[test]
     fn test_reserved_top_level_field_rejected_on_write() {
         crate::core::engine_runtime::block_on(async {
@@ -1873,7 +1873,7 @@ mod tests {
     }
 
     // 27. A reserved name nested under a user field collides with nothing
-    //     and stays allowed (spec json/017 §Entscheid: top-level only).
+    //     and stays allowed (only top-level names are reserved).
     #[test]
     fn test_nested_reserved_field_name_allowed() {
         crate::core::engine_runtime::block_on(async {
@@ -1889,9 +1889,9 @@ mod tests {
     }
 
     // 28. Non-object documents stay accepted unchanged -- the new
-    //     reserved-field check only looks at top-level object keys (spec
-    //     json/017 test 3; the `42` case is already covered by test 24's
-    //     json/015 _content-wrap regression).
+    //     reserved-field check only looks at top-level object keys (the
+    //     `42` case is already covered by test 24's _content-wrap
+    //     regression).
     #[test]
     fn test_non_object_documents_still_accepted() {
         crate::core::engine_runtime::block_on(async {

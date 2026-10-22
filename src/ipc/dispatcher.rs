@@ -30,13 +30,13 @@ use tokio::io::Interest;
 use tokio::sync::{mpsc, watch, Notify};
 
 /// Longest idle wait without a doorbell: serves clients that never ring theirs
-/// and covers lost wakeups (spec perf/014).
+/// and covers lost wakeups.
 const FALLBACK_TICK: Duration = Duration::from_millis(1);
 /// Reads of 4 KiB per doorbell drain: empties a full default-size pipe
 /// (64 KiB), yet a client refilling it concurrently cannot pin the drain.
 const DOORBELL_DRAIN_READS: usize = 16;
 /// Response-ring-full backoff: brief bounded retries before dropping the
-/// response (flow control is out of scope — spec non-goals).
+/// response (flow control is out of scope).
 const RESPOND_RETRIES: usize = 8;
 /// Max commands drained from one client per poll pass. Bounds the work a single
 /// client can force before the dispatcher round-robins to its peers and `run`
@@ -58,7 +58,7 @@ pub struct ClientConnection {
     consumer: RingConsumer,
     producer: RingProducer,
     /// Read end of the pipe the client writes a byte to after each cmd-ring
-    /// send (spec perf/014); `None` once the client closed its write end.
+    /// send; `None` once the client closed its write end.
     doorbell: Option<AsyncFd<OwnedFd>>,
     /// Declared last: the rings (mappings into these segments) must drop before
     /// `_shm` closes the fds and unlinks the names. `None` in unit tests that
@@ -145,7 +145,7 @@ impl ClientConnection {
     }
 
     /// Enqueues a response. A full ring drops it after bounded retries (no flow
-    /// control — spec non-goals). A response too large for the ring is replaced
+    /// control). A response too large for the ring is replaced
     /// by a small 413 on the same request_id, so the client fails fast instead of
     /// blocking forever on a response that can never arrive.
     async fn respond(&mut self, response: ShmResponse) {
@@ -617,7 +617,7 @@ mod tests {
                 ShmResponse::GetOk { request_id: 1, value: ShmGetValue::Present(b"v".to_vec()) }
             );
 
-            // Missing key -> GetOk { Absent }, not an error (spec §7).
+            // Missing key -> GetOk { Absent }, not an error.
             let resp = send_and_dispatch(
                 &mut h,
                 ShmCommand::Get { request_id: 2, domain: "d1".into(), key: b"absent".to_vec() },
@@ -652,8 +652,7 @@ mod tests {
         })
     }
 
-    // DELETE dispatch path: Ok, and the key is gone afterwards (spec quality/003
-    // prep work — the Delete arm had no send_and_dispatch test).
+    // DELETE dispatch path: Ok, and the key is gone afterwards.
     #[test]
     fn test_dispatch_delete() {
         crate::core::engine_runtime::block_on(async {
@@ -673,7 +672,7 @@ mod tests {
         })
     }
 
-    // SETNULL dispatch path (spec kv/018): Ok, and a subsequent GET reports the
+    // SETNULL dispatch path: Ok, and a subsequent GET reports the
     // explicit Null state — distinct from both Present and Absent.
     #[test]
     fn test_dispatch_set_null_then_get_null() {
@@ -698,8 +697,7 @@ mod tests {
         })
     }
 
-    // SCANKEYS dispatch path: ScanResult with the sorted prefix matches (spec
-    // quality/003 prep work).
+    // SCANKEYS dispatch path: ScanResult with the sorted prefix matches.
     #[test]
     fn test_dispatch_scan_keys() {
         crate::core::engine_runtime::block_on(async {
@@ -726,7 +724,7 @@ mod tests {
     }
 
     // PUT with ttl_secs > 0 takes the put_with_ttl branch and answers Ok; the
-    // value is stored (spec quality/003 prep work).
+    // value is stored.
     #[test]
     fn test_dispatch_put_with_ttl() {
         crate::core::engine_runtime::block_on(async {
@@ -927,7 +925,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/014: doorbell wakeup ──────────────────────────────────────
+    // ── Doorbell wakeup ──────────────────────────────────────
 
     /// What a doorbell-aware client does after each cmd-ring send.
     fn ring(doorbell: &OwnedFd) {
@@ -1048,7 +1046,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/007: UTF-8 key invariant ───────────────────────────────
+    // ── UTF-8 key invariant ───────────────────────────────
 
     // Test 4: a "400 "-prefixed engine error maps to code 400 over SHM.
     #[test]

@@ -106,7 +106,7 @@ impl ReaderRegistry {
 }
 
 /// Registration lifetime of one client's slot. Frees it on drop — including
-/// when the connection task is aborted at an `.await` (spec §7).
+/// when the connection task is aborted at an `.await`.
 pub struct ReaderSlotLease {
     registry: Arc<ReaderRegistry>,
     client_id: u64,

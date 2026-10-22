@@ -45,7 +45,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-/// Number of document-write lock shards (spec json/018). Not configurable —
+/// Number of document-write lock shards. Not configurable —
 /// the number only caps the collision probability.
 const DOC_WRITE_SHARDS: usize = 64;
 
@@ -70,20 +70,20 @@ pub struct JsonEngine {
     reindex_batch_size: usize,
     reindex_pause_ms: u64,
     /// task_id → (domain, status) of started re-index tasks; the domain
-    /// scopes status lookups (json/009: no cross-domain task reads).
+    /// scopes status lookups (no cross-domain task reads).
     reindex_tasks: RwLock<HashMap<String, (String, ReindexStatus)>>,
     /// Domains with a currently running re-index (domain → task_id).
     reindex_running: SyncMutex<HashMap<String, String>>,
-    /// Serializes read→write in document writes so version checks (OCC,
-    /// json/011) cannot race, and fences writers against the purger's
-    /// finalize: domain state is checked under the shard guard (json/013).
-    /// Sharded per document reference (json/018) — writes on keys of
+    /// Serializes read→write in document writes so version checks (OCC)
+    /// cannot race, and fences writers against the purger's
+    /// finalize: domain state is checked under the shard guard.
+    /// Sharded per document reference — writes on keys of
     /// different shards no longer wait for each other.
     doc_write_locks: [tokio::sync::Mutex<()>; DOC_WRITE_SHARDS],
     /// Publishes the index events and finishes purges. Unset for a
     /// standalone engine, which then publishes nothing.
     control: OnceLock<Arc<ControlPlane>>,
-    /// Engine-aggregate op/latency window (spec general/019). No `Option`,
+    /// Engine-aggregate op/latency window. No `Option`,
     /// no setter — always supplied at bootstrap.
     metrics: Arc<MetricsStore>,
 }
@@ -188,7 +188,7 @@ impl JsonEngine {
         self.engine.shutdown().await;
     }
 
-    // ── Domain management (spec json/003) ─────────────────────────────────────
+    // ── Domain management ─────────────────────────────────────
 
     /// Creates a new JSON domain, bypassing the control plane.
     #[cfg(test)]
@@ -252,12 +252,12 @@ impl JsonEngine {
         self.doc_write_locks[Self::shard(domain, key)].lock().await
     }
 
-    // ── Index management (spec json/004) ──────────────────────────────────────
+    // ── Index management ──────────────────────────────────────
 
     /// Creates an index definition on `field` for an existing domain.
     ///
-    /// Existing documents are NOT back-indexed here (that is re-indexing,
-    /// spec json/008); new writes pick the index up from spec json/005 on.
+    /// Existing documents are NOT back-indexed here (that is re-indexing);
+    /// new writes pick the index up immediately.
     pub async fn create_index(
         &self,
         domain: &str,
@@ -278,8 +278,8 @@ impl JsonEngine {
     }
 
     /// Like [`Self::get_indexes`], but read from the persisted definitions
-    /// visible under `snapshot` instead of the live cache (spec general/006
-    /// backup export) — index DDL during an export must not leak into the
+    /// visible under `snapshot` instead of the live cache (backup
+    /// export) — index DDL during an export must not leak into the
     /// archive that pins its documents to an earlier point in time.
     pub async fn get_indexes_with_snapshot(
         &self,
@@ -308,7 +308,7 @@ impl JsonEngine {
         Ok(())
     }
 
-    // ── Document write locks (spec json/018) ──────────────────────────────────
+    // ── Document write locks ──────────────────────────────────
 
     /// Lock shard of a document reference. Domain and key both feed the hash,
     /// so equal keys of different domains need not share a shard.
@@ -335,7 +335,7 @@ impl JsonEngine {
         guards
     }
 
-    // ── Core CRUD (spec json/002, domain-aware since json/003) ────────────────
+    // ── Core CRUD (domain-aware) ────────────────
 
     /// Stores `content` under a system-generated UUIDv4 key.
     pub async fn create_document(
@@ -420,7 +420,7 @@ impl JsonEngine {
     }
 
     /// Like [`Self::get_document`], but against an externally held snapshot
-    /// instead of one acquired internally (spec general/006 backup export) —
+    /// instead of one acquired internally (backup export) —
     /// lets the backup writer pin every document read of a domain export to
     /// the same point in time. Keys come from the engine's own scan, so they
     /// are not re-validated: a lowered key limit must not make stored
@@ -492,7 +492,7 @@ impl JsonEngine {
     }
 
     /// Like [`Self::read_stored`], but against an externally held snapshot
-    /// (spec general/006 backup export) instead of one acquired internally.
+    /// (backup export) instead of one acquired internally.
     async fn read_stored_with_snapshot(
         &self,
         dom: &JsonDomain,
@@ -512,7 +512,7 @@ impl JsonEngine {
 
     /// Persists the document plus index maintenance in ONE atomic batch:
     /// stale index entries are tombstoned, the document and the new index
-    /// entries are written (synchronous indexing, spec json/005).
+    /// entries are written (synchronous indexing).
     async fn write_document(
         &self,
         dom: &JsonDomain,
@@ -810,8 +810,8 @@ mod tests {
     // 10b. A document with a reserved top-level field smuggled in before
     //      this check existed (direct write_batch, bypassing
     //      create_document/put_document_with_version) stays readable via
-    //      get_document -- overshadowed, no new read error (spec json/017
-    //      §3 test 6; no migration/scan step for existing data).
+    //      get_document -- overshadowed, no new read error (no
+    //      migration/scan step for existing data).
     #[test]
     fn test_legacy_document_with_reserved_field_stays_readable() {
         crate::core::engine_runtime::block_on(async {
@@ -905,7 +905,7 @@ mod tests {
     }
 
     // 17. list_domains contains all domains; deleting ones carry their state
-    //     (spec json/013 supersedes the json/003 hide-behaviour).
+    //     (they are listed, not hidden).
     #[test]
     fn test_list_domains() {
         crate::core::engine_runtime::block_on(async {
@@ -1068,7 +1068,7 @@ mod tests {
         })
     }
 
-    // ── Optimistic concurrency (spec json/011) ───────────────────────────────
+    // ── Optimistic concurrency ───────────────────────────────
 
     // 30. Conditional update with the correct version succeeds; the
     //     generation stays stable across updates.
@@ -1236,11 +1236,11 @@ mod tests {
         })
     }
 
-    // ── Create-only precondition (spec json/014) ─────────────────────────────
+    // ── Create-only precondition ─────────────────────────────
 
     // 39. Two parallel create-only-PUTs on the same free key → exactly one
     //     creates, the other sees DocumentAlreadyExists; the key's write
-    //     shard serializes the race (pattern: test 33 for json/011).
+    //     shard serializes the race (same pattern as test 33).
     #[test]
     fn test_create_only_parallel_puts_single_winner() {
         crate::core::engine_runtime::block_on(async {
@@ -1277,7 +1277,7 @@ mod tests {
         })
     }
 
-    // ── Sharded document-write locks (spec json/018) ─────────────────────────
+    // ── Sharded document-write locks ─────────────────────────
 
     // 40. A held write shard blocks only keys of that shard: a put on a key
     //     of another shard runs through, one on the same shard waits.
@@ -1335,7 +1335,7 @@ mod tests {
         })
     }
 
-    // ── Synchronous indexing (spec json/005) ─────────────────────────────────
+    // ── Synchronous indexing ─────────────────────────────────
 
     async fn default_prefix(json: &JsonEngine) -> Vec<u8> {
         json.get_domain("default").unwrap().system_prefix
@@ -1552,7 +1552,7 @@ mod tests {
         })
     }
 
-    // Spec general/030 test 6: with both LSM limits at their startup lower
+    // With both LSM limits at their startup lower
     // bounds, a domain with a maximal name and a document with a 1-byte key work.
     #[test]
     fn test_lsm_limits_at_lower_bounds_still_work() {
@@ -1581,7 +1581,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/018: global lifecycle event bus ────────────────────────
+    // ── Global lifecycle event bus ────────────────────────
 
     // Test 5: create_index/delete_index publish index_created/index_dropped
     // with engine "json" and the field name as `object`.
@@ -1621,7 +1621,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/019: per-engine metrics — no double counting ───────────
+    // ── Per-engine metrics — no double counting ───────────
 
     // Test 7: put_document (-> put_document_with_version -> write_document)
     // is exactly 1 write_op; a conditional put_document_with_version (which
@@ -1633,7 +1633,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (json, _dir) = make_engine().await;
 
-            // aggregate_engine only sums fully ticked buckets (spec general/019).
+            // aggregate_engine only sums fully ticked buckets.
             let created = json.put_document("default", "k", json!({"n": 1})).await.unwrap();
             json.metrics.tick_all();
             let after_put = json.metrics.engine_metrics();

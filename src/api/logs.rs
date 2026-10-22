@@ -1,11 +1,11 @@
-//! Log Access REST handlers (spec general/005): read-only tail + file
+//! Log Access REST handlers: read-only tail + file
 //! listing over the log directory. Admin-only — `extract_domain`
 //! (`src/auth/middleware.rs`) has no match arm for `/store-api/logs*`, so
 //! non-admins get 403 from the existing auth middleware automatically.
 //!
 //! Opt-in: `AppState.log_access` is `None` unless `log.http_access = true`,
-//! in which case both handlers answer 503 (spec general/005 decision 1: a
-//! disabled feature is 503 project-wide, same as the JSON/rel/backup
+//! in which case both handlers answer 503 (a disabled feature is 503
+//! project-wide, same as the JSON/rel/backup
 //! guards). Routes are always registered so "disabled" (503) stays
 //! distinguishable from "wrong URL / old server" (404).
 
@@ -77,8 +77,8 @@ fn format_str(format: &LogFormat) -> &'static str {
     }
 }
 
-/// Resolves the log-access state or fails with 503 (spec general/005
-/// decision 1: "feature disabled" answers 503 project-wide) when
+/// Resolves the log-access state or fails with 503 ("feature disabled"
+/// answers 503 project-wide) when
 /// `log.http_access = false`.
 fn log_access_state(state: &AppState) -> Result<&LogAccessState, ApiError> {
     state.log_access.as_ref().ok_or_else(|| {
@@ -108,7 +108,7 @@ fn log_access_state(state: &AppState) -> Result<&LogAccessState, ApiError> {
     ),
     tag = "Logs"
 )]
-/// Reads the last N lines of a log file (spec general/005).
+/// Reads the last N lines of a log file.
 pub async fn get_logs(
     State(state): State<AppState>,
     Query(query): Query<LogQuery>,
@@ -174,7 +174,7 @@ pub async fn get_logs(
     ),
     tag = "Logs"
 )]
-/// Lists every `luradb.log*` file in the log directory (spec general/005).
+/// Lists every `luradb.log*` file in the log directory.
 /// `files[0]` is exactly the file `GET /logs` reads without a `file` param.
 pub async fn list_files(State(state): State<AppState>) -> Result<Json<LogFilesResponse>, ApiError> {
     let access = log_access_state(&state)?;
@@ -187,8 +187,8 @@ pub async fn list_files(State(state): State<AppState>) -> Result<Json<LogFilesRe
 // ── File listing & selection ────────────────────────────────────────────────
 
 /// Whitelist for the `file` query param: must start with `luradb.log` and
-/// stay a single path segment -- structurally excludes traversal (spec
-/// general/005 "Sicherheit"). Same prefix rule as `LogJanitor`.
+/// stay a single path segment -- structurally excludes traversal. Same
+/// prefix rule as `LogJanitor`.
 fn is_valid_file_name(name: &str) -> bool {
     name.starts_with("luradb.log") && !name.contains('/') && !name.contains('\\')
 }
@@ -230,7 +230,7 @@ struct TailResult {
 /// Reads `path` backwards in `CHUNK_SIZE` chunks, collecting up to `lines`
 /// lines (optionally only `q` substring matches), stopping at `lines`
 /// matches, the start of the file, or `MAX_SCAN_BYTES` scanned -- whichever
-/// comes first (spec general/005 "Sicherheit": resource caps). Returns
+/// comes first (resource caps). Returns
 /// lines in chronological (oldest-first) order, like `tail`.
 async fn tail_lines(path: &Path, lines: usize, q: Option<&str>) -> io::Result<TailResult> {
     // Same rule as `list_log_files`: regular files only, no symlink traversal
@@ -242,8 +242,8 @@ async fn tail_lines(path: &Path, lines: usize, q: Option<&str>) -> io::Result<Ta
     let mut file = tokio::fs::File::open(path).await?;
     let file_len = file.metadata().await?.len() as usize;
 
-    // A single trailing '\n' at EOF must not produce an empty-line artifact
-    // (spec): scan as if the file ended right before it.
+    // A single trailing '\n' at EOF must not produce an empty-line artifact:
+    // scan as if the file ended right before it.
     let mut pos = file_len;
     if pos > 0 {
         let mut last = [0u8; 1];
@@ -326,7 +326,7 @@ async fn tail_lines(path: &Path, lines: usize, q: Option<&str>) -> io::Result<Ta
 }
 
 /// Byte-buffer-to-line UTF-8 conversion happens per assembled line, never
-/// per chunk (spec: chunk boundaries must not split multi-byte sequences).
+/// per chunk (chunk boundaries must not split multi-byte sequences).
 fn push_if_match(bytes: &[u8], q: Option<&str>, out: &mut Vec<String>) {
     let line = String::from_utf8_lossy(bytes).into_owned();
     let matches = match q {

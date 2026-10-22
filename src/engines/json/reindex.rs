@@ -1,4 +1,4 @@
-//! Re-indexing of existing documents (spec json/008).
+//! Re-indexing of existing documents.
 //!
 //! Runs as a background task: scans all documents of a domain and writes
 //! missing index entries in throttled batches. Idempotent — existing entries
@@ -129,7 +129,7 @@ impl JsonEngine {
         let total = keys.len() as u64;
         self.set_running_status(task_id, dom, 0, total);
 
-        // One yield per chunk — the chunk itself is bounded (spec perf/017 A2).
+        // One yield per chunk — the chunk itself is bounded.
         let mut coop = YieldEvery::new(1);
         for chunk in keys.chunks(self.reindex_batch_size) {
             coop.tick().await;

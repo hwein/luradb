@@ -254,7 +254,7 @@ async fn hello_handler(message: String) -> Json<Value> {
     Json(json!({ "message": message }))
 }
 
-/// The frontend router (spec perf/018a A2): Swagger and the hello route are
+/// The frontend router: Swagger and the hello route are
 /// answered here; everything else passes the frontend layers into the bridge.
 /// The frontend knows no single API route.
 fn build_router(
@@ -267,11 +267,11 @@ fn build_router(
 
     if cfg.server.swagger_enabled {
         // Swagger UI is registered here, not inside api::create_router, so it
-        // needs its own auth layer (spec general/014) — the general/009
-        // router-contract gate would otherwise trip on docs routes with no
-        // contract entry. `docs_auth_layer` wraps this whole sub-router, so
-        // every path SwaggerUi registers under `swagger_url` (index, redirect,
-        // static assets) is covered without listing them individually.
+        // needs its own auth layer — the router-contract gate would
+        // otherwise trip on docs routes with no contract entry.
+        // `docs_auth_layer` wraps this whole sub-router, so every path
+        // SwaggerUi registers under `swagger_url` (index, redirect, static
+        // assets) is covered without listing them individually.
         let mut docs_router = Router::new().merge(
             SwaggerUi::new(cfg.server.swagger_url.clone())
                 .url("/api-docs/openapi.json", ApiDoc::openapi()),
@@ -291,7 +291,7 @@ fn build_router(
     let auth = cfg.auth.enabled.then_some(auth_cache);
     app = app.fallback_service(api::frontend_layers(bridge, auth, trusted_cidrs));
 
-    // Outermost layer (spec general/020 §Platzierung): runs before auth on
+    // Outermost layer: runs before auth on
     // every request, including Swagger/hello above, which live outside
     // create_router and would otherwise miss it.
     if let Some(cors) = cors::build_layer(&cfg.cors) {
@@ -307,7 +307,7 @@ fn build_router(
 }
 
 /// Connection builder of every listener. HTTP/2 serves one stream at a time
-/// per connection, so requests on a connection keep their order (A4);
+/// per connection, so requests on a connection keep their order;
 /// clients get parallelism from several connections.
 fn connection_builder() -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -318,7 +318,7 @@ fn connection_builder() -> auto::Builder<TokioExecutor> {
 /// Serves one accepted connection of any listener until it ends, or until
 /// `shutdown` flips — then hyper closes it gracefully (GOAWAY on h2,
 /// `Connection: close` on HTTP/1.1) and an in-flight request still finishes,
-/// instead of the drain having to wait out its cap (A6). `extend` adds the
+/// instead of the drain having to wait out its cap. `extend` adds the
 /// listener's connection info to every request.
 pub(crate) async fn serve_connection<I, F>(
     io: I,
@@ -620,7 +620,7 @@ mod tests {
         (state, dir)
     }
 
-    // Test 10 (spec general/020 §Tests): the CorsLayer must sit outside both
+    // The CorsLayer must sit outside both
     // the frontend auth_layer AND the Swagger sub-router's docs_auth_layer.
     // Regression-critical: if the layer moved inward (e.g. into
     // create_router), a request to the Swagger docs route would never reach
@@ -681,7 +681,7 @@ mod tests {
         })
     }
 
-    // A2/A3: auth runs on the frontend, in front of the bridge — the engine
+    // Auth runs on the frontend, in front of the bridge — the engine
     // router behind it carries no auth layer of its own, so a 401 here can
     // only come from the frontend router.
     #[test]
@@ -2200,7 +2200,7 @@ mod tests {
         }
     }
 
-    // Test 8 (A7): a read still running at shutdown — answered, its request
+    // A read still running at shutdown — answered, its request
     // with the engine sender it carried already gone — ends with the reader
     // pool, and only then does the engine shut down: when the read is
     // dropped, the engine loop still runs.

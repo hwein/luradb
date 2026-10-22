@@ -1,11 +1,11 @@
-//! Binder for LuraSQL (spec rel/004 §5-6, §8).
+//! Binder for LuraSQL.
 //!
 //! Two statement-independent front-end checks run for every class:
-//! parameter-count matching and the NULL-bind guard (§6). DDL (table/index)
+//! parameter-count matching and the NULL-bind guard. DDL (table/index)
 //! then gets a full AST → catalog-input translation, ready for `ddl.rs` to
 //! hand straight to `RelCatalog`'s self-validating primitives — those
 //! primitives remain the single source of truth for schema/constraint/limit
-//! checks, exactly like rel/003's `create_table` already works; duplicating
+//! checks, exactly like the catalog's `create_table` already works; duplicating
 //! that validation here would drift out of sync with it. `AstColumnDef` is
 //! translated into a `catalog::ColumnInput` here per its own doc comment.
 //! Every other class passes the two front-end checks and is returned as
@@ -31,7 +31,7 @@ use serde_json::Value;
 pub enum BoundStatement {
     Ddl(DdlPlan),
     Pending {
-        /// Surfaced for rel/011's two-stage auth enforcement.
+        /// Surfaced for the two-stage auth enforcement.
         #[allow(dead_code)]
         class: StatementClass,
         stmt: Statement,
@@ -97,7 +97,7 @@ pub fn bind(
     })
 }
 
-// ── NULL-bind guard (spec rel/004 §6) ───────────────────────────────────────────
+// ── NULL-bind guard ───────────────────────────────────────────
 //
 // Walks WHERE expression trees only — the only place `Expr` occurs in the AST
 // (a `JOIN ... ON` is always `column_ref = column_ref`, never a general
@@ -298,7 +298,7 @@ mod tests {
         assert!(matches!(err, RelStoreError::NullComparison { .. }), "got: {err}");
     }
 
-    // 004-F1 (binder path): an over-deep WHERE tree fed straight to `bind`
+    // Depth guard (binder path): an over-deep WHERE tree fed straight to `bind`
     // (bypassing the parser's own cap) yields a clean Syntax error instead of a
     // stack-overflow abort in the null guard.
     #[test]

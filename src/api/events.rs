@@ -1,4 +1,4 @@
-//! Global lifecycle/DDL event stream (spec general/018).
+//! Global lifecycle/DDL event stream.
 //!
 //! GET /store-api/events → get_events (SSE stream, admin-only — see auth::middleware::extract_domain:
 //! a path with no `{domain}` segment is admin-only, no auth code needed here)
@@ -24,15 +24,15 @@ use tokio::sync::broadcast;
 pub struct EventsParams {
     /// Fallback resume id for callers that cannot set headers (e.g. `curl`,
     /// or a `fetch`-based reader); the `Last-Event-ID` header wins when both
-    /// are present (spec general/018 §5, kv/024 §4.1).
+    /// are present.
     pub last_event_id: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolves the effective `Last-Event-ID` (spec general/018 §5, kv/024
-/// §4.1): the header — what a native `EventSource`'s auto-reconnect sets —
-/// wins when both the header and `?last_event_id=` are present.
+/// Resolves the effective `Last-Event-ID`: the header — what a native
+/// `EventSource`'s auto-reconnect sets — wins when both the header and
+/// `?last_event_id=` are present.
 fn resolve_last_event_id(headers: &HeaderMap, params: &EventsParams) -> Option<String> {
     headers
         .get("last-event-id")
@@ -41,7 +41,7 @@ fn resolve_last_event_id(headers: &HeaderMap, params: &EventsParams) -> Option<S
         .or_else(|| params.last_event_id.clone())
 }
 
-/// A decided SSE item, before axum-specific rendering (kv/024 pattern: kept
+/// A decided SSE item, before axum-specific rendering (KV watch pattern: kept
 /// as plain data so the decision logic is unit-testable without depending on
 /// `Event`'s internal representation, which exposes no accessors of its own).
 struct SseItem {
@@ -59,7 +59,7 @@ fn global_event_item(event: &GlobalEvent, epoch: u64) -> SseItem {
     SseItem { id: format_event_id(EVENTS_TAG, epoch, event.seq), event: event.kind, data }
 }
 
-/// Builds `event: reset` (spec general/018 §5, kv/024 §5): `id:` carries the
+/// Builds `event: reset`: `id:` carries the
 /// current sequence head, so a reconnect right after a reset resumes
 /// gaplessly from there.
 fn reset_item(reason: ResetReason, epoch: u64, head: u64) -> SseItem {
@@ -74,12 +74,12 @@ enum EventStep {
     Stop,
 }
 
-/// Maps one raw bus receive to a live-stream outcome (spec general/018 §5,
-/// kv/024 §4.3/§6). Unlike kv/024's per-domain `watch_item`, there is no
-/// relay task and no domain/prefix filter here (§5: the handler subscribes to
-/// the bus directly) — so there is no `Gap` message, only the receiver's own
-/// `Lagged`, mapped straight to `reset(lagged)`, never a silent `continue`.
-/// Pure (no I/O), so every branch is unit-testable without real timing.
+/// Maps one raw bus receive to a live-stream outcome. Unlike the KV watch's
+/// per-domain `watch_item`, there is no relay task and no domain/prefix
+/// filter here (the handler subscribes to the bus directly) — so there is
+/// no `Gap` message, only the receiver's own `Lagged`, mapped straight to
+/// `reset(lagged)`, never a silent `continue`. Pure (no I/O), so every
+/// branch is unit-testable without real timing.
 fn global_live_item(
     msg: Result<GlobalEvent, broadcast::error::RecvError>,
     epoch: u64,
@@ -119,7 +119,7 @@ fn global_live_item(
 /// Opens a Server-Sent Events stream of global lifecycle/DDL events: domains created, deleted and
 /// purged across all three engines, plus relational table/view/index DDL and JSON index DDL.
 /// Admin-only — the path carries no domain segment, so the standard auth middleware rejects any
-/// non-admin caller (spec general/018 §3).
+/// non-admin caller.
 ///
 /// A `Last-Event-ID` (header or `?last_event_id=`, header wins) resumes gaplessly from an in-memory
 /// replay ring when possible; otherwise the server emits `event: reset` before continuing live. This
@@ -133,7 +133,7 @@ pub async fn get_events(
     let last_event_id = resolve_last_event_id(&headers, &params);
     let epoch = stream_epoch(CONTROL_PLANE_SHARD);
 
-    // subscribe() before the ring snapshot (spec §5, kv/024 §4.3): nothing
+    // subscribe() before the ring snapshot: nothing
     // published between them can be lost — only re-delivered, which the live
     // loop below discards via `suppress_upto`.
     let bus = Arc::clone(state.control.event_bus());
@@ -330,7 +330,7 @@ mod tests {
     }
 
     // Test 6: no key -> 401; valid non-admin key -> 403; admin key -> 200
-    // with text/event-stream. Pins the path-shape admin-only property (§3).
+    // with text/event-stream. Pins the path-shape admin-only property.
     #[test]
     fn test_auth_no_key_401_non_admin_403_admin_200() {
         crate::core::engine_runtime::block_on(async {
@@ -433,7 +433,7 @@ mod tests {
     }
 
     // Test 7: disconnect after event 3, reconnect with its id -> exactly the
-    // following events, no reset. Connects (Resume::Live, spec §5) *before*
+    // following events, no reset. Connects (Resume::Live) *before*
     // the writes happen -- with no id presented, only events published after
     // the subscribe are ever seen, exactly as for a fresh domain watch.
     #[test]
@@ -627,7 +627,7 @@ mod tests {
         })
     }
 
-    // Test 11: a watch id (kv/024's "w") at /store-api/events -> reset(unknown_id).
+    // Test 11: a watch id (the KV watch's "w") at /store-api/events -> reset(unknown_id).
     #[test]
     fn test_foreign_watch_tag_is_unknown_id() {
         crate::core::engine_runtime::block_on(async {

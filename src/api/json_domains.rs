@@ -1,4 +1,4 @@
-//! JSON-domain REST handlers (spec json/009).
+//! JSON-domain REST handlers.
 //!
 //! POST   /store-api/json/domains          → create_domain  (201 | 409 | 400)
 //! GET    /store-api/json/domains          → list_domains   (200)

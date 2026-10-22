@@ -314,12 +314,12 @@ mod tests {
         assert_eq!(m.read_latency_us_p99, 50);
         // P99 with 100 samples target = ceil(100*99/100) = 99 → cumulative at bucket 1 = 99 ≥ 99.
         // So P99 midpoint = 50 µs (< 100 µs bucket).
-        // The spec says "P99 in the range [100 µs, 1 ms]" but with midpoint approximation
-        // the 99th sample lands at the boundary of bucket 1. This is acceptable given
-        // the approximation disclaimer in the spec.
+        // An exact P99 would lie in [100 µs, 1 ms], but with midpoint approximation
+        // the 99th sample lands at the boundary of bucket 1. This is acceptable, as
+        // percentiles are approximate by design.
     }
 
-    // Spec general/019 test 1: write latency used to be discarded
+    // Write latency used to be discarded
     // (`record_write(&self, _latency_us: u64)`); it must now be bucketed.
     #[test]
     fn write_latency_is_bucketed() {
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(m.write_latency_us_p50, 50);
     }
 
-    // Spec general/019 test 2: p95/p99 over a 95/5 split (bucket midpoints).
+    // p95/p99 over a 95/5 split (bucket midpoints).
     #[test]
     fn p95_p99_engine_approximation() {
         let w = MetricsWindow::new(60);

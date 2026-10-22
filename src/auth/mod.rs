@@ -60,8 +60,8 @@ pub enum UserRole {
     User,
 }
 
-/// Ordered Read < Write < Ddl (derive order = declaration order, spec
-/// rel/011 §3) — a higher grant covers the lower ones (`granted >= required`).
+/// Ordered Read < Write < Ddl (derive order = declaration order) — a
+/// higher grant covers the lower ones (`granted >= required`).
 /// Adding `Ddl` is wire-compatible: existing persisted `"Read"`/`"Write"`
 /// values deserialize unchanged, no migration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -363,8 +363,8 @@ mod tests {
             assert_eq!(serde_json::to_string(&level).unwrap(), wire);
             assert_eq!(serde_json::from_str::<AccessLevel>(wire).unwrap(), level);
         }
-        // Pre-rel/011 persisted entries only ever contain "Read"/"Write" —
-        // must deserialize unchanged (no migration, spec §3).
+        // Entries persisted before `Ddl` existed only contain "Read"/"Write" —
+        // must deserialize unchanged (no migration).
         assert_eq!(serde_json::from_str::<AccessLevel>("\"Write\"").unwrap(), AccessLevel::Write);
     }
 

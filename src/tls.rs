@@ -1,4 +1,4 @@
-//! Native TLS listener (spec general/011).
+//! Native TLS listener.
 //!
 //! Serves the same Axum router as the plain TCP listener, over TLS on a
 //! separate port. Accept-loop pattern mirrors `src/uds.rs`: `TcpListener::
@@ -227,7 +227,7 @@ mod tests {
 
     // Full accept-loop roundtrip (HTTP/1.1 request/response over TLS), plus
     // proof that ALPN can negotiate both protocol strings the listener
-    // offers (spec general/011 Tests: "ALPN-Verhandlung h2 und http/1.1").
+    // offers (h2 and http/1.1).
     #[tokio::test]
     async fn test_tls_e2e_roundtrip_and_alpn() {
         let acceptor = load_tls_acceptor(&fixture_cert_path(), &fixture_key_path()).unwrap();
@@ -269,7 +269,7 @@ mod tests {
     }
 
     // HTTP and HTTPS must serve the same router at the same time, each on
-    // its own port (spec general/011 Tests: "Parallelbetrieb").
+    // its own port.
     #[tokio::test]
     async fn test_tls_and_plain_http_serve_concurrently() {
         let acceptor = load_tls_acceptor(&fixture_cert_path(), &fixture_key_path()).unwrap();

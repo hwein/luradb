@@ -61,13 +61,13 @@ pub struct ShmDomainIndex {
 pub struct ShmEntry {
     /// User key (domain prefix stripped).
     pub key: Vec<u8>,
-    /// Inline value bytes; empty when `is_vlog_pointer` (spec §1 approach a).
+    /// Inline value bytes; empty when `is_vlog_pointer`.
     pub value: Vec<u8>,
     /// Unix seconds after which the entry expires; 0 = no expiry.
     pub expire_at: u64,
     /// Value lives in the VLog (`value` empty); client falls back to a GET.
     pub is_vlog_pointer: bool,
-    /// Key exists in the explicit NULL state (spec kv/018): `value` empty,
+    /// Key exists in the explicit NULL state: `value` empty,
     /// never a VLog pointer.
     pub is_null: bool,
 }
@@ -254,7 +254,7 @@ fn collect_domain_entries(
 }
 
 /// Builds an entry, flagging VLog-backed values (empty `value`, client falls
-/// back to a GET), NULL keys (kv/018), and inline values.
+/// back to a GET), NULL keys, and inline values.
 fn to_entry(user_key: Vec<u8>, meta: ValueWithMetadata) -> ShmEntry {
     let (value, is_vlog_pointer) =
         if meta.from_vlog { (Vec::new(), true) } else { (meta.data, false) };
@@ -842,7 +842,7 @@ mod tests {
         })
     }
 
-    // kv/018: a NULL key exists in the snapshot, marked is_null, empty value.
+    // A NULL key exists in the snapshot, marked is_null, empty value.
     #[test]
     fn test_build_null_key_included_and_flagged() {
         crate::core::engine_runtime::block_on(async {
@@ -1015,7 +1015,7 @@ mod tests {
             let (_, registry, fx) = make_setup().await;
             let store = registry.default_store().await.unwrap();
             store.put(b"stays", b"v").await.unwrap();
-            // Already expired regardless of the wall clock (spec general/033).
+            // Already expired regardless of the wall clock.
             store.put_expired_for_test(b"gone", b"v").await.unwrap();
 
             let snap = decode(&builder(&fx, 1 << 20).build().await.unwrap().bytes);
@@ -1057,7 +1057,7 @@ mod tests {
         })
     }
 
-    // Spec perf/012 test 10: the livelock guard's counting logic — warn on every
+    // The livelock guard's counting logic — warn on every
     // K-th consecutive skip, report and reset the run on the next publish.
     #[test]
     fn test_skip_tracker_warns_every_k_and_resets() {
@@ -1124,7 +1124,7 @@ mod tests {
         })
     }
 
-    // ── Spec perf/028: publisher step ─────────────────────────────────────────────
+    // ── Publisher step ─────────────────────────────────────────────
 
     const ARENA_LEN: usize = 1 << 20;
 
@@ -1240,7 +1240,7 @@ mod tests {
         find(snap, "default")?.entries.iter().find(|e| e.key == key)
     }
 
-    // Spec perf/028 test 1: without a write, the next step is idle — no build,
+    // Without a write, the next step is idle — no build,
     // no flip.
     #[test]
     fn test_step_without_write_is_idle() {
@@ -1256,7 +1256,7 @@ mod tests {
         })
     }
 
-    // Spec perf/028 test 6: an idle step confirms the unchanged snapshot by
+    // An idle step confirms the unchanged snapshot by
     // refreshing `last_update_ns`; `version` stays.
     #[test]
     fn test_idle_step_refreshes_last_update_ns() {
@@ -1274,7 +1274,7 @@ mod tests {
         })
     }
 
-    // Spec perf/028 test 2: a write between two steps makes the second one
+    // A write between two steps makes the second one
     // rebuild, and the new value is in the snapshot.
     #[test]
     fn test_step_after_write_rebuilds_with_new_value() {
@@ -1295,7 +1295,7 @@ mod tests {
         snap.domains.iter().map(|d| d.name.as_str()).collect()
     }
 
-    // Spec perf/028 test 3: creating and then deleting a domain each make the
+    // Creating and then deleting a domain each make the
     // next step rebuild with the matching domain list.
     #[test]
     fn test_step_after_domain_create_and_delete_rebuilds() {
@@ -1315,7 +1315,7 @@ mod tests {
         })
     }
 
-    // Spec perf/028 test 5: a skipped publish keeps the comparison state, so
+    // A skipped publish keeps the comparison state, so
     // the next step rebuilds without a write and publishes once the pin is gone.
     #[test]
     fn test_step_after_skipped_publish_rebuilds_without_write() {
@@ -1341,7 +1341,7 @@ mod tests {
         })
     }
 
-    // Spec perf/028 test 4, trigger: the step idles before the earliest
+    // Expiry trigger: the step idles before the earliest
     // published `expire_at` and rebuilds from it on. Stamps an hour out keep
     // every entry published, so only the step time decides.
     #[test]
@@ -1362,7 +1362,7 @@ mod tests {
         })
     }
 
-    // Spec perf/028 test 4, removal: once the wall clock reached the stamp, the
+    // Expiry removal: once the wall clock reached the stamp, the
     // step at that time drops the expired entry.
     #[test]
     fn test_step_at_expiry_drops_the_expired_entry() {

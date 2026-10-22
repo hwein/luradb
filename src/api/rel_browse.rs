@@ -1,4 +1,4 @@
-//! Catalog/Row-Browse + Row-Write REST handlers (spec rel/010).
+//! Catalog/Row-Browse + Row-Write REST handlers.
 //!
 //! GET  /store-api/rel/{domain}/tables            -> list_tables
 //! GET  /store-api/rel/{domain}/tables/{t}         -> get_table
@@ -10,12 +10,12 @@
 //! DELETE /store-api/rel/{domain}/tables/{t}/rows/{pk} -> delete_row
 //! GET  /store-api/rel/{domain}/tables/{t}/count    -> count_rows
 //!
-//! All eight compile onto the existing rel/005 (DML) / rel/006 (SELECT)
+//! All eight compile onto the existing DML / SELECT
 //! bound plans (`RelEngine::{browse_rows,get_row,insert_row,update_row,
 //! delete_row}`, `src/engines/rel/rest_browse.rs`/`rest_write.rs`) — no
-//! second query/write path. Auth is path-/method-based only (rel/011, not
-//! built here); `rel_engine(&state)?` + a rate-limit charge guard every
-//! handler, matching rel/009's `/sql` handler.
+//! second query/write path. Auth is path-/method-based only (middleware,
+//! not built here); `rel_engine(&state)?` + a rate-limit charge guard every
+//! handler, matching the `/sql` handler.
 
 use crate::api::rel::{column_type_name, compute_link_auth, dml_result_json, rel_engine};
 use crate::api::{middleware::ApiError, AppState, CountResponse};
@@ -33,7 +33,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
-/// Charges one op against the domain's rate-limit budget (spec §8) before
+/// Charges one op against the domain's rate-limit budget before
 /// any engine I/O. There is no SQL statement to classify here (unlike
 /// `/sql`'s `execute_sql`), so the HTTP method alone decides the bucket:
 /// GET -> read, POST/PUT/DELETE -> write.
@@ -46,7 +46,7 @@ fn check_budget(engine: &RelEngine, state: &AppState, domain: &str, write: bool)
     }
 }
 
-// ── Catalog Browsing (spec §2) ───────────────────────────────────────────────
+// ── Catalog Browsing ─────────────────────────────────────────────────────────
 
 #[derive(Serialize, ToSchema)]
 pub struct TableLinks {
@@ -109,7 +109,7 @@ fn table_links(domain: &str, name: &str) -> TableLinks {
 }
 
 /// `None` -> field omitted (no DEFAULT clause); the other three cases are
-/// distinguishable JSON shapes (spec §2).
+/// distinguishable JSON shapes.
 fn default_to_json(d: &DefaultValue) -> Option<Value> {
     match d {
         DefaultValue::None => None,
@@ -242,13 +242,13 @@ pub async fn list_views(
     Ok(Json(out))
 }
 
-// ── Row-Browse (spec §3/§4/§6) ───────────────────────────────────────────────
+// ── Row-Browse ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize, ToSchema)]
 pub struct RowsResponse {
     /// One JSON object per row (catalog column order in principle; `serde_json`'s
     /// default map is unordered/alphabetical here, see rel_browse.rs module docs),
-    /// with an optional `_expanded` block (spec §6).
+    /// with an optional `_expanded` block.
     #[schema(value_type = Vec<Object>)]
     pub rows: Vec<Value>,
     pub row_count: usize,
@@ -277,7 +277,7 @@ fn parse_expand_param(params: &HashMap<String, String>) -> Vec<String> {
 }
 
 /// One row as a JSON object: `{column: scalar_to_json(value), …}`, plus a
-/// transposed `_expanded` block (spec §6) — the column-wise `ExpandedBlock`
+/// transposed `_expanded` block — the column-wise `ExpandedBlock`
 /// holds one resolved value per row, in row order; this picks out row
 /// `row_idx`'s entry for every resolved column.
 fn row_to_object(
@@ -300,7 +300,7 @@ fn row_to_object(
     Value::Object(obj)
 }
 
-/// Handler-side 413 guard (spec §7), checked *after* serialization — the
+/// Handler-side 413 guard, checked *after* serialization — the
 /// same KISS pattern as `/sql` (rel.rs), especially relevant for expand
 /// fan-out whose size isn't known ahead of time.
 fn enforce_response_size(engine: &RelEngine, value: &Value) -> Result<(), ApiError> {
@@ -474,11 +474,11 @@ pub async fn count_rows(
     Ok(Json(CountResponse { count }))
 }
 
-// ── Row-Writes (spec §5) ─────────────────────────────────────────────────────
+// ── Row-Writes ───────────────────────────────────────────────────────────────
 
-/// PK value for the `Location` header's final path segment (spec §5):
+/// PK value for the `Location` header's final path segment:
 /// INTEGER as plain decimal, TEXT percent-encoded (it may contain `/`,
-/// spaces, non-ASCII, …). The PK is always INTEGER or TEXT (rel/003 §4).
+/// spaces, non-ASCII, …). The PK is always INTEGER or TEXT.
 fn pk_path_segment(pk: &ScalarValue) -> String {
     match pk {
         ScalarValue::Integer(i) => i.to_string(),
@@ -509,7 +509,7 @@ fn percent_encode_path_segment(s: &str) -> String {
     responses(
         (status = 201, description = "Row inserted", body = Object),
         (status = 400, description = "NOT NULL/type/schema violation", body = String, content_type = "text/plain"),
-        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)", body = String, content_type = "text/plain"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain, table, or referenced body column not found", body = String, content_type = "text/plain"),
         (status = 409, description = "PK collision, unique violation, or missing REFERENCES target", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
@@ -519,8 +519,8 @@ fn percent_encode_path_segment(s: &str) -> String {
     tag = "Relational Rows"
 )]
 /// Inserts one row from a JSON object body (`{column: value, …}`). An omitted
-/// AUTOINCREMENT primary key is assigned the next sequence value (rel/005
-/// §9); this compiles onto the exact same bound INSERT plan `/sql` would use.
+/// AUTOINCREMENT primary key is assigned the next sequence value; this
+/// compiles onto the exact same bound INSERT plan `/sql` would use.
 pub async fn insert_row(
     State(state): State<AppState>,
     Path((domain, table)): Path<(String, String)>,
@@ -540,7 +540,7 @@ pub async fn insert_row(
     .await;
 
     let result = engine.insert_row(&domain, &table, &body, link_auth).await?;
-    let pk = result.last_pk.as_ref().expect("single-row INSERT always yields last_pk (rel/005 §9)");
+    let pk = result.last_pk.as_ref().expect("single-row INSERT always yields last_pk");
     let location = format!("/store-api/rel/{domain}/tables/{table}/rows/{}", pk_path_segment(pk));
     Ok((StatusCode::CREATED, [(header::LOCATION, location)], Json(dml_result_json(&result))).into_response())
 }
@@ -557,7 +557,7 @@ pub async fn insert_row(
     responses(
         (status = 200, description = "Row updated", body = Object),
         (status = 400, description = "NOT NULL/type/schema violation, or body primary key != path primary key", body = String, content_type = "text/plain"),
-        (status = 403, description = "Missing read access to a linked KV/JSON domain (rel/016)", body = String, content_type = "text/plain"),
+        (status = 403, description = "Missing read access to a linked KV/JSON domain", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain, table, column, or row not found", body = String, content_type = "text/plain"),
         (status = 409, description = "Unique violation, or missing REFERENCES target", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
@@ -567,7 +567,7 @@ pub async fn insert_row(
     tag = "Relational Rows"
 )]
 /// Partially updates a row by primary key: only the columns named in the
-/// body are set, everything else stays unchanged (spec §5). Not an upsert —
+/// body are set, everything else stays unchanged. Not an upsert —
 /// a PK the table doesn't have answers 404, never a create.
 pub async fn update_row(
     State(state): State<AppState>,
@@ -613,7 +613,7 @@ pub async fn update_row(
     tag = "Relational Rows"
 )]
 /// Deletes a row by primary key. Hanging REFERENCES from other tables are
-/// not blocked by this (rel/005 §11) — they resolve to `null` afterwards.
+/// not blocked by this — they resolve to `null` afterwards.
 pub async fn delete_row(
     State(state): State<AppState>,
     Path((domain, table, pk)): Path<(String, String, String)>,
@@ -787,7 +787,7 @@ mod tests {
     }
 
     /// `orders.customer_id` REFERENCES `customers`; order 3's customer is
-    /// deleted afterward, leaving a genuine hanging link (mirrors rel/009's
+    /// deleted afterward, leaving a genuine hanging link (mirrors rel.rs's
     /// own `setup_orders` fixture).
     async fn setup_customers_orders(app: &axum::Router) {
         sql(app, "default", r#"{"sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)"}"#).await;
@@ -999,7 +999,7 @@ mod tests {
     }
 
     // 5. expand=*: every projected link column resolved — REFERENCES *and*
-    //    KVREF/JSONREF (rel/012 no longer skips them); _expanded omitted where
+    //    KVREF/JSONREF (no longer skipped); _expanded omitted where
     //    a table has no link columns at all.
     #[test]
     fn test_browse_rows_expand_wildcard() {
@@ -1315,7 +1315,7 @@ mod tests {
 
     // 14. Error mapping: one case each of 400/404/409 via Browse/Row
     //     endpoints (413/429 covered by their own dedicated tests above) —
-    //     no new engine variant, all via the existing rel/009 match.
+    //     no new engine variant, all via the existing rel.rs match.
     #[test]
     fn test_error_mapping_status_classes() {
         crate::core::engine_runtime::block_on(async {
@@ -1400,7 +1400,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/017: rel object-count endpoint ──────────────────────────
+    // ── Rel object-count endpoint ────────────────────────────────────────────
 
     // Test 6: empty table -> 0; after 3 INSERT -> 3; after 1 DELETE -> 2.
     #[test]

@@ -31,7 +31,7 @@ pub enum DdlOutcome {
     /// `renamed_from` is `Some(old_name)` only for `RENAME TABLE` (filled
     /// solely in the `DdlPlan::RenameTable` arm below) — the global event
     /// stream needs it to publish the vanished old name as its own
-    /// `table_dropped` event (spec general/018 §2.1); the three column-DDL
+    /// `table_dropped` event; the three column-DDL
     /// arms (`ADD`/`DROP`/`RENAME COLUMN`) leave it `None`.
     TableAltered { schema: TableSchema, renamed_from: Option<String> },
     TableDropped { name: String },
@@ -111,7 +111,7 @@ pub async fn execute(
         // dispatched directly by `RelEngine::execute` since it needs the LSM
         // engine and the per-table write lock, which this executor lacks.
         DdlPlan::CreateIndex { .. } => {
-            unreachable!("CREATE INDEX is dispatched to execute_create_index (spec rel/005 §13)")
+            unreachable!("CREATE INDEX is dispatched to execute_create_index")
         }
         DdlPlan::DropIndex { name } => {
             catalog.drop_index(domains, domain, &name).await?;
@@ -121,7 +121,7 @@ pub async fn execute(
     }
 }
 
-/// Executes `CREATE [UNIQUE] INDEX` with row backfill (spec rel/005 §13).
+/// Executes `CREATE [UNIQUE] INDEX` with row backfill.
 ///
 /// Order is load-bearing: (0) reserve the `index_id` and durably commit the id
 /// counter first; (1-3) under the table write lock + a snapshot, scan/decode
@@ -149,7 +149,7 @@ pub async fn execute_create_index(
     let prefix = &dom.system_prefix;
     // Frees the reserved index id if the backfill below aborts (KeyTooLong /
     // UniqueViolation / scan error) so its orphaned IDX bytes get reaped by the
-    // rel/013 sweep; the success path disarms it after commit (rel/013 F1).
+    // orphan sweep; the success path disarms it after commit.
     let reservation = catalog.index_reservation_guard(prefix, meta.index_id);
     let col = schema
         .columns
@@ -202,7 +202,7 @@ pub async fn execute_create_index(
     Ok(DdlOutcome::IndexCreated(meta))
 }
 
-/// `DROP TABLE` on a missing name surfaces as `TableNotFound` (rel/003's
+/// `DROP TABLE` on a missing name surfaces as `TableNotFound` (the catalog's
 /// generic drop reports the neutral `ObjectNotFound`): from `DROP TABLE`'s
 /// point of view there is no table by that name. The "it's a view" case is
 /// caught atomically inside `drop_object_checked` (see the `DropTable` arm),
@@ -347,7 +347,7 @@ mod tests {
         })
     }
 
-    // Spec general/018 §2.1: RENAME TABLE fills `renamed_from` with the old
+    // RENAME TABLE fills `renamed_from` with the old
     // name (needed to publish it as a `table_dropped` event); every other
     // ALTER TABLE variant leaves it `None`.
     #[test]

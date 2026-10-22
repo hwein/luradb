@@ -1,4 +1,4 @@
-//! `/sql` REST handler + `RelStoreError` → HTTP mapping (spec rel/009).
+//! `/sql` REST handler + `RelStoreError` → HTTP mapping.
 //!
 //! POST /store-api/rel/{domain}/sql — executes exactly one LuraSQL statement
 //! (200 | 400 | 404 | 409 | 410 | 413 | 429 | 503).
@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-// ── Error mapping (spec rel/009 §8) ──────────────────────────────────────────
+// ── Error mapping ────────────────────────────────────────────────────────────
 
 impl From<RelStoreError> for ApiError {
     fn from(e: RelStoreError) -> Self {
@@ -71,17 +71,16 @@ impl From<RelStoreError> for ApiError {
             | RelStoreError::ViewDependencyConflict { .. }
             | RelStoreError::CrossEngineTargetUnavailable { .. }
             | RelStoreError::CrossEngineLinkMissing { .. } => StatusCode::CONFLICT,
-            // 403 — missing read access to a cross-engine link's target domain
-            // (rel/016), rejected before the existence check that would
-            // otherwise 409.
+            // 403 — missing read access to a cross-engine link's target domain,
+            // rejected before the existence check that would otherwise 409.
             RelStoreError::CrossEngineForbidden { .. } => StatusCode::FORBIDDEN,
-            // 410 — domain marked for deletion (rel/013 purges it later).
+            // 410 — domain marked for deletion (a background purge follows).
             RelStoreError::DomainDeleting(_) => StatusCode::GONE,
-            // 429 — per-domain request budget exhausted (rel/009 §7).
+            // 429 — per-domain request budget exhausted.
             RelStoreError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             // 500 — practically-unreachable resource exhaustion, or a wrapped
-            // serialization/storage error (spec's "any otherwise
-            // unclassified variant").
+            // serialization/storage error (any otherwise unclassified
+            // variant).
             RelStoreError::IdSpaceExhausted(_)
             | RelStoreError::SerializationError(_)
             | RelStoreError::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,7 +90,7 @@ impl From<RelStoreError> for ApiError {
 }
 
 /// Resolves the rel engine or fails with 503 when `rel.enabled = false`. With
-/// conditional router registration (`create_router`, spec §1) the rel routes
+/// conditional router registration (`create_router`) the rel routes
 /// don't even exist in that case, so this never actually fires in normal
 /// operation — kept as a defensive guard (parity with `json_engine`) in case
 /// a path is ever reachable while `rel_engine` is `None`.
@@ -104,12 +103,12 @@ pub(crate) fn rel_engine(state: &AppState) -> Result<&Arc<RelEngine>, ApiError> 
     })
 }
 
-/// Builds the cross-engine `LinkAuth` for one rel request (spec rel/016):
+/// Builds the cross-engine `LinkAuth` for one rel request:
 /// auth disabled, or an admin/trusted-peer `AuthOutcome::Full`, gets
 /// unrestricted access. A Scoped user's KV/JSON read rights are looked up
 /// against the same-named `{domain}` (bare KV namespace) / `json:{domain}`
 /// permission entries — the same domain-per-engine split the middleware
-/// already enforces elsewhere (spec rel/012 §Kontext). Fail-closed (both
+/// already enforces elsewhere. Fail-closed (both
 /// `false`) if auth is on but the outcome/user extension is unexpectedly
 /// missing — a middleware bug must never grant silent access.
 pub(crate) async fn compute_link_auth(
@@ -144,23 +143,23 @@ pub(crate) async fn compute_link_auth(
 
 #[derive(Deserialize, ToSchema)]
 pub struct SqlRequest {
-    /// Exactly one LuraSQL statement (more → 400 `MultipleStatements`, rel/004).
+    /// Exactly one LuraSQL statement (more → 400 `MultipleStatements`).
     pub sql: String,
-    /// Positional parameters (JSON array), bound to the `?` placeholders
-    /// (rel/004/005). Omitted ⇒ empty array.
+    /// Positional parameters (JSON array), bound to the `?` placeholders.
+    /// Omitted ⇒ empty array.
     #[serde(default)]
     #[schema(value_type = Vec<Object>)]
     pub params: Vec<Value>,
     /// REFERENCES columns to resolve into embedded objects, or `["*"]` for
-    /// all of them (§5). Only valid for SELECT; non-empty on DML/DDL → 400.
+    /// all of them. Only valid for SELECT; non-empty on DML/DDL → 400.
     #[serde(default)]
     pub expand: Vec<String>,
 }
 
-// ── Wire serialization (spec §3/§4) ─────────────────────────────────────────
+// ── Wire serialization ──────────────────────────────────────────────────────
 
-/// Canonical wire type name (`ColumnType` → `columns[i].type`, spec §4).
-/// `pub(super)`: reused by the catalog-browse DTOs (rel/010 `rel_browse.rs`).
+/// Canonical wire type name (`ColumnType` → `columns[i].type`).
+/// `pub(super)`: reused by the catalog-browse DTOs (`rel_browse.rs`).
 pub(super) fn column_type_name(t: ColumnType) -> &'static str {
     match t {
         ColumnType::Integer => "INTEGER",
@@ -174,7 +173,7 @@ pub(super) fn column_type_name(t: ColumnType) -> &'static str {
 }
 
 /// Builds the `200 OK` body for a statement's `SqlOutcome`, in the response
-/// shape its class dictates (spec §3): DDL `{"ok":true}`; DML
+/// shape its class dictates: DDL `{"ok":true}`; DML
 /// `{"affected","last_pk"}`; SELECT `{"columns","rows","row_count",
 /// "limit_applied","expanded"?}` — rows as **arrays** (not objects), since
 /// same-named columns from a JOIN (`l.id`/`r.id`) would collide as object keys.
@@ -199,7 +198,7 @@ fn build_response(outcome: SqlOutcome) -> Value {
                 "limit_applied": result.limit_applied,
                 "rows": rows,
             });
-            // Present only when at least one column was actually resolved (§5).
+            // Present only when at least one column was actually resolved.
             if let Some(expanded) = expanded {
                 let expanded_obj: serde_json::Map<String, Value> =
                     expanded.into_iter().map(|(name, values)| (name, Value::Array(values))).collect();
@@ -212,8 +211,8 @@ fn build_response(outcome: SqlOutcome) -> Value {
     }
 }
 
-/// Wire form of a `DmlResult` (spec §3): `{"affected","last_pk"}`. `pub(super)`:
-/// reused as-is by the row-write handlers (rel/010 `rel_browse.rs`) for
+/// Wire form of a `DmlResult`: `{"affected","last_pk"}`. `pub(super)`:
+/// reused as-is by the row-write handlers (`rel_browse.rs`) for
 /// POST/PUT/DELETE responses.
 pub(super) fn dml_result_json(r: &DmlResult) -> Value {
     json!({
@@ -236,7 +235,7 @@ pub(super) fn dml_result_json(r: &DmlResult) -> Value {
             \"expanded\"?}. `rows` are arrays (not objects) so same-named JOIN columns don't collide.",
             body = Object),
         (status = 400, description = "Syntax, type, parameter-count, or expand error", body = String, content_type = "text/plain"),
-        (status = 403, description = "Access level too low for this statement (rel/011)", body = String, content_type = "text/plain"),
+        (status = 403, description = "Access level too low for this statement", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain, table, column, or index not found", body = String, content_type = "text/plain"),
         (status = 409, description = "Conflict — duplicate key, unique violation, name collision, …", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
@@ -259,7 +258,7 @@ pub async fn execute_sql(
     raw: Bytes,
 ) -> Result<Response, ApiError> {
     // The `Json` extractor over a body kept whole: a write statement on the
-    // reader pool travels on to the engine thread as it came (spec perf/018b A3).
+    // reader pool travels on to the engine thread as it came.
     let mut req = axum::extract::Request::new(axum::body::Body::from(raw.clone()));
     *req.headers_mut() = headers;
     let Json(body) = Json::<SqlRequest>::from_request(req, &state)
@@ -267,12 +266,12 @@ pub async fn execute_sql(
         .map_err(|rejection| ApiError::new(rejection.status(), rejection.body_text()))?;
     let engine = rel_engine(&state)?;
 
-    // rel/011 auth seam: classify (parse-only) then enforce the exact
+    // Auth seam: classify (parse-only) then enforce the exact
     // statement-class level *before* execute_sql runs it — this is the real
     // authorization, since the middleware only demanded Read for `/sql`.
-    // Doubles the parse (classify + execute_sql's own); accepted (rel/011 §4/§9)
+    // Doubles the parse (classify + execute_sql's own); accepted
     // — a write statement from the reader pool is parsed once here and twice
-    // on the engine thread (perf/018b A3).
+    // on the engine thread.
     let class = engine.classify(&body.sql)?;
     // On the reader pool, a write statement runs on the engine thread, which
     // handles the whole request again.
@@ -290,7 +289,7 @@ pub async fn execute_sql(
     enforce_sql_level(state.auth_enabled, outcome, required)
         .map_err(|resp| ApiError::new(resp.status(), "Forbidden"))?;
 
-    // rel/016: the caller's cross-engine KV/JSON read rights, gating expand
+    // The caller's cross-engine KV/JSON read rights, gating expand
     // masking and cross-engine write validation inside `execute_sql` itself.
     let user = auth_user.map(|Extension(u)| u);
     let link_auth = compute_link_auth(&state, outcome, user.as_ref(), &domain).await;
@@ -298,7 +297,7 @@ pub async fn execute_sql(
     let outcome = engine.execute_sql(&domain, &body.sql, &body.params, &body.expand, link_auth).await?;
     let response = build_response(outcome);
 
-    // 413 (spec §6): a handler-side check after serialization, not an
+    // 413: a handler-side check after serialization, not an
     // `RelStoreError` variant — mirrors other handler-side `ApiError::new`
     // cases (json.rs).
     let size = serde_json::to_vec(&response)
@@ -330,7 +329,7 @@ mod tests {
 
     /// `rel_config = None` ⇒ `rel.enabled = false`; `Some(cfg)` ⇒ enabled
     /// with `cfg`'s limits (paths are always freshly assigned into a temp dir).
-    /// `auth_enabled` toggles the auth middleware layer (rel/011 tests need it on).
+    /// `auth_enabled` toggles the auth middleware layer (auth tests need it on).
     async fn make_state(rel_config: Option<RelStoreConfig>, auth_enabled: bool) -> (AppState, tempfile::TempDir) {
         make_tuned_state(rel_config, auth_enabled, DomainQuota::default(), |_| {}).await
     }
@@ -378,7 +377,7 @@ mod tests {
                 };
                 // KV wired (same instance AppState uses), JSON disabled in this
                 // harness — enough for KVREF DDL/expand; JSONREF is covered by
-                // the rel/012 tests in cross_engine.rs.
+                // the tests in cross_engine.rs.
                 let resolver = crate::engines::rel::CrossEngineResolver::new(
                     Some(Arc::clone(&registry)),
                     None,
@@ -458,7 +457,7 @@ mod tests {
         (status, value)
     }
 
-    // Spec general/026 test 2 (rel sample): a real 404 (unknown domain)
+    // A real 404 (unknown domain)
     // carries a non-empty plaintext body — schema and reality agree.
     #[test]
     fn test_missing_domain_404_has_nonempty_plaintext_body() {
@@ -706,10 +705,10 @@ mod tests {
     }
 
     /// `orders.customer_id` REFERENCES `customers`: INSERT validates the link
-    /// target exists (rel/005), so a "dangling link" row can only be created
+    /// target exists, so a "dangling link" row can only be created
     /// by inserting against a *real* row and deleting it afterwards — not by
     /// inserting a bad id directly (that fails the INSERT itself, tolerant
-    /// links are about deletes, not constraint bypass; concept 3.4).
+    /// links are about deletes, not constraint bypass).
     async fn setup_orders(app: &axum::Router) {
         sql(app, "default", r#"{"sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)"}"#).await;
         sql(
@@ -720,8 +719,8 @@ mod tests {
         .await;
         sql(app, "default", r#"{"sql": "INSERT INTO customers VALUES (7, 'alice'), (99, 'ghost')"}"#).await;
         // payload (KVREF) is NULL here: cross-engine writes are now validated
-        // (rel/012 §2) and no KV keys are seeded in this harness — real KVREF
-        // resolution is covered by the rel/012 tests in cross_engine.rs.
+        // and no KV keys are seeded in this harness — real KVREF
+        // resolution is covered by the tests in cross_engine.rs.
         let (status, body) = sql(
             app,
             "default",
@@ -729,7 +728,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "setup insert must succeed: {body}");
-        // No FK-based delete restriction (concept 3.4) — this leaves order 3's
+        // No FK-based delete restriction — this leaves order 3's
         // customer_id=99 as a genuine hanging link.
         let (status, body) = sql(app, "default", r#"{"sql": "DELETE FROM customers WHERE id = 99"}"#).await;
         assert_eq!(status, StatusCode::OK, "setup delete must succeed: {body}");
@@ -758,7 +757,7 @@ mod tests {
     }
 
     // 10. expand "*": resolves every projected link column — REFERENCES *and*
-    //     KVREF/JSONREF (rel/012 no longer skips them). payload is NULL on all
+    //     KVREF/JSONREF (no longer skipped). payload is NULL on all
     //     rows here, so it resolves to null entries.
     #[test]
     fn test_expand_wildcard() {
@@ -772,12 +771,12 @@ mod tests {
             assert_eq!(body["expanded"]["customer_id"][0], json!({"id": 7, "name": "alice"}));
             assert_eq!(
                 body["expanded"]["payload"], json!([null, null, null]),
-                "KVREF column is now resolved by wildcard (rel/012): {body}"
+                "KVREF column is now resolved by wildcard: {body}"
             );
         })
     }
 
-    // 11. expand KVREF explicitly named now resolves (rel/012 live) — no
+    // 11. expand KVREF explicitly named now resolves — no
     //     longer a 400 CrossEngineExpand.
     #[test]
     fn test_expand_cross_engine_explicit_resolves() {
@@ -888,8 +887,8 @@ mod tests {
 
             // Drain the write bucket and lock its refill (default 500 write
             // IOPS) via drain_for_test — deterministically 429 regardless of
-            // scheduler/CPU load, and still needs no new config knob (spec §12
-            // explicitly rules one out).
+            // scheduler/CPU load, and still needs no new config knob (one is
+            // deliberately ruled out).
             engine.drain_domain_budget_for_test("default", true);
 
             // A SELECT (read bucket) must still go through — separate buckets.
@@ -1005,10 +1004,10 @@ mod tests {
         })
     }
 
-    // rel/011 §8 item 8: middleware auth over real rel routes. A Read grant
+    // Middleware auth over real rel routes. A Read grant
     // passes a SELECT via /sql (the middleware's /sql exception only demands
     // Read) but the handler's enforce_sql_level still blocks DDL — that's the
-    // actual authorization (Masterplan contradiction 4). A Read grant is
+    // actual authorization. A Read grant is
     // rejected on the path-based row-write route; no permission -> 403;
     // Admin/TrustedPeer bypass both checks via AuthOutcome::Full.
     #[test]
@@ -1086,7 +1085,7 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
 
-            // Path-based row write needs Write; a Read grant isn't enough (rel/010 route).
+            // Path-based row write needs Write; a Read grant isn't enough.
             let resp = send(Method::POST, "/store-api/rel/shop/tables/t/rows", Some(r#"{"id": 1}"#), user_key)
                 .await
                 .unwrap();
@@ -1132,7 +1131,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
 
             // TrustedPeer bypasses too (Full) — insert the marker directly, since
-            // there's no UDS listener in this harness (perf/001; json.rs pattern).
+            // there's no UDS listener in this harness (json.rs pattern).
             let mut req = Request::builder()
                 .method(Method::POST)
                 .uri("/store-api/rel/shop/sql")
@@ -1145,9 +1144,9 @@ mod tests {
         })
     }
 
-    // general/021: set_permission accepts access="ddl" and store_type="rel"
+    // set_permission accepts access="ddl" and store_type="rel"
     // for a domain that doesn't exist yet via the explicit ?allow_missing=true
-    // opt-in (replaces rel/011 §8 item 9's implicit no-check behavior); an
+    // opt-in (replaces the former implicit no-check behavior); an
     // invalid access value still -> 400; remove_permission with
     // ?store_type=rel removes it.
     #[test]
@@ -1206,7 +1205,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
             // "ddl" + "rel", domain doesn't exist yet -> 200 via allow_missing=true
-            // (spec general/021 pre-provisioning; without it this would now 404).
+            // (pre-provisioning; without it this would now 404).
             let resp = send(
                 Method::POST,
                 "/store-api/auth/users/worker/permissions?allow_missing=true",
@@ -1232,7 +1231,7 @@ mod tests {
         })
     }
 
-    // rel/016: cross-engine LinkAuth via HTTP. A worker with rel:shop
+    // Cross-engine LinkAuth via HTTP. A worker with rel:shop
     // Read+Write but no KV grant on "shop" gets expand masked to null and
     // INSERT-with-link forbidden — identically for an existing and a missing
     // key (oracle-proof). Granting KV Read on "shop" (the bare KV namespace,
@@ -1321,7 +1320,7 @@ mod tests {
                 .unwrap();
 
             // Expand without a KV grant: masked to null, same as a gone target
-            // domain (spec rel/016 — indistinguishable, no read-side oracle).
+            // domain (indistinguishable, no read-side oracle).
             let resp = send(
                 Method::POST,
                 "/store-api/rel/shop/sql",
@@ -1407,10 +1406,10 @@ mod tests {
         })
     }
 
-    // rel/017 §Tests 5: a pathologically self-similar LIKE pattern over /sql
+    // A pathologically self-similar LIKE pattern over /sql
     // aborts with 400 LikeBudgetExceeded instead of pinning a CPU core. A
     // short inline pattern is enough once the matched cell is large (same
-    // large-cell-via-param construction as the rel/015 E2E test in
+    // large-cell-via-param construction as the E2E test in
     // eval.rs), keeping the SQL statement itself well under
     // max_statement_len.
     #[test]
@@ -1440,7 +1439,7 @@ mod tests {
         })
     }
 
-    // Spec perf/018b A3: behind the bridge with a reader pool, a SELECT runs
+    // Behind the bridge with a reader pool, a SELECT runs
     // on the pool and a write statement travels on to the engine thread; every
     // answer, error paths included, matches the inline router's.
     #[test]

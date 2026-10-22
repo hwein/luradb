@@ -1,4 +1,4 @@
-//! Registered-buffer I/O on the engine thread's ring (spec perf/004, perf/020).
+//! Registered-buffer I/O on the engine thread's ring.
 //!
 //! `IoEngine` allocates a pool of fixed (kernel-pinned) buffers, registers it
 //! with the ring (`IORING_REGISTER_BUFFERS`) and tracks open file handles by
@@ -8,8 +8,7 @@
 //! the engine runtime ([`crate::core::engine_runtime`]).
 //!
 //! Scaffolding only: nothing here is on the hot path yet. The WAL/VLog/SSTable
-//! I/O paths are unchanged; spec 005 wires `IoEngine` into a dedicated storage
-//! thread that actually uses `read_fixed`/`write_fixed`.
+//! I/O paths do not use `read_fixed`/`write_fixed` yet.
 
 use crate::core::engine_runtime;
 use anyhow::{anyhow, Context, Result};
@@ -35,8 +34,7 @@ pub const VLOG_LOGICAL_ID: u64 = u64::MAX - 1;
 
 /// Maps a logical file id to an open file handle.
 ///
-/// No Fixed-File registration yet (that is spec 005's raw `io-uring` work) —
-/// these are regular file descriptors.
+/// No Fixed-File registration yet — these are regular file descriptors.
 pub struct FileHandleMap {
     handles: HashMap<u64, File>,
 }
@@ -79,7 +77,7 @@ impl Default for FileHandleMap {
 }
 
 /// Registered-buffer pool plus file-handle bookkeeping for the WAL, VLog, and
-/// SSTables. See module docs — not on the hot path in this spec.
+/// SSTables. See module docs — not on the hot path yet.
 pub struct IoEngine {
     pool: Rc<FixedPool>,
     file_handles: FileHandleMap,
@@ -417,7 +415,7 @@ mod tests {
         });
     }
 
-    // Regression (perf/004 finding 1): a large write then a smaller one over
+    // Regression: a large write then a smaller one over
     // the SAME slot must persist only the smaller payload, not the leftover
     // bytes.
     #[test]
@@ -449,7 +447,7 @@ mod tests {
         });
     }
 
-    // Regression (perf/004 finding 1): read must return exactly the n bytes
+    // Regression: read must return exactly the n bytes
     // read, even from a reused slot that held a larger read before.
     #[test]
     fn test_io_engine_read_fixed_reused_slot_exact_len() {

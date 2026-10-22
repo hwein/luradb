@@ -1,4 +1,4 @@
-//! Bulk operations for the JSON store (spec json/007): NDJSON mass import
+//! Bulk operations for the JSON store: NDJSON mass import
 //! and streaming export.
 
 use super::document::{
@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Documents or document keys processed between two yields (spec perf/017 A2).
+/// Documents or document keys processed between two yields.
 const DOC_LOOP_YIELD_INTERVAL: u32 = 4096;
 
 #[derive(Debug, Default)]
@@ -52,8 +52,8 @@ pub(crate) fn parse_ndjson_line(line: &str) -> Result<(Option<String>, Value), S
 type ParsedNdjson = (Vec<(Option<String>, Value)>, Vec<(String, String)>);
 
 /// Parses a whole NDJSON body into `(documents, per-line parse errors)` —
-/// the pure function [`JsonEngine::bulk_load_ndjson`] offloads (spec
-/// perf/017 A4). Blank lines are skipped.
+/// the pure function [`JsonEngine::bulk_load_ndjson`] offloads. Blank lines
+/// are skipped.
 fn parse_ndjson_body(ndjson: &str) -> ParsedNdjson {
     let mut docs = Vec::new();
     let mut errors = Vec::new();
@@ -94,8 +94,8 @@ pub fn document_to_ndjson_line(doc: &Document) -> String {
 impl JsonEngine {
     /// Reads, versions and writes one import batch entirely under the write
     /// shards of its own keys, so the read→write cycle cannot race put/delete
-    /// (json/011) and no batch lands after the purger finalized the domain
-    /// (json/013) — the purger holds every shard.
+    /// and no batch lands after the purger finalized the domain — the purger
+    /// holds every shard.
     async fn load_batch(
         &self,
         domain: &str,
@@ -214,8 +214,8 @@ impl JsonEngine {
     /// NDJSON convenience wrapper around [`JsonEngine::bulk_load`]. Unparseable
     /// lines are reported as `("line N", message)` and skipped.
     ///
-    /// Line parsing is pure CPU work and runs on the blocking pool (spec
-    /// perf/017 A4), which is why the body arrives owned.
+    /// Line parsing is pure CPU work and runs on the blocking pool, which is
+    /// why the body arrives owned.
     pub async fn bulk_load_ndjson(
         &self,
         domain: &str,
@@ -278,7 +278,7 @@ impl JsonEngine {
     }
 
     /// Lists all live document keys of a domain visible under `snapshot`
-    /// (spec general/006 backup export) — the snapshot-pinned counterpart of
+    /// (backup export) — the snapshot-pinned counterpart of
     /// the key-scan step in [`Self::bulk_export`], pairing with
     /// [`JsonEngine::get_document_with_snapshot`] for the per-document read.
     /// Unparseable LSM keys are skipped, like `bulk_export`.
@@ -327,7 +327,7 @@ mod tests {
         (engine, dir)
     }
 
-    // Spec perf/017 test 5 (import): a 10 000-line NDJSON import hands the
+    // A 10 000-line NDJSON import hands the
     // thread back between its batches — parsing runs off the engine thread
     // entirely — so a `get_document` on another domain answers first.
     #[test]
@@ -455,7 +455,7 @@ mod tests {
         })
     }
 
-    // ── Snapshot-pinned export (spec general/006 backup export) ─────────────
+    // ── Snapshot-pinned export (backup export) ─────────────
 
     // A document created/updated after the snapshot must not appear via the
     // pinned scan/read pair, while the live (unpinned) read sees the update.
@@ -538,8 +538,8 @@ mod tests {
 
     // 8. Roundtrip: NDJSON load → export → identical content, including an
     //    underscore-prefixed user field that is not a reserved name (_foo)
-    //    and a non-object document (spec json/017 test 5: every acceptable
-    //    document survives export → re-import unchanged).
+    //    and a non-object document (every acceptable document survives
+    //    export → re-import unchanged).
     #[test]
     fn test_ndjson_roundtrip() {
         crate::core::engine_runtime::block_on(async {
@@ -567,8 +567,8 @@ mod tests {
     }
 
     // 8b. A leftover reserved field after meta-extraction is rejected as a
-    //     per-line import error; other lines still import (spec json/017 §1
-    //     test 4). Line 1: after `_key` extraction the map is
+    //     per-line import error; other lines still import. Line 1: after
+    //     `_key` extraction the map is
     //     {"_content":1,"x":2} -- length 2, so the `_content`-unwrap rule
     //     (map.len() == 1) does not fire and `_content` survives as a
     //     leftover user field.
@@ -656,7 +656,7 @@ mod tests {
         })
     }
 
-    // 11. Deadlock probe (spec json/018): two concurrent batches over the same
+    // 11. Deadlock probe: two concurrent batches over the same
     //     keys in opposite order finish — the ascending shard acquisition is
     //     the proof object; a naive per-key order would deadlock here.
     #[test]
@@ -687,7 +687,7 @@ mod tests {
         })
     }
 
-    // ── Spec general/019: per-engine metrics ─────────────────────────────────
+    // ── Per-engine metrics ─────────────────────────────────
 
     // Test 6: bulk_load with N documents increments json.write_ops by
     // exactly 1, not N, with exactly one latency sample -- proof of the
@@ -703,7 +703,7 @@ mod tests {
             let result = json.bulk_load("default", docs).await.unwrap();
             assert_eq!(result.imported, 7);
 
-            // aggregate_engine only sums fully ticked buckets (spec general/019).
+            // aggregate_engine only sums fully ticked buckets.
             json.metrics.tick_all();
             let m = json.metrics.engine_metrics();
             assert_eq!(

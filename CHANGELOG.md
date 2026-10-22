@@ -51,6 +51,7 @@ All notable changes to LuraDB are documented in this file.
 - `[io_engine].enabled` has no effect with more than one shard.
 - SHM snapshots are published from a consistent cut across all shards.
 - **BREAKING** API: Backup archives use manifest format v2 (shard count, LSN cut); v1 archives remain restorable.
+- The storage hub submits writes for other log files while a commit is still in flight.
 
 ### Removed
 

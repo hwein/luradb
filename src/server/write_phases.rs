@@ -8,30 +8,44 @@
 //! `cargo test --release --lib write_phases -- --ignored --nocapture`.
 //! `LURADB_WRITE_PHASES_SECS` sets the seconds per run (default 10),
 //! `LURADB_WRITE_PHASES_RUNS` the runs per set (default 3); the data lives in
-//! the temp directory (`TMPDIR`).
+//! the temp directory (`TMPDIR`). `LURADB_WRITE_PHASES_TRACE=0` runs the same
+//! load untraced and prints the client's ops/s, p50 and p99 alone: the
+//! control for what the tracing costs.
 //!
-//! Measured once, 2026-10-22, release build on a 12-vCPU virtual machine,
-//! data on tmpfs; medians of 3 runs, key-value writes, p50 in µs:
+//! A submit in the hub table is one pass that puts chains on the ring.
 //!
-//! | phase           | alone | three engines |
-//! |-----------------|-------|---------------|
-//! | client          | 1514  | 2326          |
-//! | traced in all   | 996   | 1640          |
-//! | 1 front         | 11    | 9             |
-//! | 2 queue         | 128   | 248           |
-//! | 3 to WAL        | 18    | 14            |
-//! | 4 hub           | 561   | 887           |
-//! | 4a hub queue    | 82    | 234           |
-//! | 4b hub I/O      | 187   | 208           |
-//! | 4c wake         | 86    | 177           |
-//! | 3' after        | 8     | 8             |
-//! | 5 reply         | 110   | 202           |
+//! Measured 2026-10-22, release build on a 12-vCPU virtual machine; medians
+//! of 3 runs per set, key-value writes, p50 in µs. "Before": the hub starts
+//! new chains only once every chain on the ring is reaped; "after": it waits
+//! on the ring at most 50 µs and starts chains for free files meanwhile.
 //!
-//! Key-value writes/s 1871 → 1304. The engine thread is 30 → 45 % busy with
-//! 168 → 134 µs CPU per write: M/M/1 predicts a mean wait of 74 → 105 µs,
-//! the measured means of queue and wake are 217 + 185 → 366 + 278 µs. An
-//! fdatasync on tmpfs is free; with the data on ext4 on the guest's virtual
-//! disk one takes 1.8 ms, and submits of 1, 2 and 3 chains 2.2, 2.6 and 3.2 ms.
+//! | tmpfs           | alone before | after | three before | after |
+//! |-----------------|--------------|-------|--------------|-------|
+//! | client          | 1768         | 1728  | 2435         | 2661  |
+//! | traced in all   | 1162         | 1147  | 1745         | 1842  |
+//! | 1 front         | 14           | 14    | 10           | 11    |
+//! | 2 queue         | 141          | 147   | 266          | 292   |
+//! | 3 to WAL        | 20           | 20    | 15           | 16    |
+//! | 4 hub           | 652          | 655   | 984          | 979   |
+//! | 4a hub queue    | 86           | 81    | 255          | 199   |
+//! | 4b hub I/O      | 216          | 223   | 226          | 285   |
+//! | 4c wake         | 99           | 99    | 185          | 163   |
+//! | 3' after        | 8            | 8     | 9            | 10    |
+//! | 5 reply         | 124          | 123   | 209          | 215   |
+//!
+//! | ext4            | alone before | after | three before | after |
+//! |-----------------|--------------|-------|--------------|-------|
+//! | client          | 4631         | 4382  | 6330         | 6332  |
+//! | 4 hub           | 3306         | 2943  | 4694         | 4654  |
+//! | 4a hub queue    | 852          | 729   | 1309         | 1248  |
+//! | 4b hub I/O      | 1903         | 1732  | 2764         | 2681  |
+//! | 4c wake         | 130          | 128   | 256          | 180   |
+//!
+//! Untraced, the client p50 alone and with three engines is 1710 / 2690 →
+//! 1628 / 2360 µs on tmpfs and 4369 / 6351 → 4179 / 6465 µs on ext4; run to
+//! run it varies by up to 15 %. The storage thread is 18 → 20 %
+//! busy on tmpfs and 9 → 19 % on ext4, where the bounded wait wakes it
+//! during each 1.8 ms fdatasync.
 
 use super::{tests::test_config, Server};
 use crate::config::LuraConfig;
@@ -206,7 +220,7 @@ struct Run {
     wall: Duration,
 }
 
-fn run(engines: &[Engine], load_for: Duration, index: usize) -> Run {
+fn run(engines: &[Engine], load_for: Duration, index: usize, trace: bool) -> Run {
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = test_config(dir.path());
     tune(&mut cfg, dir.path(), index);
@@ -215,13 +229,15 @@ fn run(engines: &[Engine], load_for: Duration, index: usize) -> Run {
     let client = tokio::runtime::Runtime::new().unwrap();
     client.block_on(setup(addr, engines));
 
-    write_trace::start();
+    if trace {
+        write_trace::start();
+    }
     let before = thread_cpu();
     let started = Instant::now();
     let latencies = client.block_on(load(addr, engines, load_for));
     let wall = started.elapsed();
     let after = thread_cpu();
-    let (requests, batches) = write_trace::stop();
+    let (requests, batches) = if trace { write_trace::stop() } else { Default::default() };
     drop(client);
     server.shutdown().unwrap();
     let cpu = after.iter().map(|(group, used)| (*group, used - before.get(group).copied().unwrap_or(0.0))).collect();
@@ -386,6 +402,20 @@ fn phase_table(set: &str, run: &Run) -> Table {
     Table { title: format!("Phases, µs — {set}"), head, rows }
 }
 
+/// Per engine: ops/s and the client's p50 and p99, in µs.
+fn client_table(set: &str, run: &Run) -> Table {
+    let rows = run
+        .latencies
+        .iter()
+        .map(|(engine, latencies)| {
+            let client: Vec<f64> = latencies.iter().map(|l| l.as_secs_f64() * 1e6).collect();
+            let ops = latencies.len() as f64 / run.wall.as_secs_f64();
+            (engine.label().to_string(), vec![ops, quantile(&client, 0.5), quantile(&client, 0.99)])
+        })
+        .collect();
+    Table { title: format!("Client, untraced, µs — {set}"), head: vec!["ops/s", "p50", "p99"], rows }
+}
+
 /// Per number of chains in a submit: how often, the submit's duration up to
 /// its last completion, when its first and last fdatasync completed, each
 /// fdatasync from its write's completion, and their sum per submit; in µs.
@@ -465,17 +495,22 @@ fn env(name: &str, default: usize) -> usize {
 fn write_latency_by_phase_alone_and_with_three_engines() {
     let load_for = Duration::from_secs(env("LURADB_WRITE_PHASES_SECS", 10) as u64);
     let runs = env("LURADB_WRITE_PHASES_RUNS", 3);
-    let mut tables: Vec<Vec<[Table; 3]>> = SETS.iter().map(|_| Vec::new()).collect();
+    let trace = env("LURADB_WRITE_PHASES_TRACE", 1) != 0;
+    let mut tables: Vec<Vec<Vec<Table>>> = SETS.iter().map(|_| Vec::new()).collect();
     for r in 0..runs {
         for (s, (set, engines)) in SETS.iter().enumerate() {
-            let run = run(engines, load_for, r * SETS.len() + s);
+            let run = run(engines, load_for, r * SETS.len() + s, trace);
+            if !trace {
+                tables[s].push(vec![client_table(set, &run)]);
+                continue;
+            }
             assert_traced_in_full(&run);
             println!("run {r} {set}: {} writes, {} hub submits", run.requests.len(), run.batches.len());
-            tables[s].push([phase_table(set, &run), hub_table(set, &run), thread_table(set, &run)]);
+            tables[s].push(vec![phase_table(set, &run), hub_table(set, &run), thread_table(set, &run)]);
         }
     }
     for set in &tables {
-        for kind in 0..3 {
+        for kind in 0..set[0].len() {
             Table::median(&set.iter().map(|t| &t[kind]).collect::<Vec<_>>()).print();
         }
     }

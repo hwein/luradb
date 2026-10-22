@@ -7,8 +7,10 @@
 
 use crate::core::storage_thread::WalTarget;
 use axum::http::{request, Extensions};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -189,37 +191,49 @@ pub(crate) fn hub_answered(picked: Option<Instant>, engine: WalTarget, lsns: imp
     }
 }
 
-/// Completion times of one submit's chains. While recording, the hub waits
-/// for one completion at a time, so each gets its own time.
-pub(crate) struct ChainStamps(Option<Batch>);
+/// A submit of the hub, shared by its chains; recorded once its last chain is done.
+struct Shared(RefCell<Batch>);
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        let batch = self.0.get_mut();
+        if !batch.chains.is_empty() {
+            BATCHES.lock().unwrap().push(batch.clone());
+        }
+    }
+}
+
+/// The submit the hub starts, while recording.
+pub(crate) struct SubmitStamps(Option<Rc<Shared>>);
+
+impl SubmitStamps {
+    pub(crate) fn start() -> Self {
+        Self(now().map(|submitted| Rc::new(Shared(RefCell::new(Batch { submitted, chains: Vec::new() })))))
+    }
+
+    /// The stamps of the submit's next chain.
+    pub(crate) fn chain(&self) -> ChainStamps {
+        ChainStamps(self.0.as_ref().map(|shared| {
+            let mut batch = shared.0.borrow_mut();
+            batch.chains.push((None, None));
+            (Rc::clone(shared), batch.chains.len() - 1)
+        }))
+    }
+}
+
+/// When one chain's write and fdatasync completed.
+#[derive(Default)]
+pub(crate) struct ChainStamps(Option<(Rc<Shared>, usize)>);
 
 impl ChainStamps {
-    pub(crate) fn start() -> Self {
-        Self(now().map(|submitted| Batch { submitted, chains: Vec::new() }))
-    }
-
-    pub(crate) fn wait(&self, unreaped: usize) -> usize {
-        if self.0.is_some() { 1 } else { unreaped }
-    }
-
-    /// A completion with `user_data` = 2 · chain + step (0 write, 1 fdatasync).
-    pub(crate) fn complete(&mut self, user_data: u64) {
-        let Some(batch) = &mut self.0 else { return };
-        let chain = user_data as usize / 2;
-        if batch.chains.len() <= chain {
-            batch.chains.resize(chain + 1, (None, None));
-        }
+    pub(crate) fn complete(&self, synced: bool) {
+        let Some((shared, chain)) = &self.0 else { return };
+        let stamps = &mut shared.0.borrow_mut().chains[*chain];
         let now = Some(Instant::now());
-        if user_data.is_multiple_of(2) {
-            batch.chains[chain].0 = now;
+        if synced {
+            stamps.1 = now;
         } else {
-            batch.chains[chain].1 = now;
-        }
-    }
-
-    pub(crate) fn finish(self) {
-        if let Some(batch) = self.0.filter(|batch| !batch.chains.is_empty()) {
-            BATCHES.lock().unwrap().push(batch);
+            stamps.0 = now;
         }
     }
 }

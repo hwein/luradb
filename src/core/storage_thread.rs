@@ -16,6 +16,7 @@ use crate::core::wal::{WAL_HEADER_LEN, WAL_MAGIC};
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use io_uring::{opcode, squeue, types, IoUring};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -31,6 +32,11 @@ pub const SQPOLL_IDLE_MS: u32 = 2000;
 pub const RING_DEPTH: u32 = 256;
 /// No CPU pinning.
 pub const STORAGE_THREAD_CPU: i32 = -1;
+/// The longest the hub waits on the ring before it looks at the channel
+/// again, so a write for a free file never waits for another file's fdatasync.
+/// Of 20, 50 and 100 µs, 50 helped three writing engines most and kept a
+/// single writer as fast as before.
+const REAP_WAIT: types::Timespec = types::Timespec::new().nsec(50_000);
 
 /// Runtime parameters for [`StorageThread::new`].
 #[derive(Debug, Clone, Copy)]
@@ -178,7 +184,7 @@ impl StorageThread {
         self.shutdown.store(true, Ordering::SeqCst);
         // Non-blocking: `shutdown` may run on the engine thread. If the
         // channel is full the wake is redundant — the flag above stops the loop
-        // after its current batch, then the queue is drained.
+        // after its current turn, then the queue is drained.
         let _ = self.request_tx.try_send(IoRequest::Shutdown);
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
@@ -211,6 +217,10 @@ struct WalFile {
     /// Bytes a failed append left past `offset`, or the unsafe-end marker,
     /// may still be there; the next append cuts first.
     unsafe_end: bool,
+    /// Requests for this file, in channel order, not run yet.
+    queued: VecDeque<IoRequest>,
+    /// The write on its way to this file; at most one at a time.
+    pending: Option<Pending>,
 }
 
 /// Totals the thread logs when it stops; appends per fdatasync is the
@@ -218,7 +228,7 @@ struct WalFile {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HubStats {
     appends: u64,
-    /// Batches with at least one append.
+    /// Turns that started at least one append.
     batches: u64,
     fdatasyncs: u64,
 }
@@ -231,6 +241,8 @@ struct StorageState {
     /// `false` after a failed `register_files` — ops then fall back to raw fds.
     fixed_files: bool,
     stats: HubStats,
+    /// Completions of the chains on the ring not reaped yet.
+    unreaped: usize,
     #[cfg(test)]
     faults: Faults,
 }
@@ -255,6 +267,9 @@ pub(crate) struct Faults {
     /// Directory syncs the removals of the unsafe-end marker have attempted,
     /// the injected failure included.
     pub(crate) unmark_syncs: u64,
+    /// Until reset, the chain of this engine's file stays on its way once
+    /// its completions are reaped: its appends wait for their answer.
+    pub(crate) held: Option<WalTarget>,
 }
 
 #[cfg(test)]
@@ -297,6 +312,11 @@ impl StorageState {
 
     fn ring_file(&self, index: usize) -> RingFile {
         if self.fixed_files { RingFile::Fixed(index as u32) } else { RingFile::Raw(self.wals[index].file.as_raw_fd()) }
+    }
+
+    /// Nothing queued and no write on its way.
+    fn idle(&self) -> bool {
+        self.wals.iter().all(|wal| wal.queued.is_empty() && wal.pending.is_none())
     }
 
     /// The file's end stays unsafe until the cut and the marker removal both succeed.
@@ -387,7 +407,17 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
         let awaits_truncate = !ensure_header(&file)
             .with_context(|| format!("writing the header of the write-ahead log {}", path.display()))?;
         let offset = file.metadata()?.len();
-        files.push(WalFile { engine: *engine, file, marker, offset, lsn: 0, awaits_truncate, unsafe_end: false });
+        files.push(WalFile {
+            engine: *engine,
+            file,
+            marker,
+            offset,
+            lsn: 0,
+            awaits_truncate,
+            unsafe_end: false,
+            queued: VecDeque::new(),
+            pending: None,
+        });
     }
     // Register the WALs once as fixed files so the kernel skips the fd lookup
     // per op; on failure fall back to raw fds.
@@ -404,83 +434,169 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
         wals: files,
         fixed_files,
         stats: HubStats::default(),
+        unreaped: 0,
         #[cfg(test)]
         faults: Faults::default(),
     };
     Ok((state, sqpoll_active))
 }
 
-fn event_loop(state: &mut StorageState, rx: &mut Receiver<IoRequest>, shutdown: &AtomicBool) {
-    loop {
-        // Thread is a plain `std::thread`, not a tokio context — `blocking_recv`
-        // parks it until a request arrives (or all senders drop).
-        let first = match rx.blocking_recv() {
-            Some(req) => req,
-            None => return, // all senders dropped
-        };
-        // Coalesce everything currently queued into one batch (group commit).
-        let mut batch = vec![first];
-        while let Ok(req) = rx.try_recv() {
-            batch.push(req);
-        }
-        let stop = process_batch(state, batch);
-        if stop || shutdown.load(Ordering::SeqCst) {
-            drain_remaining(state, rx);
-            return;
+/// Aborts the process when the hub unwinds from a panic with chains on the
+/// ring: dropping the state would free buffers the kernel may still use.
+struct AbortOnUnwind<'a>(&'a mut StorageState);
+
+impl Drop for AbortOnUnwind<'_> {
+    fn drop(&mut self) {
+        if must_abort(self.0, std::thread::panicking()) {
+            eprintln!("luradb storage hub: panicked with writes on the ring, aborting to avoid a use-after-free");
+            std::process::abort();
         }
     }
 }
 
-/// Drains whatever is still queued (best-effort) so no pending request is lost.
+fn must_abort(state: &StorageState, panicking: bool) -> bool {
+    panicking && state.unreaped > 0
+}
+
+fn event_loop(state: &mut StorageState, rx: &mut Receiver<IoRequest>, shutdown: &AtomicBool) {
+    let guard = AbortOnUnwind(state);
+    let state = &mut *guard.0;
+    let mut stop = false;
+    loop {
+        // Thread is a plain `std::thread`, not a tokio context — `blocking_recv`
+        // parks it until a request arrives (or all senders drop). With a write
+        // on its way the hub waits on the ring instead and looks at the
+        // channel after each completion, and at least every `REAP_WAIT`.
+        if state.idle() {
+            match rx.blocking_recv() {
+                Some(request) => stop |= accept(state, request),
+                None => return, // all senders dropped
+            }
+        }
+        // Everything queued meanwhile joins the next submit (group commit).
+        while let Ok(request) = rx.try_recv() {
+            stop |= accept(state, request);
+        }
+        if stop || shutdown.load(Ordering::SeqCst) {
+            drain_remaining(state, rx);
+            return;
+        }
+        turn(state);
+    }
+}
+
+/// Drains whatever is still queued (best-effort) and finishes every write on
+/// its way, so no pending request is lost.
 fn drain_remaining(state: &mut StorageState, rx: &mut Receiver<IoRequest>) {
     let mut batch = Vec::new();
     while let Ok(req) = rx.try_recv() {
         batch.push(req);
     }
-    if !batch.is_empty() {
-        process_batch(state, batch);
-    }
+    process_batch(state, batch);
 }
 
-/// Processes a batch in channel order. Each run of WAL appends is written
-/// with one write and one fdatasync per file (group commit across engines);
-/// only a truncate or an LSN request ends a run and runs at its place.
+/// Takes `batch` in, in channel order, and runs until no chain is on the
+/// ring and each file with queued requests waits for its write on its way.
 /// Returns `true` if a `Shutdown` was seen.
 fn process_batch(state: &mut StorageState, batch: Vec<IoRequest>) -> bool {
     let mut stop = false;
-    let mut appended = false;
-    let mut run = Vec::new();
     for request in batch {
-        match request {
-            IoRequest::Shutdown => stop = true,
-            IoRequest::WalAppend { engine, data, response } => {
-                run.push((engine, data, response));
-                appended = true;
-            }
-            IoRequest::WalTruncate { engine, response } => {
-                commit_appends(state, std::mem::take(&mut run));
-                let _ = response.send(do_wal_truncate(state, engine));
-            }
-            IoRequest::SetLsnStart { engine, lsn, response } => {
-                commit_appends(state, std::mem::take(&mut run));
-                let index = state.wal_index(engine);
-                if let Ok(index) = &index {
-                    let wal = &mut state.wals[*index];
-                    wal.lsn = wal.lsn.max(lsn);
+        stop |= accept(state, request);
+    }
+    while turn(state) {}
+    stop
+}
+
+/// Queues a request behind the earlier ones for its file, or answers it at
+/// once if no file is open for its engine. Returns `true` for a `Shutdown`.
+fn accept(state: &mut StorageState, request: IoRequest) -> bool {
+    let engine = match &request {
+        IoRequest::Shutdown => return true,
+        IoRequest::WalAppend { engine, .. } => {
+            state.stats.appends += 1;
+            *engine
+        }
+        IoRequest::WalTruncate { engine, .. }
+        | IoRequest::SetLsnStart { engine, .. }
+        | IoRequest::WalHeadLsn { engine, .. } => *engine,
+    };
+    match state.wal_index(engine) {
+        Ok(index) => state.wals[index].queued.push_back(request),
+        Err(e) => refuse(request, e),
+    }
+    false
+}
+
+/// Answers `request` with `e`.
+fn refuse(request: IoRequest, e: anyhow::Error) {
+    match request {
+        IoRequest::WalAppend { response, .. } => {
+            let _ = response.send(Err(anyhow!("WAL append failed: {e}")));
+        }
+        IoRequest::WalTruncate { response, .. } | IoRequest::SetLsnStart { response, .. } => {
+            let _ = response.send(Err(e));
+        }
+        IoRequest::WalHeadLsn { response, .. } => {
+            let _ = response.send(Err(e));
+        }
+        IoRequest::Shutdown => {}
+    }
+}
+
+/// One turn of the hub: answers the writes whose chains are reaped, starts
+/// what can start and, while chains are on the ring, waits for completions.
+/// Returns whether the next turn has work: a chain on the ring, or a queued
+/// request of a file without a write on its way (e.g. behind a refused append).
+fn turn(state: &mut StorageState) -> bool {
+    take_reaped(state);
+    start_queued(state);
+    push_chains(state);
+    if state.unreaped == 0 {
+        return state.wals.iter().any(|wal| wal.pending.is_none() && !wal.queued.is_empty());
+    }
+    reap(state);
+    true
+}
+
+/// Each file without a write on its way runs its queued requests in channel
+/// order: the ones other than appends at once, the appends up to the next
+/// such request in one write per file, all files' writes planned together.
+fn start_queued(state: &mut StorageState) {
+    let mut run = Vec::new();
+    for index in 0..state.wals.len() {
+        if state.wals[index].pending.is_some() {
+            continue;
+        }
+        let mut appended = false;
+        loop {
+            match state.wals[index].queued.pop_front() {
+                Some(IoRequest::WalAppend { engine, data, response }) => {
+                    run.push((engine, data, response));
+                    appended = true;
                 }
-                let _ = response.send(index.map(|_| ()));
-            }
-            IoRequest::WalHeadLsn { engine, response } => {
-                commit_appends(state, std::mem::take(&mut run));
-                let _ = response.send(state.wal_index(engine).map(|index| state.wals[index].lsn));
+                Some(request) if appended => {
+                    state.wals[index].queued.push_front(request);
+                    break;
+                }
+                Some(IoRequest::WalTruncate { engine, response }) => {
+                    let _ = response.send(do_wal_truncate(state, engine));
+                }
+                Some(IoRequest::SetLsnStart { lsn, response, .. }) => {
+                    let wal = &mut state.wals[index];
+                    wal.lsn = wal.lsn.max(lsn);
+                    let _ = response.send(Ok(()));
+                }
+                Some(IoRequest::WalHeadLsn { response, .. }) => {
+                    let _ = response.send(Ok(state.wals[index].lsn));
+                }
+                Some(IoRequest::Shutdown) | None => break,
             }
         }
     }
-    commit_appends(state, run);
-    if appended {
+    if !run.is_empty() {
         state.stats.batches += 1;
+        start_writes(state, run);
     }
-    stop
 }
 
 /// One combined write of a batch to one WAL file.
@@ -520,80 +636,188 @@ fn plan_batch<'a>(
     writes
 }
 
-type Append = (WalTarget, Vec<u8>, oneshot::Sender<Result<(u64, u64)>>);
+type Responder = oneshot::Sender<Result<(u64, u64)>>;
+type Append = (WalTarget, Vec<u8>, Responder);
 
-/// Writes a run of appends, one [`FileWrite`] per WAL file, and answers each
-/// request with the offset and the LSN of its record.
-fn commit_appends(state: &mut StorageState, run: Vec<Append>) {
+/// Plans a run of appends, one [`FileWrite`] per WAL file, and puts each on
+/// its way to its file; a file whose end is not safe for an append answers
+/// its requests with the failure at once.
+fn start_writes(state: &mut StorageState, run: Vec<Append>) {
     #[cfg(test)]
     let picked = crate::core::write_trace::now();
-    state.stats.appends += run.len() as u64;
     let last_lsn = |engine: WalTarget| state.wal_index(engine).map_or(0, |index| state.wals[index].lsn);
     let writes = plan_batch(run.iter().map(|(engine, data, _)| (*engine, data.as_slice())), last_lsn);
     let mut responses: Vec<_> = run.into_iter().map(|(_, _, response)| Some(response)).collect();
-    for (write, result) in write_files(state, &writes) {
-        let result = result.map_err(|e| e.to_string());
-        #[cfg(test)]
-        if result.is_ok() {
-            crate::core::write_trace::hub_answered(picked, write.engine, write.parts.iter().map(|part| part.2));
-        }
-        for &(position, offset, lsn) in &write.parts {
-            let Some(response) = responses[position].take() else { continue };
-            let _ = response.send(match &result {
-                Ok(start) => Ok((start + offset, lsn)),
-                Err(msg) => Err(anyhow!("WAL append failed: {msg}")),
-            });
+    for write in writes {
+        let responses = write.parts.iter().map(|part| responses[part.0].take()).collect();
+        match ready_to_append(state, write.engine) {
+            Ok(index) => {
+                let start = state.wals[index].offset;
+                state.wals[index].pending = Some(Pending {
+                    write,
+                    responses,
+                    index,
+                    start,
+                    landed: 0,
+                    on_ring: false,
+                    wrote: None,
+                    synced: None,
+                    #[cfg(test)]
+                    picked,
+                    #[cfg(test)]
+                    stamps: Default::default(),
+                });
+            }
+            Err(e) => answer(&write, responses, Err(e)),
         }
     }
 }
 
-/// A write of a batch on its way to its file.
-struct Pending<'a> {
-    write: &'a FileWrite,
+/// Answers each request of `write` with the offset and the LSN of its
+/// record, given the offset the write starts at, or with the failure.
+fn answer(write: &FileWrite, responses: Vec<Option<Responder>>, result: Result<u64>) {
+    let result = result.map_err(|e| e.to_string());
+    for (&(_, offset, lsn), response) in write.parts.iter().zip(responses) {
+        let Some(response) = response else { continue };
+        let _ = response.send(match &result {
+            Ok(start) => Ok((start + offset, lsn)),
+            Err(msg) => Err(anyhow!("WAL append failed: {msg}")),
+        });
+    }
+}
+
+/// A write on its way to its file. The hub keeps it, its buffer included,
+/// until both completions of its last chain are reaped.
+struct Pending {
+    write: FileWrite,
+    /// Per part of `write`, the request waiting for its answer.
+    responses: Vec<Option<Responder>>,
     /// The file's index.
     index: usize,
     /// The file's cursor, where the write starts.
     start: u64,
     /// Bytes of the write that have landed.
     landed: usize,
+    /// Its chain is in the submission queue or on the ring.
+    on_ring: bool,
+    /// The results of the chain's write and fdatasync, once reaped.
+    wrote: Option<i32>,
+    synced: Option<i32>,
+    #[cfg(test)]
+    picked: Option<std::time::Instant>,
+    #[cfg(test)]
+    stamps: crate::core::write_trace::ChainStamps,
 }
 
-/// Appends each write at the end of its file and fdatasyncs it, the files
-/// side by side; returns each write with the offset it starts at. A failed
-/// write or fdatasync cuts its file back to the cursor, which stays where it
-/// was, and leaves its LSNs to the next write; the other files go on.
-fn write_files<'a>(state: &mut StorageState, writes: &'a [FileWrite]) -> Vec<(&'a FileWrite, Result<u64>)> {
-    let mut done = Vec::with_capacity(writes.len());
-    let mut pending = Vec::with_capacity(writes.len());
-    for write in writes {
-        match ready_to_append(state, write.engine) {
-            Ok(index) => pending.push(Pending { write, index, start: state.wals[index].offset, landed: 0 }),
-            Err(e) => done.push((write, Err(e))),
+/// Puts the chain of each write not on the ring yet into the submission
+/// queue — a write of the rest of its bytes, linked to an fdatasync of its
+/// file — while the completion queue has room for all chains on the ring.
+///
+/// At most one chain per WAL file is on its way: a file starts its next
+/// write only once its last chain is reaped, so it gets its bytes in channel
+/// order, the rest of a short write behind the bytes that landed, and a cut
+/// after a failure races no write. Other files' chains go in meanwhile.
+fn push_chains(state: &mut StorageState) {
+    #[cfg(test)]
+    let submit = crate::core::write_trace::SubmitStamps::start();
+    let room = state.ring.params().sq_entries() as usize;
+    for index in 0..state.wals.len() {
+        let file = state.ring_file(index);
+        let Some(p) = state.wals[index].pending.as_mut().filter(|p| !p.on_ring) else { continue };
+        if state.unreaped + 2 > room {
+            break;
+        }
+        let rest = &p.write.data[p.landed..];
+        #[cfg(test)]
+        let rest = &rest[..rest.len().min(state.faults.max_write_len.unwrap_or(usize::MAX))];
+        // An SQE takes a u32 length; the rest of a longer write follows in
+        // the file's next chain, as after a short write.
+        let len = rest.len().min(u32::MAX as usize) as u32;
+        // `user_data` names the file and the step: with one chain per file
+        // on the ring, that identifies the chain.
+        let write = write_entry(file, rest.as_ptr(), len, p.start + p.landed as u64)
+            .flags(squeue::Flags::IO_LINK)
+            .user_data(2 * index as u64);
+        let sync = fsync_entry(file).user_data(2 * index as u64 + 1);
+        // Safe: the buffer stays in `pending` until `reap` has both
+        // completions of the chain (or the process aborts).
+        if unsafe { state.ring.submission().push_multiple(&[write, sync]) }.is_err() {
+            break;
+        }
+        p.on_ring = true;
+        state.unreaped += 2;
+        #[cfg(test)]
+        {
+            p.stamps = submit.chain();
         }
     }
-    // At most one chain per WAL file in flight: a submit's chains are all
-    // reaped before the next submit, so each file gets its bytes in channel
-    // order, the rest of a short write behind the bytes that landed, and a
-    // cut after a failure races no write.
-    while !pending.is_empty() {
-        let chains: Vec<Chain> = pending
-            .iter()
-            .map(|p| {
-                let rest = &p.write.data[p.landed..];
-                #[cfg(test)]
-                let rest = &rest[..rest.len().min(state.faults.max_write_len.unwrap_or(usize::MAX))];
-                Chain { file: state.ring_file(p.index), offset: p.start + p.landed as u64, data: rest }
-            })
-            .collect();
-        let mut results = ring_chains(&mut state.ring, &chains).into_iter();
-        // A chain the submission queue had no room for goes in the next submit.
-        pending.retain_mut(|p| {
-            let Some(result) = results.next().and_then(|completed| take_chain(state, p, completed)) else { return true };
-            done.push((p.write, result));
-            false
-        });
+}
+
+/// Submits the chains pushed so far, waits up to [`REAP_WAIT`] for a
+/// completion and takes in every completion there is; a completion's
+/// `user_data` names its file and step (2 · file + 0 write, 1 fdatasync). The
+/// kernel runs a chain's fdatasync only once its write has landed in full and
+/// cancels it otherwise.
+///
+/// Once the SQEs are published, the kernel (in SQPOLL mode, its poll thread)
+/// may run them at any time, so a write's buffer lives in its file's
+/// `pending` until both completions are reaped. The wait can end without a
+/// completion: on the timeout (`ETIME`) or a signal (`EINTR`, not retried by
+/// io-uring 0.6); the next turn waits again. Any other error leaves
+/// possibly-in-flight ops we can neither reap nor cancel; going on could free
+/// a live buffer, so we abort instead (safety over uptime).
+fn reap(state: &mut StorageState) {
+    let args = types::SubmitArgs::new().timespec(&REAP_WAIT);
+    match state.ring.submitter().submit_with_args(1, &args) {
+        Ok(_) => {}
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::ETIME)) => {}
+        Err(e) => {
+            eprintln!(
+                "luradb storage ring: unrecoverable submit error, \
+                 aborting to avoid a use-after-free on an in-flight op: {e}"
+            );
+            std::process::abort();
+        }
     }
-    done
+    for entry in state.ring.completion() {
+        state.unreaped -= 1;
+        let Some(p) = &mut state.wals[entry.user_data() as usize / 2].pending else { continue };
+        let synced = entry.user_data() % 2 == 1;
+        #[cfg(test)]
+        p.stamps.complete(synced);
+        if synced {
+            p.synced = Some(entry.result());
+        } else {
+            p.wrote = Some(entry.result());
+        }
+    }
+}
+
+/// Takes in each write whose chain is reaped: answers its requests once the
+/// write has its outcome, or leaves the rest of a short write for the next
+/// chain.
+fn take_reaped(state: &mut StorageState) {
+    for index in 0..state.wals.len() {
+        #[cfg(test)]
+        if state.faults.held == Some(state.wals[index].engine) {
+            continue;
+        }
+        let Some(completed) = state.wals[index].pending.as_ref().and_then(|p| p.wrote.zip(p.synced)) else { continue };
+        let Some(mut p) = state.wals[index].pending.take() else { continue };
+        match take_chain(state, &mut p, completed) {
+            None => {
+                (p.on_ring, p.wrote, p.synced) = (false, None, None);
+                state.wals[index].pending = Some(p);
+            }
+            Some(result) => {
+                #[cfg(test)]
+                if result.is_ok() {
+                    crate::core::write_trace::hub_answered(p.picked, p.write.engine, p.write.parts.iter().map(|part| part.2));
+                }
+                answer(&p.write, p.responses, result);
+            }
+        }
+    }
 }
 
 /// The index of `engine`'s file, once its end is safe for an append at the
@@ -835,84 +1059,6 @@ fn build_ring(sqpoll_enabled: bool, idle_ms: u32, depth: u32) -> Result<(IoUring
     }
     let ring = IoUring::new(depth).context("io_uring standard setup")?;
     Ok((ring, false))
-}
-
-/// One file's chain on the ring: a write of `data` at `offset`, linked to an
-/// fdatasync of the file.
-struct Chain<'a> {
-    file: RingFile,
-    offset: u64,
-    data: &'a [u8],
-}
-
-/// Submits the chains the submission queue has room for, all at once, and
-/// reaps them; returns per submitted chain, in order, the results of its
-/// write and of its fdatasync. The kernel runs a chain's fdatasync only once
-/// its write has landed in full and cancels it otherwise. A completion's
-/// `user_data` names its chain and step.
-///
-/// Once the SQEs are published, the kernel (in SQPOLL mode, its poll thread)
-/// may run them at any time, so we MUST reap every completion before
-/// returning: the caller frees the referenced buffers on return, and an
-/// in-flight op would then read or write freed heap. `submit_and_wait` does
-/// not retry `EINTR` itself (io-uring 0.6) and can return before all
-/// completions are queued (e.g. a signal at shutdown), so we re-enter until
-/// they are. Any other error leaves possibly-in-flight ops we can neither
-/// reap nor cancel; returning would free a live buffer, so we abort instead
-/// (safety over uptime).
-fn ring_chains(ring: &mut IoUring, chains: &[Chain<'_>]) -> Vec<(i32, i32)> {
-    #[cfg(test)]
-    let mut stamps = crate::core::write_trace::ChainStamps::start();
-    let mut results = Vec::with_capacity(chains.len());
-    {
-        let mut sq = ring.submission();
-        for (index, chain) in chains.iter().enumerate() {
-            // An SQE takes a u32 length; the rest of a longer write follows in
-            // the file's next chain, as after a short write.
-            let len = chain.data.len().min(u32::MAX as usize) as u32;
-            let write = write_entry(chain.file, chain.data.as_ptr(), len, chain.offset)
-                .flags(squeue::Flags::IO_LINK)
-                .user_data(2 * index as u64);
-            let sync = fsync_entry(chain.file).user_data(2 * index as u64 + 1);
-            // Safe: the caller keeps the buffers alive, and the loop below
-            // reaps every op (or aborts) before returning.
-            if unsafe { sq.push_multiple(&[write, sync]) }.is_err() {
-                break;
-            }
-            results.push((0, 0));
-        }
-    }
-    let mut unreaped = 2 * results.len();
-    while unreaped > 0 {
-        let wait = unreaped;
-        #[cfg(test)]
-        let wait = stamps.wait(wait);
-        match ring.submit_and_wait(wait) {
-            Ok(_) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
-            Err(e) => {
-                eprintln!(
-                    "luradb storage ring: unrecoverable submit_and_wait error, \
-                     aborting to avoid a use-after-free on an in-flight op: {e}"
-                );
-                std::process::abort();
-            }
-        }
-        for entry in ring.completion() {
-            #[cfg(test)]
-            stamps.complete(entry.user_data());
-            let (write, sync) = &mut results[entry.user_data() as usize / 2];
-            if entry.user_data() % 2 == 0 {
-                *write = entry.result();
-            } else {
-                *sync = entry.result();
-            }
-            unreaped -= 1;
-        }
-    }
-    #[cfg(test)]
-    stamps.finish();
-    results
 }
 
 /// Builds a Write SQE for either a fixed-file slot or a raw fd.
@@ -1254,6 +1400,29 @@ mod tests {
         assert_eq!(kept[0].try_recv().unwrap().unwrap(), (8, 1));
     }
 
+    // A request queued behind a refused append still runs when the hub
+    // stops: the truncate a log of the earlier format waits for is answered.
+    #[test]
+    fn test_stopping_hub_runs_a_request_behind_a_refused_append() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        std::fs::write(&wals[0].1, delete_record(1, b"earlier")).unwrap();
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(2, b"refused")]);
+        let (response, mut truncated) = oneshot::channel();
+        let rest = [IoRequest::WalTruncate { engine: WalTarget::Kv, response }, IoRequest::Shutdown];
+        for request in batch.into_iter().chain(rest) {
+            tx.try_send(request).unwrap();
+        }
+        event_loop(&mut state, &mut rx, &AtomicBool::new(false));
+
+        assert!(refused[0].try_recv().unwrap().is_err());
+        truncated.try_recv().unwrap().unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), WAL_MAGIC);
+    }
+
     // A crash while the header was written leaves a part of it; the start
     // writes the header again.
     #[test]
@@ -1410,6 +1579,225 @@ mod tests {
             assert_eq!(appended[1].try_recv().unwrap().unwrap(), (34, 2));
             assert_eq!(recovered_keys(&wals[0].1).await, ["first", "second"]);
         })
+    }
+
+    // While one file's chain is held on its way, an append for another file
+    // is written and answered; the held file's append is answered once its
+    // chain is taken in. With SQPOLL too.
+    #[test]
+    fn test_another_file_commits_while_a_chain_is_on_its_way() {
+        use WalTarget::{Json, Kv};
+        for sqpoll in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (mut state, _) = open_state(&cfg(sqpoll, 64), &wal_paths(dir.path(), &[Kv, Json])).unwrap();
+            state.faults.held = Some(Kv);
+
+            let (batch, mut kv) = appends(&[Kv]);
+            process_batch(&mut state, batch);
+            let (batch, mut json) = appends(&[Json]);
+            process_batch(&mut state, batch);
+            assert_eq!(json[0].try_recv().unwrap().unwrap(), (8, 1));
+            assert!(kv[0].try_recv().is_err());
+            assert_eq!(state.stats, HubStats { appends: 2, batches: 2, fdatasyncs: 1 });
+
+            state.faults.held = None;
+            process_batch(&mut state, Vec::new());
+            assert_eq!(kv[0].try_recv().unwrap().unwrap(), (8, 1));
+            assert_eq!(state.stats.fdatasyncs, 2);
+        }
+    }
+
+    /// A pipe with a full buffer and its size: a write to it waits until the
+    /// reader takes bytes.
+    fn full_pipe() -> (std::io::PipeReader, std::io::PipeWriter, usize) {
+        use std::io::Write;
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        // SAFETY: F_GETPIPE_SZ reads the size of the pipe behind a valid fd.
+        let size = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        let size = usize::try_from(size).unwrap();
+        writer.write_all(&vec![0; size]).unwrap();
+        (reader, writer, size)
+    }
+
+    /// The answer on `rx`; `None` if none comes within ten seconds, so a hub
+    /// that never looks fails the test instead of hanging it.
+    fn answer_in_time<T>(mut rx: oneshot::Receiver<T>) -> Option<T> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(answer) => return Some(answer),
+                Err(oneshot::error::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    // While one file's chain waits on the ring, the running hub takes in an
+    // append for another file and commits it; the waiting chain is answered
+    // once its write lands.
+    #[test]
+    fn test_running_hub_commits_another_file_while_a_chain_waits_on_the_ring() {
+        use std::io::Read;
+        use WalTarget::{Json, Kv};
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[Kv, Json]);
+        let json_path = wals[1].1.clone();
+        let (mut reader, writer, filled) = full_pipe();
+        let (tx, mut rx) = mpsc::channel(8);
+        let hub = std::thread::spawn(move || {
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            assert!(state.fixed_files);
+            // The key-value file's slot holds the full pipe: its write waits for the reader.
+            state.ring.submitter().register_files_update(0, &[writer.as_raw_fd()]).unwrap();
+            event_loop(&mut state, &mut rx, &AtomicBool::new(false));
+        });
+
+        let (batch, mut kv) = appends(&[Kv]);
+        let (head, head_rx) = oneshot::channel();
+        // Answered in the turn that starts the key-value chain, or after it.
+        for request in batch.into_iter().chain([IoRequest::WalHeadLsn { engine: Json, response: head }]) {
+            tx.try_send(request).unwrap();
+        }
+        let json_answer = answer_in_time(head_rx).and_then(|_| {
+            let (batch, json) = appends(&[Json]);
+            batch.into_iter().for_each(|request| tx.try_send(request).unwrap());
+            answer_in_time(json.into_iter().next().unwrap())
+        });
+        let kv_waited = matches!(kv[0].try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        // The prefill and the key-value record with its LSN frame.
+        reader.read_exact(&mut vec![0; filled + 9]).unwrap();
+        let kv_answered = answer_in_time(kv.remove(0)).is_some();
+        tx.try_send(IoRequest::Shutdown).unwrap();
+        hub.join().unwrap();
+
+        assert_eq!(json_answer.map(|appended| appended.unwrap()), Some((8, 1)));
+        assert!(kv_waited);
+        assert!(kv_answered);
+        assert_eq!(std::fs::read(json_path).unwrap(), [&WAL_MAGIC[..], &framed(&[(1, b"x")])].concat());
+    }
+
+    // A hub that unwinds from a panic while a chain is on the ring must abort:
+    // dropping its state would free a buffer the kernel still writes from.
+    // Without a chain on the ring, or without a panic, it need not.
+    #[test]
+    fn test_unwinding_with_a_chain_on_the_ring_aborts() {
+        use std::io::Read;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut state, _) = open_state(&cfg(false, 64), &wal_paths(dir.path(), &[WalTarget::Kv])).unwrap();
+        let (mut reader, writer, filled) = full_pipe();
+        state.ring.submitter().register_files_update(0, &[writer.as_raw_fd()]).unwrap();
+        let (batch, _) = appends(&[WalTarget::Kv]);
+        batch.into_iter().for_each(|request| _ = accept(&mut state, request));
+        turn(&mut state);
+
+        assert!(must_abort(&state, true));
+        assert!(!must_abort(&state, false));
+        reader.read_exact(&mut vec![0; filled + 9]).unwrap();
+        while turn(&mut state) {}
+        assert!(!must_abort(&state, true));
+    }
+
+    // A file starts its next write only once its chain on its way is taken
+    // in: a second append waits behind the held chain, then goes in a submit
+    // of its own.
+    #[test]
+    fn test_a_file_waits_for_its_chain_on_its_way() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            state.faults.held = Some(WalTarget::Kv);
+
+            let (batch, mut first) = record_appends(WalTarget::Kv, vec![delete_record(1, b"first")]);
+            process_batch(&mut state, batch);
+            let (batch, mut second) = record_appends(WalTarget::Kv, vec![delete_record(2, b"second")]);
+            process_batch(&mut state, batch);
+            assert!(first[0].try_recv().is_err());
+            assert!(second[0].try_recv().is_err());
+            // The header and the first record with its LSN frame.
+            assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), 34);
+
+            state.faults.held = None;
+            process_batch(&mut state, Vec::new());
+            assert_eq!(first[0].try_recv().unwrap().unwrap(), (8, 1));
+            assert_eq!(second[0].try_recv().unwrap().unwrap(), (34, 2));
+            assert_eq!(state.stats, HubStats { appends: 2, batches: 2, fdatasyncs: 2 });
+            assert_eq!(recovered_keys(&wals[0].1).await, ["first", "second"]);
+        })
+    }
+
+    // A chain that fails while another file's chain is on its way cuts its
+    // own file back alone; the other chain commits.
+    #[test]
+    fn test_a_failed_chain_leaves_a_chain_on_its_way_committed() {
+        crate::core::engine_runtime::block_on(async {
+            use WalTarget::{Json, Kv};
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[Kv, Json]);
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            assert!(state.fixed_files);
+            state.faults.held = Some(Json);
+            let (batch, mut json) = record_appends(Json, vec![delete_record(1, b"json-1")]);
+            process_batch(&mut state, batch);
+
+            // Every write to the key-value WAL fails: its slot holds /dev/full.
+            let dev_full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+            state.ring.submitter().register_files_update(0, &[dev_full.as_raw_fd()]).unwrap();
+            let (batch, mut kv) = record_appends(Kv, vec![delete_record(1, b"kv-1")]);
+            process_batch(&mut state, batch);
+            let err = kv[0].try_recv().unwrap().unwrap_err();
+            assert!(err.to_string().starts_with("WAL append failed"), "{err}");
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), WAL_MAGIC);
+            assert!(json[0].try_recv().is_err());
+
+            state.faults.held = None;
+            process_batch(&mut state, Vec::new());
+            assert_eq!(json[0].try_recv().unwrap().unwrap(), (8, 1));
+            assert_eq!(recovered_keys(&wals[1].1).await, ["json-1"]);
+        })
+    }
+
+    // A truncate waits for the chain on its way of its own file alone: it
+    // runs beside another file's held chain, and behind its own file's.
+    #[test]
+    fn test_wal_truncate_waits_for_its_own_file_alone() {
+        use WalTarget::{Json, Kv};
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[Kv, Json]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        let truncate = |engine| {
+            let (response, rx) = oneshot::channel();
+            (IoRequest::WalTruncate { engine, response }, rx)
+        };
+
+        state.faults.held = Some(Json);
+        let (batch, mut json) = appends(&[Json]);
+        process_batch(&mut state, batch);
+        let (mut batch, mut kv) = appends(&[Kv]);
+        let (request, mut truncated) = truncate(Kv);
+        batch.push(request);
+        process_batch(&mut state, batch);
+        assert_eq!(kv[0].try_recv().unwrap().unwrap(), (8, 1));
+        truncated.try_recv().unwrap().unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), WAL_MAGIC);
+        assert!(json[0].try_recv().is_err());
+
+        state.faults.held = Some(Kv);
+        let (batch, mut kv) = appends(&[Kv]);
+        process_batch(&mut state, batch);
+        assert_eq!(json[0].try_recv().unwrap().unwrap(), (8, 1));
+        let (request, mut truncated) = truncate(Kv);
+        process_batch(&mut state, vec![request]);
+        assert!(truncated.try_recv().is_err());
+        assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), 17);
+
+        state.faults.held = None;
+        process_batch(&mut state, Vec::new());
+        assert_eq!(kv[0].try_recv().unwrap().unwrap(), (8, 2));
+        truncated.try_recv().unwrap().unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), WAL_MAGIC);
     }
 
     // A write that fails on one of four files fails that file's requests
@@ -1823,25 +2211,24 @@ mod tests {
     }
 
     // Registered (fixed) files: each WAL writes and syncs through its own
-    // slot, and each chain gets its own results.
+    // slot, and each write gets its own result.
     #[test]
     fn test_fixed_files_write_through_their_own_slots() {
+        use WalTarget::{Json, Kv};
         let dir = tempfile::TempDir::new().unwrap();
-        let kv = open_rw(&dir.path().join("kv.wal")).unwrap();
-        let json = open_rw(&dir.path().join("json.wal")).unwrap();
-        let (mut ring, _) = build_ring(false, 500, 64).unwrap();
-        ring.submitter()
-            .register_files(&[kv.as_raw_fd(), json.as_raw_fd()])
-            .unwrap();
+        let wals = wal_paths(dir.path(), &[Kv, Json]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        assert!(state.fixed_files);
 
-        let chains = [
-            Chain { file: RingFile::Fixed(1), offset: 0, data: b"fixed-json" },
-            Chain { file: RingFile::Fixed(0), offset: 0, data: b"fixed-kv" },
-        ];
-        assert_eq!(ring_chains(&mut ring, &chains), [(10, 0), (8, 0)]);
+        let (mut batch, mut json) = record_appends(Json, vec![b"fixed-json".to_vec()]);
+        let (kv_batch, mut kv) = record_appends(Kv, vec![b"fixed-kv".to_vec()]);
+        batch.extend(kv_batch);
+        process_batch(&mut state, batch);
+        assert_eq!(json[0].try_recv().unwrap().unwrap(), (8, 1));
+        assert_eq!(kv[0].try_recv().unwrap().unwrap(), (8, 1));
 
-        assert_eq!(std::fs::read(dir.path().join("kv.wal")).unwrap(), b"fixed-kv");
-        assert_eq!(std::fs::read(dir.path().join("json.wal")).unwrap(), b"fixed-json");
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), [&WAL_MAGIC[..], &framed(&[(1, b"fixed-kv")])].concat());
+        assert_eq!(std::fs::read(&wals[1].1).unwrap(), [&WAL_MAGIC[..], &framed(&[(1, b"fixed-json")])].concat());
     }
 
     // Integration: the key-value engine with its WAL on the hub and its

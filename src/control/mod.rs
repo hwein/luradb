@@ -112,6 +112,7 @@ impl DomainEntry {
 #[derive(Debug, Clone, Default)]
 pub struct Directory {
     entries: BTreeMap<(Engine, String), DomainEntry>,
+    generation: u64,
 }
 
 impl Directory {
@@ -137,6 +138,11 @@ impl Directory {
 
     pub fn get(&self, engine: Engine, name: &str) -> Option<&DomainEntry> {
         self.entries.get(&(engine, name.to_string()))
+    }
+
+    /// Counts the changes since the start: equal generations, equal directories.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn insert(&mut self, entry: DomainEntry) {
@@ -263,6 +269,9 @@ pub enum ShardCommand {
     /// answers with a sample of the shard's metrics, taken while its writes
     /// are held back.
     Sample { drained: oneshot::Sender<()>, sample: oneshot::Receiver<()>, reply: oneshot::Sender<MetricsSample> },
+    /// Applies `write` to the key-value domain `domain` in a task of its own,
+    /// beside the commands after it, and answers with the result.
+    WriteKv { domain: String, write: KvWrite, reply: oneshot::Sender<anyhow::Result<()>> },
     /// Answers at once, behind the commands before it.
     Ping { reply: oneshot::Sender<()> },
     /// Ends the command loop; the shard then shuts its engines down and
@@ -272,6 +281,27 @@ pub enum ShardCommand {
 
 /// Where a shard reports the final flush of each of its engines.
 pub type DrainReply = oneshot::Sender<Vec<(Engine, anyhow::Result<()>)>>;
+
+/// A single-key write to a key-value domain, as the domain's store runs it.
+#[derive(Debug)]
+pub enum KvWrite {
+    /// `ttl_secs` 0 = no expiry.
+    Put { key: Vec<u8>, value: Vec<u8>, ttl_secs: u64 },
+    Delete { key: Vec<u8> },
+    SetNull { key: Vec<u8> },
+}
+
+impl KvWrite {
+    async fn apply(self, registry: &DomainRegistry, domain: &str) -> anyhow::Result<()> {
+        let store = registry.store(domain).await?;
+        match self {
+            KvWrite::Put { key, value, ttl_secs: 0 } => store.put(&key, &value).await,
+            KvWrite::Put { key, value, ttl_secs } => store.put_with_ttl(&key, &value, ttl_secs).await,
+            KvWrite::Delete { key } => store.delete(&key).await,
+            KvWrite::SetNull { key } => store.set_null(&key).await,
+        }
+    }
+}
 
 /// Runs the commands for the shard of `owners` until a `Drain` arrives, and
 /// hands that one back; `None` once the control plane is gone.
@@ -314,6 +344,13 @@ pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedRecei
                 let taken = owners.kv.metrics().sample();
                 drop(drains);
                 let _ = reply.send(taken);
+            }
+            ShardCommand::WriteKv { domain, write, reply } => {
+                let registry = Arc::clone(&owners.kv);
+                compio::runtime::spawn(async move {
+                    let _ = reply.send(write.apply(&registry, &domain).await);
+                })
+                .detach();
             }
             ShardCommand::Ping { reply } => {
                 let _ = reply.send(());
@@ -489,6 +526,17 @@ impl ControlPlane {
         self.shards.iter().map(|shard| &shard.owners)
     }
 
+    /// The engines of the data shard that owns the domain `name`.
+    pub fn owners_of(&self, name: &str) -> &ShardOwners {
+        &self.owner(name).owners
+    }
+
+    /// Applies `write` to the key-value domain `domain` on the thread of the
+    /// data shard that owns it.
+    pub async fn write_kv(&self, domain: &str, write: KvWrite) -> anyhow::Result<()> {
+        self.owner(domain).request(|reply| ShardCommand::WriteKv { domain: domain.to_string(), write, reply }).await?
+    }
+
     /// Pings every data shard over its command channel, all at once: by
     /// shard index, whether it answered within `timeout`.
     #[allow(clippy::disallowed_methods, reason = "called by GET /health, which runs on the frontend runtime")]
@@ -562,7 +610,10 @@ impl ControlPlane {
     }
 
     fn change_directory(&self, change: impl FnOnce(&mut Directory)) {
-        change(Arc::make_mut(&mut self.directory.write()));
+        let mut current = self.directory.write();
+        let directory = Arc::make_mut(&mut current);
+        change(directory);
+        directory.generation += 1;
     }
 }
 
@@ -726,6 +777,38 @@ pub(crate) mod testing {
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let config = crate::engines::lsm::domain::DomainConfig::default();
         Arc::new(DomainRegistry::recover(engine, config, metrics).await.unwrap())
+    }
+
+    /// `n` data shards' key-value engines writing one log through `hub`,
+    /// `tune` applied to engine `k` before it is shared; only the shard that
+    /// owns the default domain creates it.
+    pub(crate) async fn kv_shards(
+        dir: &Path,
+        hub: &crate::core::storage_thread::TestHub,
+        n: u16,
+        mut tune: impl FnMut(usize, &mut LsmStorageEngine),
+    ) -> Vec<ShardOwners> {
+        use crate::engines::lsm::engine::{LsmEngineOptions, Recovery};
+        let mut shards = Vec::new();
+        for k in 0..usize::from(n) {
+            let at = dir.join(format!("kv-{k}"));
+            let fm = Arc::new(crate::storage::file_manager::FileManager::new(&at).await.unwrap());
+            let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&at));
+            let vlog_path = at.join("vlog");
+            let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
+            let wal = Arc::new(hub.wal(crate::core::storage_thread::WalTarget::Kv));
+            let options = LsmEngineOptions { recovery: Recovery::External, ..LsmEngineOptions::default() };
+            let mut engine =
+                LsmStorageEngine::new(wal, dir.join("kv.wal"), vlog, vlog_path, fm, mm, options).await.unwrap();
+            tune(k, &mut engine);
+            let owns_default = usize::from(slots::shard_of_domain("default", n)) == k;
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let config = crate::engines::lsm::domain::DomainConfig::default();
+            let registry =
+                DomainRegistry::recover_on_shard(Arc::new(engine), config, metrics, owns_default).await.unwrap();
+            shards.push(ShardOwners { kv: Arc::new(registry), json: None, rel: None });
+        }
+        shards
     }
 }
 
@@ -1129,37 +1212,6 @@ mod tests {
         })
     }
 
-    /// Two data shards' key-value engines writing one log through `hub`,
-    /// `tune` applied to engine `k` before it is shared; only the shard that
-    /// owns the default domain creates it.
-    async fn two_kv_shards(
-        dir: &std::path::Path,
-        hub: &crate::core::storage_thread::TestHub,
-        mut tune: impl FnMut(usize, &mut LsmStorageEngine),
-    ) -> Vec<ShardOwners> {
-        use crate::engines::lsm::engine::{LsmEngineOptions, Recovery};
-        let mut shards = Vec::new();
-        for k in 0..2 {
-            let at = dir.join(format!("kv-{k}"));
-            let fm = Arc::new(crate::storage::file_manager::FileManager::new(&at).await.unwrap());
-            let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&at));
-            let vlog_path = at.join("vlog");
-            let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
-            let wal = Arc::new(hub.wal(crate::core::storage_thread::WalTarget::Kv));
-            let options = LsmEngineOptions { recovery: Recovery::External, ..LsmEngineOptions::default() };
-            let mut engine =
-                LsmStorageEngine::new(wal, dir.join("kv.wal"), vlog, vlog_path, fm, mm, options).await.unwrap();
-            tune(k, &mut engine);
-            let owns_default = usize::from(slots::shard_of_domain("default", 2)) == k;
-            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-            let config = crate::engines::lsm::domain::DomainConfig::default();
-            let registry =
-                DomainRegistry::recover_on_shard(Arc::new(engine), config, metrics, owns_default).await.unwrap();
-            shards.push(ShardOwners { kv: Arc::new(registry), json: None, rel: None });
-        }
-        shards
-    }
-
     /// Two key-value shards and a control plane over them, with the hub
     /// their log runs through and each shard's engine. Every command reaches
     /// a shard through a relay that records it; a shard's relay holds its
@@ -1185,6 +1237,7 @@ mod tests {
             ShardCommand::Pin { .. } => "pin",
             ShardCommand::Confirm { .. } => "confirm",
             ShardCommand::Sample { .. } => "sample",
+            ShardCommand::WriteKv { .. } => "write",
             ShardCommand::Ping { .. } => "ping",
             ShardCommand::Drain { .. } => "drain",
         }
@@ -1197,7 +1250,7 @@ mod tests {
                 crate::core::storage_thread::WalTarget::Kv,
                 &dir.path().join("kv.wal"),
             )]);
-            let owners = two_kv_shards(dir.path(), &hub, tune).await;
+            let owners = testing::kv_shards(dir.path(), &hub, 2, tune).await;
             let engines = owners.iter().map(|shard| Arc::clone(shard.kv.engine())).collect();
             let registries = owners.iter().map(|shard| Arc::clone(&shard.kv)).collect();
             let commands = Arc::new(std::sync::Mutex::new(Vec::new()));

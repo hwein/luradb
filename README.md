@@ -171,8 +171,8 @@ threshold, plus MemTables being flushed.
 The shard count is fixed for a data directory: the automatic setting keeps
 the count an existing data directory was written with, also after an
 upgrade or a move to a host with another core count, and a start with a
-different count set explicitly is refused. Shared memory (`[shm]`) runs
-with a single shard.
+different count set explicitly is refused. Shared memory (`[shm]`) serves
+all shards: each snapshot is taken at one consistent point across them.
 
 ## License
 

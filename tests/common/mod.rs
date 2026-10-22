@@ -4,8 +4,8 @@ use luradb::core::storage_thread::{
 };
 use std::path::Path;
 
-/// A storage hub without SQPOLL that writes the key-value WAL at `wal_path`.
-pub fn start_kv_hub(wal_path: &Path) -> (StorageThread, StorageHandle) {
+/// A storage hub without SQPOLL that writes the WAL of each engine at its path.
+pub fn start_hub(wals: &[(WalTarget, &Path)]) -> (StorageThread, StorageHandle) {
     let config = StorageThreadConfig {
         sqpoll_enabled: false,
         sqpoll_idle_ms: SQPOLL_IDLE_MS,
@@ -13,5 +13,6 @@ pub fn start_kv_hub(wal_path: &Path) -> (StorageThread, StorageHandle) {
         channel_capacity: StorageConfig::default().wal_queue_capacity,
         cpu: STORAGE_THREAD_CPU,
     };
-    StorageThread::new(config, vec![(WalTarget::Kv, wal_path.to_path_buf())]).expect("storage hub")
+    let wals = wals.iter().map(|(target, path)| (*target, path.to_path_buf())).collect();
+    StorageThread::new(config, wals).expect("storage hub")
 }

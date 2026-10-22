@@ -33,12 +33,6 @@ pub(super) async fn shard_count(config: &LuraConfig, sys: &LsmStorageEngine, aut
         None if !system::layout_is_sharded(sys).await? && !legacy_files(config).await?.is_empty() => 1,
         None => return Ok(auto),
     };
-    if config.shm.enabled && stored > 1 {
-        anyhow::bail!(
-            "shm.enabled serves one data shard, but the data directory has {stored} data shards — run the shard \
-             migration tool"
-        );
-    }
     tracing::info!("Data shards: {stored}, as the data directory was written; the shard migration tool changes it.");
     Ok(stored)
 }
@@ -221,10 +215,10 @@ mod tests {
         })
     }
 
-    // A configured count is taken as it is; with shared memory, which serves
-    // one shard, a data directory written with two is refused.
+    // A configured count is taken as it is; with shared memory on, auto
+    // keeps the two shards the data directory was written with.
     #[test]
-    fn a_configured_count_wins_and_shared_memory_refuses_two_stored_shards() {
+    fn a_configured_count_wins_and_shared_memory_keeps_two_stored_shards() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let mut config = super::super::tests::test_config(dir.path());
@@ -235,8 +229,7 @@ mod tests {
             assert_eq!(on_twelve_cores(&config, &sys).await.unwrap(), 1);
             config.multicore.shards = 0;
             config.shm.enabled = true;
-            let err = on_twelve_cores(&config, &sys).await.unwrap_err().to_string();
-            assert!(err.contains("the data directory has 2 data shards"), "{err}");
+            assert_eq!(on_twelve_cores(&config, &sys).await.unwrap(), 2);
             sys.shutdown().await;
         })
     }

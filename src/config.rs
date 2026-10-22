@@ -1206,9 +1206,8 @@ impl Default for MulticoreConfig {
 
 impl MulticoreConfig {
     /// Startup validation: more permits or workers than `cores` would not
-    /// bound anything; both request channels need a slot. Shared memory
-    /// serves a single data shard.
-    pub fn validate(&self, cores: usize, shm_enabled: bool) -> anyhow::Result<()> {
+    /// bound anything; both request channels need a slot.
+    pub fn validate(&self, cores: usize) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.cpu_offload_threads <= cores,
             "invalid config: multicore.cpu_offload_threads ({}) must be 0 (auto) or 1 to {cores} (available cores)",
@@ -1218,11 +1217,6 @@ impl MulticoreConfig {
             self.frontend_workers <= cores,
             "invalid config: multicore.frontend_workers ({}) must be 0 (auto) or 1 to {cores} (available cores)",
             self.frontend_workers
-        );
-        anyhow::ensure!(
-            !(shm_enabled && self.shards > 1),
-            "invalid config: multicore.shards ({}) must be 0 (auto) or 1 while shm.enabled is true",
-            self.shards
         );
         anyhow::ensure!(
             self.shard_queue_capacity >= 1,
@@ -1533,13 +1527,13 @@ mod tests {
     #[test]
     fn test_multicore_validate_offload_threads_against_cores() {
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 0\n").unwrap();
-        assert!(config.multicore.validate(8, false).is_ok());
+        assert!(config.multicore.validate(8).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 8\n").unwrap();
-        assert!(config.multicore.validate(8, false).is_ok());
+        assert!(config.multicore.validate(8).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 9\n").unwrap();
-        assert_invalid(config.multicore.validate(8, false), "multicore.cpu_offload_threads (9)", "1 to 8");
+        assert_invalid(config.multicore.validate(8), "multicore.cpu_offload_threads (9)", "1 to 8");
     }
 
     // Defaults, then 0 (auto) up to the core count for the frontend workers,
@@ -1549,30 +1543,30 @@ mod tests {
         let config = LuraConfig::default();
         assert_eq!(config.multicore.frontend_workers, 0);
         assert_eq!(config.multicore.shard_queue_capacity, 1024);
-        assert!(config.multicore.validate(1, false).is_ok());
+        assert!(config.multicore.validate(1).is_ok());
 
         let config: LuraConfig =
             toml::from_str("[multicore]\nfrontend_workers = 8\nshard_queue_capacity = 1\n").unwrap();
-        assert!(config.multicore.validate(8, false).is_ok());
+        assert!(config.multicore.validate(8).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\nfrontend_workers = 9\n").unwrap();
-        assert_invalid(config.multicore.validate(8, false), "multicore.frontend_workers (9)", "1 to 8");
+        assert_invalid(config.multicore.validate(8), "multicore.frontend_workers (9)", "1 to 8");
 
         let config: LuraConfig = toml::from_str("[multicore]\nshard_queue_capacity = 0\n").unwrap();
-        assert_invalid(config.multicore.validate(8, false), "multicore.shard_queue_capacity (0)", "at least 1");
+        assert_invalid(config.multicore.validate(8), "multicore.shard_queue_capacity (0)", "at least 1");
     }
 
-    // Any data shard count starts; shared memory only with auto or one.
+    // Any data shard count starts, shared memory on or off.
     #[test]
-    fn test_multicore_shards_accept_any_count_but_one_with_shm() {
+    fn test_multicore_shards_accept_any_count_with_and_without_shm() {
         assert_eq!(LuraConfig::default().multicore.shards, 0);
-        for shards in [0, 1, 2, 16] {
-            let config: LuraConfig = toml::from_str(&format!("[multicore]\nshards = {shards}\n")).unwrap();
-            assert!(config.multicore.validate(8, false).is_ok(), "{shards}");
-            assert_eq!(config.multicore.validate(8, true).is_ok(), shards <= 1, "{shards}");
+        for shm in [false, true] {
+            for shards in [0, 1, 2, 16] {
+                let mut config: LuraConfig = toml::from_str(&format!("[multicore]\nshards = {shards}\n")).unwrap();
+                config.shm.enabled = shm;
+                assert!(config.multicore.validate(8).is_ok(), "{shards} shards, shm {shm}");
+            }
         }
-        let config: LuraConfig = toml::from_str("[multicore]\nshards = 2\n").unwrap();
-        assert_invalid(config.multicore.validate(8, true), "multicore.shards (2)", "shm.enabled");
     }
 
     // The removed bridge capacity is reported as unknown and has no effect.
@@ -1612,17 +1606,17 @@ mod tests {
         let config = LuraConfig::default();
         assert_eq!(config.multicore.reader_threads, 0);
         assert_eq!(config.multicore.reader_queue_capacity, 4096);
-        assert!(config.multicore.validate(1, false).is_ok());
+        assert!(config.multicore.validate(1).is_ok());
 
         let config: LuraConfig =
             toml::from_str("[multicore]\nreader_threads = 8\nreader_queue_capacity = 1\n").unwrap();
-        assert!(config.multicore.validate(8, false).is_ok());
+        assert!(config.multicore.validate(8).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\nreader_threads = 9\n").unwrap();
-        assert_invalid(config.multicore.validate(8, false), "multicore.reader_threads (9)", "1 to 8");
+        assert_invalid(config.multicore.validate(8), "multicore.reader_threads (9)", "1 to 8");
 
         let config: LuraConfig = toml::from_str("[multicore]\nreader_queue_capacity = 0\n").unwrap();
-        assert_invalid(config.multicore.validate(8, false), "multicore.reader_queue_capacity (0)", "at least 1");
+        assert_invalid(config.multicore.validate(8), "multicore.reader_queue_capacity (0)", "at least 1");
     }
 
     #[test]
@@ -2956,7 +2950,7 @@ flag = true
             config.rel.validate().unwrap();
             config.shm.validate().unwrap();
             config.shm.validate_registration_socket(&config.server).unwrap();
-            config.multicore.validate(1, config.shm.enabled).unwrap();
+            config.multicore.validate(1).unwrap();
         }
     }
 }

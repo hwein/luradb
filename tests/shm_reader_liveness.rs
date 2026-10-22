@@ -14,7 +14,10 @@
 
 mod common;
 
+use luradb::auth::AuthCache;
 use luradb::config::ShmConfig;
+use luradb::control::{serve_shard, system, ControlPlane, Owners, Shard, ShardOwners};
+use luradb::core::events::GlobalEventBus;
 use luradb::core::storage_thread::{StorageThread, WalTarget};
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::domain::{DomainConfig, DomainRegistry};
@@ -86,11 +89,11 @@ fn shm_reader_liveness_across_processes() {
             )
         };
 
-        let (registry, _hub, _db_dir) = make_registry().await;
+        let (control, _hub, _db_dir) = make_control().await;
         let listener = prepare_registration_socket(&sock.to_string_lossy()).expect("registration socket");
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let dispatcher = compio::runtime::spawn(ShmDispatcher::new(registry).run(events_rx, shutdown_rx.clone()));
+        let dispatcher = compio::runtime::spawn(ShmDispatcher::new(control).run(events_rx, shutdown_rx.clone()));
         let registration = compio::runtime::spawn(serve_registration(
             listener,
             RegistrationConfig {
@@ -149,11 +152,17 @@ fn shm_config(instance_id: &str, sock: &Path) -> ShmConfig {
     }
 }
 
-/// A key-value registry on a fresh store, with the storage hub that writes its WAL.
-async fn make_registry() -> (Arc<DomainRegistry>, StorageThread, tempfile::TempDir) {
+/// A control plane over one data shard with a key-value registry on a fresh
+/// store, with the storage hub that writes its and the system store's WALs.
+async fn make_control() -> (Arc<ControlPlane>, StorageThread, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let wal_path = dir.path().join("wal.log");
-    let (hub, handle) = common::start_kv_hub(&wal_path);
+    let system_dir = dir.path().join("sys");
+    std::fs::create_dir_all(&system_dir).expect("system dir");
+    let (hub, handle) =
+        common::start_hub(&[(WalTarget::Kv, &wal_path), (WalTarget::Sys, &system_dir.join(system::WAL_FILE))]);
+    let system_wal = WriteAheadLog::with_storage_handle(handle.clone(), WalTarget::Sys);
+    let system = system::open_with_wal(&system_dir, system_wal).await.expect("system store");
     let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));
     let vlog_path = dir.path().join("vlog.log");
     let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
@@ -175,7 +184,14 @@ async fn make_registry() -> (Arc<DomainRegistry>, StorageThread, tempfile::TempD
     let metrics = MetricsStore::new(MetricsConfig::default());
     let registry =
         Arc::new(DomainRegistry::recover(engine, DomainConfig::default(), metrics).await.unwrap());
-    (registry, hub, dir)
+    let owners = ShardOwners { kv: registry, json: None, rel: None };
+    let (commands, inbox) = tokio::sync::mpsc::unbounded_channel();
+    compio::runtime::spawn(serve_shard(owners.clone(), inbox)).detach();
+    let auth = Arc::new(AuthCache::new(Arc::clone(&system)));
+    let bus = Arc::new(GlobalEventBus::new(64, 64));
+    let owners = Owners { shards: vec![Shard { owners, commands }], auth };
+    let control = ControlPlane::start(owners, system, bus).await.expect("control plane");
+    (control, hub, dir)
 }
 
 /// Kills the child on drop, so a failing assertion cannot leak the process.

@@ -97,7 +97,7 @@ fn read_scaling() {
     luradb::core::engine_runtime::block_on(async {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
-        let (_hub, handle) = common::start_kv_hub(&wal_path);
+        let (_hub, handle) = common::start_hub(&[(WalTarget::Kv, &wal_path)]);
         let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));
         let vlog_path = dir.path().join("vlog.log");
         let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());

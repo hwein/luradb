@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     config.json.validate()?;
     config.rel.validate()?;
     config.shm.validate_registration_socket(&config.server)?;
-    config.multicore.validate(coop::available_cores(), config.shm.enabled)?;
+    config.multicore.validate(coop::available_cores())?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     tracing::info!("Starting LuraDB...");

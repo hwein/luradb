@@ -272,7 +272,7 @@ struct InstanceOutcome {
 /// then M drop-family cycles, all on the same TempDir.
 async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_count: usize) -> InstanceOutcome {
     let dir = TempDir::new().expect("tempdir for stress instance");
-    let (_hub, hub) = common::start_kv_hub(&dir.path().join("wal.log"));
+    let (_hub, hub) = common::start_hub(&[(WalTarget::Kv, &dir.path().join("wal.log"))]);
     let mut findings = Vec::new();
 
     match open_engine_or_finding(dir.path(), &hub, &format!("instance {instance} shutdown-init")).await {
@@ -330,7 +330,7 @@ async fn run_background_loader(id: usize, stop: Arc<AtomicBool>) {
         compaction_check_interval_ms: 5,
         ..Default::default()
     };
-    let (_hub, hub) = common::start_kv_hub(&dir.path().join("wal.log"));
+    let (_hub, hub) = common::start_hub(&[(WalTarget::Kv, &dir.path().join("wal.log"))]);
     let Ok(engine) = open_engine(dir.path(), &hub, config).await else { return };
     let engine = Arc::new(engine);
     engine.start_background_tasks();
@@ -437,7 +437,7 @@ fn self_test_conserves_evidence_on_verify_mismatch() {
         let dir = TempDir::new().unwrap();
         let artifact_dir = TempDir::new().unwrap();
 
-        let (_hub, hub) = common::start_kv_hub(&dir.path().join("wal.log"));
+        let (_hub, hub) = common::start_hub(&[(WalTarget::Kv, &dir.path().join("wal.log"))]);
         let engine = open_engine(dir.path(), &hub, stress_engine_config()).await.unwrap();
         let key = b"self-test-key".to_vec();
         let value = b"self-test-value".to_vec();

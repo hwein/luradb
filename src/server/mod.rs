@@ -173,13 +173,10 @@ fn frontend_workers(configured: usize, cores: usize) -> usize {
     }
 }
 
-/// Data shards: `configured`, or with `0` a quarter of the cores, 1 to 8 —
-/// 1 while shared memory is enabled, which serves a single shard.
-fn data_shards(configured: u16, cores: usize, shm_enabled: bool) -> u16 {
+/// Data shards: `configured`, or with `0` a quarter of the cores, 1 to 8.
+fn data_shards(configured: u16, cores: usize) -> u16 {
     if configured > 0 {
         configured
-    } else if shm_enabled {
-        1
     } else {
         (cores / 4).clamp(1, 8) as u16
     }
@@ -200,7 +197,7 @@ fn reader_threads(configured: usize, cores: usize, frontend: usize, shards: usiz
 fn core_split(config: &LuraConfig, cores: usize) -> (usize, u16, usize) {
     let multicore = &config.multicore;
     let frontend = frontend_workers(multicore.frontend_workers, cores);
-    let shards = data_shards(multicore.shards, cores, config.shm.enabled);
+    let shards = data_shards(multicore.shards, cores);
     (frontend, shards, reader_threads(multicore.reader_threads, cores, frontend, usize::from(shards)))
 }
 
@@ -1185,6 +1182,34 @@ mod tests {
         assert_eq!(events.iter().filter(|e| *e == "hub shutdown").count(), 1, "{events:?}");
     }
 
+    // With shared memory on, every data shard count starts, and shutdown
+    // stops the publisher, the dispatcher and the registration listener and
+    // unlinks the segments before any shard drains.
+    #[test]
+    fn shared_memory_stops_before_the_shards_drain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        let sock = dir.path().join("shm.sock");
+        cfg.shm.enabled = true;
+        cfg.shm.instance_id = format!("shutdown-order-{}", std::process::id());
+        cfg.shm.registration_socket_path = sock.to_string_lossy().into_owned();
+        cfg.shm.data_buffer_size = 1 << 20;
+        let (system_dir, shards) = (cfg.storage.system_dir.clone(), cfg.multicore.shards);
+        let state = format!("/dev/shm/luradb_{}_state", cfg.shm.instance_id);
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        assert!(sock.exists() && Path::new(&state).exists(), "shared memory is up");
+
+        server.shutdown().unwrap();
+        assert!(!sock.exists() && !Path::new(&state).exists(), "shared memory is gone");
+        let events = test_hook::recorded(&system_dir);
+        let stopped = events.iter().position(|e| e == "shm stopped").expect("shared memory stopped");
+        for shard in 0..shards {
+            let draining = format!("shard {shard} draining");
+            let draining = events.iter().position(|e| *e == draining).expect("a draining shard");
+            assert!(stopped < draining, "{events:?}");
+        }
+    }
+
     // Shutdown barrier: the JSON engine of shard 1 cannot flush (its SSTable
     // directory is read-only), so the JSON write-ahead log stays for the
     // next start, while the key-value and relational ones, flushed on both
@@ -1423,13 +1448,12 @@ mod tests {
         assert_eq!(split, [(1, 1, 1), (1, 1, 1), (2, 1, 1), (2, 2, 2), (2, 3, 5), (4, 8, 18), (4, 8, 50)]);
     }
 
-    // Configured values stand; shared memory keeps auto at one data shard.
+    // Configured values stand; shared memory does not change the split.
     #[test]
-    fn core_split_keeps_configured_values_and_one_shard_with_shm() {
+    fn core_split_keeps_configured_values_and_ignores_shm() {
         let mut config = LuraConfig::default();
         config.shm.enabled = true;
-        assert_eq!(core_split(&config, 32), (4, 1, 25));
-        config.shm.enabled = false;
+        assert_eq!(core_split(&config, 32), (4, 8, 18));
         config.multicore.shards = 3;
         config.multicore.frontend_workers = 1;
         config.multicore.reader_threads = 2;

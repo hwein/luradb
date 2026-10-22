@@ -2,9 +2,10 @@
 //! moves an old data directory into the shard layout, recovers every
 //! engine's write-ahead log onto the data shards' instances, starts the
 //! shards and releases them once the control plane is attached to all of
-//! them. It then serves the requests without a domain and, at the end,
-//! drains the shards, truncates each write-ahead log whose engine flushed on
-//! every shard, and stops the hub.
+//! them. It then serves the requests without a domain and the shared-memory
+//! clients and, at the end, stops shared memory, drains the shards,
+//! truncates each write-ahead log whose engine flushed on every shard, and
+//! stops the hub.
 
 use super::{
     layout,
@@ -31,8 +32,9 @@ use crate::{
         janitor::JanitorConfig,
     },
     engines::rel::RelEngine,
-    ipc::ShmManager,
+    ipc::{self, ShmManager},
     logging,
+    uds,
 };
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -95,21 +97,33 @@ struct Cluster {
     wals: Vec<(Engine, WriteAheadLog)>,
     system_store: Arc<LsmStorageEngine>,
     shm_manager: Option<Arc<ShmManager>>,
+    shm: Option<ShmServices>,
     storage_thread: StorageThread,
     #[cfg(test)]
     system_dir: String,
 }
 
 impl Cluster {
-    /// Drains every shard — the shard's requests end first — and truncates
-    /// the write-ahead log of each engine whose final flush succeeded on all
-    /// shards; then shuts the system store down, stops the storage hub, once,
-    /// and joins the shard threads.
+    /// Stops shared memory, then drains every shard — the shard's requests
+    /// end first — and truncates the write-ahead log of each engine whose
+    /// final flush succeeded on all shards; then shuts the system store
+    /// down, stops the storage hub, once, and joins the shard threads.
     async fn shutdown(self) {
         #[cfg(test)]
         let system_dir = self.system_dir.clone();
-        let Cluster { shards, loops, wals, system_store, shm_manager, mut storage_thread, .. } = self;
+        let Cluster { shards, loops, wals, system_store, shm_manager, shm, mut storage_thread, .. } = self;
         loops.store(true, Ordering::Relaxed);
+
+        // The publisher and the dispatcher take cuts and write through the
+        // shards: both end before the shards drain.
+        if let Some(shm) = shm {
+            shm.stop().await;
+        }
+        if let Some(shm) = &shm_manager {
+            shm.shutdown();
+            #[cfg(test)]
+            super::test_hook::record(&system_dir, "shm stopped".to_string());
+        }
 
         tracing::info!("Draining the data shards...");
         let mut replies = Vec::with_capacity(shards.len());
@@ -145,9 +159,6 @@ impl Cluster {
 
         tracing::info!("Shutting down system store...");
         system_store.shutdown().await;
-        if let Some(shm) = &shm_manager {
-            shm.shutdown();
-        }
         // The hub last: the shards and the system store wrote through it.
         #[cfg(test)]
         super::test_hook::record(&system_dir, "hub shutdown".to_string());
@@ -343,33 +354,39 @@ async fn bootstrap(
         }
     };
 
-    // Released, the shards start their purgers, sweepers and SHM.
+    // Released, the shards start their purgers and sweepers; then SHM.
     let mut reports = Vec::with_capacity(starts.len());
     for (start, state) in starts.into_iter().zip(&states) {
         let (started, report) = oneshot::channel();
         let _ = start.send(ShardStart { state: state.clone(), started });
         reports.push(report);
     }
-    let cluster = Cluster {
+    let mut cluster = Cluster {
         shards: threads,
         loops,
         wals,
         system_store,
         shm_manager,
+        shm: None,
         storage_thread,
         #[cfg(test)]
         system_dir: config.storage.system_dir.clone(),
     };
-    for report in reports {
-        let failed = match report.await {
-            Ok(Ok(())) => continue,
-            Ok(Err(e)) => e,
-            Err(_) => anyhow::anyhow!("a data shard stopped during startup"),
-        };
-        // The shards serve their lanes once released: those must go first.
-        drop(lanes);
-        cluster.shutdown().await;
-        return Err(failed);
+    let started = async {
+        for report in reports {
+            report.await.map_err(|_| anyhow::anyhow!("a data shard stopped during startup"))?;
+        }
+        cluster.shm_manager.as_ref().map(|manager| start_shm(config, manager, &states[0])).transpose()
+    }
+    .await;
+    match started {
+        Ok(shm) => cluster.shm = shm,
+        Err(e) => {
+            // The shards serve their lanes once released: those must go first.
+            drop(lanes);
+            cluster.shutdown().await;
+            return Err(e);
+        }
     }
     Ok((cluster, (lanes, states, trusted_cidrs)))
 }
@@ -594,8 +611,8 @@ fn init_log_access(cfg: &LuraConfig) -> Option<api::logs::LogAccessState> {
     Some(api::logs::LogAccessState { dir: std::path::PathBuf::from(&cfg.log.path), format: cfg.log.format.clone() })
 }
 
-/// The shared-memory segments, when SHM is enabled; shard 0 runs its
-/// services.
+/// The shared-memory segments, when SHM is enabled; the control plane runs
+/// their services.
 fn init_shm(cfg: &LuraConfig) -> anyhow::Result<Option<Arc<ShmManager>>> {
     if !cfg.shm.enabled {
         return Ok(None);
@@ -607,6 +624,74 @@ fn init_shm(cfg: &LuraConfig) -> anyhow::Result<Option<Arc<ShmManager>>> {
     }
     tracing::info!("SHM manager ready (instance '{}'): state/data_a/data_b segments created.", cfg.shm.instance_id);
     Ok(Some(Arc::new(manager)))
+}
+
+/// The SHM services, tasks of the control-plane thread.
+struct ShmServices {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    reg_task: compio::runtime::JoinHandle<()>,
+    dispatcher_task: compio::runtime::JoinHandle<()>,
+    publisher_task: compio::runtime::JoinHandle<()>,
+    reg_socket: String,
+}
+
+impl ShmServices {
+    /// Joins the services; the dispatcher drops its client connections on
+    /// exit, unlinking every per-client segment, and the registration socket
+    /// file is removed here.
+    async fn stop(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.reg_task.await;
+        let _ = self.dispatcher_task.await;
+        let _ = self.publisher_task.await;
+        uds::remove_socket_file(&self.reg_socket);
+    }
+}
+
+/// Starts the registration listener, the command dispatcher and the snapshot
+/// publisher over all data shards. Each client registers over its own UDS
+/// and gets a dedicated cmd/resp ring quartet; the dispatcher polls them all.
+/// The publisher counts into the metrics of shard 0's `state`.
+fn start_shm(cfg: &LuraConfig, manager: &Arc<ShmManager>, state: &AppState) -> anyhow::Result<ShmServices> {
+    let reg_path = cfg.shm.resolved_registration_socket_path();
+    let listener = ipc::prepare_registration_socket(&reg_path)?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dispatcher = ipc::ShmDispatcher::new(Arc::clone(&state.control));
+    let dispatcher_task = compio::runtime::spawn(dispatcher.run(events_rx, shutdown_rx.clone()));
+
+    // Reader slots of the registered clients: the registration listener
+    // leases them, the publisher scans them.
+    let readers = Arc::new(ipc::ReaderRegistry::new());
+
+    // RCU read-snapshot publisher: checks on an interval and after every
+    // flush, rebuilds the SHM double-buffer snapshot only after a change,
+    // and disconnects clients that block it longer than the kick threshold.
+    // A task of this thread's own runtime: SnapshotWriter is !Send.
+    let publisher = ipc::SnapshotPublisher::new(
+        ipc::SnapshotBuilder::new(Arc::clone(&state.control), cfg.shm.data_buffer_size),
+        Arc::clone(manager),
+        std::time::Duration::from_millis(cfg.shm.snapshot_interval_ms),
+        ipc::PUBLISH_WAIT_TIMEOUT_US,
+        Arc::clone(&readers),
+        Arc::clone(&state.metrics),
+        std::time::Duration::from_secs(cfg.shm.kick_blocking_client_after_secs),
+        shutdown_rx.clone(),
+    );
+    let publisher_task = compio::runtime::spawn(publisher.run());
+    tracing::info!("SHM snapshot publisher active (interval {} ms)", cfg.shm.snapshot_interval_ms);
+
+    let reg_config = ipc::RegistrationConfig {
+        instance_id: cfg.shm.instance_id.clone(),
+        ring_size: ipc::CLIENT_RING_SIZE,
+        segment_mode: ipc::SEGMENT_MODE,
+        auth_enabled: cfg.auth.enabled,
+        trusted_uids: Arc::new(cfg.auth.trusted_uids.clone()),
+        readers,
+    };
+    let reg_task = compio::runtime::spawn(ipc::serve_registration(listener, reg_config, events_tx, shutdown_rx));
+    tracing::info!("SHM registration listener active on {reg_path}");
+    Ok(ShmServices { shutdown_tx, reg_task, dispatcher_task, publisher_task, reg_socket: reg_path })
 }
 
 #[cfg(test)]

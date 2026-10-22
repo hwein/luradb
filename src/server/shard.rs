@@ -23,9 +23,7 @@ use crate::{
         ttl_sweeper::TtlSweeper,
     },
     engines::rel::{domain as rel_domain, RelEngine},
-    ipc,
     metrics::{MetricsConfig, MetricsStore, MetricsTicker},
-    uds,
 };
 use anyhow::Context;
 use std::future::Future;
@@ -52,10 +50,10 @@ pub(super) struct ShardBoot {
 }
 
 /// The release of a data shard by the control plane: its API state, and
-/// where it reports whether its loops and services run.
+/// where it reports that its loops run.
 pub(super) struct ShardStart {
     pub(super) state: AppState,
-    pub(super) started: oneshot::Sender<anyhow::Result<()>>,
+    pub(super) started: oneshot::Sender<()>,
 }
 
 /// Starts the thread of data shard `boot.shard`. It enters `frontend`'s
@@ -94,7 +92,9 @@ async fn run(boot: ShardBoot) {
     }
     let mut storage = Storage { instances, buffer_pool: None, io_engine: None };
     let opened = open(&mut storage, &boot).await;
-    let ShardBoot { shard, config, jobs, commands, ready, start, .. } = boot;
+    let ShardBoot { config, jobs, commands, ready, start, .. } = boot;
+    #[cfg(test)]
+    let shard = boot.shard;
     let owners = match opened {
         Ok(owners) => owners,
         Err(e) => {
@@ -118,16 +118,7 @@ async fn run(boot: ShardBoot) {
     super::test_hook::record(&config.storage.system_dir, format!("shard {shard} released"));
     compio::runtime::spawn(MetricsTicker::new(Arc::clone(owners.kv.metrics())).run()).detach();
     let loops = spawn_loops(&config, &owners);
-    let shm = match if shard == 0 { start_shm(&config, &state).await } else { Ok(None) } {
-        Ok(shm) => {
-            let _ = started.send(Ok(()));
-            shm
-        }
-        Err(e) => {
-            let _ = started.send(Err(e));
-            None
-        }
-    };
+    let _ = started.send(());
     let serving = compio::runtime::spawn(bridge::serve_engine(jobs, api::create_router(state)));
     #[cfg(test)]
     let commands = if super::test_hook::pings_silenced(&config.storage.system_dir, shard) {
@@ -136,12 +127,13 @@ async fn run(boot: ShardBoot) {
         commands
     };
     let drained = control::serve_shard(owners, commands).await;
+    #[cfg(test)]
+    super::test_hook::record(&config.storage.system_dir, format!("shard {shard} draining"));
 
     // Every sender of the shard's lane is gone by now; the request loop ends
     // after dropping the requests still in flight.
     let _ = serving.await;
     loops.stop().await;
-    stop_shm(shm).await;
     let flushed = close(&storage).await;
     if let Some(reply) = drained {
         let _ = reply.send(flushed);
@@ -349,80 +341,6 @@ fn spawn_loops(cfg: &LuraConfig, owners: &ShardOwners) -> Loops {
     }
 
     loops
-}
-
-struct ShmServices {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    reg_task: compio::runtime::JoinHandle<()>,
-    dispatcher_task: compio::runtime::JoinHandle<()>,
-    publisher_task: compio::runtime::JoinHandle<()>,
-    reg_socket: String,
-}
-
-// Shared Memory IPC: registration listener + command dispatcher. Each client
-// registers over its own UDS and gets a dedicated cmd/resp ring quartet; the
-// dispatcher polls them all. Runs on shard 0 when SHM is enabled, which needs
-// a single data shard.
-async fn start_shm(cfg: &LuraConfig, state: &AppState) -> anyhow::Result<Option<ShmServices>> {
-    let Some(shm_manager) = &state.shm_manager else { return Ok(None) };
-    let registry = &state.registry;
-    let lsm_store = registry.engine();
-    let reg_path = cfg.shm.resolved_registration_socket_path();
-    let listener = ipc::prepare_registration_socket(&reg_path)?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let dispatcher = ipc::ShmDispatcher::new(Arc::clone(registry));
-    let dispatcher_task = compio::runtime::spawn(dispatcher.run(events_rx, shutdown_rx.clone()));
-
-    // Reader slots of the registered clients: the registration listener
-    // leases them, the publisher scans them.
-    let readers = Arc::new(ipc::ReaderRegistry::new());
-
-    // RCU read-snapshot publisher: checks on an interval and after every
-    // flush, rebuilds the SHM double-buffer snapshot only after a change,
-    // and disconnects clients that block it longer than the kick threshold.
-    // A task of the shard thread's own runtime: SnapshotWriter is !Send.
-    let publisher = ipc::SnapshotPublisher::new(
-        ipc::SnapshotBuilder::new(Arc::clone(registry), Arc::clone(lsm_store), cfg.shm.data_buffer_size),
-        Arc::clone(shm_manager),
-        std::time::Duration::from_millis(cfg.shm.snapshot_interval_ms),
-        ipc::PUBLISH_WAIT_TIMEOUT_US,
-        Arc::clone(&readers),
-        lsm_store.flush_notify(),
-        Arc::clone(&state.metrics),
-        std::time::Duration::from_secs(cfg.shm.kick_blocking_client_after_secs),
-        shutdown_rx.clone(),
-    );
-    let publisher_task = compio::runtime::spawn(publisher.run());
-    tracing::info!("SHM snapshot publisher active (interval {} ms)", cfg.shm.snapshot_interval_ms);
-
-    let reg_config = ipc::RegistrationConfig {
-        instance_id: cfg.shm.instance_id.clone(),
-        ring_size: ipc::CLIENT_RING_SIZE,
-        segment_mode: ipc::SEGMENT_MODE,
-        auth_enabled: cfg.auth.enabled,
-        trusted_uids: Arc::new(cfg.auth.trusted_uids.clone()),
-        readers,
-    };
-    let reg_task = compio::runtime::spawn(ipc::serve_registration(listener, reg_config, events_tx, shutdown_rx));
-    tracing::info!("SHM registration listener active on {reg_path}");
-    Ok(Some(ShmServices { shutdown_tx, reg_task, dispatcher_task, publisher_task, reg_socket: reg_path }))
-}
-
-async fn stop_shm(services: Option<ShmServices>) {
-    // Stop the SHM registration listener and command dispatcher before the
-    // engines shut down (the dispatcher runs commands against them). The
-    // dispatcher task drops its ClientConnections on exit, unlinking every
-    // per-client segment; the registration socket file is removed here.
-    if let Some(services) = services {
-        let _ = services.shutdown_tx.send(true);
-        let _ = services.reg_task.await;
-        let _ = services.dispatcher_task.await;
-        // Join the snapshot publisher before the engines shut down (its build
-        // step reads them).
-        let _ = services.publisher_task.await;
-        uds::remove_socket_file(&services.reg_socket);
-    }
 }
 
 /// Relays `commands` but keeps every ping unanswered until the control plane

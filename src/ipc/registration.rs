@@ -353,7 +353,9 @@ mod tests {
         let (sd_tx, sd_rx) = watch::channel(false);
         let instance_id = unique_instance();
         let readers = Arc::new(ReaderRegistry::new());
-        let disp = compio::runtime::spawn(ShmDispatcher::new(registry).run(events_rx, sd_rx.clone()));
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
+        let (control, _) = crate::control::testing::start(sockdir.path(), registry, None, None, bus).await;
+        let disp = compio::runtime::spawn(ShmDispatcher::new(control).run(events_rx, sd_rx.clone()));
         let reg = compio::runtime::spawn(serve_registration(
             listener,
             RegistrationConfig {

@@ -65,7 +65,7 @@ LuraDB spreads its domains over several data shards; each shard is one thread wi
 The `[multicore]` keys size each part; `0` is automatic:
 
 - `frontend_workers`: cores / 6, 2 to 4 (1 below 4 cores).
-- `shards`: the count an existing data directory was written with; for a new one cores / 4, 1 to 8 (1 while `[shm]` is enabled, which needs a single shard).
+- `shards`: the count an existing data directory was written with; for a new one cores / 4, 1 to 8.
 - `reader_threads`: cores − 2 − frontend workers − shards, at least 1.
 
 On 12 cores with a new data directory that is 2 frontend workers, 3 data shards and 5 reader threads; the start log (`journalctl -u luradb`) reports the split and the memory of each shard.

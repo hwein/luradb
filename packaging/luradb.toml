@@ -85,9 +85,8 @@ frontend_workers = 0
 # Data shards, each a thread with its own storage engines that writes the
 # domains assigned to it. The data directory layout depends on it: 0 keeps
 # the count an existing data directory was written with, and gives a new one
-# cores / 4, 1 to 8 (1 while shm is enabled, which needs a single shard). A
-# set count that differs from the one the data was written with refuses the
-# start.
+# cores / 4, 1 to 8. A set count that differs from the one the data was
+# written with refuses the start.
 shards = 0
 # Requests one data shard takes at once, running or waiting; further requests
 # are answered with 503 and Retry-After: 1. At least 1.
@@ -296,8 +295,10 @@ data_buffer_size = 268435456
 # differ from the Unix socket of the server section.
 registration_socket_path = "/run/luradb/{instance_id}.sock"
 # How often, in milliseconds, the snapshot is checked for changes; it is
-# rebuilt only after a change.
-# Lower values mean fresher snapshots and more CPU load.
+# rebuilt only after a change, from one consistent point across all data
+# shards.
+# Lower values mean fresher snapshots and more CPU load; every rebuild briefly
+# holds back the writes of all data shards.
 snapshot_interval_ms = 100
 # Seconds a client may keep the snapshot from being updated, by holding on to
 # a read of the old one, before the server disconnects it; 0 = never.

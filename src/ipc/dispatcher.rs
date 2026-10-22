@@ -1,14 +1,15 @@
-//! Server-side command dispatcher (spec perf/008 §8 + Multi-Client).
+//! Server-side command dispatcher.
 //!
 //! Owns one [`ClientConnection`] per registered client — each a cmd
 //! `RingConsumer` plus a resp `RingProducer` over that client's shm quartet —
 //! and polls them all in a single adaptive loop: no pause while any ring yields
 //! work; once every ring is empty it parks until a client rings its doorbell
-//! pipe or the fallback tick expires (spec perf/014). New clients arrive
-//! over a channel from the registration listener; a disconnect, or a corrupt
-//! cmd ring from one client, drops just that connection (its `ClientShm`
-//! unlinks the segments, its doorbell fd closes). Command semantics match the
-//! REST handlers in `api::kv`.
+//! pipe or the fallback tick expires. New clients arrive over a channel from
+//! the registration listener; a disconnect, or a corrupt cmd ring from one
+//! client, drops just that connection (its `ClientShm` unlinks the segments,
+//! its doorbell fd closes). Command semantics match the REST handlers in
+//! `api::kv`: reads run here against the engines of the shard that owns the
+//! domain, writes on that shard's thread.
 
 use super::commands::{ShmCommand, ShmGetValue, ShmResponse};
 use super::protocol::{ReaderSlot, READER_SLOT_OFFSET};
@@ -17,6 +18,7 @@ use super::ringbuffer::{
     DoubleMmapRegion, RingConsumer, RingCorrupt, RingProducer, RingSendError, RingbufferHeader,
 };
 use super::shm::ClientShm;
+use crate::control::{ControlPlane, KvWrite};
 use crate::engines::lsm::{DomainRegistry, DomainStore, GetResult};
 use std::any::Any;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -123,12 +125,12 @@ impl ClientConnection {
     /// and writing its response, then returns so the dispatcher can serve other
     /// clients and re-check shutdown. `Err` = the cmd ring framing is corrupt
     /// (untrusted producer); the caller drops this client.
-    async fn drain(&mut self, registry: &DomainRegistry) -> Result<usize, RingCorrupt> {
+    async fn drain(&mut self, control: &ControlPlane) -> Result<usize, RingCorrupt> {
         let mut processed = 0;
         while processed < DRAIN_BATCH {
             let Some(raw) = self.consumer.recv()? else { break };
             let response = match ShmCommand::decode(&raw) {
-                Ok(cmd) => execute(registry, cmd).await,
+                Ok(cmd) => execute(control, cmd).await,
                 Err(e) => {
                     // Well-framed but invalid payload: reject just this message,
                     // keep the ring alive (request_id unknown).
@@ -229,20 +231,20 @@ fn new_doorbell() -> std::io::Result<(AsyncFd<OwnedFd>, OwnedFd)> {
 /// Polls every registered client's rings and dispatches their commands.
 pub struct ShmDispatcher {
     clients: Vec<ClientConnection>,
-    registry: Arc<DomainRegistry>,
+    control: Arc<ControlPlane>,
     /// `FALLBACK_TICK` outside tests.
     idle_tick: Duration,
 }
 
 impl ShmDispatcher {
-    pub fn new(registry: Arc<DomainRegistry>) -> Self {
-        Self { clients: Vec::new(), registry, idle_tick: FALLBACK_TICK }
+    pub fn new(control: Arc<ControlPlane>) -> Self {
+        Self { clients: Vec::new(), control, idle_tick: FALLBACK_TICK }
     }
 
     /// A tick out of reach leaves the doorbell as the only idle wakeup.
     #[cfg(test)]
-    fn with_idle_tick(registry: Arc<DomainRegistry>, idle_tick: Duration) -> Self {
-        Self { idle_tick, ..Self::new(registry) }
+    fn with_idle_tick(control: Arc<ControlPlane>, idle_tick: Duration) -> Self {
+        Self { idle_tick, ..Self::new(control) }
     }
 
     /// Runs until `shutdown` flips. Consumes `self`, so returning drops every
@@ -285,7 +287,7 @@ impl ShmDispatcher {
         let mut any_work = false;
         let mut corrupt: Vec<u64> = Vec::new();
         for conn in &mut self.clients {
-            match conn.drain(&self.registry).await {
+            match conn.drain(&self.control).await {
                 Ok(0) => {}
                 Ok(_) => any_work = true,
                 Err(e) => {
@@ -333,25 +335,25 @@ impl ShmDispatcher {
 }
 
 /// Flat delegation: each command arm is a private async helper, keeping this
-/// function's cognitive complexity low (spec quality/003). No atomics here —
-/// the ring atomics live in `respond`/`send_retrying`.
-async fn execute(registry: &DomainRegistry, cmd: ShmCommand) -> ShmResponse {
+/// function's cognitive complexity low. No atomics here — the ring atomics
+/// live in `respond`/`send_retrying`.
+async fn execute(control: &ControlPlane, cmd: ShmCommand) -> ShmResponse {
     match cmd {
         ShmCommand::Ping { request_id } => ShmResponse::Pong { request_id },
         ShmCommand::Get { request_id, domain, key } => {
-            handle_get(registry, request_id, domain, key).await
+            handle_get(&control.owners_of(&domain).kv, request_id, domain, key).await
         }
         ShmCommand::Put { request_id, domain, key, value, ttl_secs } => {
-            handle_put(registry, request_id, domain, key, value, ttl_secs).await
+            handle_write(control, request_id, domain, KvWrite::Put { key, value, ttl_secs }).await
         }
         ShmCommand::Delete { request_id, domain, key } => {
-            handle_delete(registry, request_id, domain, key).await
+            handle_write(control, request_id, domain, KvWrite::Delete { key }).await
         }
         ShmCommand::SetNull { request_id, domain, key } => {
-            handle_set_null(registry, request_id, domain, key).await
+            handle_write(control, request_id, domain, KvWrite::SetNull { key }).await
         }
         ShmCommand::ScanKeys { request_id, domain, prefix } => {
-            handle_scan_keys(registry, request_id, domain, prefix).await
+            handle_scan_keys(&control.owners_of(&domain).kv, request_id, domain, prefix).await
         }
     }
 }
@@ -374,46 +376,8 @@ async fn handle_get(registry: &DomainRegistry, request_id: u64, domain: String, 
     }
 }
 
-async fn handle_put(
-    registry: &DomainRegistry,
-    request_id: u64,
-    domain: String,
-    key: Vec<u8>,
-    value: Vec<u8>,
-    ttl_secs: u64,
-) -> ShmResponse {
-    let store = match resolve(registry, &domain, request_id).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let result = if ttl_secs == 0 {
-        store.put(&key, &value).await
-    } else {
-        store.put_with_ttl(&key, &value, ttl_secs).await
-    };
-    match result {
-        Ok(()) => ShmResponse::Ok { request_id },
-        Err(e) => error_response(request_id, e),
-    }
-}
-
-async fn handle_delete(registry: &DomainRegistry, request_id: u64, domain: String, key: Vec<u8>) -> ShmResponse {
-    let store = match resolve(registry, &domain, request_id).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    match store.delete(&key).await {
-        Ok(()) => ShmResponse::Ok { request_id },
-        Err(e) => error_response(request_id, e),
-    }
-}
-
-async fn handle_set_null(registry: &DomainRegistry, request_id: u64, domain: String, key: Vec<u8>) -> ShmResponse {
-    let store = match resolve(registry, &domain, request_id).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    match store.set_null(&key).await {
+async fn handle_write(control: &ControlPlane, request_id: u64, domain: String, write: KvWrite) -> ShmResponse {
+    match control.write_kv(&domain, write).await {
         Ok(()) => ShmResponse::Ok { request_id },
         Err(e) => error_response(request_id, e),
     }
@@ -545,6 +509,7 @@ mod tests {
 
     struct Harness {
         registry: Arc<DomainRegistry>,
+        control: Arc<ControlPlane>,
         conn: ClientConnection,
         client_tx: RingProducer,
         client_rx: RingConsumer,
@@ -557,11 +522,30 @@ mod tests {
     }
 
     async fn harness_sized(ring: usize) -> Harness {
-        let (registry, dir) = make_registry().await;
+        let (control, registry, dir) = make_control().await;
+        harness_over(control, registry, dir, ring)
+    }
+
+    /// A client connected to a dispatcher over `control`; `registry` is the
+    /// one the test checks.
+    fn harness_over(
+        control: Arc<ControlPlane>,
+        registry: Arc<DomainRegistry>,
+        dir: tempfile::TempDir,
+        ring: usize,
+    ) -> Harness {
         let (client_tx, server_rx, cd, ch) = ring_ends(ring);
         let (server_tx, client_rx, rd, rh) = ring_ends(ring);
         let (conn, _) = raw_connection(0, server_rx, server_tx);
-        Harness { registry, conn, client_tx, client_rx, _dir: dir, _segs: [cd, ch, rd, rh] }
+        Harness { registry, control, conn, client_tx, client_rx, _dir: dir, _segs: [cd, ch, rd, rh] }
+    }
+
+    /// A control plane over a single data shard with the registry returned.
+    async fn make_control() -> (Arc<ControlPlane>, Arc<DomainRegistry>, tempfile::TempDir) {
+        let (registry, dir) = make_registry().await;
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
+        let (control, _) = crate::control::testing::start(dir.path(), Arc::clone(&registry), None, None, bus).await;
+        (control, registry, dir)
     }
 
     async fn make_registry() -> (Arc<DomainRegistry>, tempfile::TempDir) {
@@ -600,7 +584,7 @@ mod tests {
 
     async fn send_and_dispatch(h: &mut Harness, cmd: ShmCommand) -> ShmResponse {
         h.client_tx.send(cmd.encode().as_slice()).unwrap();
-        h.conn.drain(&h.registry).await.unwrap();
+        h.conn.drain(&h.control).await.unwrap();
         let raw = h.client_rx.recv().unwrap().expect("a response frame");
         ShmResponse::decode(&raw).unwrap()
     }
@@ -787,13 +771,63 @@ mod tests {
         })
     }
 
+    // With two data shards, the commands for a domain of shard 1 write to and
+    // read from that shard's engine; a domain nobody has answers 404 as before.
+    #[test]
+    fn test_commands_for_a_domain_of_shard_1_reach_its_engine() {
+        use crate::core::storage_thread::{TestHub, WalTarget};
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hub = TestHub::start(&[(WalTarget::Kv, &dir.path().join("kv.wal"))]);
+            let shards = crate::control::testing::kv_shards(dir.path(), &hub, 2, |_, _| {}).await;
+            let registries: Vec<_> = shards.iter().map(|shard| Arc::clone(&shard.kv)).collect();
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
+            let (control, _) = crate::control::testing::start_shards(dir.path(), shards, bus).await;
+            let name = crate::control::slots::domain_name_for_shard(1, 2, 25);
+            control.create_domain(crate::control::Engine::Kv, &name, false).await.unwrap();
+            let mut h = harness_over(control, Arc::clone(&registries[1]), dir, 4096);
+
+            let put = ShmCommand::Put {
+                request_id: 1,
+                domain: name.clone(),
+                key: b"k".to_vec(),
+                value: "clé".as_bytes().to_vec(),
+                ttl_secs: 0,
+            };
+            assert_eq!(send_and_dispatch(&mut h, put).await, ShmResponse::Ok { request_id: 1 });
+            let stored = registries[1].store(&name).await.unwrap().get(b"k").await.unwrap();
+            assert_eq!(stored, GetResult::Present("clé".as_bytes().to_vec()));
+            assert!(registries[0].store(&name).await.is_err(), "shard 0 does not have the domain");
+
+            let get = ShmCommand::Get { request_id: 2, domain: name.clone(), key: b"k".to_vec() };
+            assert_eq!(
+                send_and_dispatch(&mut h, get).await,
+                ShmResponse::GetOk { request_id: 2, value: ShmGetValue::Present("clé".as_bytes().to_vec()) }
+            );
+            let scan = ShmCommand::ScanKeys { request_id: 3, domain: name.clone(), prefix: Vec::new() };
+            assert_eq!(
+                send_and_dispatch(&mut h, scan).await,
+                ShmResponse::ScanResult { request_id: 3, keys: vec![b"k".to_vec()] }
+            );
+            for cmd in [
+                ShmCommand::Get { request_id: 4, domain: "nope".into(), key: b"k".to_vec() },
+                ShmCommand::Delete { request_id: 4, domain: "nope".into(), key: b"k".to_vec() },
+            ] {
+                match send_and_dispatch(&mut h, cmd).await {
+                    ShmResponse::Error { request_id: 4, code: 404, .. } => {}
+                    other => panic!("expected a 404, got {other:?}"),
+                }
+            }
+        })
+    }
+
     // Well-framed but non-rkyv payload -> 400, and the ring keeps running.
     #[test]
     fn test_malformed_payload_is_400() {
         crate::core::engine_runtime::block_on(async {
             let mut h = harness().await;
             h.client_tx.send(&[0xffu8, 0x00, 0x11, 0x22]).unwrap();
-            h.conn.drain(&h.registry).await.unwrap();
+            h.conn.drain(&h.control).await.unwrap();
             let raw = h.client_rx.recv().unwrap().expect("a response");
             match ShmResponse::decode(&raw).unwrap() {
                 ShmResponse::Error { code, .. } => assert_eq!(code, 400),
@@ -814,8 +848,8 @@ mod tests {
             for i in 0..total {
                 h.client_tx.send(ShmCommand::Ping { request_id: i }.encode().as_slice()).unwrap();
             }
-            assert_eq!(h.conn.drain(&h.registry).await.unwrap(), DRAIN_BATCH, "first pass is capped");
-            assert_eq!(h.conn.drain(&h.registry).await.unwrap(), 10, "remainder served next pass");
+            assert_eq!(h.conn.drain(&h.control).await.unwrap(), DRAIN_BATCH, "first pass is capped");
+            assert_eq!(h.conn.drain(&h.control).await.unwrap(), 10, "remainder served next pass");
         })
     }
 
@@ -852,8 +886,8 @@ mod tests {
     #[test]
     fn test_corrupt_ring_drops_only_that_client() {
         crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let mut dispatcher = ShmDispatcher::new(Arc::clone(&registry));
+            let (control, _, _dir) = make_control().await;
+            let mut dispatcher = ShmDispatcher::new(control);
 
             let (mut a_tx, a_server_rx, _acd, _ach) = ring_ends(4096);
             let (a_server_tx, mut a_rx, _ard, _arh) = ring_ends(4096);
@@ -880,8 +914,8 @@ mod tests {
     #[test]
     fn test_disconnect_event_removes_client() {
         crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let mut dispatcher = ShmDispatcher::new(Arc::clone(&registry));
+            let (control, _, _dir) = make_control().await;
+            let mut dispatcher = ShmDispatcher::new(control);
             let (_tx, rx, _cd, _ch) = ring_ends(4096);
             let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
             dispatcher.clients.push(raw_connection(42, rx, tx2).0);
@@ -950,8 +984,8 @@ mod tests {
     #[test]
     fn test_doorbell_wakes_idle_dispatcher() {
         crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let mut p = park(ShmDispatcher::with_idle_tick(registry, Duration::from_secs(3600))).await;
+            let (control, _, _dir) = make_control().await;
+            let mut p = park(ShmDispatcher::with_idle_tick(control, Duration::from_secs(3600))).await;
 
             p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
             ring(&p.doorbell);
@@ -966,8 +1000,8 @@ mod tests {
     #[test]
     fn test_fallback_tick_serves_client_without_doorbell() {
         crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let mut p = park(ShmDispatcher::new(registry)).await;
+            let (control, _, _dir) = make_control().await;
+            let mut p = park(ShmDispatcher::new(control)).await;
 
             p.client_tx.send(ShmCommand::Ping { request_id: 2 }.encode().as_slice()).unwrap();
             assert_eq!(await_response(&mut p.client_rx).await, ShmResponse::Pong { request_id: 2 });
@@ -981,8 +1015,8 @@ mod tests {
     #[test]
     fn test_closed_doorbell_falls_back_to_tick() {
         crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let mut p = park(ShmDispatcher::new(registry)).await;
+            let (control, _, _dir) = make_control().await;
+            let mut p = park(ShmDispatcher::new(control)).await;
 
             drop(p.doorbell);
             for request_id in 2..4 {
@@ -1000,8 +1034,8 @@ mod tests {
     #[test]
     fn test_closed_doorbell_wakes_once() {
         crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let mut dispatcher = ShmDispatcher::new(registry);
+            let (control, _, _dir) = make_control().await;
+            let mut dispatcher = ShmDispatcher::new(control);
             let (_tx, rx, _cd, _ch) = ring_ends(4096);
             let (tx2, _rx2, _rd, _rh) = ring_ends(4096);
             let (conn, doorbell) = raw_connection(1, rx, tx2);

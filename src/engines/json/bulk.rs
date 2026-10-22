@@ -464,7 +464,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (json, _dir) = make_engine_with_batch(100).await;
             json.put_document("default", "d1", json!({"n": 1})).await.unwrap();
-            let snap = json.engine().snapshot();
+            let snap = json.engine().snapshot().await;
 
             json.put_document("default", "d1", json!({"n": 2})).await.unwrap(); // update after snapshot
             json.put_document("default", "d2", json!({"n": 99})).await.unwrap(); // new doc after snapshot
@@ -495,7 +495,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (json, _dir) = make_engine_with_batch(100).await;
             json.put_document("default", "gone", json!({"n": 1})).await.unwrap();
-            let snap = json.engine().snapshot();
+            let snap = json.engine().snapshot().await;
             json.delete_document("default", "gone").await.unwrap();
 
             let keys = json

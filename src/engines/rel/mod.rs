@@ -170,33 +170,43 @@ impl RelEngine {
         let vlog = Arc::new(VLog::new(&vlog_path).await?);
         let file_manager = Arc::new(FileManager::new(&config.sstable_dir).await?);
         let manifest_manager = Arc::new(ManifestManager::new(&config.sstable_dir));
-
-        let engine_config = LsmEngineConfig {
-            max_key_length: config.lsm.max_key_length,
-            max_value_size: LSM_MIN_VALUE_SIZE_LIMIT.max(config.max_row_size),
-            watch_replay_buffer_size: 0, // no watch endpoint on the relational engine (spec kv/024 §3)
-            ..LsmEngineConfig::default()
-        };
-
+        let options = Self::lsm_options(config, BlockCacheConfig::default());
         let engine = Arc::new(
-            LsmStorageEngine::new(
-                wal,
-                wal_path,
-                vlog,
-                vlog_path,
-                file_manager,
-                manifest_manager,
-                LsmEngineOptions {
-                    engine: engine_config,
-                    compaction: CompactionConfig::default(),
-                    janitor: JanitorConfig::default(),
-                    block_cache: BlockCacheConfig::default(),
-                },
-            )
-            .await?,
+            LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options).await?,
         );
         engine.start_background_tasks();
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await?);
+        Self::open(config, quota, engine, metrics, cross_engine, true).await
+    }
+
+    /// Options of the relational engine's LSM instances, with `block_cache`.
+    pub fn lsm_options(config: &RelStoreConfig, block_cache: BlockCacheConfig) -> LsmEngineOptions {
+        LsmEngineOptions {
+            engine: LsmEngineConfig {
+                max_key_length: config.lsm.max_key_length,
+                max_value_size: LSM_MIN_VALUE_SIZE_LIMIT.max(config.max_row_size),
+                watch_replay_buffer_size: 0, // no watch endpoint on the relational engine
+                ..LsmEngineConfig::default()
+            },
+            compaction: CompactionConfig::default(),
+            janitor: JanitorConfig::default(),
+            block_cache,
+            ..LsmEngineOptions::default()
+        }
+    }
+
+    /// The relational engine on `engine`, a recovered instance whose
+    /// background tasks run: recovers the domain registry and the catalog;
+    /// with `owns_default` it creates the default domain if that is missing.
+    /// `quota` is the rate limit of every domain.
+    pub async fn open(
+        config: &RelStoreConfig,
+        quota: DomainQuota,
+        engine: Arc<LsmStorageEngine>,
+        metrics: Arc<MetricsStore>,
+        cross_engine: Arc<CrossEngineResolver>,
+        owns_default: bool,
+    ) -> Result<Arc<Self>> {
+        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), owns_default).await?);
         let limits = CatalogLimits {
             max_columns: MAX_COLUMNS,
             max_indexes_per_table: MAX_INDEXES_PER_TABLE,
@@ -565,7 +575,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (rel, _dir) = make_engine().await;
             rel.engine().put(b"row:1", b"{}").await.unwrap();
-            let snap = rel.engine().snapshot();
+            let snap = rel.engine().snapshot().await;
             let got = rel
                 .engine()
                 .get_with_snapshot(b"row:1", snap.snapshot())

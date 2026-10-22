@@ -183,7 +183,7 @@ impl RelEngine {
         let plan = plan::plan_access(&schema, &None, &[], &[], &[], mask)?;
         // Registered before the key scan (spec rel/018 §2, `exec_count`
         // pattern): a point-in-time count, not a live key count.
-        let snapshot_guard = self.engine.snapshot();
+        let snapshot_guard = self.engine.snapshot().await;
         let snap = snapshot_guard.snapshot().clone();
         let (row_keys, _scanned) = resolve_candidate_keys(
             &self.engine,

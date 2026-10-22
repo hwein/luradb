@@ -268,14 +268,13 @@ async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyho
     // the manifest by the KV snapshot; the records come from the system store.
     let kv_snapshot: Option<RegistrySnapshot> =
         if !params.resolved.kv_domains.is_empty() || export_auth {
-            Some(params.kv_registry.engine().snapshot())
+            Some(params.kv_registry.engine().snapshot().await)
         } else {
             None
         };
-    let json_snapshot: Option<RegistrySnapshot> = if !params.resolved.json_domains.is_empty() {
-        params.json_engine.as_ref().map(|j| j.engine().snapshot())
-    } else {
-        None
+    let json_snapshot: Option<RegistrySnapshot> = match &params.json_engine {
+        Some(json) if !params.resolved.json_domains.is_empty() => Some(json.engine().snapshot().await),
+        _ => None,
     };
 
     let mut out = PartFile::create(part_path).await?;
@@ -368,7 +367,7 @@ async fn write_auth_section(
     lines: &mut u64,
     engine: &LsmStorageEngine,
 ) -> anyhow::Result<()> {
-    let snap = engine.snapshot();
+    let snap = engine.snapshot().await;
 
     let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
     let user_keys = engine.scan_keys_with_snapshot(PREFIX_USER.as_bytes(), snap.snapshot()).await?;

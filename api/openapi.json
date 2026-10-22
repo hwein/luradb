@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "LuraDB API",
-    "description": "REST-native multi-model database — KeyValue and JSON engines. `version` is the API contract version (see API_VERSION), independent of the server version; the latter is in the `x-luradb-server-version` extension. Runtime check: GET /version.",
+    "description": "REST-native multi-model database — KeyValue and JSON engines. `version` is the API contract version (see API_VERSION), independent of the server version; the latter is in the `x-luradb-server-version` extension. Runtime check: GET /version. Under overload, any endpoint may answer 503 Service Unavailable (text/plain) with `Retry-After: 1`; the request was not processed and may be retried.",
     "contact": {
       "name": "Heiko Wein"
     },
@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.7.0",
+    "version": "0.8.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {

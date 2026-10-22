@@ -10,7 +10,7 @@ All notable changes to LuraDB are documented in this file.
 - The shipped luradb.toml documents every configuration key.
 - Startup rejects out-of-range values for the remaining configuration keys.
 - Startup warns about unknown configuration keys.
-- New `[multicore].frontend_workers` and `[multicore].engine_queue_capacity` config keys.
+- New `[multicore].frontend_workers` config key.
 - New `[multicore].reader_threads` and `[multicore].reader_queue_capacity` config keys.
 - **BREAKING** API: GET /store-api/metrics reports an `shm` block with snapshot publish, skip and kicked-client counters.
 - New `[shm].kick_blocking_client_after_secs` config key disconnects clients that keep the shared-memory snapshot from being updated (`0` = off).
@@ -18,6 +18,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: domains created with `require_conditional_writes` reject unconditional single-key writes with 428.
 - New `[storage].system_dir` config key sets the directory of the system store, which holds users, API key hashes and permissions apart from domain data.
 - New `[storage].wal_queue_capacity` config key sets how many writes may wait for the storage thread.
+- New `[multicore].shards` config key (accepts `0` = automatic and `1`) and `[multicore].shard_queue_capacity` config key.
 
 ### Changed
 
@@ -39,6 +40,8 @@ All notable changes to LuraDB are documented in this file.
 - `io_engine.enabled` now only toggles registered buffers.
 - Write-ahead log format v2 (LSN-framed); existing logs are upgraded automatically on first start (one-way — a downgrade needs a backup restore).
 - The storage thread syncs the write-ahead logs of several engines in parallel instead of one after another.
+- **BREAKING** API: 503 Service Unavailable with Retry-After when the server is overloaded.
+- Data directory layout: engine files move into shard_0/ on first start (automatic, one-way).
 
 ### Removed
 

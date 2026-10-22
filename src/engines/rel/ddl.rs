@@ -160,7 +160,7 @@ pub async fn execute_create_index(
 
     let lock = locks.get(prefix, schema.table_id);
     let _guard = lock.lock().await;
-    let snapshot = engine.snapshot();
+    let snapshot = engine.snapshot().await;
     let snap = snapshot.snapshot();
 
     let mut idx_keys: Vec<Vec<u8>> = Vec::new();
@@ -253,7 +253,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
         let metrics = MetricsStore::new(MetricsConfig::default());
         let limits = CatalogLimits {
             max_columns: 128,

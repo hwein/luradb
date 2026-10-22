@@ -1,7 +1,8 @@
 //! Control plane: runs the rare, global mutations — domain create and delete
 //! in every engine, auth changes — one at a time on a single worker task,
-//! holds the directory of all domains, owns the system store and is the one
-//! publisher of the global event stream.
+//! holds the directory of all domains, owns the system store, is the one
+//! publisher of the global event stream and takes consistent cuts across the
+//! data shards.
 
 pub mod slots;
 pub mod system;
@@ -11,7 +12,9 @@ use crate::core::events::GlobalEventBus;
 use crate::engines::json::{JsonDomain, JsonDomainState, JsonEngine, JsonStoreError};
 use crate::engines::lsm::domain::{Domain, DomainRegistry, DomainState};
 use crate::engines::lsm::engine::LsmStorageEngine;
+use crate::engines::lsm::reader::RegistrySnapshot;
 use crate::engines::rel::{RelDomain, RelDomainState, RelEngine, RelStoreError};
+use anyhow::Context;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -111,15 +114,17 @@ pub struct Directory {
 }
 
 impl Directory {
-    async fn of(owners: &Owners) -> anyhow::Result<Self> {
+    async fn of(shards: &[Shard]) -> anyhow::Result<Self> {
         let mut directory = Self::default();
-        let kv = owners.kv.list_domains().await?.into_iter().chain(owners.kv.list_deleting_domains());
-        kv.for_each(|d| directory.insert(DomainEntry::kv(&d)));
-        if let Some(json) = &owners.json {
-            json.list_domains().iter().for_each(|d| directory.insert(DomainEntry::json(d)));
-        }
-        if let Some(rel) = &owners.rel {
-            rel.list_domains().iter().for_each(|d| directory.insert(DomainEntry::rel(d)));
+        for Shard { owners, .. } in shards {
+            let kv = owners.kv.list_domains().await?.into_iter().chain(owners.kv.list_deleting_domains());
+            kv.for_each(|d| directory.insert(DomainEntry::kv(&d)));
+            if let Some(json) = &owners.json {
+                json.list_domains().iter().for_each(|d| directory.insert(DomainEntry::json(d)));
+            }
+            if let Some(rel) = &owners.rel {
+                rel.list_domains().iter().for_each(|d| directory.insert(DomainEntry::rel(d)));
+            }
         }
         Ok(directory)
     }
@@ -188,12 +193,146 @@ enum Command {
     ChangeAuth { change: AuthChange, reply: oneshot::Sender<anyhow::Result<()>> },
 }
 
-/// What the control plane runs its commands against.
-pub struct Owners {
+/// The engines of one data shard.
+#[derive(Clone)]
+pub struct ShardOwners {
     pub kv: Arc<DomainRegistry>,
     pub json: Option<Arc<JsonEngine>>,
     pub rel: Option<Arc<RelEngine>>,
+}
+
+impl ShardOwners {
+    /// The LSM instance of `engine`; `None` when the engine is disabled.
+    fn instance(&self, engine: Engine) -> Option<&Arc<LsmStorageEngine>> {
+        match engine {
+            Engine::Kv => Some(self.kv.engine()),
+            Engine::Json => self.json.as_ref().map(|json| json.engine()),
+            Engine::Rel => self.rel.as_ref().map(|rel| rel.engine()),
+        }
+    }
+
+    async fn finalize_deletion(&self, engine: Engine, name: &str) -> anyhow::Result<()> {
+        match engine {
+            Engine::Kv => self.kv.finalize_domain_deletion(name).await,
+            Engine::Json => {
+                Ok(self.json.as_ref().ok_or(DomainError::Disabled(Engine::Json))?.finalize_deletion(name).await?)
+            }
+            Engine::Rel => Ok(self.rel.as_ref().ok_or(DomainError::Disabled(Engine::Rel))?.finalize_deletion(name).await?),
+        }
+    }
+
+    async fn quiesce(&self, engine: Engine) {
+        match engine {
+            Engine::Kv => self.kv.engine().quiesce_writes().await,
+            Engine::Json => {
+                if let Some(json) = &self.json {
+                    json.quiesce_writes().await;
+                }
+            }
+            Engine::Rel => {
+                if let Some(rel) = &self.rel {
+                    rel.quiesce_writes().await;
+                }
+            }
+        }
+    }
+}
+
+/// A command the control plane sends to a data shard; it runs on the
+/// shard's thread, one after the other.
+pub enum ShardCommand {
+    /// Answers once every write of `engine` admitted so far has applied;
+    /// later ones see the current domain state.
+    Quiesce { engine: Engine, reply: oneshot::Sender<()> },
+    /// Removes the deleted domain `name` of `engine`, whose data the purger
+    /// has removed.
+    FinalizeDeletion { engine: Engine, name: String, reply: oneshot::Sender<anyhow::Result<()>> },
+    /// Registers a snapshot of `engine` at once and answers with it.
+    Pin { engine: Engine, reply: oneshot::Sender<RegistrySnapshot> },
+    /// Holds back the writes of `engine` once the ones in flight have
+    /// applied and says so on `drained`; once `register` fires, registers a
+    /// snapshot, lets the writes go on and answers with the snapshot.
+    Confirm {
+        engine: Engine,
+        drained: oneshot::Sender<()>,
+        register: oneshot::Receiver<()>,
+        reply: oneshot::Sender<RegistrySnapshot>,
+    },
+    /// Ends the command loop; the shard then shuts its engines down and
+    /// answers with the result of each one's final flush.
+    Drain { reply: DrainReply },
+}
+
+/// Where a shard reports the final flush of each of its engines.
+pub type DrainReply = oneshot::Sender<Vec<(Engine, anyhow::Result<()>)>>;
+
+/// Runs the commands for the shard of `owners` until a `Drain` arrives, and
+/// hands that one back; `None` once the control plane is gone.
+pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedReceiver<ShardCommand>) -> Option<DrainReply> {
+    while let Some(command) = commands.recv().await {
+        match command {
+            ShardCommand::Quiesce { engine, reply } => {
+                owners.quiesce(engine).await;
+                let _ = reply.send(());
+            }
+            ShardCommand::FinalizeDeletion { engine, name, reply } => {
+                let _ = reply.send(owners.finalize_deletion(engine, &name).await);
+            }
+            ShardCommand::Pin { engine, reply } => {
+                if let Some(instance) = owners.instance(engine) {
+                    let _ = reply.send(instance.snapshot().await);
+                }
+            }
+            ShardCommand::Confirm { engine, drained, register, reply } => {
+                if let Some(instance) = owners.instance(engine) {
+                    let drain = instance.drain_writes().await;
+                    let _ = drained.send(());
+                    let _ = register.await;
+                    let snapshot = instance.snapshot().await;
+                    drop(drain);
+                    let _ = reply.send(snapshot);
+                }
+            }
+            ShardCommand::Drain { reply } => return Some(reply),
+        }
+    }
+    None
+}
+
+/// A data shard as the control plane reaches it: its engines, and the
+/// channel to its thread for what must run there.
+#[derive(Clone)]
+pub struct Shard {
+    pub owners: ShardOwners,
+    pub commands: mpsc::UnboundedSender<ShardCommand>,
+}
+
+impl Shard {
+    async fn request<T>(&self, command: impl FnOnce(oneshot::Sender<T>) -> ShardCommand) -> anyhow::Result<T> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(command(reply)).map_err(|_| anyhow::anyhow!("the data shard is not running"))?;
+        answer.await.map_err(|_| anyhow::anyhow!("the data shard did not answer"))
+    }
+}
+
+/// What the control plane runs its commands against: every data shard, by
+/// index, and the auth records.
+pub struct Owners {
+    pub shards: Vec<Shard>,
     pub auth: Arc<AuthCache>,
+}
+
+/// A consistent cut through one engine across all data shards: one read
+/// snapshot per shard, all taken while every shard held its writes back.
+/// Holds the snapshots registered until it drops.
+pub struct Cut {
+    /// The engine's write-ahead log up to this LSN is in the cut; writes that
+    /// applied a later record before the cut was taken are in it too.
+    pub s: u64,
+    /// The read snapshot of each data shard, by shard index.
+    pub reads: Vec<(u16, RegistrySnapshot)>,
+    /// The system store as of the cut.
+    pub system: RegistrySnapshot,
 }
 
 pub struct ControlPlane {
@@ -201,30 +340,89 @@ pub struct ControlPlane {
     directory: RwLock<Arc<Directory>>,
     bus: Arc<GlobalEventBus>,
     system: Arc<LsmStorageEngine>,
+    shards: Vec<Shard>,
 }
 
 impl ControlPlane {
     /// Reads the owners' domains into the directory, attaches itself to the
-    /// owners — before any purger runs, so none finishes a deletion behind
-    /// its back — and starts the worker on the current runtime.
+    /// engines of every shard — before any purger runs, so none finishes a
+    /// deletion behind its back — and starts the worker on the current
+    /// runtime.
     pub async fn start(owners: Owners, system: Arc<LsmStorageEngine>, bus: Arc<GlobalEventBus>) -> anyhow::Result<Arc<Self>> {
+        let Owners { shards, auth } = owners;
         let (commands, inbox) = mpsc::unbounded_channel();
         let control = Arc::new(Self {
             commands,
-            directory: RwLock::new(Arc::new(Directory::of(&owners).await?)),
+            directory: RwLock::new(Arc::new(Directory::of(&shards).await?)),
             bus,
             system,
+            shards,
         });
-        owners.kv.attach_control_plane(Arc::clone(&control));
-        if let Some(json) = &owners.json {
-            json.attach_control_plane(Arc::clone(&control));
+        for Shard { owners, .. } in &control.shards {
+            owners.kv.attach_control_plane(Arc::clone(&control));
+            if let Some(json) = &owners.json {
+                json.attach_control_plane(Arc::clone(&control));
+            }
+            if let Some(rel) = &owners.rel {
+                rel.attach_control_plane(Arc::clone(&control));
+            }
         }
-        if let Some(rel) = &owners.rel {
-            rel.attach_control_plane(Arc::clone(&control));
-        }
-        let worker = Worker { owners, control: Arc::clone(&control) };
+        let worker = Worker { auth, control: Arc::clone(&control) };
         compio::runtime::spawn(worker.run(inbox)).detach();
         Ok(control)
+    }
+
+    /// The data shard that owns the domain `name`.
+    fn owner(&self, name: &str) -> &Shard {
+        let shards = u16::try_from(self.shards.len()).expect("at most u16::MAX data shards");
+        &self.shards[usize::from(slots::shard_of_domain(name, shards))]
+    }
+
+    /// Takes a consistent cut through `engine` across all data shards. Every
+    /// shard first registers a snapshot, which keeps the versions the cut
+    /// may need from compaction; `s` is read after that. Then every shard
+    /// lets its writes in flight apply and holds new ones back, and only once
+    /// all of them do, each registers its read snapshot and lets its writes
+    /// go on: a write confirmed before another one that is in the cut is in
+    /// it too. Waits for at most one group commit per shard.
+    pub async fn consistent_cut(&self, engine: Engine) -> anyhow::Result<Cut> {
+        let pins = futures::future::try_join_all(
+            self.shards.iter().map(|shard| shard.request(|reply| ShardCommand::Pin { engine, reply })),
+        )
+        .await
+        .with_context(|| format!("pin the {} engine", engine.as_str()))?;
+        let system = self.system.snapshot().await;
+        let s = self.shards[0]
+            .owners
+            .instance(engine)
+            .with_context(|| format!("the {} engine is disabled", engine.as_str()))?
+            .wal_head_lsn()
+            .await?;
+
+        let mut drained = Vec::with_capacity(self.shards.len());
+        let mut registers = Vec::with_capacity(self.shards.len());
+        let mut reads = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let (drained_tx, drained_rx) = oneshot::channel();
+            let (register_tx, register_rx) = oneshot::channel();
+            let (reply, read) = oneshot::channel();
+            shard
+                .commands
+                .send(ShardCommand::Confirm { engine, drained: drained_tx, register: register_rx, reply })
+                .map_err(|_| anyhow::anyhow!("the data shard is not running"))?;
+            drained.push(drained_rx);
+            registers.push(register_tx);
+            reads.push(read);
+        }
+        futures::future::try_join_all(drained).await.context("a data shard did not hold its writes back")?;
+        for register in registers {
+            let _ = register.send(());
+        }
+        let reads = futures::future::try_join_all(reads).await.context("a data shard did not register its snapshot")?;
+        // The pins go only now: the read snapshots protect the versions from here.
+        drop(pins);
+        let reads = (0u16..).zip(reads).collect();
+        Ok(Cut { s, reads, system })
     }
 
     /// The current directory; later changes do not show in it.
@@ -293,9 +491,10 @@ impl ControlPlane {
     }
 }
 
-/// Runs the commands, one after the other.
+/// Runs the commands, one after the other, each against the data shard that
+/// owns its domain.
 struct Worker {
-    owners: Owners,
+    auth: Arc<AuthCache>,
     control: Arc<ControlPlane>,
 }
 
@@ -320,12 +519,12 @@ impl Worker {
         }
     }
 
-    fn json(&self) -> Result<&Arc<JsonEngine>, DomainError> {
-        self.owners.json.as_ref().ok_or(DomainError::Disabled(Engine::Json))
+    fn json<'a>(&self, owner: &'a Shard) -> Result<&'a Arc<JsonEngine>, DomainError> {
+        owner.owners.json.as_ref().ok_or(DomainError::Disabled(Engine::Json))
     }
 
-    fn rel(&self) -> Result<&Arc<RelEngine>, DomainError> {
-        self.owners.rel.as_ref().ok_or(DomainError::Disabled(Engine::Rel))
+    fn rel<'a>(&self, owner: &'a Shard) -> Result<&'a Arc<RelEngine>, DomainError> {
+        owner.owners.rel.as_ref().ok_or(DomainError::Disabled(Engine::Rel))
     }
 
     async fn create_domain(
@@ -334,14 +533,19 @@ impl Worker {
         name: &str,
         require_conditional_writes: bool,
     ) -> Result<DomainEntry, DomainError> {
+        let owner = self.control.owner(name);
         let entry = match engine {
             Engine::Kv => DomainEntry::kv(
-                &self.owners.kv.create_domain_with(name, require_conditional_writes).await.map_err(DomainError::Kv)?,
+                &owner.owners.kv.create_domain_with(name, require_conditional_writes).await.map_err(DomainError::Kv)?,
             ),
             Engine::Json => DomainEntry::json(
-                &self.json()?.create_domain_with(name, require_conditional_writes).await.map_err(DomainError::Json)?,
+                &self
+                    .json(owner)?
+                    .create_domain_with(name, require_conditional_writes)
+                    .await
+                    .map_err(DomainError::Json)?,
             ),
-            Engine::Rel => DomainEntry::rel(&self.rel()?.create_domain(name).await.map_err(DomainError::Rel)?),
+            Engine::Rel => DomainEntry::rel(&self.rel(owner)?.create_domain(name).await.map_err(DomainError::Rel)?),
         };
         self.control.change_directory(|d| d.insert(entry.clone()));
         self.control.publish_global(engine, "domain_created", name, None);
@@ -349,35 +553,30 @@ impl Worker {
     }
 
     async fn delete_domain(&self, engine: Engine, name: &str) -> Result<(), DomainError> {
+        let owner = self.control.owner(name);
         match engine {
-            Engine::Kv => self.owners.kv.delete_domain(name).await.map_err(DomainError::Kv)?,
-            Engine::Json => self.json()?.delete_domain(name).await.map_err(DomainError::Json)?,
-            Engine::Rel => self.rel()?.delete_domain(name).await.map_err(DomainError::Rel)?,
+            Engine::Kv => owner.owners.kv.delete_domain(name).await.map_err(DomainError::Kv)?,
+            Engine::Json => self.json(owner)?.delete_domain(name).await.map_err(DomainError::Json)?,
+            Engine::Rel => self.rel(owner)?.delete_domain(name).await.map_err(DomainError::Rel)?,
         }
         self.control.change_directory(|d| d.set_deleting(engine, name));
-        // Writes that passed the domain check before it turned `Deleting`.
-        match engine {
-            Engine::Kv => self.owners.kv.engine().quiesce_writes().await,
-            Engine::Json => self.json()?.quiesce_writes().await,
-            Engine::Rel => self.rel()?.quiesce_writes().await,
-        }
+        // Writes that passed the domain check before it turned `Deleting`;
+        // the owner drains its engine on its own thread.
+        owner.request(|reply| ShardCommand::Quiesce { engine, reply }).await.map_err(|_| DomainError::Stopped)?;
         self.control.publish_global(engine, "domain_deleted", name, None);
         Ok(())
     }
 
     async fn finalize_deletion(&self, engine: Engine, name: &str) -> anyhow::Result<()> {
-        match engine {
-            Engine::Kv => self.owners.kv.finalize_domain_deletion(name).await?,
-            Engine::Json => self.json()?.finalize_deletion(name).await?,
-            Engine::Rel => self.rel()?.finalize_deletion(name).await?,
-        }
+        let owner = self.control.owner(name);
+        owner.request(|reply| ShardCommand::FinalizeDeletion { engine, name: name.to_string(), reply }).await??;
         self.control.change_directory(|d| d.remove(engine, name));
         self.control.publish_global(engine, "domain_purged", name, None);
         Ok(())
     }
 
     async fn change_auth(&self, change: AuthChange) -> anyhow::Result<()> {
-        let auth = &self.owners.auth;
+        let auth = &self.auth;
         match change {
             AuthChange::UpsertUser(record) => auth.upsert_user(record).await,
             AuthChange::RemoveUser(name) => auth.remove_user(&name).await,
@@ -393,8 +592,8 @@ pub(crate) mod testing {
     use super::*;
     use std::path::Path;
 
-    /// A control plane over the given owners, with a system store of its own
-    /// under `dir/sys` and an auth cache on it.
+    /// A control plane over the given owners as its one data shard, with a
+    /// system store of its own under `dir/sys` and an auth cache on it.
     pub(crate) async fn start(
         dir: &Path,
         kv: Arc<DomainRegistry>,
@@ -402,9 +601,38 @@ pub(crate) mod testing {
         rel: Option<Arc<RelEngine>>,
         bus: Arc<GlobalEventBus>,
     ) -> (Arc<ControlPlane>, Arc<AuthCache>) {
+        start_shards(dir, vec![ShardOwners { kv, json, rel }], bus).await
+    }
+
+    /// A control plane over `shards`, each serving its commands in a task on
+    /// the current runtime, with a system store of its own under `dir/sys`
+    /// and an auth cache on it.
+    pub(crate) async fn start_shards(
+        dir: &Path,
+        shards: Vec<ShardOwners>,
+        bus: Arc<GlobalEventBus>,
+    ) -> (Arc<ControlPlane>, Arc<AuthCache>) {
+        let shards = shards
+            .into_iter()
+            .map(|owners| {
+                let (commands, inbox) = mpsc::unbounded_channel();
+                compio::runtime::spawn(serve_shard(owners.clone(), inbox)).detach();
+                Shard { owners, commands }
+            })
+            .collect();
+        start_over(dir, shards, bus).await
+    }
+
+    /// A control plane over `shards` as they are, with a system store of its
+    /// own under `dir/sys` and an auth cache on it.
+    pub(super) async fn start_over(
+        dir: &Path,
+        shards: Vec<Shard>,
+        bus: Arc<GlobalEventBus>,
+    ) -> (Arc<ControlPlane>, Arc<AuthCache>) {
         let system = system::open(&dir.join("sys")).await.unwrap();
         let auth = Arc::new(AuthCache::new(Arc::clone(&system)));
-        let owners = Owners { kv, json, rel, auth: Arc::clone(&auth) };
+        let owners = Owners { shards, auth: Arc::clone(&auth) };
         (ControlPlane::start(owners, system, bus).await.unwrap(), auth)
     }
 
@@ -434,7 +662,6 @@ mod tests {
     use crate::engines::lsm::domain::DomainPurger;
     use crate::engines::StorageEngine;
     use serde_json::json;
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::sync::broadcast;
 
@@ -507,7 +734,7 @@ mod tests {
     }
 
     fn purger(f: &Fixture) -> DomainPurger {
-        DomainPurger::new(Arc::clone(f.kv.engine()), Arc::clone(&f.kv), Arc::new(AtomicBool::new(false)), 100, 1)
+        DomainPurger::new(Arc::clone(f.kv.engine()), Arc::clone(&f.kv), 100)
     }
 
     #[test]
@@ -626,12 +853,7 @@ mod tests {
             assert!(matches!(refused, JsonStoreError::DomainDeleting(_)), "got: {refused}");
             assert_eq!(f.next_event(), ("json", "domain_deleted", "doomed".to_string()));
 
-            let purger = crate::engines::json::JsonDomainPurger::new(
-                Arc::clone(&f.json),
-                Arc::new(AtomicBool::new(false)),
-                100,
-                1,
-            );
+            let purger = crate::engines::json::JsonDomainPurger::new(Arc::clone(&f.json), 100);
             purger.purge_tick().await.unwrap();
             purger.purge_tick().await.unwrap();
             assert_eq!(f.next_event(), ("json", "domain_purged", "doomed".to_string()));
@@ -668,8 +890,7 @@ mod tests {
             assert!(matches!(refused, RelStoreError::DomainDeleting(_)), "got: {refused}");
             assert_eq!(f.next_event(), ("rel", "domain_deleted", "doomed".to_string()));
 
-            let purger =
-                crate::engines::rel::RelDomainPurger::new(Arc::clone(&f.rel), Arc::new(AtomicBool::new(false)), 100, 1);
+            let purger = crate::engines::rel::RelDomainPurger::new(Arc::clone(&f.rel), 100);
             purger.purge_tick().await.unwrap();
             purger.purge_tick().await.unwrap();
             assert_eq!(f.next_event(), ("rel", "domain_purged", "doomed".to_string()));
@@ -797,26 +1018,14 @@ mod tests {
     fn a_purger_attached_before_its_spawn_still_reports_the_purge() {
         crate::core::engine_runtime::block_on(async {
             let mut f = Fixture::new().await;
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let purger = Arc::new(DomainPurger::new(
-                Arc::clone(f.kv.engine()),
-                Arc::clone(&f.kv),
-                Arc::clone(&shutdown),
-                1,
-                1,
-            ));
-            compio::runtime::spawn(purger.run()).detach();
+            let purger = DomainPurger::new(Arc::clone(f.kv.engine()), Arc::clone(&f.kv), 1);
 
             f.control.create_domain(Engine::Kv, "late-purge", false).await.unwrap();
             f.control.delete_domain(Engine::Kv, "late-purge").await.unwrap();
             f.next_event();
             f.next_event();
-            let purged = compio::time::timeout(Duration::from_secs(30), f.events.recv())
-                .await
-                .expect("timed out waiting for domain_purged")
-                .unwrap();
-            assert_eq!((purged.kind, purged.domain.as_str()), ("domain_purged", "late-purge"));
-            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            purger.purge_tick().await.unwrap();
+            assert_eq!(f.next_event(), ("kv", "domain_purged", "late-purge".to_string()));
         })
     }
 
@@ -845,6 +1054,382 @@ mod tests {
         })
     }
 
+    /// Two data shards' key-value engines writing one log through `hub`,
+    /// `tune` applied to engine `k` before it is shared; only the shard that
+    /// owns the default domain creates it.
+    async fn two_kv_shards(
+        dir: &std::path::Path,
+        hub: &crate::core::storage_thread::TestHub,
+        mut tune: impl FnMut(usize, &mut LsmStorageEngine),
+    ) -> Vec<ShardOwners> {
+        use crate::engines::lsm::engine::{LsmEngineOptions, Recovery};
+        let mut shards = Vec::new();
+        for k in 0..2 {
+            let at = dir.join(format!("kv-{k}"));
+            let fm = Arc::new(crate::storage::file_manager::FileManager::new(&at).await.unwrap());
+            let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&at));
+            let vlog_path = at.join("vlog");
+            let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
+            let wal = Arc::new(hub.wal(crate::core::storage_thread::WalTarget::Kv));
+            let options = LsmEngineOptions { recovery: Recovery::External, ..LsmEngineOptions::default() };
+            let mut engine =
+                LsmStorageEngine::new(wal, dir.join("kv.wal"), vlog, vlog_path, fm, mm, options).await.unwrap();
+            tune(k, &mut engine);
+            let owns_default = usize::from(slots::shard_of_domain("default", 2)) == k;
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let config = crate::engines::lsm::domain::DomainConfig::default();
+            let registry =
+                DomainRegistry::recover_on_shard(Arc::new(engine), config, metrics, owns_default).await.unwrap();
+            shards.push(ShardOwners { kv: Arc::new(registry), json: None, rel: None });
+        }
+        shards
+    }
+
+    /// Two key-value shards and a control plane over them, with the hub
+    /// their log runs through and each shard's engine. Every command reaches
+    /// a shard through a relay that records it; a shard's relay holds its
+    /// `Confirm` back while `hold_confirms` of that shard is set.
+    struct TwoShards {
+        control: Arc<ControlPlane>,
+        engines: Vec<Arc<LsmStorageEngine>>,
+        registries: Vec<Arc<DomainRegistry>>,
+        commands: Arc<std::sync::Mutex<Vec<(usize, &'static str)>>>,
+        hold_confirms: Vec<tokio::sync::watch::Sender<bool>>,
+        _hub: crate::core::storage_thread::TestHub,
+        _dir: tempfile::TempDir,
+    }
+
+    /// The name of a shard command, as [`TwoShards`] records it.
+    fn command_name(command: &ShardCommand) -> &'static str {
+        match command {
+            ShardCommand::Quiesce { .. } => "quiesce",
+            ShardCommand::FinalizeDeletion { .. } => "finalize",
+            ShardCommand::Pin { .. } => "pin",
+            ShardCommand::Confirm { .. } => "confirm",
+            ShardCommand::Drain { .. } => "drain",
+        }
+    }
+
+    impl TwoShards {
+        async fn new(tune: impl FnMut(usize, &mut LsmStorageEngine)) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hub = crate::core::storage_thread::TestHub::start(&[(
+                crate::core::storage_thread::WalTarget::Kv,
+                &dir.path().join("kv.wal"),
+            )]);
+            let owners = two_kv_shards(dir.path(), &hub, tune).await;
+            let engines = owners.iter().map(|shard| Arc::clone(shard.kv.engine())).collect();
+            let registries = owners.iter().map(|shard| Arc::clone(&shard.kv)).collect();
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut hold_confirms = Vec::new();
+            let mut shards = Vec::new();
+            for (k, owners) in owners.into_iter().enumerate() {
+                let (to_shard, inbox) = mpsc::unbounded_channel();
+                compio::runtime::spawn(serve_shard(owners.clone(), inbox)).detach();
+                let (hold, mut held) = tokio::sync::watch::channel(false);
+                hold_confirms.push(hold);
+                let (relay, mut relayed) = mpsc::unbounded_channel::<ShardCommand>();
+                let log = Arc::clone(&commands);
+                compio::runtime::spawn(async move {
+                    while let Some(command) = relayed.recv().await {
+                        let name = command_name(&command);
+                        log.lock().unwrap().push((k, name));
+                        if name == "confirm" {
+                            let _ = held.wait_for(|held| !held).await;
+                        }
+                        if to_shard.send(command).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+                shards.push(Shard { owners, commands: relay });
+            }
+            let bus = Arc::new(GlobalEventBus::new(64, 64));
+            let (control, _) = testing::start_over(dir.path(), shards, bus).await;
+            Self { control, engines, registries, commands, hold_confirms, _hub: hub, _dir: dir }
+        }
+
+        fn state(&self, name: &str) -> Option<Lifecycle> {
+            self.control.directory().get(Engine::Kv, name).map(|entry| entry.state)
+        }
+
+        /// The commands shard `k` got so far, by name.
+        fn commands_of(&self, k: usize) -> Vec<&'static str> {
+            self.commands.lock().unwrap().iter().filter(|(shard, _)| *shard == k).map(|(_, name)| *name).collect()
+        }
+    }
+
+    /// `key` as `snapshot` of a cut sees it on `engine`.
+    async fn seen(engine: &LsmStorageEngine, key: &str, snapshot: &RegistrySnapshot) -> bool {
+        engine.get_with_snapshot(key.as_bytes(), snapshot.snapshot()).await.unwrap()
+            != crate::engines::lsm::reader::GetResult::Absent
+    }
+
+    // With no write in flight, every shard confirms at once.
+    #[test]
+    fn a_cut_over_idle_shards_returns_at_once() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::new(|_, _| {}).await;
+            s.engines[0].put(b"k", b"v").await.unwrap();
+            let cut = s.control.consistent_cut(Engine::Kv).await.unwrap();
+            assert_eq!(cut.reads.iter().map(|(shard, _)| *shard).collect::<Vec<_>>(), [0, 1]);
+            assert!(cut.s >= 1);
+            assert!(seen(&s.engines[0], "k", &cut.reads[0].1).await);
+        })
+    }
+
+    // Writers in flight on both shards — their records in the log, not yet
+    // applied — hold the cut back until they apply, and are in it; every
+    // earlier write is in it, a write after it is not and gets an LSN past s.
+    #[test]
+    fn a_cut_waits_for_the_writes_in_flight_and_holds_every_record_up_to_s() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::engine::TestHook;
+            let hooks = [Arc::new(TestHook::default()), Arc::new(TestHook::default())];
+            let s = TwoShards::new(|k, engine| {
+                engine.hooks.before_kv_pair_apply = Some((format!("held-{k}").into_bytes(), Arc::clone(&hooks[k])));
+            })
+            .await;
+            for (k, engine) in s.engines.iter().enumerate() {
+                engine.put(format!("before-{k}").as_bytes(), b"v").await.unwrap();
+            }
+            let writers: Vec<_> = s
+                .engines
+                .iter()
+                .enumerate()
+                .map(|(k, engine)| {
+                    let engine = Arc::clone(engine);
+                    compio::runtime::spawn(async move { engine.put(format!("held-{k}").as_bytes(), b"v").await })
+                })
+                .collect();
+            for hook in &hooks {
+                hook.reached.notified().await;
+            }
+
+            let cut = compio::runtime::spawn({
+                let control = Arc::clone(&s.control);
+                async move { control.consistent_cut(Engine::Kv).await }
+            });
+            settle().await;
+            assert!(!cut.is_finished(), "the cut waits for the writes in flight");
+            for hook in &hooks {
+                hook.release.notify_one();
+            }
+            let cut = cut.await.unwrap().unwrap();
+            for writer in writers {
+                writer.await.unwrap().unwrap();
+            }
+            s.engines[0].put(b"after-0", b"v").await.unwrap();
+
+            assert!(cut.s >= 4, "two writes before and two in flight are in the log: {}", cut.s);
+            assert!(s.engines[0].wal_head_lsn().await.unwrap() > cut.s);
+            for (shard, snapshot) in &cut.reads {
+                let engine = &s.engines[usize::from(*shard)];
+                for key in [format!("before-{shard}"), format!("held-{shard}")] {
+                    assert!(seen(engine, &key, snapshot).await, "{key}");
+                }
+            }
+            assert!(!seen(&s.engines[0], "after-0", &cut.reads[0].1).await);
+        })
+    }
+
+    // Round after round, a writer confirms a write on shard 0 and then makes
+    // one on shard 1 while a cut is taken: a cut that holds the second write
+    // holds the first. Round 0 cuts between the two writes, round 1 while the
+    // second is held in flight, the rest after a varying number of yields.
+    #[test]
+    fn a_write_confirmed_before_one_in_the_cut_is_in_the_cut_too() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::engine::TestHook;
+            const ROUNDS: usize = 100;
+            let hook = Arc::new(TestHook::default());
+            let s = TwoShards::new(|k, engine| {
+                if k == 1 {
+                    engine.hooks.before_kv_pair_apply = Some((b"b-1".to_vec(), Arc::clone(&hook)));
+                }
+            })
+            .await;
+            let (mut a_only, mut both) = (0, 0);
+            let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+            for i in 0..ROUNDS {
+                let (a_done, a_confirmed) = tokio::sync::oneshot::channel();
+                let (go, gate) = tokio::sync::oneshot::channel::<()>();
+                let writer = compio::runtime::spawn({
+                    let engines = s.engines.clone();
+                    async move {
+                        engines[0].put(format!("a-{i}").as_bytes(), b"v").await.unwrap();
+                        let _ = a_done.send(());
+                        gate.await.unwrap();
+                        engines[1].put(format!("b-{i}").as_bytes(), b"v").await.unwrap();
+                    }
+                });
+                let cut = if i == 0 {
+                    a_confirmed.await.unwrap();
+                    let cut = s.control.consistent_cut(Engine::Kv).await.unwrap();
+                    go.send(()).unwrap();
+                    cut
+                } else if i == 1 {
+                    go.send(()).unwrap();
+                    hook.reached.notified().await;
+                    let cut = compio::runtime::spawn({
+                        let control = Arc::clone(&s.control);
+                        async move { control.consistent_cut(Engine::Kv).await }
+                    });
+                    settle().await;
+                    hook.release.notify_one();
+                    cut.await.unwrap().unwrap()
+                } else {
+                    go.send(()).unwrap();
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    for _ in 0..state % 16 {
+                        tokio::task::yield_now().await;
+                    }
+                    s.control.consistent_cut(Engine::Kv).await.unwrap()
+                };
+                let a = seen(&s.engines[0], &format!("a-{i}"), &cut.reads[0].1).await;
+                let b = seen(&s.engines[1], &format!("b-{i}"), &cut.reads[1].1).await;
+                assert!(a || !b, "b-{i} without a-{i}");
+                a_only += usize::from(a && !b);
+                both += usize::from(a && b);
+                writer.await.unwrap();
+            }
+            assert!(a_only > 0, "no cut fell between the two writes");
+            assert!(both > 0, "no cut held both writes");
+        })
+    }
+
+    // A batch on shard 1 parked halfway through its MemTable inserts, its
+    // record already in the log, holds the cut's drain back; the cut then
+    // holds the whole batch, never half of it, and s covers its record.
+    #[test]
+    fn a_batch_half_applied_during_the_drain_is_in_the_cut_whole() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::engine::{BatchOp, ThreadHook};
+            let (hook, reached, release) = ThreadHook::new();
+            let s = TwoShards::new(|k, engine| {
+                if k == 1 {
+                    engine.hooks.batch_first_applied = Some(Arc::clone(&hook));
+                }
+            })
+            .await;
+            let batch = {
+                let engine = Arc::clone(&s.engines[1]);
+                let ops = ["x", "y"].map(|key| BatchOp::Put { key: key.as_bytes().to_vec(), value: b"v".to_vec() });
+                std::thread::spawn(move || crate::core::engine_runtime::block_on(engine.write_batch(ops.to_vec())))
+            };
+            reached.recv().unwrap();
+            let logged = s.engines[1].wal_head_lsn().await.unwrap();
+
+            let cut = compio::runtime::spawn({
+                let control = Arc::clone(&s.control);
+                async move { control.consistent_cut(Engine::Kv).await }
+            });
+            settle().await;
+            assert!(!cut.is_finished(), "the cut waits for the batch");
+            release.send(()).unwrap();
+            batch.join().unwrap().unwrap();
+            let cut = cut.await.unwrap().unwrap();
+
+            assert!(cut.s >= logged, "s {} below the batch record {logged}", cut.s);
+            for key in ["x", "y"] {
+                assert!(seen(&s.engines[1], key, &cut.reads[1].1).await, "{key}");
+            }
+        })
+    }
+
+    // While a cut has pinned shard 0 but not yet taken its read there, a
+    // newer version is written and flushed beside an older one and the two
+    // are compacted: the pin keeps the older one, the cut reads the newer
+    // one. Once the cut is gone, the next compaction drops the older one.
+    #[test]
+    fn a_cut_keeps_the_versions_it_reads_from_compaction() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::reader::{GetResult, Snapshot};
+            let s = TwoShards::new(|_, _| {}).await;
+            let engine = &s.engines[0];
+            let flush = || async {
+                engine.freeze_active_memtable();
+                engine.flush_memtable().await.unwrap();
+            };
+            engine.put(b"k", b"old").await.unwrap();
+            flush().await;
+
+            s.hold_confirms[0].send_replace(true);
+            let cut = compio::runtime::spawn({
+                let control = Arc::clone(&s.control);
+                async move { control.consistent_cut(Engine::Kv).await }
+            });
+            while !s.commands_of(0).contains(&"confirm") {
+                tokio::task::yield_now().await;
+            }
+            let pinned = Snapshot::new(engine.snapshot_registry().low_watermark().expect("shard 0 is pinned"));
+            engine.put(b"k", b"new").await.unwrap();
+            flush().await;
+            engine.compact_level(0).await.unwrap();
+            assert_eq!(engine.get_with_snapshot(b"k", &pinned).await.unwrap(), GetResult::Present(b"old".to_vec()));
+
+            s.hold_confirms[0].send_replace(false);
+            let cut = cut.await.unwrap().unwrap();
+            let read = engine.get_with_snapshot(b"k", cut.reads[0].1.snapshot()).await.unwrap();
+            assert_eq!(read, GetResult::Present(b"new".to_vec()));
+
+            drop(cut);
+            engine.compact_level(1).await.unwrap();
+            let read = engine.get_with_snapshot(b"k", &pinned).await.unwrap();
+            assert_eq!(read, GetResult::Absent, "the old version is gone");
+        })
+    }
+
+    // A delete drains the writes of its domain's shard on that shard's
+    // thread: a write in flight there holds it up, one on the other shard
+    // does not. Only the owner's purger removes the data, and the owner's
+    // command loop finishes the deletion.
+    #[test]
+    fn a_delete_drains_the_owner_shard_and_only_its_purger_purges() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::new(|_, _| {}).await;
+            let [first, second] = [17, 18].map(|seed| slots::domain_name_for_shard(1, 2, seed));
+            for name in [&first, &second] {
+                s.control.create_domain(Engine::Kv, name, false).await.unwrap();
+                s.registries[1].store(name).await.unwrap().put(b"k", b"v").await.unwrap();
+            }
+
+            let elsewhere = s.engines[0].in_flight_write_for_test().await;
+            s.control.delete_domain(Engine::Kv, &first).await.unwrap();
+            drop(elsewhere);
+
+            let in_flight = s.engines[1].in_flight_write_for_test().await;
+            let delete = compio::runtime::spawn({
+                let (control, name) = (Arc::clone(&s.control), second.clone());
+                async move { control.delete_domain(Engine::Kv, &name).await }
+            });
+            while s.state(&second) != Some(Lifecycle::Deleting) {
+                tokio::task::yield_now().await;
+            }
+            settle().await;
+            assert!(!delete.is_finished(), "the delete waits for the write in flight on the owner");
+            drop(in_flight);
+            delete.await.unwrap().unwrap();
+
+            let purge =
+                |shard: usize| DomainPurger::new(Arc::clone(&s.engines[shard]), Arc::clone(&s.registries[shard]), 100);
+            for _ in 0..2 {
+                purge(0).purge_tick().await.unwrap();
+            }
+            assert_eq!(s.state(&first), Some(Lifecycle::Deleting), "shard 0 does not own it");
+            for _ in 0..2 {
+                purge(1).purge_tick().await.unwrap();
+            }
+            assert_eq!(s.state(&first), None);
+            assert_eq!(s.state(&second), None);
+            assert_eq!(s.commands_of(1), ["quiesce", "quiesce", "finalize", "finalize"]);
+            assert!(s.commands_of(0).is_empty(), "{:?}", s.commands_of(0));
+        })
+    }
+
     /// A control plane with no worker behind it; the receiver is the worker's end.
     async fn without_worker(dir: &tempfile::TempDir) -> (ControlPlane, mpsc::UnboundedReceiver<Command>) {
         let (commands, inbox) = mpsc::unbounded_channel();
@@ -853,6 +1438,7 @@ mod tests {
             directory: RwLock::default(),
             bus: Arc::new(GlobalEventBus::new(16, 16)),
             system: system::open(&dir.path().join("sys")).await.unwrap(),
+            shards: Vec::new(),
         };
         (control, inbox)
     }

@@ -106,9 +106,9 @@ pub struct JsonDomainRegistry {
 }
 
 impl JsonDomainRegistry {
-    /// Loads all persisted domains, then creates the default domain if it is
-    /// missing in any state.
-    pub async fn recover(engine: Arc<LsmStorageEngine>) -> anyhow::Result<Self> {
+    /// Loads all persisted domains, then, with `owns_default`, creates the
+    /// default domain if it is missing in any state.
+    pub async fn recover(engine: Arc<LsmStorageEngine>, owns_default: bool) -> anyhow::Result<Self> {
         let keys = engine.scan_keys(SYS_JSON_DOMAIN_PREFIX).await?;
         let mut loaded = HashMap::new();
         for key in keys {
@@ -129,6 +129,7 @@ impl JsonDomainRegistry {
         // DomainAlreadyExists and abort every boot. The purger finalizes it;
         // the next recover() then recreates it.
         match registry.get_domain_any(DEFAULT_DOMAIN) {
+            None if !owns_default => {}
             None => {
                 registry.create_domain(DEFAULT_DOMAIN).await?;
             }

@@ -19,13 +19,13 @@ pub const VLOG_FILE: &str = "vlog";
 /// SSTable directory of the system store, inside `storage.system_dir`.
 pub const SSTABLE_DIR: &str = "sstables";
 
-/// Data shards this build runs; their data layout depends on the count.
-pub const CONFIGURED_SHARDS: u16 = 1;
-
 /// Shard count the data directories were last started with.
 const SHARDS_KEY: &[u8] = b"__sys:meta:shards";
 /// Set once the auth records moved out of the key-value engine.
 const AUTH_MIGRATED_KEY: &[u8] = b"__sys:meta:auth_migrated";
+/// Data directory layout; `2` keeps each data shard's files in `shard_<k>/`.
+const LAYOUT_KEY: &[u8] = b"__sys:meta:layout";
+const SHARDED_LAYOUT: &[u8] = b"2";
 
 /// Opens (or creates) the system store in `dir` with `wal`, the log at
 /// `<dir>/wal`, and recovers it.
@@ -73,6 +73,16 @@ pub async fn check_shard_count(sys: &LsmStorageEngine, configured: u16) -> Resul
             "shard count changed (stored {stored}, configured {configured}) — run the shard migration tool"
         ),
     }
+}
+
+/// Whether the data directories keep each shard's files in `shard_<k>/`.
+pub async fn layout_is_sharded(sys: &LsmStorageEngine) -> Result<bool> {
+    Ok(sys.get(LAYOUT_KEY).await?.as_deref() == Some(SHARDED_LAYOUT))
+}
+
+/// Records that the data directories keep each shard's files in `shard_<k>/`.
+pub async fn mark_layout_sharded(sys: &LsmStorageEngine) -> Result<()> {
+    sys.put(LAYOUT_KEY, SHARDED_LAYOUT).await
 }
 
 /// Moves the auth records from the key-value engine into the system store,

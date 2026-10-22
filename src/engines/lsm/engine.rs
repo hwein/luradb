@@ -22,7 +22,7 @@ use crate::engines::StorageEngine;
 use crate::core::coop::YieldEvery;
 use crate::core::events::{stream_epoch, Resume, SeqRing};
 use crate::core::io_engine::IoEngine;
-use crate::core::wal::WriteAheadLog;
+use crate::core::wal::{WalEntry, WriteAheadLog};
 use crate::storage::vlog::{discover_generations, generation_path, VLog, VLogError};
 use crate::storage::sstable::{SSTableBuilder, SSTableReader};
 use crate::storage::format::VersionState;
@@ -94,6 +94,19 @@ pub struct LsmEngineOptions {
     pub compaction: CompactionConfig,
     pub janitor: JanitorConfig,
     pub block_cache: BlockCacheConfig,
+    pub recovery: Recovery,
+}
+
+/// Where a new engine's unflushed writes come from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Recovery {
+    /// Replays its own write-ahead log, flushes what it read and truncates
+    /// the log.
+    #[default]
+    Internal,
+    /// Replays nothing; [`LsmStorageEngine::apply_recovered`] hands it its
+    /// share of a log several instances write, which their owner truncates.
+    External,
 }
 
 fn validate_key(key: &[u8], max_len: usize) -> Result<()> {
@@ -480,19 +493,26 @@ impl LsmStorageEngine {
             compaction: compaction_config,
             janitor: janitor_config,
             block_cache: block_cache_config,
+            recovery,
         } = options;
 
         let mut version = Self::discover_vlog_generations(vlog, &vlog_path).await?;
 
         // Recover the MemTable from the WAL first.
-        let (recovered, wal_max_ts, wal_max_lsn) = Self::recover_from_wal(
-            &wal_path,
-            &version.active_vlog,
-            engine_config.vlog_inline_threshold,
-        )
-        .await?;
-        // Before the first append: new records continue the log's LSNs.
-        wal.set_lsn_start(wal_max_lsn).await?;
+        let (recovered, wal_max_ts, wal_max_lsn) = match recovery {
+            Recovery::Internal => {
+                let recovered = Self::recover_from_wal(
+                    &wal_path,
+                    &version.active_vlog,
+                    engine_config.vlog_inline_threshold,
+                )
+                .await?;
+                // Before the first append: new records continue the log's LSNs.
+                wal.set_lsn_start(recovered.2).await?;
+                recovered
+            }
+            Recovery::External => (MemTable::new(), 0, 0),
+        };
 
         let manifest = manifest_manager.load().await?;
 
@@ -559,17 +579,37 @@ impl LsmStorageEngine {
 
         // Recovered WAL data is RAM-only: flush it to an SSTable BEFORE
         // truncating the WAL, so no later startup failure can lose it.
+        engine.flush_recovered(recovered).await?;
+        if recovery == Recovery::Internal {
+            engine.wal.truncate().await?;
+        }
+
+        Ok(engine)
+    }
+
+    /// Takes this instance's share of a write-ahead log it shares with other
+    /// instances, `max_lsn` being the log's highest LSN, and flushes it.
+    /// Built with [`Recovery::External`], before any write; the owner of the
+    /// log truncates it once every instance has applied its share.
+    pub async fn apply_recovered(&self, entries: Vec<(u64, WalEntry)>, max_lsn: u64) -> Result<()> {
+        let active = Arc::clone(&self.version().active_vlog);
+        let (recovered, max_ts) =
+            Self::replay(entries, &active, self.engine_config.vlog_inline_threshold).await?;
+        self.hlc.seed(max_ts);
+        self.last_applied_lsn.fetch_max(max_lsn, Ordering::Release);
+        self.flush_recovered(recovered).await
+    }
+
+    async fn flush_recovered(&self, recovered: MemTable) -> Result<()> {
         if !recovered.is_empty() {
-            engine.install(|v| {
+            self.install(|v| {
                 let mut next = v.clone();
                 next.immutables.push(Arc::new(recovered));
                 next
             });
-            engine.flush_memtable().await?;
+            self.flush_memtable().await?;
         }
-        engine.wal.truncate().await?;
-
-        Ok(engine)
+        Ok(())
     }
 
     // ── Recovery ────────────────────────────────────────────────────────────
@@ -605,13 +645,24 @@ impl LsmStorageEngine {
         vlog: &VLog,
         vlog_inline_threshold: usize,
     ) -> Result<(MemTable, u64, u64)> {
-        let memtable = MemTable::new();
         let recovered = crate::core::wal::recover(wal_path).await?;
+        let (memtable, max_ts) = Self::replay(recovered.entries, vlog, vlog_inline_threshold).await?;
+        Ok((memtable, max_ts, recovered.max_lsn))
+    }
+
+    /// Replays recovered WAL `entries` into a MemTable, together with the
+    /// highest raw MVCC timestamp among them (0 for none).
+    async fn replay(
+        entries: Vec<(u64, WalEntry)>,
+        vlog: &VLog,
+        vlog_inline_threshold: usize,
+    ) -> Result<(MemTable, u64)> {
+        let memtable = MemTable::new();
         let mut max_ts = 0;
 
-        for (_, entry) in recovered.entries {
+        for (_, entry) in entries {
             match entry {
-                crate::core::wal::WalEntry::Set { timestamp, key, value, expire_at } => {
+                WalEntry::Set { timestamp, key, value, expire_at } => {
                     max_ts = max_ts.max(timestamp);
                     let ts = Timestamp::new(timestamp);
                     let expire_at_opt = if expire_at == 0 { None } else { Some(expire_at) };
@@ -622,7 +673,7 @@ impl LsmStorageEngine {
                         memtable.set(key, ts, Value::Inline(value, expire_at_opt));
                     }
                 }
-                crate::core::wal::WalEntry::Delete { timestamp, key, in_batch } => {
+                WalEntry::Delete { timestamp, key, in_batch } => {
                     max_ts = max_ts.max(timestamp);
                     let ts = Timestamp::new(timestamp);
                     if in_batch {
@@ -631,7 +682,7 @@ impl LsmStorageEngine {
                         memtable.set_if_absent(key, ts, Value::Tombstone);
                     }
                 }
-                crate::core::wal::WalEntry::SetNull { timestamp, key } => {
+                WalEntry::SetNull { timestamp, key } => {
                     max_ts = max_ts.max(timestamp);
                     let ts = Timestamp::new(timestamp);
                     memtable.set(key, ts, Value::Null);
@@ -639,7 +690,7 @@ impl LsmStorageEngine {
             }
         }
 
-        Ok((memtable, max_ts, recovered.max_lsn))
+        Ok((memtable, max_ts))
     }
 
     /// Opens an SSTable reader for `file_id` — memory-mapped when `use_mmap`
@@ -831,39 +882,20 @@ impl LsmStorageEngine {
         }
     }
 
-    /// Signals background tasks to stop, joins them, then flushes remaining
-    /// MemTables and truncates the WAL. Idempotent: a second call finds no
-    /// handles left to join and flushes/truncates an already-clean state.
+    /// [`Self::shutdown_flush`], then truncates the WAL — for an engine that
+    /// writes its WAL alone. Idempotent: a second call finds no handles left
+    /// to join and flushes/truncates an already-clean state.
     ///
-    /// A failed flush skips the truncate (spec kv/026 M1): a failed
-    /// `flush_memtable` puts its MemTable back among the immutables
-    /// (spec general/028), but nothing persisted its data, so the WAL is the
-    /// only durable copy of it — truncating anyway would destroy it. So does
-    /// a failed manifest save: an earlier flush can have installed its
-    /// SSTable and then failed to save, leaving the table in L0 and in no
-    /// MANIFEST on disk, where the next startup would not find it.
-    /// The next startup replays the WAL instead. The failure stays an
-    /// `eprintln!`, not just `tracing::error!`: no tracing subscriber runs
+    /// A failed flush skips the truncate: the WAL is then the only durable
+    /// copy of the data, and the next startup replays it. The failure stays
+    /// an `eprintln!`, not just `tracing::error!`: no tracing subscriber runs
     /// under `cargo test`, so this line is the only surviving evidence in a
-    /// captured test log (spec kv/026 §A3). Callers (`main.rs`, `json`/`rel`
-    /// bootstrap) take no `Result` from this method, so a log line like
-    /// "LSM engine shutdown complete." right after it only means the
-    /// shutdown sequence ran to completion, not that the flush succeeded.
+    /// captured test log. Callers take no `Result` from this method, so a log
+    /// line like "LSM engine shutdown complete." right after it only means
+    /// the shutdown sequence ran to completion, not that the flush succeeded.
     pub async fn shutdown(&self) {
-        // Joined before touching MemTables/WAL below.
-        self.stop_background_tasks().await;
-
-        // Only now is nothing left running concurrently. A failed
-        // flush must not be followed by the truncate below — see doc comment.
-        if let Err(e) = self.flush_all_memtables().await {
-            eprintln!("[Engine] Shutdown flush error: {e}");
-            return;
-        }
-        // A no-op unless a flush's own save failed: the manifest carries the
-        // version already on disk then (spec kv/027 §A).
-        let snap = self.manifest.read().clone();
-        if let Err(e) = self.manifest_manager.save(&snap).await {
-            eprintln!("[Engine] Shutdown manifest save error: {e}");
+        if let Err(e) = self.shutdown_flush().await {
+            eprintln!("[Engine] {e:#}");
             return;
         }
 
@@ -873,6 +905,31 @@ impl LsmStorageEngine {
         if let Err(e) = self.wal.truncate().await {
             eprintln!("[Engine] Shutdown WAL truncate error: {e}");
         }
+    }
+
+    /// Signals background tasks to stop, joins them, then flushes remaining
+    /// MemTables and saves the manifest; leaves the WAL alone. `Ok` means
+    /// every write is in an SSTable the saved manifest lists, so the WAL may
+    /// go.
+    ///
+    /// A failed `flush_memtable` puts its MemTable back among the immutables,
+    /// but nothing persisted its data. A failed manifest save after an
+    /// earlier flush installed its SSTable leaves the table in L0 and in no
+    /// MANIFEST on disk, where the next startup would not find it. Either way
+    /// the WAL is the only durable copy, and this fails.
+    pub async fn shutdown_flush(&self) -> Result<()> {
+        // Joined before touching MemTables below.
+        self.stop_background_tasks().await;
+        self.flush_all_memtables().await.context("Shutdown flush error")?;
+        // A no-op unless a flush's own save failed: the manifest carries the
+        // version already on disk then.
+        let snap = self.manifest.read().clone();
+        self.manifest_manager.save(&snap).await.context("Shutdown manifest save error")
+    }
+
+    /// The LSN of the last record durable in this engine's WAL.
+    pub async fn wal_head_lsn(&self) -> Result<u64> {
+        Ok(self.wal.head_lsn().await?)
     }
 
     /// Signals the background tasks to stop and joins them, without the
@@ -911,8 +968,15 @@ impl LsmStorageEngine {
 
     // ── MVCC helpers ────────────────────────────────────────────────────────
 
-    fn next_timestamp(&self) -> Timestamp {
-        Timestamp::new(self.hlc.now().as_u64())
+    /// Draws the next stamp. While the clock's logical counter is saturated,
+    /// yields to the runtime until the wall clock moves on.
+    async fn next_timestamp(&self) -> Timestamp {
+        loop {
+            if let Some(stamp) = self.hlc.try_now() {
+                return Timestamp::new(stamp.as_u64());
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Stamp of a point read: the last one the clock issued, raised to the
@@ -921,7 +985,7 @@ impl LsmStorageEngine {
     /// the wall clock covers stored stamps no seed knows of (a manifest
     /// written before `max_timestamp`), as a drawn stamp did.
     fn read_timestamp(&self) -> Timestamp {
-        let wall = HLCTimestamp::from_components(HybridLogicalClock::physical_time(), 0);
+        let wall = HLCTimestamp::from_components(self.hlc.wall(), 0);
         Timestamp::new(self.hlc.peek().max(wall).as_u64())
     }
 
@@ -932,15 +996,17 @@ impl LsmStorageEngine {
     ///
     /// Unlike a point read, it draws a stamp of its own: one per snapshot,
     /// under the registry lock (see [`SnapshotRegistry::acquire_at`]).
-    pub fn snapshot(&self) -> RegistrySnapshot {
-        self.snapshot_registry.acquire_at(|| {
-            let stamp = self.hlc.try_now()?;
-            #[cfg(test)]
-            if let Some(hook) = &self.hooks.snapshot_stamp_drawn {
-                hook.pause();
-            }
-            Some(Timestamp::new(stamp.as_u64()))
-        })
+    pub async fn snapshot(&self) -> RegistrySnapshot {
+        self.snapshot_registry
+            .acquire_at(|| {
+                let stamp = self.hlc.try_now()?;
+                #[cfg(test)]
+                if let Some(hook) = &self.hooks.snapshot_stamp_drawn {
+                    hook.pause();
+                }
+                Some(Timestamp::new(stamp.as_u64()))
+            })
+            .await
     }
 
     /// Test-only: the registry `snapshot` registers in.
@@ -1050,7 +1116,7 @@ impl LsmStorageEngine {
     /// the version found, and the draw keeps that date within the clock.
     pub(super) async fn newest_version(&self, key: &[u8]) -> Result<Option<(Timestamp, VersionState)>> {
         let reader = self.build_reader();
-        let snapshot = Snapshot::new(self.next_timestamp());
+        let snapshot = Snapshot::new(self.next_timestamp().await);
         reader.newest_version(key, &snapshot).await
     }
 
@@ -1137,7 +1203,7 @@ impl LsmStorageEngine {
 
     /// Like [`Self::quiesce_writes`], but keeps every later write out until
     /// the returned guard drops.
-    pub(super) async fn drain_writes(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+    pub(crate) async fn drain_writes(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
         self.in_flight_writes.write().await
     }
 
@@ -1200,11 +1266,11 @@ impl LsmStorageEngine {
         let _guard = self.in_flight_writes.read().await;
         admit()?;
 
-        // Reserve, then stamp: a full WAL queue is waited out before the
-        // stamp. From the stamp to `send` no `.await` — `send` fixes the
-        // record's LSN, so the stamps follow the LSNs.
+        // Reserve, then stamp: a full WAL queue and a saturated clock are
+        // waited out before the stamp. From the stamp to `send` no `.await` —
+        // `send` fixes the record's LSN, so the stamps follow the LSNs.
         let permit = self.wal.reserve().await?;
-        let timestamp = self.next_timestamp();
+        let timestamp = self.next_timestamp().await;
         let expire_at_val = expire_at.unwrap_or(0);
 
         // WAL entry: [type=1][ts:u64][key_len:u32][key][value_len:u32][value][expire_at:u64]
@@ -1267,7 +1333,7 @@ impl LsmStorageEngine {
 
         // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
         let permit = self.wal.reserve().await?;
-        let timestamp = self.next_timestamp();
+        let timestamp = self.next_timestamp().await;
         let (_, lsn) = permit.send(Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
         // Still pinned after the WAL append; the guard above now closes the
@@ -1337,7 +1403,7 @@ impl LsmStorageEngine {
 
         // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
         let permit = self.wal.reserve().await?;
-        let timestamp = self.next_timestamp();
+        let timestamp = self.next_timestamp().await;
 
         // WAL entry: [type=4][ts:u64][key_len:u32][key] — type 3 is already
         // the batch record, so SetNull uses 4.
@@ -1466,7 +1532,7 @@ impl LsmStorageEngine {
 
         // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
         let permit = self.wal.reserve().await?;
-        let timestamp = self.next_timestamp();
+        let timestamp = self.next_timestamp().await;
         let (_, lsn) = permit.send(Self::encode_batch_wal_record(timestamp, &ops)).await?;
 
         // Captured before `resolve_batch_values` below consumes `ops` — the
@@ -2737,8 +2803,53 @@ mod tests {
     const HLC_SKEW_MS: u64 = 5_000;
 
     fn advance_hlc(engine: &LsmStorageEngine) {
-        let ahead = engine.hlc().now().physical() + HLC_SKEW_MS;
-        engine.hlc().update(HLCTimestamp::from_components(ahead, 0));
+        let ahead = engine.hlc().try_now().unwrap().physical() + HLC_SKEW_MS;
+        engine.hlc().update(HLCTimestamp::from_components(ahead, 0)).unwrap();
+    }
+
+    /// `engine` on a clock that reads `now`, its logical counter saturated
+    /// at `now`'s millisecond.
+    fn saturate_clock(engine: &mut LsmStorageEngine, now: &Arc<AtomicU64>) {
+        let read = Arc::clone(now);
+        engine.hlc = Arc::new(HybridLogicalClock::with_clock(move || read.load(Ordering::SeqCst)));
+        engine.hlc.seed(HLCTimestamp::from_components(now.load(Ordering::SeqCst), u16::MAX).as_u64());
+        assert_eq!(engine.hlc.try_now(), None);
+    }
+
+    // A saturated clock parks a write and a snapshot on the runtime instead
+    // of the thread: other tasks keep running — this one moves the clock —
+    // and both draw their stamp once the wall clock has moved on.
+    #[test]
+    fn test_a_saturated_clock_parks_writes_and_snapshots_without_blocking_the_thread() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut engine = engine_on(&dir).await;
+            let now = Arc::new(AtomicU64::new(1_700_000_000_000));
+            saturate_clock(&mut engine, &now);
+            let engine = Arc::new(engine);
+
+            let put = compio::runtime::spawn({
+                let engine = Arc::clone(&engine);
+                async move { engine.put(b"k", b"v").await }
+            });
+            let snapshot = compio::runtime::spawn({
+                let engine = Arc::clone(&engine);
+                async move { engine.snapshot().await.snapshot().timestamp().as_u64() }
+            });
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!put.is_finished(), "the write waits for the clock");
+            assert!(!snapshot.is_finished(), "the snapshot waits for the clock");
+
+            now.fetch_add(1, Ordering::SeqCst);
+            put.await.unwrap().unwrap();
+            let snapshot = HLCTimestamp::new(snapshot.await.unwrap());
+            let (_, _, stamp) = engine.get_latest_with_stamp(b"k").await.unwrap();
+            let moved_on = now.load(Ordering::SeqCst);
+            assert_eq!(HLCTimestamp::new(stamp).physical(), moved_on);
+            assert_eq!(snapshot.physical(), moved_on);
+        })
     }
 
     async fn put_range(engine: &LsmStorageEngine, range: std::ops::Range<u32>) {
@@ -2956,7 +3067,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             engine.put(b"key1", b"value1").await.unwrap();
             engine.set_null(b"key1").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Null);
         })
     }
@@ -2977,7 +3088,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             engine.set_null(b"key1").await.unwrap();
             engine.delete(b"key1").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(engine.get_with_snapshot(b"key1", snap.snapshot()).await.unwrap(), GetResult::Absent);
         })
     }
@@ -2986,11 +3097,11 @@ mod tests {
     fn test_set_null_on_nonexistent_key_creates_it() {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Absent);
 
             engine.set_null(b"ghost").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(engine.get_with_snapshot(b"ghost", snap.snapshot()).await.unwrap(), GetResult::Null);
         })
     }
@@ -3003,7 +3114,7 @@ mod tests {
             engine.put(b"empty", b"").await.unwrap();
             engine.set_null(b"null_key").await.unwrap();
 
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(
                 engine.get_with_snapshot(b"empty", snap.snapshot()).await.unwrap(),
                 GetResult::Present(Vec::new())
@@ -3030,7 +3141,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             engine.set_null(b"n").await.unwrap();
             freeze_and_flush(&engine).await;
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
 
             // A second L0 table forces an L0 -> L1 compaction that must preserve it.
@@ -3038,7 +3149,7 @@ mod tests {
             freeze_and_flush(&engine).await;
             engine.compact_level(0).await.unwrap();
 
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(engine.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
             assert!(engine.scan_keys(b"n").await.unwrap().contains(&b"n".to_vec()));
         })
@@ -3054,7 +3165,7 @@ mod tests {
             drop(engine); // crash: data only in the WAL
 
             let engine2 = engine_on(&dir).await;
-            let snap = engine2.snapshot();
+            let snap = engine2.snapshot().await;
             assert_eq!(engine2.get_with_snapshot(b"n", snap.snapshot()).await.unwrap(), GetResult::Null);
         })
     }
@@ -3321,7 +3432,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             engine.put(b"user:1", b"alice").await.unwrap();
             engine.put(b"user:2", b"bob").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
 
             engine.put(b"user:3", b"carol").await.unwrap(); // new key after snapshot
             engine.delete(b"user:1").await.unwrap(); // delete after snapshot
@@ -3347,7 +3458,7 @@ mod tests {
             engine.delete(b"user:1").await.unwrap();
             freeze_and_flush(&engine).await; // SSTable 2: user:1 tombstoned
 
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
 
             engine.put(b"user:1", b"v2").await.unwrap(); // resurrection after snapshot
             freeze_and_flush(&engine).await; // SSTable 3: user:1 = v2
@@ -3366,7 +3477,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             engine.set_null(b"user:1").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
             assert_eq!(keys, vec![b"user:1".to_vec()]);
         })
@@ -3380,7 +3491,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             wait_past_ttl(1).await;
             // Bounded retry instead of a single probe: a backwards wall-clock
             // step between the wait above and the scan's own now_secs() briefly
@@ -3412,7 +3523,7 @@ mod tests {
             for i in 0..10 {
                 engine.put(format!("z:m{i}").as_bytes(), b"v").await.unwrap();
             }
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             // Ghosts: written after the snapshot, and sort ahead of "z:m*".
             for i in 0..5 {
                 engine.put(format!("z:a{i}").as_bytes(), b"v").await.unwrap();
@@ -3437,7 +3548,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             engine.put(b"user:1", b"v").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             engine.delete(b"user:1").await.unwrap();
 
             let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
@@ -3461,7 +3572,7 @@ mod tests {
             for i in 5..10 {
                 engine.put(format!("user:{i}").as_bytes(), b"v").await.unwrap();
             }
-            let snap = engine.snapshot(); // all 10 visible: 5 in the SSTable, 5 in the active MemTable
+            let snap = engine.snapshot().await; // all 10 visible: 5 in the SSTable, 5 in the active MemTable
 
             let full = engine.scan_keys_limited_with_snapshot(b"user:", 100, snap.snapshot()).await.unwrap();
             assert_eq!(full.len(), 10, "sanity: all 10 must be snapshot-visible when uncapped");
@@ -3487,7 +3598,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
             engine.put(b"user:2", b"bob").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             wait_past_ttl(1).await;
             // Bounded retry instead of a single probe: a backwards wall-clock
             // step between the wait above and the scan's own now_secs() briefly
@@ -3515,7 +3626,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             engine.set_null(b"user:1").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             let keys = engine.scan_keys_limited_with_snapshot(b"user:", 10, snap.snapshot()).await.unwrap();
             assert_eq!(keys, vec![b"user:1".to_vec()]);
         })
@@ -3601,7 +3712,7 @@ mod tests {
             engine.put(b"ab:2", b"v1").await.unwrap();
             engine.delete(b"ab:2").await.unwrap();
             engine.put(b"ac", b"v1").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             engine.delete(b"ab:1").await.unwrap();
             engine.put(b"ab:2", b"v2").await.unwrap();
             engine.put(b"ab:3", b"v1").await.unwrap();
@@ -3671,7 +3782,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             engine.put(b"k", b"v1").await.unwrap();
             freeze_and_flush(&engine).await;
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             engine.put(b"k", b"v2").await.unwrap();
             freeze_and_flush(&engine).await;
 
@@ -3708,7 +3819,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             engine.put(b"plain", b"v").await.unwrap();
             engine.put_with_ttl(b"ttl", b"v", 3600).await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
 
             let (result, expire_at) = engine.get_with_expiry(b"plain", snap.snapshot()).await.unwrap();
             assert_eq!(result, GetResult::Present(b"v".to_vec()));
@@ -3727,7 +3838,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             engine.set_null(b"n").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(
                 engine.get_with_expiry(b"n", snap.snapshot()).await.unwrap(),
                 (GetResult::Null, 0)
@@ -3740,7 +3851,7 @@ mod tests {
     fn test_get_with_expiry_absent_for_missing_key() {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(
                 engine.get_with_expiry(b"ghost", snap.snapshot()).await.unwrap(),
                 (GetResult::Absent, 0)
@@ -3757,7 +3868,7 @@ mod tests {
             let big = vec![b'x'; 4096]; // >= vlog_inline_threshold -> VLog pointer
             engine.put(b"k", &big).await.unwrap();
             freeze_and_flush(&engine).await;
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
 
             engine.put(b"k", b"newer").await.unwrap();
             freeze_and_flush(&engine).await;
@@ -4228,7 +4339,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
 
             // Writer B: newer stamp, applied into the MemTable that is frozen next.
-            let newer = engine.next_timestamp();
+            let newer = engine.next_timestamp().await;
             engine.version().memtable.set(b"k".to_vec(), newer, Value::Inline(b"newer".to_vec(), None));
 
             engine.freeze_active_memtable();
@@ -4669,7 +4780,7 @@ mod tests {
             let engine = engine_on_hub(&dir, &hub).await;
             assert_eq!(engine.get(b"alpha").await.unwrap(), None);
             assert_eq!(engine.get(b"beta").await.unwrap(), None);
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             assert_eq!(engine.get_with_snapshot(b"gamma", snap.snapshot()).await.unwrap(), GetResult::Null);
             assert_eq!(engine.get("clé".as_bytes()).await.unwrap(), Some("🦀".as_bytes().to_vec()));
             assert_eq!(engine.get(b"after").await.unwrap(), Some(b"upgrade".to_vec()));
@@ -5434,7 +5545,7 @@ mod tests {
                 .write_batch((0..700u32).step_by(5).map(|i| delete(format!("b:{i:04}"))).collect())
                 .await
                 .unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             let mut later: Vec<BatchOp> = (0..700u32).step_by(3).map(|i| delete(format!("b:{i:04}"))).collect();
             later.extend((1..700u32).step_by(3).map(|i| put(format!("b:{i:04}"))));
             later.push(put("b:9999".to_string()));
@@ -5938,7 +6049,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             let memtable = engine.pin_memtable();
-            let stamp = engine.next_timestamp();
+            let stamp = engine.next_timestamp().await;
             assert_raises_change_epoch(&engine, engine.write_tombstone_at(&memtable, b"k", stamp)).await;
         })
     }
@@ -6007,7 +6118,7 @@ mod tests {
 
             assert_eq!(source_count(&before), 2, "the old version is untouched mid-install");
             let reader = LsmReader::new(Arc::clone(&before), Arc::clone(&engine.block_cache), &engine.applying_batch);
-            let snapshot = Snapshot::new(engine.next_timestamp());
+            let snapshot = Snapshot::new(engine.next_timestamp().await);
             for i in 0..100u32 {
                 assert_eq!(
                     reader.get(format!("k{i:03}").as_bytes(), &snapshot).await.unwrap(),
@@ -6042,8 +6153,8 @@ mod tests {
             }
             assert_eq!(engine.hlc().peek(), before, "point reads must not draw stamps");
 
-            let first = engine.snapshot();
-            let second = engine.snapshot();
+            let first = engine.snapshot().await;
+            let second = engine.snapshot().await;
             assert!(first.snapshot().timestamp().as_u64() > before.as_u64());
             assert!(
                 second.snapshot().timestamp().as_u64() > first.snapshot().timestamp().as_u64(),
@@ -6102,7 +6213,7 @@ mod tests {
             let scanner = {
                 let engine = Arc::clone(&engine);
                 compio::runtime::spawn(async move {
-                    let guard = engine.snapshot();
+                    let guard = engine.snapshot().await;
                     engine.scan_keys_with_snapshot(b"k:", guard.snapshot()).await.unwrap().len()
                 })
             };
@@ -6145,7 +6256,7 @@ mod tests {
 
             let reader = {
                 let engine = Arc::clone(&engine);
-                std::thread::spawn(move || engine.snapshot())
+                std::thread::spawn(move || futures::executor::block_on(engine.snapshot()))
             };
             reached.recv().unwrap();
             assert!(engine.snapshot_registry().is_locked(), "the stamp is drawn under the registry lock");
@@ -6406,7 +6517,7 @@ mod tests {
                         std::thread::yield_now();
                         continue;
                     }
-                    let pinned = engine.snapshot();
+                    let pinned = engine.snapshot().await;
                     let snapshot = pinned.snapshot();
                     let sample: Vec<u64> = (0..32).map(|_| next_random(&mut rng) % known).collect();
                     let mut first = Vec::with_capacity(sample.len());
@@ -6537,7 +6648,7 @@ mod tests {
     fn test_pointer_into_an_unknown_generation_is_a_clean_error() {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
-            let stamp = engine.next_timestamp();
+            let stamp = engine.next_timestamp().await;
             let dangling = Value::Pointer { file_id: 7, offset: 0, len: 4, expire_at: None };
             engine.version().memtable.set(b"k".to_vec(), stamp, dangling);
 
@@ -6583,7 +6694,7 @@ mod tests {
             put_into_l2(&engine, b"k", b"v1").await;
             engine.delete(b"k").await.unwrap();
             freeze_and_flush(&engine).await;
-            let snap = engine.snapshot(); // stamped above the tombstone
+            let snap = engine.snapshot().await; // stamped above the tombstone
 
             engine.compact_level(0).await.unwrap();
 
@@ -6600,7 +6711,7 @@ mod tests {
             engine.put_expired_for_test(b"e", b"v").await.unwrap();
             engine.delete(b"d").await.unwrap();
             freeze_and_flush(&engine).await;
-            let _snap = engine.snapshot(); // stamped above the tombstone
+            let _snap = engine.snapshot().await; // stamped above the tombstone
 
             engine.compact_level(0).await.unwrap();
 
@@ -6691,7 +6802,7 @@ mod tests {
             let seen = read_mid_batch(&engine, hook, ops, |engine| async move {
                 let no_batch = AtomicU64::new(0);
                 let blind = LsmReader::new(engine.version(), Arc::clone(&engine.block_cache), &no_batch);
-                let registered = engine.snapshot();
+                let registered = engine.snapshot().await;
                 let mut seen = Vec::new();
                 for key in [b"a", b"b"] {
                     seen.push((
@@ -6788,7 +6899,7 @@ mod tests {
                 engine.put(b"p:old", b"v").await.unwrap();
 
                 let (unregistered, registered) = read_mid_batch(&engine, hook, ops, |engine| async move {
-                    let registered = engine.snapshot();
+                    let registered = engine.snapshot().await;
                     (
                         engine.scan_keys(b"p:").await.unwrap(),
                         engine.scan_keys_with_snapshot(b"p:", registered.snapshot()).await.unwrap(),

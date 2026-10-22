@@ -680,7 +680,7 @@ impl RelEngine {
         // stable read horizon — the guard must stay alive across the whole
         // scan+fetch episode so compaction/GC cannot advance past a version
         // this snapshot still needs, matching `acquire_candidates` (dml.rs).
-        let snapshot_guard = self.engine.snapshot();
+        let snapshot_guard = self.engine.snapshot().await;
         let snap = snapshot_guard.snapshot().clone();
 
         let (mut row_keys, scanned) =
@@ -761,7 +761,7 @@ impl RelEngine {
         // Registered before the key scan (spec rel/018 §2): every branch
         // below, including the no-residual key-count path, now reads at
         // this snapshot — see the identical note in `exec_select`.
-        let snapshot_guard = self.engine.snapshot();
+        let snapshot_guard = self.engine.snapshot().await;
         let snap = snapshot_guard.snapshot().clone();
         let (row_keys, scanned) =
             resolve_candidate_keys(&self.engine, schema, prefix, &plan.access, &snap, None).await?;
@@ -1271,7 +1271,7 @@ mod tests {
             ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
             ok(&rel, "INSERT INTO t VALUES (1)").await;
 
-            let snapshot_guard = rel.engine().snapshot();
+            let snapshot_guard = rel.engine().snapshot().await;
             let snap = snapshot_guard.snapshot().clone();
             ok(&rel, "INSERT INTO t VALUES (2)").await; // live now, but not in `snap`
 
@@ -1444,7 +1444,7 @@ mod tests {
             ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
             ok(&rel, "INSERT INTO t VALUES (1), (2)").await;
 
-            let snapshot_guard = rel.engine().snapshot();
+            let snapshot_guard = rel.engine().snapshot().await;
             let snap = snapshot_guard.snapshot().clone();
 
             let prefix = rel.get_domain("default").unwrap().system_prefix;
@@ -1499,7 +1499,7 @@ mod tests {
             let name_scan_prefix = keys::index_value_prefix(&prefix, idx_name.index_id, &[]);
             let name_idx_key = rel.engine().scan_keys(&name_scan_prefix).await.unwrap().into_iter().next().unwrap();
 
-            let snapshot_guard = rel.engine().snapshot();
+            let snapshot_guard = rel.engine().snapshot().await;
             let snap = snapshot_guard.snapshot().clone();
 
             // Simulates a concurrent UPDATE moving `tag`/`name` off their
@@ -1554,7 +1554,7 @@ mod tests {
             // Gegenprobe: a fresh snapshot taken after the tombstone must NOT
             // see the vanished index entry -- proves the assertions above
             // exercise the snapshot, not a scan that ignores deletes outright.
-            let now_guard = rel.engine().snapshot();
+            let now_guard = rel.engine().snapshot().await;
             let now_snap = now_guard.snapshot().clone();
             let (point_now, _) = resolve_candidate_keys(
                 rel.engine(),

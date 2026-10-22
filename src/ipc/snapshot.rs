@@ -123,7 +123,7 @@ impl SnapshotBuilder {
     /// logged and still published. Whether it fits after serialization is the
     /// final call of [`SnapshotWriter::publish`].
     pub async fn build(&self) -> Result<BuiltSnapshot> {
-        let snap = self.engine.snapshot();
+        let snap = self.engine.snapshot().await;
 
         // Active domains only (list_domains filters Deleting), sorted by name so
         // truncation is deterministic.
@@ -812,7 +812,7 @@ mod tests {
                 }
             }
 
-            let read_point = engine.snapshot();
+            let read_point = engine.snapshot().await;
             let before = scanned_versions();
             let built =
                 build_at(&engine, std::slice::from_ref(&domain), read_point.snapshot(), max_snapshot_size).unwrap();

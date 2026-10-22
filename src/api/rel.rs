@@ -1447,26 +1447,25 @@ mod tests {
     #[allow(clippy::disallowed_methods, reason = "the reader end runs on the harness's tokio runtime")]
     fn sql_behind_the_reader_pool_answers_like_the_inline_router() {
         crate::core::engine_runtime::block_on(async {
-            use crate::bridge::{serve_engine, serve_reader, test_hook, EngineDispatch, ShipService};
+            use crate::bridge::{serve_engine, serve_reader, test_hook, EngineDispatch, Lane, ShardRouter};
 
             let (inline_state, _inline_dir) = make_state(Some(RelStoreConfig::default()), false).await;
             let inline = crate::api::router_inline(inline_state, Arc::new(vec![]));
 
             let (state, _dir) = make_state(Some(RelStoreConfig::default()), false).await;
-            let (engine_tx, engine_rx) = tokio::sync::mpsc::channel(8);
+            let (engine_tx, engine_rx) = Lane::new(8);
             let engine_router = crate::api::create_router(state.clone());
             let engine = std::thread::Builder::new()
                 .name("test-engine".to_string())
                 .spawn(move || crate::core::engine_runtime::block_on(serve_engine(engine_rx, engine_router)))
                 .unwrap();
             // The reader pool: the harness's tokio runtime.
-            let (reader_tx, reader_rx) = tokio::sync::mpsc::channel(8);
+            let (reader_tx, reader_rx) = Lane::new(8);
             tokio::spawn(serve_reader(
                 reader_rx,
-                crate::api::create_router(state),
-                EngineDispatch::Engine(engine_tx.clone()),
+                vec![(crate::api::create_router(state), EngineDispatch::Engine(engine_tx.clone()))],
             ));
-            let ship = ShipService::new(EngineDispatch::Engine(engine_tx)).with_reader(reader_tx);
+            let ship = ShardRouter::new(vec![EngineDispatch::Engine(engine_tx)]).with_reader(reader_tx);
             let pooled = crate::api::frontend_layers(
                 axum::Router::new().fallback_service(ship),
                 None,

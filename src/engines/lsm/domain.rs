@@ -28,8 +28,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
 };
-use compio::time::sleep;
-use std::time::Duration;
 use tokio::sync::broadcast;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -284,6 +282,17 @@ impl DomainRegistry {
         config: DomainConfig,
         metrics: Arc<MetricsStore>,
     ) -> Result<Self> {
+        Self::recover_on_shard(engine, config, metrics, true).await
+    }
+
+    /// [`Self::recover`] on a data shard: only the shard that `owns_default`
+    /// creates the default domain.
+    pub async fn recover_on_shard(
+        engine: Arc<LsmStorageEngine>,
+        config: DomainConfig,
+        metrics: Arc<MetricsStore>,
+        owns_default: bool,
+    ) -> Result<Self> {
         let default_domain = config.default_domain.clone();
         let registry = Self {
             domains: RwLock::new(HashMap::new()),
@@ -299,6 +308,7 @@ impl DomainRegistry {
         // recreates it.
         let default_state = registry.domains.read().get(&default_domain).map(|d| d.state.clone());
         match default_state {
+            None if !owns_default => {}
             None => {
                 registry.create_domain(&default_domain).await?;
             }
@@ -341,7 +351,7 @@ impl DomainRegistry {
         let sys_keys = self.engine.scan_keys(SYS_DOMAIN_PREFIX).await?;
         let mut loaded = Vec::new();
         for key in sys_keys {
-            let snap = self.engine.snapshot();
+            let snap = self.engine.snapshot().await;
             if let Some(value) = self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
                 match serde_json::from_slice::<Domain>(&value) {
                     Ok(domain) => loaded.push(domain),
@@ -401,7 +411,7 @@ impl DomainRegistry {
         }
         // Engine fallback (e.g. after a cold start that didn't hit load_from_engine).
         let key = sys_key(name);
-        let snap = self.engine.snapshot();
+        let snap = self.engine.snapshot().await;
         if let Some(value) = self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
             let domain: Domain = serde_json::from_slice(&value)?;
             if domain.state == DomainState::Deleting {
@@ -1016,35 +1026,11 @@ pub struct DomainPurger {
     engine: Arc<LsmStorageEngine>,
     registry: Arc<DomainRegistry>,
     pub batch_size: usize,
-    pub interval: Duration,
-    shutdown: Arc<AtomicBool>,
 }
 
 impl DomainPurger {
-    pub fn new(
-        engine: Arc<LsmStorageEngine>,
-        registry: Arc<DomainRegistry>,
-        shutdown: Arc<AtomicBool>,
-        batch_size: usize,
-        interval_secs: u64,
-    ) -> Self {
-        Self {
-            engine,
-            registry,
-            batch_size,
-            interval: Duration::from_secs(interval_secs),
-            shutdown,
-        }
-    }
-
-    /// Runs the purge loop until `shutdown` is set.
-    pub async fn run(self: Arc<Self>) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Err(e) = self.purge_tick().await {
-                eprintln!("[DomainPurger] Error: {e}");
-            }
-            sleep(self.interval).await;
-        }
+    pub fn new(engine: Arc<LsmStorageEngine>, registry: Arc<DomainRegistry>, batch_size: usize) -> Self {
+        Self { engine, registry, batch_size }
     }
 
     /// Performs one purge cycle: finds deleting domains and tombstones their keys.
@@ -1348,15 +1334,8 @@ mod tests {
 
             registry.delete_domain("purge-test").await.unwrap();
 
-            let shutdown = Arc::new(AtomicBool::new(false));
             let cfg = DomainConfig::default();
-            let purger = DomainPurger::new(
-                Arc::clone(&engine),
-                Arc::clone(&registry),
-                Arc::clone(&shutdown),
-                cfg.purger_batch_size,
-                cfg.purger_interval_secs,
-            );
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), cfg.purger_batch_size);
             // Run two ticks: first removes keys, second finalises metadata.
             purger.purge_tick().await.unwrap();
             purger.purge_tick().await.unwrap();
@@ -1385,8 +1364,7 @@ mod tests {
                 async move { engine.write_kv_pair(&key, b"v", None).await }
             });
             hook.reached.notified().await;
-            let purger =
-                DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), Arc::new(AtomicBool::new(false)), 100, 1);
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), 100);
             let tick = compio::runtime::spawn(async move { purger.purge_tick().await });
             for _ in 0..20 {
                 tokio::task::yield_now().await;
@@ -1421,13 +1399,7 @@ mod tests {
 
             // After the purger finalized it, the next recover recreates it as Active.
             let cfg = DomainConfig::default();
-            let purger = DomainPurger::new(
-                Arc::clone(&engine),
-                Arc::clone(&registry2),
-                Arc::new(AtomicBool::new(false)),
-                cfg.purger_batch_size,
-                cfg.purger_interval_secs,
-            );
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry2), cfg.purger_batch_size);
             purger.purge_tick().await.unwrap();
             purger.purge_tick().await.unwrap();
 
@@ -1535,7 +1507,7 @@ mod tests {
 
             store_a.put(b"key:1", b"va").await.unwrap();
             store_b.put(b"key:1", b"vb").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
 
             let (result_a, _) = store_a.get_with_snapshot(b"key:1", snap.snapshot()).await.unwrap();
             assert_eq!(result_a, GetResult::Present(b"va".to_vec()));
@@ -1556,7 +1528,7 @@ mod tests {
             registry.create_domain("snap-dom").await.unwrap();
             let store = registry.store("snap-dom").await.unwrap();
             store.put(b"k1", b"old").await.unwrap();
-            let snap = engine.snapshot();
+            let snap = engine.snapshot().await;
             store.put(b"k1", b"new").await.unwrap();
             store.put(b"k2", b"created-after").await.unwrap();
 

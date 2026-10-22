@@ -1,0 +1,487 @@
+//! A data shard's thread: takes over the engine instances the control plane
+//! recovered for it, runs their background tasks, its domain purgers and
+//! sweepers, and the requests of its domains on its own compio runtime, and
+//! flushes its engines when the control plane drains it.
+
+use super::layout;
+use crate::{
+    api::{self, AppState},
+    bridge::{self, Job},
+    config::LuraConfig,
+    control::{self, slots, Engine, ShardCommand, ShardOwners},
+    core::{
+        buffer_pool::BufferPoolManager,
+        disk_manager::DiskManager,
+        engine_runtime,
+        io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID, WAL_LOGICAL_ID},
+    },
+    engines::json::{domain as json_domain, JsonEngine},
+    engines::lsm::{
+        domain::{DomainPurger, DomainRegistry},
+        engine::LsmStorageEngine,
+        rate_limiter::DomainQuota,
+        ttl_sweeper::TtlSweeper,
+    },
+    engines::rel::{domain as rel_domain, RelEngine},
+    ipc,
+    metrics::MetricsStore,
+    uds,
+};
+use anyhow::Context;
+use std::future::Future;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// Everything a data shard's thread starts from.
+pub(super) struct ShardBoot {
+    pub(super) shard: usize,
+    pub(super) shards: u16,
+    pub(super) config: Arc<LuraConfig>,
+    pub(super) kv: Arc<LsmStorageEngine>,
+    pub(super) json: Option<Arc<LsmStorageEngine>>,
+    pub(super) rel: Option<Arc<LsmStorageEngine>>,
+    pub(super) buffer_pool_pages: usize,
+    pub(super) metrics: Arc<MetricsStore>,
+    pub(super) jobs: mpsc::Receiver<Job>,
+    pub(super) commands: mpsc::UnboundedReceiver<ShardCommand>,
+    /// The shard's engines once they are up.
+    pub(super) ready: oneshot::Sender<anyhow::Result<ShardOwners>>,
+    /// The release; dropped unsent, the shard shuts down.
+    pub(super) start: oneshot::Receiver<ShardStart>,
+}
+
+/// The release of a data shard by the control plane: its API state, and
+/// where it reports whether its loops and services run.
+pub(super) struct ShardStart {
+    pub(super) state: AppState,
+    pub(super) started: oneshot::Sender<anyhow::Result<()>>,
+}
+
+/// Starts the thread of data shard `boot.shard`. It enters `frontend`'s
+/// handle for its whole life: `coop::offload`, `tokio::fs` and the IPC
+/// sockets need a tokio context.
+pub(super) fn spawn(boot: ShardBoot, frontend: tokio::runtime::Handle) -> anyhow::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("luradb-shard-{}", boot.shard))
+        .spawn(move || {
+            let _frontend = frontend.enter();
+            match engine_runtime::build(super::remote_wakes(&boot.config)) {
+                Ok(rt) => engine_runtime::run(&rt, run(boot)),
+                Err(e) => {
+                    let _ = boot.ready.send(Err(e));
+                }
+            }
+        })
+        .context("failed to start a data shard thread")
+}
+
+/// The shard's engine instances and the storage stack beside them.
+struct Storage {
+    instances: Vec<(Engine, Arc<LsmStorageEngine>)>,
+    buffer_pool: Option<Arc<BufferPoolManager>>,
+    /// Registered buffers and files stay alive for the whole run; dropping
+    /// this closes their descriptors (a blocking `close(2)` each).
+    io_engine: Option<IoEngine>,
+}
+
+async fn run(boot: ShardBoot) {
+    let mut instances = vec![(Engine::Kv, Arc::clone(&boot.kv))];
+    instances.extend(boot.json.clone().map(|json| (Engine::Json, json)));
+    instances.extend(boot.rel.clone().map(|rel| (Engine::Rel, rel)));
+    for (_, instance) in &instances {
+        instance.start_background_tasks();
+    }
+    let mut storage = Storage { instances, buffer_pool: None, io_engine: None };
+    let opened = open(&mut storage, &boot).await;
+    let ShardBoot { shard, config, jobs, commands, ready, start, .. } = boot;
+    let owners = match opened {
+        Ok(owners) => owners,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            close(&storage).await;
+            return;
+        }
+    };
+    #[cfg(test)]
+    super::test_hook::record(&config.storage.system_dir, format!("shard {shard} ready"));
+    if ready.send(Ok(owners.clone())).is_err() {
+        close(&storage).await;
+        return;
+    }
+    let Ok(ShardStart { state, started }) = start.await else {
+        close(&storage).await;
+        return;
+    };
+
+    #[cfg(test)]
+    super::test_hook::record(&config.storage.system_dir, format!("shard {shard} released"));
+    let loops = spawn_loops(&config, &owners);
+    let shm = match if shard == 0 { start_shm(&config, &state).await } else { Ok(None) } {
+        Ok(shm) => {
+            let _ = started.send(Ok(()));
+            shm
+        }
+        Err(e) => {
+            let _ = started.send(Err(e));
+            None
+        }
+    };
+    let serving = compio::runtime::spawn(bridge::serve_engine(jobs, api::create_router(state)));
+    let drained = control::serve_shard(owners, commands).await;
+
+    // Every sender of the shard's lane is gone by now; the request loop ends
+    // after dropping the requests still in flight.
+    let _ = serving.await;
+    loops.stop().await;
+    stop_shm(shm).await;
+    let flushed = close(&storage).await;
+    if let Some(reply) = drained {
+        let _ = reply.send(flushed);
+    }
+    drop(storage.io_engine);
+}
+
+/// Puts the page store, the registered buffers (shard 0 of a single one
+/// only) and the domain layers on the shard's instances. Only the shard that
+/// owns the default domain creates it.
+async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOwners> {
+    let ShardBoot { shard, shards, config, kv, json, rel, buffer_pool_pages, metrics, .. } = boot;
+    let (shard, shards) = (*shard, *shards);
+    let owns = |name: &str| usize::from(slots::shard_of_domain(name, shards)) == shard;
+
+    let db_path = layout::shard_file(Path::new(&config.storage.db_path), shard);
+    let disk_manager = DiskManager::new(&db_path).await?;
+    storage.buffer_pool = Some(Arc::new(BufferPoolManager::new(*buffer_pool_pages, disk_manager)));
+    if shard == 0 && shards == 1 {
+        let vlog_path = layout::shard_file(Path::new(&config.storage.vlog_path), 0);
+        storage.io_engine = init_io_engine(config, Path::new(&config.storage.wal_path), &vlog_path).await;
+        if let Some(io_engine) = storage.io_engine.as_mut() {
+            kv.register_sstables_with_io_engine(io_engine).await?;
+        }
+    }
+
+    let domain_config = super::control::domain_config(config);
+    let owns_kv_default = owns(&domain_config.default_domain);
+    let registry = Arc::new(
+        DomainRegistry::recover_on_shard(Arc::clone(kv), domain_config, Arc::clone(metrics), owns_kv_default).await?,
+    );
+    let json = match json {
+        Some(json) => Some(
+            JsonEngine::open(&config.json, Arc::clone(json), Arc::clone(metrics), owns(json_domain::DEFAULT_DOMAIN))
+                .await?,
+        ),
+        None => None,
+    };
+    let rel = match rel {
+        Some(rel) => {
+            // Same-named KV and JSON domains live on this shard too.
+            let resolver = crate::engines::rel::CrossEngineResolver::new(
+                Some(Arc::clone(&registry)),
+                json.clone(),
+                Arc::clone(metrics),
+            );
+            let quota = DomainQuota {
+                read_iops: config.rate_limit.default_read_iops,
+                write_iops: config.rate_limit.default_write_iops,
+                max_storage_bytes: config.rate_limit.default_max_storage_bytes,
+            };
+            let owns_default = owns(rel_domain::DEFAULT_DOMAIN);
+            Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(metrics), resolver, owns_default).await?)
+        }
+        None => None,
+    };
+    Ok(ShardOwners { kv: registry, json, rel })
+}
+
+/// Stops the instances' background tasks and flushes each instance once its
+/// writes in flight have applied, then the page store; the result of each
+/// instance's flush.
+async fn close(storage: &Storage) -> Vec<(Engine, anyhow::Result<()>)> {
+    let mut flushed = Vec::with_capacity(storage.instances.len());
+    for (engine, instance) in &storage.instances {
+        instance.quiesce_writes().await;
+        flushed.push((*engine, instance.shutdown_flush().await));
+    }
+    if let Some(buffer_pool) = &storage.buffer_pool {
+        if let Err(e) = buffer_pool.flush_all_pages().await {
+            tracing::error!("Failed to flush pages: {}", e);
+        }
+    }
+    flushed
+}
+
+/// The registered buffers, with the WAL and the value log registered.
+async fn init_io_engine(cfg: &LuraConfig, wal_path: &Path, vlog_path: &Path) -> Option<IoEngine> {
+    if !cfg.io_engine.enabled {
+        return None;
+    }
+    let mut engine = match IoEngine::new(REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE) {
+        Ok(engine) => engine,
+        Err(e) => {
+            tracing::warn!("IoEngine disabled: {e}. Continuing without registered buffers.");
+            return None;
+        }
+    };
+    let registered = match engine.register_file(WAL_LOGICAL_ID, wal_path).await {
+        Ok(()) => engine.register_file(VLOG_LOGICAL_ID, vlog_path).await,
+        err => err,
+    };
+    match registered {
+        Ok(()) => {
+            tracing::info!(
+                "IoEngine ready: {REGISTERED_BUFFER_COUNT} registered buffers x {REGISTERED_BUFFER_SIZE} bytes."
+            );
+            Some(engine)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "IoEngine disabled: WAL/VLog registration failed: {e}. Continuing without registered buffers."
+            );
+            None
+        }
+    }
+}
+
+/// The shard's purgers and sweepers: each a task that runs a tick, then
+/// sleeps its interval, until [`Loops::stop`].
+struct Loops {
+    /// Dropped to wake every loop out of its sleep.
+    stop: watch::Sender<()>,
+    tasks: Vec<compio::runtime::JoinHandle<()>>,
+}
+
+impl Loops {
+    fn new() -> Self {
+        Self { stop: watch::channel(()).0, tasks: Vec::new() }
+    }
+
+    /// Runs `tick` every `interval`; a failed tick is logged.
+    fn spawn<F, Fut>(&mut self, name: &'static str, interval: Duration, tick: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + 'static,
+    {
+        let mut stop = self.stop.subscribe();
+        self.tasks.push(compio::runtime::spawn(async move {
+            loop {
+                if let Err(e) = tick().await {
+                    tracing::warn!("[{name}] {e:#}");
+                }
+                tokio::select! {
+                    _ = compio::time::sleep(interval) => {}
+                    _ = stop.changed() => break,
+                }
+            }
+        }));
+    }
+
+    /// Returns once every loop has ended the tick it was in.
+    async fn stop(self) {
+        drop(self.stop);
+        for task in self.tasks {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Spawns the shard's purgers and sweepers.
+fn spawn_loops(cfg: &LuraConfig, owners: &ShardOwners) -> Loops {
+    let mut loops = Loops::new();
+    let lsm_store = owners.kv.engine();
+
+    let purger = Arc::new(DomainPurger::new(Arc::clone(lsm_store), Arc::clone(&owners.kv), cfg.domains.purger_batch_size));
+    loops.spawn("DomainPurger", Duration::from_secs(cfg.domains.purger_interval_secs), move || {
+        let purger = Arc::clone(&purger);
+        async move { purger.purge_tick().await }
+    });
+
+    // KV only: JSON and rel never write an `expire_at`.
+    if cfg.ttl_sweeper.enabled {
+        let sweeper = Arc::new(TtlSweeper::new(Arc::clone(lsm_store), cfg.ttl_sweeper.batch_size));
+        loops.spawn("TtlSweeper", Duration::from_secs(cfg.ttl_sweeper.interval_secs), move || {
+            let sweeper = Arc::clone(&sweeper);
+            async move { sweeper.sweep_tick().await }
+        });
+    }
+
+    if let Some(engine) = &owners.json {
+        let json_purger = Arc::new(crate::engines::json::JsonDomainPurger::new(
+            Arc::clone(engine),
+            crate::engines::json::purger::PURGER_BATCH_SIZE,
+        ));
+        let interval = Duration::from_secs(crate::engines::json::purger::PURGER_INTERVAL_SECS);
+        loops.spawn("JsonDomainPurger", interval, move || {
+            let purger = Arc::clone(&json_purger);
+            async move { purger.purge_tick().await }
+        });
+    }
+
+    if let Some(engine) = &owners.rel {
+        if engine.cross_engine_has_target() {
+            let sweeper = Arc::new(crate::engines::rel::RelCrossEngineSweeper::new(
+                Arc::clone(engine),
+                crate::engines::rel::cross_engine::SWEEP_BATCH_SIZE,
+            ));
+            let interval = Duration::from_secs(crate::engines::rel::cross_engine::SWEEP_INTERVAL_SECS);
+            loops.spawn("RelCrossEngineSweeper", interval, move || {
+                let sweeper = Arc::clone(&sweeper);
+                async move { sweeper.sweep_tick().await }
+            });
+        }
+        let rel_purger = Arc::new(crate::engines::rel::RelDomainPurger::new(
+            Arc::clone(engine),
+            crate::engines::rel::purger::PURGER_BATCH_SIZE,
+        ));
+        let interval = Duration::from_secs(crate::engines::rel::purger::PURGER_INTERVAL_SECS);
+        loops.spawn("RelDomainPurger", interval, move || {
+            let purger = Arc::clone(&rel_purger);
+            async move { purger.purge_tick().await }
+        });
+    }
+
+    loops
+}
+
+struct ShmServices {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    reg_task: compio::runtime::JoinHandle<()>,
+    dispatcher_task: compio::runtime::JoinHandle<()>,
+    publisher_task: compio::runtime::JoinHandle<()>,
+    reg_socket: String,
+}
+
+// Shared Memory IPC: registration listener + command dispatcher. Each client
+// registers over its own UDS and gets a dedicated cmd/resp ring quartet; the
+// dispatcher polls them all. Runs on shard 0 when SHM is enabled, which needs
+// a single data shard.
+async fn start_shm(cfg: &LuraConfig, state: &AppState) -> anyhow::Result<Option<ShmServices>> {
+    let Some(shm_manager) = &state.shm_manager else { return Ok(None) };
+    let registry = &state.registry;
+    let lsm_store = registry.engine();
+    let reg_path = cfg.shm.resolved_registration_socket_path();
+    let listener = ipc::prepare_registration_socket(&reg_path)?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dispatcher = ipc::ShmDispatcher::new(Arc::clone(registry));
+    let dispatcher_task = compio::runtime::spawn(dispatcher.run(events_rx, shutdown_rx.clone()));
+
+    // Reader slots of the registered clients: the registration listener
+    // leases them, the publisher scans them.
+    let readers = Arc::new(ipc::ReaderRegistry::new());
+
+    // RCU read-snapshot publisher: checks on an interval and after every
+    // flush, rebuilds the SHM double-buffer snapshot only after a change,
+    // and disconnects clients that block it longer than the kick threshold.
+    // A task of the shard thread's own runtime: SnapshotWriter is !Send.
+    let publisher = ipc::SnapshotPublisher::new(
+        ipc::SnapshotBuilder::new(Arc::clone(registry), Arc::clone(lsm_store), cfg.shm.data_buffer_size),
+        Arc::clone(shm_manager),
+        std::time::Duration::from_millis(cfg.shm.snapshot_interval_ms),
+        ipc::PUBLISH_WAIT_TIMEOUT_US,
+        Arc::clone(&readers),
+        lsm_store.flush_notify(),
+        Arc::clone(&state.metrics),
+        std::time::Duration::from_secs(cfg.shm.kick_blocking_client_after_secs),
+        shutdown_rx.clone(),
+    );
+    let publisher_task = compio::runtime::spawn(publisher.run());
+    tracing::info!("SHM snapshot publisher active (interval {} ms)", cfg.shm.snapshot_interval_ms);
+
+    let reg_config = ipc::RegistrationConfig {
+        instance_id: cfg.shm.instance_id.clone(),
+        ring_size: ipc::CLIENT_RING_SIZE,
+        segment_mode: ipc::SEGMENT_MODE,
+        auth_enabled: cfg.auth.enabled,
+        trusted_uids: Arc::new(cfg.auth.trusted_uids.clone()),
+        readers,
+    };
+    let reg_task = compio::runtime::spawn(ipc::serve_registration(listener, reg_config, events_tx, shutdown_rx));
+    tracing::info!("SHM registration listener active on {reg_path}");
+    Ok(Some(ShmServices { shutdown_tx, reg_task, dispatcher_task, publisher_task, reg_socket: reg_path }))
+}
+
+async fn stop_shm(services: Option<ShmServices>) {
+    // Stop the SHM registration listener and command dispatcher before the
+    // engines shut down (the dispatcher runs commands against them). The
+    // dispatcher task drops its ClientConnections on exit, unlinking every
+    // per-client segment; the registration socket file is removed here.
+    if let Some(services) = services {
+        let _ = services.shutdown_tx.send(true);
+        let _ = services.reg_task.await;
+        let _ = services.dispatcher_task.await;
+        // Join the snapshot publisher before the engines shut down (its build
+        // step reads them).
+        let _ = services.publisher_task.await;
+        uds::remove_socket_file(&services.reg_socket);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::wal::WriteAheadLog;
+    use crate::engines::lsm::engine::{LsmEngineOptions, TestHook, TestHooks};
+    use crate::engines::StorageEngine;
+
+    /// A key-value instance with its own log under `dir`, and that log.
+    async fn instance(dir: &Path, hooks: TestHooks) -> (Arc<LsmStorageEngine>, Arc<WriteAheadLog>) {
+        let (wal_path, vlog_path) = (dir.join("wal.log"), dir.join("vlog.log"));
+        let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+        let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
+        let fm = Arc::new(crate::storage::file_manager::FileManager::new(dir).await.unwrap());
+        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(dir));
+        let options = LsmEngineOptions::default();
+        let mut engine =
+            LsmStorageEngine::new(Arc::clone(&wal), wal_path, vlog, vlog_path, fm, mm, options).await.unwrap();
+        engine.hooks = hooks;
+        (Arc::new(engine), wal)
+    }
+
+    // A loop's write that is in the log but not yet in the MemTable when the
+    // shard shuts down, and the write its tick makes a while later, are both
+    // flushed before the log is cut back: a restart finds them.
+    #[test]
+    fn the_writes_of_a_tick_in_progress_at_shutdown_survive_a_restart() {
+        engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hook = Arc::new(TestHook::default());
+            let hooks = TestHooks { before_kv_pair_apply: Some((b"held".to_vec(), Arc::clone(&hook))), ..Default::default() };
+            let (kv, wal) = instance(dir.path(), hooks).await;
+            let mut loops = Loops::new();
+            let writer = Arc::clone(&kv);
+            loops.spawn("writer", Duration::from_secs(3600), move || {
+                let kv = Arc::clone(&writer);
+                async move {
+                    kv.put(b"held", b"v").await?;
+                    for _ in 0..50 {
+                        tokio::task::yield_now().await;
+                    }
+                    kv.put(b"later", b"v").await
+                }
+            });
+            hook.reached.notified().await;
+
+            let storage = Storage { instances: vec![(Engine::Kv, Arc::clone(&kv))], buffer_pool: None, io_engine: None };
+            let shutdown = compio::runtime::spawn(async move {
+                loops.stop().await;
+                close(&storage).await
+            });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            hook.release.notify_one();
+            let flushed = shutdown.await.unwrap();
+            assert!(flushed.iter().all(|(_, result)| result.is_ok()));
+            // As the control plane does once every shard flushed.
+            wal.truncate().await.unwrap();
+            drop(kv);
+
+            let (kv, _) = instance(dir.path(), TestHooks::default()).await;
+            for key in ["held", "later"] {
+                assert_eq!(kv.get(key.as_bytes()).await.unwrap(), Some(b"v".to_vec()), "{key}");
+            }
+        })
+    }
+}

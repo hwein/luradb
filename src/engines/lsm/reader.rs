@@ -922,20 +922,21 @@ impl SnapshotRegistry {
     /// `stamp` runs under the lock [`Self::low_watermark`] takes, so a
     /// compaction either sees the snapshot or chose its inputs before the
     /// stamp existed. Every stamp must be unique, e.g. drawn from the clock.
-    /// A draw that yields none is retried after a pause without the lock:
-    /// nothing waits for the clock while holding it.
-    pub fn acquire_at(&self, mut stamp: impl FnMut() -> Option<Timestamp>) -> RegistrySnapshot {
+    /// A draw that yields none is retried after a yield to the runtime,
+    /// without the lock: nothing waits for the clock while holding it.
+    pub async fn acquire_at(&self, mut stamp: impl FnMut() -> Option<Timestamp>) -> RegistrySnapshot {
         #[cfg(test)]
         self.acquires.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ts = loop {
-            let mut active = self.active.lock();
-            if let Some(ts) = stamp() {
-                let fresh = active.insert(ts.as_u64());
-                debug_assert!(fresh, "registered stamps are unique");
-                break ts;
+            {
+                let mut active = self.active.lock();
+                if let Some(ts) = stamp() {
+                    let fresh = active.insert(ts.as_u64());
+                    debug_assert!(fresh, "registered stamps are unique");
+                    break ts;
+                }
             }
-            drop(active);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            tokio::task::yield_now().await;
         };
         RegistrySnapshot {
             active: Arc::clone(&self.active),
@@ -1004,6 +1005,10 @@ impl Drop for RegistrySnapshot {
 mod snapshot_registry_tests {
     use super::*;
 
+    fn acquire(reg: &SnapshotRegistry, stamp: impl FnMut() -> Option<Timestamp>) -> RegistrySnapshot {
+        futures::executor::block_on(reg.acquire_at(stamp))
+    }
+
     #[test]
     fn test_low_watermark_empty() {
         let reg = SnapshotRegistry::new();
@@ -1013,16 +1018,16 @@ mod snapshot_registry_tests {
     #[test]
     fn test_low_watermark_single() {
         let reg = SnapshotRegistry::new();
-        let _s = reg.acquire_at(|| Some(Timestamp::new(42)));
+        let _s = acquire(&reg, || Some(Timestamp::new(42)));
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 42);
     }
 
     #[test]
     fn test_low_watermark_multiple() {
         let reg = SnapshotRegistry::new();
-        let _s1 = reg.acquire_at(|| Some(Timestamp::new(100)));
-        let _s2 = reg.acquire_at(|| Some(Timestamp::new(50)));
-        let _s3 = reg.acquire_at(|| Some(Timestamp::new(200)));
+        let _s1 = acquire(&reg, || Some(Timestamp::new(100)));
+        let _s2 = acquire(&reg, || Some(Timestamp::new(50)));
+        let _s3 = acquire(&reg, || Some(Timestamp::new(200)));
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 50);
     }
 
@@ -1030,7 +1035,7 @@ mod snapshot_registry_tests {
     fn test_deregistration_on_drop() {
         let reg = SnapshotRegistry::new();
         {
-            let _s = reg.acquire_at(|| Some(Timestamp::new(77)));
+            let _s = acquire(&reg, || Some(Timestamp::new(77)));
             assert_eq!(reg.low_watermark().unwrap().as_u64(), 77);
         }
         assert!(reg.low_watermark().is_none());
@@ -1042,7 +1047,7 @@ mod snapshot_registry_tests {
     fn test_acquire_at_retries_until_a_stamp_is_drawn() {
         let reg = SnapshotRegistry::new();
         let mut draws = 0;
-        let s = reg.acquire_at(|| {
+        let s = acquire(&reg, || {
             draws += 1;
             (draws == 3).then(|| Timestamp::new(42))
         });
@@ -1055,8 +1060,8 @@ mod snapshot_registry_tests {
     #[test]
     fn test_low_watermark_advances_after_oldest_drops() {
         let reg = SnapshotRegistry::new();
-        let s1 = reg.acquire_at(|| Some(Timestamp::new(10)));
-        let _s2 = reg.acquire_at(|| Some(Timestamp::new(20)));
+        let s1 = acquire(&reg, || Some(Timestamp::new(10)));
+        let _s2 = acquire(&reg, || Some(Timestamp::new(20)));
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 10);
         drop(s1);
         assert_eq!(reg.low_watermark().unwrap().as_u64(), 20);

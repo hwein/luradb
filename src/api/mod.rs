@@ -61,7 +61,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.7.0";
+pub const API_VERSION: &str = "0.8.0";
 
 struct VersionInfo;
 
@@ -486,7 +486,9 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         description = "REST-native multi-model database — KeyValue and JSON engines. \
             `version` is the API contract version (see API_VERSION), independent of the \
             server version; the latter is in the `x-luradb-server-version` extension. \
-            Runtime check: GET /version."
+            Runtime check: GET /version. \
+            Under overload, any endpoint may answer 503 Service Unavailable (text/plain) \
+            with `Retry-After: 1`; the request was not processed and may be retried."
     )
 )]
 pub struct ApiDoc;

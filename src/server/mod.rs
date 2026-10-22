@@ -1,17 +1,22 @@
-//! Process topology: the storage engines run on one engine thread (compio)
-//! that serves the write requests, the other read requests run on a
-//! multi-threaded reader pool against the same engines, and HTTP/TLS
+//! Process topology: the storage engines run on N data shards, each a thread
+//! (compio) with its own engine instances that serves the write requests of
+//! its domains; a control-plane thread recovers the engines, runs the control
+//! plane and serves the writes without a domain; the other read requests run
+//! on a multi-threaded reader pool against the shards' engines; and HTTP/TLS
 //! termination, the frontend layers and the point reads on a multi-threaded
 //! frontend runtime, with the bridge in between.
 
-mod engine;
+mod control;
+mod layout;
+mod recovery;
+mod shard;
 #[cfg(test)]
 mod write_phases;
 
 use crate::{
-    api::{self, middleware::ParsedCidr, ApiDoc, AppState},
+    api::{self, middleware::ParsedCidr, ApiDoc},
     auth::{middleware::docs_auth_layer, AuthCache},
-    bridge::{self, EngineDispatch, Job, ShipService},
+    bridge::{self, EngineDispatch, Job, Lane, ShardRouter},
     config::LuraConfig,
     core::{coop, engine_runtime},
     cors, tls, uds,
@@ -20,6 +25,7 @@ use axum::{
     extract::connect_info::ConnectInfo, http::Extensions, middleware::from_fn_with_state, response::Json,
     routing::get, Router,
 };
+use control::Ready;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use serde_json::{json, Value};
@@ -36,37 +42,30 @@ use tower::ServiceExt;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-/// Handed from the engine thread to the frontend once the engines are up; the
-/// reader pool and the point reads on the frontend build their routers from
-/// `state`.
-struct Ready {
-    dispatch: mpsc::Sender<Job>,
-    state: AppState,
-    trusted_cidrs: Arc<Vec<ParsedCidr>>,
-}
-
 /// Entry point that starts the whole topology in-process.
 pub struct Server;
 
-/// A running server; [`ServerHandle::shutdown`] stops it in the A6 order.
+/// A running server; [`ServerHandle::shutdown`] stops it in order.
 pub struct ServerHandle {
     /// Bound address of the plain HTTP listener; `None` when it is disabled.
     pub http_addr: Option<SocketAddr>,
     listeners: Listeners,
     frontend: Runtime,
     reader: Runtime,
-    /// Keeps the engine loop running until the reader pool is down (perf/018b A7).
-    engine_tx: mpsc::Sender<Job>,
-    engine: std::thread::JoinHandle<()>,
+    /// Keep the shards' and the control plane's request loops running until
+    /// the reader pool is down.
+    shards: Vec<Lane>,
+    control: mpsc::UnboundedSender<Job>,
+    control_thread: std::thread::JoinHandle<()>,
 }
 
-/// Running read requests get this long to end on shutdown (perf/018b A7).
+/// Running read requests get this long to end on shutdown.
 const READER_SHUTDOWN: Duration = Duration::from_secs(5);
 
 impl Server {
-    /// Boots the engine thread and, only once it reports ready, the reader
-    /// pool and the listeners on the frontend runtime. A failed step stops
-    /// what already runs.
+    /// Boots the control-plane thread, which starts the data shards, and,
+    /// only once it reports them ready, the reader pool and the listeners on
+    /// the frontend runtime. A failed step stops what already runs.
     pub fn start(config: Arc<LuraConfig>, config_path: &Path) -> anyhow::Result<ServerHandle> {
         let cores = coop::available_cores();
         let workers = frontend_workers(config.multicore.frontend_workers, cores);
@@ -76,14 +75,15 @@ impl Server {
             .thread_name("luradb-frontend")
             .enable_all()
             .build()?;
+        let shards = config.multicore.shard_count();
         tracing::info!(
-            "Frontend runtime: {workers} workers; engine thread: 1; bridge capacity: {}",
-            config.multicore.engine_queue_capacity
+            "Frontend runtime: {workers} workers; data shards: {shards}; shard queue capacity: {}",
+            config.multicore.shard_queue_capacity
         );
 
-        let (engine, ready) =
-            spawn_engine(Arc::clone(&config), config_path.to_path_buf(), frontend.handle().clone())?;
-        let readers = reader_threads(config.multicore.reader_threads, cores, workers);
+        let (control_thread, ready) =
+            spawn_control(Arc::clone(&config), config_path.to_path_buf(), frontend.handle().clone())?;
+        let readers = reader_threads(config.multicore.reader_threads, cores, workers, usize::from(shards));
         let reader = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(readers)
             .thread_name("luradb-reader")
@@ -92,32 +92,43 @@ impl Server {
         {
             Ok(reader) => reader,
             Err(e) => {
-                // No reader pool yet: dropping the only engine sender shuts
-                // the engine down.
+                // No reader pool yet: dropping the only senders shuts the
+                // shards and the control plane down.
                 drop(ready);
-                let _ = engine.join();
+                let _ = control_thread.join();
                 return Err(e.into());
             }
         };
         let capacity = config.multicore.reader_queue_capacity;
         tracing::info!("Reader pool: {readers} workers; queue capacity: {capacity}");
-        let (reader_tx, reader_rx) = mpsc::channel(capacity);
-        let engine_tx = ready.dispatch.clone();
-        let engine_dispatch = EngineDispatch::Engine(engine_tx.clone());
-        reader.spawn(bridge::serve_reader(reader_rx, api::create_router(ready.state.clone()), engine_dispatch));
+        let (reader_lane, reader_jobs) = Lane::new(capacity);
+        let pool = ready
+            .states
+            .iter()
+            .zip(&ready.shards)
+            .map(|(state, lane)| (api::create_router(state.clone()), EngineDispatch::Engine(lane.clone())))
+            .collect();
+        reader.spawn(bridge::serve_reader(reader_jobs, pool));
 
-        match frontend.block_on(run_frontend(ready, reader_tx, &config)) {
-            Ok(listeners) => {
-                Ok(ServerHandle { http_addr: listeners.http_addr, listeners, frontend, reader, engine_tx, engine })
-            }
+        let (shard_lanes, control) = (ready.shards.clone(), ready.control.clone());
+        match frontend.block_on(run_frontend(ready, reader_lane, &config)) {
+            Ok(listeners) => Ok(ServerHandle {
+                http_addr: listeners.http_addr,
+                listeners,
+                frontend,
+                reader,
+                shards: shard_lanes,
+                control,
+                control_thread,
+            }),
             Err(e) => {
-                // The failed start dropped the frontend's bridge senders; the
-                // engine loop ends only once the reader pool is down (A7). The
-                // frontend runtime drops after the engine thread, which runs
-                // inside its handle.
+                // The failed start dropped the frontend's senders; the request
+                // loops end only once the reader pool is down. The frontend
+                // runtime drops after the control-plane thread, whose shards
+                // run inside its handle.
                 reader.shutdown_timeout(READER_SHUTDOWN);
-                drop(engine_tx);
-                let _ = engine.join();
+                drop((shard_lanes, control));
+                let _ = control_thread.join();
                 Err(e)
             }
         }
@@ -132,25 +143,25 @@ impl ServerHandle {
     }
 
     /// Stops and drains the listeners, ends the reader pool, and only then
-    /// drops its engine sender, the last one: the engine loop ends after the
-    /// reads (perf/018a A6, perf/018b A7). Then joins the engine thread once
-    /// it has shut the engines down, and ends the frontend runtime last: the
-    /// engine thread runs inside its handle (perf/020). Must not be called
-    /// from within an async context.
+    /// drops its senders, the last ones: the request loops end after the
+    /// reads, the shards' first. Then joins the control-plane thread once it
+    /// has drained the shards and shut the engines down, and ends the
+    /// frontend runtime last: the shard and control-plane threads run inside
+    /// its handle. Must not be called from within an async context.
     pub fn shutdown(self) -> anyhow::Result<()> {
-        let ServerHandle { listeners, frontend, reader, engine_tx, engine, .. } = self;
+        let ServerHandle { listeners, frontend, reader, shards, control, control_thread, .. } = self;
         frontend.block_on(listeners.stop());
         reader.shutdown_timeout(READER_SHUTDOWN);
-        drop(engine_tx);
-        let joined = engine.join();
+        drop(shards);
+        drop(control);
+        let joined = control_thread.join();
         drop(frontend);
-        joined.map_err(|_| anyhow::anyhow!("the engine thread panicked"))
+        joined.map_err(|_| anyhow::anyhow!("the control-plane thread panicked"))
     }
 }
 
 /// Worker threads of the frontend runtime: `configured`, or with `0` a sixth
-/// of the cores, 2 to 4, on hosts with at least 4 cores, otherwise 1 (spec
-/// perf/038).
+/// of the cores, 2 to 4, on hosts with at least 4 cores, otherwise 1.
 fn frontend_workers(configured: usize, cores: usize) -> usize {
     if configured > 0 {
         configured
@@ -162,40 +173,39 @@ fn frontend_workers(configured: usize, cores: usize) -> usize {
 }
 
 /// Worker threads of the reader pool: `configured`, or with `0` the cores
-/// left after the engine thread, one core of headroom and the `frontend`
-/// workers, at least 1 (spec perf/018b A6).
-fn reader_threads(configured: usize, cores: usize, frontend: usize) -> usize {
+/// left after two, the `shards` and the `frontend` workers, at least 1.
+fn reader_threads(configured: usize, cores: usize, frontend: usize, shards: usize) -> usize {
     if configured > 0 {
         configured
     } else {
-        cores.saturating_sub(2 + frontend).max(1)
+        cores.saturating_sub(2 + frontend + shards).max(1)
     }
 }
 
-/// Wakes from other threads the engine runtime has room for (see
-/// [`engine_runtime::build`]), one slot per engine task: as many as the
-/// storage hub's request channel and the bridge channel hold waiting jobs,
-/// plus compio's default for the background tasks. Running request tasks
-/// have no bound of their own.
+/// Wakes from other threads a shard's or the control plane's runtime has room
+/// for (see [`engine_runtime::build`]), one slot per task: as many as the
+/// storage hub's request channel and a shard's lane hold waiting jobs, plus
+/// compio's default for the background tasks. Running request tasks have no
+/// bound of their own.
 fn remote_wakes(config: &LuraConfig) -> usize {
     config.storage.wal_queue_capacity
-        + config.multicore.engine_queue_capacity
+        + config.multicore.shard_queue_capacity
         + engine_runtime::DEFAULT_REMOTE_WAKES
 }
 
-/// Starts the engine thread and waits until it reports ready (A1.1, A1.3).
-/// The thread enters `frontend`'s handle for its whole life: `coop::offload`,
-/// `tokio::fs` and the IPC sockets need a tokio context (perf/020).
-fn spawn_engine(
+/// Starts the control-plane thread and waits until it reports every shard
+/// ready. The thread enters `frontend`'s handle for its whole life:
+/// `coop::offload`, `tokio::fs` and the IPC sockets need a tokio context.
+fn spawn_control(
     config: Arc<LuraConfig>,
     config_path: PathBuf,
     frontend: tokio::runtime::Handle,
 ) -> anyhow::Result<(std::thread::JoinHandle<()>, Ready)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let thread = std::thread::Builder::new().name("luradb-engine".to_string()).spawn(move || {
+    let thread = std::thread::Builder::new().name("luradb-control".to_string()).spawn(move || {
         let _frontend = frontend.enter();
         match engine_runtime::build(remote_wakes(&config)) {
-            Ok(rt) => engine_runtime::run(&rt, run_engine(config, config_path, ready_tx)),
+            Ok(rt) => engine_runtime::run(&rt, control::run(config, config_path, frontend.clone(), ready_tx)),
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
             }
@@ -209,36 +219,9 @@ fn spawn_engine(
         }
         Err(_) => {
             let _ = thread.join();
-            Err(anyhow::anyhow!("the engine thread stopped during startup"))
+            Err(anyhow::anyhow!("the control-plane thread stopped during startup"))
         }
     }
-}
-
-/// Body of the engine thread: bootstrap, report, serve the bridge until the
-/// server lets go of it once the reader pool is down (perf/018b A7), then
-/// shut the engines down.
-async fn run_engine(
-    config: Arc<LuraConfig>,
-    config_path: PathBuf,
-    ready_tx: std::sync::mpsc::Sender<anyhow::Result<Ready>>,
-) {
-    // Before the bootstrap: a capacity the channel rejects must fail while
-    // nothing runs yet — afterwards it would leave SHM segments, background
-    // tasks and the storage thread behind.
-    let (dispatch, jobs) = mpsc::channel(config.multicore.engine_queue_capacity);
-    let engine = match engine::bootstrap_engine(&config, &config_path).await {
-        Ok(engine) => engine,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
-    let router = api::create_router(engine.state.clone());
-    let ready = Ready { dispatch, state: engine.state, trusted_cidrs: engine.trusted_cidrs };
-    if ready_tx.send(Ok(ready)).is_ok() {
-        bridge::serve_engine(jobs, router).await;
-    }
-    engine::graceful_shutdown(engine.teardown).await;
 }
 
 async fn hello_handler(message: String) -> Json<Value> {
@@ -252,7 +235,7 @@ fn build_router(
     cfg: &LuraConfig,
     auth_cache: Arc<AuthCache>,
     trusted_cidrs: Arc<Vec<ParsedCidr>>,
-    ship: ShipService,
+    ship: ShardRouter,
 ) -> Router {
     let mut app = Router::new();
 
@@ -370,15 +353,18 @@ impl Listeners {
 }
 
 /// Binds every enabled listener, then serves the frontend router on them;
-/// `reader_tx` leads to the reader pool, point reads stay on the frontend
+/// `reader` leads to the reader pool, point reads stay on the frontend
 /// unless they would touch the disk. Nothing is spawned before all binds
 /// succeeded.
 #[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
-async fn run_frontend(ready: Ready, reader_tx: mpsc::Sender<Job>, config: &LuraConfig) -> anyhow::Result<Listeners> {
-    let ship = ShipService::new(EngineDispatch::Engine(ready.dispatch))
-        .with_reader(reader_tx)
-        .with_inline(api::create_router(ready.state.clone()));
-    let app = build_router(config, ready.state.auth_cache, ready.trusted_cidrs, ship);
+async fn run_frontend(ready: Ready, reader: Lane, config: &LuraConfig) -> anyhow::Result<Listeners> {
+    let Ready { shards, control, states, trusted_cidrs } = ready;
+    let auth_cache = Arc::clone(&states[0].auth_cache);
+    let ship = ShardRouter::new(shards.into_iter().map(EngineDispatch::Engine).collect())
+        .with_control(EngineDispatch::Control(control))
+        .with_reader(reader)
+        .with_inline(states.into_iter().map(api::create_router).collect());
+    let app = build_router(config, auth_cache, trusted_cidrs, ship);
     let bind: IpAddr = config
         .server
         .bind_address
@@ -479,6 +465,28 @@ async fn serve_http(listener: TcpListener, router: Router, mut shutdown: watch::
     tracing::info!("[http] listener stopped");
 }
 
+/// Bootstrap and shutdown events of the in-process servers, by their system
+/// directory: tests share the process.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn events() -> &'static Mutex<HashMap<String, Vec<String>>> {
+        static EVENTS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+        EVENTS.get_or_init(Default::default)
+    }
+
+    pub(crate) fn record(system_dir: &str, event: String) {
+        events().lock().unwrap().entry(system_dir.to_string()).or_default().push(event);
+    }
+
+    /// The events of the server on `system_dir`, in order.
+    pub(crate) fn recorded(system_dir: &str) -> Vec<String> {
+        events().lock().unwrap().get(system_dir).cloned().unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,7 +573,7 @@ mod tests {
 
             let (state, _dir) = make_test_state(true).await;
             let auth_cache = Arc::clone(&state.auth_cache);
-            let ship = ShipService::new(EngineDispatch::Inline(api::create_router(state)));
+            let ship = ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]);
             let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
 
             // (a) Preflight without Authorization -> 200 with the CORS header,
@@ -634,7 +642,7 @@ mod tests {
                 &cfg,
                 Arc::clone(&auth_cache),
                 Arc::new(vec![]),
-                ShipService::new(EngineDispatch::Inline(api::create_router(state))),
+                ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]),
             );
 
             let status = |uri: &str, key: Option<&str>| {
@@ -654,9 +662,15 @@ mod tests {
 
     // ── In-process E2E (Server::start) ───────────────────────────────────────
 
+    /// Data shards of the in-process servers: `LURADB_TEST_SHARDS`, 1 when
+    /// unset, so the suite runs once per shard count.
+    fn test_shards() -> u16 {
+        std::env::var("LURADB_TEST_SHARDS").ok().and_then(|n| n.parse().ok()).unwrap_or(1)
+    }
+
     /// Loopback dev mode (auth off), HTTP on an ephemeral port, backups on,
-    /// JSON and relational engines off, two reader threads, every data path
-    /// under `dir`.
+    /// JSON and relational engines off, two reader threads, the data shards
+    /// of [`test_shards`], every data path under `dir`.
     pub(super) fn test_config(dir: &Path) -> LuraConfig {
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let mut cfg = LuraConfig::default();
@@ -677,6 +691,7 @@ mod tests {
         cfg.backup.enabled = true;
         cfg.backup.dir = path("backups");
         cfg.multicore.reader_threads = 2;
+        cfg.multicore.shards = test_shards();
         cfg
     }
 
@@ -888,9 +903,9 @@ mod tests {
         });
     }
 
-    // perf/020 step 8: a bootstrap that fails once the engines and their
-    // background tasks run still ends the engine thread, with its I/O tasks
-    // run out, and reports the error.
+    // A bootstrap that fails once the shards and their background tasks run
+    // still ends every thread, with its I/O tasks run out, and reports the
+    // error.
     #[test]
     fn a_bootstrap_failing_after_the_engines_started_ends_the_engine_thread() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -901,24 +916,34 @@ mod tests {
         assert!(dir.path().join("sstables").exists(), "the engines booted before the failure");
     }
 
-    /// The key-value engine on `cfg`'s paths, as the server opens it.
-    async fn open_kv_engine(cfg: &LuraConfig) -> Arc<crate::engines::lsm::engine::LsmStorageEngine> {
-        let (wal_path, vlog_path) = (PathBuf::from(&cfg.storage.wal_path), PathBuf::from(&cfg.storage.vlog_path));
+    /// The key-value engine on `cfg`'s paths, as a server opens it: those of
+    /// `shard`, or with `None` those of a data directory without shards.
+    async fn open_kv_engine(cfg: &LuraConfig, shard: Option<usize>) -> Arc<crate::engines::lsm::engine::LsmStorageEngine> {
+        let wal_path = PathBuf::from(&cfg.storage.wal_path);
+        let (vlog_path, sstable_dir) = match shard {
+            Some(k) => (
+                layout::shard_file(Path::new(&cfg.storage.vlog_path), k),
+                layout::shard_dir(Path::new(&cfg.storage.sstable_dir), k),
+            ),
+            None => (PathBuf::from(&cfg.storage.vlog_path), PathBuf::from(&cfg.storage.sstable_dir)),
+        };
         let wal = Arc::new(crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap());
         let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
-        let fm = Arc::new(crate::storage::file_manager::FileManager::new(&cfg.storage.sstable_dir).await.unwrap());
-        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&cfg.storage.sstable_dir));
+        let fm = Arc::new(crate::storage::file_manager::FileManager::new(&sstable_dir).await.unwrap());
+        let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&sstable_dir));
         let options = crate::engines::lsm::engine::LsmEngineOptions::default();
         Arc::new(crate::engines::lsm::engine::LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, fm, mm, options).await.unwrap())
     }
 
     // An older data directory keeps its users in the key-value engine: the
     // first start moves them into the system store, the next one finds
-    // nothing left to move, and both serve them.
+    // nothing left to move, and both serve them. Such a directory has one
+    // shard.
     #[test]
     fn the_first_start_moves_auth_records_out_of_the_key_value_engine() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cfg = test_config(dir.path());
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 1;
         let record = crate::auth::UserRecord {
             name: "zoé".to_string(),
             api_key_hash: crate::auth::hash_api_key("lura_zoe"),
@@ -926,13 +951,14 @@ mod tests {
             created_at: 1,
         };
         engine_runtime::block_on(async {
-            let kv = open_kv_engine(&cfg).await;
+            let kv = open_kv_engine(&cfg, None).await;
             kv.put("__sys:auth:user:zoé".as_bytes(), &serde_json::to_vec(&record).unwrap()).await.unwrap();
             kv.shutdown().await;
         });
 
+        let cfg = Arc::new(cfg);
         for start in ["first", "second"] {
-            let server = Server::start(Arc::new(test_config(dir.path())), &dir.path().join("luradb.toml")).unwrap();
+            let server = Server::start(Arc::clone(&cfg), &dir.path().join("luradb.toml")).unwrap();
             let addr = server.http_addr.expect("HTTP listener enabled");
             let (status, users) =
                 tokio::runtime::Runtime::new().unwrap().block_on(request(addr, &get("/store-api/auth/users")));
@@ -943,7 +969,7 @@ mod tests {
 
             engine_runtime::block_on(async {
                 use crate::engines::StorageEngine;
-                let kv = open_kv_engine(&cfg).await;
+                let kv = open_kv_engine(&cfg, Some(0)).await;
                 assert!(kv.scan_keys(b"__sys:auth:").await.unwrap().is_empty(), "{start} start");
                 kv.shutdown().await;
                 let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
@@ -953,11 +979,88 @@ mod tests {
         }
     }
 
+    /// A data directory from before the shard layout, its default domain
+    /// holding `key` in an SSTable.
+    fn legacy_data_directory(cfg: &LuraConfig, key: &[u8]) {
+        engine_runtime::block_on(async {
+            let kv = open_kv_engine(cfg, None).await;
+            let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+            let registry = crate::engines::lsm::DomainRegistry::recover(
+                Arc::clone(&kv),
+                crate::engines::lsm::domain::DomainConfig::default(),
+                metrics,
+            )
+            .await
+            .unwrap();
+            registry.store("default").await.unwrap().put(key, "clé".as_bytes()).await.unwrap();
+            kv.shutdown().await;
+        });
+        std::fs::write(&cfg.storage.db_path, b"").unwrap();
+    }
+
+    // The first start moves the files of an older data directory into
+    // shard_0/ and records the layout; the next start moves nothing. Both
+    // serve the data.
+    #[test]
+    fn the_first_start_moves_the_data_into_shard_0() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 1;
+        legacy_data_directory(&cfg, b"moved");
+        let (vlog, sstables, db) = (
+            PathBuf::from(&cfg.storage.vlog_path),
+            PathBuf::from(&cfg.storage.sstable_dir),
+            PathBuf::from(&cfg.storage.db_path),
+        );
+        let legacy_tables: Vec<_> = std::fs::read_dir(&sstables).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(legacy_tables.iter().any(|name| name == "MANIFEST"), "{legacy_tables:?}");
+
+        let cfg = Arc::new(cfg);
+        for start in ["first", "second"] {
+            let server = Server::start(Arc::clone(&cfg), &dir.path().join("luradb.toml")).unwrap();
+            let addr = server.http_addr.expect("HTTP listener enabled");
+            let (status, value) =
+                tokio::runtime::Runtime::new().unwrap().block_on(request(addr, &get("/store-api/kv/default/keys/moved")));
+            server.shutdown().unwrap();
+            assert_eq!((status, value.as_slice()), (200, "clé".as_bytes()), "{start} start");
+
+            assert!(!vlog.exists() && !db.exists(), "{start} start");
+            assert!(layout::shard_file(&vlog, 0).is_file() && layout::shard_file(&db, 0).is_file(), "{start} start");
+            for table in &legacy_tables {
+                assert!(!sstables.join(table).exists(), "{start} start: {table:?}");
+            }
+            let moved: Vec<_> =
+                std::fs::read_dir(layout::shard_dir(&sstables, 0)).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert!(moved.iter().any(|name| name == "MANIFEST"), "{start} start: {moved:?}");
+            engine_runtime::block_on(async {
+                let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
+                assert!(crate::control::system::layout_is_sharded(&system).await.unwrap(), "{start} start");
+                system.shutdown().await;
+            });
+        }
+    }
+
+    // An older data directory was written by one shard: a start with two
+    // refuses before it moves anything.
+    #[test]
+    fn an_older_data_directory_is_not_opened_with_two_shards() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        legacy_data_directory(&cfg, b"kept");
+        cfg.multicore.shards = 2;
+        let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
+        assert!(format!("{err:#}").contains("shard count changed (stored 1, configured 2)"), "{err:#}");
+        let cfg = test_config(dir.path());
+        assert!(Path::new(&cfg.storage.vlog_path).is_file(), "nothing moved");
+        assert!(!layout::shard_dir(Path::new(&cfg.storage.sstable_dir), 0).exists(), "nothing moved");
+    }
+
     // Data laid out for another shard count is not opened at all.
     #[test]
     fn a_start_with_a_changed_shard_count_is_refused() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cfg = test_config(dir.path());
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 1;
         engine_runtime::block_on(async {
             let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
             crate::control::system::check_shard_count(&system, 2).await.unwrap();
@@ -972,6 +1075,23 @@ mod tests {
         assert!(!dir.path().join("sstables").exists(), "no engine was opened");
     }
 
+    // The guard compares against the configured shard count.
+    #[test]
+    fn a_start_with_more_shards_than_the_data_was_written_with_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 1;
+        engine_runtime::block_on(async {
+            let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
+            crate::control::system::check_shard_count(&system, 1).await.unwrap();
+            system.shutdown().await;
+        });
+
+        cfg.multicore.shards = 2;
+        let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
+        assert!(format!("{err:#}").contains("shard count changed (stored 1, configured 2)"), "{err:#}");
+    }
+
     // No engine runs without the storage thread: when it cannot open a
     // write-ahead log, the start fails and says so.
     #[test]
@@ -984,13 +1104,143 @@ mod tests {
         assert!(!dir.path().join("sstables").exists(), "no engine was opened");
     }
 
-    // A1.5: a bridge capacity the channel cannot take down must fail the
+    // Bootstrap barrier: every shard reports ready before any is released to
+    // start its purgers and sweepers; the hub stops once, at the end.
+    #[test]
+    fn no_shard_starts_its_loops_before_every_shard_is_ready() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 2;
+        cfg.json.enabled = true;
+        cfg.rel.enabled = true;
+        let system_dir = cfg.storage.system_dir.clone();
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let events = test_hook::recorded(&system_dir);
+        let first_release = events.iter().position(|e| e.ends_with("released")).expect("a released shard");
+        for shard in 0..2 {
+            let ready = events.iter().position(|e| *e == format!("shard {shard} ready")).expect("a ready shard");
+            assert!(ready < first_release, "{events:?}");
+        }
+        assert_eq!(events.iter().filter(|e| e.ends_with("released")).count(), 2, "{events:?}");
+
+        server.shutdown().unwrap();
+        let events = test_hook::recorded(&system_dir);
+        assert_eq!(events.iter().filter(|e| *e == "hub shutdown").count(), 1, "{events:?}");
+    }
+
+    // Shutdown barrier: the JSON engine of shard 1 cannot flush (its SSTable
+    // directory is read-only), so the JSON write-ahead log stays for the
+    // next start, while the key-value and relational ones, flushed on both
+    // shards, are cut back; the hub stops once. The next start recovers the
+    // document from the log.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn a_failed_flush_on_one_shard_keeps_only_that_engine_s_log() {
+        use crate::control::slots::domain_name_for_shard;
+        use std::os::unix::fs::PermissionsExt;
+        let name = domain_name_for_shard(1, 2, 13);
+        let dir = tempfile::TempDir::new().unwrap();
+        let tuned = || {
+            let mut cfg = test_config(dir.path());
+            cfg.multicore.shards = 2;
+            cfg.json.enabled = true;
+            cfg.rel.enabled = true;
+            cfg
+        };
+        let cfg = tuned();
+        let document = format!("/store-api/json/{name}/documents/kept");
+        let client = tokio::runtime::Runtime::new().unwrap();
+
+        let server = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        client.block_on(async {
+            let create = json!({ "name": name }).to_string();
+            assert_eq!(request(addr, &with_body("POST", "/store-api/json/domains", &create)).await.0, 201);
+            assert_eq!(request(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await.0, 201);
+            assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
+        });
+        let unwritable = layout::shard_dir(Path::new(&cfg.json.sstable_dir), 1);
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o555)).unwrap();
+        server.shutdown().unwrap();
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let magic = crate::core::wal::WAL_MAGIC;
+        assert!(std::fs::read(&cfg.json.wal_path).unwrap().len() > magic.len(), "the JSON log stays");
+        assert_eq!(std::fs::read(&cfg.storage.wal_path).unwrap(), magic, "the key-value log is cut back");
+        assert_eq!(std::fs::read(&cfg.rel.wal_path).unwrap(), magic, "the relational log is cut back");
+        let events = test_hook::recorded(&cfg.storage.system_dir);
+        assert_eq!(events.iter().filter(|e| *e == "hub shutdown").count(), 1, "{events:?}");
+
+        let server = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let (status, body) = client.block_on(request(addr, &get(&document)));
+        server.shutdown().unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    }
+
+    // The hub opens a WAL for the enabled engines only: with JSON and
+    // relational off, no file of theirs appears.
+    #[test]
+    fn disabled_engines_get_no_write_ahead_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = Server::start(Arc::new(test_config(dir.path())), &dir.path().join("luradb.toml")).unwrap();
+        let cfg = test_config(dir.path());
+        assert!(Path::new(&cfg.storage.wal_path).is_file());
+        assert!(Path::new(&cfg.storage.system_dir).join(crate::control::system::WAL_FILE).is_file());
+        assert!(!Path::new(&cfg.json.wal_path).exists());
+        assert!(!Path::new(&cfg.rel.wal_path).exists());
+        server.shutdown().unwrap();
+    }
+
+    // With the IoEngine on or off, every engine writes its WAL through the
+    // storage hub, shared by all shards: each log holds its engine's writes
+    // until the shutdown, which cuts every one back after the final flush.
+    // Switched on, the IoEngine may still be absent: its registered buffers
+    // need lockable memory a test host does not guarantee.
+    #[test]
+    fn every_engine_writes_its_wal_through_the_storage_hub() {
+        for io_engine in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let tuned = || {
+                let mut cfg = test_config(dir.path());
+                cfg.io_engine.enabled = io_engine;
+                cfg.json.enabled = true;
+                cfg.rel.enabled = true;
+                cfg
+            };
+            let cfg = tuned();
+            let wals = [cfg.storage.wal_path.clone(), cfg.json.wal_path.clone(), cfg.rel.wal_path.clone()];
+            let server = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml")).unwrap();
+            let addr = server.http_addr.expect("HTTP listener enabled");
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let writes = [
+                    with_body("PUT", "/store-api/kv/default/keys/hub-probe", "clé"),
+                    with_body("PUT", "/store-api/json/default/documents/hub-probe", r#"{"n": 1}"#),
+                    with_body("POST", "/store-api/rel/default/sql", r#"{"sql": "CREATE TABLE probe (id INTEGER PRIMARY KEY)"}"#),
+                ];
+                for write in writes {
+                    let (status, body) = request(addr, &write).await;
+                    assert!(status < 300, "{status}: {}", String::from_utf8_lossy(&body));
+                }
+            });
+            for wal in &wals {
+                let len = std::fs::metadata(wal).unwrap().len() as usize;
+                assert!(len > crate::core::wal::WAL_MAGIC.len(), "io_engine {io_engine}: {wal} holds no write");
+            }
+            server.shutdown().unwrap();
+            for wal in &wals {
+                assert_eq!(std::fs::read(wal).unwrap(), crate::core::wal::WAL_MAGIC, "io_engine {io_engine}: {wal}");
+            }
+        }
+    }
+
+    // A shard capacity the channel cannot take down must fail the
     // in-process start before the engines, SHM and background tasks are up.
     #[test]
     fn unusable_bridge_capacity_fails_before_anything_boots() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cfg = test_config(dir.path());
-        cfg.multicore.engine_queue_capacity = 0;
+        cfg.multicore.shard_queue_capacity = 0;
         let db_path = PathBuf::from(cfg.storage.db_path.clone());
         assert!(Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).is_err());
         assert!(!db_path.exists(), "the engine booted before the bridge channel existed");
@@ -1111,13 +1361,15 @@ mod tests {
 
     #[test]
     fn reader_threads_auto_and_explicit() {
-        assert_eq!(reader_threads(0, 32, 4), 26);
-        assert_eq!(reader_threads(0, 12, 1), 9);
-        assert_eq!(reader_threads(0, 4, 1), 1);
-        assert_eq!(reader_threads(0, 2, 1), 1);
-        assert_eq!(reader_threads(0, 1, 1), 1);
-        assert_eq!(reader_threads(3, 32, 4), 3);
-        assert_eq!(reader_threads(6, 2, 1), 6);
+        assert_eq!(reader_threads(0, 32, 4, 1), 25);
+        assert_eq!(reader_threads(0, 32, 4, 8), 18);
+        assert_eq!(reader_threads(0, 12, 2, 1), 7);
+        assert_eq!(reader_threads(0, 12, 1, 1), 8);
+        assert_eq!(reader_threads(0, 4, 1, 1), 1);
+        assert_eq!(reader_threads(0, 2, 1, 1), 1);
+        assert_eq!(reader_threads(0, 1, 1, 1), 1);
+        assert_eq!(reader_threads(3, 32, 4, 1), 3);
+        assert_eq!(reader_threads(6, 2, 1, 2), 6);
     }
 
     // With two reader threads, a point GET and the probes run on the frontend
@@ -1128,7 +1380,7 @@ mod tests {
         with_server(|addr| async move {
             let key = "/store-api/kv/default/keys/where";
             let (status, head, _) = exchange(addr, &with_body("PUT", key, "v")).await;
-            assert_eq!((status, thread_of(&head)), (200, "luradb-engine"));
+            assert_eq!((status, thread_of(&head)), (200, "luradb-shard-0"));
             for point in [key, "/health", "/version"] {
                 let (status, head, _) = exchange(addr, &get(point)).await;
                 assert_eq!(status, 200, "{point}");
@@ -1205,7 +1457,7 @@ mod tests {
                     assert_eq!(status, expected, "{statement}: {answer}");
                     let thread = thread_of(&head);
                     if on_engine {
-                        assert_eq!(thread, "luradb-engine", "{statement}");
+                        assert_eq!(thread, "luradb-shard-0", "{statement}");
                     } else {
                         assert!(thread.starts_with("luradb-reader"), "{statement}: {thread}");
                     }
@@ -1232,7 +1484,7 @@ mod tests {
             let (put_head, _, rest) = split_response(&raw);
             let (point_head, value, rest) = split_response(rest);
             let (meta_head, _, _) = split_response(rest);
-            assert_eq!(thread_of(&put_head), "luradb-engine");
+            assert_eq!(thread_of(&put_head), "luradb-shard-0");
             assert!(point_head.starts_with("http/1.1 200"), "{point_head}");
             assert!(thread_of(&point_head).starts_with("luradb-frontend"), "{point_head}");
             assert_eq!(value, b"first");
@@ -1311,7 +1563,7 @@ mod tests {
         assert!(arrived.iter().all(|(name, _)| name.starts_with("luradb-reader")), "{arrived:?}");
 
         let (status, head, _) = client.block_on(exchange(addr, &with_body("PUT", &format!("{keys}/parallel-2"), "w")));
-        assert_eq!((status, thread_of(&head)), (200, "luradb-engine"));
+        assert_eq!((status, thread_of(&head)), (200, "luradb-shard-0"));
 
         gate.release();
         // Scanned before the hold, so before the second PUT.
@@ -1321,6 +1573,148 @@ mod tests {
             assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["keys"], json!(["parallel-1"]));
             assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
         }
+        server.shutdown().unwrap();
+    }
+
+    /// The data shard of a lower-cased response head, from the bridge's
+    /// test-hook header.
+    fn shard_in(head: &str) -> &str {
+        head.lines()
+            .find_map(|line| line.strip_prefix(bridge::test_hook::SHARD)?.strip_prefix(": "))
+            .unwrap_or_else(|| panic!("no shard header in {head}"))
+            .trim()
+    }
+
+    fn sql_body(statement: &str) -> String {
+        json!({ "sql": statement }).to_string()
+    }
+
+    // Two data shards, each domain placed on its shard by name: its writes
+    // run on the shard's thread, its reads on the pool and its point reads
+    // inline, both against the shard's engines. A domain's key-value, JSON
+    // and relational parts share the shard, so a relational link into its
+    // key-value domain resolves there.
+    #[test]
+    fn requests_run_on_the_shard_of_their_domain() {
+        use crate::control::slots::domain_name_for_shard;
+        let names = [domain_name_for_shard(0, 2, 5), domain_name_for_shard(1, 2, 5)];
+        with_tuned_server(
+            |cfg| {
+                cfg.multicore.shards = 2;
+                cfg.json.enabled = true;
+                cfg.rel.enabled = true;
+            },
+            |addr| async move {
+                for (shard, name) in names.iter().enumerate() {
+                    let thread = format!("luradb-shard-{shard}");
+                    let create = json!({ "name": name }).to_string();
+                    for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
+                        let (status, head, body) = exchange(addr, &with_body("POST", path, &create)).await;
+                        assert_eq!(status, 201, "{path}: {}", String::from_utf8_lossy(&body));
+                        assert_eq!(thread_of(&head), "luradb-control", "{path}");
+                        let (status, head, body) = exchange(addr, &get(&format!("{path}/{name}"))).await;
+                        assert_eq!(status, 200, "{path}/{name}: {}", String::from_utf8_lossy(&body));
+                        assert_eq!(shard_in(&head), shard.to_string(), "{path}/{name}");
+                    }
+
+                    let key = format!("/store-api/kv/{name}/keys/ref");
+                    let (status, head, _) = exchange(addr, &with_body("PUT", &key, "clé")).await;
+                    assert_eq!((status, thread_of(&head)), (200, thread.as_str()));
+                    let document = format!("/store-api/json/{name}/documents/d");
+                    let (status, head, _) = exchange(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await;
+                    assert_eq!((status, thread_of(&head)), (201, thread.as_str()));
+                    let sql = format!("/store-api/rel/{name}/sql");
+                    for statement in ["CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)", "INSERT INTO t VALUES (1, 'ref')"] {
+                        let (status, head, body) = exchange(addr, &with_body("POST", &sql, &sql_body(statement))).await;
+                        assert_eq!(status, 200, "{statement}: {}", String::from_utf8_lossy(&body));
+                        assert_eq!(thread_of(&head), thread, "{statement}");
+                    }
+
+                    let (status, head, body) = exchange(addr, &get(&format!("/store-api/kv/{name}/keys"))).await;
+                    assert_eq!(status, 200);
+                    assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+                    assert_eq!(shard_in(&head), shard.to_string());
+                    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["keys"], json!(["ref"]));
+
+                    let (status, head, body) = exchange(addr, &get(&key)).await;
+                    assert_eq!((status, body.as_slice()), (200, "clé".as_bytes()));
+                    assert!(thread_of(&head).starts_with("luradb-frontend"), "{head}");
+                    assert_eq!(shard_in(&head), shard.to_string());
+
+                    let select = json!({ "sql": "SELECT * FROM t", "expand": ["payload"] }).to_string();
+                    let (status, head, body) = exchange(addr, &with_body("POST", &sql, &select)).await;
+                    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+                    assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+                    assert_eq!(shard_in(&head), shard.to_string());
+                    let expanded = &serde_json::from_slice::<Value>(&body).unwrap()["expanded"]["payload"][0];
+                    assert_eq!(*expanded, json!({ "exists": true, "value": "clé", "encoding": "utf8" }));
+                }
+            },
+        );
+    }
+
+    // Shard 0's lane of one, held by a write: the next write for a domain of
+    // shard 0 answers 503 with Retry-After, one for shard 1 goes through.
+    // With the only reader thread held by a read, the reader lane of one
+    // takes one more read and turns the other away alike.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn a_full_lane_answers_503_while_the_other_shard_serves() {
+        use crate::control::slots::domain_name_for_shard;
+        let (a, b) = (domain_name_for_shard(0, 2, 9), domain_name_for_shard(1, 2, 9));
+        let gate = Arc::new(Rendezvous::default());
+        let hold_gate = Arc::clone(&gate);
+        bridge::test_hook::register_hold("full-lane", move |_| {
+            let gate = Arc::clone(&hold_gate);
+            async move { gate.arrive_and_wait() }.boxed()
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 2;
+        cfg.multicore.shard_queue_capacity = 1;
+        cfg.multicore.reader_queue_capacity = 1;
+        cfg.multicore.reader_threads = 1;
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let client = tokio::runtime::Runtime::new().unwrap();
+        for name in [&a, &b] {
+            let create = json!({ "name": name }).to_string();
+            assert_eq!(client.block_on(request(addr, &with_body("POST", "/store-api/domains", &create))).0, 201);
+        }
+        let held = |method: &str, path: String| {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: test\r\n{}: full-lane\r\nContent-Length: 1\r\nConnection: close\r\n\r\nv",
+                bridge::test_hook::HOLD
+            )
+        };
+
+        let raw = held("PUT", format!("/store-api/kv/{a}/keys/held"));
+        let write = client.spawn(async move { exchange(addr, &raw).await });
+        gate.arrivals_once(1);
+        let (status, head, _) = client.block_on(exchange(addr, &with_body("PUT", &format!("/store-api/kv/{a}/keys/next"), "v")));
+        assert_eq!(status, 503, "{head}");
+        assert!(head.contains("retry-after: 1"), "{head}");
+        let (status, _) = client.block_on(request(addr, &with_body("PUT", &format!("/store-api/kv/{b}/keys/next"), "v")));
+        assert_eq!(status, 200);
+
+        let raw = held("GET", format!("/store-api/kv/{b}/keys"));
+        let read = client.spawn(async move { exchange(addr, &raw).await });
+        gate.arrivals_once(2);
+        // One of the two waits in the lane until the reader thread is free,
+        // the other is turned away at once.
+        let reads = [0, 1].map(|_| {
+            let raw = get(&format!("/store-api/kv/{a}/keys"));
+            client.spawn(async move { exchange(addr, &raw).await })
+        });
+        let (turned_away, _, waiting) = client.block_on(futures::future::select_all(reads));
+        let (status, head, _) = turned_away.unwrap();
+        assert_eq!(status, 503, "{head}");
+        assert!(head.contains("retry-after: 1"), "{head}");
+
+        gate.release();
+        assert_eq!(client.block_on(write).unwrap().0, 200);
+        assert_eq!(client.block_on(read).unwrap().0, 200);
+        assert_eq!(client.block_on(waiting.into_iter().next().unwrap()).unwrap().0, 200);
         server.shutdown().unwrap();
     }
 

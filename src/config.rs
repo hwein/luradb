@@ -1165,8 +1165,8 @@ fn is_valid_origin_form(origin: &str) -> bool {
 // ── Multicore (spec perf/017) ─────────────────────────────────────────────────
 
 /// Sizing of the CPU offload pool behind `core::coop::offload`, of the
-/// frontend runtime in front of the engine thread (spec perf/018a) and of the
-/// reader pool (spec perf/018b).
+/// frontend runtime in front of the data shards, of the data shards and of
+/// the reader pool.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MulticoreConfig {
@@ -1177,15 +1177,18 @@ pub struct MulticoreConfig {
     /// auto = a sixth of the cores, at least 2 and at most 4 on hosts with at
     /// least 4 cores, otherwise 1.
     pub frontend_workers: usize,
-    /// Requests the bridge channel to the engine thread holds; a full channel
-    /// holds further requests back.
-    pub engine_queue_capacity: usize,
+    /// Data shards, each a thread with its own engine instances. `0` = auto
+    /// = 1; more than one is not enabled yet.
+    pub shards: u16,
+    /// Requests a data shard takes at once, running or waiting; beyond that
+    /// it answers 503 with `Retry-After`.
+    pub shard_queue_capacity: usize,
     /// Worker threads of the reader pool that serves read requests. `0` =
-    /// auto = the cores minus the engine thread, one core of headroom and the
-    /// frontend workers, at least 1.
+    /// auto = the cores minus two, the data shards and the frontend workers,
+    /// at least 1.
     pub reader_threads: usize,
-    /// Requests the channel to the reader pool holds; a full channel holds
-    /// further requests back.
+    /// Read requests the reader pool takes at once, running or waiting;
+    /// beyond that it answers 503 with `Retry-After`.
     pub reader_queue_capacity: usize,
 }
 
@@ -1194,7 +1197,8 @@ impl Default for MulticoreConfig {
         Self {
             cpu_offload_threads: 0,
             frontend_workers: 0,
-            engine_queue_capacity: 1024,
+            shards: 0,
+            shard_queue_capacity: 1024,
             reader_threads: 0,
             reader_queue_capacity: 4096,
         }
@@ -1202,9 +1206,16 @@ impl Default for MulticoreConfig {
 }
 
 impl MulticoreConfig {
+    /// The data shards this start runs: `shards`, with `0` resolved to 1.
+    pub fn shard_count(&self) -> u16 {
+        self.shards.max(1)
+    }
+
     /// Startup validation (spec general/030): more permits or workers than
-    /// `cores` would not bound anything; both bridge channels need a slot.
-    pub fn validate(&self, cores: usize) -> anyhow::Result<()> {
+    /// `cores` would not bound anything; both request channels need a slot.
+    /// More than one data shard is refused, and so is shared memory with
+    /// several shards.
+    pub fn validate(&self, cores: usize, shm_enabled: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.cpu_offload_threads <= cores,
             "invalid config: multicore.cpu_offload_threads ({}) must be 0 (auto) or 1 to {cores} (available cores)",
@@ -1216,9 +1227,19 @@ impl MulticoreConfig {
             self.frontend_workers
         );
         anyhow::ensure!(
-            self.engine_queue_capacity >= 1,
-            "invalid config: multicore.engine_queue_capacity ({}) must be at least 1",
-            self.engine_queue_capacity
+            !(shm_enabled && self.shards > 1),
+            "invalid config: multicore.shards ({}) must be 0 (auto) or 1 while shm.enabled is true",
+            self.shards
+        );
+        anyhow::ensure!(
+            self.shards <= 1,
+            "invalid config: multicore.shards ({}) must be 0 (auto) or 1 — multi-shard mode is not enabled yet",
+            self.shards
+        );
+        anyhow::ensure!(
+            self.shard_queue_capacity >= 1,
+            "invalid config: multicore.shard_queue_capacity ({}) must be at least 1",
+            self.shard_queue_capacity
         );
         anyhow::ensure!(
             self.reader_threads <= cores,
@@ -1401,7 +1422,7 @@ impl<'de> SeqAccess<'de> for OneElement<'_> {
     }
 }
 
-/// Keys removed by spec general/030, for the tests that check their absence.
+/// Keys the server no longer reads, for the tests that check their absence.
 #[cfg(test)]
 pub(crate) const REMOVED_KEYS: &[&str] = &[
     "server.unix_socket_mode",
@@ -1476,6 +1497,7 @@ pub(crate) const REMOVED_KEYS: &[&str] = &[
     "rel.block_cache.capacity_bytes",
     "rel.block_cache.small_ratio",
     "rel.block_cache.ghost_capacity",
+    "multicore.engine_queue_capacity",
 ];
 
 #[cfg(test)]
@@ -1486,7 +1508,7 @@ mod tests {
     // values have no effect.
     #[test]
     fn test_removed_keys_load_without_effect() {
-        assert_eq!(REMOVED_KEYS.len(), 72, "the spec removes 72 keys");
+        assert_eq!(REMOVED_KEYS.len(), 73);
         let toml_str: String = REMOVED_KEYS.iter().map(|key| format!("{key} = 1\n")).collect();
         let config: LuraConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(
@@ -1523,33 +1545,61 @@ mod tests {
     #[test]
     fn test_multicore_validate_offload_threads_against_cores() {
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 0\n").unwrap();
-        assert!(config.multicore.validate(8).is_ok());
+        assert!(config.multicore.validate(8, false).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 8\n").unwrap();
-        assert!(config.multicore.validate(8).is_ok());
+        assert!(config.multicore.validate(8, false).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\ncpu_offload_threads = 9\n").unwrap();
-        assert_invalid(config.multicore.validate(8), "multicore.cpu_offload_threads (9)", "1 to 8");
+        assert_invalid(config.multicore.validate(8, false), "multicore.cpu_offload_threads (9)", "1 to 8");
     }
 
-    // Spec perf/018a A5: defaults, then 0 (auto) up to the core count for
-    // the frontend workers, and at least one slot in the bridge channel.
+    // Defaults, then 0 (auto) up to the core count for the frontend workers,
+    // and at least one slot per data shard.
     #[test]
-    fn test_multicore_frontend_workers_and_engine_queue_capacity() {
+    fn test_multicore_frontend_workers_and_shard_queue_capacity() {
         let config = LuraConfig::default();
         assert_eq!(config.multicore.frontend_workers, 0);
-        assert_eq!(config.multicore.engine_queue_capacity, 1024);
-        assert!(config.multicore.validate(1).is_ok());
+        assert_eq!(config.multicore.shard_queue_capacity, 1024);
+        assert!(config.multicore.validate(1, false).is_ok());
 
         let config: LuraConfig =
-            toml::from_str("[multicore]\nfrontend_workers = 8\nengine_queue_capacity = 1\n").unwrap();
-        assert!(config.multicore.validate(8).is_ok());
+            toml::from_str("[multicore]\nfrontend_workers = 8\nshard_queue_capacity = 1\n").unwrap();
+        assert!(config.multicore.validate(8, false).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\nfrontend_workers = 9\n").unwrap();
-        assert_invalid(config.multicore.validate(8), "multicore.frontend_workers (9)", "1 to 8");
+        assert_invalid(config.multicore.validate(8, false), "multicore.frontend_workers (9)", "1 to 8");
 
-        let config: LuraConfig = toml::from_str("[multicore]\nengine_queue_capacity = 0\n").unwrap();
-        assert_invalid(config.multicore.validate(8), "multicore.engine_queue_capacity (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[multicore]\nshard_queue_capacity = 0\n").unwrap();
+        assert_invalid(config.multicore.validate(8, false), "multicore.shard_queue_capacity (0)", "at least 1");
+    }
+
+    // Auto and one data shard start; more are refused for now, and shared
+    // memory never runs with several.
+    #[test]
+    fn test_multicore_shards_accept_auto_and_one_only() {
+        let config = LuraConfig::default();
+        assert_eq!(config.multicore.shards, 0);
+        assert_eq!(config.multicore.shard_count(), 1);
+
+        for shards in [0, 1] {
+            let config: LuraConfig = toml::from_str(&format!("[multicore]\nshards = {shards}\n")).unwrap();
+            assert!(config.multicore.validate(8, true).is_ok(), "{shards}");
+            assert_eq!(config.multicore.shard_count(), 1);
+        }
+
+        let config: LuraConfig = toml::from_str("[multicore]\nshards = 2\n").unwrap();
+        assert_eq!(config.multicore.shard_count(), 2);
+        assert_invalid(config.multicore.validate(8, false), "multicore.shards (2)", "not enabled yet");
+        assert_invalid(config.multicore.validate(8, true), "multicore.shards (2)", "shm.enabled");
+    }
+
+    // The removed bridge capacity is reported as unknown and has no effect.
+    #[test]
+    fn test_engine_queue_capacity_is_gone() {
+        let (config, unknown) = LuraConfig::parse("[multicore]\nengine_queue_capacity = 7\n").unwrap();
+        assert_eq!(unknown, ["multicore.engine_queue_capacity"]);
+        assert_eq!(config.multicore.shard_queue_capacity, 1024);
     }
 
     // The WAL queue: the default passes, the bounds pass, a queue without a
@@ -1581,17 +1631,17 @@ mod tests {
         let config = LuraConfig::default();
         assert_eq!(config.multicore.reader_threads, 0);
         assert_eq!(config.multicore.reader_queue_capacity, 4096);
-        assert!(config.multicore.validate(1).is_ok());
+        assert!(config.multicore.validate(1, false).is_ok());
 
         let config: LuraConfig =
             toml::from_str("[multicore]\nreader_threads = 8\nreader_queue_capacity = 1\n").unwrap();
-        assert!(config.multicore.validate(8).is_ok());
+        assert!(config.multicore.validate(8, false).is_ok());
 
         let config: LuraConfig = toml::from_str("[multicore]\nreader_threads = 9\n").unwrap();
-        assert_invalid(config.multicore.validate(8), "multicore.reader_threads (9)", "1 to 8");
+        assert_invalid(config.multicore.validate(8, false), "multicore.reader_threads (9)", "1 to 8");
 
         let config: LuraConfig = toml::from_str("[multicore]\nreader_queue_capacity = 0\n").unwrap();
-        assert_invalid(config.multicore.validate(8), "multicore.reader_queue_capacity (0)", "at least 1");
+        assert_invalid(config.multicore.validate(8, false), "multicore.reader_queue_capacity (0)", "at least 1");
     }
 
     #[test]
@@ -2925,7 +2975,7 @@ flag = true
             config.rel.validate().unwrap();
             config.shm.validate().unwrap();
             config.shm.validate_registration_socket(&config.server).unwrap();
-            config.multicore.validate(1).unwrap();
+            config.multicore.validate(1, config.shm.enabled).unwrap();
         }
     }
 }

@@ -162,7 +162,7 @@ impl RelEngine {
             let end = (start + IMPORT_BATCH_SIZE).min(data_records.len());
             // A fresh snapshot per group: it must see the previous groups'
             // own commits for the PK-duplicate check inside `stage_insert_row`.
-            let snapshot = self.engine.snapshot();
+            let snapshot = self.engine.snapshot().await;
             let snap = snapshot.snapshot();
             let mut ops: Vec<BatchOp> = Vec::new();
 

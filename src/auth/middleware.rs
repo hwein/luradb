@@ -35,7 +35,7 @@ pub(crate) enum StoreType {
 ///   /store-api/metrics/domains/{domain}  → (Kv, domain, false)  domain metrics
 /// `/store-api/json/domains/…`, `/store-api/rel/domains/…` and everything
 /// else → None (admin-only).
-fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
+pub(crate) fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
         ["store-api", "kv", domain, ..] if !domain.is_empty() => {

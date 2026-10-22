@@ -18,9 +18,7 @@ use crate::engines::lsm::engine::BatchOp;
 use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::metrics::MetricsStore;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 // ── Resolver result types (spec §1) ──────────────────────────────────────────
 
@@ -137,7 +135,7 @@ impl CrossEngineResolver {
         let mut prefixed = dom.system_prefix.clone();
         prefixed.extend_from_slice(key.as_bytes());
         let engine = kv.engine();
-        let snap = engine.snapshot();
+        let snap = engine.snapshot().await;
         Ok(match engine.get_with_snapshot(&prefixed, snap.snapshot()).await? {
             GetResult::Present(bytes) => KvResolution::Present(bytes),
             GetResult::Null => KvResolution::NullValue,
@@ -311,33 +309,12 @@ pub const SWEEP_BATCH_SIZE: usize = 100;
 /// own orphaned prefix ranges); this one rewrites cells in *live* tables.
 pub struct RelCrossEngineSweeper {
     engine: Arc<RelEngine>,
-    shutdown: Arc<AtomicBool>,
     batch_size: usize,
-    interval: Duration,
 }
 
 impl RelCrossEngineSweeper {
-    pub fn new(
-        engine: Arc<RelEngine>,
-        shutdown: Arc<AtomicBool>,
-        batch_size: usize,
-        interval_secs: u64,
-    ) -> Self {
-        Self {
-            engine,
-            shutdown,
-            batch_size,
-            interval: Duration::from_secs(interval_secs),
-        }
-    }
-
-    pub async fn run(self: Arc<Self>) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Err(e) = self.sweep_tick().await {
-                tracing::warn!("[RelCrossEngineSweeper] tick error: {e}");
-            }
-            compio::time::sleep(self.interval).await;
-        }
+    pub fn new(engine: Arc<RelEngine>, batch_size: usize) -> Self {
+        Self { engine, batch_size }
     }
 
     pub async fn sweep_tick(&self) -> anyhow::Result<()> {
@@ -388,7 +365,7 @@ impl RelCrossEngineSweeper {
     ) -> anyhow::Result<()> {
         let prefix = &dom.system_prefix;
         let engine = &self.engine.engine;
-        let snapshot = engine.snapshot();
+        let snapshot = engine.snapshot().await;
         let snap = snapshot.snapshot();
         let ix = table.indexes.iter().find(|ix| ix.column == col.name);
 
@@ -474,7 +451,7 @@ impl RelCrossEngineSweeper {
         }
         // v_now: latest committed. Only null it if untouched since the snapshot
         // (a fresh valid link against a recreated domain must survive, §5).
-        let now_guard = engine.snapshot();
+        let now_guard = engine.snapshot().await;
         let Some(now_bytes) = engine.get_with_snapshot(row_key, now_guard.snapshot()).await?.into_option() else {
             return Ok(None);
         };
@@ -555,6 +532,7 @@ mod tests {
     use crate::engines::rel::{ExecOutcome, ExpandedBlock, SqlOutcome};
     use crate::metrics::MetricsConfig;
     use crate::storage::file_manager::FileManager;
+    use std::sync::atomic::Ordering;
     use crate::storage::manifest::ManifestManager;
     use crate::storage::vlog::VLog;
     use serde_json::{json, Value};
@@ -699,7 +677,7 @@ mod tests {
         let (prefix, schema) = table_of(rel, domain, table);
         let pk_enc = encode_sortable(&ScalarValue::Integer(pk)).unwrap();
         let row_key = keys::row_key(&prefix, schema.table_id, &pk_enc);
-        let snap = rel.engine().snapshot();
+        let snap = rel.engine().snapshot().await;
         let bytes = rel.engine().get_with_snapshot(&row_key, snap.snapshot()).await.unwrap().into_option().unwrap();
         let c = schema.columns.iter().find(|c| c.name == col).unwrap();
         decode_value(&bytes, c)
@@ -713,7 +691,7 @@ mod tests {
     }
 
     async fn sweep_once(rel: &Arc<RelEngine>, batch: usize) {
-        RelCrossEngineSweeper::new(Arc::clone(rel), Arc::new(AtomicBool::new(false)), batch, 10)
+        RelCrossEngineSweeper::new(Arc::clone(rel), batch)
             .sweep_tick()
             .await
             .unwrap();
@@ -1214,7 +1192,7 @@ mod tests {
         let col = schema.columns.iter().find(|c| c.name == "payload").unwrap();
         let mut n = 0;
         for rk in rel.engine().scan_keys(&keys::row_table_prefix(&prefix, schema.table_id)).await.unwrap() {
-            let snap = rel.engine().snapshot();
+            let snap = rel.engine().snapshot().await;
             if let Some(bytes) = rel.engine().get_with_snapshot(&rk, snap.snapshot()).await.unwrap().into_option() {
                 if !matches!(decode_value(&bytes, col), ScalarValue::Null) {
                     n += 1;
@@ -1308,7 +1286,7 @@ mod tests {
             sweep_once(&e.rel, 100).await;
 
             let row_key = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
-            let snap = e.rel.engine().snapshot();
+            let snap = e.rel.engine().snapshot().await;
             let bytes = e.rel.engine().get_with_snapshot(&row_key, snap.snapshot()).await.unwrap().into_option().unwrap();
             assert_eq!(
                 decode_value(&bytes, &col),
@@ -1615,7 +1593,7 @@ mod tests {
 
             // Finalize the deletion (a document is present -> two ticks, mirrors
             // json/013 purger tests) before recreating the domain same-named.
-            let purger = JsonDomainPurger::new(Arc::clone(&e.json), Arc::new(AtomicBool::new(false)), 100, 5);
+            let purger = JsonDomainPurger::new(Arc::clone(&e.json), 100);
             purger.purge_tick().await.unwrap();
             purger.purge_tick().await.unwrap();
 

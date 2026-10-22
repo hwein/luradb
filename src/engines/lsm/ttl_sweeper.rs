@@ -10,18 +10,13 @@ use crate::engines::lsm::key::Timestamp;
 use crate::storage::format::VersionState;
 use anyhow::Result;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use compio::time::sleep;
-use std::time::Duration;
 
 /// Periodic TTL sweeper over one KV engine.
 pub struct TtlSweeper {
     engine: Arc<LsmStorageEngine>,
     /// Candidates *checked* per tick — discarded ones count too (spec §6).
     batch_size: usize,
-    interval: Duration,
-    shutdown: Arc<AtomicBool>,
     /// Scan cursor kept across ticks, not persisted (spec kv/025 §3): the
     /// largest key checked last tick. It is what guarantees progress — a chunk
     /// consisting purely of false positives still moves it forward instead of
@@ -30,29 +25,8 @@ pub struct TtlSweeper {
 }
 
 impl TtlSweeper {
-    pub fn new(
-        engine: Arc<LsmStorageEngine>,
-        shutdown: Arc<AtomicBool>,
-        batch_size: usize,
-        interval_secs: u64,
-    ) -> Self {
-        Self {
-            engine,
-            batch_size,
-            interval: Duration::from_secs(interval_secs),
-            shutdown,
-            cursor: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Runs the sweep loop until `shutdown` is set.
-    pub async fn run(self: Arc<Self>) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Err(e) = self.sweep_tick().await {
-                eprintln!("[TtlSweeper] Error: {e}");
-            }
-            sleep(self.interval).await;
-        }
+    pub fn new(engine: Arc<LsmStorageEngine>, batch_size: usize) -> Self {
+        Self { engine, batch_size, cursor: Mutex::new(Vec::new()) }
     }
 
     /// One sweep cycle (spec kv/025 §3).
@@ -134,12 +108,7 @@ mod tests {
     }
 
     fn sweeper(engine: &Arc<LsmStorageEngine>, batch_size: usize) -> TtlSweeper {
-        TtlSweeper::new(
-            Arc::clone(engine),
-            Arc::new(AtomicBool::new(false)),
-            batch_size,
-            60,
-        )
+        TtlSweeper::new(Arc::clone(engine), batch_size)
     }
 
     /// Drains the delete events currently queued on `rx` (the sweeper writes
@@ -407,7 +376,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             engine.put_expired_for_test(b"k", b"v").await.unwrap();
-            let snapshot = engine.snapshot();
+            let snapshot = engine.snapshot().await;
 
             assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));
             assert_eq!(state_of(&engine, b"missing").await, None);
@@ -500,7 +469,7 @@ mod tests {
     fn test_tie_above_the_watermark_leaves_one_entry_after_compaction() {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
-            let below = engine.snapshot();
+            let below = engine.snapshot().await;
             // Far ahead of the wall clock: the next stamp is exactly `seed + 1`.
             let seed = HLCTimestamp::from_components(1 << 47, 0).as_u64();
             engine.hlc().seed(seed);

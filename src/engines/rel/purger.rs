@@ -13,10 +13,7 @@ use super::domain::{RelDomain, RelDomainState};
 use super::keys;
 use super::RelEngine;
 use crate::engines::lsm::engine::BatchOp;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use compio::time::sleep;
-use std::time::Duration;
 
 /// Data keys/candidate probes tombstoned per batch and seconds between ticks.
 pub const PURGER_BATCH_SIZE: usize = 100;
@@ -24,35 +21,12 @@ pub const PURGER_INTERVAL_SECS: u64 = 5;
 
 pub struct RelDomainPurger {
     engine: Arc<RelEngine>,
-    shutdown: Arc<AtomicBool>,
     batch_size: usize,
-    interval: Duration,
 }
 
 impl RelDomainPurger {
-    pub fn new(
-        engine: Arc<RelEngine>,
-        shutdown: Arc<AtomicBool>,
-        batch_size: usize,
-        interval_secs: u64,
-    ) -> Self {
-        Self {
-            engine,
-            shutdown,
-            batch_size,
-            interval: Duration::from_secs(interval_secs),
-        }
-    }
-
-    /// Runs the purge loop until the shutdown flag is set (shared with the
-    /// KV/JSON purgers via `main.rs`); stops after the current tick.
-    pub async fn run(self: Arc<Self>) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Err(e) = self.purge_tick().await {
-                tracing::warn!("[RelDomainPurger] error: {e}");
-            }
-            sleep(self.interval).await;
-        }
+    pub fn new(engine: Arc<RelEngine>, batch_size: usize) -> Self {
+        Self { engine, batch_size }
     }
 
     /// One cycle: first fully purge `Deleting` domains (job a), then reap
@@ -213,6 +187,7 @@ mod tests {
     use crate::engines::rel::{CatalogEntry, CrossEngineResolver, RelStoreError, TableSchema};
     use crate::metrics::{MetricsConfig, MetricsStore};
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     fn config_in(dir: &Path) -> RelStoreConfig {
         RelStoreConfig {
@@ -236,7 +211,7 @@ mod tests {
     }
 
     fn purger(rel: &Arc<RelEngine>, batch: usize) -> RelDomainPurger {
-        RelDomainPurger::new(Arc::clone(rel), Arc::new(AtomicBool::new(false)), batch, 5)
+        RelDomainPurger::new(Arc::clone(rel), batch)
     }
 
     async fn ok(rel: &RelEngine, domain: &str, sql: &str) {

@@ -67,6 +67,15 @@ pub enum WalEntry {
     },
 }
 
+impl WalEntry {
+    /// The key the entry writes.
+    pub fn key(&self) -> &[u8] {
+        match self {
+            WalEntry::Set { key, .. } | WalEntry::Delete { key, .. } | WalEntry::SetNull { key, .. } => key,
+        }
+    }
+}
+
 /// What [`recover`] read from a log.
 #[derive(Debug, Default)]
 pub struct Recovered {
@@ -223,6 +232,7 @@ enum CommitRequest {
 enum Control {
     Truncate { responder: oneshot::Sender<Result<(), WalError>> },
     SetLsnStart { lsn: u64, responder: oneshot::Sender<()> },
+    HeadLsn { responder: oneshot::Sender<u64> },
 }
 
 /// A Write-Ahead Log with Group Commit for high-throughput durability.
@@ -334,6 +344,23 @@ impl WriteAheadLog {
                 response.await.map_err(|_| broken_pipe_error())
             }
             WalMode::Remote { handle, engine } => handle.set_lsn_start(*engine, lsn).await.map_err(wal_remote_err),
+        }
+    }
+
+    /// The LSN of the last record durable in the log, after every append
+    /// queued before this call.
+    pub async fn head_lsn(&self) -> Result<u64, WalError> {
+        match &self.inner {
+            #[cfg(test)]
+            WalMode::Local(sender) => {
+                let (responder, response) = oneshot::channel();
+                sender
+                    .send(CommitRequest::Control(Control::HeadLsn { responder }))
+                    .await
+                    .map_err(|_| broken_pipe_error())?;
+                response.await.map_err(|_| broken_pipe_error())
+            }
+            WalMode::Remote { handle, engine } => handle.wal_head_lsn(*engine).await.map_err(wal_remote_err),
         }
     }
 
@@ -515,6 +542,9 @@ async fn run_control(wal: &mut LocalWal, control: Control) {
         Control::SetLsnStart { lsn, responder } => {
             wal.lsn = wal.lsn.max(lsn);
             let _ = responder.send(());
+        }
+        Control::HeadLsn { responder } => {
+            let _ = responder.send(wal.lsn);
         }
     }
 }
@@ -1190,7 +1220,7 @@ mod tests {
     /// stamp and the LSN.
     async fn reserve_stamp_send(wal: &WriteAheadLog, clock: &HybridLogicalClock, key: &[u8]) -> (u64, u64) {
         let permit = wal.reserve().await.unwrap();
-        let stamp = clock.now().as_u64();
+        let stamp = clock.try_now().unwrap().as_u64();
         let (_, lsn) = permit.send(delete_record_at(stamp, key)).await.unwrap();
         (stamp, lsn)
     }
@@ -1209,10 +1239,10 @@ mod tests {
             let mut b = std::pin::pin!(wal.reserve());
             assert!(futures::poll!(b.as_mut()).is_pending(), "the one slot is A's");
 
-            let stamp_a = clock.now().as_u64();
+            let stamp_a = clock.try_now().unwrap().as_u64();
             let (_, lsn_a) = a.send(delete_record_at(stamp_a, b"a")).await.unwrap();
             let b = b.await.unwrap();
-            let stamp_b = clock.now().as_u64();
+            let stamp_b = clock.try_now().unwrap().as_u64();
             let (_, lsn_b) = b.send(delete_record_at(stamp_b, b"b")).await.unwrap();
 
             assert_eq!((lsn_a, lsn_b), (1, 2));

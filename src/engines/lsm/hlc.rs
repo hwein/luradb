@@ -50,17 +50,25 @@ impl HLCTimestamp {
 /// - Timestamps are monotonically increasing
 /// - Causality is preserved across nodes
 /// - Physical time bounds logical time
+///
+/// It never waits: where the logical counter is saturated and the wall clock
+/// has not moved past it, a draw returns `None` and the caller yields.
 pub struct HybridLogicalClock {
     /// Last issued timestamp
     last_timestamp: AtomicU64,
+    /// Wall clock in milliseconds since the UNIX epoch.
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl HybridLogicalClock {
-    /// Creates a new HLC.
+    /// Creates a new HLC on the system clock.
     pub fn new() -> Self {
-        Self {
-            last_timestamp: AtomicU64::new(0),
-        }
+        Self::with_clock(Self::physical_time)
+    }
+
+    /// Creates a new HLC on `clock`, milliseconds since the UNIX epoch.
+    pub fn with_clock(clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self { last_timestamp: AtomicU64::new(0), clock: Box::new(clock) }
     }
 
     /// Gets the current physical time in milliseconds since UNIX epoch.
@@ -71,24 +79,17 @@ impl HybridLogicalClock {
             .as_millis() as u64
     }
 
-    /// Generates a new timestamp for a local event.
-    ///
-    /// This is called when creating a new write operation locally.
-    pub fn now(&self) -> HLCTimestamp {
-        loop {
-            if let Some(ts) = self.try_now() {
-                return ts;
-            }
-            // Logical counter overflow - wait for physical time to advance
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+    /// The wall clock this clock reads, in milliseconds since UNIX epoch.
+    pub fn wall(&self) -> u64 {
+        (self.clock)()
     }
 
-    /// Like [`Self::now`], but `None` where `now` would sleep: the logical
-    /// counter is saturated and the wall clock has not moved past the clock.
+    /// Generates a new timestamp for a local event, or `None` while the
+    /// logical counter is saturated and the wall clock has not moved past
+    /// the clock.
     pub fn try_now(&self) -> Option<HLCTimestamp> {
         loop {
-            let current_physical = Self::physical_time();
+            let current_physical = self.wall();
             let last = self.last_timestamp.load(Ordering::SeqCst);
             let last_ts = HLCTimestamp::new(last);
 
@@ -120,14 +121,12 @@ impl HybridLogicalClock {
         }
     }
 
-    /// Updates the clock based on a received timestamp.
-    ///
-    /// This is called when receiving a message from another node.
-    /// It ensures causality by updating the clock to be greater than both
-    /// the local time and the received time.
-    pub fn update(&self, received: HLCTimestamp) -> HLCTimestamp {
+    /// Updates the clock based on a received timestamp, so the result is
+    /// greater than both the local time and the received time; `None` where
+    /// the logical counter it would raise is saturated.
+    pub fn update(&self, received: HLCTimestamp) -> Option<HLCTimestamp> {
         loop {
-            let current_physical = Self::physical_time();
+            let current_physical = self.wall();
             let last = self.last_timestamp.load(Ordering::SeqCst);
             let last_ts = HLCTimestamp::new(last);
 
@@ -143,29 +142,13 @@ impl HybridLogicalClock {
                 (current_physical, 0)
             } else if last_physical > received_physical {
                 // Local time is ahead
-                if last_logical == u16::MAX {
-                    // Logical counter overflow - wait for physical time to advance
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
-                }
-                (last_physical, last_logical + 1)
+                (last_physical, last_logical.checked_add(1)?)
             } else if received_physical > last_physical {
                 // Received time is ahead
-                if received_logical == u16::MAX {
-                    // Logical counter overflow - wait for physical time to advance
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
-                }
-                (received_physical, received_logical + 1)
+                (received_physical, received_logical.checked_add(1)?)
             } else {
                 // Same physical time - take max logical + 1
-                let max_logical = last_logical.max(received_logical);
-                if max_logical == u16::MAX {
-                    // Wait for physical time to advance
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
-                }
-                (last_physical, max_logical + 1)
+                (last_physical, last_logical.max(received_logical).checked_add(1)?)
             };
 
             let new_ts = HLCTimestamp::from_components(new_physical, new_logical);
@@ -176,7 +159,7 @@ impl HybridLogicalClock {
                 .compare_exchange(last, new_ts.value, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return new_ts;
+                return Some(new_ts);
             }
         }
     }
@@ -202,16 +185,25 @@ impl Default for HybridLogicalClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+
+    /// A clock that reads `now`, and the handle that moves it.
+    fn manual_clock(start: u64) -> (HybridLogicalClock, Arc<AtomicU64>) {
+        let now = Arc::new(AtomicU64::new(start));
+        let read = Arc::clone(&now);
+        (HybridLogicalClock::with_clock(move || read.load(Ordering::SeqCst)), now)
+    }
+
+    const T: u64 = 1_700_000_000_000;
 
     #[test]
     fn test_hlc_basic() {
-        let hlc = HybridLogicalClock::new();
+        let (hlc, _now) = manual_clock(T);
 
-        let ts1 = hlc.now();
-        let ts2 = hlc.now();
-        let ts3 = hlc.now();
+        let ts1 = hlc.try_now().unwrap();
+        let ts2 = hlc.try_now().unwrap();
+        let ts3 = hlc.try_now().unwrap();
 
         // Timestamps should be monotonically increasing
         assert!(ts2 > ts1);
@@ -220,47 +212,38 @@ mod tests {
 
     #[test]
     fn test_hlc_physical_time_advance() {
-        let hlc = HybridLogicalClock::new();
+        let (hlc, now) = manual_clock(T);
 
-        let ts1 = hlc.now();
+        let ts1 = hlc.try_now().unwrap();
+        now.store(T + 1, Ordering::SeqCst);
+        let ts2 = hlc.try_now().unwrap();
 
-        // Waits for the wall clock to pass this stamp instead of assuming a
-        // sleep does it: a backwards step only makes the wait longer.
-        while HybridLogicalClock::physical_time() <= ts1.physical() {
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        let ts2 = hlc.now();
-
-        // Physical component should have advanced
-        assert!(ts2.physical() > ts1.physical());
-        // Logical component should reset
+        assert_eq!(ts2.physical(), T + 1);
         assert_eq!(ts2.logical(), 0);
+        assert!(ts2 > ts1);
     }
 
     #[test]
     fn test_hlc_logical_increment() {
-        let hlc = HybridLogicalClock::new();
+        let (hlc, _now) = manual_clock(T);
 
-        let ts1 = hlc.now();
-        let ts2 = hlc.now();
+        let ts1 = hlc.try_now().unwrap();
+        let ts2 = hlc.try_now().unwrap();
 
-        // If physical time hasn't advanced, logical should increment
-        if ts2.physical() == ts1.physical() {
-            assert_eq!(ts2.logical(), ts1.logical() + 1);
-        }
+        assert_eq!(ts2.physical(), ts1.physical());
+        assert_eq!(ts2.logical(), ts1.logical() + 1);
     }
 
     #[test]
     fn test_hlc_update_with_future_timestamp() {
-        let hlc = HybridLogicalClock::new();
+        let (hlc, _now) = manual_clock(T);
 
-        let local_ts = hlc.now();
+        let local_ts = hlc.try_now().unwrap();
 
         // Simulate receiving a timestamp from the future
         let future_ts = HLCTimestamp::from_components(local_ts.physical() + 1000, 5);
 
-        let updated_ts = hlc.update(future_ts);
+        let updated_ts = hlc.update(future_ts).unwrap();
 
         // Updated timestamp should be >= future timestamp
         assert!(updated_ts >= future_ts);
@@ -268,18 +251,14 @@ mod tests {
 
     #[test]
     fn test_hlc_update_with_past_timestamp() {
-        let hlc = HybridLogicalClock::new();
+        let (hlc, now) = manual_clock(T);
 
-        let ts1 = hlc.now();
-
-        thread::sleep(Duration::from_millis(10));
-
-        let ts2 = hlc.now();
+        let ts1 = hlc.try_now().unwrap();
+        now.store(T + 10, Ordering::SeqCst);
+        let ts2 = hlc.try_now().unwrap();
 
         // Simulate receiving a timestamp from the past
-        let past_ts = ts1;
-
-        let updated_ts = hlc.update(past_ts);
+        let updated_ts = hlc.update(ts1).unwrap();
 
         // Updated timestamp should still be greater than current
         assert!(updated_ts > ts2);
@@ -287,16 +266,17 @@ mod tests {
 
     #[test]
     fn test_hlc_concurrent() {
-        let hlc = std::sync::Arc::new(HybridLogicalClock::new());
+        let hlc = Arc::new(HybridLogicalClock::new());
         let mut handles = vec![];
 
-        // Spawn multiple threads generating timestamps
+        // Spawn multiple threads generating timestamps; 1000 draws cannot
+        // saturate the logical counter of one millisecond.
         for _ in 0..10 {
-            let hlc_clone = std::sync::Arc::clone(&hlc);
+            let hlc_clone = Arc::clone(&hlc);
             let handle = thread::spawn(move || {
                 let mut timestamps = vec![];
                 for _ in 0..100 {
-                    timestamps.push(hlc_clone.now());
+                    timestamps.push(hlc_clone.try_now().unwrap());
                 }
                 timestamps
             });
@@ -316,52 +296,58 @@ mod tests {
         }
     }
 
-    // Spec kv/026 M3: a saturated logical counter must not overflow the
-    // `+ 1` in either update() branch; the result stays monotonic.
+    // A saturated logical counter must not overflow the `+ 1` in either
+    // update() branch: the draw fails instead, and succeeds once the wall
+    // clock moved past both stamps.
     #[test]
     fn test_hlc_update_survives_logical_overflow() {
-        let hlc = HybridLogicalClock::new();
-        let base = HybridLogicalClock::physical_time();
+        let (hlc, now) = manual_clock(T);
 
         // Local time ahead of the received one, local logical saturated.
-        hlc.seed(HLCTimestamp::from_components(base + 20, u16::MAX).as_u64());
+        hlc.seed(HLCTimestamp::from_components(T + 20, u16::MAX).as_u64());
         let before = hlc.peek();
-        let ts1 = hlc.update(HLCTimestamp::from_components(base, 0));
-        assert!(ts1.as_u64() > before.as_u64());
+        assert_eq!(hlc.update(HLCTimestamp::from_components(T, 0)), None);
+        assert_eq!(hlc.peek(), before, "a failed update issues nothing");
+        now.store(T + 21, Ordering::SeqCst);
+        let ts1 = hlc.update(HLCTimestamp::from_components(T, 0)).unwrap();
+        assert!(ts1 > before);
 
         // Received time ahead of the local one, received logical saturated.
         let received = HLCTimestamp::from_components(ts1.physical() + 20, u16::MAX);
-        let ts2 = hlc.update(received);
-        assert!(ts2.as_u64() > received.as_u64());
-        assert!(ts2.as_u64() > ts1.as_u64());
+        assert_eq!(hlc.update(received), None);
+        now.store(ts1.physical() + 21, Ordering::SeqCst);
+        let ts2 = hlc.update(received).unwrap();
+        assert!(ts2 > received);
+        assert!(ts2 > ts1);
     }
 
-    // A saturated logical counter ahead of the wall clock: where `now` would
-    // sleep until the wall clock catches up, `try_now` returns at once and
-    // issues nothing.
+    // A saturated logical counter ahead of the wall clock: `try_now` returns
+    // at once and issues nothing until the wall clock moves past it.
     #[test]
     fn test_try_now_returns_none_on_a_saturated_counter() {
-        let hlc = HybridLogicalClock::new();
-        let ahead = HybridLogicalClock::physical_time() + 60_000;
-        hlc.seed(HLCTimestamp::from_components(ahead, u16::MAX - 1).as_u64());
+        let (hlc, now) = manual_clock(T);
+        hlc.seed(HLCTimestamp::from_components(T, u16::MAX - 1).as_u64());
 
-        let last = HLCTimestamp::from_components(ahead, u16::MAX);
+        let last = HLCTimestamp::from_components(T, u16::MAX);
         assert_eq!(hlc.try_now(), Some(last));
         assert_eq!(hlc.try_now(), None);
         assert_eq!(hlc.peek(), last, "a failed draw issues nothing");
+
+        now.store(T + 1, Ordering::SeqCst);
+        assert_eq!(hlc.try_now(), Some(HLCTimestamp::from_components(T + 1, 0)));
     }
 
     #[test]
     fn test_hlc_seed_never_lowers_the_clock() {
-        let hlc = HybridLogicalClock::new();
-        let high = hlc.now().as_u64() + 1_000_000;
+        let (hlc, _now) = manual_clock(T);
+        let high = hlc.try_now().unwrap().as_u64() + 1_000_000;
 
         hlc.seed(high);
         assert_eq!(hlc.peek().as_u64(), high);
 
         hlc.seed(1);
         assert_eq!(hlc.peek().as_u64(), high);
-        assert!(hlc.now().as_u64() > high);
+        assert!(hlc.try_now().unwrap().as_u64() > high);
     }
 
     #[test]

@@ -926,7 +926,7 @@ impl RelEngine {
         // (spec §2 Snapshot & Ghosts). Kept alive so compaction cannot advance
         // past it mid-pipeline; moves into the result so `expand` is covered
         // too (rel/021).
-        let snapshot_guard = self.engine.snapshot();
+        let snapshot_guard = self.engine.snapshot().await;
         let snap = snapshot_guard.snapshot().clone();
 
         let is_count = sel.items.len() == 1 && matches!(sel.items[0], SelectItem::CountStar);
@@ -1595,7 +1595,7 @@ mod tests {
             ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
             ok(&rel, "INSERT INTO a VALUES (10, 1)").await;
 
-            let snapshot_guard = rel.engine().snapshot();
+            let snapshot_guard = rel.engine().snapshot().await;
             let snap = snapshot_guard.snapshot().clone();
             ok(&rel, "INSERT INTO b VALUES (1)").await; // live now, but not in `snap`
 
@@ -1726,7 +1726,7 @@ mod tests {
             };
             b_schema.columns[1].col_type = ColumnType::KvRef; // relabel `link` for the mask check only
 
-            let snapshot_guard = rel.engine().snapshot();
+            let snapshot_guard = rel.engine().snapshot().await;
             let snap = snapshot_guard.snapshot().clone();
             let probe = JoinProbe {
                 engine: Arc::clone(rel.engine()),
@@ -1794,7 +1794,7 @@ mod tests {
                 ok(&rel, &format!("INSERT INTO b VALUES ({i}, 42)")).await;
             }
 
-            let snapshot_guard = rel.engine().snapshot();
+            let snapshot_guard = rel.engine().snapshot().await;
             let snap = snapshot_guard.snapshot().clone();
             // Ghosts: live at probe time, but after the snapshot -- must not
             // count toward the fallback budget nor appear in the result.

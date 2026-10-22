@@ -180,7 +180,7 @@ impl RelEngine {
 
         let lock = self.table_locks.get(prefix, schema.table_id);
         let _guard = lock.lock().await;
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot().await;
         let snap = snapshot.snapshot();
 
         // AUTOINCREMENT high-water: assign omitted PKs, raise for explicit ones.
@@ -287,7 +287,7 @@ impl RelEngine {
         let quals = vec![schema.name.clone()];
         let lock = self.table_locks.get(prefix, schema.table_id);
         let _guard = lock.lock().await;
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot().await;
         let snap = snapshot.snapshot();
         let candidates = self
             .acquire_candidates(&dom, &schema, &upd.where_clause, &quals, params, snap)
@@ -402,7 +402,7 @@ impl RelEngine {
 
         let lock = self.table_locks.get(prefix, schema.table_id);
         let _guard = lock.lock().await;
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot().await;
         let snap = snapshot.snapshot();
         let candidates = self
             .acquire_candidates(&dom, &schema, &del.where_clause, &quals, params, snap)

@@ -8,10 +8,7 @@ use super::document::doc_scan_prefix;
 use super::index::index_domain_prefix;
 use super::{JsonEngine, DOC_WRITE_SHARDS};
 use crate::engines::lsm::engine::BatchOp;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use compio::time::sleep;
-use std::time::Duration;
 
 /// Keys tombstoned per purger tick and seconds between ticks.
 pub const PURGER_BATCH_SIZE: usize = 100;
@@ -19,34 +16,12 @@ pub const PURGER_INTERVAL_SECS: u64 = 5;
 
 pub struct JsonDomainPurger {
     engine: Arc<JsonEngine>,
-    shutdown: Arc<AtomicBool>,
     batch_size: usize,
-    interval: Duration,
 }
 
 impl JsonDomainPurger {
-    pub fn new(
-        engine: Arc<JsonEngine>,
-        shutdown: Arc<AtomicBool>,
-        batch_size: usize,
-        interval_secs: u64,
-    ) -> Self {
-        Self {
-            engine,
-            shutdown,
-            batch_size,
-            interval: Duration::from_secs(interval_secs),
-        }
-    }
-
-    /// Runs the purge loop until the shutdown flag is set.
-    pub async fn run(self: Arc<Self>) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Err(e) = self.purge_tick().await {
-                tracing::warn!("[JsonDomainPurger] error: {e}");
-            }
-            sleep(self.interval).await;
-        }
+    pub fn new(engine: Arc<JsonEngine>, batch_size: usize) -> Self {
+        Self { engine, batch_size }
     }
 
     /// One purge cycle: tombstones up to `batch_size` keys per deleting
@@ -122,12 +97,7 @@ mod tests {
     }
 
     fn purger(json: &Arc<JsonEngine>, batch: usize) -> JsonDomainPurger {
-        JsonDomainPurger::new(
-            Arc::clone(json),
-            Arc::new(AtomicBool::new(false)),
-            batch,
-            5,
-        )
+        JsonDomainPurger::new(Arc::clone(json), batch)
     }
 
     // 1./2. Deleting state blocks CRUD with DomainDeleting (→ 410).

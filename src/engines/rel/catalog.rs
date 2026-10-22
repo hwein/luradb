@@ -1454,7 +1454,7 @@ mod tests {
     ) {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = make_engine(dir.path()).await;
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
         let metrics = MetricsStore::new(MetricsConfig::default());
         let catalog = Arc::new(
             RelCatalog::recover(Arc::clone(&engine), limits, metrics)
@@ -2118,7 +2118,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let engine = make_engine(dir.path()).await;
-            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
             let metrics = MetricsStore::new(MetricsConfig::default());
             let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
                 .await
@@ -2161,7 +2161,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let engine = make_engine(dir.path()).await;
-            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
             let metrics = MetricsStore::new(MetricsConfig::default());
             let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
                 .await
@@ -2200,7 +2200,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let engine = make_engine(dir.path()).await;
-            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
             domains.create_domain("gamma").await.unwrap();
 
             let metrics = MetricsStore::new(MetricsConfig::default());

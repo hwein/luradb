@@ -39,6 +39,12 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      # The in-process server tests run once more with two data shards.
+      - name: cargo test (two data shards)
+        run: cargo test
+        env:
+          LURADB_TEST_SHARDS: "2"
+
   deny:
     name: cargo-deny
     runs-on: self-hosted

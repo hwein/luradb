@@ -852,7 +852,7 @@ mod tests {
             assert_eq!(restored.get(b"order:1").await.unwrap(), GetResult::Present(b"hello".to_vec()));
             assert_eq!(restored.get(b"nulled").await.unwrap(), GetResult::Null);
             assert_eq!(restored.get(b"binary").await.unwrap(), GetResult::Present(binary_value.to_vec()));
-            let (result, expires_at) = restored.get_with_snapshot(b"session", kv_dst.engine().snapshot().snapshot()).await.unwrap();
+            let (result, expires_at) = restored.get_with_snapshot(b"session", kv_dst.engine().snapshot().await.snapshot()).await.unwrap();
             assert_eq!(result, GetResult::Present(b"tok".to_vec()));
             assert!(expires_at > now_secs());
         })
@@ -1050,21 +1050,16 @@ mod tests {
             let json_dst_opt = Some(Arc::clone(&json_dst));
             let control = control_over(&_d3, &kv_dst, &json_dst_opt).await;
 
-            let kv_shutdown = Arc::new(AtomicBool::new(false));
-            let kv_purger = Arc::new(crate::engines::lsm::domain::DomainPurger::new(
-                Arc::clone(&engine2),
-                Arc::clone(&kv_dst),
-                Arc::clone(&kv_shutdown),
-                100,
-                1,
-            ));
-            let json_shutdown = Arc::new(AtomicBool::new(false));
-            let json_purger = Arc::new(JsonDomainPurger::new(Arc::clone(&json_dst), Arc::clone(&json_shutdown), 100, 1));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let kv_purger =
+                Arc::new(crate::engines::lsm::domain::DomainPurger::new(Arc::clone(&engine2), Arc::clone(&kv_dst), 100));
+            let json_purger = Arc::new(JsonDomainPurger::new(Arc::clone(&json_dst), 100));
             let purger_task = compio::runtime::spawn({
                 let kv_purger = Arc::clone(&kv_purger);
                 let json_purger = Arc::clone(&json_purger);
+                let shutdown = Arc::clone(&shutdown);
                 async move {
-                    while !kv_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = kv_purger.purge_tick().await;
                         let _ = json_purger.purge_tick().await;
                         compio::time::sleep(Duration::from_millis(20)).await;
@@ -1086,7 +1081,7 @@ mod tests {
             })
             .await
             .unwrap();
-            json_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
             drop(purger_task);
 
             assert_eq!(outcome.imported, 4, "2 kv pairs + 2 documents");
@@ -1267,13 +1262,8 @@ mod tests {
 
             // Drive the KV purger in the background so replace's delete+wait converges.
             let shutdown = Arc::new(AtomicBool::new(false));
-            let purger = Arc::new(crate::engines::lsm::domain::DomainPurger::new(
-                Arc::clone(&engine2),
-                Arc::clone(&kv_dst),
-                Arc::clone(&shutdown),
-                100,
-                1,
-            ));
+            let purger =
+                Arc::new(crate::engines::lsm::domain::DomainPurger::new(Arc::clone(&engine2), Arc::clone(&kv_dst), 100));
             let purger_task = compio::runtime::spawn({
                 let purger = Arc::clone(&purger);
                 async move {
@@ -1454,13 +1444,8 @@ mod tests {
                 let (engine, kv_dst, dir) = make_kv_registry().await;
                 let control = control_over(&dir, &kv_dst, &None).await;
                 let shutdown = Arc::new(AtomicBool::new(false));
-                let purger = Arc::new(crate::engines::lsm::domain::DomainPurger::new(
-                    Arc::clone(&engine),
-                    Arc::clone(&kv_dst),
-                    Arc::clone(&shutdown),
-                    100,
-                    1,
-                ));
+                let purger =
+                    Arc::new(crate::engines::lsm::domain::DomainPurger::new(Arc::clone(&engine), Arc::clone(&kv_dst), 100));
                 let purger_task = compio::runtime::spawn({
                     let purger = Arc::clone(&purger);
                     async move {
@@ -1819,7 +1804,7 @@ mod tests {
             let control = control_over(&_d3, &kv, &json_dst_opt).await;
 
             let shutdown = Arc::new(AtomicBool::new(false));
-            let purger = Arc::new(JsonDomainPurger::new(Arc::clone(&json_dst), Arc::clone(&shutdown), 100, 1));
+            let purger = Arc::new(JsonDomainPurger::new(Arc::clone(&json_dst), 100));
             let purger_task = compio::runtime::spawn({
                 let purger = Arc::clone(&purger);
                 async move {

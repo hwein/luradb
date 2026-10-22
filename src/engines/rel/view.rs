@@ -26,6 +26,7 @@ use super::lexer;
 use super::parser;
 use super::select::{self, ProjectedColumn};
 use super::RelEngine;
+use crate::engines::lsm::reader::Snapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -53,13 +54,14 @@ pub(super) async fn execute_create_view(
     engine.domains.require_active(domain)?;
     validate_view_subset(&cv.select)?;
     let raw_sql = extract_view_sql(sql, cv.select_offset);
+    let snapshot_guard = engine.engine().snapshot().await;
 
     let view = engine
         .catalog
         .create_view_checked(&engine.domains, domain, &cv.name, &raw_sql, |current| {
             let lookup = map_lookup(current);
             let (flat, _substitutions) = inline(&lookup, &cv.select, 1)?;
-            validate_flat_select_full(engine, domain, &flat)
+            validate_flat_select_full(engine, domain, &flat, snapshot_guard.snapshot())
         })
         .await?;
     engine.metrics.record_rel_ddl_view_op("create_view");
@@ -612,9 +614,14 @@ fn and_opt(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
 /// reusing the exact rel/006/007 binder rel/006/007 execution would use
 /// (spec §3: "building performs all checks") — including, for joins, the
 /// rel/007 index requirement and `max_join_depth`. No engine I/O: no
-/// snapshot read ever happens, `build_join_probe`'s `JoinProbe` is built and
-/// immediately dropped.
-fn validate_flat_select_full(engine: &RelEngine, domain: &str, flat: &Select) -> Result<(), RelStoreError> {
+/// snapshot read ever happens, `build_join_probe`'s `JoinProbe` is built on
+/// `snap` and immediately dropped.
+fn validate_flat_select_full(
+    engine: &RelEngine,
+    domain: &str,
+    flat: &Select,
+    snap: &Snapshot,
+) -> Result<(), RelStoreError> {
     join::check_join_depth(flat.joins.len(), 0, engine.max_join_depth)?;
 
     if flat.joins.is_empty() {
@@ -633,14 +640,12 @@ fn validate_flat_select_full(engine: &RelEngine, domain: &str, flat: &Select) ->
     let offsets = join::flat_offsets(&bindings);
 
     let prefix = engine.domains.require_active(domain)?.system_prefix;
-    let snapshot_guard = engine.engine().snapshot();
-    let snap = snapshot_guard.snapshot().clone();
     let fallback_budget = Arc::new(AtomicU64::new(0));
     // CREATE-time structural bind only (no execution) — masking is a
     // read-time concern, so the default (no-op) mask is correct here.
     let env = join::ProbeEnv {
         prefix: &prefix,
-        snap: &snap,
+        snap,
         fallback_budget: &fallback_budget,
         mask: super::cross_engine::LinkMask::default(),
     };

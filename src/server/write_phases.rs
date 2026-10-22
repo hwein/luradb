@@ -186,7 +186,7 @@ fn thread_cpu() -> HashMap<&'static str, f64> {
         else {
             continue;
         };
-        let groups = ["luradb-engine", "luradb-storage", "luradb-frontend", "luradb-reader"];
+        let groups = ["luradb-shard", "luradb-storage", "luradb-frontend", "luradb-reader"];
         let Some(group) = groups.into_iter().find(|g| comm.trim().starts_with(g)) else { continue };
         // utime and stime, fields 14 and 15, after the parenthesised name.
         let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split_whitespace().collect();
@@ -425,20 +425,20 @@ fn hub_table(set: &str, run: &Run) -> Table {
     Table { title: format!("Storage hub submits, µs — {set}"), head, rows }
 }
 
-/// Thread CPU in percent of one core, and the engine thread as an M/M/1
+/// Thread CPU in percent of one core, and the data shards as an M/M/1
 /// queue: writes/s, CPU per write, load, the queue's mean wait, and the
-/// measured means of the two waits for the engine thread (queue, wake).
+/// measured means of the two waits for a shard thread (queue, wake).
 fn thread_table(set: &str, run: &Run) -> Table {
     let wall = run.wall.as_secs_f64();
     let pct = |group: &str| run.cpu.get(group).copied().unwrap_or(0.0) / wall * 100.0;
     let writes = run.requests.len() as f64;
     let rate = writes / wall;
-    let service = run.cpu.get("luradb-engine").copied().unwrap_or(0.0) / writes;
+    let service = run.cpu.get("luradb-shard").copied().unwrap_or(0.0) / writes;
     let load = rate * service;
     let traced: Vec<[f64; 10]> = run.requests.iter().map(phases).collect();
     let mean_of = |p: usize| mean(&traced.iter().map(|t| t[p]).collect::<Vec<_>>());
     let cells = vec![
-        pct("luradb-engine"),
+        pct("luradb-shard"),
         pct("luradb-storage"),
         pct("luradb-frontend"),
         pct("luradb-reader"),

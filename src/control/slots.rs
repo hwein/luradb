@@ -34,6 +34,36 @@ pub fn shard_of(slot: u16, shards: u16) -> u16 {
     slot % shards
 }
 
+/// Data shard that owns the domain `name` when `shards` shards run.
+pub fn shard_of_domain(name: &str, shards: u16) -> u16 {
+    shard_of(slot_of_domain(name), shards)
+}
+
+/// Metadata keys that carry their domain's name: `<prefix><name>`, the
+/// index keys `<prefix><name>:<field>`.
+const NAMED_KEYS: [&[u8]; 5] =
+    [b"__sys:domain:", b"__sys:json_domain:", b"__sys:index:", b"__sys:rel_domain:", b"__sys:rel_catalog_seq:"];
+
+/// Data keys that carry their domain's FNV-1a hash: `<prefix><hash:016x>:…`.
+const HASHED_KEYS: [&[u8]; 6] = [b"d:", b"DOC:", b"IDX:", b"ROW:", b"SEQ:", b"CAT:"];
+
+/// Data shard that owns `key`, a data or metadata key of a domain in any
+/// engine, when `shards` shards run; `None` for a key of no domain.
+pub fn shard_of_key(key: &[u8], shards: u16) -> Option<u16> {
+    let slot = if let Some(rest) = NAMED_KEYS.iter().find_map(|prefix| key.strip_prefix(*prefix)) {
+        let name = rest.split(|&b| b == b':').next()?;
+        slot_of_domain(std::str::from_utf8(name).ok().filter(|name| !name.is_empty())?)
+    } else {
+        let rest = HASHED_KEYS.iter().find_map(|prefix| key.strip_prefix(*prefix))?;
+        let (hash, separator) = (rest.get(..16)?, rest.get(16)?);
+        if *separator != b':' {
+            return None;
+        }
+        slot_of_prefix(u64::from_str_radix(std::str::from_utf8(hash).ok()?, 16).ok()?)
+    };
+    Some(shard_of(slot, shards))
+}
+
 /// Finds a domain name on data shard `k` of `n`, deterministically from
 /// `seed`, so tests can place domains without any override mechanism.
 #[cfg(test)]
@@ -105,12 +135,56 @@ mod tests {
         assert_eq!([0, 7, 8, 9, 142, 255].map(|s| shard_of(s, 8)), [0, 7, 0, 1, 6, 7]);
     }
 
+    // Every key family of every engine maps to the shard of its domain: by
+    // the name in metadata keys, by the name's hash in data keys.
+    #[test]
+    fn every_key_of_a_domain_belongs_to_the_domain_s_shard() {
+        for n in [1, 2, 3, 8] {
+            for k in 0..n {
+                let name = domain_name_for_shard(k, n, 11);
+                let hash = format!("{:016x}", fnv64(name.as_bytes()));
+                let keys = [
+                    format!("__sys:domain:{name}"),
+                    format!("__sys:json_domain:{name}"),
+                    format!("__sys:index:{name}:address.city"),
+                    format!("__sys:rel_domain:{name}"),
+                    format!("__sys:rel_catalog_seq:{name}"),
+                    format!("d:{hash}:clé"),
+                    format!("DOC:{hash}:doc-1"),
+                    format!("IDX:{hash}:field:"),
+                    format!("ROW:{hash}:\0\0\0\x01:"),
+                    format!("SEQ:{hash}:\0\0\0\x01"),
+                    format!("CAT:{hash}:orders"),
+                ];
+                for key in keys {
+                    assert_eq!(shard_of_key(key.as_bytes(), n), Some(k), "{key} of {name}, {n} shards");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keys_of_no_domain_belong_to_no_shard() {
+        for key in [
+            &b"__sys:auth:user:alice"[..],
+            b"__sys:meta:shards",
+            b"__sys:domain:",
+            b"hub-probe",
+            b"d:not-a-hash-at-all:k",
+            b"d:0123456789abcdef",
+            b"DOC:0123456789abcdefk",
+        ] {
+            assert_eq!(shard_of_key(key, 2), None, "{}", String::from_utf8_lossy(key));
+        }
+    }
+
     #[test]
     fn domain_name_for_shard_finds_a_name_on_every_shard() {
         for n in 1..=8 {
             for k in 0..n {
                 let name = domain_name_for_shard(k, n, 7);
                 assert_eq!(shard_of(slot_of_domain(&name), n), k, "{name} for shard {k} of {n}");
+                assert_eq!(shard_of_domain(&name, n), k, "{name} for shard {k} of {n}");
                 assert_eq!(domain_name_for_shard(k, n, 7), name, "deterministic for one seed");
             }
         }

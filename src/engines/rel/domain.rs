@@ -100,9 +100,9 @@ pub struct RelDomainRegistry {
 }
 
 impl RelDomainRegistry {
-    /// Loads all persisted domains, then creates the default domain if it is
-    /// missing in any state.
-    pub async fn recover(engine: Arc<LsmStorageEngine>) -> anyhow::Result<Self> {
+    /// Loads all persisted domains, then, with `owns_default`, creates the
+    /// default domain if it is missing in any state.
+    pub async fn recover(engine: Arc<LsmStorageEngine>, owns_default: bool) -> anyhow::Result<Self> {
         let keys = engine.scan_keys(SYS_REL_DOMAIN_PREFIX).await?;
         let mut loaded = HashMap::new();
         for key in keys {
@@ -123,6 +123,7 @@ impl RelDomainRegistry {
         // DomainAlreadyExists and abort every boot. The purger (rel/013)
         // finalizes it; the next recover() then recreates it.
         match registry.get_domain_any(DEFAULT_DOMAIN) {
+            None if !owns_default => {}
             None => {
                 registry.create_domain(DEFAULT_DOMAIN).await?;
             }
@@ -256,7 +257,7 @@ mod tests {
             .unwrap(),
         );
         let registry =
-            Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+            Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
         (engine, registry, dir)
     }
 
@@ -353,7 +354,7 @@ mod tests {
             let (engine, registry, _dir) = make_setup().await;
             assert!(registry.get_domain(DEFAULT_DOMAIN).is_some());
 
-            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap();
+            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap();
             assert!(registry2.get_domain(DEFAULT_DOMAIN).is_some());
         })
     }
@@ -420,7 +421,7 @@ mod tests {
             let (engine, registry, _dir) = make_setup().await;
             registry.delete_domain(DEFAULT_DOMAIN).await.unwrap();
 
-            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine))
+            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine), true)
                 .await
                 .expect("recover must survive a Deleting default domain");
             assert!(registry2.get_domain(DEFAULT_DOMAIN).is_none());

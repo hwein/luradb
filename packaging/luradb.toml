@@ -78,19 +78,25 @@ enabled = false
 # Parallel CPU-heavy tasks moved off the request thread: 0 is automatic
 # (cores minus 2, at least 1), otherwise at most the number of cores.
 cpu_offload_threads = 0
-# Threads that accept connections and parse HTTP/TLS in front of the storage
-# engine thread: 0 is automatic (cores / 6, 2 to 4 on hosts with at least 4
-# cores, otherwise 1), otherwise at most the number of cores.
+# Threads that accept connections and parse HTTP/TLS in front of the data
+# shards: 0 is automatic (cores / 6, 2 to 4 on hosts with at least 4 cores,
+# otherwise 1), otherwise at most the number of cores.
 frontend_workers = 0
-# Requests queued for the storage engine thread; when full, connections wait
-# until it catches up. At least 1.
-engine_queue_capacity = 1024
-# Threads that serve read requests next to the storage engine thread: 0 is
-# automatic (cores minus 2 minus the frontend threads, at least 1), otherwise
-# at most the number of cores.
+# Data shards, each a thread with its own storage engines: 0 is automatic (1).
+# Only 1 is accepted for now. The data directory layout depends on it; the
+# server refuses to start when it differs from the count the data was written
+# with.
+shards = 0
+# Requests one data shard takes at once, running or waiting; further requests
+# are answered with 503 and Retry-After: 1. At least 1.
+shard_queue_capacity = 1024
+# Threads that serve read requests next to the data shards: 0 is automatic
+# (cores minus 2, minus the data shards and the frontend threads, at least 1),
+# otherwise at most the number of cores.
 reader_threads = 0
-# Read requests queued for the reader threads; when full, connections wait
-# until they catch up. At least 1.
+# Read requests that may wait for a reader thread; a request beyond that is
+# answered with 503 and Retry-After: 1. Running reads and open streams do not
+# count. At least 1.
 reader_queue_capacity = 4096
 
 [buffer_pool]

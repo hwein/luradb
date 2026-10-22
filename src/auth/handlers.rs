@@ -11,8 +11,8 @@
 //! DELETE /store-api/auth/users/:name/permissions/:domain → remove_permission (204 | 404)
 //! POST   /store-api/auth/users/:name/rotate-key          → rotate_key    (200 | 404)
 
-use crate::auth::middleware::{extract_bearer, split_permission_domain, StoreType, TrustedPeer};
-use crate::auth::{generate_api_key, hash_api_key, AccessLevel, AuthCache, DomainPermission, UserRecord, UserRole};
+use crate::auth::middleware::{split_permission_domain, McpInternal, StoreType, TrustedPeer};
+use crate::auth::{generate_api_key, hash_api_key, now_secs, AccessLevel, AuthCache, DomainPermission, UserRecord, UserRole};
 use crate::control::{AuthChange, ControlPlane, Engine, Lifecycle};
 use crate::engines::json::JsonEngine;
 use crate::engines::rel::RelEngine;
@@ -23,7 +23,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
 #[derive(Clone)]
@@ -146,13 +145,6 @@ fn err(status: StatusCode, msg: &str) -> Response {
     (status, msg.to_string()).into_response()
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[utoipa::path(
     get,
     path = "/store-api/auth/whoami",
@@ -174,6 +166,7 @@ fn now_secs() -> u64 {
 pub async fn whoami(
     State(state): State<AuthState>,
     trusted: Option<Extension<TrustedPeer>>,
+    mcp_internal: Option<Extension<McpInternal>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     if !state.auth_enabled {
@@ -190,14 +183,12 @@ pub async fn whoami(
         })
         .into_response();
     }
-    if let Some(hash) = extract_bearer(&headers) {
-        if let Some(user) = state.cache.get_user_by_key_hash(&hash).await {
-            return Json(WhoamiResponse {
-                name: Some(user.name),
-                role: format!("{:?}", user.role),
-            })
-            .into_response();
-        }
+    if let Some(user) = state.cache.resolve_bearer(&headers, mcp_internal.is_some(), now_secs()).await {
+        return Json(WhoamiResponse {
+            name: Some(user.name),
+            role: format!("{:?}", user.role),
+        })
+        .into_response();
     }
     err(StatusCode::UNAUTHORIZED, "Unauthorized")
 }

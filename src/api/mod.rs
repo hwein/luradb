@@ -268,6 +268,12 @@ pub fn create_router(state: AppState) -> Router {
             "/auth/users/{name}/rotate-key",
             post(crate::auth::handlers::rotate_key),
         )
+        // OAuth state of the MCP listener, for its requests only.
+        .route("/auth/oauth/clients", post(crate::auth::oauth::register_client))
+        .route("/auth/oauth/clients/{id}", get(crate::auth::oauth::get_client))
+        .route("/auth/oauth/codes", post(crate::auth::oauth::issue_code))
+        .route("/auth/oauth/tokens", post(crate::auth::oauth::issue_token))
+        .route("/auth/oauth/revoke", post(crate::auth::oauth::revoke))
         .with_state(auth_state);
 
     let router = Router::new()
@@ -900,6 +906,16 @@ mod router_coverage_tests {
         registered
     }
 
+    /// Routes only the MCP listener reaches (404 for everyone else); they
+    /// are no part of the REST contract.
+    const INTERNAL_ROUTES: &[(&str, &str)] = &[
+        ("post", "/store-api/auth/oauth/clients"),
+        ("get", "/store-api/auth/oauth/clients/{id}"),
+        ("post", "/store-api/auth/oauth/codes"),
+        ("post", "/store-api/auth/oauth/tokens"),
+        ("post", "/store-api/auth/oauth/revoke"),
+    ];
+
     /// The drift gate only guarantees definition == file; a route registered in
     /// `create_router` without a `paths(...)` entry would be silently missing on
     /// both sides. Swagger's runtime routes and the hello route
@@ -907,7 +923,10 @@ mod router_coverage_tests {
     /// live outside `create_router`.
     #[test]
     fn every_registered_route_matches_contract_exactly() {
-        let registered = registered_routes();
+        let mut registered = registered_routes();
+        for (method, path) in INTERNAL_ROUTES {
+            assert!(registered.remove(&(method.to_string(), path.to_string())), "{method} {path} is not registered");
+        }
         let contract = contract_pairs();
         let not_in_contract: Vec<_> = registered.difference(&contract).collect();
         let not_registered: Vec<_> = contract.difference(&registered).collect();
@@ -967,6 +986,7 @@ mod router_coverage_tests {
         ("get", "/store-api/rel/{domain}/tables/{table}/count"),
         ("get", "/store-api/auth/whoami"),
         ("get", "/store-api/auth/users"),
+        ("get", "/store-api/auth/oauth/clients/{id}"),
     ];
 
     /// Routes served by the engine thread.
@@ -1001,6 +1021,10 @@ mod router_coverage_tests {
         ("post", "/store-api/auth/users/{name}/permissions"),
         ("delete", "/store-api/auth/users/{name}/permissions/{domain}"),
         ("post", "/store-api/auth/users/{name}/rotate-key"),
+        ("post", "/store-api/auth/oauth/clients"),
+        ("post", "/store-api/auth/oauth/codes"),
+        ("post", "/store-api/auth/oauth/tokens"),
+        ("post", "/store-api/auth/oauth/revoke"),
     ];
 
     // Every registered route sits in exactly one of the three lists above, and

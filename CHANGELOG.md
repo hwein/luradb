@@ -23,6 +23,7 @@ All notable changes to LuraDB are documented in this file.
 - `luradb --migrate-shards N` changes the shard count of a data directory offline.
 - The server refuses to start on a data directory that another LuraDB process uses.
 - **BREAKING** API: Backups include relational domains (schema, rows, AUTOINCREMENT state); scope accepts `rel` and `rel:<domain>`.
+- Built-in MCP server with OAuth sign-in (opt-in, `[mcp]` config section).
 
 ### Changed
 

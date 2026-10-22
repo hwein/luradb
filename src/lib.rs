@@ -12,6 +12,7 @@ pub mod cors;
 pub mod engines;
 pub mod ipc;
 pub mod logging;
+pub mod mcp;
 pub mod metrics;
 pub mod server;
 pub mod storage;

@@ -78,7 +78,7 @@ const LSM_MIN_VALUE_SIZE_LIMIT: usize = 512 * 1024;
 const MAX_COLUMNS: usize = 128;
 const MAX_INDEXES_PER_TABLE: usize = 16;
 /// Statements longer than this many bytes are rejected before lexing.
-const MAX_STATEMENT_LEN: usize = 64 * 1024;
+pub(crate) const MAX_STATEMENT_LEN: usize = 64 * 1024;
 /// Max bytes per TEXT/KVREF/JSONREF value.
 const MAX_TEXT_LEN: usize = 64 * 1024;
 /// Applied when a SELECT has no explicit LIMIT.

@@ -77,6 +77,8 @@ rand = "0.8"
 hex = "0.4"
 # CSV/TSV parsing for the rel from-file import.
 csv = "1"
+# Model Context Protocol server (Streamable HTTP) behind the MCP listener.
+rmcp = { version = "3.7", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]
 tempfile = "3.10"

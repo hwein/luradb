@@ -33,6 +33,7 @@ pub struct LuraConfig {
     pub events: EventsConfig,
     pub cors: CorsConfig,
     pub multicore: MulticoreConfig,
+    pub mcp: McpConfig,
 }
 
 impl LuraConfig {
@@ -1117,6 +1118,109 @@ fn is_valid_origin_form(origin: &str) -> bool {
         None => true,
         Some(p) => !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
     }
+}
+
+/// The built-in MCP server: its own listener next to the REST API.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Starts the MCP listener.
+    pub enabled: bool,
+    /// Port of the MCP listener, on `server.bind_address`.
+    pub port: u16,
+    /// Hides the tools that write or change structure.
+    pub read_only: bool,
+    /// Offers the tools that create domains, tables, views and indexes;
+    /// only with `read_only = false`.
+    pub allow_ddl: bool,
+    /// Exact `Origin` values (`scheme://host[:port]`) a browser-based MCP
+    /// client may send; a request with any other `Origin` is refused.
+    pub allowed_origins: Vec<String>,
+    /// Lets MCP clients sign in through OAuth with LuraDB as the
+    /// authorization server.
+    pub oauth_enabled: bool,
+    /// Public base URL of the MCP listener, the OAuth issuer.
+    pub public_url: String,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 3100,
+            read_only: true,
+            allow_ddl: false,
+            allowed_origins: Vec::new(),
+            oauth_enabled: false,
+            public_url: String::new(),
+        }
+    }
+}
+
+impl McpConfig {
+    /// Startup validation; a no-op while the listener is off. Returns the
+    /// warnings to log.
+    pub fn validate(&self, server: &ServerConfig, auth: &AuthConfig) -> anyhow::Result<Vec<String>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        // Port 0 binds an ephemeral port and collides with nothing.
+        for (used, active, key) in
+            [(server.port, server.http_enabled, "server.port"), (server.tls_port, server.tls_enabled, "server.tls_port")]
+        {
+            anyhow::ensure!(
+                !active || self.port == 0 || self.port != used,
+                "invalid config: mcp.port ({}) must differ from {key}",
+                self.port
+            );
+        }
+        for origin in &self.allowed_origins {
+            anyhow::ensure!(
+                is_valid_origin_form(origin),
+                "invalid config: mcp.allowed_origins entry '{origin}' is not a valid origin — expected exactly scheme://host[:port] (lowercase, no wildcard)"
+            );
+        }
+        if self.oauth_enabled {
+            anyhow::ensure!(auth.enabled, "invalid config: mcp.oauth_enabled = true requires auth.enabled = true");
+            anyhow::ensure!(
+                !self.public_url.is_empty(),
+                "invalid config: mcp.oauth_enabled = true requires mcp.public_url"
+            );
+            validate_public_url(&self.public_url)?;
+        }
+        let mut warnings = Vec::new();
+        if self.allow_ddl && self.read_only {
+            warnings.push("mcp.allow_ddl has no effect while mcp.read_only is true".to_string());
+        }
+        if !auth.enabled {
+            warnings.push(
+                "mcp.enabled is true and auth.enabled is false — any client that reaches the MCP port has full access"
+                    .to_string(),
+            );
+        }
+        Ok(warnings)
+    }
+}
+
+/// `https://host[:port][/path]`, or `http://` on a loopback host.
+fn validate_public_url(url: &str) -> anyhow::Result<()> {
+    let invalid = || anyhow::anyhow!("invalid config: mcp.public_url '{url}' is not an absolute http(s) URL");
+    let (scheme, rest) = url.split_once("://").ok_or_else(invalid)?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    anyhow::ensure!(
+        matches!(scheme, "https" | "http") && !authority.is_empty() && !url.contains(['?', '#', '@']),
+        invalid()
+    );
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    anyhow::ensure!(!host.is_empty(), invalid());
+    anyhow::ensure!(
+        scheme == "https" || matches!(host, "localhost" | "127.0.0.1" | "::1"),
+        "invalid config: mcp.public_url '{url}' must use https:// unless its host is localhost, 127.0.0.1 or ::1"
+    );
+    Ok(())
 }
 
 /// Sizing of the CPU offload pool behind `core::coop::offload`, of the
@@ -2890,6 +2994,90 @@ flag = true
             config.shm.validate().unwrap();
             config.shm.validate_registration_socket(&config.server).unwrap();
             config.multicore.validate(1).unwrap();
+            config.mcp.validate(&config.server, &config.auth).unwrap();
         }
+    }
+
+    /// An MCP section that passes, with auth on.
+    fn mcp_enabled() -> (McpConfig, ServerConfig, AuthConfig) {
+        let mcp = McpConfig { enabled: true, ..McpConfig::default() };
+        (mcp, ServerConfig::default(), AuthConfig { enabled: true, ..AuthConfig::default() })
+    }
+
+    #[test]
+    fn mcp_defaults_are_off_read_only_on_port_3100() {
+        let mcp = McpConfig::default();
+        assert!(!mcp.enabled && mcp.read_only && !mcp.allow_ddl && !mcp.oauth_enabled);
+        assert_eq!(mcp.port, 3100);
+        assert!(mcp.allowed_origins.is_empty() && mcp.public_url.is_empty());
+        let (mcp, server, auth) = mcp_enabled();
+        assert_eq!(mcp.validate(&server, &auth).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mcp_port_must_differ_from_the_rest_listeners() {
+        let (mut mcp, mut server, auth) = mcp_enabled();
+        mcp.port = server.port;
+        assert!(mcp.validate(&server, &auth).unwrap_err().to_string().contains("server.port"));
+        server.tls_enabled = true;
+        mcp.port = server.tls_port;
+        assert!(mcp.validate(&server, &auth).unwrap_err().to_string().contains("server.tls_port"));
+        server.tls_enabled = false;
+        assert!(mcp.validate(&server, &auth).is_ok(), "the HTTPS port is free while TLS is off");
+        mcp.enabled = false;
+        mcp.port = server.port;
+        assert!(mcp.validate(&server, &auth).is_ok(), "nothing is checked while MCP is off");
+    }
+
+    #[test]
+    fn mcp_allowed_origins_take_exact_origins_only() {
+        let (mut mcp, server, auth) = mcp_enabled();
+        mcp.allowed_origins = vec!["https://app.example.com".into(), "http://localhost:5173".into()];
+        assert!(mcp.validate(&server, &auth).is_ok());
+        for bad in ["*", "https://app.example.com/", "app.example.com", "https://App.example.com"] {
+            mcp.allowed_origins = vec![bad.to_string()];
+            let err = mcp.validate(&server, &auth).unwrap_err().to_string();
+            assert!(err.contains("mcp.allowed_origins"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn mcp_oauth_needs_auth_and_a_public_url() {
+        let (mut mcp, server, mut auth) = mcp_enabled();
+        mcp.oauth_enabled = true;
+        assert!(mcp.validate(&server, &auth).unwrap_err().to_string().contains("mcp.public_url"));
+        mcp.public_url = "https://db.example.com:3100".into();
+        assert!(mcp.validate(&server, &auth).is_ok());
+        auth.enabled = false;
+        assert!(mcp.validate(&server, &auth).unwrap_err().to_string().contains("auth.enabled"));
+    }
+
+    #[test]
+    fn mcp_public_url_needs_https_off_loopback() {
+        let (mut mcp, server, auth) = mcp_enabled();
+        mcp.oauth_enabled = true;
+        for good in ["https://db.example.com", "https://db.example.com:3100/luradb", "http://localhost:3100", "http://127.0.0.1:3100", "http://[::1]:3100"] {
+            mcp.public_url = good.to_string();
+            assert!(mcp.validate(&server, &auth).is_ok(), "{good}");
+        }
+        for bad in ["http://db.example.com:3100", "ftp://db.example.com", "db.example.com", "https://", "https://db.example.com?x=1"] {
+            mcp.public_url = bad.to_string();
+            let err = mcp.validate(&server, &auth).unwrap_err().to_string();
+            assert!(err.contains("mcp.public_url"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn mcp_warns_about_ddl_without_writes_and_about_disabled_auth() {
+        let (mut mcp, server, mut auth) = mcp_enabled();
+        mcp.allow_ddl = true;
+        let warnings = mcp.validate(&server, &auth).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("mcp.allow_ddl"), "{warnings:?}");
+        mcp.read_only = false;
+        assert!(mcp.validate(&server, &auth).unwrap().is_empty());
+        auth.enabled = false;
+        let warnings = mcp.validate(&server, &auth).unwrap();
+        assert!(warnings.len() == 1 && warnings[0].contains("auth.enabled is false"), "{warnings:?}");
     }
 }

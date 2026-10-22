@@ -102,3 +102,19 @@ trusted_proxies = ["127.0.0.1", "::1"]
 enabled = false
 # Exact origins, e.g. ["https://console.example.com", "http://localhost:5173"].
 allowed_origins = []
+
+[mcp]
+# Built-in MCP server on its own port, with the API keys and permissions of the REST API.
+enabled = false
+# Port of the MCP listener; must differ from the REST ports.
+port = 3100
+# Read-only tools only; false also offers the tools that write.
+read_only = true
+# Also offers the tools that create structure; only with read_only = false.
+allow_ddl = false
+# Origins a browser-based MCP client may send.
+allowed_origins = []
+# OAuth sign-in for MCP clients; needs auth.enabled = true and public_url.
+oauth_enabled = false
+# Base URL of the MCP listener as clients reach it; https:// unless the host is loopback.
+public_url = ""

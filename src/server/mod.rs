@@ -8,6 +8,10 @@
 
 mod control;
 mod layout;
+#[cfg(test)]
+mod mcp_oauth_tests;
+#[cfg(test)]
+mod mcp_tests;
 mod migrate;
 mod recovery;
 mod shard;
@@ -52,8 +56,12 @@ pub struct Server;
 pub struct ServerHandle {
     /// Bound address of the plain HTTP listener; `None` when it is disabled.
     pub http_addr: Option<SocketAddr>,
+    /// Bound address of the MCP listener; `None` when it is disabled.
+    pub mcp_addr: Option<SocketAddr>,
     listeners: Listeners,
     frontend: Runtime,
+    /// Runs the MCP listener when it is enabled.
+    mcp: Option<Runtime>,
     reader: Runtime,
     /// Keep the shards' and the control plane's request loops running until
     /// the reader pool is down.
@@ -62,8 +70,9 @@ pub struct ServerHandle {
     control_thread: std::thread::JoinHandle<()>,
 }
 
-/// Running read requests get this long to end on shutdown.
-const READER_SHUTDOWN: Duration = Duration::from_secs(5);
+/// Requests still running on the reader pool or the MCP runtime get this
+/// long to end on shutdown.
+const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(5);
 
 impl Server {
     /// Boots the control-plane thread, which starts the data shards, and,
@@ -78,6 +87,16 @@ impl Server {
             .thread_name("luradb-frontend")
             .enable_all()
             .build()?;
+        let mcp = if config.mcp.enabled {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(crate::mcp::RUNTIME_WORKERS)
+                .thread_name("luradb-mcp")
+                .enable_all()
+                .build()?;
+            Some(runtime)
+        } else {
+            None
+        };
 
         let (control_thread, ready) =
             spawn_control(Arc::clone(&config), config_path.to_path_buf(), auto_shards, frontend.handle().clone())?;
@@ -115,11 +134,14 @@ impl Server {
         reader.spawn(bridge::serve_reader(reader_jobs, pool));
 
         let (shard_lanes, control) = (ready.shards.clone(), ready.control.clone());
-        match frontend.block_on(run_frontend(ready, reader_lane, &config)) {
+        let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle().clone());
+        match frontend.block_on(run_frontend(ready, reader_lane, &config, mcp_handle)) {
             Ok(listeners) => Ok(ServerHandle {
                 http_addr: listeners.http_addr,
+                mcp_addr: listeners.mcp_addr,
                 listeners,
                 frontend,
+                mcp,
                 reader,
                 shards: shard_lanes,
                 control,
@@ -130,7 +152,7 @@ impl Server {
                 // loops end only once the reader pool is down. The frontend
                 // runtime drops after the control-plane thread, whose shards
                 // run inside its handle.
-                reader.shutdown_timeout(READER_SHUTDOWN);
+                reader.shutdown_timeout(RUNTIME_SHUTDOWN);
                 drop((shard_lanes, control));
                 let _ = control_thread.join();
                 Err(e)
@@ -146,16 +168,20 @@ impl ServerHandle {
         self.shutdown()
     }
 
-    /// Stops and drains the listeners, ends the reader pool, and only then
-    /// drops its senders, the last ones: the request loops end after the
-    /// reads, the shards' first. Then joins the control-plane thread once it
-    /// has drained the shards and shut the engines down, and ends the
-    /// frontend runtime last: the shard and control-plane threads run inside
-    /// its handle. Must not be called from within an async context.
+    /// Stops and drains the listeners, ends the MCP runtime and the reader
+    /// pool, and only then drops the pool's senders, the last ones: the
+    /// request loops end after the reads, the shards' first. Then joins the
+    /// control-plane thread once it has drained the shards and shut the
+    /// engines down, and ends the frontend runtime last: the shard and
+    /// control-plane threads run inside its handle. Must not be called from
+    /// within an async context.
     pub fn shutdown(self) -> anyhow::Result<()> {
-        let ServerHandle { listeners, frontend, reader, shards, control, control_thread, .. } = self;
+        let ServerHandle { listeners, frontend, mcp, reader, shards, control, control_thread, .. } = self;
         frontend.block_on(listeners.stop());
-        reader.shutdown_timeout(READER_SHUTDOWN);
+        if let Some(mcp) = mcp {
+            mcp.shutdown_timeout(RUNTIME_SHUTDOWN);
+        }
+        reader.shutdown_timeout(RUNTIME_SHUTDOWN);
         drop(shards);
         drop(control);
         let joined = control_thread.join();
@@ -359,6 +385,7 @@ pub(crate) async fn serve_connection<I, F>(
 /// The running accept loops, stopped together by [`Listeners::stop`].
 struct Listeners {
     http_addr: Option<SocketAddr>,
+    mcp_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     uds_path: Option<String>,
@@ -380,12 +407,27 @@ impl Listeners {
 
 /// Binds every enabled listener, then serves the frontend router on them;
 /// `reader` leads to the reader pool, point reads stay on the frontend
-/// unless they would touch the disk. Nothing is spawned before all binds
-/// succeeded.
+/// unless they would touch the disk. With `mcp`, the MCP listener runs there
+/// with a bridge of its own that sends every read to the reader pool: a
+/// read waiting for the disk would hold up its one worker. Nothing is
+/// spawned before all binds succeeded.
 #[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
-async fn run_frontend(ready: Ready, reader: Lane, config: &LuraConfig) -> anyhow::Result<Listeners> {
+async fn run_frontend(
+    ready: Ready,
+    reader: Lane,
+    config: &LuraConfig,
+    mcp: Option<tokio::runtime::Handle>,
+) -> anyhow::Result<Listeners> {
     let Ready { shards, control, states, trusted_cidrs } = ready;
     let auth_cache = Arc::clone(&states[0].auth_cache);
+    let mcp_internal = mcp.is_some().then(|| {
+        let bridge = ShardRouter::new(shards.iter().cloned().map(EngineDispatch::Engine).collect())
+            .with_control(EngineDispatch::Control(control.clone()))
+            .with_reader(reader.clone());
+        let auth = config.auth.enabled.then(|| Arc::clone(&auth_cache));
+        let internal = api::frontend_layers(Router::new().fallback_service(bridge), auth, Arc::clone(&trusted_cidrs));
+        (internal, Arc::clone(&trusted_cidrs))
+    });
     let ship = ShardRouter::new(shards.into_iter().map(EngineDispatch::Engine).collect())
         .with_control(EngineDispatch::Control(control))
         .with_reader(reader)
@@ -414,9 +456,31 @@ async fn run_frontend(ready: Ready, reader: Lane, config: &LuraConfig) -> anyhow
         tracing::info!("HTTP listener disabled by config (server.http_enabled = false).");
         None
     };
+    // Bound here, registered on the MCP runtime once its loop runs there.
+    let mcp_listener = match &mcp {
+        Some(_) => {
+            let listener = std::net::TcpListener::bind(SocketAddr::from((bind, config.mcp.port)))?;
+            listener.set_nonblocking(true)?;
+            Some(listener)
+        }
+        None => None,
+    };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = Vec::new();
+    let mut mcp_addr = None;
+    if let (Some(runtime), Some(listener), Some((internal, cidrs))) = (mcp, mcp_listener, mcp_internal) {
+        let addr = listener.local_addr()?;
+        let acceptor = tls_listener.as_ref().map(|(_, acceptor)| acceptor.clone());
+        let scheme = if acceptor.is_some() { "https" } else { "http" };
+        tracing::info!("MCP listening on {scheme}://{addr}/mcp");
+        mcp_addr = Some(addr);
+        let app = {
+            let _mcp = runtime.enter();
+            crate::mcp::router(config, internal, cidrs, shutdown_rx.clone())
+        };
+        tasks.push(runtime.spawn(serve_mcp(listener, acceptor, app, shutdown_rx.clone())));
+    }
     if let Some((listener, path)) = uds_listener {
         tracing::info!("UDS listener active on {}", path);
         let trusted_uids = Arc::new(config.auth.trusted_uids.clone());
@@ -440,7 +504,27 @@ async fn run_frontend(ready: Ready, reader: Lane, config: &LuraConfig) -> anyhow
         tasks.push(tokio::spawn(serve_http(listener, app, shutdown_rx)));
     }
 
-    Ok(Listeners { http_addr, shutdown_tx, tasks, uds_path: config.server.unix_socket_path.clone() })
+    Ok(Listeners { http_addr, mcp_addr, shutdown_tx, tasks, uds_path: config.server.unix_socket_path.clone() })
+}
+
+/// The MCP listener's accept loop, HTTPS with `acceptor`, on the MCP runtime.
+async fn serve_mcp(
+    listener: std::net::TcpListener,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    app: Router,
+    shutdown: watch::Receiver<bool>,
+) {
+    let listener = match TcpListener::from_std(listener) {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("[mcp] listener failed: {e}");
+            return;
+        }
+    };
+    match acceptor {
+        Some(acceptor) => tls::serve_tls(listener, acceptor, app, shutdown).await,
+        None => serve_http(listener, app, shutdown).await,
+    }
 }
 
 /// Plain HTTP accept loop, same pattern as `tls::serve_tls` minus the

@@ -78,6 +78,7 @@ fn main() -> anyhow::Result<()> {
     config.rel.validate()?;
     config.shm.validate_registration_socket(&config.server)?;
     config.multicore.validate(coop::available_cores())?;
+    let mcp_warnings = config.mcp.validate(&config.server, &config.auth)?;
     let _log_guard = logging::init_logging(&config.log)?;
 
     if let Some(shards) = cli.migrate_shards {
@@ -103,6 +104,9 @@ fn main() -> anyhow::Result<()> {
             "auth.enabled is false — the server is unauthenticated. Allowed only because server.bind_address ({}) is loopback-only.",
             config.server.bind_address
         );
+    }
+    for warning in &mcp_warnings {
+        tracing::warn!("{warning}");
     }
 
     Server::start(config, &config_path)?.run_until(shutdown_signal())

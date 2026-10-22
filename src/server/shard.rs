@@ -245,21 +245,21 @@ async fn init_io_engine(cfg: &LuraConfig, wal_path: &Path, vlog_path: &Path) -> 
     }
 }
 
-/// The shard's purgers and sweepers: each a task that runs a tick, then
-/// sleeps its interval, until [`Loops::stop`].
-struct Loops {
+/// Purgers and sweepers of a shard or the control plane: each a task that
+/// runs a tick, then sleeps its interval, until [`Loops::stop`].
+pub(super) struct Loops {
     /// Dropped to wake every loop out of its sleep.
     stop: watch::Sender<()>,
     tasks: Vec<compio::runtime::JoinHandle<()>>,
 }
 
 impl Loops {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self { stop: watch::channel(()).0, tasks: Vec::new() }
     }
 
     /// Runs `tick` every `interval`; a failed tick is logged.
-    fn spawn<F, Fut>(&mut self, name: &'static str, interval: Duration, tick: F)
+    pub(super) fn spawn<F, Fut>(&mut self, name: &'static str, interval: Duration, tick: F)
     where
         F: Fn() -> Fut + 'static,
         Fut: Future<Output = anyhow::Result<()>> + 'static,
@@ -279,7 +279,7 @@ impl Loops {
     }
 
     /// Returns once every loop has ended the tick it was in.
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         drop(self.stop);
         for task in self.tasks {
             let _ = task.await;

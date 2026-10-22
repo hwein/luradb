@@ -18,6 +18,13 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug)]
 pub struct TrustedPeer;
 
+/// Marker the MCP listener sets on the internal requests it builds for its
+/// tools, resources and OAuth endpoints; no network request carries it. Only
+/// such requests may use an OAuth access token or reach the internal OAuth
+/// routes.
+#[derive(Clone, Copy, Debug)]
+pub struct McpInternal;
+
 /// Store type of a domain-scoped request — KV, JSON and rel domains are
 /// separate permission namespaces.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -167,18 +174,21 @@ pub async fn auth_layer(
         return next.run(request).await;
     }
 
+    // The MCP listener's OAuth state: its client registrations and code
+    // exchanges carry no user key, and for every other caller the routes
+    // do not exist.
+    let mcp_internal = request.extensions().get::<McpInternal>().is_some();
+    if path.starts_with("/store-api/auth/oauth/") {
+        return if mcp_internal { next.run(request).await } else { StatusCode::NOT_FOUND.into_response() };
+    }
+
     // UDS peers with a trusted UID are authenticated by the kernel.
     if request.extensions().get::<TrustedPeer>().is_some() {
         request.extensions_mut().insert(AuthOutcome::Full);
         return next.run(request).await;
     }
 
-    let hash = match extract_bearer(request.headers()) {
-        Some(h) => h,
-        None => return unauthorized(),
-    };
-
-    let user = match cache.get_user_by_key_hash(&hash).await {
+    let user = match cache.resolve_bearer(request.headers(), mcp_internal, crate::auth::now_secs()).await {
         Some(u) => u,
         None => return unauthorized(),
     };
@@ -271,13 +281,13 @@ pub async fn docs_auth_layer(
 }
 
 pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?;
-    let s = value.to_str().ok()?;
-    let token = s.strip_prefix("Bearer ")?;
-    if token.is_empty() {
-        return None;
-    }
-    Some(crate::auth::hash_api_key(token))
+    bearer_token(headers).map(crate::auth::hash_api_key)
+}
+
+/// The Bearer credential of `headers`, if any.
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
+    (!token.is_empty()).then_some(token)
 }
 
 #[cfg(test)]

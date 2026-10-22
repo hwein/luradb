@@ -3,9 +3,12 @@
 //! System keys layout:
 //!   __sys:auth:user:<name>          → serialised UserRecord (JSON)
 //!   __sys:auth:perm:<name>:<domain> → serialised DomainPermission (JSON)
+//!   __sys:oauth:client:<id>         → serialised OAuthClient (JSON)
+//!   __sys:oauth:token:<hash>        → serialised TokenRecord (JSON), with a TTL
 
 pub mod handlers;
 pub mod middleware;
+pub mod oauth;
 
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::StorageEngine;
@@ -43,7 +46,7 @@ pub fn hash_api_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -87,14 +90,21 @@ pub struct AuthCache {
     users: RwLock<HashMap<String, UserRecord>>,
     /// (username, domain_name) → AccessLevel
     permissions: RwLock<HashMap<(String, String), AccessLevel>>,
+    /// OAuth clients and tokens of the MCP listener.
+    oauth: RwLock<oauth::OAuthState>,
+    /// Access tokens count only with the MCP listener and its OAuth on;
+    /// otherwise the OAuth state is not even loaded.
+    oauth_enabled: bool,
     engine: Arc<LsmStorageEngine>,
 }
 
 impl AuthCache {
-    pub fn new(engine: Arc<LsmStorageEngine>) -> Self {
+    pub fn new(engine: Arc<LsmStorageEngine>, oauth_enabled: bool) -> Self {
         Self {
             users: RwLock::new(HashMap::new()),
             permissions: RwLock::new(HashMap::new()),
+            oauth: RwLock::new(oauth::OAuthState::default()),
+            oauth_enabled,
             engine,
         }
     }
@@ -133,8 +143,11 @@ impl AuthCache {
             }
         }
 
+        let new_oauth = if self.oauth_enabled { oauth::load(&self.engine).await? } else { oauth::OAuthState::default() };
+
         *self.users.write().await = new_users;
         *self.permissions.write().await = new_perms;
+        *self.oauth.write().await = new_oauth;
 
         Ok(())
     }
@@ -374,7 +387,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        (AuthCache::new(engine), dir)
+        (AuthCache::new(engine, false), dir)
     }
 
     /// A user record overwritten by name with a different api_key_hash —

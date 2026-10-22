@@ -30,6 +30,7 @@ use crate::{
         domain::DomainConfig,
         engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine},
         janitor::JanitorConfig,
+        TtlSweeper,
     },
     engines::rel::RelEngine,
     ipc::{self, ShmManager},
@@ -96,6 +97,8 @@ struct Cluster {
     /// Each enabled engine's write-ahead log.
     wals: Vec<(Engine, WriteAheadLog)>,
     system_store: Arc<LsmStorageEngine>,
+    /// Removes the expired OAuth codes and tokens from the system store.
+    system_loops: shard::Loops,
     shm_manager: Option<Arc<ShmManager>>,
     shm: Option<ShmServices>,
     storage_thread: StorageThread,
@@ -106,16 +109,19 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// Stops shared memory, then drains every shard — the shard's requests
-    /// end first — and truncates the write-ahead log of each engine whose
-    /// final flush succeeded on all shards; then shuts the system store
+    /// Stops the system store's sweeper and shared memory, then drains every
+    /// shard — the shard's requests end first — and truncates the
+    /// write-ahead log of each engine whose final flush succeeded on all
+    /// shards; then shuts the system store
     /// down, stops the storage hub, once, joins the shard threads and only
     /// then lets go of the data directories.
     async fn shutdown(self) {
         #[cfg(test)]
         let system_dir = self.system_dir.clone();
-        let Cluster { shards, loops, wals, system_store, shm_manager, shm, mut storage_thread, lock, .. } = self;
+        let Cluster { shards, loops, wals, system_store, system_loops, shm_manager, shm, mut storage_thread, lock, .. } =
+            self;
         loops.store(true, Ordering::Relaxed);
+        system_loops.stop().await;
 
         // The publisher and the dispatcher take cuts and write through the
         // shards: both end before the shards drain.
@@ -367,11 +373,21 @@ async fn bootstrap(
         let _ = start.send(ShardStart { state: state.clone(), started });
         reports.push(report);
     }
+    let mut system_loops = shard::Loops::new();
+    if config.mcp.enabled && config.mcp.oauth_enabled && config.ttl_sweeper.enabled {
+        let sweeper = Arc::new(TtlSweeper::new(Arc::clone(&system_store), config.ttl_sweeper.batch_size));
+        let interval = std::time::Duration::from_secs(config.ttl_sweeper.interval_secs);
+        system_loops.spawn("SystemTtlSweeper", interval, move || {
+            let sweeper = Arc::clone(&sweeper);
+            async move { sweeper.sweep_tick().await }
+        });
+    }
     let mut cluster = Cluster {
         shards: threads,
         loops,
         wals,
         system_store,
+        system_loops,
         shm_manager,
         shm: None,
         storage_thread,
@@ -424,7 +440,8 @@ async fn prepare_control(
     system::migrate_auth(owners[0].kv.engine(), system_store).await?;
 
     // The auth cache on the system store, after the auth move above.
-    let auth_cache = Arc::new(AuthCache::new(Arc::clone(system_store)));
+    let oauth_enabled = config.mcp.enabled && config.mcp.oauth_enabled;
+    let auth_cache = Arc::new(AuthCache::new(Arc::clone(system_store), oauth_enabled));
     auth_cache.load_from_engine().await?;
     reconcile_admins(&auth_cache, &config.auth.admins, config.auth.enabled).await?;
     tracing::info!("Auth cache loaded.");

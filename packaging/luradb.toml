@@ -281,6 +281,30 @@ enabled = false
 # Exact origins, e.g. ["https://console.example.com", "http://localhost:5173"].
 allowed_origins = []
 
+# Built-in MCP server for AI assistants and agents, on its own port. It uses
+# the same API keys and permissions as the REST API.
+[mcp]
+# Starts the MCP listener. Off by default.
+enabled = false
+# Port of the MCP listener on server.bind_address; must differ from the REST ports.
+port = 3100
+# Offers only the tools that read; set to false to also offer the tools that
+# write keys, documents and rows.
+read_only = true
+# Also offers the tools that create domains, tables, views and indexes; only
+# with read_only = false. No tool deletes a domain, table, view or index.
+allow_ddl = false
+# Origins a browser-based MCP client may send, e.g. ["https://app.example.com"].
+# A request with any other Origin header is refused; requests without one pass.
+allowed_origins = []
+# Lets MCP clients that only support OAuth sign in once on a LuraDB page with
+# their API key. Needs auth.enabled = true and public_url.
+oauth_enabled = false
+# Public base URL of the MCP listener as clients reach it, e.g.
+# "https://db.example.com:3100" or the address of a reverse proxy; https:// is
+# required unless the host is localhost, 127.0.0.1 or ::1.
+public_url = ""
+
 # Shared-memory read path for local clients.
 [shm]
 # Publishes read snapshots in shared memory.

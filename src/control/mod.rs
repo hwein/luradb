@@ -7,6 +7,7 @@
 pub mod slots;
 pub mod system;
 
+use crate::auth::oauth::{OAuthClient, RedeemCode, Refresh, TokenRecord};
 use crate::auth::{AuthCache, DomainPermission, UserRecord};
 use crate::core::events::GlobalEventBus;
 use crate::engines::json::{JsonDomain, JsonDomainState, JsonEngine, JsonStoreError};
@@ -187,6 +188,11 @@ pub enum AuthChange {
     RotateKey { name: String, new_hash: String },
     SetPermission(DomainPermission),
     RemovePermission { username: String, domain: String },
+    RegisterClient(OAuthClient),
+    IssueCode { hash: String, record: TokenRecord, now: u64 },
+    RedeemCode(RedeemCode),
+    Refresh(Refresh),
+    RevokeToken { hash: String },
 }
 
 enum Command {
@@ -759,6 +765,11 @@ impl Worker {
             AuthChange::RotateKey { name, new_hash } => auth.rotate_key(&name, &new_hash).await,
             AuthChange::SetPermission(perm) => auth.set_permission(perm).await,
             AuthChange::RemovePermission { username, domain } => auth.remove_permission(&username, &domain).await,
+            AuthChange::RegisterClient(client) => auth.register_client(client).await,
+            AuthChange::IssueCode { hash, record, now } => auth.issue_code(hash, record, now).await,
+            AuthChange::RedeemCode(redeem) => auth.redeem_code(redeem).await,
+            AuthChange::Refresh(refresh) => auth.refresh(refresh).await,
+            AuthChange::RevokeToken { hash } => auth.revoke_token(&hash).await,
         }
     }
 }
@@ -807,7 +818,7 @@ pub(crate) mod testing {
         bus: Arc<GlobalEventBus>,
     ) -> (Arc<ControlPlane>, Arc<AuthCache>) {
         let system = system::open(&dir.join("sys")).await.unwrap();
-        let auth = Arc::new(AuthCache::new(Arc::clone(&system)));
+        let auth = Arc::new(AuthCache::new(Arc::clone(&system), false));
         let owners = Owners { shards, auth: Arc::clone(&auth) };
         (ControlPlane::start(owners, system, bus).await.unwrap(), auth)
     }

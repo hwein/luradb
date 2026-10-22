@@ -1,8 +1,8 @@
-//! Shared infrastructure for resumable SSE streams (spec kv/024): a
-//! per-process stream epoch and a sequenced replay ring. Generic over the
-//! event type `T` so a second stream source (spec general/018) can reuse it
-//! with its own tag and its own `SeqRing` instance — sequences are per
-//! stream source, never shared across two `SeqRing`s.
+//! Shared infrastructure for resumable SSE streams: a stream epoch per data
+//! shard and a sequenced replay ring. Generic over the event type `T` so
+//! every stream source can reuse it with its own tag and its own `SeqRing`
+//! instance — sequences are per stream source, never shared across two
+//! `SeqRing`s.
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -10,11 +10,18 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tokio::sync::broadcast;
 
-/// Per-process stream epoch. Random, not clock-based: a restart within the
-/// same second (or a clock that went backwards) must never reuse an epoch.
-pub fn stream_epoch() -> u64 {
-    static EPOCH: OnceLock<u64> = OnceLock::new();
-    *EPOCH.get_or_init(rand::random::<u64>)
+/// The shard ID in the epoch of the control plane's streams.
+pub const CONTROL_PLANE_SHARD: u16 = 0xFFFF;
+
+/// Stream epoch of the streams of data shard `shard`, or of the control
+/// plane's with [`CONTROL_PLANE_SHARD`]: the process's boot epoch in the
+/// upper 48 bits, `shard` in the lower 16, so a cursor of one shard never
+/// passes on another. The boot epoch is random, not clock-based: a restart
+/// within the same second (or a clock that went backwards) must never reuse
+/// an epoch.
+pub fn stream_epoch(shard: u16) -> u64 {
+    static BOOT: OnceLock<u64> = OnceLock::new();
+    (*BOOT.get_or_init(rand::random::<u64>) & !0xFFFF) | u64::from(shard)
 }
 
 /// Parses `<tag>-<epoch:016x>-<seq>`, verifying `tag` matches `expected_tag`
@@ -242,11 +249,11 @@ impl GlobalEventBus {
         self.log.head()
     }
 
-    /// Full resume decision for `GET /store-api/events` (spec §5): parses
-    /// and validates against `EVENTS_TAG`/the process epoch, then defers to
-    /// the replay ring.
+    /// Full resume decision for `GET /store-api/events`: parses and
+    /// validates against `EVENTS_TAG`/the control plane's epoch, then defers
+    /// to the replay ring.
     pub fn decide_resume(&self, raw_id: Option<&str>) -> Resume<GlobalEvent> {
-        self.log.decide_resume(raw_id, EVENTS_TAG, stream_epoch())
+        self.log.decide_resume(raw_id, EVENTS_TAG, stream_epoch(CONTROL_PLANE_SHARD))
     }
 
     /// Publishes one event, filling `seq`/`ts` and delegating to
@@ -290,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_stream_epoch_is_stable_within_process() {
-        assert_eq!(stream_epoch(), stream_epoch());
+        assert_eq!(stream_epoch(0), stream_epoch(0));
     }
 
     #[test]
@@ -422,8 +429,8 @@ mod tests {
     fn test_decide_resume_wrong_tag_is_unknown_id() {
         let (ring, tx) = ring_of(10);
         ring.publish(&tx, |seq| seq as u32);
-        let id = format_event_id("g", stream_epoch(), 1);
-        match ring.decide_resume(Some(&id), "w", stream_epoch()) {
+        let id = format_event_id("g", stream_epoch(0), 1);
+        match ring.decide_resume(Some(&id), "w", stream_epoch(0)) {
             Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
             _ => panic!("expected unknown_id for a foreign tag"),
         }
@@ -510,7 +517,7 @@ mod tests {
     fn test_global_event_bus_decide_resume_rejects_foreign_tag() {
         let bus = GlobalEventBus::new(16, 16);
         bus.publish("kv", "domain_created", "sales", None);
-        let foreign = format_event_id("w", stream_epoch(), 1);
+        let foreign = format_event_id("w", stream_epoch(CONTROL_PLANE_SHARD), 1);
         match bus.decide_resume(Some(&foreign)) {
             Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
             _ => panic!("expected unknown_id for a foreign tag"),

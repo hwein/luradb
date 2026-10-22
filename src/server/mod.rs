@@ -68,22 +68,23 @@ impl Server {
     /// the frontend runtime. A failed step stops what already runs.
     pub fn start(config: Arc<LuraConfig>, config_path: &Path) -> anyhow::Result<ServerHandle> {
         let cores = coop::available_cores();
-        let workers = frontend_workers(config.multicore.frontend_workers, cores);
+        let (workers, auto_shards, _) = core_split(&config, cores);
         let frontend = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .max_blocking_threads(coop::permit_count(config.multicore.cpu_offload_threads, cores))
             .thread_name("luradb-frontend")
             .enable_all()
             .build()?;
-        let shards = config.multicore.shard_count();
-        tracing::info!(
-            "Frontend runtime: {workers} workers; data shards: {shards}; shard queue capacity: {}",
-            config.multicore.shard_queue_capacity
-        );
 
         let (control_thread, ready) =
-            spawn_control(Arc::clone(&config), config_path.to_path_buf(), frontend.handle().clone())?;
-        let readers = reader_threads(config.multicore.reader_threads, cores, workers, usize::from(shards));
+            spawn_control(Arc::clone(&config), config_path.to_path_buf(), auto_shards, frontend.handle().clone())?;
+        let shards = ready.shards.len();
+        let readers = reader_threads(config.multicore.reader_threads, cores, workers, shards);
+        tracing::info!(
+            "{cores} cores: {workers} frontend workers, {shards} data shards, {readers} reader threads; \
+             shard queue capacity: {}",
+            config.multicore.shard_queue_capacity
+        );
         let reader = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(readers)
             .thread_name("luradb-reader")
@@ -100,7 +101,7 @@ impl Server {
             }
         };
         let capacity = config.multicore.reader_queue_capacity;
-        tracing::info!("Reader pool: {readers} workers; queue capacity: {capacity}");
+        tracing::info!("Reader pool queue capacity: {capacity}");
         let (reader_lane, reader_jobs) = Lane::new(capacity);
         let pool = ready
             .states
@@ -172,6 +173,18 @@ fn frontend_workers(configured: usize, cores: usize) -> usize {
     }
 }
 
+/// Data shards: `configured`, or with `0` a quarter of the cores, 1 to 8 —
+/// 1 while shared memory is enabled, which serves a single shard.
+fn data_shards(configured: u16, cores: usize, shm_enabled: bool) -> u16 {
+    if configured > 0 {
+        configured
+    } else if shm_enabled {
+        1
+    } else {
+        (cores / 4).clamp(1, 8) as u16
+    }
+}
+
 /// Worker threads of the reader pool: `configured`, or with `0` the cores
 /// left after two, the `shards` and the `frontend` workers, at least 1.
 fn reader_threads(configured: usize, cores: usize, frontend: usize, shards: usize) -> usize {
@@ -180,6 +193,15 @@ fn reader_threads(configured: usize, cores: usize, frontend: usize, shards: usiz
     } else {
         cores.saturating_sub(2 + frontend + shards).max(1)
     }
+}
+
+/// Frontend workers, data shards and reader threads on `cores` for a new
+/// data directory: as configured, `0` resolved automatically.
+fn core_split(config: &LuraConfig, cores: usize) -> (usize, u16, usize) {
+    let multicore = &config.multicore;
+    let frontend = frontend_workers(multicore.frontend_workers, cores);
+    let shards = data_shards(multicore.shards, cores, config.shm.enabled);
+    (frontend, shards, reader_threads(multicore.reader_threads, cores, frontend, usize::from(shards)))
 }
 
 /// Wakes from other threads a shard's or the control plane's runtime has room
@@ -193,19 +215,23 @@ fn remote_wakes(config: &LuraConfig) -> usize {
         + engine_runtime::DEFAULT_REMOTE_WAKES
 }
 
-/// Starts the control-plane thread and waits until it reports every shard
-/// ready. The thread enters `frontend`'s handle for its whole life:
-/// `coop::offload`, `tokio::fs` and the IPC sockets need a tokio context.
+/// Starts the control-plane thread and waits until it reports every data
+/// shard ready — `auto_shards` of them for a new data directory. The thread
+/// enters `frontend`'s handle for its whole life: `coop::offload`,
+/// `tokio::fs` and the IPC sockets need a tokio context.
 fn spawn_control(
     config: Arc<LuraConfig>,
     config_path: PathBuf,
+    auto_shards: u16,
     frontend: tokio::runtime::Handle,
 ) -> anyhow::Result<(std::thread::JoinHandle<()>, Ready)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new().name("luradb-control".to_string()).spawn(move || {
         let _frontend = frontend.enter();
         match engine_runtime::build(remote_wakes(&config)) {
-            Ok(rt) => engine_runtime::run(&rt, control::run(config, config_path, frontend.clone(), ready_tx)),
+            Ok(rt) => {
+                engine_runtime::run(&rt, control::run(config, config_path, auto_shards, frontend.clone(), ready_tx))
+            }
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
             }
@@ -484,6 +510,21 @@ pub(crate) mod test_hook {
     /// The events of the server on `system_dir`, in order.
     pub(crate) fn recorded(system_dir: &str) -> Vec<String> {
         events().lock().unwrap().get(system_dir).cloned().unwrap_or_default()
+    }
+
+    fn silent() -> &'static Mutex<Vec<(String, usize)>> {
+        static SILENT: OnceLock<Mutex<Vec<(String, usize)>>> = OnceLock::new();
+        SILENT.get_or_init(Default::default)
+    }
+
+    /// Data shard `shard` of the server on `system_dir`, started after this
+    /// call, leaves the pings of the control plane unanswered.
+    pub(crate) fn silence_pings(system_dir: &str, shard: usize) {
+        silent().lock().unwrap().push((system_dir.to_string(), shard));
+    }
+
+    pub(crate) fn pings_silenced(system_dir: &str, shard: usize) -> bool {
+        silent().lock().unwrap().iter().any(|(dir, k)| dir == system_dir && *k == shard)
     }
 }
 
@@ -1055,6 +1096,22 @@ mod tests {
         assert!(!layout::shard_dir(Path::new(&cfg.storage.sstable_dir), 0).exists(), "nothing moved");
     }
 
+    // With `shards = 0`, an older data directory starts with the one shard it
+    // was written with, whatever the host's cores.
+    #[test]
+    fn an_older_data_directory_starts_with_one_shard_on_auto() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        legacy_data_directory(&cfg, b"kept");
+        cfg.multicore.shards = 0;
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let (status, value) =
+            tokio::runtime::Runtime::new().unwrap().block_on(request(addr, &get("/store-api/kv/default/keys/kept")));
+        server.shutdown().unwrap();
+        assert_eq!((status, value.as_slice()), (200, "clé".as_bytes()));
+    }
+
     // Data laid out for another shard count is not opened at all.
     #[test]
     fn a_start_with_a_changed_shard_count_is_refused() {
@@ -1357,7 +1414,27 @@ mod tests {
         });
     }
 
-    // ── Reader pool (spec perf/018b) ─────────────────────────────────────────
+    // Automatic split: the frontend workers, a quarter of the cores as data
+    // shards, 1 to 8, and the reader threads from what is left.
+    #[test]
+    fn core_split_resolves_auto_from_the_core_count() {
+        let auto = LuraConfig::default();
+        let split = [2, 3, 4, 8, 12, 32, 64].map(|cores| core_split(&auto, cores));
+        assert_eq!(split, [(1, 1, 1), (1, 1, 1), (2, 1, 1), (2, 2, 2), (2, 3, 5), (4, 8, 18), (4, 8, 50)]);
+    }
+
+    // Configured values stand; shared memory keeps auto at one data shard.
+    #[test]
+    fn core_split_keeps_configured_values_and_one_shard_with_shm() {
+        let mut config = LuraConfig::default();
+        config.shm.enabled = true;
+        assert_eq!(core_split(&config, 32), (4, 1, 25));
+        config.shm.enabled = false;
+        config.multicore.shards = 3;
+        config.multicore.frontend_workers = 1;
+        config.multicore.reader_threads = 2;
+        assert_eq!(core_split(&config, 32), (1, 3, 2));
+    }
 
     #[test]
     fn reader_threads_auto_and_explicit() {
@@ -1651,6 +1728,190 @@ mod tests {
                 }
             },
         );
+    }
+
+    /// The sorted keys of a JSON object.
+    fn keys_of(value: &Value) -> Vec<String> {
+        let mut keys: Vec<_> = value.as_object().unwrap_or_else(|| panic!("not an object: {value}")).keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    // Writes on domains of both shards: the scrape sums them exactly — the
+    // lifetime counter at once, the engine and domain windows once the
+    // shards' tickers have committed their second — in the shape a scrape
+    // of one shard has.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn metrics_sum_the_writes_of_every_shard() {
+        use crate::control::slots::domain_name_for_shard;
+        let names = [domain_name_for_shard(0, 2, 31), domain_name_for_shard(1, 2, 31)];
+        with_tuned_server(
+            |cfg| cfg.multicore.shards = 2,
+            |addr| async move {
+                for (shard, name) in names.iter().enumerate() {
+                    let create = json!({ "name": name }).to_string();
+                    assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
+                    for i in 0..=shard {
+                        let put = with_body("PUT", &format!("/store-api/kv/{name}/keys/k{i}"), "clé");
+                        assert_eq!(request(addr, &put).await.0, 200);
+                    }
+                }
+                let scrape = || async {
+                    let (status, body) = request(addr, &get("/store-api/metrics")).await;
+                    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+                    serde_json::from_slice::<Value>(&body).unwrap()
+                };
+                let mut body = scrape().await;
+                assert_eq!(body["system"]["total_writes"], 3, "{body}");
+                for _ in 0..500 {
+                    if body["engines"]["kv"]["write_ops"].as_u64().unwrap() >= 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    body = scrape().await;
+                }
+                assert_eq!(body["engines"]["kv"]["write_ops"], 3, "{body}");
+                assert_eq!(body["engines"]["kv"]["window_secs"], 60, "{body}");
+                for (shard, name) in names.iter().enumerate() {
+                    let domain = body["domains"].as_array().unwrap().iter().find(|d| d["domain"] == json!(name));
+                    assert_eq!(domain.expect("a domain of each shard")["write_ops"], shard + 1, "{body}");
+                }
+
+                let shape = [
+                    ("", vec!["backup", "block_cache", "domains", "engines", "shm", "system"]),
+                    ("/system", vec!["compaction_runs", "janitor_runs", "memtable_size_bytes", "total_reads", "total_writes"]),
+                    ("/engines", vec!["json", "kv", "rel"]),
+                    ("/engines/kv", vec![
+                        "read_latency_us_p50", "read_latency_us_p95", "read_latency_us_p99", "read_ops", "window_secs",
+                        "write_latency_us_p50", "write_latency_us_p95", "write_latency_us_p99", "write_ops",
+                    ]),
+                    ("/domains/0", vec![
+                        "cache_hit_rate", "domain", "rate_limit_rejections", "read_latency_us_p50", "read_latency_us_p99",
+                        "read_ops", "window_secs", "write_ops",
+                    ]),
+                    ("/block_cache", vec![
+                        "current_bytes", "hits", "main_evictions", "main_hits", "misses", "small_evictions", "small_hits",
+                    ]),
+                    ("/shm", vec!["clients_kicked_total", "snapshot_consecutive_skips", "snapshot_publish_skips_total", "snapshot_publishes_total"]),
+                ];
+                for (pointer, expected) in shape {
+                    assert_eq!(keys_of(body.pointer(pointer).unwrap()), expected, "{pointer}");
+                }
+            },
+        );
+    }
+
+    // The domain lists of all three engines name the domains of every shard,
+    // in name order, as with a single shard.
+    #[test]
+    fn domain_lists_name_the_domains_of_every_shard_in_order() {
+        use crate::control::slots::domain_name_for_shard;
+        let names: Vec<String> =
+            (0..3).flat_map(|seed| [domain_name_for_shard(1, 2, seed), domain_name_for_shard(0, 2, seed)]).collect();
+        let mut expected: Vec<String> = names.iter().cloned().chain(["default".to_string()]).collect();
+        expected.sort();
+        for shards in [1, 2] {
+            let (names, expected) = (names.clone(), expected.clone());
+            with_tuned_server(
+                |cfg| {
+                    cfg.multicore.shards = shards;
+                    cfg.json.enabled = true;
+                    cfg.rel.enabled = true;
+                },
+                |addr| async move {
+                    for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
+                        for name in &names {
+                            let create = json!({ "name": name }).to_string();
+                            assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path} {name}");
+                        }
+                        let (status, body) = request(addr, &get(path)).await;
+                        assert_eq!(status, 200, "{path}");
+                        let listed: Vec<String> = serde_json::from_slice::<Vec<Value>>(&body)
+                            .unwrap()
+                            .iter()
+                            .map(|domain| domain["name"].as_str().unwrap().to_string())
+                            .collect();
+                        assert_eq!(listed, expected, "{shards} shards: {path}");
+                    }
+                },
+            );
+        }
+    }
+
+    // A permission on a domain of shard 1 finds the domain in every engine;
+    // one on a missing domain is still refused.
+    #[test]
+    fn a_permission_finds_a_domain_of_any_shard() {
+        use crate::control::slots::domain_name_for_shard;
+        let name = domain_name_for_shard(1, 2, 43);
+        with_tuned_server(
+            |cfg| {
+                cfg.multicore.shards = 2;
+                cfg.json.enabled = true;
+                cfg.rel.enabled = true;
+            },
+            |addr| async move {
+                let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
+                assert_eq!(request(addr, &user).await.0, 201);
+                let create = json!({ "name": name }).to_string();
+                for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
+                    assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path}");
+                }
+                for store_type in ["kv", "json", "rel"] {
+                    for (domain, expected) in [(name.as_str(), 200), ("ghost", 404)] {
+                        let grant = json!({ "domain": domain, "access": "read", "store_type": store_type }).to_string();
+                        let (status, body) =
+                            request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await;
+                        assert_eq!(status, expected, "{store_type} {domain}: {}", String::from_utf8_lossy(&body));
+                    }
+                }
+            },
+        );
+    }
+
+    /// The `shards` list of a `/health` body.
+    fn shard_statuses(body: &[u8]) -> Value {
+        serde_json::from_slice::<Value>(body).unwrap()["shards"].clone()
+    }
+
+    // Every shard answers its ping: 200, each one `ok`, and the report sums
+    // the domains of both shards.
+    #[test]
+    fn health_reports_every_shard() {
+        use crate::control::slots::domain_name_for_shard;
+        with_tuned_server(
+            |cfg| cfg.multicore.shards = 2,
+            |addr| async move {
+                for shard in [0, 1] {
+                    let create = json!({ "name": domain_name_for_shard(shard, 2, 41) }).to_string();
+                    assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
+                }
+                let (status, body) = request(addr, &get("/health")).await;
+                assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+                assert_eq!(shard_statuses(&body), json!([{ "id": 0, "status": "ok" }, { "id": 1, "status": "ok" }]));
+                let body = serde_json::from_slice::<Value>(&body).unwrap();
+                assert_eq!((&body["status"], &body["domain_count"]), (&json!("ok"), &json!(3)));
+            },
+        );
+    }
+
+    // Shard 1 leaves its pings unanswered: /health answers 503 once the
+    // ping times out, with the full report naming shard 1.
+    #[test]
+    fn health_answers_503_naming_a_silent_shard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 2;
+        test_hook::silence_pings(&cfg.storage.system_dir, 1);
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let (status, body) = tokio::runtime::Runtime::new().unwrap().block_on(request(addr, &get("/health")));
+        server.shutdown().unwrap();
+        assert_eq!(status, 503, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(shard_statuses(&body), json!([{ "id": 0, "status": "ok" }, { "id": 1, "status": "timeout" }]));
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!((&body["status"], &body["version"]), (&json!("degraded"), &json!(env!("CARGO_PKG_VERSION"))));
     }
 
     // Shard 0's lane of one, held by a write: the next write for a domain of

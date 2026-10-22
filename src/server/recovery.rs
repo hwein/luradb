@@ -60,7 +60,7 @@ async fn open_instance(
     let vlog = Arc::new(VLog::new(&vlog_path).await?);
     let file_manager = Arc::new(FileManager::new(&sstable_dir).await?);
     let manifest_manager = Arc::new(ManifestManager::new(&sstable_dir));
-    let options = LsmEngineOptions { recovery: Recovery::External, ..options };
+    let options = LsmEngineOptions { recovery: Recovery::External, shard: shard as u16, ..options };
     LsmStorageEngine::new(wal, files.wal.clone(), vlog, vlog_path, file_manager, manifest_manager, options).await
 }
 
@@ -144,6 +144,37 @@ mod tests {
         }
         engine.stop_background_tasks().await;
         stamps
+    }
+
+    // Each shard's instance streams its changes under an epoch of its own:
+    // the boot epoch in the upper 48 bits, the shard in the lower 16. A
+    // cursor of shard 0 resets on shard 1; the control plane's stream, shard
+    // 0xFFFF, takes its own cursors as before.
+    #[test]
+    fn each_shard_streams_under_an_epoch_of_its_own() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::core::events::{format_event_id, stream_epoch, GlobalEventBus, ResetReason, Resume, CONTROL_PLANE_SHARD, EVENTS_TAG};
+            use crate::engines::lsm::WATCH_TAG;
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = files(dir.path());
+            let hub = TestHub::start(&[(WalTarget::Kv, &files.wal)]);
+            let shards = open_sharded(&files, 2, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+            let epochs = [shards[0].watch_epoch(), shards[1].watch_epoch()];
+            let control = stream_epoch(CONTROL_PLANE_SHARD);
+            assert_eq!([epochs[0] & 0xFFFF, epochs[1] & 0xFFFF, control & 0xFFFF], [0, 1, 0xFFFF]);
+            assert_eq!([epochs[0] >> 16, epochs[1] >> 16], [control >> 16, control >> 16]);
+
+            shards[0].put(&data_key(&domain_name_for_shard(0, 2, 3), "k"), b"v").await.unwrap();
+            let cursor = format_event_id(WATCH_TAG, epochs[0], 1);
+            assert!(matches!(shards[0].watch_decide_resume(Some(&cursor)), Resume::Replay { .. }));
+            let moved = shards[1].watch_decide_resume(Some(&cursor));
+            assert!(matches!(moved, Resume::Reset { reason: ResetReason::Restart, .. }));
+
+            let bus = GlobalEventBus::new(16, 16);
+            bus.publish("kv", "domain_created", "shop", None);
+            let cursor = format_event_id(EVENTS_TAG, control, 1);
+            assert!(matches!(bus.decide_resume(Some(&cursor)), Resume::Replay { .. }));
+        })
     }
 
     // Two shards: every record of the shared log lands on the instance of

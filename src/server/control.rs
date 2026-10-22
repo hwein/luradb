@@ -33,7 +33,6 @@ use crate::{
     engines::rel::RelEngine,
     ipc::ShmManager,
     logging,
-    metrics::{MetricsConfig, MetricsStore, MetricsTicker},
 };
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -60,10 +59,12 @@ pub(super) struct Ready {
 pub(super) async fn run(
     config: Arc<LuraConfig>,
     config_path: PathBuf,
+    auto_shards: u16,
     frontend: tokio::runtime::Handle,
     ready_tx: std::sync::mpsc::Sender<anyhow::Result<Ready>>,
 ) {
-    let (cluster, (shards, states, trusted_cidrs)) = match bootstrap(&config, &config_path, &frontend).await {
+    let booted = bootstrap(&config, &config_path, auto_shards, &frontend).await;
+    let (cluster, (shards, states, trusted_cidrs)) = match booted {
         Ok(started) => started,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -218,20 +219,20 @@ impl MemorySplit {
 /// The lanes to the shards, the shards' API states and the trusted CIDRs.
 type Started = (Vec<Lane>, Vec<AppState>, Arc<Vec<ParsedCidr>>);
 
-/// Boots the hub, the system store and the data shards, then the control
-/// plane over them, and releases the shards. Returns what shuts down and
-/// what the frontend needs. A failed step stops what already runs.
+/// Boots the hub, the system store and the data shards — as many as the data
+/// directory has, for a new one `auto_shards` — then the control plane over
+/// them, and releases the shards. Returns what shuts down and what the
+/// frontend needs. A failed step stops what already runs.
 async fn bootstrap(
     config: &Arc<LuraConfig>,
     config_path: &Path,
+    auto_shards: u16,
     frontend: &tokio::runtime::Handle,
 ) -> anyhow::Result<(Cluster, Started)> {
     // First: a capacity the channel rejects must fail while nothing runs yet.
-    let shards = config.multicore.shard_count();
-    let (lanes, jobs): (Vec<Lane>, Vec<_>) =
-        (0..shards).map(|_| Lane::new(config.multicore.shard_queue_capacity)).unzip();
+    let capacity = config.multicore.shard_queue_capacity;
+    let shard_0 = Lane::new(capacity);
     coop::init(config.multicore.cpu_offload_threads);
-    let metrics = MetricsStore::new(MetricsConfig::default());
 
     // The storage hub before every engine: it writes all their WALs. The
     // system store's directory must exist before the hub opens its WAL there.
@@ -244,9 +245,12 @@ async fn bootstrap(
     // count must not be opened at all.
     let system_wal = WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Sys);
     let system_store = system::open_with_wal(Path::new(&config.storage.system_dir), system_wal).await?;
+    let shards = layout::shard_count(config, &system_store, auto_shards).await?;
     layout::migrate(config, &system_store, shards).await?;
     system::check_shard_count(&system_store, shards).await?;
     tracing::info!("System store ready.");
+    let (lanes, jobs): (Vec<Lane>, Vec<_>) =
+        std::iter::once(shard_0).chain((1..shards).map(|_| Lane::new(capacity))).unzip();
 
     // Every log is recovered once, onto the instances of all shards, and cut
     // back only once every engine has flushed what it recovered.
@@ -311,7 +315,6 @@ async fn bootstrap(
             json: json.as_ref().map(|json| Arc::clone(&json[k])),
             rel: rel.as_ref().map(|rel| Arc::clone(&rel[k])),
             buffer_pool_pages: memory.buffer_pool_pages,
-            metrics: Arc::clone(&metrics),
             jobs,
             commands: commands_rx,
             ready,
@@ -331,7 +334,7 @@ async fn bootstrap(
     }
     drop((kv, json, rel));
 
-    let prepared = prepare_control(config, config_path, &threads, readies, &system_store, metrics).await;
+    let prepared = prepare_control(config, config_path, &threads, readies, &system_store).await;
     let Prepared { states, trusted_cidrs, loops, shm_manager } = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
@@ -388,7 +391,6 @@ async fn prepare_control(
     threads: &[ShardThread],
     readies: Vec<oneshot::Receiver<anyhow::Result<ShardOwners>>>,
     system_store: &Arc<LsmStorageEngine>,
-    metrics: Arc<MetricsStore>,
 ) -> anyhow::Result<Prepared> {
     let mut owners = Vec::with_capacity(readies.len());
     for ready in readies {
@@ -419,7 +421,7 @@ async fn prepare_control(
     let owners_auth = Owners { shards, auth: Arc::clone(&auth_cache) };
     let control = ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus).await?;
 
-    let loops = spawn_loops(config, &metrics);
+    let loops = spawn_loops(config);
     let backup_manager = init_backup(config, &owners[0].kv, &owners[0].json, &control, &loops);
     let log_access = init_log_access(config);
     let trusted_cidrs = crate::api::middleware::parse_cidrs(&config.proxy.trusted_proxies)
@@ -442,10 +444,10 @@ async fn prepare_control(
     let states = owners
         .into_iter()
         .map(|owners| AppState {
+            metrics: Arc::clone(owners.kv.metrics()),
             registry: owners.kv,
             auth_cache: Arc::clone(&auth_cache),
             auth_enabled: config.auth.enabled,
-            metrics: Arc::clone(&metrics),
             json_engine: owners.json,
             rel_engine: owners.rel,
             shm_manager: shm_manager.clone(),
@@ -531,13 +533,9 @@ fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageThread, Stor
     StorageThread::new(st_config, wals).context("the storage thread failed to start")
 }
 
-/// The control plane's own loops — metrics ticker, log janitor; they stop
-/// once the returned flag is set.
-fn spawn_loops(cfg: &LuraConfig, metrics: &Arc<MetricsStore>) -> Arc<AtomicBool> {
-    let ticker = MetricsTicker::new(Arc::clone(metrics));
-    compio::runtime::spawn(async move { ticker.run().await }).detach();
-    tracing::info!("Metrics ticker started.");
-
+/// The control plane's own loops — the log janitor, and the backup scheduler
+/// once started; they stop once the returned flag is set.
+fn spawn_loops(cfg: &LuraConfig) -> Arc<AtomicBool> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     if !cfg.log.path.is_empty() && cfg.log.retention_days > 0 {
         let janitor = logging::LogJanitor::new(&cfg.log.path, cfg.log.retention_days);

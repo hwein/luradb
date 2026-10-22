@@ -1,8 +1,8 @@
 //! Control plane: runs the rare, global mutations — domain create and delete
 //! in every engine, auth changes — one at a time on a single worker task,
 //! holds the directory of all domains, owns the system store, is the one
-//! publisher of the global event stream and takes consistent cuts across the
-//! data shards.
+//! publisher of the global event stream and takes consistent cuts and metrics
+//! samples across the data shards.
 
 pub mod slots;
 pub mod system;
@@ -14,6 +14,7 @@ use crate::engines::lsm::domain::{Domain, DomainRegistry, DomainState};
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::reader::RegistrySnapshot;
 use crate::engines::rel::{RelDomain, RelDomainState, RelEngine, RelStoreError};
+use crate::metrics::MetricsSample;
 use anyhow::Context;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -258,6 +259,12 @@ pub enum ShardCommand {
         register: oneshot::Receiver<()>,
         reply: oneshot::Sender<RegistrySnapshot>,
     },
+    /// Like `Confirm` for every engine of the shard: once `sample` fires,
+    /// answers with a sample of the shard's metrics, taken while its writes
+    /// are held back.
+    Sample { drained: oneshot::Sender<()>, sample: oneshot::Receiver<()>, reply: oneshot::Sender<MetricsSample> },
+    /// Answers at once, behind the commands before it.
+    Ping { reply: oneshot::Sender<()> },
     /// Ends the command loop; the shard then shuts its engines down and
     /// answers with the result of each one's final flush.
     Drain { reply: DrainReply },
@@ -292,6 +299,24 @@ pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedRecei
                     drop(drain);
                     let _ = reply.send(snapshot);
                 }
+            }
+            ShardCommand::Sample { drained, sample, reply } => {
+                let mut drains = Vec::with_capacity(3);
+                for engine in [Engine::Kv, Engine::Json, Engine::Rel] {
+                    if let Some(instance) = owners.instance(engine) {
+                        drains.push(instance.drain_writes().await);
+                    }
+                }
+                let _ = drained.send(());
+                let _ = sample.await;
+                // A write on this thread counts itself right after it applies,
+                // before the drain can take over: each is in or out with its count.
+                let taken = owners.kv.metrics().sample();
+                drop(drains);
+                let _ = reply.send(taken);
+            }
+            ShardCommand::Ping { reply } => {
+                let _ = reply.send(());
             }
             ShardCommand::Drain { reply } => return Some(reply),
         }
@@ -341,6 +366,9 @@ pub struct ControlPlane {
     bus: Arc<GlobalEventBus>,
     system: Arc<LsmStorageEngine>,
     shards: Vec<Shard>,
+    /// One held round at a time: two whose commands reach the shards in
+    /// different orders would each hold one shard and wait for the other.
+    rounds: tokio::sync::Mutex<()>,
 }
 
 impl ControlPlane {
@@ -357,6 +385,7 @@ impl ControlPlane {
             bus,
             system,
             shards,
+            rounds: tokio::sync::Mutex::new(()),
         });
         for Shard { owners, .. } in &control.shards {
             owners.kv.attach_control_plane(Arc::clone(&control));
@@ -398,31 +427,77 @@ impl ControlPlane {
             .with_context(|| format!("the {} engine is disabled", engine.as_str()))?
             .wal_head_lsn()
             .await?;
-
-        let mut drained = Vec::with_capacity(self.shards.len());
-        let mut registers = Vec::with_capacity(self.shards.len());
-        let mut reads = Vec::with_capacity(self.shards.len());
-        for shard in &self.shards {
-            let (drained_tx, drained_rx) = oneshot::channel();
-            let (register_tx, register_rx) = oneshot::channel();
-            let (reply, read) = oneshot::channel();
-            shard
-                .commands
-                .send(ShardCommand::Confirm { engine, drained: drained_tx, register: register_rx, reply })
-                .map_err(|_| anyhow::anyhow!("the data shard is not running"))?;
-            drained.push(drained_rx);
-            registers.push(register_tx);
-            reads.push(read);
-        }
-        futures::future::try_join_all(drained).await.context("a data shard did not hold its writes back")?;
-        for register in registers {
-            let _ = register.send(());
-        }
-        let reads = futures::future::try_join_all(reads).await.context("a data shard did not register its snapshot")?;
+        let reads = self
+            .held_round(|drained, register, reply| ShardCommand::Confirm { engine, drained, register, reply })
+            .await?;
         // The pins go only now: the read snapshots protect the versions from here.
         drop(pins);
         let reads = (0u16..).zip(reads).collect();
         Ok(Cut { s, reads, system })
+    }
+
+    /// Samples the metrics of every data shard while all of them hold their
+    /// writes back, once the ones in flight have applied, and merges the
+    /// samples: a write is in a sample or not, never half, and in every later
+    /// one. Reads count as they come. Waits for at most one group commit per
+    /// shard.
+    pub async fn sample_metrics(&self) -> anyhow::Result<MetricsSample> {
+        let samples =
+            self.held_round(|drained, sample, reply| ShardCommand::Sample { drained, sample, reply }).await?;
+        samples
+            .into_iter()
+            .reduce(|mut all, sample| {
+                all.merge(sample);
+                all
+            })
+            .context("no data shard runs")
+    }
+
+    /// Sends every data shard the command `make` builds from its three
+    /// channels, waits until all of them hold their writes back, then lets
+    /// them go on and returns their answers, by shard index. Rounds run one
+    /// after the other.
+    async fn held_round<T>(
+        &self,
+        make: impl Fn(oneshot::Sender<()>, oneshot::Receiver<()>, oneshot::Sender<T>) -> ShardCommand,
+    ) -> anyhow::Result<Vec<T>> {
+        let _round = self.rounds.lock().await;
+        let mut drained = Vec::with_capacity(self.shards.len());
+        let mut releases = Vec::with_capacity(self.shards.len());
+        let mut answers = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let (drained_tx, drained_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let (reply, answer) = oneshot::channel();
+            shard
+                .commands
+                .send(make(drained_tx, release_rx, reply))
+                .map_err(|_| anyhow::anyhow!("the data shard is not running"))?;
+            drained.push(drained_rx);
+            releases.push(release_tx);
+            answers.push(answer);
+        }
+        futures::future::try_join_all(drained).await.context("a data shard did not hold its writes back")?;
+        for release in releases {
+            let _ = release.send(());
+        }
+        futures::future::try_join_all(answers).await.context("a data shard did not answer")
+    }
+
+    /// The engines of every data shard, by shard index.
+    pub fn shard_owners(&self) -> impl Iterator<Item = &ShardOwners> {
+        self.shards.iter().map(|shard| &shard.owners)
+    }
+
+    /// Pings every data shard over its command channel, all at once: by
+    /// shard index, whether it answered within `timeout`.
+    #[allow(clippy::disallowed_methods, reason = "called by GET /health, which runs on the frontend runtime")]
+    pub async fn ping_shards(&self, timeout: std::time::Duration) -> Vec<bool> {
+        let pings = self.shards.iter().map(|shard| async move {
+            let ping = shard.request(|reply| ShardCommand::Ping { reply });
+            matches!(tokio::time::timeout(timeout, ping).await, Ok(Ok(())))
+        });
+        futures::future::join_all(pings).await
     }
 
     /// The current directory; later changes do not show in it.
@@ -1088,13 +1163,16 @@ mod tests {
     /// Two key-value shards and a control plane over them, with the hub
     /// their log runs through and each shard's engine. Every command reaches
     /// a shard through a relay that records it; a shard's relay holds its
-    /// `Confirm` back while `hold_confirms` of that shard is set.
+    /// `Confirm` back while `hold_confirms` of that shard is set, and keeps
+    /// its `Sample`s back while `hold_samples` is set, to pass them on in
+    /// reverse order once it is cleared.
     struct TwoShards {
         control: Arc<ControlPlane>,
         engines: Vec<Arc<LsmStorageEngine>>,
         registries: Vec<Arc<DomainRegistry>>,
         commands: Arc<std::sync::Mutex<Vec<(usize, &'static str)>>>,
         hold_confirms: Vec<tokio::sync::watch::Sender<bool>>,
+        hold_samples: Vec<tokio::sync::watch::Sender<bool>>,
         _hub: crate::core::storage_thread::TestHub,
         _dir: tempfile::TempDir,
     }
@@ -1106,6 +1184,8 @@ mod tests {
             ShardCommand::FinalizeDeletion { .. } => "finalize",
             ShardCommand::Pin { .. } => "pin",
             ShardCommand::Confirm { .. } => "confirm",
+            ShardCommand::Sample { .. } => "sample",
+            ShardCommand::Ping { .. } => "ping",
             ShardCommand::Drain { .. } => "drain",
         }
     }
@@ -1122,23 +1202,41 @@ mod tests {
             let registries = owners.iter().map(|shard| Arc::clone(&shard.kv)).collect();
             let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut hold_confirms = Vec::new();
+            let mut hold_samples = Vec::new();
             let mut shards = Vec::new();
             for (k, owners) in owners.into_iter().enumerate() {
                 let (to_shard, inbox) = mpsc::unbounded_channel();
                 compio::runtime::spawn(serve_shard(owners.clone(), inbox)).detach();
                 let (hold, mut held) = tokio::sync::watch::channel(false);
                 hold_confirms.push(hold);
+                let (hold, mut samples_held) = tokio::sync::watch::channel(false);
+                hold_samples.push(hold);
                 let (relay, mut relayed) = mpsc::unbounded_channel::<ShardCommand>();
                 let log = Arc::clone(&commands);
                 compio::runtime::spawn(async move {
-                    while let Some(command) = relayed.recv().await {
-                        let name = command_name(&command);
-                        log.lock().unwrap().push((k, name));
-                        if name == "confirm" {
-                            let _ = held.wait_for(|held| !held).await;
-                        }
-                        if to_shard.send(command).is_err() {
-                            break;
+                    let mut kept = Vec::new();
+                    loop {
+                        tokio::select! {
+                            command = relayed.recv() => {
+                                let Some(command) = command else { break };
+                                let name = command_name(&command);
+                                log.lock().unwrap().push((k, name));
+                                if name == "confirm" {
+                                    let _ = held.wait_for(|held| !held).await;
+                                }
+                                if name == "sample" && *samples_held.borrow() {
+                                    kept.push(command);
+                                } else if to_shard.send(command).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(()) = samples_held.changed() => {
+                                if !*samples_held.borrow_and_update() {
+                                    for command in kept.drain(..).rev() {
+                                        let _ = to_shard.send(command);
+                                    }
+                                }
+                            }
                         }
                     }
                 })
@@ -1147,7 +1245,7 @@ mod tests {
             }
             let bus = Arc::new(GlobalEventBus::new(64, 64));
             let (control, _) = testing::start_over(dir.path(), shards, bus).await;
-            Self { control, engines, registries, commands, hold_confirms, _hub: hub, _dir: dir }
+            Self { control, engines, registries, commands, hold_confirms, hold_samples, _hub: hub, _dir: dir }
         }
 
         fn state(&self, name: &str) -> Option<Lifecycle> {
@@ -1340,6 +1438,87 @@ mod tests {
         })
     }
 
+    // A domain write held in flight on shard 1, its record in the log but not
+    // yet applied, holds a metrics sample back until it applies; the sample
+    // then counts it with the writes of shard 0, and the next sample counts
+    // it again, once.
+    #[test]
+    fn a_metrics_sample_waits_for_a_write_in_flight_and_counts_it_once() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::engine::TestHook;
+            let [a, b] = [0, 1].map(|shard| slots::domain_name_for_shard(shard, 2, 21));
+            let held = [format!("d:{:016x}:", crate::engines::lsm::domain::fnv64(b.as_bytes())).as_bytes(), b"held"].concat();
+            let hook = Arc::new(TestHook::default());
+            let s = TwoShards::new(|k, engine| {
+                if k == 1 {
+                    engine.hooks.before_kv_pair_apply = Some((held.clone(), Arc::clone(&hook)));
+                }
+            })
+            .await;
+            for name in [&a, &b] {
+                s.control.create_domain(Engine::Kv, name, false).await.unwrap();
+            }
+            for key in [b"k1", b"k2"] {
+                s.registries[0].store(&a).await.unwrap().put(key, b"v").await.unwrap();
+            }
+            assert_eq!(s.control.sample_metrics().await.unwrap().total_writes, 2);
+
+            let store = s.registries[1].store(&b).await.unwrap();
+            let writer = compio::runtime::spawn(async move { store.put(b"held", b"v").await });
+            hook.reached.notified().await;
+            let sample = compio::runtime::spawn({
+                let control = Arc::clone(&s.control);
+                async move { control.sample_metrics().await }
+            });
+            settle().await;
+            assert!(!sample.is_finished(), "the sample waits for the write in flight");
+            hook.release.notify_one();
+            writer.await.unwrap().unwrap();
+            let during = sample.await.unwrap().unwrap();
+            let after = s.control.sample_metrics().await.unwrap();
+            assert_eq!((during.total_writes, after.total_writes), (3, 3));
+            assert_eq!(s.commands_of(1), ["sample", "sample", "sample"]);
+        })
+    }
+
+    // Two metrics samples asked for at once take their rounds one after the
+    // other: shard 1 keeps the samples it has back and then runs them in
+    // reverse order, and still both end and count every write.
+    #[test]
+    fn two_metrics_samples_at_once_both_end() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::new(|_, _| {}).await;
+            for (k, name) in [0, 1].map(|shard| slots::domain_name_for_shard(shard, 2, 21)).iter().enumerate() {
+                s.control.create_domain(Engine::Kv, name, false).await.unwrap();
+                s.registries[k].store(name).await.unwrap().put(b"k", b"v").await.unwrap();
+            }
+
+            s.hold_samples[1].send_replace(true);
+            let samples: Vec<_> = (0..2)
+                .map(|_| {
+                    let control = Arc::clone(&s.control);
+                    compio::runtime::spawn(async move { control.sample_metrics().await })
+                })
+                .collect();
+            // Upper bound against hanging only.
+            let limit = Duration::from_secs(30);
+            let first_held = async {
+                while !s.commands_of(1).contains(&"sample") {
+                    tokio::task::yield_now().await;
+                }
+            };
+            compio::time::timeout(limit, first_held).await.expect("no sample reaches shard 1");
+            settle().await;
+            s.hold_samples[1].send_replace(false);
+            let samples = compio::time::timeout(limit, futures::future::join_all(samples))
+                .await
+                .expect("the two samples deadlock");
+            for sample in samples {
+                assert_eq!(sample.unwrap().unwrap().total_writes, 2);
+            }
+        })
+    }
+
     // While a cut has pinned shard 0 but not yet taken its read there, a
     // newer version is written and flushed beside an older one and the two
     // are compacted: the pin keeps the older one, the cut reads the newer
@@ -1439,6 +1618,7 @@ mod tests {
             bus: Arc::new(GlobalEventBus::new(16, 16)),
             system: system::open(&dir.path().join("sys")).await.unwrap(),
             shards: Vec::new(),
+            rounds: tokio::sync::Mutex::new(()),
         };
         (control, inbox)
     }

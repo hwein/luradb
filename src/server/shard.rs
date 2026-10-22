@@ -1,7 +1,7 @@
 //! A data shard's thread: takes over the engine instances the control plane
 //! recovered for it, runs their background tasks, its domain purgers and
-//! sweepers, and the requests of its domains on its own compio runtime, and
-//! flushes its engines when the control plane drains it.
+//! sweepers, its metrics ticker and the requests of its domains on its own
+//! compio runtime, and flushes its engines when the control plane drains it.
 
 use super::layout;
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
     },
     engines::rel::{domain as rel_domain, RelEngine},
     ipc,
-    metrics::MetricsStore,
+    metrics::{MetricsConfig, MetricsStore, MetricsTicker},
     uds,
 };
 use anyhow::Context;
@@ -43,7 +43,6 @@ pub(super) struct ShardBoot {
     pub(super) json: Option<Arc<LsmStorageEngine>>,
     pub(super) rel: Option<Arc<LsmStorageEngine>>,
     pub(super) buffer_pool_pages: usize,
-    pub(super) metrics: Arc<MetricsStore>,
     pub(super) jobs: mpsc::Receiver<Job>,
     pub(super) commands: mpsc::UnboundedReceiver<ShardCommand>,
     /// The shard's engines once they are up.
@@ -117,6 +116,7 @@ async fn run(boot: ShardBoot) {
 
     #[cfg(test)]
     super::test_hook::record(&config.storage.system_dir, format!("shard {shard} released"));
+    compio::runtime::spawn(MetricsTicker::new(Arc::clone(owners.kv.metrics())).run()).detach();
     let loops = spawn_loops(&config, &owners);
     let shm = match if shard == 0 { start_shm(&config, &state).await } else { Ok(None) } {
         Ok(shm) => {
@@ -129,6 +129,12 @@ async fn run(boot: ShardBoot) {
         }
     };
     let serving = compio::runtime::spawn(bridge::serve_engine(jobs, api::create_router(state)));
+    #[cfg(test)]
+    let commands = if super::test_hook::pings_silenced(&config.storage.system_dir, shard) {
+        unanswered_pings(commands)
+    } else {
+        commands
+    };
     let drained = control::serve_shard(owners, commands).await;
 
     // Every sender of the shard's lane is gone by now; the request loop ends
@@ -144,11 +150,12 @@ async fn run(boot: ShardBoot) {
 }
 
 /// Puts the page store, the registered buffers (shard 0 of a single one
-/// only) and the domain layers on the shard's instances. Only the shard that
-/// owns the default domain creates it.
+/// only) and the domain layers, with a metrics store of their own, on the
+/// shard's instances. Only the shard that owns the default domain creates it.
 async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOwners> {
-    let ShardBoot { shard, shards, config, kv, json, rel, buffer_pool_pages, metrics, .. } = boot;
+    let ShardBoot { shard, shards, config, kv, json, rel, buffer_pool_pages, .. } = boot;
     let (shard, shards) = (*shard, *shards);
+    let metrics = MetricsStore::new(MetricsConfig::default());
     let owns = |name: &str| usize::from(slots::shard_of_domain(name, shards)) == shard;
 
     let db_path = layout::shard_file(Path::new(&config.storage.db_path), shard);
@@ -165,11 +172,11 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
     let domain_config = super::control::domain_config(config);
     let owns_kv_default = owns(&domain_config.default_domain);
     let registry = Arc::new(
-        DomainRegistry::recover_on_shard(Arc::clone(kv), domain_config, Arc::clone(metrics), owns_kv_default).await?,
+        DomainRegistry::recover_on_shard(Arc::clone(kv), domain_config, Arc::clone(&metrics), owns_kv_default).await?,
     );
     let json = match json {
         Some(json) => Some(
-            JsonEngine::open(&config.json, Arc::clone(json), Arc::clone(metrics), owns(json_domain::DEFAULT_DOMAIN))
+            JsonEngine::open(&config.json, Arc::clone(json), Arc::clone(&metrics), owns(json_domain::DEFAULT_DOMAIN))
                 .await?,
         ),
         None => None,
@@ -180,7 +187,7 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
             let resolver = crate::engines::rel::CrossEngineResolver::new(
                 Some(Arc::clone(&registry)),
                 json.clone(),
-                Arc::clone(metrics),
+                Arc::clone(&metrics),
             );
             let quota = DomainQuota {
                 read_iops: config.rate_limit.default_read_iops,
@@ -188,7 +195,7 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
                 max_storage_bytes: config.rate_limit.default_max_storage_bytes,
             };
             let owns_default = owns(rel_domain::DEFAULT_DOMAIN);
-            Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(metrics), resolver, owns_default).await?)
+            Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(&metrics), resolver, owns_default).await?)
         }
         None => None,
     };
@@ -416,6 +423,28 @@ async fn stop_shm(services: Option<ShmServices>) {
         let _ = services.publisher_task.await;
         uds::remove_socket_file(&services.reg_socket);
     }
+}
+
+/// Relays `commands` but keeps every ping unanswered until the control plane
+/// lets go of the shard.
+#[cfg(test)]
+fn unanswered_pings(mut commands: mpsc::UnboundedReceiver<ShardCommand>) -> mpsc::UnboundedReceiver<ShardCommand> {
+    let (relay, relayed) = mpsc::unbounded_channel();
+    compio::runtime::spawn(async move {
+        let mut pings = Vec::new();
+        while let Some(command) = commands.recv().await {
+            match command {
+                ShardCommand::Ping { reply } => pings.push(reply),
+                command => {
+                    if relay.send(command).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .detach();
+    relayed
 }
 
 #[cfg(test)]

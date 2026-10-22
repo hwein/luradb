@@ -61,7 +61,7 @@ impl Modify for BearerAuth {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.8.0";
+pub const API_VERSION: &str = "0.9.0";
 
 struct VersionInfo;
 
@@ -132,7 +132,6 @@ pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState {
         cache: Arc::clone(&state.auth_cache),
         control: Arc::clone(&state.control),
-        registry: Arc::clone(&state.registry),
         auth_enabled: state.auth_enabled,
         json_engine: state.json_engine.clone(),
         rel_engine: state.rel_engine.clone(),
@@ -409,6 +408,8 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     components(
         schemas(
             metrics::VersionResponse,
+            crate::metrics::HeartbeatMetrics,
+            crate::metrics::ShardHealth,
             domains::CreateDomainRequest,
             domains::DomainResponse,
             kv::KeyMetaResponse,
@@ -701,6 +702,10 @@ mod contract_tests {
         // that provably never carries a body).
         const NO_BODY_EXCEPTIONS: &[(&str, &str, &str)] =
             &[("/store-api/metrics/domains/{name}", "get", "404")];
+        // GET /health answers 503 with its full JSON report when a data shard
+        // stays silent, so a probe still reads which one; it declares that
+        // body instead.
+        const JSON_BODY_EXCEPTIONS: &[(&str, &str, &str)] = &[("/health", "get", "503")];
 
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = json["paths"].as_object().expect("contract without paths");
@@ -716,7 +721,15 @@ mod contract_tests {
                     if code < 400 {
                         continue;
                     }
-                    if NO_BODY_EXCEPTIONS.contains(&(path.as_str(), method.as_str(), status.as_str())) {
+                    let route = (path.as_str(), method.as_str(), status.as_str());
+                    if NO_BODY_EXCEPTIONS.contains(&route) {
+                        continue;
+                    }
+                    if JSON_BODY_EXCEPTIONS.contains(&route) {
+                        assert!(
+                            response["content"]["application/json"].is_object(),
+                            "{method} {path} -> {status}: missing JSON body: {response}"
+                        );
                         continue;
                     }
                     let schema_type = &response["content"]["text/plain"]["schema"]["type"];

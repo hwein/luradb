@@ -18,7 +18,8 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: domains created with `require_conditional_writes` reject unconditional single-key writes with 428.
 - New `[storage].system_dir` config key sets the directory of the system store, which holds users, API key hashes and permissions apart from domain data.
 - New `[storage].wal_queue_capacity` config key sets how many writes may wait for the storage thread.
-- New `[multicore].shards` config key (accepts `0` = automatic and `1`) and `[multicore].shard_queue_capacity` config key.
+- New `[multicore].shard_queue_capacity` config key.
+- Multi-shard mode: `[multicore].shards` spreads domain writes over N engine threads; `0` keeps the count a data directory was written with, a new directory gets cores / 4 (at most 8), or 1 while SHM is enabled.
 
 ### Changed
 
@@ -42,6 +43,10 @@ All notable changes to LuraDB are documented in this file.
 - The storage thread syncs the write-ahead logs of several engines in parallel instead of one after another.
 - **BREAKING** API: 503 Service Unavailable with Retry-After when the server is overloaded.
 - Data directory layout: engine files move into shard_0/ on first start (automatic, one-way).
+- **BREAKING** API: `GET /health` reports per-shard status and answers 503 with status `degraded` when a shard does not respond.
+- **BREAKING** API: `GET /store-api/metrics` answers 503 while a data shard is not running.
+- **BREAKING** API: Watch/event stream ids carry the shard in their epoch; existing cursors resync once after the upgrade.
+- `[io_engine].enabled` has no effect with more than one shard.
 
 ### Removed
 

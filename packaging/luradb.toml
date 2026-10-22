@@ -82,10 +82,12 @@ cpu_offload_threads = 0
 # shards: 0 is automatic (cores / 6, 2 to 4 on hosts with at least 4 cores,
 # otherwise 1), otherwise at most the number of cores.
 frontend_workers = 0
-# Data shards, each a thread with its own storage engines: 0 is automatic (1).
-# Only 1 is accepted for now. The data directory layout depends on it; the
-# server refuses to start when it differs from the count the data was written
-# with.
+# Data shards, each a thread with its own storage engines that writes the
+# domains assigned to it. The data directory layout depends on it: 0 keeps
+# the count an existing data directory was written with, and gives a new one
+# cores / 4, 1 to 8 (1 while shm is enabled, which needs a single shard). A
+# set count that differs from the one the data was written with refuses the
+# start.
 shards = 0
 # Requests one data shard takes at once, running or waiting; further requests
 # are answered with 503 and Retry-After: 1. At least 1.

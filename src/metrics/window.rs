@@ -60,11 +60,11 @@ pub struct BucketSnapshot {
     pub rate_limit_rejections: u64,
 }
 
-/// Bucket sums across every committed snapshot in a window — the shared
-/// result of `MetricsWindow::sum_buckets`, consumed by both `aggregate`
-/// (per-domain) and `aggregate_engine` (per-engine).
-#[derive(Default)]
-struct BucketTotals {
+/// Bucket sums across every committed snapshot in a window. Totals of
+/// several windows add up field by field, latency buckets included, so
+/// percentiles of the sum are those of all samples together.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WindowTotals {
     read_ops: u64,
     write_ops: u64,
     read_latency: [u64; 7],
@@ -74,7 +74,62 @@ struct BucketTotals {
     rate_limit_rejections: u64,
 }
 
-// ── MetricsWindow ─────────────────────────────────────────────────────────────
+impl WindowTotals {
+    /// Adds `other` to these totals.
+    pub fn add(&mut self, other: &WindowTotals) {
+        self.read_ops += other.read_ops;
+        self.write_ops += other.write_ops;
+        for i in 0..7 {
+            self.read_latency[i] += other.read_latency[i];
+            self.write_latency[i] += other.write_latency[i];
+        }
+        self.cache_hits += other.cache_hits;
+        self.cache_misses += other.cache_misses;
+        self.rate_limit_rejections += other.rate_limit_rejections;
+    }
+
+    /// The totals as a `DomainWindowMetrics` snapshot.
+    pub fn domain_metrics(&self, domain: &str, window_secs: u64) -> DomainWindowMetrics {
+        let total_read_samples: u64 = self.read_latency.iter().sum();
+        let total_cache = self.cache_hits + self.cache_misses;
+        let cache_hit_rate = if total_cache == 0 {
+            0.0
+        } else {
+            self.cache_hits as f32 / total_cache as f32
+        };
+
+        DomainWindowMetrics {
+            domain: domain.to_string(),
+            read_ops: self.read_ops,
+            write_ops: self.write_ops,
+            read_latency_us_p50: percentile(&self.read_latency, total_read_samples, 50),
+            read_latency_us_p99: percentile(&self.read_latency, total_read_samples, 99),
+            cache_hit_rate,
+            rate_limit_rejections: self.rate_limit_rejections,
+            window_secs,
+        }
+    }
+
+    /// The totals as an `EngineWindowMetrics` snapshot: read and write
+    /// latency percentiles side by side, no cache hit/miss (engine windows
+    /// don't track it).
+    pub fn engine_metrics(&self, window_secs: u64) -> EngineWindowMetrics {
+        let read_total: u64 = self.read_latency.iter().sum();
+        let write_total: u64 = self.write_latency.iter().sum();
+
+        EngineWindowMetrics {
+            read_ops: self.read_ops,
+            write_ops: self.write_ops,
+            read_latency_us_p50: percentile(&self.read_latency, read_total, 50),
+            read_latency_us_p95: percentile(&self.read_latency, read_total, 95),
+            read_latency_us_p99: percentile(&self.read_latency, read_total, 99),
+            write_latency_us_p50: percentile(&self.write_latency, write_total, 50),
+            write_latency_us_p95: percentile(&self.write_latency, write_total, 95),
+            write_latency_us_p99: percentile(&self.write_latency, write_total, 99),
+            window_secs,
+        }
+    }
+}
 
 /// Per-domain sliding-window metrics store.
 pub struct MetricsWindow {
@@ -162,11 +217,10 @@ impl MetricsWindow {
         }
     }
 
-    /// Sums every committed bucket in the window in one pass, shared by
-    /// `aggregate` and `aggregate_engine` so neither duplicates the loop.
-    fn sum_buckets(&self) -> BucketTotals {
+    /// Sums every committed bucket in the window.
+    pub fn totals(&self) -> WindowTotals {
         let buckets = self.buckets.lock();
-        let mut t = BucketTotals::default();
+        let mut t = WindowTotals::default();
         for b in buckets.iter() {
             t.read_ops += b.read_ops;
             t.write_ops += b.write_ops;
@@ -183,55 +237,15 @@ impl MetricsWindow {
 
     /// Aggregates all committed buckets into a `DomainWindowMetrics` snapshot.
     pub fn aggregate(&self, domain: &str, window_secs: u64) -> DomainWindowMetrics {
-        let t = self.sum_buckets();
-
-        let total_read_samples: u64 = t.read_latency.iter().sum();
-        let read_latency_us_p50 = percentile(&t.read_latency, total_read_samples, 50);
-        let read_latency_us_p99 = percentile(&t.read_latency, total_read_samples, 99);
-
-        let total_cache = t.cache_hits + t.cache_misses;
-        let cache_hit_rate = if total_cache == 0 {
-            0.0
-        } else {
-            t.cache_hits as f32 / total_cache as f32
-        };
-
-        DomainWindowMetrics {
-            domain: domain.to_string(),
-            read_ops: t.read_ops,
-            write_ops: t.write_ops,
-            read_latency_us_p50,
-            read_latency_us_p99,
-            cache_hit_rate,
-            rate_limit_rejections: t.rate_limit_rejections,
-            window_secs,
-        }
+        self.totals().domain_metrics(domain, window_secs)
     }
 
     /// Aggregates all committed buckets into an `EngineWindowMetrics`
-    /// snapshot (spec general/019): read and write latency percentiles side
-    /// by side, no cache hit/miss (engine windows don't track it).
+    /// snapshot.
     pub fn aggregate_engine(&self, window_secs: u64) -> EngineWindowMetrics {
-        let t = self.sum_buckets();
-
-        let read_total: u64 = t.read_latency.iter().sum();
-        let write_total: u64 = t.write_latency.iter().sum();
-
-        EngineWindowMetrics {
-            read_ops: t.read_ops,
-            write_ops: t.write_ops,
-            read_latency_us_p50: percentile(&t.read_latency, read_total, 50),
-            read_latency_us_p95: percentile(&t.read_latency, read_total, 95),
-            read_latency_us_p99: percentile(&t.read_latency, read_total, 99),
-            write_latency_us_p50: percentile(&t.write_latency, write_total, 50),
-            write_latency_us_p95: percentile(&t.write_latency, write_total, 95),
-            write_latency_us_p99: percentile(&t.write_latency, write_total, 99),
-            window_secs,
-        }
+        self.totals().engine_metrics(window_secs)
     }
 }
-
-// ── P-value approximation ─────────────────────────────────────────────────────
 
 fn percentile(buckets: &[u64; 7], total: u64, pct: u64) -> u64 {
     if total == 0 {

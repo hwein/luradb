@@ -4,7 +4,9 @@
 //! a path with no `{domain}` segment is admin-only, no auth code needed here)
 
 use crate::api::AppState;
-use crate::core::events::{format_event_id, stream_epoch, GlobalEvent, ResetReason, Resume, EVENTS_TAG};
+use crate::core::events::{
+    format_event_id, stream_epoch, GlobalEvent, ResetReason, Resume, CONTROL_PLANE_SHARD, EVENTS_TAG,
+};
 use axum::{
     extract::{Query, State},
     http::HeaderMap,
@@ -129,7 +131,7 @@ pub async fn get_events(
     headers: HeaderMap,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static> {
     let last_event_id = resolve_last_event_id(&headers, &params);
-    let epoch = stream_epoch();
+    let epoch = stream_epoch(CONTROL_PLANE_SHARD);
 
     // subscribe() before the ring snapshot (spec §5, kv/024 §4.3): nothing
     // published between them can be lost — only re-delivered, which the live
@@ -517,7 +519,7 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::CREATED);
             }
 
-            let epoch = stream_epoch();
+            let epoch = stream_epoch(CONTROL_PLANE_SHARD);
             let stale_id = format_event_id(EVENTS_TAG, epoch, 1);
             let resp = t
                 .app
@@ -544,7 +546,7 @@ mod tests {
     fn test_restart_epoch_mismatch_resets() {
         crate::core::engine_runtime::block_on(async {
             let (t, _dir) = make_app().await;
-            let fake_epoch = stream_epoch().wrapping_add(1);
+            let fake_epoch = stream_epoch(CONTROL_PLANE_SHARD).wrapping_add(1);
             let id = format_event_id(EVENTS_TAG, fake_epoch, 1);
             let resp = t
                 .app
@@ -630,7 +632,7 @@ mod tests {
     fn test_foreign_watch_tag_is_unknown_id() {
         crate::core::engine_runtime::block_on(async {
             let (t, _dir) = make_app().await;
-            let id = format_event_id("w", stream_epoch(), 1);
+            let id = format_event_id("w", stream_epoch(CONTROL_PLANE_SHARD), 1);
             let resp = t
                 .app
                 .clone()

@@ -1162,8 +1162,6 @@ fn is_valid_origin_form(origin: &str) -> bool {
     }
 }
 
-// ── Multicore (spec perf/017) ─────────────────────────────────────────────────
-
 /// Sizing of the CPU offload pool behind `core::coop::offload`, of the
 /// frontend runtime in front of the data shards, of the data shards and of
 /// the reader pool.
@@ -1178,7 +1176,8 @@ pub struct MulticoreConfig {
     /// least 4 cores, otherwise 1.
     pub frontend_workers: usize,
     /// Data shards, each a thread with its own engine instances. `0` = auto
-    /// = 1; more than one is not enabled yet.
+    /// = the count the data directory was written with; for a new one a
+    /// quarter of the cores, 1 to 8, and 1 while shared memory is enabled.
     pub shards: u16,
     /// Requests a data shard takes at once, running or waiting; beyond that
     /// it answers 503 with `Retry-After`.
@@ -1206,15 +1205,9 @@ impl Default for MulticoreConfig {
 }
 
 impl MulticoreConfig {
-    /// The data shards this start runs: `shards`, with `0` resolved to 1.
-    pub fn shard_count(&self) -> u16 {
-        self.shards.max(1)
-    }
-
-    /// Startup validation (spec general/030): more permits or workers than
-    /// `cores` would not bound anything; both request channels need a slot.
-    /// More than one data shard is refused, and so is shared memory with
-    /// several shards.
+    /// Startup validation: more permits or workers than `cores` would not
+    /// bound anything; both request channels need a slot. Shared memory
+    /// serves a single data shard.
     pub fn validate(&self, cores: usize, shm_enabled: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.cpu_offload_threads <= cores,
@@ -1229,11 +1222,6 @@ impl MulticoreConfig {
         anyhow::ensure!(
             !(shm_enabled && self.shards > 1),
             "invalid config: multicore.shards ({}) must be 0 (auto) or 1 while shm.enabled is true",
-            self.shards
-        );
-        anyhow::ensure!(
-            self.shards <= 1,
-            "invalid config: multicore.shards ({}) must be 0 (auto) or 1 — multi-shard mode is not enabled yet",
             self.shards
         );
         anyhow::ensure!(
@@ -1574,23 +1562,16 @@ mod tests {
         assert_invalid(config.multicore.validate(8, false), "multicore.shard_queue_capacity (0)", "at least 1");
     }
 
-    // Auto and one data shard start; more are refused for now, and shared
-    // memory never runs with several.
+    // Any data shard count starts; shared memory only with auto or one.
     #[test]
-    fn test_multicore_shards_accept_auto_and_one_only() {
-        let config = LuraConfig::default();
-        assert_eq!(config.multicore.shards, 0);
-        assert_eq!(config.multicore.shard_count(), 1);
-
-        for shards in [0, 1] {
+    fn test_multicore_shards_accept_any_count_but_one_with_shm() {
+        assert_eq!(LuraConfig::default().multicore.shards, 0);
+        for shards in [0, 1, 2, 16] {
             let config: LuraConfig = toml::from_str(&format!("[multicore]\nshards = {shards}\n")).unwrap();
-            assert!(config.multicore.validate(8, true).is_ok(), "{shards}");
-            assert_eq!(config.multicore.shard_count(), 1);
+            assert!(config.multicore.validate(8, false).is_ok(), "{shards}");
+            assert_eq!(config.multicore.validate(8, true).is_ok(), shards <= 1, "{shards}");
         }
-
         let config: LuraConfig = toml::from_str("[multicore]\nshards = 2\n").unwrap();
-        assert_eq!(config.multicore.shard_count(), 2);
-        assert_invalid(config.multicore.validate(8, false), "multicore.shards (2)", "not enabled yet");
         assert_invalid(config.multicore.validate(8, true), "multicore.shards (2)", "shm.enabled");
     }
 

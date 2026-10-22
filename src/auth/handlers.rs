@@ -13,9 +13,8 @@
 
 use crate::auth::middleware::{extract_bearer, split_permission_domain, StoreType, TrustedPeer};
 use crate::auth::{generate_api_key, hash_api_key, AccessLevel, AuthCache, DomainPermission, UserRecord, UserRole};
-use crate::control::{AuthChange, ControlPlane};
+use crate::control::{AuthChange, ControlPlane, Engine, Lifecycle};
 use crate::engines::json::JsonEngine;
-use crate::engines::lsm::DomainRegistry;
 use crate::engines::rel::RelEngine;
 use axum::{
     extract::{Extension, Path, State},
@@ -34,7 +33,6 @@ pub struct AuthState {
     pub cache: Arc<AuthCache>,
     /// Runs every change to the auth records.
     pub control: Arc<ControlPlane>,
-    pub registry: Arc<DomainRegistry>,
     /// Mirrors `AppState::auth_enabled` (`api/mod.rs`) — needed by `whoami`
     /// to report the `Disabled` pseudo-role when the `auth_layer` middleware
     /// isn't in the router at all.
@@ -391,46 +389,24 @@ pub async fn set_permission(
         Err(resp) => return *resp,
     };
     let allow_missing = params.allow_missing.unwrap_or(false);
-    // Domain existence check (spec general/021): kv unchanged; json/rel check
-    // via the engine when active. `allow_missing` skips the check for all
-    // three (pre-provisioning). json/rel always validate the name first;
-    // kv only in the allow_missing branch, where no lookup exists to catch
-    // an impossible name (§4 — kv's real length limit is config-driven, so
-    // `valid_name`'s fixed 50 must not apply to kv's normal lookup branch).
-    match store_type {
-        StoreType::Kv => {
-            if allow_missing {
-                if !valid_name(&body.domain) {
-                    return err(StatusCode::BAD_REQUEST, "domain must be 1-50 chars of [a-zA-Z0-9_-]");
-                }
-            } else if state.registry.get_domain(&body.domain).await.unwrap_or(None).is_none() {
-                return err(StatusCode::NOT_FOUND, "404 Not Found: domain not found");
-            }
-        }
-        StoreType::Json => {
-            if !valid_name(&body.domain) {
-                return err(StatusCode::BAD_REQUEST, "domain must be 1-50 chars of [a-zA-Z0-9_-]");
-            }
-            if !allow_missing {
-                if let Some(engine) = &state.json_engine {
-                    if engine.get_domain(&body.domain).is_none() {
-                        return err(StatusCode::NOT_FOUND, "404 Not Found: domain not found");
-                    }
-                }
-            }
-        }
-        StoreType::Rel => {
-            if !valid_name(&body.domain) {
-                return err(StatusCode::BAD_REQUEST, "domain must be 1-50 chars of [a-zA-Z0-9_-]");
-            }
-            if !allow_missing {
-                if let Some(engine) = &state.rel_engine {
-                    if engine.get_domain(&body.domain).is_none() {
-                        return err(StatusCode::NOT_FOUND, "404 Not Found: domain not found");
-                    }
-                }
-            }
-        }
+    // The domain must be active in the directory of all shards, unless
+    // `allow_missing` (pre-provisioning) or its engine is disabled. json/rel
+    // always validate the name first; kv only with `allow_missing`, where no
+    // lookup catches an impossible name — kv's real length limit is
+    // config-driven, so the fixed 50 of `valid_name` must not apply to it.
+    if (allow_missing || !matches!(store_type, StoreType::Kv)) && !valid_name(&body.domain) {
+        return err(StatusCode::BAD_REQUEST, "domain must be 1-50 chars of [a-zA-Z0-9_-]");
+    }
+    let active = |engine: Engine| {
+        state.control.directory().get(engine, &body.domain).is_some_and(|entry| entry.state == Lifecycle::Active)
+    };
+    let missing = match store_type {
+        StoreType::Kv => !active(Engine::Kv),
+        StoreType::Json => state.json_engine.is_some() && !active(Engine::Json),
+        StoreType::Rel => state.rel_engine.is_some() && !active(Engine::Rel),
+    };
+    if missing && !allow_missing {
+        return err(StatusCode::NOT_FOUND, "404 Not Found: domain not found");
     }
     let access = match body.access.to_lowercase().as_str() {
         "read" => AccessLevel::Read,
@@ -543,8 +519,7 @@ mod tests {
     }
 
     /// Like `make_app`, but also boots the JSON/rel engines when requested
-    /// (spec general/021) and returns their handles so a test can create/
-    /// delete domains directly instead of only through the router.
+    /// and returns their handles so a test can check a domain's state.
     async fn make_app_with_engines(
         auth_enabled: bool,
         json_enabled: bool,
@@ -1060,6 +1035,13 @@ mod tests {
         send(app, Method::POST, &uri, Body::from(body.to_string())).await.status()
     }
 
+    /// Creates `name` in the `json` or `rel` engine through the API.
+    async fn create_domain(app: &axum::Router, engine: &str, name: &str) {
+        let body = Body::from(serde_json::json!({ "name": name }).to_string());
+        let resp = send(app, Method::POST, &format!("/store-api/{engine}/domains"), body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{engine} {name}");
+    }
+
     /// Like `send`, but with a Bearer key -- needed once `auth_enabled = true`.
     async fn authed(
         app: &axum::Router,
@@ -1083,9 +1065,9 @@ mod tests {
     #[test]
     fn set_permission_json_engine_active_checks_domain_existence() {
         crate::core::engine_runtime::block_on(async {
-            let (app, auth_cache, json, _rel, _dir) = make_app_with_engines(false, true, false).await;
+            let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, true, false).await;
             add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
-            json.unwrap().create_domain("jsondom").await.unwrap();
+            create_domain(&app, "json", "jsondom").await;
 
             assert_eq!(set_perm(&app, "alice", "jsondom", "json", None).await, StatusCode::OK);
             assert_eq!(set_perm(&app, "alice", "ghost", "json", None).await, StatusCode::NOT_FOUND);
@@ -1097,9 +1079,9 @@ mod tests {
     #[test]
     fn set_permission_rel_engine_active_checks_domain_existence() {
         crate::core::engine_runtime::block_on(async {
-            let (app, auth_cache, _json, rel, _dir) = make_app_with_engines(false, false, true).await;
+            let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, true).await;
             add_user(&auth_cache, "bob", "lura_bob", UserRole::User).await;
-            rel.unwrap().create_domain("reldom").await.unwrap();
+            create_domain(&app, "rel", "reldom").await;
 
             assert_eq!(set_perm(&app, "bob", "reldom", "rel", None).await, StatusCode::OK);
             assert_eq!(set_perm(&app, "bob", "ghost", "rel", None).await, StatusCode::NOT_FOUND);
@@ -1233,9 +1215,8 @@ mod tests {
     }
 
     // Test 8: a domain in Deleting state answers 404 without allow_missing,
-    // for both json and rel. Deleted directly through the engine handle --
-    // this harness never spawns a purger, so the state can't race the
-    // assertion below (spec general/021 Test 8 herstellungsweg).
+    // for both json and rel. This harness never spawns a purger, so the
+    // state can't race the assertion below.
     #[test]
     fn set_permission_deleting_domain_answers_404() {
         crate::core::engine_runtime::block_on(async {
@@ -1243,17 +1224,21 @@ mod tests {
             add_user(&auth_cache, "frank", "lura_frank", UserRole::User).await;
             let json = json.unwrap();
             let rel = rel.unwrap();
+            let delete = |engine: &str, name: &str| {
+                let (app, uri) = (app.clone(), format!("/store-api/{engine}/domains/{name}"));
+                async move { send(&app, Method::DELETE, &uri, Body::empty()).await.status() }
+            };
 
-            json.create_domain("doomed").await.unwrap();
-            json.delete_domain("doomed").await.unwrap();
+            create_domain(&app, "json", "doomed").await;
+            assert_eq!(delete("json", "doomed").await, StatusCode::ACCEPTED);
             assert_eq!(
                 json.get_domain_any("doomed").map(|d| d.state),
                 Some(crate::engines::json::JsonDomainState::Deleting)
             );
             assert_eq!(set_perm(&app, "frank", "doomed", "json", None).await, StatusCode::NOT_FOUND);
 
-            rel.create_domain("doomed2").await.unwrap();
-            rel.delete_domain("doomed2").await.unwrap();
+            create_domain(&app, "rel", "doomed2").await;
+            assert_eq!(delete("rel", "doomed2").await, StatusCode::ACCEPTED);
             assert_eq!(
                 rel.get_domain_any("doomed2").map(|d| d.state),
                 Some(crate::engines::rel::RelDomainState::Deleting)

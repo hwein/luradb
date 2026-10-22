@@ -1,12 +1,15 @@
-//! Metrics system — Spec 013.
+//! Metrics system.
 //!
-//! - `MetricsStore`: central store for system-wide lifetime counters and per-domain
-//!   sliding-window metrics. Held as `Arc<MetricsStore>` in `AppState`.
+//! - `MetricsStore`: one per data shard — lifetime counters and per-domain
+//!   and per-engine sliding-window metrics of that shard's work. Held as
+//!   `Arc<MetricsStore>` in the shard's `AppState`.
+//! - `MetricsSample`: a store's counters and windows as of one moment; the
+//!   samples of all shards merge into what `/metrics` reports.
 //! - `MetricsTicker`: background task that calls `tick_all()` every second.
 //! - `HeartbeatMetrics`: data returned by `GET /health`.
 //! - `DomainWindowMetrics`: aggregated per-domain window returned by `/metrics`.
 //! - `EngineWindowMetrics`: aggregated per-engine (kv/json/rel) window returned
-//!   by `/metrics` (spec general/019).
+//!   by `/metrics`.
 
 pub mod window;
 
@@ -18,7 +21,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use window::MetricsWindow;
+use window::{MetricsWindow, WindowTotals};
 
 // ── Version string ────────────────────────────────────────────────────────────
 
@@ -48,10 +51,9 @@ impl Default for MetricsConfig {
     }
 }
 
-// ── HeartbeatMetrics ──────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct HeartbeatMetrics {
+    /// `ok`, or `degraded` while a data shard does not answer.
     pub status: &'static str,
     pub uptime_secs: u64,
     pub version: &'static str,
@@ -59,6 +61,16 @@ pub struct HeartbeatMetrics {
     pub estimated_memtable_keys: u64,
     pub vlog_size_bytes: u64,
     pub l0_sstable_count: usize,
+    /// Every data shard, by id.
+    pub shards: Vec<ShardHealth>,
+}
+
+/// A data shard as `GET /health` reports it: `ok` once it answered its
+/// ping, `timeout` otherwise.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ShardHealth {
+    pub id: u16,
+    pub status: &'static str,
 }
 
 // ── SystemMetrics ─────────────────────────────────────────────────────────────
@@ -202,7 +214,46 @@ pub struct EngineWindowMetrics {
     pub window_secs: u64,
 }
 
-// ── MetricsStore ──────────────────────────────────────────────────────────────
+/// One store's counters and windows as of one moment. Samples of several
+/// stores, one per data shard, merge into the totals `/metrics` reports.
+pub struct MetricsSample {
+    pub total_reads: u64,
+    pub total_writes: u64,
+    pub shm_snapshot_publishes_total: u64,
+    pub shm_snapshot_publish_skips_total: u64,
+    pub shm_snapshot_consecutive_skips: u64,
+    pub shm_clients_kicked_total: u64,
+    domains: HashMap<String, WindowTotals>,
+    engines: [WindowTotals; 3],
+    window_secs: u64,
+}
+
+impl MetricsSample {
+    /// Adds `other` field by field; windows of the same domain add up.
+    pub fn merge(&mut self, other: MetricsSample) {
+        self.total_reads += other.total_reads;
+        self.total_writes += other.total_writes;
+        self.shm_snapshot_publishes_total += other.shm_snapshot_publishes_total;
+        self.shm_snapshot_publish_skips_total += other.shm_snapshot_publish_skips_total;
+        self.shm_snapshot_consecutive_skips += other.shm_snapshot_consecutive_skips;
+        self.shm_clients_kicked_total += other.shm_clients_kicked_total;
+        for (domain, totals) in other.domains {
+            self.domains.entry(domain).or_default().add(&totals);
+        }
+        for (engine, totals) in self.engines.iter_mut().zip(&other.engines) {
+            engine.add(totals);
+        }
+    }
+
+    pub fn domain_metrics(&self) -> Vec<DomainWindowMetrics> {
+        self.domains.iter().map(|(name, totals)| totals.domain_metrics(name, self.window_secs)).collect()
+    }
+
+    /// The three engine windows, indexed by `EngineKind` (`[kv, json, rel]`).
+    pub fn engine_metrics(&self) -> [EngineWindowMetrics; 3] {
+        std::array::from_fn(|i| self.engines[i].engine_metrics(self.window_secs))
+    }
+}
 
 pub struct MetricsStore {
     pub system: SystemMetrics,
@@ -495,9 +546,20 @@ impl MetricsStore {
         domains.get(domain).map(|w| w.aggregate(domain, self.config.window_secs))
     }
 
-    pub fn get_all_domain_metrics(&self) -> Vec<DomainWindowMetrics> {
-        let domains = self.domains();
-        domains.iter().map(|(name, w)| w.aggregate(name, self.config.window_secs)).collect()
+    /// The counters and windows as of now.
+    pub fn sample(&self) -> MetricsSample {
+        let sys = &self.system;
+        MetricsSample {
+            total_reads: sys.total_reads.load(Ordering::Relaxed),
+            total_writes: sys.total_writes.load(Ordering::Relaxed),
+            shm_snapshot_publishes_total: sys.shm_snapshot_publishes_total.load(Ordering::Relaxed),
+            shm_snapshot_publish_skips_total: sys.shm_snapshot_publish_skips_total.load(Ordering::Relaxed),
+            shm_snapshot_consecutive_skips: sys.shm_snapshot_consecutive_skips.load(Ordering::Relaxed),
+            shm_clients_kicked_total: sys.shm_clients_kicked_total.load(Ordering::Relaxed),
+            domains: self.domains().iter().map(|(name, w)| (name.clone(), w.totals())).collect(),
+            engines: std::array::from_fn(|i| self.engines[i].totals()),
+            window_secs: self.config.window_secs,
+        }
     }
 
     /// Advances all per-domain rolling windows by one second.
@@ -515,16 +577,21 @@ impl MetricsStore {
         }
     }
 
-    /// Builds a `HeartbeatMetrics` snapshot using live engine data.
-    pub fn heartbeat(&self, engine_data: &EngineHeartbeatData, domain_count: usize) -> HeartbeatMetrics {
+    /// Builds a `HeartbeatMetrics` snapshot from the live data of every data
+    /// shard's engine, summed, and whether each shard answered, by index.
+    pub fn heartbeat(&self, engines: &[EngineHeartbeatData], domain_count: usize, answered: &[bool]) -> HeartbeatMetrics {
         HeartbeatMetrics {
-            status: "ok",
+            status: if answered.iter().all(|&ok| ok) { "ok" } else { "degraded" },
             uptime_secs: now_secs().saturating_sub(self.started_at),
             version: LURADB_VERSION,
             domain_count,
-            estimated_memtable_keys: engine_data.estimated_memtable_keys,
-            vlog_size_bytes: engine_data.vlog_size_bytes,
-            l0_sstable_count: engine_data.l0_sstable_count,
+            estimated_memtable_keys: engines.iter().map(|e| e.estimated_memtable_keys).sum(),
+            vlog_size_bytes: engines.iter().map(|e| e.vlog_size_bytes).sum(),
+            l0_sstable_count: engines.iter().map(|e| e.l0_sstable_count).sum(),
+            shards: (0u16..)
+                .zip(answered)
+                .map(|(id, &ok)| ShardHealth { id, status: if ok { "ok" } else { "timeout" } })
+                .collect(),
         }
     }
 }
@@ -626,5 +693,31 @@ mod tests {
 
         store.record_shm_client_kicked();
         assert_eq!(sys.shm_clients_kicked_total.load(Ordering::Relaxed), 1);
+    }
+
+    // The samples of two stores add up field by field, a domain's windows by
+    // its name; a percentile of the merged sample is the one of all writes
+    // together, not the mean of the stores' percentiles.
+    #[test]
+    fn samples_of_several_stores_merge_field_by_field() {
+        let (fast, slow) = (MetricsStore::new(MetricsConfig::default()), MetricsStore::new(MetricsConfig::default()));
+        for _ in 0..3 {
+            fast.record_write("a", 5);
+        }
+        slow.record_write("a", 5);
+        slow.record_write("b", 2_000_000);
+        slow.record_shm_publish();
+        fast.tick_all();
+        slow.tick_all();
+
+        let mut sample = fast.sample();
+        sample.merge(slow.sample());
+        assert_eq!((sample.total_writes, sample.total_reads, sample.shm_snapshot_publishes_total), (5, 0, 1));
+        let [kv, json, _] = sample.engine_metrics();
+        assert_eq!((kv.write_ops, kv.write_latency_us_p50, kv.write_latency_us_p99), (5, 5, 2_000_000));
+        assert_eq!((json.write_ops, kv.window_secs), (0, 60));
+        let mut domains: Vec<_> = sample.domain_metrics().into_iter().map(|d| (d.domain, d.write_ops)).collect();
+        domains.sort();
+        assert_eq!(domains, [("a".to_string(), 4), ("b".to_string(), 1)]);
     }
 }

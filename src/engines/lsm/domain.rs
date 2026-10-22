@@ -326,6 +326,11 @@ impl DomainRegistry {
         &self.engine
     }
 
+    /// The metrics store the domains record into.
+    pub fn metrics(&self) -> &Arc<MetricsStore> {
+        &self.metrics
+    }
+
     /// Set once at startup, before the purger runs.
     pub(crate) fn attach_control_plane(&self, control: Arc<ControlPlane>) {
         let _ = self.control.set(control);
@@ -549,11 +554,13 @@ pub struct KeyMeta {
     pub last_modified_ms: u64,
 }
 
-/// Result of starting (or resuming) a KV watch (spec kv/024 §4.3):
-/// `resume` is already domain-filtered/stripped, `rx` is the live stream.
+/// Result of starting (or resuming) a KV watch: `resume` is already
+/// domain-filtered/stripped, `rx` is the live stream, `epoch` the epoch of
+/// its event ids.
 pub struct WatchStart {
     pub resume: Resume<WalEvent>,
     pub rx: broadcast::Receiver<WatchMessage>,
+    pub epoch: u64,
 }
 
 /// The change a single-key write makes.
@@ -985,7 +992,7 @@ impl DomainStore {
             }
         });
 
-        WatchStart { resume, rx } // step 4
+        WatchStart { resume, rx, epoch: self.engine.watch_epoch() } // step 4
     }
 
     /// Current head of the engine's watch-stream sequence (spec kv/024 §5)
@@ -1564,7 +1571,7 @@ mod tests {
             let mut last_id = String::new();
             for _ in 0..3 {
                 match rx.recv().await.unwrap() {
-                    WatchMessage::Event(e) => last_id = format_event_id(WATCH_TAG, stream_epoch(), e.seq),
+                    WatchMessage::Event(e) => last_id = format_event_id(WATCH_TAG, stream_epoch(0), e.seq),
                     WatchMessage::Gap => panic!("unexpected gap"),
                 }
             }
@@ -1595,7 +1602,7 @@ mod tests {
             for i in 0..10 {
                 store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
             }
-            let id = format_event_id(WATCH_TAG, stream_epoch(), 1);
+            let id = format_event_id(WATCH_TAG, stream_epoch(0), 1);
             let mut resumed = store.watch_from(Some(&id));
             match resumed.resume {
                 Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
@@ -1621,7 +1628,7 @@ mod tests {
             let store = registry.store("w4").await.unwrap();
             store.put(b"k", b"v").await.unwrap();
 
-            let fake_epoch = stream_epoch().wrapping_add(1);
+            let fake_epoch = stream_epoch(0).wrapping_add(1);
             let id = format_event_id(WATCH_TAG, fake_epoch, 1);
             let started = store.watch_from(Some(&id));
             match started.resume {
@@ -1708,7 +1715,7 @@ mod tests {
             let last_id = match rx.recv().await.unwrap() {
                 WatchMessage::Event(e) => {
                     assert!(e.seq > 0, "id must be assigned even with the ring disabled");
-                    format_event_id(WATCH_TAG, stream_epoch(), e.seq)
+                    format_event_id(WATCH_TAG, stream_epoch(0), e.seq)
                 }
                 WatchMessage::Gap => panic!("unexpected gap"),
             };
@@ -1731,7 +1738,7 @@ mod tests {
             let store = registry.store("w12").await.unwrap();
             store.put(b"k", b"v").await.unwrap();
 
-            let id = format_event_id("g", stream_epoch(), 1);
+            let id = format_event_id("g", stream_epoch(0), 1);
             let started = store.watch_from(Some(&id));
             match started.resume {
                 Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
@@ -1766,7 +1773,7 @@ mod tests {
 
             // Resuming from before either write: replay must contain only A's
             // key, raw-prefix-stripped, even though the ring holds both.
-            let before_id = format_event_id(WATCH_TAG, stream_epoch(), 0);
+            let before_id = format_event_id(WATCH_TAG, stream_epoch(0), 0);
             let resumed = store_a.watch_from(Some(&before_id));
             match resumed.resume {
                 Resume::Replay { events, .. } => {

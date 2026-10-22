@@ -138,6 +138,42 @@ the key.
 Requests on one connection are processed in order (HTTP/1.1 pipelining and
 HTTP/2 alike); open several connections for parallelism.
 
+## Multicore
+
+LuraDB spreads its domains over several data shards by name; each shard is
+one thread with its own storage engines. What that means for one domain:
+
+- **Reads scale across cores.** Point reads run on the thread that holds the
+  connection, longer reads on a pool of reader threads — both against the
+  domain's shard, from any number of connections at once.
+- **Writes of one domain run on exactly one core**, the thread of its shard.
+  Write parallelism is therefore at most the number of domains being written
+  at the same time; spread independent write traffic over several domains.
+
+The cores are split automatically (`[multicore]` in `luradb.toml` overrides
+each part):
+
+| Part | Automatic size | 4 cores | 8 cores | 12 cores | 32 cores |
+| --- | --- | --- | --- | --- | --- |
+| Frontend workers (HTTP/TLS) | cores / 6, 2 to 4; 1 below 4 cores | 2 | 2 | 2 | 4 |
+| Data shards (new data directory) | cores / 4, 1 to 8 | 1 | 2 | 3 | 8 |
+| Reader threads | cores − 2 − frontend − shards, at least 1 | 1 | 2 | 5 | 18 |
+
+Two cores stay for the storage thread and background work.
+
+Memory per data shard: the block cache of each engine (64 MiB per engine)
+and the buffer pool (`buffer_pool.pool_size`) are split evenly across the
+shards, so their totals stay the same. The MemTable threshold
+(`lsm.memtable_size_threshold`) applies to every engine of every shard, so
+MemTable memory grows with the shard count: up to engines × shards ×
+threshold, plus MemTables being flushed.
+
+The shard count is fixed for a data directory: the automatic setting keeps
+the count an existing data directory was written with, also after an
+upgrade or a move to a host with another core count, and a start with a
+different count set explicitly is refused. Shared memory (`[shm]`) runs
+with a single shard.
+
 ## License
 
 LuraDB is Fair Source (FSL-1.1-ALv2): free to use, modify and redistribute

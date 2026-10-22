@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.8.0",
+    "version": "0.9.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -20,11 +20,28 @@
           "Metrics"
         ],
         "summary": "`GET /health` — public heartbeat endpoint.",
-        "description": "Returns a JSON snapshot of system vitals. No authentication required.",
+        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, and\nin `shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms. No authentication required.",
         "operationId": "health",
         "responses": {
           "200": {
-            "description": "System is healthy"
+            "description": "System is healthy: every data shard answered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatMetrics"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A data shard did not answer within 250 ms; the full report with status `degraded`; its `shards` list names the shard with status `timeout`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatMetrics"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3539,6 +3556,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "A data shard is not running",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -5645,6 +5672,58 @@
           }
         }
       },
+      "HeartbeatMetrics": {
+        "type": "object",
+        "required": [
+          "status",
+          "uptime_secs",
+          "version",
+          "domain_count",
+          "estimated_memtable_keys",
+          "vlog_size_bytes",
+          "l0_sstable_count",
+          "shards"
+        ],
+        "properties": {
+          "domain_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "estimated_memtable_keys": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "l0_sstable_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "shards": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShardHealth"
+            },
+            "description": "Every data shard, by id."
+          },
+          "status": {
+            "type": "string",
+            "description": "`ok`, or `degraded` while a data shard does not answer."
+          },
+          "uptime_secs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string"
+          },
+          "vlog_size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "IndexInfo": {
         "type": "object",
         "required": [
@@ -6231,6 +6310,24 @@
               "null"
             ],
             "description": "Store type of the domain: `\"kv\"` (default), `\"json\"` (spec json/012) or `\"rel\"` (spec rel/011)."
+          }
+        }
+      },
+      "ShardHealth": {
+        "type": "object",
+        "description": "A data shard as `GET /health` reports it: `ok` once it answered its\nping, `timeout` otherwise.",
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string"
           }
         }
       },

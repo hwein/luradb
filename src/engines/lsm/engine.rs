@@ -95,6 +95,9 @@ pub struct LsmEngineOptions {
     pub janitor: JanitorConfig,
     pub block_cache: BlockCacheConfig,
     pub recovery: Recovery,
+    /// The data shard the instance belongs to; its watch stream's epoch
+    /// carries it.
+    pub shard: u16,
 }
 
 /// Where a new engine's unflushed writes come from.
@@ -392,8 +395,10 @@ pub struct LsmStorageEngine {
     change_tx: broadcast::Sender<WalEvent>,
 
     /// Sequences every `change_tx` event and keeps a bounded replay ring for
-    /// the KV watch resume protocol (spec kv/024 §2).
+    /// the KV watch resume protocol.
     watch_log: SeqRing<WalEvent>,
+    /// Epoch of the watch stream's event ids: [`stream_epoch`] of the shard.
+    watch_epoch: u64,
 
     /// Signals background tasks to stop.
     shutdown: Arc<AtomicBool>,
@@ -494,6 +499,7 @@ impl LsmStorageEngine {
             janitor: janitor_config,
             block_cache: block_cache_config,
             recovery,
+            shard,
         } = options;
 
         let mut version = Self::discover_vlog_generations(vlog, &vlog_path).await?;
@@ -553,6 +559,7 @@ impl LsmStorageEngine {
             snapshot_registry: Arc::new(SnapshotRegistry::new()),
             change_tx,
             watch_log,
+            watch_epoch: stream_epoch(shard),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
             background_tasks: Mutex::new(Vec::new()),
@@ -1776,11 +1783,16 @@ impl LsmStorageEngine {
         self.watch_log.head()
     }
 
-    /// Full resume decision for the KV watch (spec kv/024 §4.2) from a raw
-    /// `Last-Event-ID`/`?last_event_id=` value, using this process's real
-    /// [`stream_epoch`].
+    /// Full resume decision for the KV watch from a raw
+    /// `Last-Event-ID`/`?last_event_id=` value, against [`Self::watch_epoch`]:
+    /// a cursor of another shard or an earlier run resets.
     pub fn watch_decide_resume(&self, raw_id: Option<&str>) -> Resume<WalEvent> {
-        self.watch_log.decide_resume(raw_id, WATCH_TAG, stream_epoch())
+        self.watch_log.decide_resume(raw_id, WATCH_TAG, self.watch_epoch)
+    }
+
+    /// The epoch of this instance's watch event ids.
+    pub fn watch_epoch(&self) -> u64 {
+        self.watch_epoch
     }
 
     // ── Flush ───────────────────────────────────────────────────────────────

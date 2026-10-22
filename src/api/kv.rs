@@ -12,7 +12,7 @@
 //! GET    /store-api/kv/{domain}/watch?prefix={p}    → watch     (SSE stream)
 
 use crate::api::{middleware::ApiError, AppState, CountResponse};
-use crate::core::events::{format_event_id, stream_epoch, ResetReason, Resume};
+use crate::core::events::{format_event_id, ResetReason, Resume};
 use crate::engines::lsm::{
     GetResult, KeyWrite, OpType, Precondition, PreconditionFailed, PreconditionRequired, WalEvent, WatchMessage,
     WatchStart, WATCH_TAG,
@@ -581,8 +581,7 @@ pub async fn watch(
     let last_event_id = resolve_last_event_id(&headers, &params);
     let prefix_bytes: Vec<u8> = params.prefix.unwrap_or_default().into_bytes();
 
-    let WatchStart { resume, rx } = store.watch_from(last_event_id.as_deref());
-    let epoch = stream_epoch();
+    let WatchStart { resume, rx, epoch } = store.watch_from(last_event_id.as_deref());
 
     // Leading items served up front (never through the relay channel, see
     // spec kv/024 §4.3): 0 or 1 `reset`, or a domain-/prefix-filtered replay.
@@ -1868,7 +1867,7 @@ mod tests {
 
             // Resume from seq 0 ("from the beginning") so both pre-existing
             // writes are replayed, exercising the replay-side filter.
-            let id0 = format_event_id(WATCH_TAG, stream_epoch(), 0);
+            let id0 = format_event_id(WATCH_TAG, crate::core::events::stream_epoch(0), 0);
             let watch_resp = app
                 .clone()
                 .oneshot(

@@ -1,10 +1,12 @@
-//! REST handlers for Spec 013 — Metrics & Heartbeat.
+//! REST handlers for metrics and the heartbeat, both over every data shard.
 //!
 //! GET /health                             → heartbeat, no auth
 //! GET /store-api/metrics                  → system + all domain metrics, Admin only
 //! GET /store-api/metrics/domains/{name}   → single domain metrics, Admin or domain user
 
+use crate::api::middleware::ApiError;
 use crate::api::AppState;
+use crate::control::{Engine, Lifecycle};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -12,29 +14,35 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+/// A data shard that does not answer its ping within this long is reported
+/// as `timeout`.
+const SHARD_PING_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// `GET /health` — public heartbeat endpoint.
 ///
-/// Returns a JSON snapshot of system vitals. No authentication required.
+/// Returns a JSON snapshot of system vitals, summed over the data shards, and
+/// in `shards` the status of each data shard: `ok` once it answered, `timeout`
+/// when it did not within 250 ms. No authentication required.
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "System is healthy"),
+        (status = 200, description = "System is healthy: every data shard answered", body = crate::metrics::HeartbeatMetrics),
+        (status = 503, description = "A data shard did not answer within 250 ms; the full report with status `degraded`; its `shards` list names the shard with status `timeout`", body = crate::metrics::HeartbeatMetrics),
     ),
     security(()),
     tag = "Metrics"
 )]
-pub async fn health(State(state): State<AppState>) -> Json<Value> {
-    let engine_data = state.registry.engine().heartbeat_data();
-    let domain_count = state
-        .registry
-        .list_domains()
-        .await
-        .map(|d| d.len())
-        .unwrap_or(0);
-    let hb = state.metrics.heartbeat(&engine_data, domain_count);
-    Json(serde_json::to_value(hb).unwrap_or_else(|_| json!({"status": "ok"})))
+pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let answered = state.control.ping_shards(SHARD_PING_TIMEOUT).await;
+    let engines: Vec<_> = state.control.shard_owners().map(|owners| owners.kv.engine().heartbeat_data()).collect();
+    let directory = state.control.directory();
+    let domain_count = directory.domains(Engine::Kv).filter(|d| d.state == Lifecycle::Active).count();
+    let hb = state.metrics.heartbeat(&engines, domain_count, &answered);
+    let status = if answered.iter().all(|&ok| ok) { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status, Json(serde_json::to_value(hb).unwrap_or_else(|_| json!({"status": "ok"}))))
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -108,11 +116,13 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 /// is not being updated) and `clients_kicked_total` (clients disconnected after
 /// `shm.kick_blocking_client_after_secs`).
 //
-// The `system` block is KV-only: `compaction_runs`, `janitor_runs` and
-// `memtable_size_bytes` come from the KV engine's LSM instance — json/rel
-// run their own instances, not reflected here (spec general/024). Plain
-// `//` on purpose: a `///` line would enter the OpenAPI description and
-// change the pinned contract file.
+// Every field is the sum over the data shards; the latency percentiles are
+// those of the shards' windows merged. The `system` block's
+// `compaction_runs`, `janitor_runs` and `memtable_size_bytes` and the
+// `block_cache` block come from the KV engine's LSM instances — json/rel run
+// their own instances, not reflected here. Plain `//` on purpose: a `///`
+// line would enter the OpenAPI description and change the pinned contract
+// file.
 #[utoipa::path(
     get,
     path = "/store-api/metrics",
@@ -120,40 +130,56 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
         (status = 200, description = "Metrics snapshot"),
         (status = 401, description = "Unauthorized", body = String, content_type = "text/plain"),
         (status = 403, description = "Forbidden — Admin only", body = String, content_type = "text/plain"),
+        (status = 503, description = "A data shard is not running", body = String, content_type = "text/plain"),
     ),
     security(("bearer_auth" = [])),
     tag = "Metrics"
 )]
-pub async fn get_metrics(State(state): State<AppState>) -> Json<Value> {
-    let sys = &state.metrics.system;
-    let engine = state.registry.engine();
+pub async fn get_metrics(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let sample = state.control.sample_metrics().await.map_err(|e| {
+        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, format!("503 Service Unavailable: {e:#}"))
+    })?;
+    let (mut compaction_runs, mut janitor_runs, mut memtable_size_bytes) = (0, 0, 0);
+    let mut cache = [0u64; 7];
+    for owners in state.control.shard_owners() {
+        let engine = owners.kv.engine();
+        compaction_runs += engine.compaction_runs();
+        janitor_runs += engine.janitor_runs();
+        memtable_size_bytes += engine.stats().memtable_size as u64;
+        let bc = engine.block_cache_metrics();
+        let counters =
+            [&bc.hits, &bc.misses, &bc.small_hits, &bc.main_hits, &bc.small_evictions, &bc.main_evictions, &bc.current_bytes];
+        for (sum, counter) in cache.iter_mut().zip(counters) {
+            *sum += counter.load(Ordering::Relaxed);
+        }
+    }
     let system = json!({
-        "total_reads":       sys.total_reads.load(Ordering::Relaxed),
-        "total_writes":      sys.total_writes.load(Ordering::Relaxed),
-        "compaction_runs":   engine.compaction_runs(),
-        "janitor_runs":      engine.janitor_runs(),
-        "memtable_size_bytes": engine.stats().memtable_size as u64,
+        "total_reads":       sample.total_reads,
+        "total_writes":      sample.total_writes,
+        "compaction_runs":   compaction_runs,
+        "janitor_runs":      janitor_runs,
+        "memtable_size_bytes": memtable_size_bytes,
     });
-    let domains = state.metrics.get_all_domain_metrics();
-    let [kv_metrics, json_metrics, rel_metrics] = state.metrics.engine_metrics();
+    let domains = sample.domain_metrics();
+    let [kv_metrics, json_metrics, rel_metrics] = sample.engine_metrics();
     let engines = json!({ "kv": kv_metrics, "json": json_metrics, "rel": rel_metrics });
 
-    let bc = state.registry.engine().block_cache_metrics();
+    let [hits, misses, small_hits, main_hits, small_evictions, main_evictions, current_bytes] = cache;
     let block_cache = json!({
-        "hits":             bc.hits.load(Ordering::Relaxed),
-        "misses":           bc.misses.load(Ordering::Relaxed),
-        "small_hits":       bc.small_hits.load(Ordering::Relaxed),
-        "main_hits":        bc.main_hits.load(Ordering::Relaxed),
-        "small_evictions":  bc.small_evictions.load(Ordering::Relaxed),
-        "main_evictions":   bc.main_evictions.load(Ordering::Relaxed),
-        "current_bytes":    bc.current_bytes.load(Ordering::Relaxed),
+        "hits":             hits,
+        "misses":           misses,
+        "small_hits":       small_hits,
+        "main_hits":        main_hits,
+        "small_evictions":  small_evictions,
+        "main_evictions":   main_evictions,
+        "current_bytes":    current_bytes,
     });
 
     let shm = json!({
-        "snapshot_publishes_total":     sys.shm_snapshot_publishes_total.load(Ordering::Relaxed),
-        "snapshot_publish_skips_total": sys.shm_snapshot_publish_skips_total.load(Ordering::Relaxed),
-        "snapshot_consecutive_skips":   sys.shm_snapshot_consecutive_skips.load(Ordering::Relaxed),
-        "clients_kicked_total":         sys.shm_clients_kicked_total.load(Ordering::Relaxed),
+        "snapshot_publishes_total":     sample.shm_snapshot_publishes_total,
+        "snapshot_publish_skips_total": sample.shm_snapshot_publish_skips_total,
+        "snapshot_consecutive_skips":   sample.shm_snapshot_consecutive_skips,
+        "clients_kicked_total":         sample.shm_clients_kicked_total,
     });
 
     // Backup block (spec general/006 metrics section) — null when backup.enabled = false.
@@ -173,14 +199,14 @@ pub async fn get_metrics(State(state): State<AppState>) -> Json<Value> {
         })
     });
 
-    Json(json!({
+    Ok(Json(json!({
         "system": system,
         "domains": domains,
         "engines": engines,
         "block_cache": block_cache,
         "backup": backup,
         "shm": shm
-    }))
+    })))
 }
 
 /// `GET /metrics/domains/{name}` — metrics for one domain. Admin or domain user.
@@ -234,6 +260,12 @@ mod tests {
     }
 
     // ── Spec general/019: per-engine metrics, HTTP level ─────────────────────
+
+    /// The body of a `GET /store-api/metrics` against `state`.
+    async fn scrape(state: AppState) -> Value {
+        let Ok(Json(body)) = get_metrics(State(state)).await else { panic!("the metrics scrape failed") };
+        body
+    }
 
     // Minimal KV-only AppState (json_engine/rel_engine disabled) -- enough to
     // exercise get_metrics's engines block, which is always present
@@ -301,7 +333,7 @@ mod tests {
             state.registry.store("shop").await.unwrap().get(b"k").await.unwrap();
             state.metrics.tick_all();
 
-            let Json(body) = get_metrics(State(state)).await;
+            let body = scrape(state).await;
             for engine in ["kv", "json", "rel"] {
                 let block = &body["engines"][engine];
                 for field in [
@@ -341,7 +373,7 @@ mod tests {
             let (state, _dir) = make_state().await;
             assert!(state.json_engine.is_none());
 
-            let Json(body) = get_metrics(State(state)).await;
+            let body = scrape(state).await;
             let json_block = &body["engines"]["json"];
             assert_eq!(json_block["read_ops"], 0);
             assert_eq!(json_block["write_ops"], 0);
@@ -369,7 +401,7 @@ mod tests {
             // rather than spinning up a full purger cycle in this HTTP-level test.
             state.metrics.remove_domain("gone");
 
-            let Json(body) = get_metrics(State(state)).await;
+            let body = scrape(state).await;
             assert!(
                 body["domains"].as_array().unwrap().iter().all(|d| d["domain"] != "gone"),
                 "deleted domain must be gone from domains[]"
@@ -394,13 +426,13 @@ mod tests {
             state.registry.create_domain("shop").await.unwrap();
             state.registry.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
 
-            let Json(body) = get_metrics(State(state.clone())).await;
+            let body = scrape(state.clone()).await;
             let before = body["system"]["memtable_size_bytes"].as_u64().unwrap();
             assert!(before > 0, "memtable_size_bytes must be > 0 after a PUT");
 
             state.registry.engine().flush_all_memtables().await.unwrap();
 
-            let Json(body) = get_metrics(State(state)).await;
+            let body = scrape(state).await;
             let after = body["system"]["memtable_size_bytes"].as_u64().unwrap();
             assert!(after < before, "memtable_size_bytes must shrink after a full flush");
         })
@@ -413,7 +445,7 @@ mod tests {
     fn test_system_block_keeps_exactly_five_numeric_fields() {
         crate::core::engine_runtime::block_on(async {
             let (state, _dir) = make_state().await;
-            let Json(body) = get_metrics(State(state)).await;
+            let body = scrape(state).await;
             let system = body["system"].as_object().unwrap();
 
             let mut fields: Vec<&str> = system.keys().map(|s| s.as_str()).collect();
@@ -443,7 +475,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (state, _dir) = make_state().await;
             assert!(state.shm_manager.is_none());
-            let Json(body) = get_metrics(State(state)).await;
+            let body = scrape(state).await;
             let shm = body["shm"].as_object().expect("shm block present");
 
             let mut fields: Vec<&str> = shm.keys().map(|s| s.as_str()).collect();
@@ -467,7 +499,7 @@ mod tests {
             state.metrics.record_shm_publish_skip();
             state.metrics.record_shm_client_kicked();
 
-            let Json(body) = get_metrics(State(state)).await;
+            let body = scrape(state).await;
             let shm = &body["shm"];
             assert_eq!(shm["snapshot_publishes_total"], 1);
             assert_eq!(shm["snapshot_publish_skips_total"], 2);

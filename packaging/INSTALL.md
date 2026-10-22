@@ -58,6 +58,22 @@ sudo systemctl restart luradb
 
 Disabling authentication (`auth.enabled = false`) only starts if `server.bind_address` is loopback (`127.0.0.1` / `::1`) — binding wider than loopback with auth off is refused at startup, so an unauthenticated listener can never end up reachable from the network. Enable auth, or keep the bind on loopback.
 
+## Multicore
+
+LuraDB spreads its domains over several data shards; each shard is one thread with its own storage engines. Reads of a domain scale across cores (the connection threads and the reader pool); the writes of one domain run on exactly one core, so write parallelism is at most the number of domains written at the same time.
+
+The `[multicore]` keys size each part; `0` is automatic:
+
+- `frontend_workers`: cores / 6, 2 to 4 (1 below 4 cores).
+- `shards`: the count an existing data directory was written with; for a new one cores / 4, 1 to 8 (1 while `[shm]` is enabled, which needs a single shard).
+- `reader_threads`: cores − 2 − frontend workers − shards, at least 1.
+
+On 12 cores with a new data directory that is 2 frontend workers, 3 data shards and 5 reader threads; the start log (`journalctl -u luradb`) reports the split and the memory of each shard.
+
+Memory: the block cache of each engine (64 MiB) and the buffer pool (`buffer_pool.pool_size`) are split evenly across the shards; the MemTable threshold (`lsm.memtable_size_threshold`) applies per engine and shard, so MemTable memory grows to engines × shards × threshold (plus MemTables being flushed).
+
+The shard count is fixed for a data directory: with `shards = 0` the service keeps the count the data was written with, also after an upgrade or a move to a host with another core count; a different count set explicitly refuses the start.
+
 ## Enabling HTTPS (quickstart)
 
 LuraDB can terminate TLS itself, on its own port (`tls_port`, default `3443`), in parallel to the plain HTTP listener. This is a quick start with a self-signed certificate; for a certificate from a public or internal CA (e.g. via `certbot`), just point `tls_cert_path`/`tls_key_path` at those files instead — or keep operating behind a reverse proxy.

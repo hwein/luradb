@@ -14,6 +14,7 @@ use super::error::RelStoreError;
 use super::types::{ColumnType, ScalarValue};
 use crate::engines::lsm::domain::now_secs;
 use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
+use crate::engines::lsm::reader::Snapshot;
 use crate::engines::StorageEngine;
 use crate::metrics::MetricsStore;
 use parking_lot::RwLock;
@@ -207,6 +208,14 @@ impl ColumnInput {
 pub struct TableInput {
     pub name: String,
     pub columns: Vec<ColumnInput>,
+}
+
+/// An index of a table being restored, under its stored name.
+#[derive(Debug, Clone)]
+pub struct IndexInput {
+    pub name: String,
+    pub column: String,
+    pub unique: bool,
 }
 
 /// Catalog limits: `max_tables_per_domain` from the `[rel]`
@@ -404,6 +413,113 @@ impl RelCatalog {
         self.metrics.record_rel_ddl_create();
         self.metrics.set_rel_catalog_objects(&dom.name, count as u64);
         Ok(schema)
+    }
+
+    /// Recreates a table from a backup with exactly the given columns and
+    /// indexes under their stored names: no implicit index is added and no
+    /// `REFERENCES` target is resolved, since a source catalog may legally
+    /// hold cycles, dangling targets and renamed implicit indexes. Ids are
+    /// assigned afresh, as in [`Self::create_table`].
+    pub async fn restore_table(
+        &self,
+        domains: &RelDomainRegistry,
+        domain: &str,
+        input: TableInput,
+        indexes: Vec<IndexInput>,
+    ) -> Result<TableSchema, RelStoreError> {
+        let name = normalize_identifier(&input.name)?;
+        let _guard = self.ddl_lock.lock().await;
+        let dom = domains.require_active(domain)?;
+        let prefix = dom.system_prefix.clone();
+        if self.entries.read().get(&prefix).is_some_and(|m| m.contains_key(&name)) {
+            return Err(RelStoreError::TableAlreadyExists { domain: dom.name.clone(), name });
+        }
+
+        let mut columns: Vec<ColumnDef> = Vec::with_capacity(input.columns.len());
+        for (idx, col) in input.columns.iter().enumerate() {
+            let cname = normalize_identifier(&col.name)?;
+            if columns.iter().any(|c| c.name == cname) {
+                return Err(RelStoreError::InvalidSchema(format!("duplicate column '{cname}'")));
+            }
+            Self::check_default(&cname, col.col_type, &col.default)?;
+            columns.push(ColumnDef {
+                name: cname,
+                col_id: (idx + 1) as u16,
+                col_type: col.col_type,
+                nullable: !col.primary_key && col.nullable,
+                primary_key: col.primary_key,
+                autoincrement: col.autoincrement,
+                unique: col.unique,
+                default: col.default.clone(),
+                references: col.references.clone(),
+            });
+        }
+        let pk_count = columns.iter().filter(|c| c.primary_key).count();
+        if pk_count != 1 {
+            return Err(RelStoreError::InvalidSchema(format!(
+                "table '{name}' must have exactly one primary key (has {pk_count})"
+            )));
+        }
+
+        let last = self.last_allocated_id(&dom.name, &prefix);
+        let new_last = (last as u64)
+            .checked_add(1 + indexes.len() as u64)
+            .filter(|v| *v <= u32::MAX as u64)
+            .ok_or_else(|| RelStoreError::IdSpaceExhausted(dom.name.clone()))? as u32;
+        let mut metas: Vec<IndexMeta> = Vec::with_capacity(indexes.len());
+        for (i, ix) in indexes.into_iter().enumerate() {
+            let index_name = normalize_identifier(&ix.name)?;
+            if self.index_name_taken(&prefix, &index_name) || metas.iter().any(|m| m.name == index_name) {
+                return Err(RelStoreError::IndexAlreadyExists { domain: dom.name.clone(), name: index_name });
+            }
+            let column = ix.column.to_ascii_lowercase();
+            if !columns.iter().any(|c| c.name == column) {
+                return Err(RelStoreError::ColumnNotFound { table: name, name: column });
+            }
+            metas.push(IndexMeta { name: index_name, index_id: last + 2 + i as u32, column, unique: ix.unique });
+        }
+
+        let schema = TableSchema {
+            name: name.clone(),
+            table_id: last + 1,
+            schema_version: 1,
+            next_col_id: columns.len() as u16 + 1,
+            columns,
+            indexes: metas,
+            created_at: now_secs(),
+        };
+        let entry = CatalogEntry::Table(schema.clone());
+        self.engine
+            .write_batch(vec![
+                BatchOp::Put { key: seq_key(&dom.name), value: serde_json::to_vec(&new_last)? },
+                BatchOp::Put { key: cat_key(&prefix, &name), value: serde_json::to_vec(&entry)? },
+            ])
+            .await?;
+        self.seq.write().insert(dom.name.clone(), new_last);
+        let count = self.cache_insert(prefix, name, entry);
+        self.metrics.record_rel_ddl_create();
+        self.metrics.set_rel_catalog_objects(&dom.name, count as u64);
+        Ok(schema)
+    }
+
+    /// The catalog objects stored under `prefix` as of `snapshot`, read from
+    /// storage rather than the cache; an unreadable entry is skipped, as on
+    /// recovery.
+    pub(crate) async fn entries_at(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<CatalogEntry>, RelStoreError> {
+        let mut scan = CAT_PREFIX.to_vec();
+        scan.extend_from_slice(prefix);
+        scan.push(b':');
+        let mut out = Vec::new();
+        for key in self.engine.scan_keys_with_snapshot(&scan, snapshot).await? {
+            let Some(bytes) = self.engine.get_with_snapshot(&key, snapshot).await?.into_option() else {
+                continue;
+            };
+            match serde_json::from_slice::<CatalogEntry>(&bytes) {
+                Ok(entry) => out.push(entry),
+                Err(e) => tracing::warn!("[RelCatalog] cannot deserialize catalog entry at {:?}: {e}", key),
+            }
+        }
+        Ok(out)
     }
 
     /// Stores a view's raw SELECT text unvalidated (binding → `view.rs`). Views

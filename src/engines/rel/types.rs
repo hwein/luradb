@@ -45,6 +45,19 @@ impl ColumnType {
             _ => None,
         }
     }
+
+    /// The canonical SQL type name, which [`Self::from_sql_name`] reads back.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            ColumnType::Integer => "INTEGER",
+            ColumnType::Real => "REAL",
+            ColumnType::Text => "TEXT",
+            ColumnType::Boolean => "BOOLEAN",
+            ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::KvRef => "KVREF",
+            ColumnType::JsonRef => "JSONREF",
+        }
+    }
 }
 
 /// A canonical scalar value — the shared basis for defaults and encoding.

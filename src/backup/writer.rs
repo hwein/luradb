@@ -1,6 +1,7 @@
 //! Backup export pipeline: scope resolution, one consistent cut per engine
 //! across the data shards, and the NDJSON writer (manifest -> kv-domains ->
-//! kv-pairs -> json-domains -> index-definitions -> docs -> auth -> checksum).
+//! kv-pairs -> json-domains -> index-definitions -> docs -> rel-domains ->
+//! tables -> views -> rows -> auth -> checksum).
 
 use super::{BackupError, BackupScope};
 use crate::auth::{DomainPermission, UserRecord, PREFIX_PERM, PREFIX_USER};
@@ -10,9 +11,10 @@ use crate::engines::json::IndexFieldType;
 use crate::engines::lsm::domain::now_secs;
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::{GetResult, Snapshot};
+use crate::engines::rel::{CatalogEntry, ColumnDef, DefaultValue, ScalarValue, TableSchema};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use crate::core::engine_runtime::{self, spawn_io};
 use std::path::Path;
@@ -42,6 +44,8 @@ pub(crate) struct ManifestLine {
     /// The newest read-snapshot stamp among the data shards.
     pub kv_snapshot_ts: u64,
     pub json_snapshot_ts: u64,
+    #[serde(default)]
+    pub rel_snapshot_ts: u64,
     pub encoding: String,
     pub schedule: Option<String>,
     /// Data shards of the server that wrote the archive; restore ignores it.
@@ -57,6 +61,8 @@ pub(crate) struct ManifestLine {
 pub(crate) struct LsnCut {
     pub kv: u64,
     pub json: u64,
+    #[serde(default)]
+    pub rel: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +106,131 @@ pub(crate) struct DocLine {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RelDomainLine {
+    pub t: String,
+    pub name: String,
+    pub created_at: u64,
+}
+
+/// A table's schema in the archive's own form: no internal ids, types by SQL
+/// name, every index under its stored name.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RelTableLine {
+    pub t: String,
+    pub domain: String,
+    pub name: String,
+    pub columns: Vec<RelColumn>,
+    pub indexes: Vec<RelIndex>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RelColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub col_type: String,
+    pub nullable: bool,
+    pub primary_key: bool,
+    pub autoincrement: bool,
+    pub unique: bool,
+    /// Absent: no default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<RelDefault>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum RelDefault {
+    Null,
+    CurrentTimestamp,
+    Literal { value: Value },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RelIndex {
+    pub name: String,
+    pub column: String,
+    pub unique: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RelViewLine {
+    pub t: String,
+    pub domain: String,
+    pub name: String,
+    pub sql: String,
+}
+
+/// One row, every column of the table by name.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RelRowLine {
+    pub t: String,
+    pub domain: String,
+    pub table: String,
+    pub row: Map<String, Value>,
+}
+
+/// The AUTOINCREMENT high-water mark of a table: the next insert without a
+/// key gets `hw + 1`.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RelSeqLine {
+    pub t: String,
+    pub domain: String,
+    pub table: String,
+    pub hw: u64,
+}
+
+impl RelTableLine {
+    fn new(domain: &str, schema: &TableSchema) -> Self {
+        Self {
+            t: "rel-table".to_string(),
+            domain: domain.to_string(),
+            name: schema.name.clone(),
+            columns: schema.columns.iter().map(RelColumn::new).collect(),
+            indexes: schema
+                .indexes
+                .iter()
+                .map(|ix| RelIndex { name: ix.name.clone(), column: ix.column.clone(), unique: ix.unique })
+                .collect(),
+        }
+    }
+}
+
+impl RelColumn {
+    fn new(c: &ColumnDef) -> Self {
+        let default = match &c.default {
+            DefaultValue::None => None,
+            DefaultValue::Null => Some(RelDefault::Null),
+            DefaultValue::CurrentTimestamp => Some(RelDefault::CurrentTimestamp),
+            DefaultValue::Literal(v) => Some(RelDefault::Literal { value: rel_value(v) }),
+        };
+        Self {
+            name: c.name.clone(),
+            col_type: c.col_type.sql_name().to_string(),
+            nullable: c.nullable,
+            primary_key: c.primary_key,
+            autoincrement: c.autoincrement,
+            unique: c.unique,
+            default,
+            references: c.references.clone(),
+        }
+    }
+}
+
+/// A relational value as the archive holds it; TIMESTAMP as integer
+/// milliseconds, which covers its whole range.
+pub(crate) fn rel_value(v: &ScalarValue) -> Value {
+    match v {
+        ScalarValue::Integer(i) | ScalarValue::Timestamp(i) => Value::from(*i),
+        ScalarValue::Real(f) => Value::from(*f),
+        ScalarValue::Text(s) => Value::from(s.clone()),
+        ScalarValue::Boolean(b) => Value::from(*b),
+        ScalarValue::Null => Value::Null,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ChecksumLine {
     pub t: String,
     pub sha256: String,
@@ -125,46 +256,71 @@ struct AuthPermLine<'a> {
 /// list can be empty for any scope — every domain of an engine may be
 /// deleted at runtime — and only means there is no *domain* data to export;
 /// auth records live outside any domain and still need the KV cut.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ResolvedScope {
     pub kv_domains: Vec<DomainEntry>,
     pub json_domains: Vec<DomainEntry>,
+    pub rel_domains: Vec<DomainEntry>,
 }
 
+/// A disabled engine has no domain in the directory, so `all` and
+/// `domain:<name>` leave it out on their own.
 pub(crate) fn resolve_scope(scope: &BackupScope, control: &ControlPlane) -> Result<ResolvedScope, BackupError> {
     let directory = control.directory();
     let json_enabled = control.shard_owners().any(|owners| owners.json.is_some());
+    let rel_enabled = control.shard_owners().any(|owners| owners.rel.is_some());
     let all = |engine| -> Vec<DomainEntry> {
         directory.domains(engine).filter(|d| d.state == Lifecycle::Active).cloned().collect()
     };
     let one = |engine, name: &str| directory.get(engine, name).filter(|d| d.state == Lifecycle::Active).cloned();
     let not_found = |name: &String| BackupError::DomainNotFound(name.clone());
     match scope {
-        BackupScope::All => Ok(ResolvedScope { kv_domains: all(Engine::Kv), json_domains: all(Engine::Json) }),
-        BackupScope::Kv => Ok(ResolvedScope { kv_domains: all(Engine::Kv), json_domains: Vec::new() }),
+        BackupScope::All => Ok(ResolvedScope {
+            kv_domains: all(Engine::Kv),
+            json_domains: all(Engine::Json),
+            rel_domains: all(Engine::Rel),
+        }),
+        BackupScope::Kv => Ok(ResolvedScope { kv_domains: all(Engine::Kv), ..ResolvedScope::default() }),
         BackupScope::Json => {
             if !json_enabled {
                 return Err(BackupError::JsonEngineDisabled);
             }
-            Ok(ResolvedScope { kv_domains: Vec::new(), json_domains: all(Engine::Json) })
+            Ok(ResolvedScope { json_domains: all(Engine::Json), ..ResolvedScope::default() })
+        }
+        BackupScope::Rel => {
+            if !rel_enabled {
+                return Err(BackupError::RelEngineDisabled);
+            }
+            Ok(ResolvedScope { rel_domains: all(Engine::Rel), ..ResolvedScope::default() })
         }
         BackupScope::KvDomain(name) => {
             let d = one(Engine::Kv, name).ok_or_else(|| not_found(name))?;
-            Ok(ResolvedScope { kv_domains: vec![d], json_domains: Vec::new() })
+            Ok(ResolvedScope { kv_domains: vec![d], ..ResolvedScope::default() })
         }
         BackupScope::JsonDomain(name) => {
             if !json_enabled {
                 return Err(BackupError::JsonEngineDisabled);
             }
             let d = one(Engine::Json, name).ok_or_else(|| not_found(name))?;
-            Ok(ResolvedScope { kv_domains: Vec::new(), json_domains: vec![d] })
+            Ok(ResolvedScope { json_domains: vec![d], ..ResolvedScope::default() })
+        }
+        BackupScope::RelDomain(name) => {
+            if !rel_enabled {
+                return Err(BackupError::RelEngineDisabled);
+            }
+            let d = one(Engine::Rel, name).ok_or_else(|| not_found(name))?;
+            Ok(ResolvedScope { rel_domains: vec![d], ..ResolvedScope::default() })
         }
         BackupScope::Domain(name) => {
-            let (kv_d, json_d) = (one(Engine::Kv, name), one(Engine::Json, name));
-            if kv_d.is_none() && json_d.is_none() {
+            let resolved = ResolvedScope {
+                kv_domains: one(Engine::Kv, name).into_iter().collect(),
+                json_domains: one(Engine::Json, name).into_iter().collect(),
+                rel_domains: one(Engine::Rel, name).into_iter().collect(),
+            };
+            if resolved.kv_domains.is_empty() && resolved.json_domains.is_empty() && resolved.rel_domains.is_empty() {
                 return Err(not_found(name));
             }
-            Ok(ResolvedScope { kv_domains: kv_d.into_iter().collect(), json_domains: json_d.into_iter().collect() })
+            Ok(resolved)
         }
     }
 }
@@ -257,7 +413,13 @@ async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyho
     // One cut per engine, held for the whole export so compaction keeps every
     // version it reads; it holds back no write. `None` when that engine has
     // nothing to export in this scope. The auth records come from the system
-    // store as of the KV cut.
+    // store as of the KV cut. The relational cut comes first: a link that
+    // exists in it then finds its target in the later ones.
+    let rel_cut = if !params.resolved.rel_domains.is_empty() {
+        Some(params.control.consistent_cut(Engine::Rel).await?)
+    } else {
+        None
+    };
     let kv_cut = if !params.resolved.kv_domains.is_empty() || export_auth {
         Some(params.control.consistent_cut(Engine::Kv).await?)
     } else {
@@ -283,24 +445,30 @@ async fn write_backup_file(part_path: &Path, params: &BackupParams<'_>) -> anyho
         include_auth: export_auth,
         kv_snapshot_ts: kv_cut.as_ref().map_or(0, Cut::max_stamp),
         json_snapshot_ts: json_cut.as_ref().map_or(0, Cut::max_stamp),
+        rel_snapshot_ts: rel_cut.as_ref().map_or(0, Cut::max_stamp),
         encoding: "hex".to_string(),
         schedule: params.schedule.map(|s| s.to_string()),
         shards: params.control.shard_count(),
         lsn_cut: LsnCut {
             kv: kv_cut.as_ref().map_or(0, |cut| cut.s),
             json: json_cut.as_ref().map_or(0, |cut| cut.s),
+            rel: rel_cut.as_ref().map_or(0, |cut| cut.s),
         },
     };
     write_line(&mut out, &mut hasher, &mut lines, &manifest).await?;
 
-    // Binding section order: kv sections, then json sections, then auth,
-    // then the checksum line.
+    // Binding section order: kv sections, then json sections, then rel
+    // sections, then auth, then the checksum line.
     if let Some(cut) = &kv_cut {
         write_kv_section(&mut out, &mut hasher, &mut lines, params, cut).await?;
     }
 
     if let Some(cut) = &json_cut {
         write_json_section(&mut out, &mut hasher, &mut lines, params, cut).await?;
+    }
+
+    if let Some(cut) = &rel_cut {
+        write_rel_section(&mut out, &mut hasher, &mut lines, params, cut).await?;
     }
 
     if let (true, Some(cut)) = (export_auth, &kv_cut) {
@@ -450,6 +618,76 @@ async fn write_json_section(
     Ok(())
 }
 
+/// Per relational domain: the domain, its tables by id, its views by creation
+/// (then name), then per table its rows in key order and, with an
+/// AUTOINCREMENT column, its high-water mark.
+async fn write_rel_section(
+    out: &mut PartFile,
+    hasher: &mut Sha256,
+    lines: &mut u64,
+    params: &BackupParams<'_>,
+    cut: &Cut,
+) -> anyhow::Result<()> {
+    for domain in &params.resolved.rel_domains {
+        let name = &domain.name;
+        write_line(
+            out,
+            hasher,
+            lines,
+            &RelDomainLine { t: "rel-domain".to_string(), name: name.clone(), created_at: domain.created_at },
+        )
+        .await?;
+
+        let snapshot = cut.read_of(params.control.shard_of(name));
+        let rel = params.control.owners_of(name).rel.as_ref().context("the relational engine is disabled")?;
+        let mut tables = Vec::new();
+        let mut views = Vec::new();
+        for entry in rel.catalog_at(name, snapshot).await? {
+            match entry {
+                CatalogEntry::Table(t) => tables.push(t),
+                CatalogEntry::View(v) => views.push(v),
+            }
+        }
+        tables.sort_by_key(|t| t.table_id);
+        views.sort_by(|a, b| (a.created_at, &a.name).cmp(&(b.created_at, &b.name)));
+
+        for table in &tables {
+            write_line(out, hasher, lines, &RelTableLine::new(name, table)).await?;
+        }
+        for view in views {
+            let line = RelViewLine { t: "rel-view".to_string(), domain: name.clone(), name: view.name, sql: view.sql };
+            write_line(out, hasher, lines, &line).await?;
+        }
+
+        let mut coop = YieldEvery::new(EXPORT_KEY_YIELD_INTERVAL);
+        for table in &tables {
+            let mut scan = rel.rows_at(name, table, snapshot).await?;
+            let mut i = 0;
+            loop {
+                let group = scan.next_group(params.scan_batch_size).await?;
+                if group.is_empty() {
+                    break;
+                }
+                for values in group {
+                    coop.tick().await;
+                    let row = table.columns.iter().zip(&values).map(|(c, v)| (c.name.clone(), rel_value(v))).collect();
+                    let line =
+                        RelRowLine { t: "rel-row".to_string(), domain: name.clone(), table: table.name.clone(), row };
+                    write_line(out, hasher, lines, &line).await?;
+                    maybe_pause(i, params.scan_batch_size, params.scan_pause_ms).await;
+                    i += 1;
+                }
+            }
+            if table.columns.iter().any(|c| c.autoincrement) {
+                let hw = rel.autoincrement_hw_at(name, table.table_id, snapshot).await?;
+                let line = RelSeqLine { t: "rel-seq".to_string(), domain: name.clone(), table: table.name.clone(), hw };
+                write_line(out, hasher, lines, &line).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Serializes one line, appends `\n`, writes it, and feeds the exact bytes,
 /// including the trailing newline, into the running checksum.
 async fn write_line(
@@ -557,19 +795,30 @@ mod tests {
             include_auth: true,
             kv_snapshot_ts: 7,
             json_snapshot_ts: 9,
+            rel_snapshot_ts: 11,
             encoding: "hex".to_string(),
             schedule: Some("nightly".to_string()),
             shards: 3,
-            lsn_cut: LsnCut { kv: 41, json: 12 },
+            lsn_cut: LsnCut { kv: 41, json: 12, rel: 5 },
         };
         let line = serde_json::to_string(&manifest).unwrap();
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["format_version"], json!(2));
         assert_eq!(value["shards"], json!(3));
-        assert_eq!(value["lsn_cut"], json!({"kv": 41, "json": 12}));
+        assert_eq!(value["lsn_cut"], json!({"kv": 41, "json": 12, "rel": 5}));
+        assert_eq!(value["rel_snapshot_ts"], json!(11));
         let back: ManifestLine = serde_json::from_str(&line).unwrap();
-        assert_eq!((back.shards, back.lsn_cut), (3, LsnCut { kv: 41, json: 12 }));
+        assert_eq!((back.shards, back.lsn_cut), (3, LsnCut { kv: 41, json: 12, rel: 5 }));
         assert_eq!((back.kv_snapshot_ts, back.json_snapshot_ts, back.schedule.as_deref()), (7, 9, Some("nightly")));
+
+        // A version 2 manifest written before relational data was archived.
+        let v2 = json!({
+            "t": "manifest", "format_version": 2, "id": "bk_v2", "created_at": 1, "luradb_version": "0.5.0",
+            "scope": "all", "include_auth": false, "kv_snapshot_ts": 5, "json_snapshot_ts": 6, "encoding": "hex",
+            "schedule": null, "shards": 2, "lsn_cut": {"kv": 3, "json": 4},
+        });
+        let older: ManifestLine = serde_json::from_value(v2).unwrap();
+        assert_eq!((older.rel_snapshot_ts, older.lsn_cut), (0, LsnCut { kv: 3, json: 4, rel: 0 }));
 
         let v1 = json!({
             "t": "manifest", "format_version": 1, "id": "bk_old", "created_at": 1, "luradb_version": "0.4.0",
@@ -1061,5 +1310,40 @@ mod tests {
             assert!(a_only > 0, "no backup fell between the two writes");
             assert!(both > 0, "no backup held both writes");
         })
+    }
+
+    #[test]
+    fn real_values_come_back_from_the_archive_bit_for_bit() {
+        use crate::engines::rel::dml::coerce_json;
+        use crate::engines::rel::ColumnType;
+
+        let mut values = vec![
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::from_bits(0x000f_ffff_ffff_ffff),
+            f64::MAX,
+            f64::MIN,
+            f64::EPSILON,
+            0.1 + 0.2,
+            -0.0,
+            0.0,
+        ];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        while values.len() < 10_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let f = f64::from_bits(state);
+            if f.is_finite() {
+                values.push(f);
+            }
+        }
+        for f in values {
+            let line = serde_json::to_string(&rel_value(&ScalarValue::Real(f))).unwrap();
+            let parsed: Value = serde_json::from_str(&line).unwrap();
+            let back = coerce_json(ColumnType::Real, &parsed, "r").unwrap();
+            let ScalarValue::Real(back) = back else { panic!("{f:e}: got {back:?}") };
+            assert_eq!(back.to_bits(), f.to_bits(), "{f:e} came back as {back:e} via {line}");
+        }
     }
 }

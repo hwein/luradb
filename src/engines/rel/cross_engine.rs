@@ -301,7 +301,15 @@ impl RelCrossEngineSweeper {
         Self { engine, batch_size }
     }
 
+    fn restore_running(&self) -> bool {
+        self.engine.control.get().is_some_and(|control| control.restore_running())
+    }
+
+    /// Skipped while a restore runs: a domain it replaces is briefly gone.
     pub async fn sweep_tick(&self) -> anyhow::Result<()> {
+        if self.restore_running() {
+            return Ok(());
+        }
         for dom in self.engine.domains.list_domains() {
             // `list_domains` surfaces `Deleting` domains too; the domain
             // purger owns those (it tombstones every row), so the
@@ -371,9 +379,11 @@ impl RelCrossEngineSweeper {
             // the rel domain is still active. If the domain purger is
             // finalizing this domain, stop — otherwise this row rewrite could
             // land after the domain was emptied and orphan a `ROW:` key.
+            // The restore flag is read again after the target was seen gone:
+            // a restore sets it before it removes a domain, so the flag shows.
             {
                 let _wg = self.engine.write_guard.lock().await;
-                if self.engine.domains.require_active(&dom.name).is_err() {
+                if self.engine.domains.require_active(&dom.name).is_err() || self.restore_running() {
                     break;
                 }
                 engine.write_batch(ops).await?;
@@ -1525,6 +1535,51 @@ mod tests {
             e.json.create_domain("d").await.unwrap();
             let r = rows(&e.rel, "d", "SELECT doc FROM t WHERE id = 1").await;
             assert_eq!(r[0][0], ScalarValue::Null, "nulled stays nulled");
+        })
+    }
+
+    // A tick that already passed the restore check at its start still finds
+    // the target gone later; it must leave the links alone while a restore runs.
+    #[test]
+    fn test_sweep_after_gone_target_writes_nothing_while_a_restore_runs() {
+        crate::core::engine_runtime::block_on(async {
+            let e = env().await;
+            e.rel.create_domain("d").await.unwrap();
+            e.kv.create_domain("d").await.unwrap();
+            e.json.create_domain("d").await.unwrap();
+            kv_put(&e.kv, "d", b"k", b"v").await;
+            e.json.put_document("d", "j1", json!({"a": 1})).await.unwrap();
+            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF, doc JSONREF)").await;
+            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k', 'j1')").await;
+
+            // KV target Deleting, JSON target missing altogether.
+            e.kv.delete_domain("d").await.unwrap();
+            e.json.delete_domain("d").await.unwrap();
+            let purger = JsonDomainPurger::new(Arc::clone(&e.json), 100);
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
+            assert!(e.json.get_domain_any("d").is_none());
+
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
+            let (control, _) = crate::control::testing::start(
+                e._dir.path(),
+                Arc::clone(&e.kv),
+                Some(Arc::clone(&e.json)),
+                Some(Arc::clone(&e.rel)),
+                bus,
+            )
+            .await;
+            let sweeper = RelCrossEngineSweeper::new(Arc::clone(&e.rel), 100);
+            let dom = e.rel.get_domain("d").unwrap();
+            let running = control.mark_restore_running();
+            sweeper.sweep_domain(&dom).await.unwrap();
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Text("k".into()));
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Text("j1".into()));
+
+            drop(running);
+            sweeper.sweep_domain(&dom).await.unwrap();
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Null);
         })
     }
 }

@@ -18,6 +18,7 @@ use crate::metrics::MetricsSample;
 use anyhow::Context;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -418,6 +419,17 @@ pub struct ControlPlane {
     /// One held round at a time: two whose commands reach the shards in
     /// different orders would each hold one shard and wait for the other.
     rounds: tokio::sync::Mutex<()>,
+    /// Set while a restore job runs; see [`Self::restore_running`].
+    restoring: AtomicBool,
+}
+
+/// Marks a restore as running until it drops, on every exit path.
+pub(crate) struct RestoreRunning<'a>(&'a ControlPlane);
+
+impl Drop for RestoreRunning<'_> {
+    fn drop(&mut self) {
+        self.0.restoring.store(false, Ordering::SeqCst);
+    }
 }
 
 impl ControlPlane {
@@ -435,6 +447,7 @@ impl ControlPlane {
             system,
             shards,
             rounds: tokio::sync::Mutex::new(()),
+            restoring: AtomicBool::new(false),
         });
         for Shard { owners, .. } in &control.shards {
             owners.kv.attach_control_plane(Arc::clone(&control));
@@ -583,6 +596,19 @@ impl ControlPlane {
 
     pub fn system_store(&self) -> &Arc<LsmStorageEngine> {
         &self.system
+    }
+
+    /// Whether a restore job runs. A restore that replaces a domain leaves it
+    /// briefly deleted, so the link sweep of the relational engine waits
+    /// meanwhile instead of clearing links to it for good.
+    pub fn restore_running(&self) -> bool {
+        self.restoring.load(Ordering::SeqCst)
+    }
+
+    /// Marks a restore as running until the returned guard drops.
+    pub(crate) fn mark_restore_running(&self) -> RestoreRunning<'_> {
+        self.restoring.store(true, Ordering::SeqCst);
+        RestoreRunning(self)
     }
 
     /// Creates a domain; `require_conditional_writes` has no effect on a
@@ -1696,6 +1722,7 @@ mod tests {
             system: system::open(&dir.path().join("sys")).await.unwrap(),
             shards: Vec::new(),
             rounds: tokio::sync::Mutex::new(()),
+            restoring: AtomicBool::new(false),
         };
         (control, inbox)
     }

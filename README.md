@@ -191,6 +191,22 @@ leave `[multicore].shards` at `0` or set it to the new count. A tool that
 stops halfway is finished by running the same command again; until then the
 server refuses to start. Backups restore into any shard count.
 
+## Backups
+
+A backup (`POST /store-api/backups`, or a schedule in `[backup]`) is a
+logical NDJSON archive of key-value, JSON and relational domains: keys,
+documents with their index definitions, and tables with their rows,
+indexes, views and AUTOINCREMENT state. The scope picks what goes in: `all`,
+one engine (`kv`, `json`, `rel`), one domain of one engine (`kv:<domain>`,
+`json:<domain>`, `rel:<domain>`) or one domain name in every engine
+(`domain:<name>`).
+
+KVREF and JSONREF columns link to the KV and JSON domain of the same name.
+They resolve after a restore when that domain is restored too or already
+exists; otherwise they read as missing and are cleared, as after deleting
+that domain. A restore
+under a new name (`into_domain`) links them to the domains of the new name.
+
 ## License
 
 LuraDB is Fair Source (FSL-1.1-ALv2): free to use, modify and redistribute

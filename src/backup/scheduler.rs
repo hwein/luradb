@@ -369,6 +369,7 @@ mod tests {
             include_auth: false,
             kv_snapshot_ts: 0,
             json_snapshot_ts: 0,
+            rel_snapshot_ts: 0,
             encoding: "hex".to_string(),
             schedule: schedule.map(|s| s.to_string()),
             shards: 1,

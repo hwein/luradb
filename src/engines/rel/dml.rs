@@ -93,10 +93,20 @@ pub(super) struct RowPlan {
 
 impl RowPlan {
     /// Builds an already-resolved row (no AUTOINCREMENT fill-in needed) — the
-    /// shape the from-file import stages via [`RelEngine::stage_insert_row`].
+    /// shape the from-file import and a restore stage via
+    /// [`RelEngine::stage_insert_row`].
     pub(super) fn new(values: HashMap<u16, ScalarValue>) -> Self {
         Self { values, needs_auto: false }
     }
+}
+
+/// Which checks [`RelEngine::stage_insert_row`] runs on a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InsertChecks {
+    All,
+    /// A row from a backup: its `REFERENCES` targets and cross-engine links
+    /// held in the source and are not checked again.
+    Restore,
 }
 
 impl RelEngine {
@@ -192,7 +202,18 @@ impl RelEngine {
         for row in &rows {
             coop.tick().await;
             let pk_v = self
-                .stage_insert_row(domain, &schema, prefix, row, snap, &mut seen_pk, &mut seen_unique, &mut ops, auth)
+                .stage_insert_row(
+                    domain,
+                    &schema,
+                    prefix,
+                    row,
+                    snap,
+                    &mut seen_pk,
+                    &mut seen_unique,
+                    &mut ops,
+                    auth,
+                    InsertChecks::All,
+                )
                 .await?;
             if single {
                 last_pk = Some(pk_v);
@@ -213,8 +234,8 @@ impl RelEngine {
 
     /// One INSERT row's checks and batch ops: NOT NULL/text size
     /// → PK dup → row size → UNIQUE → REFERENCES → cross-engine links → index
-    /// entries → row `Put`. Returns the row's PK, for `exec_insert`'s
-    /// single-row `last_pk`.
+    /// entries → row `Put`; `checks` may skip the two link checks. Returns
+    /// the row's PK, for `exec_insert`'s single-row `last_pk`.
     pub(super) async fn stage_insert_row(
         &self,
         domain: &str,
@@ -226,6 +247,7 @@ impl RelEngine {
         seen_unique: &mut HashSet<(u32, Vec<u8>)>,
         ops: &mut Vec<BatchOp>,
         auth: LinkAuth,
+        checks: InsertChecks,
     ) -> Result<ScalarValue, RelStoreError> {
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
         self.validate_not_null_and_text(schema, &row.values)?;
@@ -252,8 +274,10 @@ impl RelEngine {
         }
 
         self.check_row_unique(schema, &row.values, prefix, &pk_enc, seen_unique).await?;
-        self.check_row_references(domain, schema, &row.values, prefix, snap).await?;
-        self.check_row_cross_engine_links(domain, schema, &row.values, auth).await?;
+        if checks == InsertChecks::All {
+            self.check_row_references(domain, schema, &row.values, prefix, snap).await?;
+            self.check_row_cross_engine_links(domain, schema, &row.values, auth).await?;
+        }
 
         for k in row_index_keys(schema, &row.values, prefix, &pk_enc) {
             self.guard_key_len(&k)?;
@@ -657,7 +681,7 @@ impl RelEngine {
         }
     }
 
-    async fn read_seq(
+    pub(super) async fn read_seq(
         &self,
         prefix: &[u8],
         table_id: u32,
@@ -879,7 +903,7 @@ pub(super) fn coerce_literal(t: ColumnType, lit: &Literal, ctx: &str) -> Result<
     }
 }
 
-pub(super) fn coerce_json(t: ColumnType, v: &Value, ctx: &str) -> Result<ScalarValue, RelStoreError> {
+pub(crate) fn coerce_json(t: ColumnType, v: &Value, ctx: &str) -> Result<ScalarValue, RelStoreError> {
     match v {
         Value::Null => Ok(ScalarValue::Null),
         Value::Bool(b) => match t.physical_type() {

@@ -71,6 +71,10 @@ impl From<BackupError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "503 Service Unavailable: scope requires the JSON engine, which is disabled (json.enabled = false)",
             ),
+            BackupError::RelEngineDisabled => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "503 Service Unavailable: scope requires the relational engine, which is disabled (rel.enabled = false)",
+            ),
             BackupError::InvalidId(id) => {
                 ApiError::new(StatusCode::BAD_REQUEST, format!("400 Bad Request: invalid backup id '{id}'"))
             }
@@ -115,8 +119,10 @@ fn log_audit(admin: &Option<String>, action: &str, backup_id: &str) {
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateBackupRequest {
-    /// `all` | `kv` | `json` | `kv:<domain>` | `json:<domain>` | `domain:<name>`.
-    /// Covers the KV and JSON engines only — relational data is never included.
+    /// `all` | `kv` | `json` | `rel` | `kv:<domain>` | `json:<domain>` |
+    /// `rel:<domain>` | `domain:<name>`. `all` covers every enabled engine;
+    /// `domain:<name>` covers the domain of that name in each engine that has
+    /// it. Relational domains go in with schema, rows and AUTOINCREMENT state.
     pub scope: String,
     /// Only effective for `all`/`kv` scopes (auth records live in the KV instance).
     #[serde(default)]
@@ -200,6 +206,10 @@ pub struct BackupDetailResponse {
     /// The newest read-snapshot stamp of the JSON engine among the data shards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json_snapshot_ts: Option<u64>,
+    /// The newest read-snapshot stamp of the relational engine among the
+    /// data shards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rel_snapshot_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
     /// Data shards of the server that wrote the archive; 0 for format
@@ -221,6 +231,7 @@ pub struct BackupDetailResponse {
 pub struct LsnCutResponse {
     pub kv: u64,
     pub json: u64,
+    pub rel: u64,
 }
 
 impl BackupDetailResponse {
@@ -237,6 +248,7 @@ impl BackupDetailResponse {
             include_auth: None,
             kv_snapshot_ts: None,
             json_snapshot_ts: None,
+            rel_snapshot_ts: None,
             encoding: None,
             shards: None,
             lsn_cut: None,
@@ -257,9 +269,14 @@ impl BackupDetailResponse {
             include_auth: Some(manifest.include_auth),
             kv_snapshot_ts: Some(manifest.kv_snapshot_ts),
             json_snapshot_ts: Some(manifest.json_snapshot_ts),
+            rel_snapshot_ts: Some(manifest.rel_snapshot_ts),
             encoding: Some(manifest.encoding),
             shards: Some(manifest.shards),
-            lsn_cut: Some(LsnCutResponse { kv: manifest.lsn_cut.kv, json: manifest.lsn_cut.json }),
+            lsn_cut: Some(LsnCutResponse {
+                kv: manifest.lsn_cut.kv,
+                json: manifest.lsn_cut.json,
+                rel: manifest.lsn_cut.rel,
+            }),
             started_at: None,
         }
     }
@@ -278,7 +295,9 @@ pub struct RestoreRequest {
     #[serde(default)]
     pub mode: Option<String>,
     /// Only legal when the archive contains exactly one domain name
-    /// (`kv:*`/`json:*`/`domain:*` scopes).
+    /// (`kv:*`/`json:*`/`rel:*`/`domain:*` scopes). Links of relational
+    /// tables (KVREF/JSONREF) then point to the KV and JSON domain of the new
+    /// name.
     pub into_domain: Option<String>,
     /// Apply auth-user/auth-perm lines from the archive (upsert). Default false.
     #[serde(default)]
@@ -351,7 +370,7 @@ fn parse_restore_mode(s: &str) -> Result<restore::RestoreMode, ApiError> {
         (status = 400, description = "Invalid scope", body = String, content_type = "text/plain"),
         (status = 404, description = "Scope targets a missing domain", body = String, content_type = "text/plain"),
         (status = 409, description = "A backup or restore job is already running", body = String, content_type = "text/plain"),
-        (status = 503, description = "Backup is disabled, or scope requires the JSON engine, which is disabled", body = String, content_type = "text/plain"),
+        (status = 503, description = "Backup is disabled, or scope requires the JSON or relational engine, which is disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Backup"
 )]
@@ -438,19 +457,39 @@ pub async fn get_backup(
 /// - `shards`: data shards of the server that wrote it. Informational only:
 ///   a restore places every domain by the shard count of the server it runs
 ///   on, so an archive restores into any shard count.
-/// - `lsn_cut`: `{kv, json}`, per engine a write-ahead-log position that
+/// - `lsn_cut`: `{kv, json, rel}`, per engine a write-ahead-log position that
 ///   every write in the archive is at or below (a lower bound of the cut);
 ///   0 for an engine outside the scope. Positions restart at 1 after a clean
 ///   shutdown, so they compare only within one run of the server.
-/// - `kv_snapshot_ts`, `json_snapshot_ts`: per engine, the newest
-///   read-snapshot stamp among the data shards; 0 for an engine outside the
-///   scope.
+/// - `kv_snapshot_ts`, `json_snapshot_ts`, `rel_snapshot_ts`: per engine,
+///   the newest read-snapshot stamp among the data shards; 0 for an engine
+///   outside the scope.
 ///
 /// All shards of one engine are read at one consistent cut: an archive that
-/// holds a write holds every write confirmed before it. Domain lines carry
-/// their domain's name; auth records form a section of their own; the last
-/// line is the checksum. Archives of format version 1, which lack `shards`
-/// and `lsn_cut`, remain restorable.
+/// holds a write holds every write confirmed before it. The relational cut
+/// is taken before the KV and JSON cuts. Domain lines carry their domain's
+/// name; sections follow in the order KV, JSON, relational, auth; the last
+/// line is the checksum.
+///
+/// A relational domain is a `rel-domain` line (`name`, `created_at`), then
+/// its tables by creation, its views, and per table its rows and
+/// AUTOINCREMENT state:
+/// - `rel-table`: `domain`, `name`, `columns` (each `name`, `type` as SQL
+///   type name, `nullable`, `primary_key`, `autoincrement`, `unique`, an
+///   optional `default` of `{"kind": "null"}`, `{"kind":
+///   "current_timestamp"}` or `{"kind": "literal", "value": …}`, an optional
+///   `references` naming the target table) and `indexes` (`name`, `column`,
+///   `unique`; every index under its stored name).
+/// - `rel-view`: `domain`, `name`, `sql`, the stored SELECT text.
+/// - `rel-row`: `domain`, `table`, `row`, every column by name, NULL as
+///   `null`, KVREF/JSONREF links as stored.
+/// - `rel-seq`: `domain`, `table`, `hw`: the next insert without a key gets
+///   `hw + 1`.
+///
+/// Values are JSON numbers (INTEGER, REAL), booleans, strings (TEXT, KVREF,
+/// JSONREF) and, for TIMESTAMP, integer milliseconds since the Unix epoch.
+/// Archives of format version 1, which lack `shards` and `lsn_cut`, and
+/// archives without relational lines remain restorable.
 pub async fn download_backup(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -625,8 +664,7 @@ pub async fn restore_backup(
         .into());
     }
     if body.into_domain.is_some() {
-        let single_domain =
-            summary.scope.starts_with("kv:") || summary.scope.starts_with("json:") || summary.scope.starts_with("domain:");
+        let single_domain = ["kv:", "json:", "rel:", "domain:"].iter().any(|prefix| summary.scope.starts_with(prefix));
         if !single_domain {
             return Err(BackupError::RemapRequiresSingleDomain.into());
         }
@@ -1337,6 +1375,29 @@ mod tests {
         })
     }
 
+    // A relational scope on a server without the relational engine answers
+    // 503 and starts no job; a relational scope without a domain name is 400.
+    #[test]
+    fn test_relational_scope_without_the_engine_is_503() {
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
+            let manager = Arc::clone(state.backup_manager.as_ref().unwrap());
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
+
+            for scope in ["rel", "rel:shop"] {
+                let body = format!(r#"{{"scope":"{scope}"}}"#);
+                let (status, resp) = request(&app, Method::POST, "/store-api/backups", Some(&body), None).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{scope}: {resp}");
+                assert!(resp.contains("relational engine, which is disabled"), "{scope}: {resp}");
+            }
+            assert!(manager.running_job().is_none());
+
+            let (status, resp) =
+                request(&app, Method::POST, "/store-api/backups", Some(r#"{"scope":"rel:"}"#), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        })
+    }
+
     /// Polls `GET /backups/{id}` until it is no longer "running" (bounded,
     /// direction-stable, not a tight timing window).
     async fn wait_for_backup_completion(app: &Router, id: &str) -> serde_json::Value {
@@ -1395,6 +1456,7 @@ mod tests {
             include_auth: false,
             kv_snapshot_ts: 0,
             json_snapshot_ts: 0,
+            rel_snapshot_ts: 0,
             encoding: "hex".to_string(),
             schedule: schedule.map(|s| s.to_string()),
             shards: 1,

@@ -22,6 +22,7 @@ All notable changes to LuraDB are documented in this file.
 - Multi-shard mode: `[multicore].shards` spreads domain writes over N engine threads; `0` keeps the count a data directory was written with, a new directory gets cores / 4 (at most 8).
 - `luradb --migrate-shards N` changes the shard count of a data directory offline.
 - The server refuses to start on a data directory that another LuraDB process uses.
+- **BREAKING** API: Backups include relational domains (schema, rows, AUTOINCREMENT state); scope accepts `rel` and `rel:<domain>`.
 
 ### Changed
 
@@ -78,6 +79,7 @@ All notable changes to LuraDB are documented in this file.
 - A write-ahead log whose cleanup after a failed append also failed is cut on the next start, before recovery reads it.
 - A write admitted just before its KV domain was deleted is refused with 410 instead of leaving an orphaned key.
 - Writes no longer stall for minutes while the SHM snapshot of a large domain is built.
+- A restore that replaces a KV or JSON domain no longer clears links to it from relational tables.
 
 ### Security
 

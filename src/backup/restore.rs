@@ -4,14 +4,16 @@
 
 use super::writer::{
     is_supported_format, maybe_pause, ChecksumLine, DocLine, JsonDomainLine, JsonIndexLine, KvDomainLine, KvLine,
-    ManifestLine,
+    ManifestLine, RelDefault, RelDomainLine, RelRowLine, RelSeqLine, RelTableLine, RelViewLine,
 };
 use super::{BackupError, MAX_LINE_BYTES};
 use crate::auth::{DomainPermission, UserRecord};
 use crate::control::{AuthChange, ControlPlane, Engine};
 use crate::engines::json::{JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{now_secs, DomainRegistry, DomainStore};
-use serde_json::Value;
+use crate::engines::rel::dml::coerce_json;
+use crate::engines::rel::{ColumnInput, ColumnType, DefaultValue, IndexInput, RelDomainState, RelEngine, TableInput};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -89,17 +91,22 @@ fn short_label(mut key: String) -> String {
 /// Runs the full restore: checksum-verify the archive, prepare (create or
 /// replace) every target domain, then stream-apply the data. Each domain
 /// goes to the data shard that owns it on this server, whatever shard count
-/// wrote the archive. Per-entry failures are counted in the returned
-/// [`RestoreOutcome`] and the job keeps going; an `Err` here means an
-/// engine-level failure aborted the whole job.
+/// wrote the archive. Per-entry KV and JSON failures are counted in the
+/// returned [`RestoreOutcome`] and the job keeps going; an `Err` here means
+/// an engine-level failure or a failed relational line aborted the whole
+/// job. The control plane counts the restore as running until it ends.
 pub(crate) async fn run_restore(params: RestoreParams<'_>) -> anyhow::Result<RestoreOutcome> {
+    let _running = params.control.mark_restore_running();
     let path = params.dir.join(format!("{}.ndjson", params.backup_id));
 
     let scan = verify_and_scan(&path).await?;
-    // An archive with JSON sections cannot be applied without the JSON
-    // engine — silently dropping those sections would be data loss.
+    // An archive with JSON or relational sections cannot be applied without
+    // that engine — silently dropping those sections would be data loss.
     if !scan.json_domains.is_empty() && !json_enabled(params.control) {
         return Err(BackupError::JsonEngineDisabled.into());
+    }
+    if !scan.rel_domains.is_empty() && !params.control.shard_owners().any(|owners| owners.rel.is_some()) {
+        return Err(BackupError::RelEngineDisabled.into());
     }
     let remap = build_remap(params.into_domain, &scan)?;
 
@@ -117,9 +124,15 @@ fn json_of<'c>(control: &'c ControlPlane, domain: &str) -> anyhow::Result<&'c Ar
     control.owners_of(domain).json.as_ref().ok_or_else(|| BackupError::JsonEngineDisabled.into())
 }
 
+/// The relational engine of the data shard that owns `domain`.
+fn rel_of<'c>(control: &'c ControlPlane, domain: &str) -> anyhow::Result<&'c Arc<RelEngine>> {
+    control.owners_of(domain).rel.as_ref().ok_or_else(|| BackupError::RelEngineDisabled.into())
+}
+
 pub(crate) struct ArchiveScan {
     kv_domains: Vec<String>,
     json_domains: Vec<String>,
+    rel_domains: Vec<String>,
     /// Exposed for the "manifest fields" response of POST
     /// /backups/upload — restore itself only needs the
     /// domain-name lists above.
@@ -127,7 +140,7 @@ pub(crate) struct ArchiveScan {
 }
 
 /// Full read pass ahead of any write: verifies the SHA-256 checksum line
-/// and, along the way, collects every kv-domain/json-domain name — needed
+/// and, along the way, collects every kv-, json- and rel-domain name — needed
 /// up front so `fail_if_exists`/`replace` and the `into_domain` single-name
 /// check can run before any write in pass 2. Data lines naming an
 /// undeclared domain are rejected here: the apply pass takes its target from
@@ -141,8 +154,10 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
     let mut line_count: u64 = 0;
     let mut kv_domains: Vec<String> = Vec::new();
     let mut json_domains: Vec<String> = Vec::new();
+    let mut rel_domains: Vec<String> = Vec::new();
     let mut kv_refs: HashSet<String> = HashSet::new();
     let mut json_refs: HashSet<String> = HashSet::new();
+    let mut rel_refs: HashSet<String> = HashSet::new();
     let mut saw_checksum = false;
     let mut manifest_line: Option<ManifestLine> = None;
     let mut raw: Vec<u8> = Vec::new();
@@ -207,8 +222,13 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
                 let line: JsonDomainLine = parse_line(value)?;
                 json_domains.push(line.name);
             }
+            "rel-domain" => {
+                let line: RelDomainLine = parse_line(value)?;
+                rel_domains.push(line.name);
+            }
             "kv" => collect_ref(&value, &mut kv_refs),
             "doc" | "json-index" => collect_ref(&value, &mut json_refs),
+            "rel-table" | "rel-view" | "rel-row" | "rel-seq" => collect_ref(&value, &mut rel_refs),
             _ => {}
         }
 
@@ -239,10 +259,14 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
             .into());
         }
     }
+    if let Some(name) = rel_refs.iter().find(|name| !rel_domains.contains(name)) {
+        return Err(BackupError::InvalidBackupFile(format!("relational data for undeclared domain '{name}'")).into());
+    }
 
     Ok(ArchiveScan {
         kv_domains,
         json_domains,
+        rel_domains,
         manifest: manifest_line.expect("checked above: the first line is always a manifest when saw_checksum is true"),
     })
 }
@@ -333,19 +357,14 @@ async fn read_line_capped(reader: &mut ArchiveReader, buf: &mut Vec<u8>) -> anyh
 }
 
 /// Validates `into_domain` (only legal when the archive
-/// contains exactly one domain *name*, counting kv/json together — a
-/// `domain:*` export has the same name in both sections) and returns the
+/// contains exactly one domain *name*, counting every engine together — a
+/// `domain:*` export has the same name in each section) and returns the
 /// `(archived_name, target_name)` substitution to apply everywhere.
 fn build_remap(into_domain: Option<&str>, scan: &ArchiveScan) -> anyhow::Result<Option<(String, String)>> {
     let Some(target) = into_domain else { return Ok(None) };
 
-    let mut names: HashSet<&str> = HashSet::new();
-    for name in &scan.kv_domains {
-        names.insert(name.as_str());
-    }
-    for name in &scan.json_domains {
-        names.insert(name.as_str());
-    }
+    let names: HashSet<&str> =
+        scan.kv_domains.iter().chain(&scan.json_domains).chain(&scan.rel_domains).map(String::as_str).collect();
     if names.len() != 1 {
         return Err(BackupError::RemapRequiresSingleDomain.into());
     }
@@ -377,6 +396,9 @@ async fn prepare_domains(
     for name in &scan.json_domains {
         ready_json_domain(remapped(remap, name), mode, control).await?;
     }
+    for name in &scan.rel_domains {
+        ready_rel_domain(remapped(remap, name), mode, control).await?;
+    }
 
     for name in &scan.kv_domains {
         control.create_domain(Engine::Kv, remapped(remap, name), false).await?;
@@ -384,8 +406,42 @@ async fn prepare_domains(
     for name in &scan.json_domains {
         control.create_domain(Engine::Json, remapped(remap, name), false).await?;
     }
+    for name in &scan.rel_domains {
+        control.create_domain(Engine::Rel, remapped(remap, name), false).await?;
+    }
 
     Ok(())
+}
+
+async fn ready_rel_domain(target: &str, mode: RestoreMode, control: &ControlPlane) -> anyhow::Result<()> {
+    let rel = rel_of(control, target)?;
+    let existing = rel.get_domain_any(target);
+    match mode {
+        RestoreMode::FailIfExists => {
+            if existing.is_some() {
+                return Err(BackupError::DomainExists(target.to_string()).into());
+            }
+            Ok(())
+        }
+        RestoreMode::Replace => {
+            match existing {
+                Some(d) if d.state == RelDomainState::Active => {
+                    control.delete_domain(Engine::Rel, target).await?;
+                    wait_for_rel_domain_gone(target, rel).await?;
+                }
+                Some(_) => wait_for_rel_domain_gone(target, rel).await?,
+                None => {}
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn wait_for_rel_domain_gone(name: &str, rel: &Arc<RelEngine>) -> anyhow::Result<()> {
+    wait_for_purge(name, PURGE_WAIT_TIMEOUT, || {
+        !matches!(rel.get_domain_any(name), Some(d) if d.state == RelDomainState::Deleting)
+    })
+    .await
 }
 
 async fn ready_kv_domain(target: &str, mode: RestoreMode, control: &ControlPlane) -> anyhow::Result<()> {
@@ -471,7 +527,9 @@ async fn wait_for_purge(name: &str, timeout: Duration, is_gone: impl Fn() -> boo
 /// every `scan_batch_size` entries); JSON documents are grouped into
 /// per-domain batches and imported via [`JsonEngine::bulk_load`] (its
 /// index entries are maintained synchronously, like `load_batch`), flushed
-/// on a domain change, a full batch, or end of stream.
+/// on a domain change, a full batch, or end of stream. Relational rows are
+/// grouped the same way per table; relational tables, views and
+/// AUTOINCREMENT marks apply one by one.
 async fn apply_pass(
     path: &Path,
     remap: &Option<(String, String)>,
@@ -489,6 +547,8 @@ async fn apply_pass(
 
     let mut doc_domain: Option<String> = None;
     let mut doc_batch: Vec<(Option<String>, Value)> = Vec::new();
+
+    let mut rel_rows = RelRowBatch::default();
 
     while read_line_capped(&mut reader, &mut line).await? > 0 {
         let raw = std::str::from_utf8(&line)?;
@@ -554,8 +614,28 @@ async fn apply_pass(
                     compio::time::sleep(Duration::from_millis(scan_pause_ms)).await;
                 }
             }
+            "rel-domain" | "rel-table" | "rel-view" | "rel-row" | "rel-seq" => {
+                flush_doc_batch(&mut doc_domain, &mut doc_batch, control, &mut outcome).await?;
+                if t == "rel-row" {
+                    let line: RelRowLine = parse_line(value)?;
+                    let target = (remapped(remap, &line.domain).to_string(), line.table);
+                    if rel_rows.target.as_ref() != Some(&target) {
+                        rel_rows.flush(control, &mut outcome).await?;
+                        rel_rows.target = Some(target);
+                    }
+                    rel_rows.rows.push(line.row);
+                    if rel_rows.rows.len() >= scan_batch_size.max(1) {
+                        rel_rows.flush(control, &mut outcome).await?;
+                        compio::time::sleep(Duration::from_millis(scan_pause_ms)).await;
+                    }
+                } else {
+                    rel_rows.flush(control, &mut outcome).await?;
+                    apply_rel_schema_line(&t, value, remap, control).await?;
+                }
+            }
             "auth-user" => {
                 flush_doc_batch(&mut doc_domain, &mut doc_batch, control, &mut outcome).await?;
+                rel_rows.flush(control, &mut outcome).await?;
                 if include_auth {
                     apply_auth_user(&value, control, &mut outcome).await;
                 }
@@ -574,7 +654,117 @@ async fn apply_pass(
     }
 
     flush_doc_batch(&mut doc_domain, &mut doc_batch, control, &mut outcome).await?;
+    rel_rows.flush(control, &mut outcome).await?;
     Ok(outcome)
+}
+
+/// Relational rows of one table, buffered to go to the engine as one group.
+#[derive(Default)]
+struct RelRowBatch {
+    /// `(domain, table)` the rows belong to.
+    target: Option<(String, String)>,
+    rows: Vec<Map<String, Value>>,
+}
+
+impl RelRowBatch {
+    /// Inserts the buffered rows; a failure aborts the restore, since an
+    /// archive of this engine must restore in full.
+    async fn flush(&mut self, control: &ControlPlane, outcome: &mut RestoreOutcome) -> anyhow::Result<()> {
+        let Some((domain, table)) = &self.target else { return Ok(()) };
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::take(&mut self.rows);
+        let inserted = rel_of(control, domain)
+            .map_err(|e| rel_failure(domain, "table", table, e))?
+            .restore_rows(domain, table, rows)
+            .await
+            .map_err(|e| rel_failure(domain, "table", table, e))?;
+        outcome.imported += inserted;
+        Ok(())
+    }
+}
+
+/// The error that aborts a restore at a relational line, naming domain and
+/// object, `kind` being `table` or `view`, in its one-line text.
+fn rel_failure(domain: &str, kind: &str, object: &str, cause: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("relational domain '{domain}', {kind} '{object}': {cause}")
+}
+
+/// Applies a `rel-table`, `rel-view` or `rel-seq` line; `rel-domain` lines
+/// were handled when the domains were prepared.
+async fn apply_rel_schema_line(
+    t: &str,
+    value: Value,
+    remap: &Option<(String, String)>,
+    control: &ControlPlane,
+) -> anyhow::Result<()> {
+    match t {
+        "rel-table" => {
+            let line: RelTableLine = parse_line(value)?;
+            let domain = remapped(remap, &line.domain);
+            let failure = |e: &dyn std::fmt::Display| rel_failure(domain, "table", &line.name, e);
+            let (input, indexes) = table_input(&line).map_err(|e| failure(&e))?;
+            rel_of(control, domain)
+                .map_err(|e| failure(&e))?
+                .restore_table(domain, input, indexes)
+                .await
+                .map_err(|e| failure(&e))?;
+        }
+        "rel-view" => {
+            let line: RelViewLine = parse_line(value)?;
+            let domain = remapped(remap, &line.domain);
+            let failure = |e: &dyn std::fmt::Display| rel_failure(domain, "view", &line.name, e);
+            rel_of(control, domain)
+                .map_err(|e| failure(&e))?
+                .create_view(domain, &line.name, &line.sql)
+                .await
+                .map_err(|e| failure(&e))?;
+        }
+        "rel-seq" => {
+            let line: RelSeqLine = parse_line(value)?;
+            let domain = remapped(remap, &line.domain);
+            let failure = |e: &dyn std::fmt::Display| rel_failure(domain, "table", &line.table, e);
+            rel_of(control, domain)
+                .map_err(|e| failure(&e))?
+                .raise_autoincrement(domain, &line.table, line.hw)
+                .await
+                .map_err(|e| failure(&e))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The catalog input of an archived table.
+fn table_input(line: &RelTableLine) -> anyhow::Result<(TableInput, Vec<IndexInput>)> {
+    let mut columns = Vec::with_capacity(line.columns.len());
+    for c in &line.columns {
+        let col_type = ColumnType::from_sql_name(&c.col_type)
+            .ok_or_else(|| anyhow::anyhow!("unknown type '{}' of column '{}'", c.col_type, c.name))?;
+        let default = match &c.default {
+            None => DefaultValue::None,
+            Some(RelDefault::Null) => DefaultValue::Null,
+            Some(RelDefault::CurrentTimestamp) => DefaultValue::CurrentTimestamp,
+            Some(RelDefault::Literal { value }) => DefaultValue::Literal(coerce_json(col_type, value, &c.name)?),
+        };
+        columns.push(ColumnInput {
+            name: c.name.clone(),
+            col_type,
+            nullable: c.nullable,
+            primary_key: c.primary_key,
+            autoincrement: c.autoincrement,
+            unique: c.unique,
+            default,
+            references: c.references.clone(),
+        });
+    }
+    let indexes = line
+        .indexes
+        .iter()
+        .map(|ix| IndexInput { name: ix.name.clone(), column: ix.column.clone(), unique: ix.unique })
+        .collect();
+    Ok((TableInput { name: line.name.clone(), columns }, indexes))
 }
 
 async fn apply_kv_line(store: &DomainStore, line: &KvLine, now: u64, outcome: &mut RestoreOutcome) {

@@ -7,6 +7,8 @@
 //! `scheduler`. HTTP handlers live in `crate::api::backup`.
 
 pub mod cron;
+#[cfg(test)]
+mod rel_tests;
 pub mod restore;
 pub mod scheduler;
 pub mod writer;
@@ -28,28 +30,33 @@ pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 /// syntax-only — domain existence is checked when a backup job actually runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupScope {
-    /// Both engines, all active domains.
+    /// Every engine, all active domains.
     All,
     /// KV engine, all KV domains.
     Kv,
     /// JSON engine, all JSON domains (incl. index definitions).
     Json,
+    /// Relational engine, all relational domains (schema and rows).
+    Rel,
     /// A single KV domain.
     KvDomain(String),
     /// A single JSON domain.
     JsonDomain(String),
-    /// The KV **and** JSON domain of this name (whichever engine has it).
+    /// A single relational domain.
+    RelDomain(String),
+    /// The domain of this name in every engine that has it.
     Domain(String),
 }
 
 impl BackupScope {
-    /// Parses a scope string: `all`, `kv`, `json`, `kv:<domain>`,
-    /// `json:<domain>`, or `domain:<name>`.
+    /// Parses a scope string: `all`, `kv`, `json`, `rel`, `kv:<domain>`,
+    /// `json:<domain>`, `rel:<domain>`, or `domain:<name>`.
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "all" => return Ok(Self::All),
             "kv" => return Ok(Self::Kv),
             "json" => return Ok(Self::Json),
+            "rel" => return Ok(Self::Rel),
             _ => {}
         }
         if let Some(domain) = s.strip_prefix("kv:") {
@@ -58,11 +65,15 @@ impl BackupScope {
         if let Some(domain) = s.strip_prefix("json:") {
             return Ok(Self::JsonDomain(validate_scope_domain(domain)?.to_string()));
         }
+        if let Some(domain) = s.strip_prefix("rel:") {
+            return Ok(Self::RelDomain(validate_scope_domain(domain)?.to_string()));
+        }
         if let Some(domain) = s.strip_prefix("domain:") {
             return Ok(Self::Domain(validate_scope_domain(domain)?.to_string()));
         }
         anyhow::bail!(
-            "invalid backup scope '{s}': expected 'all', 'kv', 'json', 'kv:<domain>', 'json:<domain>', or 'domain:<name>'"
+            "invalid backup scope '{s}': expected 'all', 'kv', 'json', 'rel', 'kv:<domain>', 'json:<domain>', \
+             'rel:<domain>', or 'domain:<name>'"
         );
     }
 }
@@ -75,8 +86,10 @@ impl BackupScope {
             Self::All => "all".to_string(),
             Self::Kv => "kv".to_string(),
             Self::Json => "json".to_string(),
+            Self::Rel => "rel".to_string(),
             Self::KvDomain(d) => format!("kv:{d}"),
             Self::JsonDomain(d) => format!("json:{d}"),
+            Self::RelDomain(d) => format!("rel:{d}"),
             Self::Domain(d) => format!("domain:{d}"),
         }
     }
@@ -123,6 +136,8 @@ pub enum BackupError {
     UnsupportedFormatVersion(u32),
     #[error("json_engine_disabled")]
     JsonEngineDisabled,
+    #[error("rel_engine_disabled")]
+    RelEngineDisabled,
     #[error("invalid backup id '{0}'")]
     InvalidId(String),
     #[error(transparent)]
@@ -777,6 +792,7 @@ mod tests {
         assert_eq!(BackupScope::parse("all").unwrap(), BackupScope::All);
         assert_eq!(BackupScope::parse("kv").unwrap(), BackupScope::Kv);
         assert_eq!(BackupScope::parse("json").unwrap(), BackupScope::Json);
+        assert_eq!(BackupScope::parse("rel").unwrap(), BackupScope::Rel);
     }
 
     #[test]
@@ -788,6 +804,10 @@ mod tests {
         assert_eq!(
             BackupScope::parse("json:shop").unwrap(),
             BackupScope::JsonDomain("shop".to_string())
+        );
+        assert_eq!(
+            BackupScope::parse("rel:shop").unwrap(),
+            BackupScope::RelDomain("shop".to_string())
         );
         assert_eq!(
             BackupScope::parse("domain:shop").unwrap(),
@@ -815,6 +835,7 @@ mod tests {
     fn test_parse_rejects_empty_domain_name() {
         assert!(BackupScope::parse("kv:").is_err());
         assert!(BackupScope::parse("json:").is_err());
+        assert!(BackupScope::parse("rel:").is_err());
         assert!(BackupScope::parse("domain:").is_err());
     }
 
@@ -827,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_as_string_round_trips_through_parse() {
-        for s in ["all", "kv", "json", "kv:shop", "json:shop", "domain:shop"] {
+        for s in ["all", "kv", "json", "rel", "kv:shop", "json:shop", "rel:shop", "domain:shop"] {
             let scope = BackupScope::parse(s).unwrap();
             assert_eq!(scope.as_string(), s);
         }
@@ -907,6 +928,7 @@ mod manager_tests {
             include_auth: false,
             kv_snapshot_ts: 0,
             json_snapshot_ts: 0,
+            rel_snapshot_ts: 0,
             encoding: "hex".to_string(),
             schedule: schedule.map(|s| s.to_string()),
             shards: 1,

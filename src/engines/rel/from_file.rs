@@ -7,7 +7,7 @@
 
 use super::catalog::{ColumnInput, TableInput, MAX_IDENTIFIER_LEN};
 use super::cross_engine::LinkAuth;
-use super::dml::{coerce_json, RowPlan};
+use super::dml::{coerce_json, InsertChecks, RowPlan};
 use super::error::RelStoreError;
 use super::types::{ColumnType, ScalarValue};
 use super::RelEngine;
@@ -211,6 +211,7 @@ impl RelEngine {
                         &mut seen_unique,
                         &mut ops,
                         LinkAuth::full(), // no KVREF/JSONREF column is ever inferred
+                        InsertChecks::All,
                     )
                     .await
                 {

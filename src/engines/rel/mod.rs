@@ -1,6 +1,7 @@
 //! Relational engine — runs on its own dedicated LSM instance so relational
 //! workloads (bulk imports, compaction) never impact KV/JSON performance.
 
+pub mod archive;
 pub mod ast;
 pub mod binder;
 pub mod catalog;
@@ -26,10 +27,11 @@ pub mod select;
 pub mod types;
 pub mod view;
 
+pub use archive::RowScan;
 pub use ast::StatementClass;
 pub use binder::DdlPlan;
 pub use catalog::{
-    CatalogEntry, CatalogLimits, ColumnDef, ColumnInput, DefaultValue, IndexMeta, RelCatalog,
+    CatalogEntry, CatalogLimits, ColumnDef, ColumnInput, DefaultValue, IndexInput, IndexMeta, RelCatalog,
     TableInput, TableSchema, ViewSchema,
 };
 pub use cross_engine::{CrossEngineResolver, LinkAuth, RelCrossEngineSweeper};

@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.10.2",
+    "version": "0.11.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -437,7 +437,7 @@
             }
           },
           "503": {
-            "description": "Backup is disabled, or scope requires the JSON engine, which is disabled",
+            "description": "Backup is disabled, or scope requires the JSON or relational engine, which is disabled",
             "content": {
               "text/plain": {
                 "schema": {
@@ -632,7 +632,7 @@
           "Backup"
         ],
         "summary": "Streams the archive with HTTP Range support for resumable downloads.",
-        "description": "The archive is NDJSON. Its first line is the manifest, format version 2:\n`format_version`, `id`, `created_at`, `luradb_version`, `scope`,\n`include_auth`, `encoding`, `schedule`, and\n- `shards`: data shards of the server that wrote it. Informational only:\n  a restore places every domain by the shard count of the server it runs\n  on, so an archive restores into any shard count.\n- `lsn_cut`: `{kv, json}`, per engine a write-ahead-log position that\n  every write in the archive is at or below (a lower bound of the cut);\n  0 for an engine outside the scope. Positions restart at 1 after a clean\n  shutdown, so they compare only within one run of the server.\n- `kv_snapshot_ts`, `json_snapshot_ts`: per engine, the newest\n  read-snapshot stamp among the data shards; 0 for an engine outside the\n  scope.\n\nAll shards of one engine are read at one consistent cut: an archive that\nholds a write holds every write confirmed before it. Domain lines carry\ntheir domain's name; auth records form a section of their own; the last\nline is the checksum. Archives of format version 1, which lack `shards`\nand `lsn_cut`, remain restorable.",
+        "description": "The archive is NDJSON. Its first line is the manifest, format version 2:\n`format_version`, `id`, `created_at`, `luradb_version`, `scope`,\n`include_auth`, `encoding`, `schedule`, and\n- `shards`: data shards of the server that wrote it. Informational only:\n  a restore places every domain by the shard count of the server it runs\n  on, so an archive restores into any shard count.\n- `lsn_cut`: `{kv, json, rel}`, per engine a write-ahead-log position that\n  every write in the archive is at or below (a lower bound of the cut);\n  0 for an engine outside the scope. Positions restart at 1 after a clean\n  shutdown, so they compare only within one run of the server.\n- `kv_snapshot_ts`, `json_snapshot_ts`, `rel_snapshot_ts`: per engine,\n  the newest read-snapshot stamp among the data shards; 0 for an engine\n  outside the scope.\n\nAll shards of one engine are read at one consistent cut: an archive that\nholds a write holds every write confirmed before it. The relational cut\nis taken before the KV and JSON cuts. Domain lines carry their domain's\nname; sections follow in the order KV, JSON, relational, auth; the last\nline is the checksum.\n\nA relational domain is a `rel-domain` line (`name`, `created_at`), then\nits tables by creation, its views, and per table its rows and\nAUTOINCREMENT state:\n- `rel-table`: `domain`, `name`, `columns` (each `name`, `type` as SQL\n  type name, `nullable`, `primary_key`, `autoincrement`, `unique`, an\n  optional `default` of `{\"kind\": \"null\"}`, `{\"kind\":\n  \"current_timestamp\"}` or `{\"kind\": \"literal\", \"value\": …}`, an optional\n  `references` naming the target table) and `indexes` (`name`, `column`,\n  `unique`; every index under its stored name).\n- `rel-view`: `domain`, `name`, `sql`, the stored SELECT text.\n- `rel-row`: `domain`, `table`, `row`, every column by name, NULL as\n  `null`, KVREF/JSONREF links as stored.\n- `rel-seq`: `domain`, `table`, `hw`: the next insert without a key gets\n  `hw + 1`.\n\nValues are JSON numbers (INTEGER, REAL), booleans, strings (TEXT, KVREF,\nJSONREF) and, for TIMESTAMP, integer milliseconds since the Unix epoch.\nArchives of format version 1, which lack `shards` and `lsn_cut`, and\narchives without relational lines remain restorable.",
         "operationId": "download_backup",
         "parameters": [
           {
@@ -5204,6 +5204,15 @@
               "null"
             ]
           },
+          "rel_snapshot_ts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The newest read-snapshot stamp of the relational engine among the\ndata shards.",
+            "minimum": 0
+          },
           "schedule": {
             "type": [
               "string",
@@ -5430,7 +5439,7 @@
           },
           "scope": {
             "type": "string",
-            "description": "`all` | `kv` | `json` | `kv:<domain>` | `json:<domain>` | `domain:<name>`.\nCovers the KV and JSON engines only — relational data is never included."
+            "description": "`all` | `kv` | `json` | `rel` | `kv:<domain>` | `json:<domain>` |\n`rel:<domain>` | `domain:<name>`. `all` covers every enabled engine;\n`domain:<name>` covers the domain of that name in each engine that has\nit. Relational domains go in with schema, rows and AUTOINCREMENT state."
           }
         }
       },
@@ -6006,7 +6015,8 @@
         "description": "Per engine, a write-ahead-log position that every write in the archive is\nat or below; 0 for an engine outside the scope and for format version 1.\nPositions restart at 1 after a clean shutdown, so they compare only within\none run of the server.",
         "required": [
           "kv",
-          "json"
+          "json",
+          "rel"
         ],
         "properties": {
           "json": {
@@ -6015,6 +6025,11 @@
             "minimum": 0
           },
           "kv": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "rel": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -6131,7 +6146,7 @@
               "string",
               "null"
             ],
-            "description": "Only legal when the archive contains exactly one domain name\n(`kv:*`/`json:*`/`domain:*` scopes)."
+            "description": "Only legal when the archive contains exactly one domain name\n(`kv:*`/`json:*`/`rel:*`/`domain:*` scopes). Links of relational\ntables (KVREF/JSONREF) then point to the KV and JSON domain of the new\nname."
           },
           "mode": {
             "type": [

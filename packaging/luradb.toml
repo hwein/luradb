@@ -321,7 +321,7 @@ dir = "luradb_backups"
 # name = "nightly"
 # When the schedule runs: a 5-field cron expression in UTC that fires within 4 years.
 # cron = "0 3 * * *"
-# Data to back up: all, kv, json, kv:<domain>, json:<domain> or domain:<name>.
+# Data to back up: all, kv, json, rel, kv:<domain>, json:<domain>, rel:<domain> or domain:<name>.
 # scope = "all"
 # Also backs up users and permissions (scopes all and kv only).
 # The backup file then contains API key hashes.

@@ -495,8 +495,10 @@ async fn serve_http(listener: TcpListener, router: Router, mut shutdown: watch::
 /// directory: tests share the process.
 #[cfg(test)]
 pub(crate) mod test_hook {
+    use crate::metrics::MetricsStore;
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
 
     fn events() -> &'static Mutex<HashMap<String, Vec<String>>> {
         static EVENTS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
@@ -525,6 +527,35 @@ pub(crate) mod test_hook {
 
     pub(crate) fn pings_silenced(system_dir: &str, shard: usize) -> bool {
         silent().lock().unwrap().iter().any(|(dir, k)| dir == system_dir && *k == shard)
+    }
+
+    /// How long `GET /health` waits for the ping of `shard`: not at all for a
+    /// silenced one, which times out at once, and long for the others, so a
+    /// loaded runner never turns a live shard into a timeout.
+    pub(crate) fn ping_timeout(system_dir: &str, shard: usize, production: Duration) -> Duration {
+        if pings_silenced(system_dir, shard) {
+            Duration::ZERO
+        } else {
+            production.max(Duration::from_secs(60))
+        }
+    }
+
+    fn metrics_stores() -> &'static Mutex<HashMap<String, Vec<Arc<MetricsStore>>>> {
+        static STORES: OnceLock<Mutex<HashMap<String, Vec<Arc<MetricsStore>>>>> = OnceLock::new();
+        STORES.get_or_init(Default::default)
+    }
+
+    pub(crate) fn register_metrics(system_dir: &str, store: Arc<MetricsStore>) {
+        metrics_stores().lock().unwrap().entry(system_dir.to_string()).or_default().push(store);
+    }
+
+    /// Commits the current second of the metrics windows of every data shard
+    /// of the server on `system_dir`, as their tickers do once a second.
+    pub(crate) fn tick_metrics(system_dir: &str) {
+        let stores = metrics_stores().lock().unwrap().get(system_dir).cloned().unwrap_or_default();
+        for store in stores {
+            store.tick_all();
+        }
     }
 
     fn faults() -> &'static Mutex<Vec<(String, &'static str)>> {
@@ -1789,15 +1820,20 @@ mod tests {
 
     // Writes on domains of both shards: the scrape sums them exactly — the
     // lifetime counter at once, the engine and domain windows once the
-    // shards' tickers have committed their second — in the shape a scrape
+    // shards' windows have committed their second — in the shape a scrape
     // of one shard has.
     #[test]
     #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     fn metrics_sum_the_writes_of_every_shard() {
         use crate::control::slots::domain_name_for_shard;
         let names = [domain_name_for_shard(0, 2, 31), domain_name_for_shard(1, 2, 31)];
+        let dir = std::cell::RefCell::new(String::new());
+        let system_dir = &dir;
         with_tuned_server(
-            |cfg| cfg.multicore.shards = 2,
+            |cfg| {
+                cfg.multicore.shards = 2;
+                *dir.borrow_mut() = cfg.storage.system_dir.clone();
+            },
             |addr| async move {
                 for (shard, name) in names.iter().enumerate() {
                     let create = json!({ "name": name }).to_string();
@@ -1812,15 +1848,11 @@ mod tests {
                     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
                     serde_json::from_slice::<Value>(&body).unwrap()
                 };
-                let mut body = scrape().await;
+                let body = scrape().await;
                 assert_eq!(body["system"]["total_writes"], 3, "{body}");
-                for _ in 0..500 {
-                    if body["engines"]["kv"]["write_ops"].as_u64().unwrap() >= 3 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    body = scrape().await;
-                }
+                crate::server::test_hook::tick_metrics(&system_dir.borrow());
+                let body = scrape().await;
+                assert_eq!(body["system"]["total_writes"], 3, "{body}");
                 assert_eq!(body["engines"]["kv"]["write_ops"], 3, "{body}");
                 assert_eq!(body["engines"]["kv"]["window_secs"], 60, "{body}");
                 for (shard, name) in names.iter().enumerate() {

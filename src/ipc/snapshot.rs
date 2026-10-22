@@ -1358,27 +1358,23 @@ mod tests {
         })
     }
 
-    // Expiry removal: once the wall clock reached the stamp, the
-    // step at that time drops the expired entry.
+    // Expiry removal: a rebuild at the stamp drops the entry the previous
+    // publish held. The engine reads the wall clock, so the expiry is
+    // simulated by overwriting the entry with an already-expired stamp.
     #[test]
     fn test_step_at_expiry_drops_the_expired_entry() {
         crate::core::engine_runtime::block_on(async {
             let (_, registry, fx) = make_setup().await;
             let store = registry.default_store().await.unwrap();
-            let expire_at = now_secs() + 2;
+            let expire_at = now_secs() + 3600;
             store.put_unthrottled(b"ttl", b"v", Some(expire_at)).await.unwrap();
             let arena = Arena::new();
             let mut publish = arena.publish_loop(builder(&fx, ARENA_LEN));
             publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await;
+            assert!(default_entry(&arena.read(), b"ttl").is_some(), "live entry must be published");
 
-            // The engine hides expired entries by wall clock: poll it, a fixed
-            // sleep could be cut short by a backwards clock step.
-            while now_secs() < expire_at {
-                compio::time::sleep(Duration::from_millis(50)).await;
-            }
-            publish.step(expire_at, Instant::now()).await;
-            // Absence only: whether the first build still saw the entry depends
-            // on scheduling; the trigger itself is the test above.
+            store.put_expired_for_test(b"ttl", b"v").await.unwrap();
+            assert_eq!(publish.step(expire_at, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             assert!(default_entry(&arena.read(), b"ttl").is_none(), "expired entry must be gone");
         })
     }

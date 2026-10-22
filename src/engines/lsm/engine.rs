@@ -3264,30 +3264,9 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
             // Immediate readability is covered by test_ttl_key_readable_before_expiry.
-            engine.put_with_ttl(b"ttl_key", b"value", 1).await.unwrap();
-            wait_past_ttl(1).await;
-            // Bounded retry instead of a single probe: a backwards wall-clock
-            // step between the wait above and get()'s own now_secs() briefly
-            // un-expires the key (observed on WSL2).
-            let mut value = engine.get(b"ttl_key").await.unwrap();
-            for _ in 0..100 {
-                if value.is_none() {
-                    break;
-                }
-                compio::time::sleep(Duration::from_millis(100)).await;
-                value = engine.get(b"ttl_key").await.unwrap();
-            }
-            assert!(value.is_none());
+            engine.put_expired_for_test(b"ttl_key", b"value").await.unwrap();
+            assert!(engine.get(b"ttl_key").await.unwrap().is_none());
         })
-    }
-
-    /// Polls the expiry clock instead of sleeping a fixed span, which a
-    /// backwards clock correction would cut short.
-    async fn wait_past_ttl(ttl_secs: u64) {
-        let deadline = now_secs() + ttl_secs + 1;
-        while now_secs() < deadline {
-            compio::time::sleep(Duration::from_millis(50)).await;
-        }
     }
 
     // Worst case for the stamp: written at second W.95, read 1.1 s later in
@@ -3445,20 +3424,9 @@ mod tests {
     fn test_scan_keys_excludes_ttl_expired() {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
-            engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+            engine.put_expired_for_test(b"user:1", b"alice").await.unwrap();
             engine.put(b"user:2", b"bob").await.unwrap();
-            wait_past_ttl(1).await;
-            // Bounded retry instead of a single probe: a backwards wall-clock
-            // step between the wait above and the scan's own now_secs() briefly
-            // un-expires the key (observed on WSL2).
-            let mut keys = engine.scan_keys(b"user:").await.unwrap();
-            for _ in 0..100 {
-                if !keys.contains(&b"user:1".to_vec()) {
-                    break;
-                }
-                compio::time::sleep(Duration::from_millis(100)).await;
-                keys = engine.scan_keys(b"user:").await.unwrap();
-            }
+            let keys = engine.scan_keys(b"user:").await.unwrap();
             assert!(!keys.contains(&b"user:1".to_vec()));
             assert!(keys.contains(&b"user:2".to_vec()));
         })
@@ -3524,26 +3492,15 @@ mod tests {
     }
 
     // Expiry uses wall-clock time, not the snapshot timestamp -- an entry
-    // that was live when the snapshot was acquired but has since expired
-    // must not appear (matches every other read path).
+    // written before the snapshot that is expired now must not appear
+    // (matches every other read path).
     #[test]
     fn test_scan_keys_with_snapshot_excludes_expired() {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
-            engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+            engine.put_expired_for_test(b"user:1", b"alice").await.unwrap();
             let snap = engine.snapshot().await;
-            wait_past_ttl(1).await;
-            // Bounded retry instead of a single probe: a backwards wall-clock
-            // step between the wait above and the scan's own now_secs() briefly
-            // un-expires the key (observed on WSL2).
-            let mut keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
-            for _ in 0..100 {
-                if keys.is_empty() {
-                    break;
-                }
-                compio::time::sleep(Duration::from_millis(100)).await;
-                keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
-            }
+            let keys = engine.scan_keys_with_snapshot(b"user:", snap.snapshot()).await.unwrap();
             assert!(keys.is_empty(), "TTL-expired entry must not appear even under an older snapshot");
         })
     }
@@ -3633,21 +3590,10 @@ mod tests {
     fn test_scan_keys_limited_with_snapshot_excludes_expired_from_cap() {
         crate::core::engine_runtime::block_on(async {
             let (engine, _dir) = make_engine().await;
-            engine.put_with_ttl(b"user:1", b"alice", 1).await.unwrap();
+            engine.put_expired_for_test(b"user:1", b"alice").await.unwrap();
             engine.put(b"user:2", b"bob").await.unwrap();
             let snap = engine.snapshot().await;
-            wait_past_ttl(1).await;
-            // Bounded retry instead of a single probe: a backwards wall-clock
-            // step between the wait above and the scan's own now_secs() briefly
-            // un-expires the key (observed on WSL2).
-            let mut keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
-            for _ in 0..100 {
-                if keys == vec![b"user:2".to_vec()] {
-                    break;
-                }
-                compio::time::sleep(Duration::from_millis(100)).await;
-                keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
-            }
+            let keys = engine.scan_keys_limited_with_snapshot(b"user:", 1, snap.snapshot()).await.unwrap();
             assert_eq!(
                 keys,
                 vec![b"user:2".to_vec()],

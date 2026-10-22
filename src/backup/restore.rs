@@ -995,18 +995,24 @@ mod tests {
     #[test]
     fn test_expired_ttl_entry_is_skipped() {
         crate::core::engine_runtime::block_on(async {
-            let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
-            src.store("shop").await.put_with_ttl(b"soon-gone", b"v", 1).await.unwrap();
-
+            // The writer never exports an expired entry, so the archive is
+            // written by hand with an expiry stamp long past.
             let out_dir = tempfile::TempDir::new().unwrap();
-            src.backup(out_dir.path(), "bk_ttl", BackupScope::KvDomain("shop".to_string()), false).await;
-            // Polls the expiry clock: a backwards clock correction cuts a fixed
-            // sleep short before the stamp is reached.
-            let deadline = now_secs() + 1 + 1;
-            while now_secs() < deadline {
-                compio::time::sleep(Duration::from_millis(50)).await;
-            }
+            let manifest = json!({
+                "t": "manifest", "format_version": 2, "id": "bk_ttl", "created_at": 1_700_000_000u64,
+                "luradb_version": "0.4.0", "scope": "kv:shop", "include_auth": false, "kv_snapshot_ts": 1,
+                "json_snapshot_ts": 0, "encoding": "hex", "schedule": null, "shards": 1,
+                "lsn_cut": {"kv": 1, "json": 0},
+            });
+            let domain = json!({"t": "kv-domain", "name": "shop", "created_at": 1_700_000_000u64});
+            let entry = json!({
+                "t": "kv", "domain": "shop", "k": hex::encode(b"soon-gone"), "v": hex::encode(b"v"),
+                "expires_at": 1_700_000_001u64,
+            });
+            reseal(
+                &out_dir.path().join("bk_ttl.ndjson"),
+                &[manifest.to_string(), domain.to_string(), entry.to_string()],
+            );
 
             let dst = instance(false).await;
             let outcome = dst.restore(out_dir.path(), "bk_ttl", RestoreMode::FailIfExists, None, false).await.unwrap();

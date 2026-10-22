@@ -117,6 +117,8 @@ async fn run(boot: ShardBoot) {
     #[cfg(test)]
     super::test_hook::record(&config.storage.system_dir, format!("shard {shard} released"));
     compio::runtime::spawn(MetricsTicker::new(Arc::clone(owners.kv.metrics())).run()).detach();
+    #[cfg(test)]
+    super::test_hook::register_metrics(&config.storage.system_dir, Arc::clone(owners.kv.metrics()));
     let loops = spawn_loops(&config, &owners);
     let _ = started.send(());
     let serving = compio::runtime::spawn(bridge::serve_engine(jobs, api::create_router(state)));

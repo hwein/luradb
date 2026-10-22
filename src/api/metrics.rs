@@ -36,7 +36,12 @@ const SHARD_PING_TIMEOUT: Duration = Duration::from_millis(250);
     tag = "Metrics"
 )]
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let answered = state.control.ping_shards(SHARD_PING_TIMEOUT).await;
+    #[cfg(test)]
+    let timeout =
+        |shard| crate::server::test_hook::ping_timeout(&state.config.storage.system_dir, shard, SHARD_PING_TIMEOUT);
+    #[cfg(not(test))]
+    let timeout = |_| SHARD_PING_TIMEOUT;
+    let answered = state.control.ping_shards(timeout).await;
     let engines: Vec<_> = state.control.shard_owners().map(|owners| owners.kv.engine().heartbeat_data()).collect();
     let directory = state.control.directory();
     let domain_count = directory.domains(Engine::Kv).filter(|d| d.state == Lifecycle::Active).count();

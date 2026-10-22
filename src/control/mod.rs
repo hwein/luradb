@@ -559,12 +559,15 @@ impl ControlPlane {
     }
 
     /// Pings every data shard over its command channel, all at once: by
-    /// shard index, whether it answered within `timeout`.
+    /// shard index, whether it answered within `timeout(index)`.
     #[allow(clippy::disallowed_methods, reason = "called by GET /health, which runs on the frontend runtime")]
-    pub async fn ping_shards(&self, timeout: std::time::Duration) -> Vec<bool> {
-        let pings = self.shards.iter().map(|shard| async move {
-            let ping = shard.request(|reply| ShardCommand::Ping { reply });
-            matches!(tokio::time::timeout(timeout, ping).await, Ok(Ok(())))
+    pub async fn ping_shards(&self, timeout: impl Fn(usize) -> std::time::Duration) -> Vec<bool> {
+        let pings = self.shards.iter().enumerate().map(|(index, shard)| {
+            let timeout = timeout(index);
+            async move {
+                let ping = shard.request(|reply| ShardCommand::Ping { reply });
+                matches!(tokio::time::timeout(timeout, ping).await, Ok(Ok(())))
+            }
         });
         futures::future::join_all(pings).await
     }

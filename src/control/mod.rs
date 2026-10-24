@@ -860,7 +860,7 @@ pub(crate) mod testing {
         bus: Arc<GlobalEventBus>,
     ) -> (Arc<ControlPlane>, Arc<AuthCache>) {
         let system = system::open(&dir.join("sys")).await.unwrap();
-        let auth = Arc::new(AuthCache::new(Arc::clone(&system), false));
+        let auth = Arc::new(AuthCache::new(Arc::clone(&system), None));
         let owners = Owners { shards, auth: Arc::clone(&auth) };
         (ControlPlane::start(owners, system, bus).await.unwrap(), auth)
     }

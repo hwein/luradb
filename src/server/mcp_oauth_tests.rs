@@ -463,6 +463,37 @@ fn tokens_survive_a_restart() {
     server.shutdown().unwrap();
 }
 
+// Tokens are bound to the public URL: after a restart under another one
+// they count no more, and refreshing one revokes its grant.
+#[test]
+fn tokens_stop_working_once_the_public_url_changes() {
+    let admin_key = "lura_oauth_moved_admin";
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = tokio::runtime::Runtime::new().unwrap();
+
+    let server = Server::start(Arc::new(oauth_config(dir.path(), admin_key)), &dir.path().join("luradb.toml")).unwrap();
+    let mcp = server.mcp_addr.unwrap();
+    let (client_id, tokens) = client.block_on(async {
+        let client_id = register(mcp).await;
+        let code = sign_in(mcp, &client_id, admin_key).await;
+        let tokens = exchange_code(mcp, &client_id, &code, VERIFIER).await.1;
+        (client_id, tokens)
+    });
+    server.shutdown().unwrap();
+
+    let mut moved = oauth_config(dir.path(), admin_key);
+    moved.mcp.public_url = "http://127.0.0.1:3100/".to_string();
+    let server = Server::start(Arc::new(moved), &dir.path().join("luradb.toml")).unwrap();
+    let mcp = server.mcp_addr.unwrap();
+    client.block_on(async {
+        assert_eq!(whoami(mcp, tokens["access_token"].as_str().unwrap()).await.0, 401);
+        let (status, error) = refresh(mcp, &client_id, tokens["refresh_token"].as_str().unwrap()).await;
+        assert_eq!((status, error["error"].clone()), (400, json!("invalid_grant")));
+        assert_eq!(whoami(mcp, admin_key).await, (200, Some(ADMIN_NAME.to_string())));
+    });
+    server.shutdown().unwrap();
+}
+
 // Tokens outlive a restart, but not one with OAuth switched off; API keys
 // keep working.
 #[test]

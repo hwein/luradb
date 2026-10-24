@@ -92,19 +92,19 @@ pub struct AuthCache {
     permissions: RwLock<HashMap<(String, String), AccessLevel>>,
     /// OAuth clients and tokens of the MCP listener.
     oauth: RwLock<oauth::OAuthState>,
-    /// Access tokens count only with the MCP listener and its OAuth on;
-    /// otherwise the OAuth state is not even loaded.
-    oauth_enabled: bool,
+    /// The resource access tokens must be for, with the MCP listener and
+    /// its OAuth on; without, the OAuth state is not even loaded.
+    oauth_resource: Option<String>,
     engine: Arc<LsmStorageEngine>,
 }
 
 impl AuthCache {
-    pub fn new(engine: Arc<LsmStorageEngine>, oauth_enabled: bool) -> Self {
+    pub fn new(engine: Arc<LsmStorageEngine>, oauth_resource: Option<String>) -> Self {
         Self {
             users: RwLock::new(HashMap::new()),
             permissions: RwLock::new(HashMap::new()),
             oauth: RwLock::new(oauth::OAuthState::default()),
-            oauth_enabled,
+            oauth_resource,
             engine,
         }
     }
@@ -143,7 +143,7 @@ impl AuthCache {
             }
         }
 
-        let new_oauth = if self.oauth_enabled { oauth::load(&self.engine).await? } else { oauth::OAuthState::default() };
+        let new_oauth = if self.oauth_resource.is_some() { oauth::load(&self.engine).await? } else { oauth::OAuthState::default() };
 
         *self.users.write().await = new_users;
         *self.permissions.write().await = new_perms;
@@ -387,7 +387,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        (AuthCache::new(engine, false), dir)
+        (AuthCache::new(engine, None), dir)
     }
 
     /// A user record overwritten by name with a different api_key_hash —

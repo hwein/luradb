@@ -302,7 +302,8 @@ allowed_origins = []
 oauth_enabled = false
 # Public base URL of the MCP listener as clients reach it, e.g.
 # "https://db.example.com:3100" or the address of a reverse proxy; https:// is
-# required unless the host is localhost, 127.0.0.1 or ::1.
+# required unless the host is localhost, 127.0.0.1 or ::1. OAuth tokens are
+# bound to it: changing it makes OAuth clients sign in again.
 public_url = ""
 
 # Shared-memory read path for local clients.

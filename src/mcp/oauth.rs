@@ -68,7 +68,7 @@ impl OAuth {
     }
 
     fn resource(&self) -> String {
-        format!("{}/mcp", self.public_url)
+        resource_url(&self.public_url)
     }
 
     pub(crate) fn resource_metadata_url(public_url: &str) -> String {
@@ -89,6 +89,12 @@ impl OAuth {
         let inner = Sha256::digest(data.join("\n").as_bytes());
         hex::encode(Sha256::new().chain_update(self.csrf_key).chain_update(inner).finalize())
     }
+}
+
+/// The resource (RFC 8707) of the MCP listener at `public_url`, which its
+/// tokens are bound to.
+pub(crate) fn resource_url(public_url: &str) -> String {
+    format!("{}/mcp", public_url.trim_end_matches('/'))
 }
 
 /// The `Origin` a browser sends for pages under `public_url`: scheme and
@@ -774,6 +780,15 @@ mod tests {
         assert!(!failures.blocked(ip, 1000));
         assert!(failures.reserve(ip, 1000));
         assert!(!failures.reserve(ip, 1000));
+    }
+
+    // The cache checks tokens against the same resource the listener issues
+    // them for, with or without a trailing slash in the config.
+    #[test]
+    fn the_resource_ignores_a_trailing_slash() {
+        let internal = Internal::new(Router::new());
+        assert_eq!(OAuth::new(internal, "https://db.example.com:3100/").resource(), "https://db.example.com:3100/mcp");
+        assert_eq!(resource_url("https://db.example.com:3100"), resource_url("https://db.example.com:3100//"));
     }
 
     // As a browser sends it: lower case, without the scheme's default port.

@@ -27,6 +27,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Changed
 
+- With `mcp.public_url` under a path, the MCP listener also serves its OAuth metadata at the RFC 8414 and RFC 9728 well-known paths.
 - The MCP tool `kv_get` returns a value exactly as stored, as `{"value": …}` with `null` for a NULL key and base64url for non-UTF-8 values.
 - The MCP listener limits OAuth client registrations per client IP and to 10 redirect URIs of up to 2048 characters; registrations never used to sign in expire after a day.
 - The Debian package no longer starts the service on first install and prints where the config lives and how to start it; upgrades restart the service only if it is running.

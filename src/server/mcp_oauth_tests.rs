@@ -2,7 +2,7 @@
 //! key, code exchange with PKCE, refresh, revocation, written by hand as a
 //! client and a browser send them.
 
-use super::mcp_tests::{create_user, http, mcp_config, rest_call, rest_ok, with_admin, Client};
+use super::mcp_tests::{create_user, http, mcp_config, rest_call, rest_ok, with_admin, with_mcp, Client};
 use super::tests::{exchange, request};
 use super::*;
 
@@ -71,8 +71,18 @@ where
     F: FnOnce(SocketAddr, SocketAddr) -> Fut,
     Fut: Future<Output = ()>,
 {
+    with_oauth_at(PUBLIC_URL, admin_key, client);
+}
+
+fn with_oauth_at<F, Fut>(public_url: &str, admin_key: &str, client: F)
+where
+    F: FnOnce(SocketAddr, SocketAddr) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let dir = tempfile::TempDir::new().unwrap();
-    let server = Server::start(Arc::new(oauth_config(dir.path(), admin_key)), &dir.path().join("luradb.toml")).unwrap();
+    let mut config = oauth_config(dir.path(), admin_key);
+    config.mcp.public_url = public_url.to_string();
+    let server = Server::start(Arc::new(config), &dir.path().join("luradb.toml")).unwrap();
     let (rest, mcp) = (server.http_addr.unwrap(), server.mcp_addr.unwrap());
     tokio::runtime::Runtime::new().unwrap().block_on(client(rest, mcp));
     server.shutdown().unwrap();
@@ -205,6 +215,108 @@ fn both_metadata_documents_describe_this_server() {
         assert_eq!(answer.status, 401);
         let challenge = format!("resource_metadata=\"{PUBLIC_URL}/.well-known/oauth-protected-resource\"");
         assert!(header(&answer.head, "www-authenticate").unwrap().contains(&challenge), "{}", answer.head);
+    });
+}
+
+async fn get(mcp: SocketAddr, path: &str) -> (u16, Vec<u8>) {
+    request(mcp, &http("GET", path, &[], "")).await
+}
+
+/// `path` answers 200 with the same body as `root`.
+async fn assert_same_document(mcp: SocketAddr, path: &str, root: &str) {
+    let (status, expected) = get(mcp, root).await;
+    assert_eq!(status, 200, "{root}");
+    let (status, body) = get(mcp, path).await;
+    assert_eq!(status, 200, "{path}");
+    assert_eq!(body, expected, "{path}");
+}
+
+/// `path` answers like an unknown route: 404 with an empty body, for GET
+/// and POST.
+async fn assert_not_found(mcp: SocketAddr, path: &str) {
+    for method in ["GET", "POST"] {
+        let (status, body) = request(mcp, &http(method, path, &[], "")).await;
+        assert_eq!((status, String::from_utf8_lossy(&body).as_ref()), (404, ""), "{method} {path}");
+    }
+}
+
+const AS_ROOT: &str = "/.well-known/oauth-authorization-server";
+const PR_ROOT: &str = "/.well-known/oauth-protected-resource";
+
+// RFC 8414 and RFC 9728 insert the well-known segment between the host and
+// the path of the public URL; the root routes and the challenge stay.
+#[test]
+fn under_a_public_path_the_metadata_is_also_at_the_well_known_paths() {
+    const PATHED: &str = "https://db.example.com/luradb";
+    with_oauth_at(PATHED, "lura_oauth_pathed_admin", |_, mcp| async move {
+        assert_same_document(mcp, "/.well-known/oauth-authorization-server/luradb", AS_ROOT).await;
+        assert_same_document(mcp, "/.well-known/oauth-protected-resource/luradb/mcp", PR_ROOT).await;
+        for path in ["/.well-known/oauth-authorization-server/luradb", "/.well-known/oauth-protected-resource/luradb/mcp"] {
+            let (status, body) = request(mcp, &http("POST", path, &[], "")).await;
+            assert_eq!((status, body.is_empty()), (404, true), "POST {path}");
+        }
+        let (_, body) = get(mcp, "/.well-known/oauth-authorization-server/luradb").await;
+        assert_eq!(json_of(&body)["issuer"], json!(PATHED));
+
+        assert_not_found(mcp, "/unknown").await;
+        for path in [
+            "/.well-known/oauth-authorization-server/other",
+            "/.well-known/oauth-authorization-server/luradb/",
+            "/.well-known/oauth-authorization-server/LuraDB",
+            "/.well-known/oauth-protected-resource/luradb",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            assert_not_found(mcp, path).await;
+        }
+
+        let answer = Client::new(mcp, None).initialize().await;
+        assert_eq!(answer.status, 401);
+        let challenge = format!("resource_metadata=\"{PATHED}/.well-known/oauth-protected-resource\"");
+        assert!(header(&answer.head, "www-authenticate").unwrap().contains(&challenge), "{}", answer.head);
+    });
+}
+
+#[test]
+fn without_a_public_path_the_resource_metadata_is_also_under_mcp() {
+    with_oauth("lura_oauth_rootpath_admin", |_, mcp| async move {
+        assert_same_document(mcp, "/.well-known/oauth-protected-resource/mcp", PR_ROOT).await;
+        assert_not_found(mcp, "/.well-known/oauth-authorization-server/x").await;
+    });
+}
+
+// The public path is compared as sent, never read as a route pattern.
+#[test]
+fn a_public_path_with_pattern_characters_matches_only_itself() {
+    with_oauth_at("https://db.example.com/{x}/{*rest}", "lura_oauth_pattern_admin", |_, mcp| async move {
+        assert_same_document(mcp, "/.well-known/oauth-authorization-server/{x}/{*rest}", AS_ROOT).await;
+        assert_same_document(mcp, "/.well-known/oauth-protected-resource/{x}/{*rest}/mcp", PR_ROOT).await;
+        for path in [
+            "/.well-known/oauth-authorization-server/y/z",
+            "/.well-known/oauth-authorization-server/%7Bx%7D/%7B*rest%7D",
+            "/.well-known/oauth-protected-resource/y/z/mcp",
+            "/.well-known/oauth-protected-resource/{x}/{*rest}",
+        ] {
+            assert_not_found(mcp, path).await;
+        }
+    });
+}
+
+#[test]
+fn without_oauth_no_metadata_path_exists() {
+    let tune = |cfg: &mut LuraConfig| {
+        with_admin(cfg, "lura_oauth_nometa_admin");
+        cfg.mcp.public_url = "https://db.example.com/luradb".to_string();
+    };
+    with_mcp(tune, |_, mcp| async move {
+        for path in [
+            AS_ROOT,
+            PR_ROOT,
+            "/.well-known/oauth-authorization-server/luradb",
+            "/.well-known/oauth-protected-resource/luradb/mcp",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            assert_not_found(mcp, path).await;
+        }
     });
 }
 

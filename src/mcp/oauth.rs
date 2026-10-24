@@ -11,7 +11,7 @@ use crate::api::middleware::ClientIp;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::rejection::{FormRejection, QueryRejection};
 use axum::extract::{Extension, Form, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -47,6 +47,10 @@ pub(crate) struct OAuth {
     public_url: String,
     /// `scheme://host[:port]` of `public_url`; the sign-in form posts from there.
     origin: String,
+    // Where RFC 8414 and RFC 9728 place the metadata for `public_url`, as
+    // sent, not decoded.
+    authorization_server_path: String,
+    protected_resource_path: String,
     /// Binds the sign-in form's CSRF token to its request.
     csrf_key: [u8; 32],
     failures: Failures,
@@ -57,10 +61,15 @@ impl OAuth {
     pub(crate) fn new(internal: Internal, public_url: &str) -> Self {
         let public_url = public_url.trim_end_matches('/').to_string();
         let origin = origin_of(&public_url);
+        let path = path_of(&public_url);
+        let authorization_server_path = format!("/.well-known/oauth-authorization-server{path}");
+        let protected_resource_path = format!("/.well-known/oauth-protected-resource{path}/mcp");
         Self {
             internal,
             public_url,
             origin,
+            authorization_server_path,
+            protected_resource_path,
             csrf_key: rand::thread_rng().gen(),
             failures: Failures::default(),
             registrations: Registrations::default(),
@@ -106,6 +115,12 @@ fn origin_of(public_url: &str) -> String {
     let default_port = if scheme == "https" { ":443" } else { ":80" };
     let authority = authority.strip_suffix(default_port).unwrap_or(&authority);
     format!("{scheme}://{authority}")
+}
+
+/// The path of `public_url`: empty, or from the first `/` after the authority.
+fn path_of(public_url: &str) -> &str {
+    let rest = public_url.split_once("://").map_or(public_url, |(_, rest)| rest);
+    rest.find('/').map_or("", |i| &rest[i..])
 }
 
 /// Failed and pending sign-ins by client IP, as Unix seconds.
@@ -225,6 +240,11 @@ pub(crate) fn routes(oauth: Arc<OAuth>) -> Router {
     Router::new()
         .route("/.well-known/oauth-protected-resource", get(protected_resource))
         .route("/.well-known/oauth-authorization-server", get(authorization_server))
+        // The public path comes from the config and may hold characters
+        // axum reads as a pattern, so it is compared, not routed. Other
+        // methods get the 404 of an unknown route, not 405.
+        .route("/.well-known/oauth-protected-resource/{*rest}", get(protected_resource_at).fallback(not_found))
+        .route("/.well-known/oauth-authorization-server/{*rest}", get(authorization_server_at).fallback(not_found))
         .route("/oauth/register", post(register))
         .route("/oauth/authorize", get(authorize_page).post(authorize_submit))
         .route("/oauth/token", post(token))
@@ -256,6 +276,24 @@ async fn authorization_server(State(oauth): State<Arc<OAuth>>) -> Json<Value> {
         "revocation_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": [],
     }))
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+async fn protected_resource_at(State(oauth): State<Arc<OAuth>>, uri: Uri) -> Response {
+    if uri.path() != oauth.protected_resource_path {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    protected_resource(State(oauth)).await.into_response()
+}
+
+async fn authorization_server_at(State(oauth): State<Arc<OAuth>>, uri: Uri) -> Response {
+    if uri.path() != oauth.authorization_server_path {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    authorization_server(State(oauth)).await.into_response()
 }
 
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
@@ -803,6 +841,20 @@ mod tests {
             ("http://[::1]:3100", "http://[::1]:3100"),
         ] {
             assert_eq!(origin_of(public_url), origin, "{public_url}");
+        }
+    }
+
+    #[test]
+    fn the_metadata_paths_insert_the_well_known_segment_before_the_public_path() {
+        for (public_url, path) in [
+            ("https://db.example.com", ""),
+            ("https://db.example.com:8443/", ""),
+            ("https://db.example.com:8443/luradb/", "/luradb"),
+            ("http://[::1]:3100/a/b%20c", "/a/b%20c"),
+        ] {
+            let oauth = OAuth::new(Internal::new(Router::new()), public_url);
+            assert_eq!(oauth.authorization_server_path, format!("/.well-known/oauth-authorization-server{path}"));
+            assert_eq!(oauth.protected_resource_path, format!("/.well-known/oauth-protected-resource{path}/mcp"));
         }
     }
 

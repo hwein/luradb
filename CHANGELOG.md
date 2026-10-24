@@ -86,6 +86,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: `POST /store-api/domains` answers 400 instead of 500 for an invalid domain name.
 - **BREAKING** API: the schema of `default` in the table description now allows the scalar and null values the server returns.
 - `--migrate-shards` stops instead of skipping JSON or relational data it cannot find at the configured paths.
+- JSON search no longer returns documents that stopped matching the filter while the search ran; results and `total` come from one consistent state.
 
 ### Security
 

@@ -12,7 +12,7 @@ permissions:
 jobs:
   test:
     name: Test
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'self-hosted' }}
     # Internal reference pattern shared by the file and commit-message gates.
     # The section sign is written as an escape so this file does not match itself.
     env:
@@ -40,13 +40,17 @@ jobs:
           done
           exit "$fail"
 
-      # io_uring needs the runner VM, not a container (Docker's default
-      # seccomp blocks it) - uname -r is the acceptance proof.
+      # io_uring needs a VM, not a container (Docker's default seccomp
+      # blocks it); uname -r logs the kernel the tests ran on. Fork PRs run
+      # on fresh GitHub-hosted machines so outside code never reaches a
+      # persistent one.
       - name: Log kernel version
         run: uname -r
 
       - name: Toolchain (from rust-toolchain.toml)
-        run: rustup show
+        run: |
+          rustup toolchain install
+          rustup show
 
       # A persistent runner keeps its own rustup in ~/.cargo/bin; caching
       # that directory would prune it after the job.
@@ -71,7 +75,7 @@ jobs:
 
   deny:
     name: cargo-deny
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'self-hosted' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 

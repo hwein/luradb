@@ -579,6 +579,7 @@ async fn serve_http(listener: TcpListener, router: Router, mut shutdown: watch::
 /// directory: tests share the process.
 #[cfg(test)]
 pub(crate) mod test_hook {
+    use crate::control::ShardOwners;
     use crate::metrics::MetricsStore;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -640,6 +641,26 @@ pub(crate) mod test_hook {
         for store in stores {
             store.tick_all();
         }
+    }
+
+    fn shard_owners() -> &'static Mutex<HashMap<(String, usize), ShardOwners>> {
+        static OWNERS: OnceLock<Mutex<HashMap<(String, usize), ShardOwners>>> = OnceLock::new();
+        OWNERS.get_or_init(Default::default)
+    }
+
+    /// Data shard `shard` of the server on `system_dir` serves `owners` until
+    /// [`forget_owners`].
+    pub(crate) fn register_owners(system_dir: &str, shard: usize, owners: ShardOwners) {
+        shard_owners().lock().unwrap().insert((system_dir.to_string(), shard), owners);
+    }
+
+    pub(crate) fn forget_owners(system_dir: &str, shard: usize) {
+        shard_owners().lock().unwrap().remove(&(system_dir.to_string(), shard));
+    }
+
+    /// The engines of data shard `shard` of the running server on `system_dir`.
+    pub(crate) fn owners(system_dir: &str, shard: usize) -> ShardOwners {
+        shard_owners().lock().unwrap().get(&(system_dir.to_string(), shard)).cloned().expect("a running data shard")
     }
 
     fn faults() -> &'static Mutex<Vec<(String, &'static str)>> {
@@ -1676,6 +1697,99 @@ mod tests {
                 assert!(thread_of(&head).starts_with("luradb-frontend"), "{head}");
             },
         );
+    }
+
+    /// [`with_tuned_server`], handing `client` the engines of the data shard
+    /// that owns the domain `name` too.
+    fn with_owner_of<F, Fut>(name: &str, tune: impl FnOnce(&mut LuraConfig), client: F)
+    where
+        F: FnOnce(SocketAddr, crate::control::ShardOwners) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        tune(&mut cfg);
+        let shard = usize::from(crate::control::slots::shard_of_domain(name, cfg.multicore.shards));
+        let system_dir = cfg.storage.system_dir.clone();
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let owners = test_hook::owners(&system_dir, shard);
+        tokio::runtime::Runtime::new().unwrap().block_on(client(addr, owners));
+        server.shutdown().unwrap();
+    }
+
+    /// Waits until `engine` has an SSTable on level 0.
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    async fn until_flushed(engine: &crate::engines::lsm::engine::LsmStorageEngine) {
+        // Upper bound against hanging only.
+        for _ in 0..1500 {
+            if engine.heartbeat_data().l0_sstable_count >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no SSTable was flushed within the poll budget");
+    }
+
+    // With a budget of one read token and its refill locked, a point read of
+    // a key whose SSTable block is not cached gives up on the frontend and
+    // runs again on the pool: it takes the one token once and answers, and
+    // the next read finds the budget spent.
+    #[test]
+    fn a_cold_point_read_handed_to_the_pool_takes_one_read_token() {
+        let tune = |cfg: &mut LuraConfig| {
+            // One flush: 300 inline values of 512 bytes outgrow 128 KiB once.
+            cfg.lsm.memtable_size_threshold = 128 * 1024;
+            cfg.rate_limit.default_read_iops = 1;
+        };
+        with_owner_of("default", tune, |addr, owners| async move {
+            let value = |i: usize| format!("{i:0>512}");
+            for i in 0..300 {
+                let put = with_body("PUT", &format!("/store-api/kv/default/keys/cold-{i}"), &value(i));
+                assert_eq!(request(addr, &put).await.0, 200);
+            }
+            until_flushed(owners.kv.engine()).await;
+            owners.kv.store("default").await.unwrap().lock_read_refill_for_test();
+
+            let cold = get("/store-api/kv/default/keys/cold-7");
+            let (status, head, body) = exchange(addr, &cold).await;
+            let body = String::from_utf8(body).unwrap();
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body, value(7));
+            assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+            assert_eq!(request(addr, &cold).await.0, 429);
+        });
+    }
+
+    // The same for a row of a relational table: its read gives the token
+    // back when it gives up on the frontend.
+    #[test]
+    fn a_cold_row_read_handed_to_the_pool_takes_one_read_token() {
+        let tune = |cfg: &mut LuraConfig| {
+            cfg.rel.enabled = true;
+            cfg.rate_limit.default_read_iops = 1;
+        };
+        with_owner_of("default", tune, |addr, owners| async move {
+            let sql = |statement: &str| with_body("POST", "/store-api/rel/default/sql", &json!({ "sql": statement }).to_string());
+            assert_eq!(request(addr, &sql("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")).await.0, 200);
+            assert_eq!(request(addr, &sql("INSERT INTO t VALUES (1, 'clé'), (2, '✓')")).await.0, 200);
+            let rel = owners.rel.expect("the relational engine runs");
+            {
+                // As a write past the MemTable threshold does.
+                let _drain = rel.engine().drain_writes().await;
+                rel.engine().freeze_active_memtable();
+            }
+            until_flushed(rel.engine()).await;
+            rel.lock_read_refill_for_test("default");
+
+            let row = get("/store-api/rel/default/tables/t/rows/1");
+            let (status, head, body) = exchange(addr, &row).await;
+            let body = String::from_utf8(body).unwrap();
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("clé"), "{body}");
+            assert!(thread_of(&head).starts_with("luradb-reader"), "{head}");
+            assert_eq!(request(addr, &row).await.0, 429);
+        });
     }
 
     // Test 3: SQL arrives on the pool; write statements answer from the

@@ -1,24 +1,37 @@
 //! Cooperative scheduling helpers: yielding, bounded offloading, and reads
 //! that give up rather than wait for the disk.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 
+/// The state of one [`inline_read`].
+#[derive(Default)]
+struct InlineRead {
+    /// Set once a read there would have waited for the disk.
+    gave_up: Cell<bool>,
+    /// Run if the read gives up; see [`on_give_up`].
+    on_give_up: RefCell<Vec<Box<dyn FnOnce() + Send>>>,
+}
+
 tokio::task_local! {
-    /// Set inside [`inline_read`] once a read there would have waited for the disk.
-    static WOULD_BLOCK: Cell<bool>;
+    static INLINE_READ: InlineRead;
 }
 
 /// Runs `fut` as a read that must not wait for the disk; also returns whether
-/// it gave up because it would have had to ([`would_block`]). Task-local, so
-/// it follows `fut` from one worker thread to the next.
+/// it gave up because it would have had to ([`would_block`]), after running
+/// what it registered with [`on_give_up`]. Task-local, so it follows `fut`
+/// from one worker thread to the next.
 pub async fn inline_read<F: Future>(fut: F) -> (F::Output, bool) {
-    WOULD_BLOCK
-        .scope(Cell::new(false), async {
+    INLINE_READ
+        .scope(InlineRead::default(), async {
             let out = fut.await;
-            (out, WOULD_BLOCK.with(Cell::get))
+            let (gave_up, on_give_up) = INLINE_READ.with(|read| (read.gave_up.get(), read.on_give_up.take()));
+            if gave_up {
+                on_give_up.into_iter().for_each(|f| f());
+            }
+            (out, gave_up)
         })
         .await
 }
@@ -26,7 +39,13 @@ pub async fn inline_read<F: Future>(fut: F) -> (F::Output, bool) {
 /// True inside [`inline_read`], which then reports the read as given up: the
 /// caller must fail instead of waiting for the disk. False anywhere else.
 pub fn would_block() -> bool {
-    WOULD_BLOCK.try_with(|flag| flag.set(true)).is_ok()
+    INLINE_READ.try_with(|read| read.gave_up.set(true)).is_ok()
+}
+
+/// Inside [`inline_read`], runs `f` once the read ends if it gave up, so
+/// that the read can undo what it did before; anywhere else drops `f`.
+pub fn on_give_up(f: impl FnOnce() + Send + 'static) {
+    let _ = INLINE_READ.try_with(|read| read.on_give_up.borrow_mut().push(Box::new(f)));
 }
 
 /// Hands the thread back every `every` ticks.
@@ -210,6 +229,46 @@ mod tests {
         let ((), gave_up) = inline_read(async { tokio::task::yield_now().await }).await;
         assert!(!gave_up);
         assert!(!would_block());
+    }
+
+    // What a read registers runs once it gives up; not when it ends without
+    // giving up, nor outside an inline read, nor when it is dropped unfinished.
+    #[tokio::test]
+    async fn test_on_give_up_runs_only_for_a_read_that_gave_up() {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let register = || {
+            let ran = Arc::clone(&ran);
+            on_give_up(move || {
+                ran.fetch_add(1, Ordering::SeqCst);
+            });
+        };
+
+        let ((), gave_up) = inline_read(async {
+            register();
+            tokio::task::yield_now().await;
+            would_block();
+        })
+        .await;
+        assert!(gave_up);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        let ((), gave_up) = inline_read(async {
+            register();
+            tokio::task::yield_now().await;
+        })
+        .await;
+        assert!(!gave_up);
+        register();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        // Dropped before it ends, as when the client goes away.
+        let dropped = inline_read(async {
+            register();
+            would_block();
+            std::future::pending::<()>().await;
+        });
+        assert!(futures::FutureExt::now_or_never(dropped).is_none());
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     // `0` resolves to the auto count, anything else is taken verbatim.

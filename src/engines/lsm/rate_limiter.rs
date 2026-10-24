@@ -101,6 +101,20 @@ impl TokenBucket {
         }
     }
 
+    /// Gives one token back, up to the capacity.
+    pub fn refund(&self) {
+        let _ = self.tokens.fetch_update(Ordering::AcqRel, Ordering::Acquire, |tokens| {
+            (tokens < self.capacity).then_some(tokens + 1)
+        });
+    }
+
+    /// Locks out lazy refill (`last_refill` pushed far into the future) and
+    /// keeps the tokens: from now on only consumes and refunds change them.
+    #[cfg(test)]
+    pub fn lock_refill_for_test(&self) {
+        self.last_refill.store(now_millis() + 3_600_000, Ordering::Release);
+    }
+
     /// Drains the bucket and locks out lazy refill (`last_refill` pushed far
     /// into the future) — stays deterministically empty no matter how much
     /// real time passes before the next `try_consume` (avoids flaky tests).
@@ -131,6 +145,11 @@ impl RateLimiter {
     /// Consumes one read token. Returns `false` if exhausted (→ 429).
     pub fn check_read(&self) -> bool {
         self.read_bucket.try_consume()
+    }
+
+    /// Gives back a read token that [`Self::check_read`] took.
+    pub fn refund_read(&self) {
+        self.read_bucket.refund();
     }
 
     /// Consumes one write token. Returns `false` if exhausted (→ 429).
@@ -166,5 +185,19 @@ mod tests {
         // refill() sees elapsed >= 150 ms -> at least 1 token (10 IOPS).
         bucket.last_refill.store(now_millis() - 150, Ordering::Release);
         assert!(bucket.try_consume(), "must have refilled at least 1 token");
+    }
+
+    // A refund gives back a token taken, never more than the capacity.
+    #[test]
+    fn test_refund_stays_within_the_capacity() {
+        let bucket = TokenBucket::new(2);
+        bucket.lock_refill_for_test();
+        bucket.refund();
+        assert!(bucket.try_consume(), "1st");
+        assert!(bucket.try_consume(), "2nd");
+        assert!(!bucket.try_consume(), "a refund at capacity adds nothing");
+        bucket.refund();
+        assert!(bucket.try_consume(), "the refunded token");
+        assert!(!bucket.try_consume());
     }
 }

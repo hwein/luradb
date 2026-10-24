@@ -119,6 +119,8 @@ async fn run(boot: ShardBoot) {
     compio::runtime::spawn(MetricsTicker::new(Arc::clone(owners.kv.metrics())).run()).detach();
     #[cfg(test)]
     super::test_hook::register_metrics(&config.storage.system_dir, Arc::clone(owners.kv.metrics()));
+    #[cfg(test)]
+    super::test_hook::register_owners(&config.storage.system_dir, shard, owners.clone());
     let loops = spawn_loops(&config, &owners);
     let _ = started.send(());
     let serving = compio::runtime::spawn(bridge::serve_engine(jobs, api::create_router(state)));
@@ -129,6 +131,8 @@ async fn run(boot: ShardBoot) {
         commands
     };
     let drained = control::serve_shard(owners, commands).await;
+    #[cfg(test)]
+    super::test_hook::forget_owners(&config.storage.system_dir, shard);
     #[cfg(test)]
     super::test_hook::record(&config.storage.system_dir, format!("shard {shard} draining"));
 

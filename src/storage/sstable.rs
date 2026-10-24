@@ -20,6 +20,16 @@ fn not_behind_prefix_run(key: &[u8], prefix: &[u8]) -> bool {
     key < prefix || key.starts_with(prefix)
 }
 
+/// Inside [`coop::inline_read`], gives the read up if a page of `bytes`, a
+/// slice of a mapped table, is not in memory. Anywhere else asks nothing.
+fn give_up_unless_resident(bytes: &[u8], what: &str) -> Result<()> {
+    if coop::in_inline_scope() && !coop::resident(bytes) {
+        coop::would_block();
+        bail!("{what} not in memory: reading it may wait for the disk");
+    }
+    Ok(())
+}
+
 /// Returns the user-key portion of an encoded MVCC key.
 ///
 /// MVCC keys have the layout `[user_key][inv_timestamp_be_8_bytes]`.
@@ -200,7 +210,6 @@ impl SSTableData {
 
 pub struct SSTableReader {
     data: SSTableData,
-    #[allow(dead_code)]
     footer: &'static Archived<SSTableFooter>,
     index: &'static Archived<IndexBlock>,
     bloom_filter: BloomFilterImpl,
@@ -330,7 +339,8 @@ impl SSTableReader {
     /// Semantics are identical to [`get`] but every data block read is
     /// first looked up in `cache`; on a miss the raw block bytes are stored
     /// in the cache for future reads, except inside [`coop::inline_read`],
-    /// where a miss on a mapped table ends the lookup with an error.
+    /// where a miss on a mapped table, or index or block pages of it that are
+    /// not in memory, end the lookup with an error.
     pub fn get_with_cache(
         &self,
         key: &[u8],
@@ -350,6 +360,12 @@ impl SSTableReader {
         let bloom_key = mvcc_user_key(key);
         if !self.bloom_filter.contains(bloom_key) {
             return Ok(None);
+        }
+        if let SSTableData::Mapped(mmap) = &self.data {
+            // The whole index section, not just the rkyv root at its end.
+            let offset = u64::from(self.footer.index_handle.offset) as usize;
+            let size = u64::from(self.footer.index_handle.size) as usize;
+            give_up_unless_resident(&mmap[offset..offset + size], "index")?;
         }
 
         let block_idx = self.find_block(key)?;
@@ -432,7 +448,8 @@ impl SSTableReader {
     ///
     /// On a cache miss the block is taken from the table's data and, unless
     /// the table is retired, inserted into the cache before being returned.
-    /// Inside [`coop::inline_read`] a miss on a mapped table fails instead.
+    /// Inside [`coop::inline_read`] a miss on a mapped table fails instead,
+    /// and so does a hit on a mapped block whose pages are not in memory.
     /// Only the block's own stripe is locked.
     fn get_or_cache_block(
         &self,
@@ -442,6 +459,10 @@ impl SSTableReader {
     ) -> Result<CachedBlock> {
         let mut stripe = cache.stripe(cache_key);
         if let Some(cached) = stripe.get(cache_key) {
+            drop(stripe);
+            if matches!(cached, CachedBlock::Mapped { .. }) {
+                give_up_unless_resident(cached.as_bytes(), "data block")?;
+            }
             return Ok(cached);
         }
         #[cfg(test)]
@@ -931,6 +952,93 @@ mod tests {
         let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
         let (read, gave_up) = coop::inline_read(async { owned.get_with_cache(b"mkey", &cache) }).await;
         assert!(read?.is_some() && !gave_up);
+        Ok(())
+    }
+
+    /// A mapped table holding `mkey`, its block cached, and that block's bytes.
+    fn mapped_table_with_a_cached_block(
+        dir: &tempfile::TempDir,
+    ) -> anyhow::Result<(SSTableReader, StripedBlockCache, CachedBlock)> {
+        let mut builder = SSTableBuilder::new();
+        builder.add_inline(b"mkey".to_vec(), b"mval".to_vec(), 0);
+        let path = dir.path().join("table.sst");
+        std::fs::write(&path, builder.finish()?)?;
+        let mapped = SSTableReader::open_mmap(&path)?;
+        let cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+        let Some(CachedValue::Cached { block, .. }) = mapped.get_with_cache(b"mkey", &cache)? else {
+            bail!("expected a cached value");
+        };
+        Ok((mapped, cache, block))
+    }
+
+    // The kernel may have evicted the pages of a cached block of a mapped
+    // table: an inline read gives up on it as on an uncached block.
+    #[tokio::test]
+    async fn test_inline_read_gives_up_on_a_cached_mapped_block_whose_pages_are_evicted() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let (mapped, cache, block) = mapped_table_with_a_cached_block(&dir)?;
+        let block_start = block.as_bytes().as_ptr();
+        coop::set_residency(Some(Box::new(move |bytes| bytes.as_ptr() != block_start)));
+
+        let (read, gave_up) = coop::inline_read(async { mapped.get_with_cache(b"mkey", &cache) }).await;
+        coop::set_residency(None);
+        assert!(read.is_err() && gave_up);
+        assert!(mapped.get_with_cache(b"mkey", &cache)?.is_some());
+        Ok(())
+    }
+
+    // So may the pages of the index: an inline read asks about the whole index
+    // section first and gives up before it looks at the index or a block.
+    #[tokio::test]
+    async fn test_inline_read_gives_up_when_the_index_pages_are_evicted() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let (mapped, cache, block) = mapped_table_with_a_cached_block(&dir)?;
+        let block_start = block.as_bytes().as_ptr();
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = std::rc::Rc::clone(&asked);
+        coop::set_residency(Some(Box::new(move |bytes| {
+            log.borrow_mut().push(bytes.to_vec());
+            bytes.as_ptr() == block_start
+        })));
+
+        let (read, gave_up) = coop::inline_read(async { mapped.get_with_cache(b"mkey", &cache) }).await;
+        coop::set_residency(None);
+        assert!(read.is_err() && gave_up);
+        let asked = asked.borrow();
+        assert_eq!(asked.len(), 1);
+        let mut index_section = AlignedVec::<16>::new();
+        index_section.extend_from_slice(&asked[0]);
+        let index = rkyv::access::<Archived<IndexBlock>, rancor::Error>(&index_section)?;
+        assert_eq!(index.entries[0].0.as_slice(), b"mkey");
+        Ok(())
+    }
+
+    // Resident pages keep a hit inline. Only an inline read of a mapped table
+    // asks; an owned table and a read outside an inline read never do.
+    #[tokio::test]
+    async fn test_only_an_inline_read_of_a_mapped_table_asks_whether_pages_are_resident() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let (mapped, cache, _) = mapped_table_with_a_cached_block(&dir)?;
+        let mut builder = SSTableBuilder::new();
+        builder.add_inline(b"mkey".to_vec(), b"mval".to_vec(), 0);
+        let owned = SSTableReader::open(builder.finish()?)?;
+        let owned_cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
+        assert!(owned.get_with_cache(b"mkey", &owned_cache)?.is_some());
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = std::rc::Rc::clone(&asked);
+        coop::set_residency(Some(Box::new(move |_| {
+            count.set(count.get() + 1);
+            true
+        })));
+
+        let (read, gave_up) = coop::inline_read(async { mapped.get_with_cache(b"mkey", &cache) }).await;
+        assert!(read?.is_some() && !gave_up);
+        assert_eq!(asked.get(), 2, "the index and the block");
+        assert!(mapped.get_with_cache(b"mkey", &cache)?.is_some());
+        let (read, gave_up) = coop::inline_read(async { owned.get_with_cache(b"mkey", &owned_cache) }).await;
+        assert!(read?.is_some() && !gave_up);
+        coop::set_residency(None);
+        assert_eq!(asked.get(), 2);
         Ok(())
     }
 

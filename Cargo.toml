@@ -27,7 +27,7 @@ utoipa = { version = "6", features = ["axum_extras"] }
 # 10.0.2 is the first utoipa-swagger-ui version that builds with zip 9.
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 # Tokio as the base runtime (required by Axum)
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 # Middleware for tracing and CORS
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }

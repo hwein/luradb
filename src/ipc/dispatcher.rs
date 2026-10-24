@@ -225,7 +225,10 @@ fn new_doorbell() -> std::io::Result<(AsyncFd<OwnedFd>, OwnedFd)> {
         }
         (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
     };
-    Ok((AsyncFd::with_interest(read_end, Interest::READABLE)?, write_end))
+    // Safe: the AsyncFd owns the open read end and never closes or replaces
+    // it while registered, so its raw fd stays the same until drop.
+    let read_end = unsafe { AsyncFd::register_with_interest(read_end, Interest::READABLE) }?;
+    Ok((read_end, write_end))
 }
 
 /// Polls every registered client's rings and dispatches their commands.

@@ -86,6 +86,10 @@ pub struct JsonEngine {
     /// Engine-aggregate op/latency window. No `Option`,
     /// no setter — always supplied at bootstrap.
     metrics: Arc<MetricsStore>,
+    /// Test-only: parks the next `search_documents` after its index scans,
+    /// before it reads the page.
+    #[cfg(test)]
+    search_parked: SyncMutex<Option<Arc<crate::engines::lsm::engine::TestHook>>>,
 }
 
 impl JsonEngine {
@@ -165,6 +169,8 @@ impl JsonEngine {
             doc_write_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
             control: OnceLock::new(),
             metrics,
+            #[cfg(test)]
+            search_parked: SyncMutex::new(None),
         }))
     }
 
@@ -484,7 +490,7 @@ impl JsonEngine {
     }
 
     /// Like [`Self::read_stored`], but against an externally held snapshot
-    /// (backup export) instead of one acquired internally.
+    /// (backup export, search) instead of one acquired internally.
     async fn read_stored_with_snapshot(
         &self,
         dom: &JsonDomain,

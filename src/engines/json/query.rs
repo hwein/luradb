@@ -13,6 +13,7 @@ use super::index::{
 };
 use super::JsonEngine;
 use crate::core::coop::YieldEvery;
+use crate::engines::lsm::reader::Snapshot;
 use crate::metrics::EngineKind;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -105,6 +106,11 @@ impl JsonEngine {
         }
         let limit = query.limit.min(MAX_LIMIT);
         let defs = self.indexes.get_indexes(&dom.name);
+        // Every index scan and document read of this search runs against one
+        // snapshot: hits, their content and `total` share one state, and
+        // writes after it stay invisible to this search.
+        let snapshot_guard = self.engine.snapshot().await;
+        let snapshot = snapshot_guard.snapshot();
 
         // Intersect per-filter matches; BTreeSet keeps pagination deterministic.
         let mut matched: Option<BTreeSet<String>> = None;
@@ -115,7 +121,7 @@ impl JsonEngine {
                     field: field.clone(),
                 }
             })?;
-            let keys = self.eval_filter(&dom, def, condition).await?;
+            let keys = self.eval_filter(&dom, def, condition, snapshot).await?;
             matched = Some(match matched {
                 None => keys,
                 Some(previous) => previous.intersection(&keys).cloned().collect(),
@@ -126,13 +132,20 @@ impl JsonEngine {
         }
         let matched = matched.unwrap_or_default();
         let total = matched.len() as u64;
+        #[cfg(test)]
+        {
+            let hook = self.search_parked.lock().take();
+            if let Some(hook) = hook {
+                hook.pause().await;
+            }
+        }
 
         // Only the requested page is actually fetched.
         let mut documents = Vec::new();
         let mut coop = YieldEvery::new(DOC_YIELD_INTERVAL);
         for key in matched.iter().skip(query.offset as usize).take(limit as usize) {
             coop.tick().await;
-            if let Some(stored) = self.read_stored(&dom, key).await? {
+            if let Some(stored) = self.read_stored_with_snapshot(&dom, key, snapshot).await? {
                 documents.push(Document {
                     key: key.clone(),
                     domain: dom.name.clone(),
@@ -220,6 +233,7 @@ impl JsonEngine {
         dom: &JsonDomain,
         def: &IndexDefinition,
         condition: &FilterCondition,
+        snapshot: &Snapshot,
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let encode = |value: &Value| {
             encode_index_value(value, def.field_type).ok_or_else(|| {
@@ -232,14 +246,14 @@ impl JsonEngine {
         match condition {
             FilterCondition::Eq(value) => {
                 let encoded = encode(value)?;
-                self.eval_eq(dom, def, &encoded).await
+                self.eval_eq(dom, def, &encoded, snapshot).await
             }
             FilterCondition::Gt(value)
             | FilterCondition::Gte(value)
             | FilterCondition::Lt(value)
             | FilterCondition::Lte(value) => {
                 let bound = encode(value)?;
-                self.eval_range(dom, def, condition, &bound).await
+                self.eval_range(dom, def, condition, &bound, snapshot).await
             }
         }
     }
@@ -249,11 +263,12 @@ impl JsonEngine {
         dom: &JsonDomain,
         def: &IndexDefinition,
         encoded: &[u8],
+        snapshot: &Snapshot,
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let mut matches = BTreeSet::new();
         let prefix = index_scan_prefix(&dom.system_prefix, &def.field, encoded);
         let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
-        for lsm_key in self.engine.scan_keys(&prefix).await? {
+        for lsm_key in self.engine.scan_keys_with_snapshot(&prefix, snapshot).await? {
             coop.tick().await;
             let Some((_, _, value_bytes, doc_key)) = index::parse_index_key(&lsm_key) else {
                 continue;
@@ -273,11 +288,12 @@ impl JsonEngine {
         def: &IndexDefinition,
         condition: &FilterCondition,
         bound: &[u8],
+        snapshot: &Snapshot,
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let mut matches = BTreeSet::new();
         let prefix = index_field_prefix(&dom.system_prefix, &def.field);
         let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
-        for lsm_key in self.engine.scan_keys(&prefix).await? {
+        for lsm_key in self.engine.scan_keys_with_snapshot(&prefix, snapshot).await? {
             coop.tick().await;
             let Some((_, _, value_bytes, doc_key)) = index::parse_index_key(&lsm_key) else {
                 continue;
@@ -507,6 +523,89 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, JsonStoreError::InvalidFilter(_)), "got: {err}");
+        })
+    }
+
+    /// `d` with `grp = a` under an index on `grp`.
+    async fn engine_with_d() -> (Arc<JsonEngine>, tempfile::TempDir, Document) {
+        let (json, dir) = make_engine().await;
+        json.create_index("default", "grp", super::super::IndexFieldType::String).await.unwrap();
+        let d = json.put_document("default", "d", json!({"grp": "a"})).await.unwrap();
+        (json, dir, d)
+    }
+
+    /// Runs the search `grp = a`, parks it after its index scans, runs
+    /// `write` meanwhile, then lets the search finish. The search holds
+    /// exactly one snapshot while parked and none afterwards.
+    async fn search_around(json: &Arc<JsonEngine>, write: impl std::future::Future<Output = ()>) -> SearchResult {
+        let hook = Arc::new(crate::engines::lsm::engine::TestHook::default());
+        *json.search_parked.lock() = Some(Arc::clone(&hook));
+        let search = compio::runtime::spawn({
+            let json = Arc::clone(json);
+            async move { json.search_documents("default", eq_query(&[("grp", json!("a"))])).await }
+        });
+        hook.reached.notified().await;
+        let registry = json.engine().snapshot_registry();
+        assert_eq!(registry.active_count(), 1, "the parked search holds its snapshot");
+        write.await;
+        hook.release.notify_one();
+        let result = search.await.unwrap().unwrap();
+        assert_eq!(registry.active_count(), 0, "the search released its snapshot");
+        result
+    }
+
+    // 14. An update during the search: the hit comes with the content and
+    //     version it matched with.
+    #[test]
+    fn test_search_returns_the_matching_state_of_a_document_updated_meanwhile() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir, d) = engine_with_d().await;
+            let result = search_around(&json, async {
+                json.put_document("default", "d", json!({"grp": "b"})).await.unwrap();
+            })
+            .await;
+            assert_eq!(result.total, 1);
+            assert_eq!(result.documents.len(), 1);
+            assert_eq!(result.documents[0].content, json!({"grp": "a"}));
+            assert_eq!(result.documents[0].version, d.version);
+            let now = json.get_document("default", "d").await.unwrap().unwrap();
+            assert_ne!(now.version, d.version, "the update went through");
+        })
+    }
+
+    // 15. A delete during the search: the hit is still delivered, the page
+    //     is as long as `total` says.
+    #[test]
+    fn test_search_delivers_a_document_deleted_meanwhile() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir, d) = engine_with_d().await;
+            let result = search_around(&json, async {
+                assert!(json.delete_document("default", "d").await.unwrap());
+            })
+            .await;
+            assert_eq!(result.total, 1);
+            assert_eq!(result.documents.len(), 1);
+            assert_eq!((result.documents[0].key.as_str(), result.documents[0].version), ("d", d.version));
+            assert!(json.get_document("default", "d").await.unwrap().is_none(), "the delete went through");
+        })
+    }
+
+    // 16. A matching document created during the search stays invisible to
+    //     it; the next search finds it.
+    #[test]
+    fn test_search_hides_a_document_created_meanwhile_until_the_next_search() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir, _) = engine_with_d().await;
+            let result = search_around(&json, async {
+                json.put_document("default", "e", json!({"grp": "a"})).await.unwrap();
+            })
+            .await;
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!((result.total, keys), (1, vec!["d"]));
+
+            let result = json.search_documents("default", eq_query(&[("grp", json!("a"))])).await.unwrap();
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!((result.total, keys), (2, vec!["d", "e"]));
         })
     }
 

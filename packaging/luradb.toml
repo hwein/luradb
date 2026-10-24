@@ -303,7 +303,11 @@ oauth_enabled = false
 # Public base URL of the MCP listener as clients reach it, e.g.
 # "https://db.example.com:3100" or the address of a reverse proxy; https:// is
 # required unless the host is localhost, 127.0.0.1 or ::1. OAuth tokens are
-# bound to it: changing it makes OAuth clients sign in again.
+# bound to it: changing it makes OAuth clients sign in again. Behind a proxy
+# under a path, e.g. "https://db.example.com/luradb", the proxy must also pass
+# /.well-known/oauth-authorization-server/luradb and
+# /.well-known/oauth-protected-resource/luradb/mcp to the listener unchanged,
+# without stripping /luradb: OAuth clients look for the metadata there.
 public_url = ""
 
 # Shared-memory read path for local clients.

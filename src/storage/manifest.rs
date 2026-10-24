@@ -212,6 +212,8 @@ impl ManifestManager {
         // guard: it runs to its end even if the caller is dropped, and the
         // next save cannot touch the temporary file before.
         spawn_io(async move {
+            #[cfg(test)]
+            crate::storage::test_fault::check(&temp_path).context("Failed to create temporary manifest")?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create(true)

@@ -1351,8 +1351,8 @@ mod tests {
         }
     }
 
-    // Shutdown barrier: the JSON engine of shard 1 cannot flush (its SSTable
-    // directory is read-only), so the JSON write-ahead log stays for the
+    // Shutdown barrier: the JSON engine of shard 1 cannot flush (a fault in
+    // its SSTable directory), so the JSON write-ahead log stays for the
     // next start, while the key-value and relational ones, flushed on both
     // shards, are cut back; the hub stops once. The next start recovers the
     // document from the log.
@@ -1360,7 +1360,7 @@ mod tests {
     #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     fn a_failed_flush_on_one_shard_keeps_only_that_engine_s_log() {
         use crate::control::slots::domain_name_for_shard;
-        use std::os::unix::fs::PermissionsExt;
+        use crate::storage::test_fault;
         let name = domain_name_for_shard(1, 2, 13);
         let dir = tempfile::TempDir::new().unwrap();
         let tuned = || {
@@ -1383,9 +1383,9 @@ mod tests {
             assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
         });
         let unwritable = layout::shard_dir(Path::new(&cfg.json.sstable_dir), 1);
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o555)).unwrap();
+        test_fault::fail_writes_in(&unwritable);
         server.shutdown().unwrap();
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_fault::allow_writes_in(&unwritable);
 
         let magic = crate::core::wal::WAL_MAGIC;
         assert!(std::fs::read(&cfg.json.wal_path).unwrap().len() > magic.len(), "the JSON log stays");

@@ -2322,7 +2322,7 @@ mod tests {
     use crate::engines::lsm::block_cache::BlockCacheKey;
     use crate::engines::lsm::hlc::HLCTimestamp;
     use crate::engines::lsm::watcher::OpType;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::storage::test_fault;
 
     // The JSON and rel instances run on these defaults, so they must stay
     // this fixed tuning.
@@ -2542,9 +2542,9 @@ mod tests {
     // A failed SSTable write persists nothing (the MemTable
     // goes back among the immutables), so the WAL is
     // the only durable copy -- shutdown() must not truncate it in that case.
-    // The SSTable directory is split out from the
-    // WAL/manifest one so making it read-only fails only the flush, not the
-    // truncate that would otherwise follow it.
+    // The SSTable directory is split out from the WAL/manifest one so the
+    // fault fails only the flush, not the truncate that would otherwise
+    // follow it.
     #[test]
     fn test_shutdown_skips_wal_truncate_after_failed_flush() {
         crate::core::engine_runtime::block_on(async {
@@ -2556,11 +2556,9 @@ mod tests {
             let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
             engine.put(b"crash-key", b"crash-value").await.unwrap();
 
-            // write_sstable creates a new tmp file in sstable_dir -- a read-only
-            // directory rejects that deterministically (verified non-root).
-            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            test_fault::fail_writes_in(&sstable_dir);
             engine.shutdown().await;
-            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            test_fault::allow_writes_in(&sstable_dir);
 
             assert!(
                 std::fs::read(&wal_path).unwrap().len() > crate::core::wal::WAL_MAGIC.len(),
@@ -2585,8 +2583,8 @@ mod tests {
     // A flush whose manifest save fails after its install leaves the table
     // in L0 but in no MANIFEST on disk: shutdown must save the manifest
     // before it truncates the WAL, or the next start loses those writes.
-    // With the SSTable directory split out, a read-only `dir` fails only the
-    // manifest save (verified non-root).
+    // With the SSTable directory split out, a fault in `dir` fails only the
+    // manifest save.
     #[test]
     fn test_shutdown_saves_the_manifest_a_failed_flush_left_unsaved() {
         crate::core::engine_runtime::block_on(async {
@@ -2597,9 +2595,9 @@ mod tests {
             let engine = engine_with_sstable_dir(&dir, &sstable_dir).await;
             engine.put(b"k", b"v").await.unwrap();
             engine.freeze_active_memtable();
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            test_fault::fail_writes_in(dir.path());
             let flushed = engine.flush_memtable().await;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            test_fault::allow_writes_in(dir.path());
             assert!(flushed.is_err(), "the manifest save must fail");
             assert_eq!(engine.version().level(0).len(), 1, "the table was installed before the save");
 
@@ -5145,9 +5143,8 @@ mod tests {
     // A failed flush hands its MemTable back to the
     // immutables and leaves the flush slot empty, so the next call
     // is its retry -- the keys stay readable throughout and end up in exactly
-    // one L0 file. The fault is a read-only SSTable directory (same lever as
-    // test_shutdown_skips_wal_truncate_after_failed_flush), which fails the
-    // write before the install.
+    // one L0 file. The fault in the SSTable directory fails the write before
+    // the install.
     #[test]
     fn test_failed_flush_returns_its_memtable_for_the_retry() {
         crate::core::engine_runtime::block_on(async {
@@ -5159,9 +5156,9 @@ mod tests {
             engine.put(b"b", b"2").await.unwrap();
             engine.freeze_active_memtable();
 
-            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            test_fault::fail_writes_in(&sstable_dir);
             assert!(engine.flush_memtable().await.is_err(), "the SSTable write must fail");
-            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            test_fault::allow_writes_in(&sstable_dir);
 
             assert!(engine.version().flushing.is_empty(), "a failed flush claims nothing");
             assert_eq!(engine.version().immutables.len(), 1, "its MemTable is back");
@@ -5653,7 +5650,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
 
-            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            test_fault::fail_writes_in(&sstable_dir);
             // Lets the parked flush go on, and every later one that parks.
             let releaser = {
                 let hook = Arc::clone(&hook);
@@ -5666,7 +5663,7 @@ mod tests {
             };
             assert!(flusher.await.unwrap().is_err(), "the parked SSTable write must fail");
             let cycle = gc.await.unwrap();
-            std::fs::set_permissions(&sstable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            test_fault::allow_writes_in(&sstable_dir);
 
             assert!(cycle.is_err(), "the GC must not go on past a MemTable its barrier left behind");
             assert!(engine.version().vlog.contains_key(&1), "generation 1 stays live");

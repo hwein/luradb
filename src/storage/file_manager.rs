@@ -97,6 +97,8 @@ impl FileManager {
         // One I/O task from the temporary file to the rename: it runs to its
         // end even if the caller is dropped.
         spawn_io(async move {
+            #[cfg(test)]
+            crate::storage::test_fault::check(&temp_path).context("Failed to create temporary file")?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create(true)

@@ -1422,6 +1422,60 @@ mod tests {
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     }
 
+    // A failed sync counts as a failed flush: with the SSTable directory of
+    // the JSON engine of shard 1 unsyncable, the stop keeps the JSON log byte
+    // for byte while the others are cut back, and a start that replays it
+    // fails before it truncates anything. Once the directory syncs again, the
+    // next start recovers the document.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn a_failed_sync_keeps_the_engine_s_log_at_the_stop_and_fails_the_start() {
+        use crate::control::slots::domain_name_for_shard;
+        use crate::storage::test_fault;
+        let name = domain_name_for_shard(1, 2, 13);
+        let dir = tempfile::TempDir::new().unwrap();
+        let tuned = || {
+            let mut cfg = test_config(dir.path());
+            cfg.multicore.shards = 2;
+            cfg.json.enabled = true;
+            cfg.rel.enabled = true;
+            cfg
+        };
+        let cfg = tuned();
+        let document = format!("/store-api/json/{name}/documents/kept");
+        let client = tokio::runtime::Runtime::new().unwrap();
+
+        let server = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        client.block_on(async {
+            let create = json!({ "name": name }).to_string();
+            assert_eq!(request(addr, &with_body("POST", "/store-api/json/domains", &create)).await.0, 201);
+            assert_eq!(request(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await.0, 201);
+            assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
+        });
+        let json_log = std::fs::read(&cfg.json.wal_path).unwrap();
+        let unsyncable = layout::shard_dir(Path::new(&cfg.json.sstable_dir), 1);
+        test_fault::fail_syncs_of(&unsyncable);
+        server.shutdown().unwrap();
+
+        let magic = crate::core::wal::WAL_MAGIC;
+        assert_eq!(std::fs::read(&cfg.json.wal_path).unwrap(), json_log, "the JSON log stays as it was");
+        assert_eq!(std::fs::read(&cfg.storage.wal_path).unwrap(), magic, "the key-value log is cut back");
+        assert_eq!(std::fs::read(&cfg.rel.wal_path).unwrap(), magic, "the relational log is cut back");
+
+        let started = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml"));
+        test_fault::allow_syncs_of(&unsyncable);
+        let err = started.err().expect("the start must fail");
+        assert!(format!("{err:#}").contains(&format!("sync {}", unsyncable.display())), "{err:#}");
+        assert_eq!(std::fs::read(&cfg.json.wal_path).unwrap(), json_log, "the failed start truncates nothing");
+
+        let server = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let (status, body) = client.block_on(request(addr, &get(&document)));
+        server.shutdown().unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    }
+
     // The hub opens a WAL for the enabled engines only: with JSON and
     // relational off, no file of theirs appears.
     #[test]

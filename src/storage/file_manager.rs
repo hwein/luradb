@@ -70,6 +70,11 @@ impl FileManager {
         self.next_file_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// The directory of the SSTable files.
+    pub fn dir(&self) -> &Path {
+        &self.base_dir
+    }
+
     /// Returns the path for a given file ID.
     pub fn file_path(&self, file_id: u64) -> PathBuf {
         self.base_dir.join(format!("sstable_{:06}.sst", file_id))
@@ -141,7 +146,11 @@ impl FileManager {
     pub async fn delete_sstable(&self, file_id: u64) -> Result<()> {
         let path = self.file_path(file_id);
         let context = format!("Failed to delete SSTable: {:?}", path);
+        #[cfg(test)]
+        let deleted = path.clone();
         spawn_io(async move { compio::fs::remove_file(path).await }).await.context(context)?;
+        #[cfg(test)]
+        crate::storage::test_trace::record(&deleted, "delete");
 
         Ok(())
     }

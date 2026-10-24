@@ -6,6 +6,7 @@
 use crate::config::LuraConfig;
 use crate::control::system;
 use crate::engines::lsm::engine::LsmStorageEngine;
+use crate::storage::sync_dir;
 use crate::storage::vlog::{discover_generations, generation_path};
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -127,14 +128,6 @@ async fn legacy_files(config: &LuraConfig) -> anyhow::Result<Vec<(PathBuf, PathB
 fn is_sstable_dir_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
     name.starts_with("MANIFEST") || name.starts_with("sstable_")
-}
-
-/// Makes the renames in `dir` durable.
-pub(super) fn sync_dir(dir: &Path) -> anyhow::Result<()> {
-    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-    std::fs::File::open(dir)
-        .and_then(|dir| dir.sync_all())
-        .with_context(|| format!("sync {}", dir.display()))
 }
 
 #[cfg(test)]

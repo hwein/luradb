@@ -162,6 +162,11 @@ impl ManifestManager {
         Self { manifest_path, last_saved_version: Arc::new(Mutex::new(0)) }
     }
 
+    /// The directory the manifest is renamed into.
+    pub fn dir(&self) -> &Path {
+        self.manifest_path.parent().unwrap_or(Path::new(""))
+    }
+
     /// Loads the manifest from disk.
     ///
     /// Returns a new empty manifest if the file doesn't exist. Seeds the
@@ -229,6 +234,8 @@ impl ManifestManager {
             compio::fs::rename(&temp_path, &manifest_path)
                 .await
                 .context("Failed to rename manifest")?;
+            #[cfg(test)]
+            crate::storage::test_trace::record(&manifest_path, "save");
 
             *last_saved = version;
             Ok(())

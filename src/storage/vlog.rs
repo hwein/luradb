@@ -126,6 +126,16 @@ impl VLog {
         Ok(offset)
     }
 
+    /// Makes every append that returned so far durable (`fdatasync`).
+    pub async fn sync(&self) -> Result<(), VLogError> {
+        #[cfg(test)]
+        crate::storage::test_fault::check_sync(&self.path)?;
+        engine_runtime::sync(&self.file, true).await?;
+        #[cfg(test)]
+        crate::storage::test_trace::record(&self.path, "sync");
+        Ok(())
+    }
+
     /// Returns the current size of the vLog in bytes.
     pub fn size_bytes(&self) -> u64 {
         self.offset.load(Ordering::Relaxed)

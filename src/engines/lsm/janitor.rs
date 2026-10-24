@@ -15,10 +15,12 @@
 //!    pointer into `<= N` resides in an SSTable.
 //! 5. Snapshot the manifest and collect the live `(file_id, offset, len)` set.
 //! 6. Copy those values into `N+1`, recording the remap.
-//! 7. Rebuild every snapshot SSTable with the remapped pointers.
-//! 8. Install a version without the old generations; each file is deleted
-//!    once no version holds its generation any more, so a reader still on
-//!    an older version keeps reading it.
+//! 7. Rebuild every snapshot SSTable with the remapped pointers, then sync
+//!    `N+1` and the vLog and SSTable directories before the manifest changes.
+//! 8. Install a version without the old generations and sync the directory
+//!    of the saved manifest; each file is then deleted once no version holds
+//!    its generation any more, so a reader still on an older version keeps
+//!    reading it.
 //!
 //! All steps are performed without holding any write-path locks for extended
 //! periods, so normal reads and writes are never stalled.
@@ -39,7 +41,7 @@ use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use compio::time::sleep;
@@ -169,6 +171,11 @@ pub struct Janitor {
     /// the window a whole flush fits into.
     #[cfg(test)]
     before_manifest_swap_hook: Option<Arc<TestHook>>,
+
+    /// Test-only pause point between the manifest change in memory and the
+    /// cycle's own save of it.
+    #[cfg(test)]
+    before_manifest_save_hook: Option<Arc<TestHook>>,
 }
 
 impl Janitor {
@@ -211,6 +218,8 @@ impl Janitor {
             install_hook: None,
             #[cfg(test)]
             before_manifest_swap_hook: None,
+            #[cfg(test)]
+            before_manifest_save_hook: None,
         }
     }
 
@@ -227,6 +236,14 @@ impl Janitor {
     #[cfg(test)]
     pub(crate) fn set_before_manifest_swap_hook(&mut self, hook: Arc<TestHook>) {
         self.before_manifest_swap_hook = Some(hook);
+    }
+
+    /// Parks the next [`Self::run_gc`] after its manifest change in memory,
+    /// before its own save — a flush released here saves the changed
+    /// manifest first.
+    #[cfg(test)]
+    pub(crate) fn set_before_manifest_save_hook(&mut self, hook: Arc<TestHook>) {
+        self.before_manifest_save_hook = Some(hook);
     }
 
     /// Runs the Janitor's periodic GC loop.
@@ -350,6 +367,13 @@ impl Janitor {
             self.rebuild_all_sstables(&manifest_snapshot, &remap, new_id).await?;
         let sstables_rebuilt = old_file_ids.len();
 
+        // Before the manifest changes in memory, not just before its save: a
+        // flush may save the shared manifest from then on, and a saved
+        // manifest must name only files whose bytes and names are on disk.
+        new_vlog.sync().await?;
+        let vlog_dir = self.vlog_base_path.parent().unwrap_or(Path::new(""));
+        crate::storage::sync_dirs(&[vlog_dir, self.file_manager.dir()]).await?;
+
         #[cfg(test)]
         if let Some(hook) = &self.before_manifest_swap_hook {
             hook.pause().await;
@@ -367,8 +391,24 @@ impl Janitor {
             self.reload_level_readers().await?
         };
 
+        #[cfg(test)]
+        if let Some(hook) = &self.before_manifest_save_hook {
+            hook.pause().await;
+        }
+
         let manifest_for_save = self.manifest.read().clone();
         self.manifest_manager.save(&manifest_for_save).await?;
+
+        // The old files go only once the manifest without them survives a
+        // power loss.
+        if let Err(e) = crate::storage::sync_dirs(&[self.manifest_manager.dir()]).await {
+            let replaced: Vec<u64> = old_file_ids.iter().map(|(_, file_id)| *file_id).collect();
+            eprintln!(
+                "[Janitor] Warning: replaced SSTables {replaced:?} stay on disk unlisted; value log \
+                 generations {source_ids:?} go with a later cycle: {e:#}"
+            );
+            return Err(e);
+        }
 
         self.retire_old_sstables(&retired, &old_file_ids).await;
 
@@ -503,8 +543,14 @@ impl Janitor {
         };
         for vlog in doomed {
             let path = vlog.path().to_path_buf();
-            if let Err(e) = spawn_io(async move { compio::fs::remove_file(path).await }).await {
-                eprintln!("[Janitor] Warning: could not delete vLog generation {}: {e}", vlog.id());
+            #[cfg(test)]
+            let deleted = path.clone();
+            match spawn_io(async move { compio::fs::remove_file(path).await }).await {
+                Ok(()) => {
+                    #[cfg(test)]
+                    crate::storage::test_trace::record(&deleted, "delete");
+                }
+                Err(e) => eprintln!("[Janitor] Warning: could not delete vLog generation {}: {e}", vlog.id()),
             }
         }
     }

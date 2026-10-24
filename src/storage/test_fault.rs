@@ -1,5 +1,6 @@
 //! Directories in which file creation fails, as in a read-only directory but
-//! for any user, root included: tests share the process.
+//! for any user, root included, and files and directories whose sync fails:
+//! tests share the process.
 
 use std::collections::HashSet;
 use std::io;
@@ -28,4 +29,25 @@ pub(crate) fn check(path: &Path) -> io::Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+fn unsyncable() -> &'static Mutex<HashSet<PathBuf>> {
+    static PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(Default::default)
+}
+
+/// Every sync of the file or directory `path` fails until [`allow_syncs_of`].
+pub(crate) fn fail_syncs_of(path: &Path) {
+    unsyncable().lock().unwrap().insert(path.to_path_buf());
+}
+
+pub(crate) fn allow_syncs_of(path: &Path) {
+    unsyncable().lock().unwrap().remove(path);
+}
+
+pub(crate) fn check_sync(path: &Path) -> io::Result<()> {
+    if unsyncable().lock().unwrap().contains(path) {
+        return Err(io::Error::other(format!("test fault: sync of {}", path.display())));
+    }
+    Ok(())
 }

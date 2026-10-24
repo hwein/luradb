@@ -405,6 +405,7 @@ type AppendResponder = oneshot::Sender<Result<(u64, u64), WalError>>;
 #[cfg(test)]
 struct LocalWal {
     file: File,
+    path: PathBuf,
     /// Where a failed cut records `offset` for the next open.
     marker: PathBuf,
     offset: u64,
@@ -436,6 +437,7 @@ impl LocalWal {
         file.seek(SeekFrom::Start(offset)).await?;
         Ok(Self {
             file,
+            path: path.to_path_buf(),
             marker: unsafe_end_marker(path),
             offset,
             lsn: 0,
@@ -632,6 +634,7 @@ async fn do_truncate(wal: &mut LocalWal) -> Result<(), WalError> {
         return Err(e.into());
     }
     wal.unsafe_end = false;
+    crate::storage::test_trace::record(&wal.path, "truncate");
     Ok(())
 }
 

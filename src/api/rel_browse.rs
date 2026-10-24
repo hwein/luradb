@@ -71,7 +71,6 @@ pub struct ColumnInfo {
     pub unique: bool,
     pub references: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object)]
     pub default: Option<Value>,
 }
 
@@ -635,6 +634,7 @@ mod tests {
     use axum::http::{Method, Request};
     use std::sync::Arc;
     use tower::util::ServiceExt;
+    use utoipa::OpenApi;
 
     async fn make_state(rel_config: Option<RelStoreConfig>, auth_enabled: bool) -> (AppState, tempfile::TempDir) {
         make_tuned_state(rel_config, auth_enabled, |_| {}).await
@@ -857,6 +857,77 @@ mod tests {
             let (status, _) =
                 req_json(&app, Method::GET, "/store-api/rel/default/tables/v1/rows/1", None).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "a view has no rows resource");
+        })
+    }
+
+    /// Minimal check of `value` against an OpenAPI 3.1 schema object:
+    /// `type` (string or list) and `oneOf`/`anyOf`; anything else admits all.
+    fn schema_admits(schema: &Value, value: &Value) -> bool {
+        if let Some(subs) = schema.get("oneOf").or_else(|| schema.get("anyOf")) {
+            return subs.as_array().unwrap().iter().any(|s| schema_admits(s, value));
+        }
+        let Some(ty) = schema.get("type") else { return true };
+        let types: Vec<&str> = match ty {
+            Value::Array(list) => list.iter().map(|t| t.as_str().unwrap()).collect(),
+            t => vec![t.as_str().unwrap()],
+        };
+        types.iter().any(|t| match *t {
+            "null" => value.is_null(),
+            "boolean" => value.is_boolean(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "string" => value.is_string(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            other => panic!("unknown schema type {other}"),
+        })
+    }
+
+    // 1b. Every DEFAULT form in a table description matches the contract's
+    //     ColumnInfo schema (properties, required fields, field types).
+    #[test]
+    fn test_column_defaults_match_contract_schema() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            let (status, body) = sql(
+                &app,
+                "default",
+                r#"{"sql": "CREATE TABLE d (id INTEGER PRIMARY KEY, i INTEGER DEFAULT 42, r REAL DEFAULT -3.5, t TEXT DEFAULT 'pending', b BOOLEAN DEFAULT TRUE, n TEXT DEFAULT NULL, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            let (status, body) = req_json(&app, Method::GET, "/store-api/rel/default/tables/d", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let cols = body["columns"].as_array().unwrap();
+            let col = |name: &str| cols.iter().find(|c| c["name"] == json!(name)).unwrap();
+            let expected = [
+                ("i", json!(42)),
+                ("r", json!(-3.5)),
+                ("t", json!("pending")),
+                ("b", json!(true)),
+                ("n", Value::Null),
+                ("ts", json!("CURRENT_TIMESTAMP")),
+            ];
+            for (name, default) in &expected {
+                assert_eq!(col(name).get("default"), Some(default), "{name}");
+            }
+
+            let doc = serde_json::to_value(crate::api::ApiDoc::openapi()).unwrap();
+            let schema = &doc["components"]["schemas"]["ColumnInfo"];
+            let properties = schema["properties"].as_object().unwrap();
+            let required = schema["required"].as_array().unwrap();
+            assert!(!required.contains(&json!("default")), "default must stay optional");
+            for column in cols {
+                let fields = column.as_object().unwrap();
+                for field in required {
+                    assert!(fields.contains_key(field.as_str().unwrap()), "{field} missing: {column}");
+                }
+                for (field, value) in fields {
+                    let field_schema = properties.get(field).unwrap_or_else(|| panic!("{field} not in schema"));
+                    assert!(schema_admits(field_schema, value), "{field} = {value} vs {field_schema}");
+                }
+            }
         })
     }
 

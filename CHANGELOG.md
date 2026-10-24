@@ -83,6 +83,7 @@ All notable changes to LuraDB are documented in this file.
 - Writes no longer stall for minutes while the SHM snapshot of a large domain is built.
 - A restore that replaces a KV or JSON domain no longer clears links to it from relational tables.
 - **BREAKING** API: `POST /store-api/domains` answers 400 instead of 500 for an invalid domain name.
+- **BREAKING** API: the schema of `default` in the table description now allows the scalar and null values the server returns.
 
 ### Security
 

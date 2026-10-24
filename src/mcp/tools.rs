@@ -4,6 +4,7 @@
 
 use super::internal::{encode, Call, Reply, MAX_RESULT_BYTES};
 use super::sql::{self, Rejected, SqlTool};
+use crate::auth::oauth::base64url;
 use axum::http::{Method, StatusCode};
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotations};
 use serde_json::{json, Map, Value};
@@ -105,7 +106,7 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec { name: "list_views", description: "Views of a relational domain.", access: Access::Read, admin_only: false, params: &[DOMAIN] },
     ToolSpec { name: "list_json_indexes", description: "Indexes of a JSON domain.", access: Access::Read, admin_only: false, params: &[DOMAIN] },
     ToolSpec { name: "health", description: "Health report of the server and its data shards.", access: Access::Read, admin_only: false, params: &[] },
-    ToolSpec { name: "kv_get", description: "Value of a key in a key-value domain.", access: Access::Read, admin_only: false, params: &[DOMAIN, KEY] },
+    ToolSpec { name: "kv_get", description: "Value of a key in a key-value domain as {\"value\": text}, exactly as stored; null for a key in the NULL state; a value that is not UTF-8 comes as base64url with \"encoding\": \"base64url\".", access: Access::Read, admin_only: false, params: &[DOMAIN, KEY] },
     ToolSpec {
         name: "kv_scan",
         description: "Keys of a key-value domain, optionally filtered, one page at a time.",
@@ -268,6 +269,8 @@ enum Merge {
     Last,
     /// One domain listing per engine, in the order of the calls.
     Domains(Vec<&'static str>),
+    /// The last answer is a KV value as raw bytes.
+    KvValue,
 }
 
 impl Plan {
@@ -280,6 +283,7 @@ impl Plan {
         match &self.merge {
             Merge::Last => replies.last().map_or_else(|| tool_error("no answer"), reply_result),
             Merge::Domains(engines) => merge_domains(engines, replies),
+            Merge::KvValue => replies.last().map_or_else(|| tool_error("no answer"), kv_value_result),
         }
     }
 }
@@ -314,6 +318,24 @@ pub(crate) fn reply_result(reply: &Reply) -> CallToolResult {
         Some(value) => CallToolResult::structured(json!({ "result": value })),
         None if reply.text().is_empty() => CallToolResult::structured(json!({ "status": reply.status.as_u16() })),
         None => CallToolResult::success(vec![ContentBlock::text(reply.text())]),
+    }
+}
+
+/// The raw bytes of a KV value as `{"value": …}`, unchanged: `null` for a key
+/// in the NULL state, base64url with `"encoding"` for bytes that are not UTF-8.
+fn kv_value_result(reply: &Reply) -> CallToolResult {
+    let Some(body) = &reply.body else {
+        return too_large();
+    };
+    if !reply.status.is_success() {
+        return status_error(reply);
+    }
+    if reply.status == StatusCode::NO_CONTENT {
+        return CallToolResult::structured(json!({ "value": null }));
+    }
+    match std::str::from_utf8(body) {
+        Ok(text) => CallToolResult::structured(json!({ "value": text })),
+        Err(_) => CallToolResult::structured(json!({ "value": base64url(body), "encoding": "base64url" })),
     }
 }
 
@@ -468,7 +490,10 @@ pub(crate) fn plan(spec: &ToolSpec, arguments: &JsonObject, max_statement_len: u
             calls: vec![Call::get("/store-api/auth/whoami".into()), Call::get("/health".into())],
             merge: Merge::Last,
         },
-        "kv_get" => Plan::single(Call::get(path(&["/store-api/kv/", &domain()?, "/keys/", &key()?]))),
+        "kv_get" => Plan {
+            calls: vec![Call::get(path(&["/store-api/kv/", &domain()?, "/keys/", &key()?]))],
+            merge: Merge::KvValue,
+        },
         "kv_scan" => Plan::single(
             Call::get(path(&["/store-api/kv/", &domain()?, "/keys"]))
                 .query("prefix", args.opt_string("prefix")?)
@@ -712,6 +737,37 @@ mod tests {
             assert_eq!(text, &format!("HTTP {}: {body}", StatusCode::from_u16(status).unwrap()));
         }
         let result = reply_result(&Reply { status: StatusCode::OK, body: None });
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].as_text().unwrap().text.contains("reduce `limit`"));
+    }
+
+    #[test]
+    fn kv_get_returns_the_value_byte_for_byte() {
+        let plan = plan_of("kv_get", json!({"domain": "d", "key": "k"})).unwrap();
+        let bytes = |status: u16, body: &[u8]| Reply {
+            status: StatusCode::from_u16(status).unwrap(),
+            body: Some(Bytes::copy_from_slice(body)),
+        };
+        let mut cases = vec![
+            (reply(200, "clé ✓"), json!({"value": "clé ✓"})),
+            (reply(200, ""), json!({"value": ""})),
+            (reply(204, ""), json!({"value": null})),
+            (bytes(200, &[0xff, 0x00, 0x41]), json!({"value": "_wBB", "encoding": "base64url"})),
+        ];
+        for body in [r#"{"status":204}"#, "12345678901234567890123", r#""hello""#, r#"{"b": 1, "a": 2}"#] {
+            cases.push((reply(200, body), json!({ "value": body })));
+        }
+        for (reply, expected) in cases {
+            let result = plan.result(&[reply]);
+            assert_eq!((result.is_error, result.structured_content.clone()), (Some(false), Some(expected.clone())));
+            assert_eq!(result.content.len(), 1);
+            assert_eq!(result.content[0].as_text().unwrap().text, serde_json::to_string(&expected).unwrap());
+        }
+
+        let result = plan.result(&[reply(404, "404 Not Found: key")]);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content[0].as_text().unwrap().text, "HTTP 404 Not Found: 404 Not Found: key");
+        let result = plan.result(&[Reply { status: StatusCode::OK, body: None }]);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].as_text().unwrap().text.contains("reduce `limit`"));
     }

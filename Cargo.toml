@@ -106,7 +106,7 @@ section = "database"
 priority = "optional"
 depends = "$auto, adduser"
 maintainer-scripts = "packaging/deb"
-systemd-units = { unit-scripts = "packaging", enable = true, start = true }
+systemd-units = { unit-scripts = "packaging", enable = true, start = false }
 assets = [
     ["target/release/luradb", "usr/bin/", "755"],
     ["packaging/luradb.toml", "etc/luradb/luradb.toml", "640"],

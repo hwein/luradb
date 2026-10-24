@@ -24,6 +24,22 @@ case "$1" in
             # The placeholder comment no longer describes anything afterward — remove it.
             sed -i '/^# Placeholder/d' "$CONFIG"
         fi
+
+        # $2 (the previously configured version) is empty only on first install.
+        if [ -z "$2" ]; then
+            cat <<'EOF'
+
+LuraDB is installed but not started.
+
+  Config:  /etc/luradb/luradb.toml
+  Data:    /var/lib/luradb
+  Start:   sudo systemctl start luradb
+
+Review the config before the first start (bind address, data paths, admin API key).
+The service is enabled and starts automatically on the next boot.
+
+EOF
+        fi
     ;;
 esac
 

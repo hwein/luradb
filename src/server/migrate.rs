@@ -30,6 +30,7 @@ use crate::engines::lsm::{
     RawEntry, RawValue,
 };
 use crate::engines::rel::RelEngine;
+use crate::storage::sync_dir;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -289,7 +290,7 @@ async fn build(
     }
     for root in roots {
         sync_tree(&root.join(&marker.staging))?;
-        layout::sync_dir(root)?;
+        sync_dir(root)?;
         check_one_file_system(root, &root.join(&marker.staging), device)?;
     }
     Ok(())
@@ -376,7 +377,7 @@ fn sync_tree(dir: &Path) -> anyhow::Result<()> {
                 .with_context(|| format!("sync {}", path.display()))?;
         }
     }
-    layout::sync_dir(dir)
+    sync_dir(dir)
 }
 
 /// Moves the new layout into place in every root of the marker, then records
@@ -436,16 +437,16 @@ fn swap(root: &Path, staging: &Path, shards: u16) -> anyhow::Result<()> {
             let to = previous.join(old.file_name().unwrap_or_default());
             std::fs::rename(&old, &to).with_context(|| format!("move {} to {}", old.display(), to.display()))?;
         }
-        layout::sync_dir(&previous)?;
-        layout::sync_dir(root)?;
+        sync_dir(&previous)?;
+        sync_dir(root)?;
     }
     for k in waiting {
         let (from, to) = (layout::shard_dir(staging, k), layout::shard_dir(root, k));
         anyhow::ensure!(!to.exists(), "{} exists already", to.display());
         std::fs::rename(&from, &to).with_context(|| format!("move {} to {}", from.display(), to.display()))?;
     }
-    layout::sync_dir(root)?;
-    layout::sync_dir(staging)
+    sync_dir(root)?;
+    sync_dir(staging)
 }
 
 /// The `shard_<k>/` directories in `root`.

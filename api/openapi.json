@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.12.0",
+    "version": "0.13.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -5407,9 +5407,7 @@
           "autoincrement": {
             "type": "boolean"
           },
-          "default": {
-            "type": "object"
-          },
+          "default": {},
           "name": {
             "type": "string"
           },

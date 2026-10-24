@@ -43,6 +43,9 @@ pub const CODE_TTL_SECS: u64 = 60;
 pub const ACCESS_TTL_SECS: u64 = 60 * 60;
 /// A refresh token is valid this long, or until it is used.
 pub const REFRESH_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// A registered client is kept this long unless a code is issued for it;
+/// after its first code it stays.
+pub const CLIENT_TTL_SECS: u64 = 24 * 60 * 60;
 
 const PREFIX_CLIENT: &str = "__sys:oauth:client:";
 const PREFIX_TOKEN: &str = "__sys:oauth:token:";
@@ -55,6 +58,15 @@ pub struct OAuthClient {
     pub client_name: String,
     pub redirect_uris: Vec<String>,
     pub created_at: u64,
+    /// Unix seconds; none once a code was issued for the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+impl OAuthClient {
+    fn live(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|expires_at| expires_at > now)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,13 +257,28 @@ impl AuthCache {
         (user.api_key_hash == record.key_hash).then_some(user)
     }
 
-    pub async fn oauth_client(&self, client_id: &str) -> Option<OAuthClient> {
-        self.oauth.read().await.clients.get(client_id).cloned()
+    /// The client `client_id`, unless it expired before `now`.
+    pub async fn oauth_client(&self, client_id: &str, now: u64) -> Option<OAuthClient> {
+        self.oauth.read().await.clients.get(client_id).filter(|client| client.live(now)).cloned()
     }
 
+    /// Stores `client` registered at `now`, with a TTL while it has an
+    /// expiry.
+    async fn put_client(&self, client: &OAuthClient, now: u64) -> anyhow::Result<()> {
+        let (key, value) = (client_key(&client.client_id), serde_json::to_vec(client)?);
+        match client.expires_at {
+            Some(expires_at) => self.engine.put_with_ttl(&key, &value, expires_at.saturating_sub(now).max(1)).await,
+            None => self.engine.put(&key, &value).await,
+        }
+    }
+
+    /// Stores a new client, and drops the expired clients from the cache.
     pub(crate) async fn register_client(&self, client: OAuthClient) -> anyhow::Result<()> {
-        self.engine.put(&client_key(&client.client_id), &serde_json::to_vec(&client)?).await?;
-        self.oauth.write().await.clients.insert(client.client_id.clone(), client);
+        let now = client.created_at;
+        let mut state = self.oauth.write().await;
+        self.put_client(&client, now).await?;
+        state.clients.retain(|_, c| c.live(now));
+        state.clients.insert(client.client_id.clone(), client);
         Ok(())
     }
 
@@ -281,8 +308,15 @@ impl AuthCache {
         Ok(())
     }
 
+    /// Stores a code; the client's first one makes the client permanent.
     pub(crate) async fn issue_code(&self, hash: String, record: TokenRecord, now: u64) -> anyhow::Result<()> {
         let mut state = self.oauth.write().await;
+        let expiring = state.clients.get(&record.client_id).filter(|c| c.expires_at.is_some()).cloned();
+        if let Some(mut client) = expiring {
+            client.expires_at = None;
+            self.put_client(&client, now).await?;
+            state.clients.insert(client.client_id.clone(), client);
+        }
         self.put_token(&mut state, hash, record, now).await
     }
 
@@ -379,11 +413,13 @@ pub async fn register_client(
     if internal.is_none() {
         return not_found();
     }
+    let now = now_secs();
     let client = OAuthClient {
         client_id: random_hex(),
         client_name: body.client_name,
         redirect_uris: body.redirect_uris,
-        created_at: now_secs(),
+        created_at: now,
+        expires_at: Some(now + CLIENT_TTL_SECS),
     };
     match state.control.change_auth(AuthChange::RegisterClient(client.clone())).await {
         Ok(()) => (StatusCode::CREATED, Json(client)).into_response(),
@@ -396,7 +432,7 @@ pub async fn get_client(
     internal: Option<Extension<McpInternal>>,
     Path(id): Path<String>,
 ) -> Response {
-    match (internal, state.cache.oauth_client(&id).await) {
+    match (internal, state.cache.oauth_client(&id, now_secs()).await) {
         (Some(_), Some(client)) => Json(client).into_response(),
         _ => not_found(),
     }
@@ -428,10 +464,10 @@ pub async fn issue_code(
     let Some(user) = user else {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     };
-    if state.cache.oauth_client(&body.client_id).await.is_none() {
+    let now = now_secs();
+    if state.cache.oauth_client(&body.client_id, now).await.is_none() {
         return (StatusCode::BAD_REQUEST, "unknown client").into_response();
     }
-    let now = now_secs();
     let code = random_hex();
     let record = TokenRecord {
         kind: TokenKind::Code,
@@ -727,6 +763,7 @@ mod tests {
                 client_name: "Agent ✓".into(),
                 redirect_uris: vec!["http://127.0.0.1:9000/cb".into()],
                 created_at: 1,
+                expires_at: None,
             };
             cache.register_client(client.clone()).await.unwrap();
             let now = now_secs();
@@ -735,8 +772,56 @@ mod tests {
 
             let reloaded = AuthCache::new(std::sync::Arc::clone(&cache.engine), true);
             reloaded.load_from_engine().await.unwrap();
-            assert_eq!(reloaded.oauth_client("client").await, Some(client));
+            assert_eq!(reloaded.oauth_client("client", now).await, Some(client));
             assert!(reloaded.resolve_bearer(&bearer("lura_at_1"), true, now_secs()).await.is_some());
+        })
+    }
+
+    fn client_at(id: &str, now: u64) -> OAuthClient {
+        OAuthClient {
+            client_id: id.into(),
+            client_name: "Agent ✓".into(),
+            redirect_uris: vec!["http://127.0.0.1:9000/cb".into()],
+            created_at: now,
+            expires_at: Some(now + CLIENT_TTL_SECS),
+        }
+    }
+
+    /// The `expire_at` of the stored client (0 = no TTL).
+    async fn stored_expiry(cache: &AuthCache, id: &str) -> u64 {
+        let (found, expire_at) = cache.engine.get_latest_with_expiry(&client_key(id)).await.unwrap();
+        assert!(found.into_option().is_some(), "{id} is not stored");
+        expire_at
+    }
+
+    // A client nobody signed in with expires, also across a reload; its
+    // first code makes a client permanent.
+    #[test]
+    fn a_client_without_a_code_expires() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = cache().await;
+            let expired = NOW + CLIENT_TTL_SECS;
+            cache.register_client(client_at("client", NOW)).await.unwrap();
+            cache.register_client(client_at("idle", NOW)).await.unwrap();
+            assert_ne!(stored_expiry(&cache, "client").await, 0);
+            assert!(cache.oauth_client("client", expired - 1).await.is_some());
+            assert!(cache.oauth_client("client", expired).await.is_none());
+
+            cache.issue_code(hash_api_key("code"), code_at(NOW + 1), NOW + 1).await.unwrap();
+            assert_eq!(stored_expiry(&cache, "client").await, 0);
+            assert_eq!(cache.oauth_client("client", expired).await.and_then(|c| c.expires_at), None);
+            assert!(cache.oauth_client("idle", expired).await.is_none());
+
+            let reloaded = AuthCache::new(std::sync::Arc::clone(&cache.engine), true);
+            reloaded.load_from_engine().await.unwrap();
+            assert!(reloaded.oauth_client("client", expired).await.is_some());
+            assert_eq!(reloaded.oauth_client("idle", NOW + 1).await, Some(client_at("idle", NOW)));
+            assert!(reloaded.oauth_client("idle", expired).await.is_none());
+
+            // The next registration drops it from the cache.
+            reloaded.register_client(client_at("next", expired)).await.unwrap();
+            let clients = &reloaded.oauth.read().await.clients;
+            assert!(clients.contains_key("client") && clients.contains_key("next") && !clients.contains_key("idle"));
         })
     }
 

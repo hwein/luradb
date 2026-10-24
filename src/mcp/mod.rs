@@ -14,6 +14,7 @@ mod tools;
 
 #[cfg(test)]
 pub(crate) use internal::test_hook;
+pub(crate) use oauth::resource_url;
 
 use crate::api::middleware::{proxy_fn, ParsedCidr};
 use crate::config::LuraConfig;

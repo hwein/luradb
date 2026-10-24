@@ -185,7 +185,7 @@ async fn make_control() -> (Arc<ControlPlane>, StorageThread, tempfile::TempDir)
     let owners = ShardOwners { kv: registry, json: None, rel: None };
     let (commands, inbox) = tokio::sync::mpsc::unbounded_channel();
     compio::runtime::spawn(serve_shard(owners.clone(), inbox)).detach();
-    let auth = Arc::new(AuthCache::new(Arc::clone(&system), false));
+    let auth = Arc::new(AuthCache::new(Arc::clone(&system), None));
     let bus = Arc::new(GlobalEventBus::new(64, 64));
     let owners = Owners { shards: vec![Shard { owners, commands }], auth };
     let control = ControlPlane::start(owners, system, bus).await.expect("control plane");

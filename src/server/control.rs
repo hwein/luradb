@@ -440,8 +440,9 @@ async fn prepare_control(
     system::migrate_auth(owners[0].kv.engine(), system_store).await?;
 
     // The auth cache on the system store, after the auth move above.
-    let oauth_enabled = config.mcp.enabled && config.mcp.oauth_enabled;
-    let auth_cache = Arc::new(AuthCache::new(Arc::clone(system_store), oauth_enabled));
+    let oauth_resource =
+        (config.mcp.enabled && config.mcp.oauth_enabled).then(|| crate::mcp::resource_url(&config.mcp.public_url));
+    let auth_cache = Arc::new(AuthCache::new(Arc::clone(system_store), oauth_resource));
     auth_cache.load_from_engine().await?;
     reconcile_admins(&auth_cache, &config.auth.admins, config.auth.enabled).await?;
     tracing::info!("Auth cache loaded.");

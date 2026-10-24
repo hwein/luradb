@@ -6,7 +6,7 @@
 //!
 //! A token carries no permissions of its own: it stands for the user and the
 //! API key hash it was issued for, and becomes invalid as soon as the user is
-//! deleted or the key rotated.
+//! deleted, the key rotated or the MCP listener's resource changes.
 //!
 //! The internal routes under `/store-api/auth/oauth/` take requests from the
 //! MCP listener only; for everyone else they do not exist.
@@ -96,8 +96,8 @@ pub struct TokenRecord {
     /// A code's PKCE challenge (S256).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_challenge: Option<String>,
-    /// A refresh token that was already exchanged: using it again revokes
-    /// the whole grant.
+    /// A code that was already redeemed, or a refresh token that was
+    /// already exchanged: using it again revokes the whole grant.
     #[serde(default)]
     pub rotated: bool,
 }
@@ -233,19 +233,17 @@ pub(super) async fn load(engine: &LsmStorageEngine) -> anyhow::Result<OAuthState
 impl AuthCache {
     /// The user behind the request's Bearer credential: an API key, or with
     /// OAuth on and on a request of the MCP listener (`mcp_internal`) an
-    /// access token that has not expired, of a user whose API key is
-    /// unchanged since.
+    /// access token for the current resource that has not expired, of a
+    /// user whose API key is unchanged since.
     pub async fn resolve_bearer(&self, headers: &HeaderMap, mcp_internal: bool, now: u64) -> Option<UserRecord> {
         let token = bearer_token(headers)?;
         let hash = hash_api_key(token);
         if !token.starts_with(ACCESS_TOKEN_PREFIX) {
             return self.get_user_by_key_hash(&hash).await;
         }
-        if !mcp_internal || !self.oauth_enabled {
-            return None;
-        }
+        let resource = self.oauth_resource.as_deref().filter(|_| mcp_internal)?;
         let record = self.oauth.read().await.tokens.get(&hash).cloned()?;
-        if record.kind != TokenKind::Access || record.expires_at <= now {
+        if record.kind != TokenKind::Access || record.expires_at <= now || record.resource != resource {
             return None;
         }
         self.granted_user(&record).await
@@ -344,11 +342,17 @@ impl AuthCache {
     pub(crate) async fn redeem_code(&self, redeem: RedeemCode) -> anyhow::Result<()> {
         let mut state = self.oauth.write().await;
         let code = state.tokens.get(&redeem.code_hash).cloned();
-        let Some(code) = code.filter(|c| c.kind == TokenKind::Code && c.expires_at > redeem.now) else {
-            return Err(OAuthError::InvalidGrant("the authorization code is invalid, used or expired").into());
+        let Some(mut code) = code.filter(|c| c.kind == TokenKind::Code && c.expires_at > redeem.now) else {
+            return Err(OAuthError::InvalidGrant("the authorization code is invalid or expired").into());
         };
-        // A code is used up by any attempt.
-        self.drop_token(&mut state, &redeem.code_hash).await?;
+        if code.rotated {
+            self.revoke_family(&mut state, &code.family).await?;
+            return Err(OAuthError::InvalidGrant("the authorization code was already used; the grant is revoked").into());
+        }
+        // A code is used up by any attempt; it stays, marked, until it
+        // expires, so that using it again revokes the grant.
+        code.rotated = true;
+        self.put_token(&mut state, redeem.code_hash.clone(), code.clone(), redeem.now).await?;
         if code.client_id != redeem.client_id || code.redirect_uri.as_deref() != Some(redeem.redirect_uri.as_str()) {
             return Err(OAuthError::InvalidGrant("the code was issued to another client or redirect URI").into());
         }
@@ -370,6 +374,10 @@ impl AuthCache {
         if current.rotated {
             self.revoke_family(&mut state, &current.family).await?;
             return Err(OAuthError::InvalidGrant("the refresh token was already used; the grant is revoked").into());
+        }
+        if self.oauth_resource.as_deref() != Some(current.resource.as_str()) {
+            self.revoke_family(&mut state, &current.family).await?;
+            return Err(OAuthError::InvalidGrant("the grant was made for another resource").into());
         }
         if current.client_id != refresh.client_id {
             return Err(OAuthError::InvalidGrant("the refresh token was issued to another client").into());
@@ -599,7 +607,7 @@ mod tests {
     async fn cache() -> (AuthCache, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = crate::control::system::open(dir.path()).await.unwrap();
-        let cache = AuthCache::new(engine, true);
+        let cache = AuthCache::new(engine, Some(RESOURCE.into()));
         cache
             .upsert_user(UserRecord {
                 name: "zoé".into(),
@@ -613,6 +621,7 @@ mod tests {
     }
 
     const NOW: u64 = 1_000_000;
+    const RESOURCE: &str = "https://db.example.com/mcp";
     const VERIFIER: &str = "a-verifier-of-at-least-forty-three-characters-0123456789";
 
     /// A code issued at `now`.
@@ -622,7 +631,7 @@ mod tests {
             user: "zoé".into(),
             key_hash: hash_api_key("lura_zoe"),
             client_id: "client".into(),
-            resource: "https://db.example.com/mcp".into(),
+            resource: RESOURCE.into(),
             family: "family".into(),
             expires_at: now + CODE_TTL_SECS,
             redirect_uri: Some("http://127.0.0.1:9000/cb".into()),
@@ -662,7 +671,14 @@ mod tests {
             let user = cache.resolve_bearer(&bearer("lura_at_1"), true, NOW + 2).await;
             assert_eq!(user.map(|u| u.name), Some("zoé".to_string()));
             let again = cache.redeem_code(redeem(NOW + 2, VERIFIER)).await.unwrap_err();
-            assert!(matches!(grant_error(again), OAuthError::InvalidGrant(_)));
+            assert_eq!(
+                grant_error(again),
+                OAuthError::InvalidGrant("the authorization code was already used; the grant is revoked")
+            );
+            // The second attempt revoked the tokens of the first.
+            assert!(cache.resolve_bearer(&bearer("lura_at_1"), true, NOW + 2).await.is_none());
+            let refreshed = cache.refresh(refresh("lura_rt_1", "2", NOW + 3)).await.unwrap_err();
+            assert!(matches!(grant_error(refreshed), OAuthError::InvalidGrant(_)));
         })
     }
 
@@ -680,6 +696,9 @@ mod tests {
             // The failed attempt used the code up.
             let retry = cache.redeem_code(redeem(NOW + 2, VERIFIER)).await.unwrap_err();
             assert!(matches!(grant_error(retry), OAuthError::InvalidGrant(_)));
+            assert!(cache.resolve_bearer(&bearer("lura_at_1"), true, NOW + 2).await.is_none());
+            assert!(cache.resolve_bearer(&bearer("lura_rt_1"), true, NOW + 2).await.is_none());
+            assert!(cache.oauth.read().await.tokens.values().all(|r| r.kind == TokenKind::Code));
         })
     }
 
@@ -770,7 +789,7 @@ mod tests {
             cache.issue_code(hash_api_key("code"), code_at(now), now).await.unwrap();
             cache.redeem_code(redeem(now, VERIFIER)).await.unwrap();
 
-            let reloaded = AuthCache::new(std::sync::Arc::clone(&cache.engine), true);
+            let reloaded = AuthCache::new(std::sync::Arc::clone(&cache.engine), Some(RESOURCE.into()));
             reloaded.load_from_engine().await.unwrap();
             assert_eq!(reloaded.oauth_client("client", now).await, Some(client));
             assert!(reloaded.resolve_bearer(&bearer("lura_at_1"), true, now_secs()).await.is_some());
@@ -812,7 +831,7 @@ mod tests {
             assert_eq!(cache.oauth_client("client", expired).await.and_then(|c| c.expires_at), None);
             assert!(cache.oauth_client("idle", expired).await.is_none());
 
-            let reloaded = AuthCache::new(std::sync::Arc::clone(&cache.engine), true);
+            let reloaded = AuthCache::new(std::sync::Arc::clone(&cache.engine), Some(RESOURCE.into()));
             reloaded.load_from_engine().await.unwrap();
             assert!(reloaded.oauth_client("client", expired).await.is_some());
             assert_eq!(reloaded.oauth_client("idle", NOW + 1).await, Some(client_at("idle", NOW)));
@@ -822,6 +841,53 @@ mod tests {
             reloaded.register_client(client_at("next", expired)).await.unwrap();
             let clients = &reloaded.oauth.read().await.clients;
             assert!(clients.contains_key("client") && clients.contains_key("next") && !clients.contains_key("idle"));
+        })
+    }
+
+    /// A cache on `cache`'s store with `resource`, loaded.
+    async fn reloaded(cache: &AuthCache, resource: &str) -> AuthCache {
+        let reloaded = AuthCache::new(std::sync::Arc::clone(&cache.engine), Some(resource.into()));
+        reloaded.load_from_engine().await.unwrap();
+        reloaded
+    }
+
+    #[test]
+    fn a_used_code_survives_a_reload_and_its_reuse_revokes() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = cache().await;
+            cache.issue_code(hash_api_key("code"), code_at(NOW), NOW).await.unwrap();
+            cache.redeem_code(redeem(NOW + 1, VERIFIER)).await.unwrap();
+
+            let reloaded = reloaded(&cache, RESOURCE).await;
+            assert!(reloaded.resolve_bearer(&bearer("lura_at_1"), true, NOW + 2).await.is_some());
+            let again = reloaded.redeem_code(redeem(NOW + 2, VERIFIER)).await.unwrap_err();
+            assert!(matches!(grant_error(again), OAuthError::InvalidGrant(_)));
+            assert!(reloaded.resolve_bearer(&bearer("lura_at_1"), true, NOW + 2).await.is_none());
+            assert!(reloaded.oauth.read().await.tokens.is_empty());
+            assert!(reloaded.engine.scan_keys(PREFIX_TOKEN.as_bytes()).await.unwrap().is_empty());
+        })
+    }
+
+    // Tokens count for the resource they were issued for only: another
+    // public URL ignores them, and a refresh there revokes the grant.
+    #[test]
+    fn tokens_count_for_their_resource_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = cache().await;
+            cache.issue_code(hash_api_key("code"), code_at(NOW), NOW).await.unwrap();
+            cache.redeem_code(redeem(NOW, VERIFIER)).await.unwrap();
+            let other = "https://db.example.org/mcp";
+
+            let moved = reloaded(&cache, other).await;
+            assert!(moved.resolve_bearer(&bearer("lura_at_1"), true, NOW + 1).await.is_none());
+            let back = reloaded(&cache, RESOURCE).await;
+            assert!(back.resolve_bearer(&bearer("lura_at_1"), true, NOW + 1).await.is_some());
+
+            let refused = moved.refresh(refresh("lura_rt_1", "2", NOW + 2)).await.unwrap_err();
+            assert_eq!(grant_error(refused), OAuthError::InvalidGrant("the grant was made for another resource"));
+            let back = reloaded(&cache, RESOURCE).await;
+            assert!(back.resolve_bearer(&bearer("lura_at_1"), true, NOW + 2).await.is_none());
+            assert!(back.refresh(refresh("lura_rt_1", "3", NOW + 3)).await.is_err());
         })
     }
 
@@ -839,7 +905,7 @@ mod tests {
             cache.issue_code(hash_api_key("code"), code_at(now), now).await.unwrap();
             cache.redeem_code(redeem(now, VERIFIER)).await.unwrap();
 
-            let off = AuthCache::new(std::sync::Arc::clone(&cache.engine), false);
+            let off = AuthCache::new(std::sync::Arc::clone(&cache.engine), None);
             off.load_from_engine().await.unwrap();
             assert!(off.resolve_bearer(&bearer("lura_at_1"), true, now_secs()).await.is_none());
             assert!(off.resolve_bearer(&bearer("lura_zoe"), true, now_secs()).await.is_some());

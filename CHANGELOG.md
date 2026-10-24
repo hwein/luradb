@@ -95,6 +95,7 @@ All notable changes to LuraDB are documented in this file.
 - Upgraded rustls to 0.23.46+, resolving RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
 - Upgraded rustls-webpki to 0.103.16+, resolving RUSTSEC-2026-0382.
 - Upgraded tokio to 1.54.1, resolving RUSTSEC-2026-0386.
+- Reusing an OAuth authorization code on the MCP listener revokes the tokens issued from it; tokens issued for a previous `mcp.public_url` are no longer accepted.
 
 ## [0.4.0] - 2026-08-29
 

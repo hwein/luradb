@@ -331,6 +331,37 @@ fn registration_takes_valid_redirect_uris_only() {
     });
 }
 
+// Every body that is not a JSON object gets the JSON error of RFC 7591 and
+// costs nothing of the ten registrations an hour.
+#[test]
+fn a_body_that_is_no_json_object_gets_a_json_error() {
+    with_oauth("lura_oauth_register_body_admin", |_, mcp| async move {
+        let valid = json!({ "client_name": "Agent 🦒", "redirect_uris": [REDIRECT] }).to_string();
+        let refused = |content_type: Option<&'static str>, body: &str| {
+            let headers: Vec<_> = content_type.map(|value| ("Content-Type", value)).into_iter().collect();
+            let raw = http("POST", "/oauth/register", &headers, body);
+            async move {
+                let (status, head, answer) = exchange(mcp, &raw).await;
+                assert_eq!(status, 400, "{}", String::from_utf8_lossy(&answer));
+                assert_eq!(header(&head, "content-type"), Some("application/json"));
+                assert_eq!(header(&head, "cache-control"), Some("no-store"));
+                let answer = json_of(&answer);
+                assert_eq!(answer["error"], json!("invalid_client_metadata"));
+                answer["error_description"].as_str().unwrap().to_string()
+            }
+        };
+        for content_type in [Some("application/x-www-form-urlencoded"), Some("text/plain"), None] {
+            let description = refused(content_type, &valid).await;
+            assert!(description.contains("Content-Type"), "{content_type:?}: {description}");
+        }
+        refused(Some("application/json"), "{bad").await;
+        assert_eq!(refused(Some("application/json"), "[1]").await, "the body must be a JSON object");
+        for _ in 0..10 {
+            register(mcp).await;
+        }
+    });
+}
+
 // Ten registrations per client IP an hour; behind a trusted proxy every
 // client counts on its own, and a refused registration counts not at all.
 #[test]

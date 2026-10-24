@@ -9,7 +9,7 @@
 use super::internal::{encode, Call, Internal, Reply};
 use crate::api::middleware::ClientIp;
 use axum::extract::connect_info::ConnectInfo;
-use axum::extract::rejection::{FormRejection, QueryRejection};
+use axum::extract::rejection::{FormRejection, JsonRejection, QueryRejection};
 use axum::extract::{Extension, Form, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
@@ -350,10 +350,13 @@ async fn register(
     State(oauth): State<Arc<OAuth>>,
     client_ip: Option<Extension<ClientIp>>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
-    body: Option<Json<Value>>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    let Some(Json(body)) = body else {
-        return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "the body must be a JSON object");
+    // RFC 7591 wants 400 for every registration error, a wrong Content-Type too.
+    let body = match body {
+        Ok(Json(body)) if body.is_object() => body,
+        Ok(_) => return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "the body must be a JSON object"),
+        Err(rejection) => return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", &rejection.body_text()),
     };
     let (name, uris) = match registration(&body) {
         Ok(registered) => registered,

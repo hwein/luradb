@@ -1762,6 +1762,20 @@ mod tests {
         })
     }
 
+    // 10b. Invalid JSON domain names → 400.
+    #[test]
+    fn test_json_domain_invalid_name_400() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(true).await;
+            let long = "a".repeat(51);
+            for bad in ["", long.as_str(), "bad name!"] {
+                let req = json!({ "name": bad }).to_string();
+                let (status, body) = request(&app, Method::POST, "/store-api/json/domains", Some(&req)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {body}");
+            }
+        })
+    }
+
     // 23. DocumentResponse schema sample: a written document's
     //     _key/_version/user-field shape matches what the contract now declares.
     #[test]

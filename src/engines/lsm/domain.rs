@@ -153,16 +153,16 @@ fn generate_prefix(name: &str) -> Vec<u8> {
 }
 
 fn validate_domain_name(name: &str, max_len: usize) -> Result<()> {
-    anyhow::ensure!(!name.is_empty(), "Domain name must not be empty");
+    anyhow::ensure!(!name.is_empty(), "400 Bad Request: Domain name must not be empty");
     anyhow::ensure!(
         name.len() <= max_len,
-        "Domain name '{}' exceeds maximum of {} characters",
+        "400 Bad Request: Domain name '{}' exceeds maximum of {} characters",
         name,
         max_len
     );
     anyhow::ensure!(
         name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-        "Domain name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
+        "400 Bad Request: Domain name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
         name
     );
     Ok(())
@@ -1209,16 +1209,19 @@ mod tests {
         })
     }
 
-    // 5. Invalid domain names → error.
+    // 5. Invalid domain names → 400-prefixed error, no domain created.
     #[test]
     fn test_invalid_domain_name_rejected() {
         crate::core::engine_runtime::block_on(async {
             let (registry, _dir) = make_registry().await;
-            assert!(registry.create_domain("").await.is_err());
-            let long = "a".repeat(51);
-            assert!(registry.create_domain(&long).await.is_err());
-            assert!(registry.create_domain("bad name!").await.is_err());
-            assert!(registry.create_domain("bad/slash").await.is_err());
+            let before = registry.list_domains().await.unwrap().len();
+            let long = "a".repeat(DomainConfig::default().max_name_length + 1);
+            for bad in ["", long.as_str(), "bad name!", "bad/slash"] {
+                let err = registry.create_domain(bad).await.unwrap_err().to_string();
+                assert!(err.starts_with("400 Bad Request: Domain name"), "{bad:?}: {err}");
+                assert!(registry.get_domain(bad).await.unwrap().is_none(), "{bad:?}");
+            }
+            assert_eq!(registry.list_domains().await.unwrap().len(), before);
         })
     }
 

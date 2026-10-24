@@ -498,9 +498,11 @@ mod tests {
                 request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#)).await;
             assert_eq!(status, StatusCode::CONFLICT);
 
-            for bad in [r#"{"name": "bad name!"}"#, r#"{"name": "domains"}"#] {
-                let (status, body) = request(&app, Method::POST, "/store-api/rel/domains", Some(bad)).await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+            let long = "a".repeat(51);
+            for bad in ["", long.as_str(), "bad name!", "domains"] {
+                let req = json!({ "name": bad }).to_string();
+                let (status, body) = request(&app, Method::POST, "/store-api/rel/domains", Some(&req)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {body}");
             }
         })
     }

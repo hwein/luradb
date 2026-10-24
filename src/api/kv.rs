@@ -853,6 +853,37 @@ mod tests {
         })
     }
 
+    // POST /store-api/domains: an invalid name answers 400 with the reason in
+    // the body; a valid name 201, a duplicate 409.
+    #[test]
+    fn test_create_domain_invalid_name_400() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let json = [("content-type", "application/json")];
+            let long = "a".repeat(51);
+            let cases = [
+                ("", "must not be empty"),
+                (long.as_str(), "exceeds maximum of 50 characters"),
+                ("bad name!", "contains invalid characters"),
+            ];
+            for (bad, reason) in cases {
+                let body = serde_json::json!({ "name": bad }).to_string();
+                let resp = send_with(&app, Method::POST, "/store-api/domains", &json, Body::from(body)).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+                let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.starts_with("400 Bad Request: Domain name") && text.contains(reason), "{bad:?}: {text}");
+            }
+
+            for expected in [StatusCode::CREATED, StatusCode::CONFLICT] {
+                let resp =
+                    send_with(&app, Method::POST, "/store-api/domains", &json, Body::from(r#"{"name": "fresh"}"#))
+                        .await;
+                assert_eq!(resp.status(), expected);
+            }
+        })
+    }
+
     // Test 7: Rate limit → 429 + Retry-After header (verified via ApiError).
     #[test]
     fn test_rate_limit_returns_429_with_retry_after() {

@@ -11,6 +11,11 @@ const ADMIN: &str = "admin";
 
 /// A raw HTTP/1.1 request with `Connection: close`.
 pub(super) fn http(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> String {
+    String::from_utf8(http_bytes(method, path, headers, body.as_bytes())).unwrap()
+}
+
+/// [`http`] with a body that need not be UTF-8.
+fn http_bytes(method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
     let mut raw = format!("{method} {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n");
     for (name, value) in headers {
         raw.push_str(&format!("{name}: {value}\r\n"));
@@ -19,7 +24,8 @@ pub(super) fn http(method: &str, path: &str, headers: &[(&str, &str)], body: &st
         raw.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     raw.push_str("\r\n");
-    raw.push_str(body);
+    let mut raw = raw.into_bytes();
+    raw.extend_from_slice(body);
     raw
 }
 
@@ -364,7 +370,7 @@ fn a_user_key_sees_and_does_what_its_permissions_allow() {
             let tables = client.call("list_tables", json!({"domain": "mine"})).await;
             assert!(!tables.is_error() && tables.text().contains("\"t\""), "{}", tables.text());
             let value = client.call("kv_get", json!({"domain": "mine", "key": "k"})).await;
-            assert_eq!(value.text(), "clé");
+            assert_eq!(value.result()["structuredContent"]["value"], json!("clé"));
             let put = client.call("kv_put", json!({"domain": "mine", "key": "k", "value": "x"})).await;
             assert!(put.is_error() && put.text().starts_with("HTTP 403"), "{}", put.text());
             let create = client.call("create_domain", json!({"engine": "kv", "name": "new"})).await;
@@ -411,7 +417,8 @@ fn an_admin_key_works_every_engine() {
             assert_eq!(listed.result()["structuredContent"]["unavailable_engines"], json!([]));
 
             ok(client.call("kv_put", json!({"domain": "zoo", "key": "k", "value": "clé"})).await);
-            assert_eq!(ok(client.call("kv_get", json!({"domain": "zoo", "key": "k"})).await).text(), "clé");
+            let value = ok(client.call("kv_get", json!({"domain": "zoo", "key": "k"})).await);
+            assert_eq!(value.result()["structuredContent"]["value"], json!("clé"));
             ok(client.call("kv_set_null", json!({"domain": "zoo", "key": "k"})).await);
             ok(client.call("kv_delete", json!({"domain": "zoo", "key": "k"})).await);
             assert_eq!(ok(client.call("kv_count", json!({"domain": "zoo"})).await).result()["structuredContent"]["count"], json!(0));
@@ -447,6 +454,38 @@ fn switched_off_tools_are_neither_listed_nor_callable() {
             let answer = client.call("kv_put", json!({"domain": "default", "key": "k", "value": "v"})).await;
             let message = answer.message.unwrap();
             assert!(message.get("error").is_some(), "{message}");
+        },
+    );
+}
+
+// `kv_get` tells a NULL key, an empty value and a binary value apart.
+#[test]
+fn kv_get_returns_null_empty_and_binary_values() {
+    with_mcp(
+        |_| {},
+        |rest, mcp| async move {
+            let writes = [
+                http("PATCH", "/store-api/kv/default/keys/null/null", &[], "").into_bytes(),
+                http("PUT", "/store-api/kv/default/keys/empty", &[], "").into_bytes(),
+                http_bytes("PUT", "/store-api/kv/default/keys/binary", &[], &[0xff, 0x00, 0x41]),
+            ];
+            for raw in &writes {
+                let (status, body) = super::tests::request(rest, raw).await;
+                assert!(status < 300, "{status} {}", String::from_utf8_lossy(&body));
+            }
+            let mut client = Client::new(mcp, None);
+            assert_eq!(client.initialize().await.status, 200);
+            let cases = [
+                ("null", json!({"value": null})),
+                ("empty", json!({"value": ""})),
+                ("binary", json!({"value": "_wBB", "encoding": "base64url"})),
+            ];
+            for (key, expected) in cases {
+                let answer = client.call("kv_get", json!({"domain": "default", "key": key})).await;
+                assert!(!answer.is_error(), "{key}: {}", answer.text());
+                assert_eq!(answer.result()["structuredContent"], expected, "{key}");
+                assert_eq!(answer.text(), expected.to_string(), "{key}");
+            }
         },
     );
 }

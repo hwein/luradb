@@ -986,15 +986,15 @@ mod tests {
     }
 
     /// One request (with `Connection: close`) on a fresh connection.
-    pub(super) async fn request(addr: SocketAddr, raw: &str) -> (u16, Vec<u8>) {
+    pub(super) async fn request(addr: SocketAddr, raw: &(impl AsRef<[u8]> + ?Sized)) -> (u16, Vec<u8>) {
         let (status, _, body) = exchange(addr, raw).await;
         (status, body)
     }
 
     /// [`request`], with the lower-cased response head as well.
-    pub(super) async fn exchange(addr: SocketAddr, raw: &str) -> (u16, String, Vec<u8>) {
+    pub(super) async fn exchange(addr: SocketAddr, raw: &(impl AsRef<[u8]> + ?Sized)) -> (u16, String, Vec<u8>) {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(raw.as_bytes()).await.unwrap();
+        stream.write_all(raw.as_ref()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         let (head, body, _) = split_response(&buf);

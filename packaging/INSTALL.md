@@ -82,10 +82,11 @@ The migration tool rewrites the data directory for another number of data shards
 
 ```bash
 sudo systemctl stop luradb
-sudo -u luradb /usr/bin/luradb --config /etc/luradb/luradb.toml --migrate-shards 4
+sudo -u luradb sh -c 'cd /var/lib/luradb && exec /usr/bin/luradb --config /etc/luradb/luradb.toml --migrate-shards 4'
 sudo systemctl start luradb
 ```
 
+- Relative paths in the config count from the current directory, and the service runs in `/var/lib/luradb`; run the tool from there, as above, or it does not find the JSON and relational data and stops without changing anything.
 - The service must have been shut down cleanly. If the tool reports writes that are not flushed yet, start the service once, stop it again and rerun the tool.
 - It refuses to run while the service runs on the same data directory: the service holds a lock on `<system_dir>/lock` for as long as it runs, so a second LuraDB process on the same data directory does not start, and the tool runs only while the service is stopped.
 - It needs free disk space for a second copy of the data next to the first: the new layout is built in a `migrate_<timestamp>/` directory inside each data directory and only then moved into place. The old layout is removed once the move has finished.

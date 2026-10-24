@@ -84,6 +84,7 @@ All notable changes to LuraDB are documented in this file.
 - A restore that replaces a KV or JSON domain no longer clears links to it from relational tables.
 - **BREAKING** API: `POST /store-api/domains` answers 400 instead of 500 for an invalid domain name.
 - **BREAKING** API: the schema of `default` in the table description now allows the scalar and null values the server returns.
+- `--migrate-shards` stops instead of skipping JSON or relational data it cannot find at the configured paths.
 
 ### Security
 

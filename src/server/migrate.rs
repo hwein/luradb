@@ -51,7 +51,8 @@ struct Marker {
 
 /// Changes the shard count of the data directory `config` names to
 /// `shards`, or finishes a change to it that stopped halfway. The server
-/// must be stopped, and every write-ahead log empty.
+/// must be stopped, every write-ahead log empty, and the SSTable directory
+/// of every enabled engine present.
 pub fn migrate_shards(config: &LuraConfig, shards: u16) -> anyhow::Result<()> {
     anyhow::ensure!(shards > 0, "the shard count must be at least 1");
     let tokio = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
@@ -71,12 +72,25 @@ async fn migrate(config: &LuraConfig, shards: u16) -> anyhow::Result<()> {
         );
     }
     for (engine, files) in engine_files(config) {
-        let recovered = wal::recover(&files.wal).await?;
         let enabled = match engine {
             Engine::Kv => true,
             Engine::Json => config.json.enabled,
             Engine::Rel => config.rel.enabled,
         };
+        // Every start of an enabled engine creates its SSTable directory; a
+        // missing one means its data lies elsewhere (relative paths resolved
+        // from another directory) or the engine never ran here. Checked
+        // before the storage thread creates any file.
+        if enabled && !files.sstables.is_dir() {
+            let name = engine.as_str();
+            anyhow::bail!(
+                "{name} data not found at {} — run the tool from the directory the service runs in (relative paths \
+                 count from there; the packaged service runs in /var/lib/luradb), or start the server once with the \
+                 {name} engine enabled, shut it down, then rerun",
+                std::env::current_dir()?.join(&files.sstables).display()
+            );
+        }
+        let recovered = wal::recover(&files.wal).await?;
         let way = if enabled {
             "start the server once to flush, then shut it down".to_string()
         } else {
@@ -833,6 +847,102 @@ mod tests {
         let err = migrate_shards(&json_off, 2).unwrap_err();
         let way = "enable the json engine, start the server once to flush, shut it down, then rerun";
         assert!(format!("{err:#}").contains(way), "{err:#}");
+    }
+
+    /// An enabled engine whose SSTable directory is not where the config
+    /// points, by an absolute or a relative path, stops the tool before it
+    /// creates or changes anything: the old layout starts as before.
+    #[test]
+    fn an_enabled_engine_without_its_data_directory_stops_the_tool_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        serve(split_config(dir.path(), 1), |addr| async move { fill(addr, &two_domains()).await });
+        let before = serve(split_config(dir.path(), 1), |addr| async move { observe(addr, &two_domains()).await });
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let in_empty = |name: &str| empty.join(name).to_string_lossy().into_owned();
+        // Relative to the working directory, under a directory that does not
+        // exist: nothing can be created there.
+        let missing = PathBuf::from(format!("missing-{}", dir.path().file_name().unwrap().to_string_lossy()));
+        let in_missing = |name: &str| missing.join(name).to_string_lossy().into_owned();
+
+        let mut json_elsewhere = split_config(dir.path(), 0);
+        (json_elsewhere.json.wal_path, json_elsewhere.json.vlog_path, json_elsewhere.json.sstable_dir) =
+            (in_empty("json.wal"), in_empty("json.vlog"), in_empty("sstables"));
+        let mut rel_elsewhere = split_config(dir.path(), 0);
+        (rel_elsewhere.rel.wal_path, rel_elsewhere.rel.vlog_path, rel_elsewhere.rel.sstable_dir) =
+            (in_empty("rel.wal"), in_empty("rel.vlog"), in_empty("sstables"));
+        let mut rel_relative = split_config(dir.path(), 0);
+        (rel_relative.rel.wal_path, rel_relative.rel.vlog_path, rel_relative.rel.sstable_dir) =
+            (in_missing("rel.wal"), in_missing("rel.vlog"), in_missing("sstables"));
+        let cases = [
+            (json_elsewhere, "json", empty.join("sstables")),
+            (rel_elsewhere, "rel", empty.join("sstables")),
+            (rel_relative, "rel", std::env::current_dir().unwrap().join(&missing).join("sstables")),
+        ];
+        let roots: Vec<PathBuf> =
+            ["json", "json/sstables", "kv", "kv/sstables", "rel", "rel/sstables"].map(|root| dir.path().join(root)).to_vec();
+
+        for (cfg, engine, shown) in cases {
+            let err = format!("{:#}", migrate_shards(&cfg, 2).unwrap_err());
+            let found = format!("{engine} data not found at {} — run the tool from the directory", shown.display());
+            assert!(err.contains(&found), "{err}");
+            assert!(err.contains(&format!("start the server once with the {engine} engine enabled")), "{err}");
+            assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0, "no file in {}", empty.display());
+            assert!(!missing.exists(), "{} created", missing.display());
+            assert!(staging_left(&roots).is_empty(), "{:?}", staging_left(&roots));
+        }
+        let (after, shards) = serve(split_config(dir.path(), 0), |addr| async move {
+            (observe(addr, &two_domains()).await, read_on(addr, &two_domains()).await)
+        });
+        assert_eq!(after, before);
+        assert_eq!(shards, ["0", "0"], "the stored shard count is still 1");
+    }
+
+    /// An enabled engine that never ran on the data directory stops the tool
+    /// with the way to create its data; turned off, it is skipped and the
+    /// other engines move.
+    #[test]
+    fn an_engine_that_never_ran_stops_the_tool_while_enabled_and_is_skipped_while_disabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rel_off = |shards: u16| {
+            let mut cfg = config(dir.path(), shards);
+            cfg.rel.enabled = false;
+            cfg
+        };
+        serve(rel_off(1), |addr| async move {
+            for name in &two_domains() {
+                let create = json!({ "name": name }).to_string();
+                expect(addr, &with_body("POST", "/store-api/domains", &create), 201).await;
+                expect(addr, &with_body("POST", "/store-api/json/domains", &create), 201).await;
+                expect(addr, &with_body("PUT", &format!("/store-api/kv/{name}/keys/k"), "v"), 200).await;
+                let doc = json!({ "city": "Lyon" }).to_string();
+                expect(addr, &with_body("PUT", &format!("/store-api/json/{name}/documents/d"), &doc), 201).await;
+            }
+        });
+        let rel_dir = PathBuf::from(config(dir.path(), 0).rel.sstable_dir);
+        assert!(!rel_dir.exists(), "the rel engine never ran");
+
+        let err = format!("{:#}", migrate_shards(&config(dir.path(), 0), 2).unwrap_err());
+        assert!(err.contains(&format!("rel data not found at {}", rel_dir.display())), "{err}");
+        assert!(err.contains("start the server once with the rel engine enabled, shut it down, then rerun"), "{err}");
+
+        migrate_shards(&rel_off(0), 2).unwrap();
+        assert!(!rel_dir.exists());
+        let cfg = rel_off(0);
+        for sstables in [&cfg.storage.sstable_dir, &cfg.json.sstable_dir] {
+            for k in 0..2 {
+                assert!(has_sstables(&layout::shard_dir(Path::new(sstables), k)), "{sstables} shard {k}");
+            }
+        }
+        let (shards, documents) = serve(rel_off(0), |addr| async move {
+            let mut documents = Vec::new();
+            for name in &two_domains() {
+                documents.push(request(addr, &get(&format!("/store-api/json/{name}/documents/d"))).await.0);
+            }
+            (read_on(addr, &two_domains()).await, documents)
+        });
+        assert_eq!(shards, ["0", "1"]);
+        assert_eq!(documents, [200, 200]);
     }
 
     /// Fills `dir` with a file named `content` holding it.

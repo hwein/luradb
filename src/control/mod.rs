@@ -17,7 +17,9 @@ use crate::engines::lsm::reader::{RegistrySnapshot, Snapshot};
 use crate::engines::rel::{RelDomain, RelDomainState, RelEngine, RelStoreError};
 use crate::metrics::MetricsSample;
 use anyhow::Context;
-use parking_lot::RwLock;
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -252,11 +254,13 @@ impl ShardOwners {
     }
 }
 
-/// A command the control plane sends to a data shard; it runs on the
-/// shard's thread, one after the other.
+/// A command the control plane sends to a data shard; the commands run on
+/// the shard's thread, one after the other, but a `Quiesce` waits in a task
+/// of its own.
 pub enum ShardCommand {
     /// Answers once every write of `engine` admitted so far has applied;
-    /// later ones see the current domain state.
+    /// later ones see the current domain state. Waits beside the commands
+    /// after it.
     Quiesce { engine: Engine, reply: oneshot::Sender<()> },
     /// Removes the deleted domain `name` of `engine`, whose data the purger
     /// has removed.
@@ -279,10 +283,12 @@ pub enum ShardCommand {
     /// Applies `write` to the key-value domain `domain` in a task of its own,
     /// beside the commands after it, and answers with the result.
     WriteKv { domain: String, write: KvWrite, reply: oneshot::Sender<anyhow::Result<()>> },
-    /// Answers at once, behind the commands before it.
+    /// Answers at once, behind the commands before it but not behind the
+    /// wait of a `Quiesce`.
     Ping { reply: oneshot::Sender<()> },
-    /// Ends the command loop; the shard then shuts its engines down and
-    /// answers with the result of each one's final flush.
+    /// Ends the command loop once every `Quiesce` before it has answered;
+    /// the shard then shuts its engines down and answers with the result of
+    /// each one's final flush.
     Drain { reply: DrainReply },
 }
 
@@ -313,11 +319,16 @@ impl KvWrite {
 /// Runs the commands for the shard of `owners` until a `Drain` arrives, and
 /// hands that one back; `None` once the control plane is gone.
 pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedReceiver<ShardCommand>) -> Option<DrainReply> {
+    let mut quiesces: Vec<compio::runtime::JoinHandle<()>> = Vec::new();
     while let Some(command) = commands.recv().await {
         match command {
             ShardCommand::Quiesce { engine, reply } => {
-                owners.quiesce(engine).await;
-                let _ = reply.send(());
+                quiesces.retain(|quiesce| !quiesce.is_finished());
+                let owners = owners.clone();
+                quiesces.push(compio::runtime::spawn(async move {
+                    owners.quiesce(engine).await;
+                    let _ = reply.send(());
+                }));
             }
             ShardCommand::FinalizeDeletion { engine, name, reply } => {
                 let _ = reply.send(owners.finalize_deletion(engine, &name).await);
@@ -362,7 +373,12 @@ pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedRecei
             ShardCommand::Ping { reply } => {
                 let _ = reply.send(());
             }
-            ShardCommand::Drain { reply } => return Some(reply),
+            ShardCommand::Drain { reply } => {
+                for quiesce in quiesces {
+                    let _ = quiesce.await;
+                }
+                return Some(reply);
+            }
         }
     }
     None
@@ -427,6 +443,8 @@ pub struct ControlPlane {
     rounds: tokio::sync::Mutex<()>,
     /// Set while a restore job runs; see [`Self::restore_running`].
     restoring: AtomicBool,
+    /// The last ping sent to each data shard, by shard index.
+    pings: Mutex<Vec<Option<Shared<BoxFuture<'static, bool>>>>>,
 }
 
 /// Marks a restore as running until it drops, on every exit path.
@@ -451,6 +469,7 @@ impl ControlPlane {
             directory: RwLock::new(Arc::new(Directory::of(&shards).await?)),
             bus,
             system,
+            pings: Mutex::new(vec![None; shards.len()]),
             shards,
             rounds: tokio::sync::Mutex::new(()),
             restoring: AtomicBool::new(false),
@@ -578,14 +597,37 @@ impl ControlPlane {
     }
 
     /// Pings every data shard over its command channel, all at once: by
-    /// shard index, whether it answered within `timeout(index)`.
+    /// shard index, whether it answered within `timeout(index)`. A shard has
+    /// at most one ping outstanding: a call while it is unanswered waits for
+    /// that one, and a call after its answer sends a new one.
     #[allow(clippy::disallowed_methods, reason = "called by GET /health, which runs on the frontend runtime")]
     pub async fn ping_shards(&self, timeout: impl Fn(usize) -> std::time::Duration) -> Vec<bool> {
-        let pings = self.shards.iter().enumerate().map(|(index, shard)| {
+        let pings: Vec<_> = {
+            let mut slots = self.pings.lock();
+            self.shards
+                .iter()
+                .zip(slots.iter_mut())
+                .map(|(shard, slot)| {
+                    // Polls once: an answer that arrived before this call is no answer to it.
+                    if slot.as_ref().is_none_or(|ping| ping.clone().now_or_never().is_some()) {
+                        let (reply, answer) = oneshot::channel();
+                        *slot = shard
+                            .commands
+                            .send(ShardCommand::Ping { reply })
+                            .is_ok()
+                            .then(|| answer.map(|answered| answered.is_ok()).boxed().shared());
+                    }
+                    slot.clone()
+                })
+                .collect()
+        };
+        let pings = pings.into_iter().enumerate().map(|(index, ping)| {
             let timeout = timeout(index);
             async move {
-                let ping = shard.request(|reply| ShardCommand::Ping { reply });
-                matches!(tokio::time::timeout(timeout, ping).await, Ok(Ok(())))
+                match ping {
+                    Some(ping) => tokio::time::timeout(timeout, ping).await.unwrap_or(false),
+                    None => false,
+                }
             }
         });
         futures::future::join_all(pings).await
@@ -898,6 +940,14 @@ mod tests {
 
     impl Fixture {
         async fn new() -> Self {
+            let (f, serving) = Self::serving().await;
+            serving.detach();
+            f
+        }
+
+        /// A fixture whose data shard serves its commands in the task returned
+        /// beside it.
+        async fn serving() -> (Self, compio::runtime::JoinHandle<Option<DrainReply>>) {
             let dir = tempfile::TempDir::new().unwrap();
             let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
@@ -919,9 +969,11 @@ mod tests {
             let rel = RelEngine::bootstrap(&rel_config, metrics, resolver).await.unwrap();
             let bus = Arc::new(GlobalEventBus::new(64, 64));
             let events = bus.subscribe();
-            let (control, auth) =
-                testing::start(dir.path(), Arc::clone(&kv), Some(Arc::clone(&json)), Some(Arc::clone(&rel)), bus).await;
-            Self { kv, json, rel, auth, control, events, _dir: dir }
+            let owners = ShardOwners { kv: Arc::clone(&kv), json: Some(Arc::clone(&json)), rel: Some(Arc::clone(&rel)) };
+            let (commands, inbox) = mpsc::unbounded_channel();
+            let serving = compio::runtime::spawn(serve_shard(owners.clone(), inbox));
+            let (control, auth) = testing::start_over(dir.path(), vec![Shard { owners, commands }], bus).await;
+            (Self { kv, json, rel, auth, control, events, _dir: dir }, serving)
         }
 
         fn state(&self, engine: Engine, name: &str) -> Option<Lifecycle> {
@@ -942,6 +994,17 @@ mod tests {
         fn next_event(&mut self) -> (&'static str, &'static str, String) {
             let event = self.events.try_recv().expect("an event");
             (event.engine, event.kind, event.domain)
+        }
+
+        /// Whether a ping sent to the data shard now is answered while every
+        /// runnable task gets a few turns.
+        async fn ping_answers(&self) -> bool {
+            let ping = compio::runtime::spawn({
+                let control = Arc::clone(&self.control);
+                async move { control.shards[0].request(|reply| ShardCommand::Ping { reply }).await }
+            });
+            settle().await;
+            ping.is_finished() && ping.await.unwrap().is_ok()
         }
     }
 
@@ -971,6 +1034,8 @@ mod tests {
             });
             f.until_deleting(Engine::Kv, "doomed").await;
             settle().await;
+            assert!(!delete.is_finished(), "the delete must wait for the write in flight");
+            assert!(f.ping_answers().await, "the shard answers a ping while the delete waits");
             assert!(!delete.is_finished(), "the delete must wait for the write in flight");
             let refused = f.kv.store("doomed").await.err().expect("a new write must be refused");
             assert!(refused.to_string().starts_with("410"), "{refused}");
@@ -1060,6 +1125,8 @@ mod tests {
             f.until_deleting(Engine::Json, "doomed").await;
             settle().await;
             assert!(!delete.is_finished(), "the delete must wait for the held document lock");
+            assert!(f.ping_answers().await, "the shard answers a ping while the delete waits");
+            assert!(!delete.is_finished(), "the delete must wait for the held document lock");
             let late_write = compio::runtime::spawn({
                 let json = Arc::clone(&f.json);
                 async move { json.put_document("doomed", "late", json!({"n": 2})).await }
@@ -1097,6 +1164,8 @@ mod tests {
             f.until_deleting(Engine::Rel, "doomed").await;
             settle().await;
             assert!(!delete.is_finished(), "the delete must wait for the write guard");
+            assert!(f.ping_answers().await, "the shard answers a ping while the delete waits");
+            assert!(!delete.is_finished(), "the delete must wait for the write guard");
             let late_write = compio::runtime::spawn({
                 let rel = Arc::clone(&f.rel);
                 async move { rel.execute("doomed", "INSERT INTO t VALUES (1)", &[]).await }
@@ -1114,6 +1183,60 @@ mod tests {
             purger.purge_tick().await.unwrap();
             assert_eq!(f.next_event(), ("rel", "domain_purged", "doomed".to_string()));
             assert_eq!(f.state(Engine::Rel, "doomed"), None);
+        })
+    }
+
+    // A delete waiting for the relational write guard on the only shard does
+    // not hold up a metrics round there.
+    #[test]
+    fn a_metrics_round_ends_while_a_delete_waits() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            f.control.create_domain(Engine::Rel, "doomed", false).await.unwrap();
+            let guard = f.rel.write_guard_for_test().await;
+            let delete = compio::runtime::spawn({
+                let control = Arc::clone(&f.control);
+                async move { control.delete_domain(Engine::Rel, "doomed").await }
+            });
+            f.until_deleting(Engine::Rel, "doomed").await;
+            settle().await;
+
+            // Upper bound against hanging only.
+            compio::time::timeout(Duration::from_secs(30), f.control.sample_metrics())
+                .await
+                .expect("the round waits for the delete")
+                .unwrap();
+            assert!(!delete.is_finished(), "the delete must wait for the write guard");
+            drop(guard);
+            delete.await.unwrap().unwrap();
+        })
+    }
+
+    // A drain that reaches the shard while a delete waits for the relational
+    // write guard ends the command loop only once the delete's wait is over;
+    // the delete then succeeds.
+    #[test]
+    fn a_drain_waits_for_a_delete_in_progress() {
+        crate::core::engine_runtime::block_on(async {
+            let (mut f, serving) = Fixture::serving().await;
+            f.control.create_domain(Engine::Rel, "doomed", false).await.unwrap();
+            assert_eq!(f.next_event(), ("rel", "domain_created", "doomed".to_string()));
+            let guard = f.rel.write_guard_for_test().await;
+            let delete = compio::runtime::spawn({
+                let control = Arc::clone(&f.control);
+                async move { control.delete_domain(Engine::Rel, "doomed").await }
+            });
+            f.until_deleting(Engine::Rel, "doomed").await;
+            let (reply, _flushed) = oneshot::channel();
+            f.control.shards[0].commands.send(ShardCommand::Drain { reply }).unwrap();
+            settle().await;
+            assert!(!serving.is_finished(), "the drain waits for the delete");
+            assert!(!delete.is_finished(), "the delete must wait for the write guard");
+
+            drop(guard);
+            assert!(serving.await.unwrap().is_some(), "the loop ends with the drain");
+            delete.await.unwrap().unwrap();
+            assert_eq!(f.next_event(), ("rel", "domain_deleted", "doomed".to_string()));
         })
     }
 
@@ -1278,7 +1401,8 @@ mod tests {
     /// a shard through a relay that records it; a shard's relay holds its
     /// `Confirm` back while `hold_confirms` of that shard is set, and keeps
     /// its `Sample`s back while `hold_samples` is set, to pass them on in
-    /// reverse order once it is cleared.
+    /// reverse order once it is cleared; likewise its `Ping`s while
+    /// `hold_pings` is set, in order.
     struct TwoShards {
         control: Arc<ControlPlane>,
         engines: Vec<Arc<LsmStorageEngine>>,
@@ -1286,6 +1410,7 @@ mod tests {
         commands: Arc<std::sync::Mutex<Vec<(usize, &'static str)>>>,
         hold_confirms: Vec<tokio::sync::watch::Sender<bool>>,
         hold_samples: Vec<tokio::sync::watch::Sender<bool>>,
+        hold_pings: Vec<tokio::sync::watch::Sender<bool>>,
         _hub: crate::core::storage_thread::TestHub,
         _dir: tempfile::TempDir,
     }
@@ -1317,6 +1442,7 @@ mod tests {
             let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut hold_confirms = Vec::new();
             let mut hold_samples = Vec::new();
+            let mut hold_pings = Vec::new();
             let mut shards = Vec::new();
             for (k, owners) in owners.into_iter().enumerate() {
                 let (to_shard, inbox) = mpsc::unbounded_channel();
@@ -1325,10 +1451,13 @@ mod tests {
                 hold_confirms.push(hold);
                 let (hold, mut samples_held) = tokio::sync::watch::channel(false);
                 hold_samples.push(hold);
+                let (hold, mut pings_held) = tokio::sync::watch::channel(false);
+                hold_pings.push(hold);
                 let (relay, mut relayed) = mpsc::unbounded_channel::<ShardCommand>();
                 let log = Arc::clone(&commands);
                 compio::runtime::spawn(async move {
                     let mut kept = Vec::new();
+                    let mut kept_pings = Vec::new();
                     loop {
                         tokio::select! {
                             command = relayed.recv() => {
@@ -1340,6 +1469,8 @@ mod tests {
                                 }
                                 if name == "sample" && *samples_held.borrow() {
                                     kept.push(command);
+                                } else if name == "ping" && *pings_held.borrow() {
+                                    kept_pings.push(command);
                                 } else if to_shard.send(command).is_err() {
                                     break;
                                 }
@@ -1347,6 +1478,13 @@ mod tests {
                             Ok(()) = samples_held.changed() => {
                                 if !*samples_held.borrow_and_update() {
                                     for command in kept.drain(..).rev() {
+                                        let _ = to_shard.send(command);
+                                    }
+                                }
+                            }
+                            Ok(()) = pings_held.changed() => {
+                                if !*pings_held.borrow_and_update() {
+                                    for command in kept_pings.drain(..) {
                                         let _ = to_shard.send(command);
                                     }
                                 }
@@ -1359,7 +1497,17 @@ mod tests {
             }
             let bus = Arc::new(GlobalEventBus::new(64, 64));
             let (control, _) = testing::start_over(dir.path(), shards, bus).await;
-            Self { control, engines, registries, commands, hold_confirms, hold_samples, _hub: hub, _dir: dir }
+            Self {
+                control,
+                engines,
+                registries,
+                commands,
+                hold_confirms,
+                hold_samples,
+                hold_pings,
+                _hub: hub,
+                _dir: dir,
+            }
         }
 
         fn state(&self, name: &str) -> Option<Lifecycle> {
@@ -1723,6 +1871,41 @@ mod tests {
         })
     }
 
+    // A thousand health checks at once while both shards hold their pings
+    // back send one ping to each. Once that one is answered, the next check
+    // sends a new one and does not take the old answer for its own.
+    #[test]
+    fn concurrent_health_checks_send_one_ping_per_shard() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::new(|_, _| {}).await;
+            let pings = |k| s.commands_of(k).iter().filter(|name| **name == "ping").count();
+            let hold = |held: bool| {
+                for hold in &s.hold_pings {
+                    hold.send_replace(held);
+                }
+            };
+
+            hold(true);
+            let checks = (0..1000).map(|_| s.control.ping_shards(|_| Duration::ZERO));
+            for answered in futures::future::join_all(checks).await {
+                assert_eq!(answered, [false, false]);
+            }
+            settle().await;
+            assert_eq!((pings(0), pings(1)), (1, 1));
+
+            hold(false);
+            settle().await;
+            hold(true);
+            assert_eq!(s.control.ping_shards(|_| Duration::ZERO).await, [false, false], "an earlier answer must not count");
+            settle().await;
+            assert_eq!((pings(0), pings(1)), (2, 2));
+
+            hold(false);
+            // Upper bound against hanging only.
+            assert_eq!(s.control.ping_shards(|_| Duration::from_secs(30)).await, [true, true]);
+        })
+    }
+
     /// A control plane with no worker behind it; the receiver is the worker's end.
     async fn without_worker(dir: &tempfile::TempDir) -> (ControlPlane, mpsc::UnboundedReceiver<Command>) {
         let (commands, inbox) = mpsc::unbounded_channel();
@@ -1734,6 +1917,7 @@ mod tests {
             shards: Vec::new(),
             rounds: tokio::sync::Mutex::new(()),
             restoring: AtomicBool::new(false),
+            pings: Mutex::default(),
         };
         (control, inbox)
     }

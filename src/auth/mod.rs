@@ -3,7 +3,7 @@
 //! System keys layout:
 //!   __sys:auth:user:<name>          → serialised UserRecord (JSON)
 //!   __sys:auth:perm:<name>:<domain> → serialised DomainPermission (JSON)
-//!   __sys:oauth:client:<id>         → serialised OAuthClient (JSON)
+//!   __sys:oauth:client:<id>         → serialised OAuthClient (JSON), with a TTL until its first code
 //!   __sys:oauth:token:<hash>        → serialised TokenRecord (JSON), with a TTL
 
 pub mod handlers;

@@ -3,7 +3,8 @@
 //! (RFC 7591) for public clients, the authorization code flow with PKCE
 //! S256 where the user signs in once with an API key, refresh and
 //! revocation (RFC 7009). The state lives behind internal routes on the
-//! control plane; this module keeps none of it but the failed sign-ins.
+//! control plane; this module keeps none of it but the failed sign-ins and
+//! the recent registrations.
 
 use super::internal::{encode, Call, Internal, Reply};
 use crate::api::middleware::ClientIp;
@@ -19,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 /// Failed sign-ins from one client IP after which the sign-in page answers
@@ -29,6 +30,14 @@ const MAX_FAILED_SIGN_INS: usize = 5;
 const FAILURE_WINDOW_SECS: u64 = 15 * 60;
 /// Longest client name a registration may carry.
 const MAX_CLIENT_NAME_CHARS: usize = 100;
+/// Most redirect URIs a registration may carry ...
+const MAX_REDIRECT_URIS: usize = 10;
+/// ... each at most this long.
+const MAX_REDIRECT_URI_CHARS: usize = 2048;
+/// Registrations one client IP may make ...
+const MAX_REGISTRATIONS: usize = 10;
+/// ... within this long.
+const REGISTRATION_WINDOW_SECS: u64 = 60 * 60;
 
 const PAGE_CSP: &str = "default-src 'none'; style-src 'self'; form-action 'self'";
 
@@ -41,13 +50,21 @@ pub(crate) struct OAuth {
     /// Binds the sign-in form's CSRF token to its request.
     csrf_key: [u8; 32],
     failures: Failures,
+    registrations: Registrations,
 }
 
 impl OAuth {
     pub(crate) fn new(internal: Internal, public_url: &str) -> Self {
         let public_url = public_url.trim_end_matches('/').to_string();
         let origin = origin_of(&public_url);
-        Self { internal, public_url, origin, csrf_key: rand::thread_rng().gen(), failures: Failures::default() }
+        Self {
+            internal,
+            public_url,
+            origin,
+            csrf_key: rand::thread_rng().gen(),
+            failures: Failures::default(),
+            registrations: Registrations::default(),
+        }
     }
 
     fn resource(&self) -> String {
@@ -125,6 +142,79 @@ impl Failures {
     }
 }
 
+/// Recent and pending registrations by [`registration_key`], as Unix seconds.
+#[derive(Default)]
+struct Registrations(Mutex<RegistrationTimes>);
+
+#[derive(Default)]
+struct RegistrationTimes {
+    by_key: HashMap<IpAddr, Vec<u64>>,
+    /// When keys without a recent registration were last dropped.
+    swept: u64,
+}
+
+/// The key a client IP's registrations count under: an IPv4 address as it
+/// is, also mapped into IPv6; an IPv6 address by its /64 prefix, as one
+/// subscriber usually gets a whole /64.
+fn registration_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+        },
+    }
+}
+
+impl Registrations {
+    /// Counts a registration from `ip` before it is made, unless the limit
+    /// is reached: concurrent registrations then never exceed it. Refused,
+    /// it returns the seconds until the oldest counted one runs out.
+    fn reserve(&self, ip: IpAddr, now: u64) -> Result<(), u64> {
+        let recent = |t: &u64| now.saturating_sub(*t) < REGISTRATION_WINDOW_SECS;
+        let mut times = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Sweeping all keys once per window keeps each call cheap and the
+        // map to the keys of the last two windows.
+        if now.saturating_sub(times.swept) >= REGISTRATION_WINDOW_SECS {
+            times.by_key.retain(|_, list| {
+                list.retain(recent);
+                !list.is_empty()
+            });
+            times.swept = now;
+        }
+        let list = times.by_key.entry(registration_key(ip)).or_default();
+        list.retain(recent);
+        if list.len() >= MAX_REGISTRATIONS {
+            let oldest = list.iter().min().copied().unwrap_or(now);
+            return Err((oldest + REGISTRATION_WINDOW_SECS).saturating_sub(now));
+        }
+        list.push(now);
+        Ok(())
+    }
+
+    /// Takes back the registration reserved at `now`; it was not made.
+    fn release(&self, ip: IpAddr, now: u64) {
+        let mut times = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let key = registration_key(ip);
+        if let Some(list) = times.by_key.get_mut(&key) {
+            if let Some(i) = list.iter().rposition(|t| *t == now) {
+                list.remove(i);
+            }
+            if list.is_empty() {
+                times.by_key.remove(&key);
+            }
+        }
+    }
+}
+
+/// The client IP: as resolved behind trusted proxies, else the peer.
+fn request_ip(client_ip: Option<Extension<ClientIp>>, peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> IpAddr {
+    client_ip
+        .map(|Extension(ip)| ip.0)
+        .or_else(|| peer.map(|Extension(info)| info.0.ip()))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
 pub(crate) fn routes(oauth: Arc<OAuth>) -> Router {
     Router::new()
         .route("/.well-known/oauth-protected-resource", get(protected_resource))
@@ -200,13 +290,24 @@ fn registration(body: &Value) -> Result<(String, Vec<String>), (&'static str, St
     let Some(uris) = uris.filter(|uris| !uris.is_empty()) else {
         return Err(("invalid_redirect_uri", "redirect_uris is required".to_string()));
     };
+    if uris.len() > MAX_REDIRECT_URIS {
+        return Err(("invalid_redirect_uri", format!("redirect_uris may name at most {MAX_REDIRECT_URIS} URIs")));
+    }
+    if uris.iter().any(|uri| uri.chars().count() > MAX_REDIRECT_URI_CHARS) {
+        return Err(("invalid_redirect_uri", format!("a redirect URI may be at most {MAX_REDIRECT_URI_CHARS} characters long")));
+    }
     if let Some(bad) = uris.iter().find(|uri| !redirect_uri_allowed(uri)) {
         return Err(("invalid_redirect_uri", format!("'{bad}' must be https:// or http:// on a loopback host")));
     }
     Ok((name.to_string(), uris))
 }
 
-async fn register(State(oauth): State<Arc<OAuth>>, body: Option<Json<Value>>) -> Response {
+async fn register(
+    State(oauth): State<Arc<OAuth>>,
+    client_ip: Option<Extension<ClientIp>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    body: Option<Json<Value>>,
+) -> Response {
     let Some(Json(body)) = body else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "the body must be a JSON object");
     };
@@ -214,10 +315,19 @@ async fn register(State(oauth): State<Arc<OAuth>>, body: Option<Json<Value>>) ->
         Ok(registered) => registered,
         Err((error, description)) => return oauth_error(StatusCode::BAD_REQUEST, error, &description),
     };
+    let ip = request_ip(client_ip, peer);
+    let now = crate::auth::now_secs();
+    if let Err(retry_after) = oauth.registrations.reserve(ip, now) {
+        let mut resp =
+            oauth_error(StatusCode::TOO_MANY_REQUESTS, "temporarily_unavailable", "too many registrations; try again later");
+        resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+        return resp;
+    }
     let call = Call::new(Method::POST, "/store-api/auth/oauth/clients".into())
         .json(json!({ "client_name": name, "redirect_uris": uris }));
     let reply = oauth.internal.run(&call, None, None).await;
     let Some(client) = reply.json().filter(|_| reply.status == StatusCode::CREATED) else {
+        oauth.registrations.release(ip, now);
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &reply.text());
     };
     let body = json!({
@@ -403,10 +513,7 @@ async fn authorize_submit(
     if headers.get(header::ORIGIN).map(HeaderValue::as_bytes) != Some(oauth.origin.as_bytes()) {
         return (StatusCode::FORBIDDEN, "Forbidden: the sign-in form must be sent from this server").into_response();
     }
-    let ip = client_ip
-        .map(|Extension(ip)| ip.0)
-        .or_else(|| peer.map(|Extension(info)| info.0.ip()))
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let ip = request_ip(client_ip, peer);
     let now = crate::auth::now_secs();
     if oauth.failures.blocked(ip, now) {
         return too_many_failures();
@@ -545,6 +652,97 @@ mod tests {
             assert_eq!(registration(&body).unwrap_err().0, error, "{body}");
         }
         assert!(registration(&json!({"client_name": "é".repeat(100), "redirect_uris": ["https://a.example/cb"]})).is_ok());
+    }
+
+    #[test]
+    fn a_registration_names_at_most_ten_redirect_uris_of_2048_characters() {
+        let uri = |i: usize, len: usize| {
+            let start = format!("https://a.example/{i}/");
+            format!("{start}{}", "x".repeat(len - start.len()))
+        };
+        let uris: Vec<String> = (0..MAX_REDIRECT_URIS).map(|i| uri(i, MAX_REDIRECT_URI_CHARS)).collect();
+        let ok = registration(&json!({"client_name": "a", "redirect_uris": uris}));
+        assert_eq!(ok.map(|(_, registered)| registered), Ok(uris));
+
+        let too_many: Vec<String> = (0..=MAX_REDIRECT_URIS).map(|i| uri(i, 30)).collect();
+        let (error, description) = registration(&json!({"client_name": "a", "redirect_uris": too_many})).unwrap_err();
+        assert_eq!(error, "invalid_redirect_uri");
+        assert!(description.contains("10"), "{description}");
+
+        let too_long = [uri(0, MAX_REDIRECT_URI_CHARS + 1)];
+        let (error, description) = registration(&json!({"client_name": "a", "redirect_uris": too_long})).unwrap_err();
+        assert_eq!(error, "invalid_redirect_uri");
+        assert!(description.contains("2048") && description.len() < 100, "{description}");
+    }
+
+    #[test]
+    fn ten_registrations_per_ip_within_an_hour() {
+        let registrations = Registrations::default();
+        let (ip, other) = (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)));
+        for i in 0..MAX_REGISTRATIONS as u64 {
+            assert_eq!(registrations.reserve(ip, 1000 + i), Ok(()));
+        }
+        // The oldest, from 1000, runs out at 1000 + window.
+        assert_eq!(registrations.reserve(ip, 1100), Err(REGISTRATION_WINDOW_SECS - 100));
+        assert_eq!(registrations.reserve(other, 1100), Ok(()));
+        assert_eq!(registrations.reserve(ip, 1000 + REGISTRATION_WINDOW_SECS - 1), Err(1));
+        assert_eq!(registrations.reserve(ip, 1000 + REGISTRATION_WINDOW_SECS), Ok(()));
+        assert!(registrations.reserve(ip, 1000 + REGISTRATION_WINDOW_SECS).is_err());
+    }
+
+    #[test]
+    fn a_failed_registration_is_released() {
+        let registrations = Registrations::default();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        for _ in 0..MAX_REGISTRATIONS {
+            assert_eq!(registrations.reserve(ip, 1000), Ok(()));
+        }
+        assert!(registrations.reserve(ip, 1000).is_err());
+        registrations.release(ip, 1000);
+        assert_eq!(registrations.reserve(ip, 1000), Ok(()));
+        assert!(registrations.reserve(ip, 1000).is_err());
+    }
+
+    #[test]
+    fn ipv6_counts_per_64_and_mapped_ipv4_as_ipv4() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(registration_key(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+        assert_eq!(registration_key(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
+        assert_eq!(registration_key(ip("192.0.2.1")), ip("192.0.2.1"));
+
+        let registrations = Registrations::default();
+        for i in 0..MAX_REGISTRATIONS {
+            assert_eq!(registrations.reserve(ip(&format!("2001:db8:1:2::{:x}", i + 1)), 1000), Ok(()));
+        }
+        assert!(registrations.reserve(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"), 1000).is_err());
+        assert_eq!(registrations.reserve(ip("2001:db8:1:3::1"), 1000), Ok(()));
+
+        for _ in 0..MAX_REGISTRATIONS {
+            assert_eq!(registrations.reserve(ip("::ffff:192.0.2.1"), 1000), Ok(()));
+        }
+        assert!(registrations.reserve(ip("192.0.2.1"), 1000).is_err());
+        registrations.release(ip("192.0.2.1"), 1000);
+        assert_eq!(registrations.reserve(ip("::ffff:192.0.2.1"), 1000), Ok(()));
+    }
+
+    // Keys whose registrations ran out are dropped, so the counter holds
+    // only the recent ones.
+    #[test]
+    fn keys_without_recent_registrations_are_dropped() {
+        let registrations = Registrations::default();
+        for i in 0..100u8 {
+            assert_eq!(registrations.reserve(IpAddr::V4(Ipv4Addr::new(192, 0, 2, i)), 1000), Ok(()));
+        }
+        let later = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(registrations.reserve(later, 1000 + 2 * REGISTRATION_WINDOW_SECS), Ok(()));
+        let times = registrations.0.lock().unwrap();
+        assert_eq!(times.by_key.keys().collect::<Vec<_>>(), [&later]);
+        drop(times);
+
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        assert_eq!(registrations.reserve(ip, 5000), Ok(()));
+        registrations.release(ip, 5000);
+        assert!(!registrations.0.lock().unwrap().by_key.contains_key(&ip));
     }
 
     #[test]

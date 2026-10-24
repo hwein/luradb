@@ -74,6 +74,7 @@ pub fn router(
     if oauth_enabled {
         app = app.merge(oauth::routes(Arc::new(OAuth::new(internal, &config.mcp.public_url))));
     }
-    // Resolves the client IP behind trusted proxies, for the sign-in limit.
+    // Resolves the client IP behind trusted proxies, for the sign-in and
+    // registration limits.
     app.layer(from_fn_with_state(trusted_cidrs, proxy_fn))
 }

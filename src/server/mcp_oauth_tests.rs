@@ -219,6 +219,44 @@ fn registration_takes_valid_redirect_uris_only() {
     });
 }
 
+// Ten registrations per client IP an hour; behind a trusted proxy every
+// client counts on its own, and a refused registration counts not at all.
+#[test]
+fn the_eleventh_registration_from_one_ip_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = oauth_config(dir.path(), "lura_oauth_quota_admin");
+    config.proxy.trusted_proxies = vec!["127.0.0.1".to_string()];
+    let server = Server::start(Arc::new(config), &dir.path().join("luradb.toml")).unwrap();
+    let mcp = server.mcp_addr.unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        for _ in 0..10 {
+            register(mcp).await;
+        }
+        let post = |body: &Value, forwarded: Option<&str>| {
+            let mut headers = vec![("Content-Type", "application/json")];
+            headers.extend(forwarded.map(|ip| ("X-Forwarded-For", ip)));
+            http("POST", "/oauth/register", &headers, &body.to_string())
+        };
+        let body = json!({ "client_name": "Agent 🦒", "redirect_uris": [REDIRECT] });
+        let (status, head, answer) = exchange(mcp, &post(&body, None)).await;
+        assert_eq!(status, 429, "{}", String::from_utf8_lossy(&answer));
+        assert_eq!(
+            json_of(&answer),
+            json!({ "error": "temporarily_unavailable", "error_description": "too many registrations; try again later" })
+        );
+        let retry_after: u64 = header(&head, "retry-after").expect("Retry-After").parse().unwrap();
+        assert!((1..=3600).contains(&retry_after), "{retry_after}");
+
+        let too_many = json!({ "client_name": "Agent 🦒", "redirect_uris": vec![REDIRECT; 11] });
+        let (status, answer) = request(mcp, &post(&too_many, None)).await;
+        assert_eq!((status, json_of(&answer)["error"].clone()), (400, json!("invalid_redirect_uri")));
+
+        let (status, answer) = request(mcp, &post(&body, Some("203.0.113.7"))).await;
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&answer));
+    });
+    server.shutdown().unwrap();
+}
+
 // The complete flow: register, sign in with an API key, exchange the code
 // with its verifier, call a tool with the token; the token is no API key on
 // the REST listener.

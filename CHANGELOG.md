@@ -27,6 +27,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Changed
 
+- The MCP listener limits OAuth client registrations per client IP and to 10 redirect URIs of up to 2048 characters; registrations never used to sign in expire after a day.
 - The Debian package no longer starts the service on first install and prints where the config lives and how to start it; upgrades restart the service only if it is running.
 - Relational domains follow the `[rate_limit]` defaults instead of a fixed 1000 reads/500 writes per second.
 - Building the SHM snapshot of a domain larger than the data buffer no longer holds the whole domain in memory.

@@ -42,10 +42,62 @@ pub fn would_block() -> bool {
     INLINE_READ.try_with(|read| read.gave_up.set(true)).is_ok()
 }
 
+/// True inside [`inline_read`]; unlike [`would_block`], it does not give the read up.
+pub fn in_inline_scope() -> bool {
+    INLINE_READ.try_with(|_| ()).is_ok()
+}
+
 /// Inside [`inline_read`], runs `f` once the read ends if it gave up, so
 /// that the read can undo what it did before; anywhere else drops `f`.
 pub fn on_give_up(f: impl FnOnce() + Send + 'static) {
     let _ = INLINE_READ.try_with(|read| read.on_give_up.borrow_mut().push(Box::new(f)));
+}
+
+#[cfg(test)]
+type ResidencyHook = Box<dyn Fn(&[u8]) -> bool>;
+
+#[cfg(test)]
+thread_local! {
+    static RESIDENCY: RefCell<Option<ResidencyHook>> = const { RefCell::new(None) };
+}
+
+/// Lets [`resident`] answer with `hook` on this thread instead of asking the
+/// kernel; `None` asks the kernel again.
+#[cfg(test)]
+pub(crate) fn set_residency(hook: Option<ResidencyHook>) {
+    RESIDENCY.with(|residency| *residency.borrow_mut() = hook);
+}
+
+/// True if every page that `bytes`, a slice of a memory mapping, overlaps is
+/// in memory, so that reading it cannot wait for the disk. One `mincore`
+/// call per 64 pages; a failed call counts as not resident.
+pub fn resident(bytes: &[u8]) -> bool {
+    #[cfg(test)]
+    if let Some(answer) = RESIDENCY.with(|residency| residency.borrow().as_ref().map(|hook| hook(bytes))) {
+        return answer;
+    }
+    let page = page_size();
+    let end = bytes.as_ptr() as usize + bytes.len();
+    let mut addr = bytes.as_ptr() as usize & !(page - 1);
+    let mut pages = [0u8; 64];
+    while addr < end {
+        let len = (end - addr).min(pages.len() * page);
+        // SAFETY: `addr` is page-aligned and `addr..addr + len` lies in the
+        // mapping that holds `bytes`; `pages` has room for every page of it.
+        if unsafe { libc::mincore(addr as *mut libc::c_void, len, pages.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        if pages[..len.div_ceil(page)].iter().any(|state| state & 1 == 0) {
+            return false;
+        }
+        addr += len;
+    }
+    true
+}
+
+fn page_size() -> usize {
+    // sysconf(_SC_PAGESIZE) is always a positive power of two on Linux.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
 /// Hands the thread back every `every` ticks.
@@ -229,6 +281,35 @@ mod tests {
         let ((), gave_up) = inline_read(async { tokio::task::yield_now().await }).await;
         assert!(!gave_up);
         assert!(!would_block());
+    }
+
+    // Asking whether a read runs inline does not give it up.
+    #[tokio::test]
+    async fn test_in_inline_scope_does_not_give_the_read_up() {
+        assert!(!in_inline_scope());
+        let (inside, gave_up) = inline_read(async { in_inline_scope() }).await;
+        assert!(inside && !gave_up);
+    }
+
+    // An untouched anonymous page is not in memory until written; a range is
+    // resident only if every page it overlaps is, also past one `mincore` batch.
+    #[test]
+    fn test_resident_reports_only_ranges_whose_pages_are_all_in_memory() {
+        let page = page_size();
+        let mut map = memmap2::MmapMut::map_anon(200 * page).unwrap();
+        map[150 * page] = 1;
+        map[199 * page] = 1;
+        assert!(resident(&map[150 * page..151 * page]));
+        assert!(resident(&map[150 * page + 100..150 * page + 200]));
+        assert!(!resident(&map[149 * page + 10..150 * page + 5]));
+        assert!(!resident(&map[150 * page..152 * page]));
+        assert!(!resident(&map[..]));
+        assert!(resident(&map[150 * page..150 * page]));
+        for i in 0..200 {
+            map[i * page] = 1;
+        }
+        assert!(resident(&map[..]));
+        assert!(resident(&map[10..]));
     }
 
     // What a read registers runs once it gives up; not when it ends without

@@ -13,13 +13,32 @@ jobs:
   test:
     name: Test
     runs-on: self-hosted
+    # Internal reference pattern shared by the file and commit-message gates.
+    # The section sign is written as an escape so this file does not match itself.
+    env:
+      INTERNAL_REFS: "\\b(general|perf|kv|json|dist|rel|quality)/[0-9]{3}|\\b(spec|concept) [0-9]{3}\\b|\u00a7"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+        with:
+          fetch-depth: 0
 
-      # The section sign is written as bytes so this file does not match itself.
       - name: No internal references or marker lines
         run: |
-          ! git grep -nE '\b(general|perf|kv|json|dist|rel|quality)/[0-9]{3}|\b(spec|concept) [0-9]{3}\b|^\s*(//[/!]?|#)\s*(-|=|\*|#|─){3,}\s*$|^\s*(//[/!]?|#)\s*(-|=|\*|─){2,}\s*[^-=*[:space:]].*\s(-|=|\*|─){2,}\s*$|'$'\xc2\xa7' -- . ':!CHANGELOG.md'
+          ! git grep -nE "$INTERNAL_REFS"'|^\s*(//[/!]?|#)\s*(-|=|\*|#|─){3,}\s*$|^\s*(//[/!]?|#)\s*(-|=|\*|─){2,}\s*[^-=*[:space:]].*\s(-|=|\*|─){2,}\s*$' -- . ':!CHANGELOG.md'
+
+      # Commits up to the baseline below predate this rule and history is
+      # not rewritten, so only later commits are checked.
+      - name: No internal references in commit messages
+        run: |
+          commits=$(git rev-list e924dc8a1295036b8f66431a92145cf45adfb805..HEAD)
+          fail=0
+          for c in $commits; do
+            if grep -qE "$INTERNAL_REFS" <<< "$(git log -1 --format=%B "$c")"; then
+              git log -1 --format='%H %s' "$c"
+              fail=1
+            fi
+          done
+          exit "$fail"
 
       # io_uring needs the runner VM, not a container (Docker's default
       # seccomp blocks it) - uname -r is the acceptance proof.

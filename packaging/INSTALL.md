@@ -23,7 +23,13 @@ sudo apt install ./target/debian/luradb_*.deb
 - The system user `luradb` is created (no login, no home directory).
 - `/etc/luradb/luradb.toml` is owned by `root:luradb`, mode `640` (contains the admin API key).
 - A random admin API key is generated (see below).
-- The systemd service is enabled and started.
+- The systemd service is enabled but not started, so you can review the config (bind address, data paths, admin API key) before LuraDB first runs and creates its data files. A notice at the end of the install says where the config lives and how to start.
+
+Start the service once the config is ready (being enabled, it also starts on the next boot):
+
+```sh
+sudo systemctl start luradb
+```
 
 ## Service status & logs
 
@@ -164,7 +170,7 @@ Log in again for the group membership to take effect.
 sudo apt reinstall ./target/debian/luradb_*.deb
 ```
 
-Updates the binary and systemd unit — even for the same package version, for which `apt install` would be a no-op. The conffile `/etc/luradb/luradb.toml` stays unchanged (standard dpkg behavior for conffiles), the existing admin API key is kept, and the service is restarted afterward.
+Updates the binary and systemd unit — even for the same package version, for which `apt install` would be a no-op. The conffile `/etc/luradb/luradb.toml` stays unchanged (standard dpkg behavior for conffiles), the existing admin API key is kept, and a running service is restarted afterward; a stopped service stays stopped.
 
 ## Uninstallation
 

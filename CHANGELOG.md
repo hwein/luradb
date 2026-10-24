@@ -27,6 +27,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Changed
 
+- The Debian package no longer starts the service on first install and prints where the config lives and how to start it; upgrades restart the service only if it is running.
 - Relational domains follow the `[rate_limit]` defaults instead of a fixed 1000 reads/500 writes per second.
 - Building the SHM snapshot of a domain larger than the data buffer no longer holds the whole domain in memory.
 - Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.

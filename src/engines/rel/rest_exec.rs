@@ -61,14 +61,25 @@ impl RelEngine {
 
     /// Charges one op against the domain's rate limiter. `write`: DML/DDL
     /// draw the write bucket, SELECT the read bucket (separate buckets).
-    /// `false` ⇒ the caller must not perform any execution I/O.
+    /// `false` ⇒ the caller must not perform any execution I/O. An inline
+    /// read that gives up gets its read token back.
     pub fn check_domain_budget(&self, domain: &str, write: bool) -> bool {
         let limiter = self.limiter_for(domain);
         if write {
             limiter.check_write()
+        } else if limiter.check_read() {
+            crate::core::coop::on_give_up(move || limiter.refund_read());
+            true
         } else {
-            limiter.check_read()
+            false
         }
+    }
+
+    /// Test-only: locks out the refill of the domain's read bucket and keeps
+    /// its tokens, so only reads and refunds change them.
+    #[cfg(test)]
+    pub fn lock_read_refill_for_test(&self, domain: &str) {
+        self.limiter_for(domain).read_bucket.lock_refill_for_test();
     }
 
     /// Test-only counterpart to `check_domain_budget`: drains and locks the

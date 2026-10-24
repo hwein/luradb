@@ -12,7 +12,7 @@
 //! Per-domain statistics are recorded in the `MetricsStore`.
 
 use crate::control::{ControlPlane, Engine};
-use crate::core::coop::YieldEvery;
+use crate::core::coop::{on_give_up, YieldEvery};
 use crate::core::events::Resume;
 use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
@@ -607,6 +607,17 @@ impl DomainStore {
         self.runtime.metrics_window.get_or_init(|| self.metrics.domain_window(&self.domain.name))
     }
 
+    /// Takes a read token; an inline read that gives up gets it back, so
+    /// that its run on the reader pool takes the only one.
+    fn check_read(&self) -> bool {
+        if !self.runtime.rate_limiter.check_read() {
+            return false;
+        }
+        let runtime = Arc::clone(&self.runtime);
+        on_give_up(move || runtime.rate_limiter.refund_read());
+        true
+    }
+
     fn validate_user_key(&self, key: &[u8]) -> Result<()> {
         anyhow::ensure!(!key.is_empty(), "400 Bad Request: Key must not be empty");
         anyhow::ensure!(
@@ -727,7 +738,7 @@ impl DomainStore {
     /// without registering a snapshot and goes through the read rate limiter.
     pub async fn get_with_stamp(&self, key: &[u8]) -> Result<(GetResult, u64, u64)> {
         self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
@@ -745,7 +756,7 @@ impl DomainStore {
     /// a miss) — the read still spends a rate-limit token on the domain path.
     pub async fn get_meta(&self, key: &[u8]) -> Result<Option<KeyMeta>> {
         self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
@@ -770,7 +781,7 @@ impl DomainStore {
 
     /// Returns all live user-keys whose raw form starts with `prefix`.
     pub async fn scan_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let full_prefix = self.prefixed_key(prefix);
@@ -794,7 +805,7 @@ impl DomainStore {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let full_prefix = self.prefixed_key(prefix);
@@ -814,7 +825,7 @@ impl DomainStore {
     /// as `scan_keys`, without materializing the stripped key strings; the
     /// scanned list is released key by key with yield points.
     pub async fn count_keys(&self, prefix: &[u8]) -> Result<u64> {
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let full_prefix = self.prefixed_key(prefix);
@@ -870,6 +881,13 @@ impl DomainStore {
     #[cfg(test)]
     pub fn drain_read_budget_for_test(&self) {
         self.runtime.rate_limiter.read_bucket.drain_for_test();
+    }
+
+    /// Test-only: locks out the refill of this domain's read bucket and keeps
+    /// its tokens, so only reads and refunds change them.
+    #[cfg(test)]
+    pub fn lock_read_refill_for_test(&self) {
+        self.runtime.rate_limiter.read_bucket.lock_refill_for_test();
     }
 
     /// Test-only: write-bucket counterpart of

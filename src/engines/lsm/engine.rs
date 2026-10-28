@@ -364,6 +364,9 @@ pub(crate) struct TestHooks {
     /// Parks `compact_level` between its manifest change in memory and its
     /// own save of the manifest.
     pub before_compaction_save: Option<Arc<TestHook>>,
+    /// Parks `flush_memtable` between its manifest change in memory and its
+    /// own save of the manifest.
+    pub before_flush_save: Option<Arc<TestHook>>,
 }
 
 /// LSM-Tree Storage Engine with MVCC and background maintenance.
@@ -1959,6 +1962,11 @@ impl LsmStorageEngine {
 
         // The bytes come back, so the non-mmap reader below needs no copy.
         let sstable_data = self.file_manager.write_sstable(file_id, sstable_data).await?;
+        // Before the manifest changes in memory, not just before its save: a
+        // compaction or GC cycle may save the shared manifest from then on,
+        // and a saved manifest must name only files whose names are on disk.
+        // Before the install, so a failure still hands the MemTable back.
+        crate::storage::sync_dirs(&[self.file_manager.dir()]).await?;
 
         let mut sstable = if self.engine_config.use_mmap {
             SSTableReader::open_mmap(&self.file_manager.file_path(file_id))?
@@ -1989,6 +1997,11 @@ impl LsmStorageEngine {
                 file_size,
                 max_timestamp,
             });
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.hooks.before_flush_save {
+            hook.pause().await;
         }
 
         let snap = self.manifest.read().clone();
@@ -7000,7 +7013,7 @@ mod tests {
             engine.persist_all().await.unwrap();
             assert_eq!(
                 test_trace::steps(dir.path()),
-                ["save sst/MANIFEST", "sync vlog/vlog.log", "sync vlog/vlog.log.2", "sync sst", "sync vlog"]
+                ["sync sst", "save sst/MANIFEST", "sync vlog/vlog.log", "sync vlog/vlog.log.2", "sync sst", "sync vlog"]
             );
 
             for unsyncable in [gen2, dir.path().join("vlog")] {
@@ -7027,7 +7040,7 @@ mod tests {
             engine.shutdown().await;
             assert_eq!(
                 test_trace::steps(dir.path()),
-                ["save sst/MANIFEST", "sync vlog/vlog.log", "sync sst", "sync vlog", "truncate wal.log"]
+                ["sync sst", "save sst/MANIFEST", "sync vlog/vlog.log", "sync sst", "sync vlog", "truncate wal.log"]
             );
             drop(engine);
 
@@ -7068,14 +7081,14 @@ mod tests {
             test_fault::allow_syncs_of(&vlog_path);
             assert!(started.is_err(), "a failed sync stops the start");
             assert_eq!(std::fs::read(&wal_path).unwrap(), wal, "the WAL stays as it was");
-            assert_eq!(test_trace::steps(dir.path()), ["save sst/MANIFEST"]);
+            assert_eq!(test_trace::steps(dir.path()), ["sync sst", "save sst/MANIFEST"]);
             drop(started);
 
             test_trace::watch(dir.path());
             let engine = engine_split(dir.path()).await.unwrap();
             assert_eq!(
                 test_trace::steps(dir.path()),
-                ["save sst/MANIFEST", "sync vlog/vlog.log", "sync sst", "sync vlog", "truncate wal.log"]
+                ["sync sst", "save sst/MANIFEST", "sync vlog/vlog.log", "sync sst", "sync vlog", "truncate wal.log"]
             );
             assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
         })
@@ -7117,6 +7130,7 @@ mod tests {
             assert_eq!(
                 steps[at_hook.len()..],
                 [
+                    "sync sst".to_string(),
                     "save sst/MANIFEST".to_string(),
                     "sync sst".to_string(),
                     format!("delete sst/sstable_{old_table:06}.sst"),
@@ -7235,6 +7249,7 @@ mod tests {
             assert_eq!(
                 steps[at_hook.len()..],
                 [
+                    "sync sst".to_string(),
                     "save sst/MANIFEST".to_string(),
                     "sync sst".to_string(),
                     format!("delete sst/sstable_{first:06}.sst"),
@@ -7282,6 +7297,205 @@ mod tests {
             let engine = engine_split(dir.path()).await.unwrap();
             assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
             assert_eq!(engine.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+        })
+    }
+
+    /// File ids of the level-0 tables the manifest on disk below `dir` names.
+    async fn saved_level0(dir: &Path) -> Vec<u64> {
+        let saved = ManifestManager::new(dir.join("sst")).load().await.unwrap();
+        saved.get_level(0).iter().map(|m| m.file_id).collect()
+    }
+
+    // A flush syncs the SSTable directory before it adds its table to the
+    // shared manifest, so a compaction that saves that manifest before the
+    // flush does comes after the sync.
+    #[test]
+    fn test_flush_syncs_its_directory_before_a_compaction_can_save_its_table() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut engine = engine_split(dir.path()).await.unwrap();
+            engine.put(b"a", b"1").await.unwrap();
+            let first = flush_new_table(&engine).await;
+            engine.put(b"b", b"2").await.unwrap();
+            let second = flush_new_table(&engine).await;
+
+            let compaction_hook = Arc::new(TestHook::default());
+            let flush_hook = Arc::new(TestHook::default());
+            engine.hooks.before_compaction_save = Some(Arc::clone(&compaction_hook));
+            engine.hooks.before_flush_save = Some(Arc::clone(&flush_hook));
+            let engine = Arc::new(engine);
+            let compactor = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.compact_level(0).await })
+            };
+            compaction_hook.reached.notified().await;
+
+            engine.put(b"c", b"3").await.unwrap();
+            engine.freeze_active_memtable();
+            test_trace::watch(dir.path());
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            flush_hook.reached.notified().await;
+            assert_eq!(test_trace::steps(dir.path()), ["sync sst"]);
+
+            // Saves the manifest that already names the flushed table.
+            compaction_hook.release.notify_one();
+            compactor.await.unwrap().unwrap();
+            flush_hook.release.notify_one();
+            let third = flusher.await.unwrap().unwrap().unwrap();
+
+            assert_eq!(
+                test_trace::steps(dir.path()),
+                [
+                    "sync sst".to_string(),
+                    "save sst/MANIFEST".to_string(),
+                    "sync sst".to_string(),
+                    format!("delete sst/sstable_{first:06}.sst"),
+                    format!("delete sst/sstable_{second:06}.sst"),
+                ]
+            );
+            assert_eq!(saved_level0(dir.path()).await, vec![third]);
+            for (key, value) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+                assert_eq!(engine.get(key).await.unwrap(), Some(value.to_vec()));
+            }
+        })
+    }
+
+    // A flush syncs the SSTable directory before it adds its table to the
+    // shared manifest, so a GC cycle that saves that manifest before the
+    // flush does comes after the sync.
+    #[test]
+    fn test_flush_syncs_its_directory_before_a_gc_cycle_can_save_its_table() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut engine = engine_split(dir.path()).await.unwrap();
+            engine.put(b"a", &vlog_value(b'a')).await.unwrap();
+            let old_table = flush_new_table(&engine).await;
+
+            let flush_hook = Arc::new(TestHook::default());
+            engine.hooks.before_flush_save = Some(Arc::clone(&flush_hook));
+            let engine = Arc::new(engine);
+            let gc_hook = Arc::new(TestHook::default());
+            let mut janitor = engine.build_janitor(gc_always());
+            janitor.set_before_manifest_save_hook(Arc::clone(&gc_hook));
+            let janitor = Arc::new(janitor);
+            let gc = {
+                let janitor = Arc::clone(&janitor);
+                compio::runtime::spawn(async move { janitor.run_gc().await })
+            };
+            gc_hook.reached.notified().await;
+
+            engine.put(b"b", &vlog_value(b'b')).await.unwrap();
+            engine.freeze_active_memtable();
+            test_trace::watch(dir.path());
+            let flusher = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.flush_memtable().await })
+            };
+            flush_hook.reached.notified().await;
+            assert_eq!(test_trace::steps(dir.path()), ["sync sst"]);
+
+            // Saves the manifest that already names the flushed table.
+            gc_hook.release.notify_one();
+            assert!(gc.await.unwrap().unwrap().ran);
+            flush_hook.release.notify_one();
+            let new_table = flusher.await.unwrap().unwrap().unwrap();
+
+            assert_eq!(
+                test_trace::steps(dir.path()),
+                [
+                    "sync sst".to_string(),
+                    "save sst/MANIFEST".to_string(),
+                    "sync sst".to_string(),
+                    format!("delete sst/sstable_{old_table:06}.sst"),
+                    "delete vlog/vlog.log".to_string(),
+                ]
+            );
+            assert!(saved_level0(dir.path()).await.contains(&new_table));
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(vlog_value(b'b')));
+        })
+    }
+
+    // A flush whose SSTable directory does not sync fails before the
+    // manifest names its table and hands its MemTable back; once the
+    // directory syncs again, the next flush succeeds.
+    #[test]
+    fn test_flush_with_an_unsyncable_directory_hands_its_memtable_back() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sst = dir.path().join("sst");
+            let manifest_path = sst.join("MANIFEST");
+            let engine = engine_split(dir.path()).await.unwrap();
+            engine.put(b"a", &vlog_value(b'a')).await.unwrap();
+            let first = flush_new_table(&engine).await;
+            let manifest = std::fs::read(&manifest_path).unwrap();
+
+            engine.put(b"b", &vlog_value(b'b')).await.unwrap();
+            engine.freeze_active_memtable();
+            test_fault::fail_syncs_of(&sst);
+            let flushed = engine.flush_memtable().await;
+            test_fault::allow_syncs_of(&sst);
+
+            assert!(flushed.is_err());
+            let version = engine.version();
+            assert_eq!(version.immutables.len(), 1, "the MemTable is back among the immutables");
+            assert!(version.flushing.is_empty());
+            assert_eq!(version.levels[0].len(), 1, "L0 holds only the earlier table");
+            let level0: Vec<u64> = engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
+            assert_eq!(level0, vec![first], "the manifest in memory is unchanged");
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest, "the manifest on disk is unchanged");
+
+            let second = engine.flush_memtable().await.unwrap().unwrap();
+            assert!(engine.version().immutables.is_empty());
+            assert_eq!(saved_level0(dir.path()).await, vec![first, second]);
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(vlog_value(b'b')));
+            drop(engine); // crash
+
+            let engine = engine_split(dir.path()).await.unwrap();
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(vlog_value(b'b')));
+        })
+    }
+
+    // A flush leaves the vLog unsynced: a crash after it saved its manifest
+    // that loses the vLog bytes its table points to loses no value, since the
+    // replay of the WAL appends them again at the same offsets; a compaction
+    // over both tables and another start keep them readable.
+    #[test]
+    fn test_values_survive_losing_the_vlog_bytes_a_flushed_table_points_to() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog_path = dir.path().join("vlog").join("vlog.log");
+            let keys: [&[u8]; 3] = [b"a", b"b", b"c"];
+            let engine = engine_split(dir.path()).await.unwrap();
+            let len_before = std::fs::metadata(&vlog_path).unwrap().len();
+            for key in keys {
+                engine.put(key, &vlog_value(key[0])).await.unwrap();
+            }
+            flush_new_table(&engine).await;
+            assert_eq!(saved_level0(dir.path()).await.len(), 1);
+            drop(engine); // crash: the WAL keeps every value
+            std::fs::OpenOptions::new().write(true).open(&vlog_path).unwrap().set_len(len_before).unwrap();
+
+            let engine = engine_split(dir.path()).await.unwrap();
+            for key in keys {
+                assert_eq!(engine.get(key).await.unwrap(), Some(vlog_value(key[0])));
+            }
+            engine.compact_level(0).await.unwrap();
+            assert!(engine.manifest.read().get_level(0).is_empty(), "the compaction merged both tables");
+            for key in keys {
+                assert_eq!(engine.get(key).await.unwrap(), Some(vlog_value(key[0])));
+            }
+            drop(engine); // crash
+
+            let engine = engine_split(dir.path()).await.unwrap();
+            for key in keys {
+                assert_eq!(engine.get(key).await.unwrap(), Some(vlog_value(key[0])));
+            }
         })
     }
 }

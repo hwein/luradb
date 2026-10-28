@@ -92,6 +92,7 @@ All notable changes to LuraDB are documented in this file.
 - `--migrate-shards` stops instead of skipping JSON or relational data it cannot find at the configured paths.
 - JSON search no longer returns documents that stopped matching the filter while the search ran; results and `total` come from one consistent state.
 - The value log, new data files and their directories are synced before the write-ahead log is cleared at start and stop and before compaction or value-log cleanup delete old files, so a power loss loses no confirmed write.
+- A flush syncs its directory before the manifest names the new data file, so a power loss right after a flush no longer prevents the next start.
 
 ### Security
 

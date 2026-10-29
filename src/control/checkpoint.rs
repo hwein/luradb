@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A log this long is checkpointed. It bounds what a restart after a crash
-/// reads into memory: about 6.6 MiB per MiB of log with small records.
+/// A log this long is checkpointed. It bounds how much log a restart after a
+/// crash reads.
 pub const WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How often each log's length is checked.

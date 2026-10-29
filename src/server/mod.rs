@@ -695,6 +695,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    /// The write-ahead log at `path` holds its header and no record.
+    fn holds_only_its_header(path: impl AsRef<Path>) -> bool {
+        let log = std::fs::read(path).unwrap();
+        log.len() as u64 == crate::core::wal::WAL_HEADER_LEN && log.starts_with(&crate::core::wal::WAL_MAGIC)
+    }
+
     #[test]
     fn frontend_workers_auto_and_explicit() {
         assert_eq!(frontend_workers(0, 32), 4);
@@ -1429,10 +1435,9 @@ mod tests {
         server.shutdown().unwrap();
         test_fault::allow_writes_in(&unwritable);
 
-        let magic = crate::core::wal::WAL_MAGIC;
-        assert!(std::fs::read(&cfg.json.wal_path).unwrap().len() > magic.len(), "the JSON log stays");
-        assert_eq!(std::fs::read(&cfg.storage.wal_path).unwrap(), magic, "the key-value log is cut back");
-        assert_eq!(std::fs::read(&cfg.rel.wal_path).unwrap(), magic, "the relational log is cut back");
+        assert!(!holds_only_its_header(&cfg.json.wal_path), "the JSON log stays");
+        assert!(holds_only_its_header(&cfg.storage.wal_path), "the key-value log is cut back");
+        assert!(holds_only_its_header(&cfg.rel.wal_path), "the relational log is cut back");
         let events = test_hook::recorded(&cfg.storage.system_dir);
         assert_eq!(events.iter().filter(|e| *e == "hub shutdown").count(), 1, "{events:?}");
 
@@ -1479,10 +1484,9 @@ mod tests {
         test_fault::fail_syncs_of(&unsyncable);
         server.shutdown().unwrap();
 
-        let magic = crate::core::wal::WAL_MAGIC;
         assert_eq!(std::fs::read(&cfg.json.wal_path).unwrap(), json_log, "the JSON log stays as it was");
-        assert_eq!(std::fs::read(&cfg.storage.wal_path).unwrap(), magic, "the key-value log is cut back");
-        assert_eq!(std::fs::read(&cfg.rel.wal_path).unwrap(), magic, "the relational log is cut back");
+        assert!(holds_only_its_header(&cfg.storage.wal_path), "the key-value log is cut back");
+        assert!(holds_only_its_header(&cfg.rel.wal_path), "the relational log is cut back");
 
         let started = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml"));
         test_fault::allow_syncs_of(&unsyncable);
@@ -1543,12 +1547,12 @@ mod tests {
                 }
             });
             for wal in &wals {
-                let len = std::fs::metadata(wal).unwrap().len() as usize;
-                assert!(len > crate::core::wal::WAL_MAGIC.len(), "io_engine {io_engine}: {wal} holds no write");
+                let len = std::fs::metadata(wal).unwrap().len();
+                assert!(len > crate::core::wal::WAL_HEADER_LEN, "io_engine {io_engine}: {wal} holds no write");
             }
             server.shutdown().unwrap();
             for wal in &wals {
-                assert_eq!(std::fs::read(wal).unwrap(), crate::core::wal::WAL_MAGIC, "io_engine {io_engine}: {wal}");
+                assert!(holds_only_its_header(wal), "io_engine {io_engine}: {wal}");
             }
         }
     }

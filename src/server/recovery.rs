@@ -1,12 +1,12 @@
 //! Recovery of the sharded engines: each engine's write-ahead log is read
-//! once, before the shards start, and every record goes to the instance of
-//! the data shard that owns its key. The log is truncated only after every
-//! instance has flushed what it was handed.
+//! once, entry by entry, before the shards start, and every record goes to
+//! the instance of the data shard that owns its key. The log is truncated
+//! only after every instance has flushed what it was handed.
 
 use super::layout;
 use crate::auth::{PREFIX_PERM, PREFIX_USER};
 use crate::control::slots;
-use crate::core::wal::{self, WalEntry, WriteAheadLog};
+use crate::core::wal::{WalEntry, WriteAheadLog};
 use crate::engines::lsm::engine::{LsmEngineOptions, LsmStorageEngine, Recovery};
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::ManifestManager;
@@ -24,25 +24,31 @@ pub(crate) struct EngineFiles {
 
 /// Opens the `shards` instances of one engine, all on the log `wal` hands
 /// out a handle to, and gives each the records of `files.wal` whose keys its
-/// shard owns. Every instance has flushed its records when this returns; the
-/// log is left for the caller to truncate.
+/// shard owns and that its SSTables do not hold yet. Every instance has
+/// flushed its records when this returns; the log is left for the caller to
+/// truncate.
 pub(crate) async fn open_sharded(
     files: &EngineFiles,
     shards: u16,
     wal: impl Fn() -> WriteAheadLog,
     options: impl Fn() -> LsmEngineOptions,
 ) -> anyhow::Result<Vec<Arc<LsmStorageEngine>>> {
-    let recovered = wal::recover(&files.wal).await?;
-    let routed = route(recovered.entries, shards).with_context(|| format!("recover {}", files.wal.display()))?;
-    // Before the first append: new records continue the log's LSNs.
-    wal().set_lsn_start(recovered.max_lsn).await?;
-    let mut instances = Vec::with_capacity(routed.len());
-    for (shard, entries) in routed.into_iter().enumerate() {
-        let engine = open_instance(files, shard, Arc::new(wal()), options()).await?;
-        engine.apply_recovered(entries, recovered.max_lsn).await?;
-        instances.push(Arc::new(engine));
+    let mut instances = Vec::with_capacity(usize::from(shards));
+    for shard in 0..usize::from(shards) {
+        instances.push(open_instance(files, shard, Arc::new(wal()), options()).await?);
     }
-    Ok(instances)
+    let owner_of = |lsn: u64, entry: &WalEntry| {
+        owner(entry.key(), shards).ok_or_else(|| {
+            anyhow::anyhow!(
+                "record {lsn} holds the key '{}', which belongs to no domain",
+                String::from_utf8_lossy(entry.key())
+            )
+        })
+    };
+    LsmStorageEngine::replay_wal(&files.wal, &instances, owner_of)
+        .await
+        .with_context(|| format!("recover {}", files.wal.display()))?;
+    Ok(instances.into_iter().map(Arc::new).collect())
 }
 
 /// The instance of data shard `shard` on `files`, recovered by the caller.
@@ -65,22 +71,6 @@ pub(crate) async fn open_instance(
     LsmStorageEngine::new(wal, files.wal.clone(), vlog, vlog_path, file_manager, manifest_manager, options).await
 }
 
-/// Splits the records of one log among the data shards; a key that belongs
-/// to no domain stops the start.
-pub(super) fn route(entries: Vec<(u64, WalEntry)>, shards: u16) -> anyhow::Result<Vec<Vec<(u64, WalEntry)>>> {
-    let mut routed: Vec<Vec<(u64, WalEntry)>> = (0..shards).map(|_| Vec::new()).collect();
-    for (lsn, entry) in entries {
-        let Some(shard) = owner(entry.key(), shards) else {
-            anyhow::bail!(
-                "record {lsn} holds the key '{}', which belongs to no domain",
-                String::from_utf8_lossy(entry.key())
-            );
-        };
-        routed[shard].push((lsn, entry));
-    }
-    Ok(routed)
-}
-
 /// Auth records in an engine's log predate the system store: they go to
 /// shard 0, whose key-value engine hands them over to it.
 pub(super) fn owner(key: &[u8], shards: u16) -> Option<usize> {
@@ -96,7 +86,8 @@ mod tests {
     use crate::control::slots::domain_name_for_shard;
     use crate::core::storage_thread::{TestHub, WalTarget};
     use crate::engines::lsm::domain::fnv64;
-    use crate::engines::lsm::engine::BatchOp;
+    use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig};
+    use crate::engines::lsm::reader::GetResult;
     use crate::engines::lsm::hlc::HLCTimestamp;
     use crate::engines::StorageEngine;
 
@@ -245,6 +236,161 @@ mod tests {
         }
         found.sort();
         found
+    }
+
+    /// The SSTable files of shard `shard`, by name.
+    fn tables(files: &EngineFiles, shard: usize) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(layout::shard_dir(&files.sstables, shard))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".sst"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn vlog_len(files: &EngineFiles, shard: usize) -> u64 {
+        std::fs::metadata(layout::shard_file(&files.vlog, shard)).unwrap().len()
+    }
+
+    /// The newest version of each of `keys` on the instance of its shard.
+    async fn versions(shards: &[Arc<LsmStorageEngine>], keys: &[(usize, Vec<u8>)]) -> Vec<(GetResult, u64, u64)> {
+        let mut found = Vec::new();
+        for (shard, key) in keys {
+            found.push(shards[*shard].get_latest_with_stamp(key).await.unwrap());
+        }
+        found
+    }
+
+    // Each instance replays only the records after its flushed LSN: every
+    // confirmed write is back with its stamp, deleted keys stay gone, the
+    // value log grows only by the values after the flushes, and an instance
+    // with nothing after its flush writes no table.
+    #[test]
+    fn each_instance_replays_only_the_records_after_its_flushed_lsn() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = files(dir.path());
+            let domains = [domain_name_for_shard(0, 2, 3), domain_name_for_shard(1, 2, 3)];
+            let hub = TestHub::start(&[(WalTarget::Kv, &files.wal)]);
+            let shards = open_sharded(&files, 2, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+            let large = "clé ✓".repeat(400);
+            let mut keys = Vec::new();
+            for round in 0..2 {
+                for (shard, domain) in domains.iter().enumerate() {
+                    let engine = &shards[shard];
+                    let key = |name: &str| data_key(domain, &format!("{name}-{round}"));
+                    engine.put(&key("small"), "clé".as_bytes()).await.unwrap();
+                    engine.put(&key("large"), large.as_bytes()).await.unwrap();
+                    engine.set_null(&key("nulled")).await.unwrap();
+                    engine.put(&key("gone"), b"v").await.unwrap();
+                    engine.delete(&key("gone")).await.unwrap();
+                    let batch = vec![
+                        BatchOp::Put { key: key("batch"), value: b"1".to_vec() },
+                        BatchOp::Delete { key: key("small") },
+                    ];
+                    engine.write_batch(batch).await.unwrap();
+                    keys.extend(["small", "large", "nulled", "gone", "batch"].map(|name| (shard, key(name))));
+                    engine.flush_all_memtables().await.unwrap();
+                }
+            }
+            let before_rest = vlog_len(&files, 0);
+            let rest = data_key(&domains[0], "rest");
+            shards[0].put(&rest, large.as_bytes()).await.unwrap();
+            keys.push((0, rest));
+            let rest_bytes = vlog_len(&files, 0) - before_rest;
+            let confirmed = versions(&shards, &keys).await;
+            let vlogs = [vlog_len(&files, 0), vlog_len(&files, 1)];
+            let flushed = [tables(&files, 0), tables(&files, 1)];
+            drop((shards, hub)); // crash
+
+            let hub = TestHub::start(&[(WalTarget::Kv, &files.wal)]);
+            let shards = open_sharded(&files, 2, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+            assert_eq!(versions(&shards, &keys).await, confirmed);
+            for ((_, key), (found, _, _)) in keys.iter().zip(versions(&shards, &keys).await) {
+                let deleted = [&b"gone-0"[..], b"gone-1", b"small-0", b"small-1"].iter().any(|end| key.ends_with(end));
+                assert_eq!(found == GetResult::Absent, deleted, "{}", String::from_utf8_lossy(key));
+            }
+            assert_eq!(vlog_len(&files, 0), vlogs[0] + rest_bytes, "the replay appended the value after the flushes");
+            assert_eq!(vlog_len(&files, 1), vlogs[1], "nothing to replay on shard 1");
+            assert_eq!(tables(&files, 0).len(), flushed[0].len() + 1);
+            assert_eq!(tables(&files, 1), flushed[1]);
+        })
+    }
+
+    /// Copies the files below `from` to `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        for (relative, bytes) in tree(from) {
+            let target = to.join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, bytes).unwrap();
+        }
+    }
+
+    // A log many MemTables long replays with bounded memory: each instance
+    // flushes whenever its MemTable reaches the threshold, under the LSN of
+    // the record read last, and ends with the same versions, stamps, LSN and
+    // clock as a replay that flushes only at its end.
+    #[test]
+    fn a_long_log_replays_through_memtables_of_the_threshold() {
+        const THRESHOLD: usize = 4096;
+        const VALUE: usize = 100;
+        crate::core::engine_runtime::block_on(async {
+            let base = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(base.path().join("streamed")).unwrap();
+            let streamed = files(&base.path().join("streamed"));
+            let domains = [domain_name_for_shard(0, 2, 3), domain_name_for_shard(1, 2, 3)];
+            let mut keys = Vec::new();
+            {
+                let hub = TestHub::start(&[(WalTarget::Kv, &streamed.wal)]);
+                let shards =
+                    open_sharded(&streamed, 2, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+                for i in 0..300 {
+                    for (shard, domain) in domains.iter().enumerate() {
+                        let key = data_key(domain, &format!("k{i:03}"));
+                        let value = if i % 50 == 0 { "clé ✓".repeat(400) } else { format!("{i:0>VALUE$}") };
+                        shards[shard].put(&key, value.as_bytes()).await.unwrap();
+                        keys.push((shard, key));
+                    }
+                }
+            } // crash
+            let whole = files(&base.path().join("whole"));
+            copy_tree(&base.path().join("streamed"), &base.path().join("whole"));
+            assert!(std::fs::metadata(&streamed.wal).unwrap().len() > 2 * 8 * THRESHOLD as u64);
+
+            let with_threshold = |threshold| {
+                move || LsmEngineOptions {
+                    engine: LsmEngineConfig { memtable_size_threshold: threshold, ..LsmEngineConfig::default() },
+                    ..LsmEngineOptions::default()
+                }
+            };
+            let hub = TestHub::start(&[(WalTarget::Kv, &streamed.wal)]);
+            let shards = open_sharded(&streamed, 2, || hub.wal(WalTarget::Kv), with_threshold(THRESHOLD)).await.unwrap();
+            let whole_hub = TestHub::start(&[(WalTarget::Kv, &whole.wal)]);
+            let wholes =
+                open_sharded(&whole, 2, || whole_hub.wal(WalTarget::Kv), with_threshold(usize::MAX)).await.unwrap();
+
+            let max_lsn = shards[0].last_applied_lsn();
+            assert_eq!(max_lsn, 600);
+            let largest = keys[0].1.len() + 8 + VALUE;
+            for shard in 0..2 {
+                let instance = &shards[shard];
+                let peak = instance.replay_peak.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(peak <= THRESHOLD + largest, "shard {shard}: {peak} bytes");
+                let watermarks = instance.replay_watermarks.lock().clone();
+                assert!(watermarks.len() >= 8, "shard {shard}: {watermarks:?}");
+                assert!(watermarks.windows(2).all(|pair| pair[0] < pair[1]), "shard {shard}: {watermarks:?}");
+                // The record read last before each flush is one of the other shard.
+                assert!(watermarks.iter().all(|lsn| *lsn < max_lsn && lsn % 2 == shard as u64), "{watermarks:?}");
+                assert_eq!(tables(&streamed, shard).len(), watermarks.len() + 1);
+                assert_eq!(instance.flushed_lsn(), max_lsn);
+                assert!(wholes[shard].replay_watermarks.lock().is_empty());
+                assert_eq!(tables(&whole, shard).len(), 1);
+                assert_eq!(instance.last_applied_lsn(), wholes[shard].last_applied_lsn());
+                assert_eq!(instance.hlc().peek(), wholes[shard].hlc().peek());
+            }
+            assert_eq!(versions(&shards, &keys).await, versions(&wholes, &keys).await);
+        })
     }
 
     // One shard: recovering through the shared log writes the same value log

@@ -292,8 +292,8 @@ pub enum ShardCommand {
     /// answers with a sample of the shard's metrics, taken while its writes
     /// are held back.
     Sample { drained: oneshot::Sender<()>, sample: oneshot::Receiver<()>, reply: oneshot::Sender<MetricsSample> },
-    /// Like `Confirm`, but counts a checkpoint on the instance of `engine`
-    /// while its writes are held back and answers once `release` fires.
+    /// Like `Confirm` for the instance of `engine`: holds its writes back
+    /// and answers once `release` fires.
     HoldForCheckpoint {
         engine: Engine,
         drained: oneshot::Sender<()>,
@@ -388,7 +388,7 @@ pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedRecei
             }
             ShardCommand::HoldForCheckpoint { engine, drained, release, reply } => {
                 if let Some(instance) = owners.instance(engine) {
-                    let hold = instance.hold_for_checkpoint().await;
+                    let hold = instance.drain_writes().await;
                     let _ = drained.send(());
                     let _ = release.await;
                     drop(hold);
@@ -593,9 +593,9 @@ impl ControlPlane {
     }
 
     /// Cuts `engine`'s write-ahead log `wal` back to the records after a mark
-    /// taken while every data shard holds the engine's writes back and has
-    /// counted a checkpoint, once every shard has persisted its instance. A
-    /// shard that fails or does not answer leaves the log whole.
+    /// taken while every data shard holds the engine's writes back, once
+    /// every shard has persisted its instance. A shard that fails or does
+    /// not answer leaves the log whole.
     pub async fn checkpoint(&self, engine: Engine, wal: &crate::core::wal::WriteAheadLog) -> anyhow::Result<()> {
         let (mark, _) = self
             .held_round(
@@ -2095,8 +2095,11 @@ mod tests {
                         assert_eq!(checkpoints.run().await, []);
                         ticks += 1;
                         assert!(wal_len() < LIMIT);
-                        let recovered = crate::core::wal::recover(s.wal_path()).await.unwrap();
-                        assert!(recovered.entries.iter().all(|(lsn, _)| *lsn > head));
+                        let mut log = crate::core::wal::recover(s.wal_path()).await.unwrap();
+                        while let Some(entry) = log.next().await {
+                            assert!(entry.unwrap().0 > head);
+                        }
+                        assert!(log.max_lsn() >= head, "the header starts at the cut");
                     }
                 }
                 round += 1;
@@ -2114,10 +2117,11 @@ mod tests {
             keys.push((1, during.clone()));
             s.hold_persists[1].send_replace(false);
             assert_eq!(tick.await.unwrap(), []);
-            let recovered = crate::core::wal::recover(s.wal_path()).await.unwrap();
-            assert_eq!(recovered.entries.len(), 1);
-            assert!(recovered.entries[0].0 > head);
-            assert_eq!(recovered.entries[0].1.key(), during);
+            let mut log = crate::core::wal::recover(s.wal_path()).await.unwrap();
+            let (lsn, entry) = log.next().await.unwrap().unwrap();
+            assert!(lsn > head);
+            assert_eq!(entry.key(), during);
+            assert!(log.next().await.is_none());
 
             let confirmed = reads(&s.engines, &keys).await;
             let (engines, _hub, _dir) = s.crash().await;
@@ -2141,9 +2145,9 @@ mod tests {
             let engine = &s.engines[0];
             let active = Arc::clone(&engine.version().active_vlog);
             let full = Arc::new(crate::storage::vlog::VLog::new("/dev/full").await.unwrap());
-            engine.install(|v| v.with_active_vlog(full));
+            engine.install(|v| v.with_active_vlog(full, engine.last_applied_lsn()));
             assert!(engine.put(&failed, large.as_bytes()).await.is_err());
-            engine.install(|v| v.with_active_vlog(active));
+            engine.install(|v| v.with_active_vlog(active, engine.last_applied_lsn()));
             engine.put(&kept, large.as_bytes()).await.unwrap();
             assert_eq!(s.checkpoints(1).run().await, []);
 
@@ -2167,7 +2171,7 @@ mod tests {
                 }
             }
             assert_eq!(s.checkpoints(1).run().await, []);
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::WAL_MAGIC);
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::wal_header(s.engines[0].wal_head_lsn().await.unwrap()));
             let config = crate::engines::lsm::janitor::JanitorConfig {
                 check_interval_secs: 3600,
                 dead_bytes_threshold: 0.0,
@@ -2206,7 +2210,7 @@ mod tests {
             );
             assert_eq!(std::fs::read(s.wal_path()).unwrap(), log);
             assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 1 }]);
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::WAL_MAGIC);
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::wal_header(s.engines[0].wal_head_lsn().await.unwrap()));
         })
     }
 
@@ -2237,7 +2241,7 @@ mod tests {
             std::fs::remove_dir(&blocked).unwrap();
 
             assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 1 }]);
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::WAL_MAGIC);
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::wal_header(s.engines[0].wal_head_lsn().await.unwrap()));
 
             let (engines, _hub, _dir) = s.crash().await;
             for (k, key) in &keys {

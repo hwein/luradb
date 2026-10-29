@@ -231,6 +231,38 @@ mod tests {
         })
     }
 
+    // Auth records written over several flushes are all there after a crash;
+    // the start replays only the one after the last flush, so the value log
+    // does not take the flushed values a second time.
+    #[test]
+    fn a_crash_after_flushes_replays_only_the_records_after_them() {
+        crate::core::engine_runtime::block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sys");
+            let (sys, hub) = open_on(&dir, true).await;
+            let user = |i: usize| format!("{PREFIX_USER}user-{i}").into_bytes();
+            let record = |i: usize| format!("record {i} of zoé ✓ ").repeat(80).into_bytes();
+            for round in 0..3 {
+                for i in round * 10..(round + 1) * 10 {
+                    sys.put(&user(i), &record(i)).await.unwrap();
+                }
+                sys.flush_all_memtables().await.unwrap();
+            }
+            sys.put(&user(30), b"after the flushes").await.unwrap();
+            sys.stop_background_tasks().await;
+            let vlog = std::fs::metadata(dir.join(VLOG_FILE)).unwrap().len();
+            drop((sys, hub)); // crash
+
+            let (sys, _hub) = open_on(&dir, true).await;
+            for i in 0..30 {
+                assert_eq!(sys.get(&user(i)).await.unwrap(), Some(record(i)));
+            }
+            assert_eq!(sys.get(&user(30)).await.unwrap(), Some(b"after the flushes".to_vec()));
+            assert_eq!(std::fs::metadata(dir.join(VLOG_FILE)).unwrap().len(), vlog);
+            sys.shutdown().await;
+        })
+    }
+
     // Auth records written before and after a checkpoint tick over a log
     // past the limit are all there after a crash; the checkpoint left only
     // the later ones in the log.
@@ -255,7 +287,7 @@ mod tests {
             }
             assert!(std::fs::metadata(dir.join(WAL_FILE)).unwrap().len() > LIMIT);
             assert_eq!(checkpoints.run().await, []);
-            assert_eq!(std::fs::read(dir.join(WAL_FILE)).unwrap(), crate::core::wal::WAL_MAGIC);
+            assert_eq!(std::fs::read(dir.join(WAL_FILE)).unwrap(), crate::core::wal::wal_header(sys.wal_head_lsn().await.unwrap()));
             sys.put(&user(200), b"after the checkpoint").await.unwrap();
             sys.stop_background_tasks().await;
             drop((checkpoints, sys, hub));

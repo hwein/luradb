@@ -68,11 +68,13 @@ impl Version {
         self.levels.get(level).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// The active MemTable joins the immutables (unless it is empty) and a
-    /// fresh one takes its place.
-    pub(crate) fn rotated(&self) -> Self {
+    /// The active MemTable joins the immutables (unless it is empty) with
+    /// `watermark`, the LSN up to which the instance has applied all of its
+    /// records, and a fresh one takes its place.
+    pub(crate) fn rotated(&self, watermark: u64) -> Self {
         let mut next = self.clone();
         if !self.memtable.is_empty() {
+            self.memtable.set_lsn_watermark(watermark);
             next.immutables.push(Arc::clone(&self.memtable));
         }
         next.memtable = Arc::new(MemTable::new());
@@ -81,9 +83,10 @@ impl Version {
 
     /// Makes `vlog` the append target together with a fresh MemTable: every
     /// pointer into `vlog` then lands in a MemTable that only versions knowing
-    /// `vlog` hold, never in one an older version holds as active.
-    pub(crate) fn with_active_vlog(&self, vlog: Arc<VLog>) -> Self {
-        let mut next = self.rotated();
+    /// `vlog` hold, never in one an older version holds as active. The old
+    /// one rotates out with `watermark`, as in [`Self::rotated`].
+    pub(crate) fn with_active_vlog(&self, vlog: Arc<VLog>, watermark: u64) -> Self {
+        let mut next = self.rotated(watermark);
         Arc::make_mut(&mut next.vlog).insert(vlog.id(), Arc::clone(&vlog));
         next.active_vlog = vlog;
         next

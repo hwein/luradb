@@ -98,7 +98,7 @@ sudo systemctl start luradb
 - It needs free disk space for a second copy of the data next to the first: the new layout is built in a `migrate_<timestamp>/` directory inside each data directory and only then moved into place. The old layout is removed once the move has finished.
 - Leave `shards = 0` in `[multicore]`, or set it to the new count; any other explicit value refuses the start.
 - If the tool stops while it moves the new layout into place, the service refuses to start with "shard migration incomplete — rerun the migration tool"; running the same command again finishes the change. A tool stopped earlier leaves the old layout untouched.
-- Backups are not affected: an archive restores into any shard count. Write-ahead-log positions (`lsn_cut` in a backup manifest) restart at 1 after the change.
+- Backups are not affected: an archive restores into any shard count. Write-ahead-log positions (`lsn_cut` in a backup manifest) go on across the change.
 
 ## Enabling HTTPS (quickstart)
 
@@ -171,6 +171,8 @@ sudo apt reinstall ./target/debian/luradb_*.deb
 ```
 
 Updates the binary and systemd unit — even for the same package version, for which `apt install` would be a no-op. The conffile `/etc/luradb/luradb.toml` stays unchanged (standard dpkg behavior for conffiles), the existing admin API key is kept, and a running service is restarted afterward; a stopped service stays stopped.
+
+The write-ahead logs of this version carry a header that records where their sequence numbers start. Once this version has started on a data directory, an earlier version refuses to start on it, with an error about an invalid write-ahead log entry, and changes no data. To go back to an earlier version, either restore a backup into it, or stop this version cleanly, which leaves each write-ahead log with its 16-byte header alone, and delete the write-ahead log files (`wal_path` of `[storage]`, `[json]` and `[rel]`, and `wal` in `system_dir`) before the earlier version starts. The next update to this version then replays the logs the earlier version wrote once in full.
 
 ## Uninstallation
 

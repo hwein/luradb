@@ -91,14 +91,14 @@ async fn migrate(config: &LuraConfig, shards: u16) -> anyhow::Result<()> {
                 std::env::current_dir()?.join(&files.sstables).display()
             );
         }
-        let recovered = wal::recover(&files.wal).await?;
+        let unflushed = wal::recover(&files.wal).await?.next().await.transpose()?.is_some();
         let way = if enabled {
             "start the server once to flush, then shut it down".to_string()
         } else {
             format!("enable the {} engine, start the server once to flush, shut it down, then rerun", engine.as_str())
         };
         anyhow::ensure!(
-            recovered.entries.is_empty(),
+            !unflushed,
             "{} holds writes that are not flushed yet — {way}",
             files.wal.display()
         );

@@ -50,29 +50,32 @@ api_key = "@GENERATED_ON_INSTALL@"
 [storage]
 # Page file of the buffer pool. Default: luradb.db
 db_path = "/var/lib/luradb/luradb.db"
-# Write-ahead log. A failed write may leave luradb.wal.unsafe-end (the log's file name
-# plus .unsafe-end), marking where the next start cuts the log; never delete it by hand,
-# or recovery reads that write. Once the log reaches 64 MiB the running server cuts it
-# back, with luradb.wal.tmp briefly beside the file, or beside its target for a symlink;
-# never delete that by hand either. The path may be a symlink, but not a second hard
-# link to the log. Its header records where its sequence numbers start; an earlier
-# LuraDB version does not start on a log this version wrote. Default: luradb.wal
+# Write-ahead log: a directory of segment files of about 64 MiB each, which the server
+# creates, writes and deletes; never change anything in it by hand. The path may be a
+# symlink, the segments then lie at its target. A log file of an earlier LuraDB version
+# at the path becomes such a directory on the first start; an earlier version does not
+# start on it. Default: luradb.wal
 wal_path = "/var/lib/luradb/luradb.wal"
 # Value log for large values. Default: luradb.vlog
 vlog_path = "/var/lib/luradb/luradb.vlog"
 # SSTable directory. Default: luradb_sstables
 sstable_dir = "/var/lib/luradb/sstables"
 # Directory of the system store, which keeps the users, API key hashes and permissions
-# apart from domain data. A failed write may leave wal.unsafe-end beside its write-ahead
-# log wal, marking where the next start cuts the log; never delete it by hand, or
-# recovery reads that write. Once wal reaches 64 MiB the running server cuts it back,
-# with wal.tmp briefly beside it, or beside its target for a symlink; never delete that
-# by hand either. wal may be a symlink, but not a second hard link to the log.
+# apart from domain data. Its write-ahead log wal is a directory of segment files the
+# server creates, writes and deletes; never change anything in it by hand. wal may be a
+# symlink, the segments then lie at its target.
 # Default: luradb_sys beside the SSTable directory
 system_dir = "/var/lib/luradb/luradb_sys"
 # Writes waiting for the storage thread, which writes the write-ahead logs of all
 # engines; a full queue holds further writes back. 1 to 65536. Default: 1024
 wal_queue_capacity = 1024
+# Cap on the write-ahead log of each engine, the system store's included. Once its
+# segments reach it, the shards whose records in the oldest segment are not in SSTables
+# yet write them there, and the segment is deleted; a larger cap means fewer such writes
+# and a longer recovery after a crash. At least 128 MiB. A number with a unit: B, kB, MB,
+# GB, TB (powers of 1000) or KiB, MiB, GiB, TiB (powers of 1024), as in "512 MiB".
+# Default: "256 MiB"
+wal_max_size = "256 MiB"
 
 [io_engine]
 # Registers I/O buffers with the storage engine thread's io_uring ring; not
@@ -191,14 +194,11 @@ default_max_storage_bytes = 0
 # Starts the JSON document engine.
 # While disabled, relational tables show JSON references as NULL.
 enabled = true
-# Write-ahead log; relative paths resolve against the working directory. A failed write
-# may leave luradb_json.wal.unsafe-end (the log's file name plus .unsafe-end), marking
-# where the next start cuts the log; never delete it by hand, or recovery reads that write.
-# Once the log reaches 64 MiB the running server cuts it back, with luradb_json.wal.tmp
-# briefly beside the file, or beside its target for a symlink; never delete that by hand
-# either. The path may be a symlink, but not a second hard link to the log. Its header
-# records where its sequence numbers start; an earlier LuraDB version does not start on
-# a log this version wrote.
+# Write-ahead log; relative paths resolve against the working directory. A directory of
+# segment files the server creates, writes and deletes; never change anything in it by
+# hand. The path may be a symlink, the segments then lie at its target. A log file of an
+# earlier LuraDB version at the path becomes such a directory on the first start; an
+# earlier version does not start on it.
 wal_path = "luradb_json.wal"
 # Value log for large documents.
 vlog_path = "luradb_json.vlog"
@@ -219,14 +219,11 @@ max_value_size = 524288
 [rel]
 # Starts the relational engine.
 enabled = true
-# Write-ahead log; relative paths resolve against the working directory. A failed write
-# may leave luradb_rel.wal.unsafe-end (the log's file name plus .unsafe-end), marking
-# where the next start cuts the log; never delete it by hand, or recovery reads that write.
-# Once the log reaches 64 MiB the running server cuts it back, with luradb_rel.wal.tmp
-# briefly beside the file, or beside its target for a symlink; never delete that by hand
-# either. The path may be a symlink, but not a second hard link to the log. Its header
-# records where its sequence numbers start; an earlier LuraDB version does not start on
-# a log this version wrote.
+# Write-ahead log; relative paths resolve against the working directory. A directory of
+# segment files the server creates, writes and deletes; never change anything in it by
+# hand. The path may be a symlink, the segments then lie at its target. A log file of an
+# earlier LuraDB version at the path becomes such a directory on the first start; an
+# earlier version does not start on it.
 wal_path = "luradb_rel.wal"
 # Value log for large rows.
 vlog_path = "luradb_rel.vlog"

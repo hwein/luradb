@@ -91,7 +91,10 @@ async fn migrate(config: &LuraConfig, shards: u16) -> anyhow::Result<()> {
                 std::env::current_dir()?.join(&files.sstables).display()
             );
         }
-        let unflushed = wal::recover(&files.wal).await?.next().await.transpose()?.is_some();
+        let mut unflushed = false;
+        for mut log in wal::recover_path(&files.wal).await? {
+            unflushed |= log.next().await.transpose()?.is_some();
+        }
         let way = if enabled {
             "start the server once to flush, then shut it down".to_string()
         } else {
@@ -573,7 +576,7 @@ mod tests {
     /// Writes an expired version of `expired` into `domain` on shard 0.
     fn expire_one(config: &LuraConfig, domain: &str) {
         crate::core::engine_runtime::block_on(async {
-            let kv = open_kv_engine(config, Some(0)).await;
+            let (kv, _hub) = open_kv_engine(config, Some(0)).await;
             kv.put_expired_for_test(&data_key(domain, "expired"), b"v").await.unwrap();
             kv.shutdown().await;
         });
@@ -696,7 +699,7 @@ mod tests {
             expect(addr, &with_body("POST", "/store-api/domains", &create), 201).await;
         });
         let moved = crate::core::engine_runtime::block_on(async {
-            let kv = open_kv_engine(&config(dir.path(), 1), Some(0)).await;
+            let (kv, _hub) = open_kv_engine(&config(dir.path(), 1), Some(0)).await;
             let ahead = HybridLogicalClock::physical_time() + 10 * 24 * 3600 * 1000;
             kv.hlc().update(HLCTimestamp::from_components(ahead, 0)).unwrap();
             kv.put(&data_key(&name, "ahead"), b"v").await.unwrap();
@@ -795,12 +798,14 @@ mod tests {
         assert!(format!("{err:#}").contains("is in use by another LuraDB process"), "{err:#}");
 
         crate::core::engine_runtime::block_on(async {
-            let kv = open_kv_engine(&config(dir.path(), 1), Some(0)).await;
+            let (kv, _hub) = open_kv_engine(&config(dir.path(), 1), Some(0)).await;
             kv.put(&data_key(&names[0], "late"), b"v").await.unwrap();
             kv.stop_background_tasks().await;
         });
         let err = migrate_shards(&config(dir.path(), 0), 2).unwrap_err();
         assert!(format!("{err:#}").contains("start the server once to flush, then shut it down"), "{err:#}");
+        let segments = crate::core::wal::segments_in(Path::new(&config(dir.path(), 1).storage.wal_path)).unwrap();
+        assert_eq!(segments.len(), 1, "the record waits in the segment appended to");
         let cfg = config(dir.path(), 1);
         let dirs = [dir.path().to_path_buf(), PathBuf::from(&cfg.storage.sstable_dir), PathBuf::from(&cfg.json.sstable_dir)];
         assert!(staging_left(&dirs).is_empty());
@@ -830,7 +835,7 @@ mod tests {
         (on_json.storage.wal_path, on_json.storage.vlog_path, on_json.storage.sstable_dir) =
             (on_json.json.wal_path.clone(), on_json.json.vlog_path.clone(), on_json.json.sstable_dir.clone());
         crate::core::engine_runtime::block_on(async {
-            let json = open_kv_engine(&on_json, Some(0)).await;
+            let (json, _hub) = open_kv_engine(&on_json, Some(0)).await;
             json.put(&data_key(&names[0], "late"), b"v").await.unwrap();
             json.stop_background_tasks().await;
         });

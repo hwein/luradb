@@ -199,7 +199,7 @@ mod tests {
                 let dir = tmp.path().join("sys");
                 let (sys, hub) = open_on(&dir, on_hub).await;
                 assert!(dir.join(SSTABLE_DIR).is_dir());
-                assert!(dir.join(WAL_FILE).is_file());
+                assert_eq!(dir.join(WAL_FILE).is_dir(), on_hub, "the hub keeps a directory of segments");
 
                 sys.put(b"__sys:auth:user:alice", "clé ✓".as_bytes()).await.unwrap();
                 sys.shutdown().await;
@@ -223,7 +223,8 @@ mod tests {
             sys.stop_background_tasks().await;
             drop(sys);
             drop(hub);
-            assert!(std::fs::metadata(dir.join(WAL_FILE)).unwrap().len() > 0, "the write is only in the WAL");
+            let segment = crate::core::wal::segment_path(&dir.join(WAL_FILE), 1);
+            assert!(std::fs::metadata(segment).unwrap().len() > crate::core::wal::WAL_HEADER_LEN, "the write is only in the WAL");
 
             let (sys, _hub) = open_on(&dir, true).await;
             assert_eq!(sys.get("__sys:auth:user:zoé".as_bytes()).await.unwrap(), Some(b"zoe-record".to_vec()));
@@ -263,38 +264,44 @@ mod tests {
         })
     }
 
-    // Auth records written before and after a checkpoint tick over a log
-    // past the limit are all there after a crash; the checkpoint left only
-    // the later ones in the log.
+    // Auth records written over several segments past the size cap are all
+    // there after a crash: the checkpoint raises the system store's flushed
+    // LSN itself and drops the segments before the one appended to.
     #[test]
-    fn auth_records_survive_a_checkpoint_and_a_crash() {
+    fn auth_records_survive_dropped_segments_and_a_crash() {
         use crate::control::checkpoint::{Holder, WalCheckpoint};
         use crate::control::{ControlPlane, Owners};
         crate::core::engine_runtime::block_on(async {
-            const LIMIT: u64 = 16 * 1024;
+            const SEGMENT: u64 = 4 * 1024;
             let tmp = tempfile::TempDir::new().unwrap();
             let dir = tmp.path().join("sys");
-            let (sys, hub) = open_on(&dir, true).await;
-            let hub = hub.unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let hub = TestHub::with_segment_bytes(&[(WalTarget::Sys, &dir.join(WAL_FILE))], SEGMENT);
+            let sys = open_with_wal(&dir, hub.wal(WalTarget::Sys)).await.unwrap();
             let auth = Arc::new(crate::auth::AuthCache::new(Arc::clone(&sys), None));
             let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
             let control = ControlPlane::start(Owners { shards: Vec::new(), auth }, Arc::clone(&sys), bus).await.unwrap();
-            let checkpoints =
-                WalCheckpoint::new(control, vec![(Holder::System, hub.wal(WalTarget::Sys))]).with_limit(LIMIT);
+            let checkpoints = WalCheckpoint::new(control, vec![(Holder::System, hub.wal(WalTarget::Sys))], 3 * SEGMENT);
             let user = |i: usize| format!("{PREFIX_USER}user-{i}").into_bytes();
+            let record = |i: usize| format!("record {i} of zoé ✓").repeat(4).into_bytes();
+            let log = dir.join(WAL_FILE);
             for i in 0..200 {
-                sys.put(&user(i), format!("record {i} of zoé ✓").repeat(4).as_bytes()).await.unwrap();
+                sys.put(&user(i), &record(i)).await.unwrap();
             }
-            assert!(std::fs::metadata(dir.join(WAL_FILE)).unwrap().len() > LIMIT);
+            assert!(crate::core::wal::segments_in(&log).unwrap().len() > 3);
+            let flushed = sys.flushed_lsn();
             assert_eq!(checkpoints.run().await, []);
-            assert_eq!(std::fs::read(dir.join(WAL_FILE)).unwrap(), crate::core::wal::wal_header(sys.wal_head_lsn().await.unwrap()));
+            assert!(sys.flushed_lsn() > flushed, "the checkpoint raised the system store's flushed LSN");
+            let left = hub.wal(WalTarget::Sys).segments().await.unwrap();
+            assert!(left.total_bytes() < 3 * SEGMENT, "{left:?}");
+            assert!(!crate::core::wal::segment_path(&log, 1).exists());
             sys.put(&user(200), b"after the checkpoint").await.unwrap();
             sys.stop_background_tasks().await;
             drop((checkpoints, sys, hub));
 
             let (sys, _hub) = open_on(&dir, true).await;
             for i in 0..200 {
-                assert_eq!(sys.get(&user(i)).await.unwrap(), Some(format!("record {i} of zoé ✓").repeat(4).into_bytes()));
+                assert_eq!(sys.get(&user(i)).await.unwrap(), Some(record(i)));
             }
             assert_eq!(sys.get(&user(200)).await.unwrap(), Some(b"after the checkpoint".to_vec()));
             sys.shutdown().await;

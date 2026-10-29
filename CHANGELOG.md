@@ -24,9 +24,12 @@ All notable changes to LuraDB are documented in this file.
 - The server refuses to start on a data directory that another LuraDB process uses.
 - **BREAKING** API: Backups include relational domains (schema, rows, AUTOINCREMENT state); scope accepts `rel` and `rel:<domain>`.
 - Built-in MCP server with OAuth sign-in (opt-in, `[mcp]` config section).
+- `storage.wal_max_size` caps the write-ahead log of each engine (default 256 MiB); the shards holding the oldest segment flush and the segment is dropped when the cap is reached, and a segment open for five minutes is closed the same way.
 
 ### Changed
 
+- **BREAKING** Format: the write-ahead log path is now a directory of segments; earlier versions cannot open a data directory written by this version.
+- The write-ahead log of each engine is kept in 64 MiB segment files under the configured path; full segments are deleted once their contents are in the data files, with no copying and no write pause.
 - **BREAKING** Format: the write-ahead log header now records the starting sequence number; data directories opened by this version cannot be opened by earlier versions.
 - Recovery after a crash replays only the write-ahead log entries that are not yet in the data files, streaming them with bounded memory.
 - Write-ahead log sequence numbers continue across restarts instead of starting at 1 after a clean shutdown.

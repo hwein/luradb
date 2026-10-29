@@ -37,9 +37,9 @@ fn test_lsm_engine_writes_and_reads() {
             engine.set(key.as_bytes(), value.as_bytes()).await.unwrap();
         }
 
-        // Verify WAL exists and is not empty
-        let wal_metadata = std::fs::metadata(&wal_path).unwrap();
-        assert!(wal_metadata.len() > 0);
+        // Verify the WAL's first segment holds more than its header
+        let wal_metadata = std::fs::metadata(luradb::core::wal::segment_path(&wal_path, 1)).unwrap();
+        assert!(wal_metadata.len() > luradb::core::wal::WAL_HEADER_LEN);
 
         // Read some entries back
         for i in 0..10000 {

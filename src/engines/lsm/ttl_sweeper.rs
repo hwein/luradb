@@ -588,9 +588,10 @@ mod tests {
         compio::runtime::spawn(async move { sweeper.sweep_tick().await })
     }
 
-    /// The bytes of the log at `<dir>/wal`.
+    /// The bytes of the segments of the log at `<dir>/wal`, in order.
     fn log_in(dir: &std::path::Path) -> Vec<u8> {
-        std::fs::read(dir.join("wal")).unwrap()
+        let segments = crate::core::wal::segments_in(&dir.join("wal")).unwrap();
+        segments.into_iter().flat_map(|(_, path)| std::fs::read(path).unwrap()).collect()
     }
 
     // A sweep whose re-check saw the expired value before a newer write and

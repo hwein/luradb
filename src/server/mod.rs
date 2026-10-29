@@ -695,10 +695,24 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    /// The write-ahead log at `path` holds its header and no record.
+    /// The write-ahead log at `path` is one segment that holds its header and
+    /// no record.
     fn holds_only_its_header(path: impl AsRef<Path>) -> bool {
-        let log = std::fs::read(path).unwrap();
+        let segments = crate::core::wal::segments_in(path.as_ref()).unwrap();
+        let [(_, segment)] = &segments[..] else { return false };
+        let log = std::fs::read(segment).unwrap();
         log.len() as u64 == crate::core::wal::WAL_HEADER_LEN && log.starts_with(&crate::core::wal::WAL_MAGIC)
+    }
+
+    /// The bytes of every segment of the write-ahead log at `path`, in order,
+    /// without one a checkpoint prepared after the last one written.
+    fn log_bytes(path: impl AsRef<Path>) -> Vec<u8> {
+        let segments = crate::core::wal::segments_in(path.as_ref()).unwrap();
+        let mut segments: Vec<Vec<u8>> = segments.into_iter().map(|(_, segment)| std::fs::read(segment).unwrap()).collect();
+        if segments.len() > 1 && segments.last().unwrap().len() as u64 == crate::core::wal::WAL_HEADER_LEN {
+            segments.pop();
+        }
+        segments.concat()
     }
 
     #[test]
@@ -1120,9 +1134,17 @@ mod tests {
     }
 
     /// The key-value engine on `cfg`'s paths, as a server opens it: those of
-    /// `shard`, or with `None` those of a data directory without shards.
-    pub(super) async fn open_kv_engine(cfg: &LuraConfig, shard: Option<usize>) -> Arc<crate::engines::lsm::engine::LsmStorageEngine> {
+    /// `shard`, or with `None` those of a data directory without shards; and
+    /// the hub that writes its log once a server made that a directory of
+    /// segments; a log that is none yet stays a single file, as an earlier
+    /// version wrote it.
+    pub(super) async fn open_kv_engine(
+        cfg: &LuraConfig,
+        shard: Option<usize>,
+    ) -> (Arc<crate::engines::lsm::engine::LsmStorageEngine>, Option<crate::core::storage_thread::TestHub>) {
+        use crate::core::storage_thread::{TestHub, WalTarget};
         let wal_path = PathBuf::from(&cfg.storage.wal_path);
+        let hub = wal_path.is_dir().then(|| TestHub::start(&[(WalTarget::Kv, &wal_path)]));
         let (vlog_path, sstable_dir) = match shard {
             Some(k) => (
                 layout::shard_file(Path::new(&cfg.storage.vlog_path), k),
@@ -1130,12 +1152,16 @@ mod tests {
             ),
             None => (PathBuf::from(&cfg.storage.vlog_path), PathBuf::from(&cfg.storage.sstable_dir)),
         };
-        let wal = Arc::new(crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap());
+        let wal = Arc::new(match &hub {
+            Some(hub) => hub.wal(WalTarget::Kv),
+            None => crate::core::wal::WriteAheadLog::new(&wal_path).await.unwrap(),
+        });
         let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
         let fm = Arc::new(crate::storage::file_manager::FileManager::new(&sstable_dir).await.unwrap());
         let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&sstable_dir));
         let options = crate::engines::lsm::engine::LsmEngineOptions::default();
-        Arc::new(crate::engines::lsm::engine::LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, fm, mm, options).await.unwrap())
+        let engine = crate::engines::lsm::engine::LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, fm, mm, options);
+        (Arc::new(engine.await.unwrap()), hub)
     }
 
     // An older data directory keeps its users in the key-value engine: the
@@ -1154,7 +1180,7 @@ mod tests {
             created_at: 1,
         };
         engine_runtime::block_on(async {
-            let kv = open_kv_engine(&cfg, None).await;
+            let (kv, _hub) = open_kv_engine(&cfg, None).await;
             kv.put("__sys:auth:user:zoé".as_bytes(), &serde_json::to_vec(&record).unwrap()).await.unwrap();
             kv.shutdown().await;
         });
@@ -1172,21 +1198,32 @@ mod tests {
 
             engine_runtime::block_on(async {
                 use crate::engines::StorageEngine;
-                let kv = open_kv_engine(&cfg, Some(0)).await;
+                let (kv, _hub) = open_kv_engine(&cfg, Some(0)).await;
                 assert!(kv.scan_keys(b"__sys:auth:").await.unwrap().is_empty(), "{start} start");
                 kv.shutdown().await;
-                let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
+                let (system, _hub) = open_system_store(&cfg).await;
                 assert!(system.get("__sys:auth:user:zoé".as_bytes()).await.unwrap().is_some(), "{start} start");
                 system.shutdown().await;
             });
         }
     }
 
+    /// The system store on `cfg`'s paths, after a start of the server, and
+    /// the hub that writes its log.
+    async fn open_system_store(
+        cfg: &LuraConfig,
+    ) -> (Arc<crate::engines::lsm::engine::LsmStorageEngine>, crate::core::storage_thread::TestHub) {
+        use crate::core::storage_thread::{TestHub, WalTarget};
+        let dir = Path::new(&cfg.storage.system_dir);
+        let hub = TestHub::start(&[(WalTarget::Sys, &dir.join(crate::control::system::WAL_FILE))]);
+        (crate::control::system::open_with_wal(dir, hub.wal(WalTarget::Sys)).await.unwrap(), hub)
+    }
+
     /// A data directory from before the shard layout, its default domain
     /// holding `key` in an SSTable.
     fn legacy_data_directory(cfg: &LuraConfig, key: &[u8]) {
         engine_runtime::block_on(async {
-            let kv = open_kv_engine(cfg, None).await;
+            let (kv, _hub) = open_kv_engine(cfg, None).await;
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
             let registry = crate::engines::lsm::DomainRegistry::recover(
                 Arc::clone(&kv),
@@ -1236,7 +1273,7 @@ mod tests {
                 std::fs::read_dir(layout::shard_dir(&sstables, 0)).unwrap().map(|e| e.unwrap().file_name()).collect();
             assert!(moved.iter().any(|name| name == "MANIFEST"), "{start} start: {moved:?}");
             engine_runtime::block_on(async {
-                let system = crate::control::system::open(Path::new(&cfg.storage.system_dir)).await.unwrap();
+                let (system, _hub) = open_system_store(&cfg).await;
                 assert!(crate::control::system::layout_is_sharded(&system).await.unwrap(), "{start} start");
                 system.shutdown().await;
             });
@@ -1479,12 +1516,12 @@ mod tests {
             assert_eq!(request(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
         });
-        let json_log = std::fs::read(&cfg.json.wal_path).unwrap();
+        let json_log = log_bytes(&cfg.json.wal_path);
         let unsyncable = layout::shard_dir(Path::new(&cfg.json.sstable_dir), 1);
         test_fault::fail_syncs_of(&unsyncable);
         server.shutdown().unwrap();
 
-        assert_eq!(std::fs::read(&cfg.json.wal_path).unwrap(), json_log, "the JSON log stays as it was");
+        assert_eq!(log_bytes(&cfg.json.wal_path), json_log, "the JSON log stays as it was");
         assert!(holds_only_its_header(&cfg.storage.wal_path), "the key-value log is cut back");
         assert!(holds_only_its_header(&cfg.rel.wal_path), "the relational log is cut back");
 
@@ -1492,7 +1529,7 @@ mod tests {
         test_fault::allow_syncs_of(&unsyncable);
         let err = started.err().expect("the start must fail");
         assert!(format!("{err:#}").contains(&format!("sync {}", unsyncable.display())), "{err:#}");
-        assert_eq!(std::fs::read(&cfg.json.wal_path).unwrap(), json_log, "the failed start truncates nothing");
+        assert_eq!(log_bytes(&cfg.json.wal_path), json_log, "the failed start truncates nothing");
 
         let server = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml")).unwrap();
         let addr = server.http_addr.expect("HTTP listener enabled");
@@ -1502,14 +1539,14 @@ mod tests {
     }
 
     // The hub opens a WAL for the enabled engines only: with JSON and
-    // relational off, no file of theirs appears.
+    // relational off, no directory of theirs appears.
     #[test]
     fn disabled_engines_get_no_write_ahead_log() {
         let dir = tempfile::TempDir::new().unwrap();
         let server = Server::start(Arc::new(test_config(dir.path())), &dir.path().join("luradb.toml")).unwrap();
         let cfg = test_config(dir.path());
-        assert!(Path::new(&cfg.storage.wal_path).is_file());
-        assert!(Path::new(&cfg.storage.system_dir).join(crate::control::system::WAL_FILE).is_file());
+        assert!(Path::new(&cfg.storage.wal_path).is_dir());
+        assert!(Path::new(&cfg.storage.system_dir).join(crate::control::system::WAL_FILE).is_dir());
         assert!(!Path::new(&cfg.json.wal_path).exists());
         assert!(!Path::new(&cfg.rel.wal_path).exists());
         server.shutdown().unwrap();
@@ -1547,7 +1584,7 @@ mod tests {
                 }
             });
             for wal in &wals {
-                let len = std::fs::metadata(wal).unwrap().len();
+                let len = log_bytes(wal).len() as u64;
                 assert!(len > crate::core::wal::WAL_HEADER_LEN, "io_engine {io_engine}: {wal} holds no write");
             }
             server.shutdown().unwrap();

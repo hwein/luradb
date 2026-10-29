@@ -1,13 +1,12 @@
 #[cfg(test)]
 use crate::core::storage_thread::{
-    appends_refused, apply_unsafe_end_marker, ensure_header, mark_unsafe_end, unmark_unsafe_end, unsafe_end_marker,
-    Faults,
+    apply_unsafe_end_marker, ensure_header, mark_unsafe_end, unmark_unsafe_end, unsafe_end_marker, Faults,
 };
-use crate::core::storage_thread::{StorageHandle, WalMark, WalPermit, WalTarget};
+use crate::core::storage_thread::{StorageHandle, WalMark, WalPermit, WalSegments, WalTarget};
+use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::io::SeekFrom;
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
@@ -33,6 +32,71 @@ pub fn wal_header(start_lsn: u64) -> [u8; WAL_HEADER_LEN as usize] {
     header[..WAL_MAGIC.len()].copy_from_slice(&WAL_MAGIC);
     header[WAL_MAGIC.len()..].copy_from_slice(&start_lsn.to_be_bytes());
     header
+}
+
+/// Where the single-file log of an earlier version waits for recovery once
+/// its segment directory has taken its place: `<path>.migrating`.
+pub const MIGRATING_SUFFIX: &str = ".migrating";
+
+/// Segment `n` of the log directory `dir`.
+pub fn segment_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n:08}.wal"))
+}
+
+/// The number of the segment named `name`: eight digits and `.wal`.
+fn segment_number(name: &OsStr) -> Option<u64> {
+    let digits = name.to_str()?.strip_suffix(".wal")?;
+    if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The segments of the log directory `dir`, oldest first; a gap in their
+/// numbers is an error.
+pub(crate) fn segments_in(dir: &Path) -> std::io::Result<Vec<(u64, PathBuf)>> {
+    let mut segments = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(n) = segment_number(&entry.file_name()) {
+            segments.push((n, entry.path()));
+        }
+    }
+    segments.sort();
+    if let Some(pair) = segments.windows(2).find(|pair| pair[1].0 != pair[0].0 + 1) {
+        let missing = segment_path(dir, pair[0].0 + 1);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the segment {} of the write-ahead log is missing", missing.display()),
+        ));
+    }
+    Ok(segments)
+}
+
+/// `path` with every symlink of its last component followed, also to a
+/// target that does not exist: the place of the log's directory.
+pub(crate) fn log_location(path: &Path) -> std::io::Result<PathBuf> {
+    let mut location = path.to_path_buf();
+    // Linux's MAXSYMLINKS.
+    for _ in 0..40 {
+        match std::fs::read_link(&location) {
+            Ok(target) => location = location.parent().unwrap_or(Path::new("")).join(target),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound) => {
+                return Ok(location);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!("{} has more than 40 symlink hops", path.display())))
+}
+
+/// The single-file log of an earlier version beside the log directory at
+/// `path`, if a migration left it there.
+pub(crate) fn migrating_log(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let mut name = log_location(path)?.into_os_string();
+    name.push(MIGRATING_SUFFIX);
+    let migrating = PathBuf::from(name);
+    Ok(migrating.try_exists()?.then_some(migrating))
 }
 
 /// Hard ceiling on any single length-prefixed WAL field (a key or a value)
@@ -120,6 +184,10 @@ pub struct WalReader {
     max_lsn: u64,
     /// The entries of the record read last not handed out yet.
     record: std::vec::IntoIter<(u64, WalEntry)>,
+    /// The segment read now, named in its errors; `None` for a single file.
+    segment: Option<PathBuf>,
+    /// The segments after it, oldest first.
+    rest: VecDeque<PathBuf>,
 }
 
 impl WalReader {
@@ -131,6 +199,8 @@ impl WalReader {
             lsn: 0,
             max_lsn: 0,
             record: Vec::new().into_iter(),
+            segment: None,
+            rest: VecDeque::new(),
         }
     }
 
@@ -141,7 +211,17 @@ impl WalReader {
         if let Some(entry) = self.record.next() {
             return Some(Ok(entry));
         }
-        match self.next_record().await {
+        let next = loop {
+            match self.next_record().await {
+                Ok(None) if !self.rest.is_empty() => {
+                    if let Err(e) = self.open_next_segment().await {
+                        break Err(e);
+                    }
+                }
+                next => break next,
+            }
+        };
+        match next {
             Ok(Some(entries)) => {
                 self.max_lsn = self.max_lsn.max(self.lsn);
                 self.record = entries.into_iter();
@@ -153,8 +233,44 @@ impl WalReader {
             }
             Err(e) => {
                 self.file = None;
-                Some(Err(e))
+                self.rest.clear();
+                Some(Err(self.in_segment(e)))
             }
+        }
+    }
+
+    /// Opens the next segment; its header must start at the last LSN of the
+    /// segment before, or of none for the first.
+    async fn open_next_segment(&mut self) -> Result<(), WalError> {
+        let Some(path) = self.rest.pop_front() else { return Ok(()) };
+        let first = self.segment.is_none();
+        self.segment = Some(path.clone());
+        let mut file = BufReader::with_capacity(RECOVERY_READ_BUFFER, File::open(&path).await?);
+        let start = match read_next::<{ WAL_HEADER_LEN as usize }>(&mut file).await? {
+            Some(head) if head[..WAL_MAGIC.len()] == WAL_MAGIC => {
+                u64::from_be_bytes(head[WAL_MAGIC.len()..].try_into().expect("8 bytes"))
+            }
+            _ => return Err(invalid_data("the segment has no header of this version")),
+        };
+        if first {
+            (self.lsns_continue, self.max_lsn) = (true, start);
+        } else if start != self.max_lsn {
+            return Err(invalid_data(&format!(
+                "the segment starts after LSN {start}, but the segment before it ends at LSN {}",
+                self.max_lsn
+            )));
+        }
+        (self.file, self.framed) = (Some(file), true);
+        Ok(())
+    }
+
+    /// `e` with the name of the segment it happened in, of the same kind.
+    fn in_segment(&self, e: WalError) -> WalError {
+        match (&self.segment, e) {
+            (Some(path), WalError::Io(e)) => {
+                WalError::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+            }
+            (_, e) => e,
         }
     }
 
@@ -232,6 +348,35 @@ pub async fn recover(path: impl AsRef<Path>) -> Result<WalReader, WalError> {
     Ok(reader)
 }
 
+/// Opens the log directory `dir` for recovery: its segments, oldest first,
+/// read as one log. A missing directory reads as an empty log; a torn
+/// record, a segment without this version's header or one that does not
+/// start where the one before ends fails the read and names the segment.
+pub async fn recover_dir(dir: impl AsRef<Path>) -> Result<WalReader, WalError> {
+    let mut reader = WalReader::empty();
+    reader.rest = match segments_in(dir.as_ref()) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(reader),
+        segments => segments?.into_iter().map(|(_, path)| path).collect(),
+    };
+    if let Err(e) = reader.open_next_segment().await {
+        return Err(reader.in_segment(e));
+    }
+    Ok(reader)
+}
+
+/// The logs recovery reads for the log configured at `path`, in order: the
+/// single file of an earlier version a migration to segments left beside
+/// it, then the segment directory — or the single file a local committer
+/// writes there.
+pub async fn recover_path(path: &Path) -> Result<Vec<WalReader>, WalError> {
+    let mut logs = Vec::with_capacity(2);
+    if let Some(migrating) = migrating_log(path)? {
+        logs.push(recover(migrating).await?);
+    }
+    logs.push(if path.is_dir() { recover_dir(path).await? } else { recover(path).await? });
+    Ok(logs)
+}
+
 /// Every entry of a log and its highest LSN, read in full.
 #[cfg(test)]
 #[derive(Debug)]
@@ -240,15 +385,17 @@ pub(crate) struct Recovered {
     pub(crate) max_lsn: u64,
 }
 
-/// Tests only: [`recover`] read to the end of the log.
+/// Tests only: every log [`recover_path`] opens, read to its end.
 #[cfg(test)]
 pub(crate) async fn recover_all(path: impl AsRef<Path>) -> Result<Recovered, WalError> {
-    let mut reader = recover(path).await?;
-    let mut entries = Vec::new();
-    while let Some(entry) = reader.next().await {
-        entries.push(entry?);
+    let (mut entries, mut max_lsn) = (Vec::new(), 0);
+    for mut reader in recover_path(path.as_ref()).await? {
+        while let Some(entry) = reader.next().await {
+            entries.push(entry?);
+        }
+        max_lsn = max_lsn.max(reader.max_lsn());
     }
-    Ok(Recovered { entries, max_lsn: reader.max_lsn() })
+    Ok(Recovered { entries, max_lsn })
 }
 
 /// The next `N` bytes of the log, `None` at its end; fewer than `N` bytes
@@ -334,6 +481,10 @@ fn invalid_entry_error() -> WalError {
         std::io::ErrorKind::InvalidData,
         "Invalid WAL entry type found during recovery",
     ))
+}
+
+fn invalid_data(message: &str) -> WalError {
+    WalError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string()))
 }
 
 fn field_too_long_error(len: usize) -> WalError {
@@ -495,18 +646,38 @@ impl WriteAheadLog {
         }
     }
 
-    /// Drops the records before `mark` from the log; the records after it
-    /// stay, and so do the LSNs.
-    pub async fn cut_before(&self, mark: &WalMark) -> Result<(), WalError> {
+    /// The log's segments, after every append queued before this call.
+    pub async fn segments(&self) -> Result<WalSegments, WalError> {
         match &self.inner {
             #[cfg(test)]
             WalMode::Local(_) => Err(no_checkpoint_error()),
-            WalMode::Remote { handle, engine } => handle.wal_cut_before(*engine, *mark).await.map_err(wal_remote_err),
+            WalMode::Remote { handle, engine } => handle.wal_segments(*engine).await.map_err(wal_remote_err),
         }
     }
 
-    /// Truncates the WAL file back to its header, effectively clearing it.
-    /// The LSNs go on where they were.
+    /// Goes on in the next segment, unless the current one holds no record.
+    pub async fn rotate(&self) -> Result<(), WalError> {
+        match &self.inner {
+            #[cfg(test)]
+            WalMode::Local(_) => Err(no_checkpoint_error()),
+            WalMode::Remote { handle, engine } => handle.wal_rotate(*engine).await.map_err(wal_remote_err),
+        }
+    }
+
+    /// Drops the segments before `segment` from the log directory `dir`;
+    /// the SSTables must hold every record in them.
+    pub async fn drop_segments_before(&self, dir: &Path, segment: u64) -> Result<(), WalError> {
+        match &self.inner {
+            #[cfg(test)]
+            WalMode::Local(_) => Err(no_checkpoint_error()),
+            WalMode::Remote { handle, engine } => {
+                handle.wal_drop_before(*engine, dir, segment).await.map_err(wal_remote_err)
+            }
+        }
+    }
+
+    /// Truncates the WAL back to its header, effectively clearing it: one
+    /// segment with the header is left. The LSNs go on where they were.
     ///
     /// This is typically done after the MemTable has been successfully
     /// recovered from the WAL at startup.
@@ -550,6 +721,15 @@ fn broken_pipe_error() -> WalError {
 /// Offset and LSN of an appended record.
 #[cfg(test)]
 type AppendResponder = oneshot::Sender<Result<(u64, u64), WalError>>;
+
+/// Why a log of the earlier format takes no append: records with and without
+/// an LSN must never share a file.
+#[cfg(test)]
+fn appends_refused() -> std::io::Error {
+    std::io::Error::other(
+        "the write-ahead log still has the format of an earlier version; it takes appends once the start has truncated it",
+    )
+}
 
 #[cfg(test)]
 struct LocalWal {
@@ -1390,19 +1570,117 @@ mod tests {
         })
     }
 
-    // The local committer takes no checkpoint: a mark and a cut both fail
-    // and leave the log as it is.
+    // The local committer takes no checkpoint: a mark, the segment list, a
+    // rotation and a drop all fail and leave the log as it is.
     #[test]
-    fn test_the_local_committer_takes_no_mark_and_no_cut() {
+    fn test_the_local_committer_takes_no_checkpoint() {
         crate::core::engine_runtime::block_on(async {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("wal");
             let wal = WriteAheadLog::new(&path).await.unwrap();
             wal.append(b"kept").await.unwrap();
             assert!(wal.mark().await.is_err());
-            let mark = WalMark { generation: 0, offset: WAL_HEADER_LEN, lsn: 0 };
-            assert!(wal.cut_before(&mark).await.is_err());
+            assert!(wal.segments().await.is_err());
+            assert!(wal.rotate().await.is_err());
+            assert!(wal.drop_segments_before(dir.path(), 2).await.is_err());
             assert_eq!(std::fs::read(&path).unwrap(), log_of(&[(1, b"kept")]));
+        })
+    }
+
+    /// A log directory in `dir` with `segments`, each written as given.
+    fn write_segments(dir: &TempDir, segments: &[Vec<u8>]) -> PathBuf {
+        let log = dir.path().join("log");
+        std::fs::create_dir_all(&log).unwrap();
+        for (n, bytes) in (1..).zip(segments) {
+            std::fs::write(segment_path(&log, n), bytes).unwrap();
+        }
+        log
+    }
+
+    // The segments of a directory read as one log, in the order of their
+    // numbers, not of their names' listing; each starts where the one
+    // before ends, an empty one included.
+    #[test]
+    fn test_recover_dir_reads_the_segments_in_order() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let segments = [
+                log_of(&[(1, &delete_record(b"one")), (2, &delete_record(b"two"))]),
+                wal_header(2).to_vec(),
+                log_of(&[(3, &delete_record(b"three"))]),
+            ];
+            let log = write_segments(&dir, &segments);
+            std::fs::write(log.join("00000003.wal.unsafe-end.tmp"), b"ignored").unwrap();
+            let recovered = recover_all(&log).await.unwrap();
+            assert_eq!(recovered.entries.iter().map(|(lsn, entry)| (*lsn, entry.key().to_vec())).collect::<Vec<_>>(), [
+                (1, b"one".to_vec()),
+                (2, b"two".to_vec()),
+                (3, b"three".to_vec())
+            ]);
+            assert_eq!(recovered.max_lsn, 3);
+            assert!(recover_dir(&log).await.unwrap().lsns_continue());
+            assert!(recover_all(dir.path().join("missing")).await.unwrap().entries.is_empty());
+        })
+    }
+
+    // A torn record fails the read in any segment, the last one included,
+    // and the error names the segment.
+    #[test]
+    fn test_recover_dir_names_the_segment_of_a_torn_record() {
+        crate::core::engine_runtime::block_on(async {
+            for torn in [1, 2] {
+                let dir = TempDir::new().unwrap();
+                let mut segments = vec![log_of(&[(1, &delete_record(b"one"))]), log_of(&[(2, &delete_record(b"two"))])];
+                segments[torn - 1].pop();
+                let log = write_segments(&dir, &segments);
+                let err = recover_all(&log).await.unwrap_err();
+                assert!(
+                    matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+                    "expected a torn record, got: {err}"
+                );
+                assert!(err.to_string().contains(&format!("0000000{torn}.wal")), "{err}");
+            }
+        })
+    }
+
+    // A segment that does not start where the one before ends, one without
+    // this version's header and a gap in the numbers each fail the read.
+    #[test]
+    fn test_recover_dir_refuses_a_broken_chain_of_segments() {
+        crate::core::engine_runtime::block_on(async {
+            let first = log_of(&[(1, &delete_record(b"one"))]);
+            let previous = [&PREVIOUS_WAL_MAGIC[..], &first[WAL_HEADER_LEN as usize..]].concat();
+            for (second, expected) in [
+                (log_of(&[(5, &delete_record(b"far"))]), "00000002.wal: the segment starts after LSN 4"),
+                (previous, "00000002.wal: the segment has no header of this version"),
+            ] {
+                let dir = TempDir::new().unwrap();
+                let log = write_segments(&dir, &[first.clone(), second]);
+                let err = recover_all(&log).await.unwrap_err();
+                assert!(err.to_string().contains(expected), "{err}");
+            }
+            let dir = TempDir::new().unwrap();
+            let log = write_segments(&dir, std::slice::from_ref(&first));
+            std::fs::write(segment_path(&log, 3), wal_header(1)).unwrap();
+            let err = recover_all(&log).await.unwrap_err();
+            assert!(err.to_string().contains("00000002.wal of the write-ahead log is missing"), "{err}");
+        })
+    }
+
+    // Recovery reads the log of an earlier version a migration left beside
+    // the directory first, then the segments.
+    #[test]
+    fn test_recover_path_reads_the_migrating_log_before_the_segments() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let log = write_segments(&dir, &[log_of(&[(6, &delete_record(b"after"))])]);
+            std::fs::write(dir.path().join("log.migrating"), &V1_LOG[..33]).unwrap();
+            let logs = recover_path(&log).await.unwrap();
+            assert_eq!(logs.iter().map(WalReader::lsns_continue).collect::<Vec<_>>(), [false, true]);
+            let recovered = recover_all(&log).await.unwrap();
+            assert_eq!(recovered.entries.len(), 2);
+            assert_eq!(recovered.entries[1].1.key(), b"after");
+            assert_eq!(recovered.max_lsn, 6);
         })
     }
 

@@ -461,6 +461,6 @@ fn self_test_conserves_evidence_on_verify_mismatch() {
         assert!(s1.exists(), "S1 must be conserved (not deleted) when a finding is present");
         let s2 = artifact_dir.path().join("self-test-S2");
         assert!(s2.exists(), "S2 must be conserved (not deleted) when a finding is present");
-        assert!(s1.join("wal.log").exists(), "S1 must contain the copied WAL file");
+        assert!(s1.join("wal.log").exists(), "S1 must contain the copied WAL");
     })
 }

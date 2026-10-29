@@ -420,10 +420,12 @@ async fn run_frontend(
 ) -> anyhow::Result<Listeners> {
     let Ready { shards, control, states, trusted_cidrs } = ready;
     let auth_cache = Arc::clone(&states[0].auth_cache);
+    let resources = states[0].control.resources().clone();
     let mcp_internal = mcp.is_some().then(|| {
         let bridge = ShardRouter::new(shards.iter().cloned().map(EngineDispatch::Engine).collect())
             .with_control(EngineDispatch::Control(control.clone()))
-            .with_reader(reader.clone());
+            .with_reader(reader.clone())
+            .with_resources(resources.clone());
         let auth = config.auth.enabled.then(|| Arc::clone(&auth_cache));
         let internal = api::frontend_layers(Router::new().fallback_service(bridge), auth, Arc::clone(&trusted_cidrs));
         (internal, Arc::clone(&trusted_cidrs))
@@ -431,7 +433,8 @@ async fn run_frontend(
     let ship = ShardRouter::new(shards.into_iter().map(EngineDispatch::Engine).collect())
         .with_control(EngineDispatch::Control(control))
         .with_reader(reader)
-        .with_inline(states.into_iter().map(api::create_router).collect());
+        .with_inline(states.into_iter().map(api::create_router).collect())
+        .with_resources(resources);
     let app = build_router(config, auth_cache, trusted_cidrs, ship);
     let bind: IpAddr = config
         .server
@@ -579,11 +582,47 @@ async fn serve_http(listener: TcpListener, router: Router, mut shutdown: watch::
 /// directory: tests share the process.
 #[cfg(test)]
 pub(crate) mod test_hook {
+    use crate::control::resources::{tests::FakeProbe, Probe, ResourceWatch};
     use crate::control::ShardOwners;
     use crate::metrics::MetricsStore;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
+
+    fn probes() -> &'static Mutex<HashMap<String, Arc<FakeProbe>>> {
+        static PROBES: OnceLock<Mutex<HashMap<String, Arc<FakeProbe>>>> = OnceLock::new();
+        PROBES.get_or_init(Default::default)
+    }
+
+    /// The server on `system_dir`, started after this call, reads disk space
+    /// and memory from `probe`.
+    pub(crate) fn use_probe(system_dir: &str, probe: Arc<FakeProbe>) {
+        probes().lock().unwrap().insert(system_dir.to_string(), probe);
+    }
+
+    /// The probe of the server on `system_dir`: the one set for it, or a
+    /// roomy fake.
+    pub(crate) fn probe(system_dir: &str) -> Arc<dyn Probe> {
+        probes().lock().unwrap().get(system_dir).cloned().unwrap_or_else(FakeProbe::new)
+    }
+
+    type Watch = Arc<parking_lot::Mutex<ResourceWatch>>;
+
+    fn watches() -> &'static Mutex<HashMap<String, Watch>> {
+        static WATCHES: OnceLock<Mutex<HashMap<String, Watch>>> = OnceLock::new();
+        WATCHES.get_or_init(Default::default)
+    }
+
+    pub(crate) fn register_watch(system_dir: &str, watch: Watch) {
+        watches().lock().unwrap().insert(system_dir.to_string(), watch);
+    }
+
+    /// One tick of the resource watch of the server on `system_dir`, as its
+    /// loop runs once a second.
+    pub(crate) fn tick_resources(system_dir: &str) {
+        let watch = watches().lock().unwrap().get(system_dir).cloned().expect("a running resource watch");
+        watch.lock().tick();
+    }
 
     fn events() -> &'static Mutex<HashMap<String, Vec<String>>> {
         static EVENTS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
@@ -1331,7 +1370,7 @@ mod tests {
             format!("{err:#}").contains("shard count changed (stored 2, configured 1) — run `luradb --migrate-shards 1`"),
             "{err:#}"
         );
-        assert!(!dir.path().join("sstables").exists(), "no engine was opened");
+        assert!(std::fs::read_dir(dir.path().join("sstables")).unwrap().next().is_none(), "no engine was opened");
     }
 
     // The guard compares against the configured shard count.
@@ -1356,11 +1395,13 @@ mod tests {
     #[test]
     fn a_storage_thread_that_cannot_start_fails_the_start() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut cfg = test_config(dir.path());
-        cfg.storage.wal_path = dir.path().join("missing").join("luradb.wal").to_string_lossy().into_owned();
+        let cfg = test_config(dir.path());
+        let log = Path::new(&cfg.storage.wal_path);
+        std::fs::create_dir_all(log).unwrap();
+        std::fs::write(crate::core::wal::segment_path(log, 1), b"not a segment header").unwrap();
         let err = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
         assert!(format!("{err:#}").contains("the storage thread failed to start"), "{err:#}");
-        assert!(!dir.path().join("sstables").exists(), "no engine was opened");
+        assert!(std::fs::read_dir(dir.path().join("sstables")).unwrap().next().is_none(), "no engine was opened");
     }
 
     // Bootstrap barrier: every shard reports ready before any is released to
@@ -1485,11 +1526,11 @@ mod tests {
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     }
 
-    // A failed sync counts as a failed flush: with the SSTable directory of
-    // the JSON engine of shard 1 unsyncable, the stop keeps the JSON log byte
-    // for byte while the others are cut back, and a start that replays it
-    // fails before it truncates anything. Once the directory syncs again, the
-    // next start recovers the document.
+    // A failed sync stops the server, which keeps the log: with the SSTable
+    // directory of the JSON engine of shard 1 unsyncable, the stop keeps the
+    // JSON log byte for byte while the others are cut back, and a start that
+    // replays it stops before it truncates anything. Once the directory
+    // syncs again, the next start recovers the document.
     #[test]
     #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     fn a_failed_sync_keeps_the_engine_s_log_at_the_stop_and_fails_the_start() {
@@ -1528,7 +1569,7 @@ mod tests {
         let started = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml"));
         test_fault::allow_syncs_of(&unsyncable);
         let err = started.err().expect("the start must fail");
-        assert!(format!("{err:#}").contains(&format!("sync {}", unsyncable.display())), "{err:#}");
+        assert!(format!("{err:#}").contains(&format!("data sync failed on {}", unsyncable.display())), "{err:#}");
         assert_eq!(log_bytes(&cfg.json.wal_path), json_log, "the failed start truncates nothing");
 
         let server = Server::start(Arc::new(tuned()), &dir.path().join("luradb.toml")).unwrap();
@@ -2175,7 +2216,8 @@ mod tests {
                 }
 
                 let shape = [
-                    ("", vec!["backup", "block_cache", "domains", "engines", "shm", "system"]),
+                    ("", vec!["backup", "block_cache", "domains", "engines", "resources", "shm", "system"]),
+                    ("/resources", vec!["disk", "memory", "state"]),
                     ("/system", vec!["compaction_runs", "janitor_runs", "memtable_size_bytes", "total_reads", "total_writes"]),
                     ("/engines", vec!["json", "kv", "rel"]),
                     ("/engines/kv", vec![
@@ -2416,6 +2458,175 @@ mod tests {
                 assert_eq!((&body["status"], &body["domain_count"]), (&json!("ok"), &json!(3)));
             },
         );
+    }
+
+    // Test 4 (health): while disk space runs short, /health stays 200 with
+    // status `degraded` and names the volume in `resources`; the metrics
+    // carry the same block.
+    #[test]
+    fn health_stays_200_and_degraded_while_disk_space_runs_short() {
+        use crate::control::resources::tests::{FakeProbe, GB};
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let system_dir = cfg.storage.system_dir.clone();
+        let probe = FakeProbe::new();
+        probe.mount(dir.path(), 100 * GB, 50 * GB);
+        test_hook::use_probe(&system_dir, Arc::clone(&probe));
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (status, body) = request(addr, &get("/health")).await;
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!((status, &body["status"], &body["resources"]["state"]), (200, &json!("ok"), &json!("ok")));
+
+            probe.set_free(dir.path(), 9 * GB);
+            test_hook::tick_resources(&system_dir);
+            let (status, body) = request(addr, &get("/health")).await;
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!((status, &body["status"]), (200, &json!("degraded")), "{body}");
+            let disk = &body["resources"]["disk"][0];
+            assert_eq!((&body["resources"]["state"], &disk["state"]), (&json!("warning"), &json!("warning")), "{body}");
+            assert_eq!((&disk["size_bytes"], &disk["free_bytes"]), (&json!(100 * GB), &json!(9 * GB)));
+            assert_eq!(body["resources"]["memory"]["state"], json!("ok"));
+
+            let (status, body) = request(addr, &get("/store-api/metrics")).await;
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!((status, &body["resources"]["state"]), (200, &json!("warning")), "{body}");
+        });
+        server.shutdown().unwrap();
+    }
+
+    // Test 4 (server): while disk space runs short, the writes of every
+    // engine, domain changes and restores answer 507 with Retry-After: 5, an
+    // SQL INSERT too, which the engine refuses; the engines of a shard refuse
+    // their writes themselves. Reads, health, metrics, backup download and
+    // deletion, new users and their API keys go on; a backup runs into a
+    // backup directory on a volume with room and is refused once that volume
+    // runs short too. Back above the resume threshold, writes go in again.
+    #[test]
+    fn writes_answer_507_while_disk_space_runs_short_and_reads_go_on() {
+        use crate::control::resources::{tests::{FakeProbe, GB}, WriteBlocked};
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.json.enabled = true;
+        cfg.rel.enabled = true;
+        let system_dir = cfg.storage.system_dir.clone();
+        let backups = PathBuf::from(&cfg.backup.dir);
+        std::fs::create_dir_all(&backups).unwrap();
+        let probe = FakeProbe::new();
+        probe.mount(dir.path(), 100 * GB, 50 * GB);
+        probe.mount(&backups, 100 * GB, 50 * GB);
+        test_hook::use_probe(&system_dir, Arc::clone(&probe));
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let delete = |path: &str| format!("DELETE {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+        let backup = with_body("POST", "/store-api/backups", &json!({ "scope": "all" }).to_string());
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "clé")).await.0, 200);
+            let sql = |statement: &str| with_body("POST", "/store-api/rel/default/sql", &sql_body(statement));
+            assert_eq!(request(addr, &sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")).await.0, 200);
+            let index = json!({ "field": "city", "type": "string" }).to_string();
+            assert_eq!(request(addr, &with_body("POST", "/store-api/json/default/indexes", &index)).await.0, 201);
+            let document = json!({ "city": "Lyon" }).to_string();
+            assert!(request(addr, &with_body("PUT", "/store-api/json/default/documents/kept", &document)).await.0 < 300);
+            let (status, body) = request(addr, &backup).await;
+            assert_eq!(status, 202, "{}", String::from_utf8_lossy(&body));
+            let id = serde_json::from_slice::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            assert_eq!(when_finished(addr, &format!("/store-api/backups/{id}")).await["state"], json!("complete"));
+
+            probe.set_free(dir.path(), GB);
+            test_hook::tick_resources(&system_dir);
+            let refused = [
+                with_body("PUT", "/store-api/kv/default/keys/k", "v"),
+                delete("/store-api/kv/default/keys/k"),
+                with_body("POST", "/store-api/domains", &json!({ "name": "more" }).to_string()),
+                delete("/store-api/domains/default"),
+                with_body("PUT", "/store-api/json/default/documents/d", &document),
+                delete("/store-api/json/default/documents/kept"),
+                with_body("POST", "/store-api/json/default/bulk", "{}"),
+                with_body("POST", "/store-api/json/default/reindex", "{}"),
+                sql("INSERT INTO t VALUES (1, 'clé')"),
+                sql("CREATE TABLE u (id INTEGER PRIMARY KEY)"),
+                with_body("POST", "/store-api/rel/default/tables/from-file?name=imported&format=csv", "id,v\n1,clé\n"),
+                with_body("POST", &format!("/store-api/backups/{id}/restore"), "{}"),
+            ];
+            for raw in refused {
+                let (status, head, body) = exchange(addr, &raw).await;
+                let body = String::from_utf8_lossy(&body);
+                assert_eq!(status, 507, "{raw}: {body}");
+                assert!(head.to_ascii_lowercase().contains("retry-after: 5"), "{raw}: {head}");
+                assert_eq!(body, "507 Insufficient Storage: write blocked: disk space below threshold, retry in 5 s");
+            }
+            let owners = test_hook::owners(&system_dir, 0);
+            let engines = [owners.kv.engine(), owners.json.as_ref().unwrap().engine(), owners.rel.as_ref().unwrap().engine()];
+            for engine in engines {
+                assert!(WriteBlocked::in_chain(&engine.put(b"raw", b"v").await.unwrap_err()).is_some());
+            }
+
+            let (status, value) = request(addr, &get("/store-api/kv/default/keys/k")).await;
+            assert_eq!((status, value.as_slice()), (200, "clé".as_bytes()));
+            assert_eq!(request(addr, &sql("SELECT v FROM t")).await.0, 200);
+            let search = json!({ "filter": { "city": "Lyon" } }).to_string();
+            assert_eq!(request(addr, &with_body("POST", "/store-api/json/default/search", &search)).await.0, 200);
+            let (status, body) = request(addr, &get("/health")).await;
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!((status, &body["status"], &body["resources"]["state"]), (200, &json!("degraded"), &json!("blocked")));
+            assert_eq!(request(addr, &get("/store-api/metrics")).await.0, 200);
+            assert_eq!(request(addr, &get(&format!("/store-api/backups/{id}/download"))).await.0, 200);
+            let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
+            assert_eq!(request(addr, &user).await.0, 201);
+            assert_eq!(request(addr, &with_body("POST", "/store-api/auth/users/ines/rotate-key", "")).await.0, 200);
+
+            let (status, body) = request(addr, &backup).await;
+            assert_eq!(status, 202, "onto a volume with room: {}", String::from_utf8_lossy(&body));
+            let second = serde_json::from_slice::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+            assert_eq!(when_finished(addr, &format!("/store-api/backups/{second}")).await["state"], json!("complete"));
+            probe.set_free(&backups, 5 * GB);
+            test_hook::tick_resources(&system_dir);
+            assert_eq!(request(addr, &backup).await.0, 507, "onto a volume below its warn threshold");
+            assert!(request(addr, &delete(&format!("/store-api/backups/{second}"))).await.0 < 300);
+
+            probe.set_free(dir.path(), 50 * GB);
+            probe.set_free(&backups, 50 * GB);
+            test_hook::tick_resources(&system_dir);
+            test_hook::tick_resources(&system_dir);
+            assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
+            assert_eq!(request(addr, &sql("INSERT INTO t VALUES (1, 'clé')")).await.0, 200);
+        });
+        server.shutdown().unwrap();
+    }
+
+    // Test 8: a start on a volume with less free space than the block
+    // threshold plus the write-ahead log recovering onto it fails with
+    // `NoRoomToRecover`, the exit code 4 error, before any engine opens.
+    // Without a log to recover, a start below the block threshold refuses
+    // writes from the outset.
+    #[test]
+    fn a_start_without_room_to_recover_fails_with_exit_code_4() {
+        use crate::control::resources::{tests::{FakeProbe, GB}, NoRoomToRecover};
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let log = Path::new(&cfg.storage.wal_path);
+        let segment = crate::core::wal::segment_path(log, 1);
+        std::fs::create_dir_all(log).unwrap();
+        std::fs::write(&segment, crate::core::wal::wal_header(0)).unwrap();
+        let probe = FakeProbe::new();
+        probe.mount(dir.path(), 100 * GB, 2 * GB + 15);
+        test_hook::use_probe(&cfg.storage.system_dir, Arc::clone(&probe));
+        let cfg = Arc::new(cfg);
+
+        let err = Server::start(Arc::clone(&cfg), &dir.path().join("luradb.toml")).err().expect("the start must fail");
+        assert!(err.downcast_ref::<NoRoomToRecover>().is_some(), "{err:#}");
+        assert!(std::fs::read_dir(dir.path().join("sstables")).unwrap().next().is_none(), "no engine was opened");
+
+        std::fs::remove_file(&segment).unwrap();
+        probe.set_free(dir.path(), GB);
+        let server = Server::start(cfg, &dir.path().join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let put = with_body("PUT", "/store-api/kv/default/keys/k", "v");
+        let (status, _) = tokio::runtime::Runtime::new().unwrap().block_on(request(addr, &put));
+        server.shutdown().unwrap();
+        assert_eq!(status, 507);
     }
 
     // Shard 1 leaves its pings unanswered: /health answers 503 once the

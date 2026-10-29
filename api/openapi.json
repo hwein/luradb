@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "LuraDB API",
-    "description": "REST-native multi-model database — KeyValue and JSON engines. `version` is the API contract version (see API_VERSION), independent of the server version; the latter is in the `x-luradb-server-version` extension. Runtime check: GET /version. Under overload, any endpoint may answer 503 Service Unavailable (text/plain) with `Retry-After: 1`; the request was not processed and may be retried.",
+    "description": "REST-native multi-model database — KeyValue and JSON engines. `version` is the API contract version (see API_VERSION), independent of the server version; the latter is in the `x-luradb-server-version` extension. Runtime check: GET /version. Under overload, any endpoint may answer 503 Service Unavailable (text/plain) with `Retry-After: 1`; the request was not processed and may be retried. While disk space or memory runs short, writes answer 507 Insufficient Storage (text/plain) with `Retry-After: 5` and are not applied; reads go on.",
     "contact": {
       "name": "Heiko Wein"
     },
@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.13.1",
+    "version": "0.14.0",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -20,11 +20,11 @@
           "Metrics"
         ],
         "summary": "`GET /health` — public heartbeat endpoint.",
-        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, and\nin `shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms. No authentication required.",
+        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, in\n`shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms, and in `resources` the free disk space of\neach data volume and the server's own memory. No authentication required.",
         "operationId": "health",
         "responses": {
           "200": {
-            "description": "System is healthy: every data shard answered",
+            "description": "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory",
             "content": {
               "application/json": {
                 "schema": {
@@ -445,6 +445,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -490,6 +507,23 @@
           },
           "503": {
             "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -779,6 +813,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -899,6 +950,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -967,6 +1035,23 @@
           },
           "404": {
             "description": "Domain not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1128,6 +1213,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1243,6 +1345,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1309,6 +1428,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1492,6 +1628,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1799,6 +1952,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -1924,6 +2094,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2134,6 +2321,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2191,6 +2395,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2284,6 +2505,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2703,6 +2941,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2977,6 +3232,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -3098,6 +3370,23 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
                 }
               }
             },
@@ -3331,6 +3620,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3542,7 +3848,7 @@
           "Metrics"
         ],
         "summary": "`GET /metrics` — system + all domain metrics. Admin only.",
-        "description": "`engines` is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.\n\n`shm` covers the shared-memory snapshot publisher, all zero while SHM is\noff: `snapshot_publishes_total`, `snapshot_publish_skips_total` (a client\nwas still reading the buffer due for overwriting),\n`snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot\nis not being updated) and `clients_kicked_total` (clients disconnected after\n`shm.kick_blocking_client_after_secs`).",
+        "description": "`engines` is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.\n\n`shm` covers the shared-memory snapshot publisher, all zero while SHM is\noff: `snapshot_publishes_total`, `snapshot_publish_skips_total` (a client\nwas still reading the buffer due for overwriting),\n`snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot\nis not being updated) and `clients_kicked_total` (clients disconnected after\n`shm.kick_blocking_client_after_secs`).\n\n`resources` is the disk and memory state `GET /health` reports.",
         "operationId": "get_metrics",
         "responses": {
           "200": {
@@ -3728,6 +4034,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3853,6 +4176,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3968,6 +4308,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -4202,6 +4559,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -4620,6 +4994,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -4867,6 +5258,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -4958,6 +5366,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -5633,6 +6058,37 @@
           }
         }
       },
+      "DiskReport": {
+        "type": "object",
+        "description": "A volume in the resource report.",
+        "required": [
+          "path",
+          "size_bytes",
+          "free_bytes",
+          "state"
+        ],
+        "properties": {
+          "free_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Free to the server, without the space reserved for root.",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "description": "A data path on the volume."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`ok`, `warning` or `blocked`."
+          }
+        }
+      },
       "DocumentListResponse": {
         "type": "object",
         "required": [
@@ -5731,7 +6187,8 @@
           "estimated_memtable_keys",
           "vlog_size_bytes",
           "l0_sstable_count",
-          "shards"
+          "shards",
+          "resources"
         ],
         "properties": {
           "domain_count": {
@@ -5747,6 +6204,10 @@
             "type": "integer",
             "minimum": 0
           },
+          "resources": {
+            "$ref": "#/components/schemas/ResourceReport",
+            "description": "Free disk space of each data volume and the server's own memory."
+          },
           "shards": {
             "type": "array",
             "items": {
@@ -5756,7 +6217,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`ok`, or `degraded` while a data shard does not answer."
+            "description": "`ok`, or `degraded` while a data shard does not answer or disk space\nor memory runs short (`resources`)."
           },
           "uptime_secs": {
             "type": "integer",
@@ -6054,6 +6515,31 @@
           }
         }
       },
+      "MemoryReport": {
+        "type": "object",
+        "description": "The server's anonymous memory against its budget.",
+        "required": [
+          "rss_anon_bytes",
+          "budget_bytes",
+          "state"
+        ],
+        "properties": {
+          "budget_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "rss_anon_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`ok`, `warning` or `blocked`."
+          }
+        }
+      },
       "PermissionItem": {
         "type": "object",
         "description": "One entry of a user's domain permission matrix. `store_type`/`access` are\nlowercase and match the write-endpoint vocabulary exactly (`parse_store_type`,\n`access` parsing in `set_permission`) — usable as-is in a follow-up request.",
@@ -6119,6 +6605,31 @@
           "state": {
             "type": "string",
             "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running).\nAlways present — so a later `list_domains` visibility change\n(surfacing `Deleting` domains too) needs no REST-contract change."
+          }
+        }
+      },
+      "ResourceReport": {
+        "type": "object",
+        "description": "`resources` of `GET /health` and `GET /store-api/metrics`.",
+        "required": [
+          "state",
+          "disk",
+          "memory"
+        ],
+        "properties": {
+          "disk": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiskReport"
+            },
+            "description": "Every volume a data path lies on."
+          },
+          "memory": {
+            "$ref": "#/components/schemas/MemoryReport"
+          },
+          "state": {
+            "type": "string",
+            "description": "`ok`, `warning` (below a warn threshold) or `blocked` (writes refused)."
           }
         }
       },

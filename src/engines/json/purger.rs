@@ -28,8 +28,12 @@ impl JsonDomainPurger {
     /// domain; finalizes the domain once no data keys remain. The scans run
     /// under every document-write shard: a writer still in flight lands its
     /// keys before the final empty scan, every later one sees the domain
-    /// `Deleting` and writes nothing — so the finalize needs no shard.
+    /// `Deleting` and writes nothing — so the finalize needs no shard. No
+    /// cycle runs while writes are refused for want of disk space or memory.
     pub async fn purge_tick(&self) -> anyhow::Result<()> {
+        if self.engine.engine().writes_refused() {
+            return Ok(());
+        }
         for domain in self.engine.domains.list_deleting_domains() {
             let emptied = {
                 let _guards = self.engine.lock_shards((0..DOC_WRITE_SHARDS).collect()).await;
@@ -141,6 +145,28 @@ mod tests {
                 json.domains.get_domain_any("doomed").is_none(),
                 "metadata must be gone after finalize"
             );
+        })
+    }
+
+    // Test 6: while writes are refused, a purge tick writes nothing; after
+    // the block the purge goes on.
+    #[test]
+    fn test_no_purge_while_writes_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let json = seeded_engine(&dir).await;
+            json.delete_domain("doomed").await.unwrap();
+            let purger = purger(&json, 100);
+
+            json.engine().resources().block_for_test(false, false);
+            let lsn = json.engine().last_applied_lsn();
+            purger.purge_tick().await.unwrap();
+            assert_eq!(json.engine().last_applied_lsn(), lsn, "no tombstone during the block");
+
+            json.engine().resources().unblock_for_test();
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
+            assert!(json.domains.get_domain_any("doomed").is_none());
         })
     }
 

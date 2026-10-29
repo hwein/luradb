@@ -22,14 +22,15 @@ const SHARD_PING_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// `GET /health` — public heartbeat endpoint.
 ///
-/// Returns a JSON snapshot of system vitals, summed over the data shards, and
-/// in `shards` the status of each data shard: `ok` once it answered, `timeout`
-/// when it did not within 250 ms. No authentication required.
+/// Returns a JSON snapshot of system vitals, summed over the data shards, in
+/// `shards` the status of each data shard: `ok` once it answered, `timeout`
+/// when it did not within 250 ms, and in `resources` the free disk space of
+/// each data volume and the server's own memory. No authentication required.
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "System is healthy: every data shard answered", body = crate::metrics::HeartbeatMetrics),
+        (status = 200, description = "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory", body = crate::metrics::HeartbeatMetrics),
         (status = 503, description = "A data shard did not answer within 250 ms; the full report with status `degraded`; its `shards` list names the shard with status `timeout`", body = crate::metrics::HeartbeatMetrics),
     ),
     security(()),
@@ -45,7 +46,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
     let engines: Vec<_> = state.control.shard_owners().map(|owners| owners.kv.engine().heartbeat_data()).collect();
     let directory = state.control.directory();
     let domain_count = directory.domains(Engine::Kv).filter(|d| d.state == Lifecycle::Active).count();
-    let hb = state.metrics.heartbeat(&engines, domain_count, &answered);
+    let hb = state.metrics.heartbeat(&engines, domain_count, &answered, state.control.resources().report());
     let status = if answered.iter().all(|&ok| ok) { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, Json(serde_json::to_value(hb).unwrap_or_else(|_| json!({"status": "ok"}))))
 }
@@ -120,6 +121,8 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 /// `snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot
 /// is not being updated) and `clients_kicked_total` (clients disconnected after
 /// `shm.kick_blocking_client_after_secs`).
+///
+/// `resources` is the disk and memory state `GET /health` reports.
 //
 // Every field is the sum over the data shards; the latency percentiles are
 // those of the shards' windows merged. The `system` block's
@@ -210,7 +213,8 @@ pub async fn get_metrics(State(state): State<AppState>) -> Result<Json<Value>, A
         "engines": engines,
         "block_cache": block_cache,
         "backup": backup,
-        "shm": shm
+        "shm": shm,
+        "resources": state.control.resources().report(),
     })))
 }
 

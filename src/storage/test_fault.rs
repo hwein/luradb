@@ -1,6 +1,6 @@
 //! Directories in which file creation fails, as in a read-only directory but
-//! for any user, root included, and files and directories whose sync fails:
-//! tests share the process.
+//! for any user, root included, files and directories whose sync fails, and
+//! the stops failed syncs caused: tests share the process.
 
 use std::collections::HashSet;
 use std::io;
@@ -50,4 +50,19 @@ pub(crate) fn check_sync(path: &Path) -> io::Result<()> {
         return Err(io::Error::other(format!("test fault: sync of {}", path.display())));
     }
     Ok(())
+}
+
+fn stops() -> &'static Mutex<Vec<PathBuf>> {
+    static STOPS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    STOPS.get_or_init(Default::default)
+}
+
+/// A stop after a failed sync of `path`, in place of the process exit.
+pub(crate) fn record_stop(path: &Path) {
+    stops().lock().unwrap().push(path.to_path_buf());
+}
+
+/// The paths below `root` whose failed syncs stopped the server, in order.
+pub(crate) fn stops_under(root: &Path) -> Vec<PathBuf> {
+    stops().lock().unwrap().iter().filter(|path| path.starts_with(root)).cloned().collect()
 }

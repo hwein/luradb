@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, PoisonError,
 };
 use std::time::{Duration, SystemTime};
 use tracing_appender::{
@@ -13,7 +13,17 @@ use tracing_appender::{
 };
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-pub fn init_logging(cfg: &LogConfig) -> Result<Option<WorkerGuard>> {
+/// The file logger's writer guard, held here so a stop from any thread can
+/// write out what the logger still buffers ([`flush`]).
+static FILE_LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
+
+/// Writes out the lines the file logger still buffers; the last call before
+/// the process ends, from any thread. Later lines go nowhere.
+pub fn flush() {
+    drop(FILE_LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner).take());
+}
+
+pub fn init_logging(cfg: &LogConfig) -> Result<()> {
     let filter = build_env_filter(cfg);
 
     if cfg.path.is_empty() {
@@ -31,7 +41,7 @@ pub fn init_logging(cfg: &LogConfig) -> Result<Option<WorkerGuard>> {
                     .init();
             }
         }
-        return Ok(None);
+        return Ok(());
     }
 
     let appender = match cfg.rotation.as_str() {
@@ -56,7 +66,8 @@ pub fn init_logging(cfg: &LogConfig) -> Result<Option<WorkerGuard>> {
         }
     }
 
-    Ok(Some(guard))
+    *FILE_LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
+    Ok(())
 }
 
 fn build_env_filter(cfg: &LogConfig) -> EnvFilter {

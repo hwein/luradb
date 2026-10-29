@@ -82,6 +82,14 @@ impl BackupScheduler {
             if !entry.cron.matches(t.minute, t.hour, t.day, t.month, t.weekday) {
                 continue;
             }
+            if !self.manager.backup_allowed() {
+                tracing::warn!(
+                    "[Backup Scheduler] skipping this tick for schedule '{}': writes are refused for want of \
+                     disk space or memory, and the backup directory has no volume of its own with room",
+                    entry.name
+                );
+                continue;
+            }
             match self.manager.start_backup(entry.scope.clone(), entry.include_auth, Some(entry.name.clone())).await
             {
                 Ok((id, handle)) => {
@@ -218,6 +226,26 @@ mod tests {
             let job = manager.running_job().expect("the pre-existing job must still be there");
             assert_eq!(job.id, "bk_manual", "tick must not have started (and overwritten) a new job");
             assert!(manager.list_backups().unwrap().is_empty(), "no backup file must have been produced");
+        })
+    }
+
+    // A due schedule is skipped while writes are refused for want of disk
+    // space and the backup directory has no volume of its own with room; it
+    // starts once that volume has room.
+    #[test]
+    fn test_tick_skips_a_schedule_while_backups_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let scheduler =
+                BackupScheduler::new(Arc::clone(&manager), &[always_matching_schedule("nightly")], Arc::new(AtomicBool::new(false)))
+                    .unwrap();
+            manager.control.resources().block_for_test(false, false);
+            scheduler.tick(now_secs()).await;
+            assert!(manager.running_job().is_none(), "no backup during the block");
+
+            manager.control.resources().block_for_test(false, true);
+            scheduler.tick(now_secs()).await;
+            assert!(manager.running_job().is_some(), "a backup onto a volume with room");
         })
     }
 

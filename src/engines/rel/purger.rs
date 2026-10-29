@@ -31,8 +31,12 @@ impl RelDomainPurger {
 
     /// One cycle: first fully purge `Deleting` domains (job a), then reap
     /// orphaned ranges of active domains (job b). Per-domain errors are logged;
-    /// the tick continues.
+    /// the tick continues. No cycle runs while writes are refused for want of
+    /// disk space or memory.
     pub async fn purge_tick(&self) -> anyhow::Result<()> {
+        if self.engine.engine().writes_refused() {
+            return Ok(());
+        }
         self.purge_deleting_domains().await?;
         self.sweep_active_domains().await?;
         Ok(())
@@ -271,6 +275,29 @@ mod tests {
             assert!(e.scan_keys(&cat).await.unwrap().is_empty(), "CAT entries gone");
             assert!(e.scan_keys(b"__sys:rel_catalog_seq:doomed").await.unwrap().is_empty(), "catalog seq gone");
             assert!(e.scan_keys(b"__sys:rel_domain:doomed").await.unwrap().is_empty(), "metadata gone");
+            assert!(rel.get_domain_any("doomed").is_none());
+            rel.shutdown().await;
+        })
+    }
+
+    // Test 6: while writes are refused, a purge tick writes nothing; after
+    // the block the purge goes on.
+    #[test]
+    fn test_no_purge_while_writes_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make().await;
+            seed_doomed(&rel).await;
+            rel.delete_domain("doomed").await.unwrap();
+            let p = purger(&rel, 100);
+
+            rel.engine().resources().block_for_test(false, false);
+            let lsn = rel.engine().last_applied_lsn();
+            p.purge_tick().await.unwrap();
+            assert_eq!(rel.engine().last_applied_lsn(), lsn, "no tombstone during the block");
+
+            rel.engine().resources().unblock_for_test();
+            p.purge_tick().await.unwrap();
+            p.purge_tick().await.unwrap();
             assert!(rel.get_domain_any("doomed").is_none());
             rel.shutdown().await;
         })

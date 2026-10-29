@@ -7,7 +7,8 @@
 //! The Janitor runs as a background engine task and reclaims dead space by
 //! rolling the vLog forward one *generation* per cycle:
 //!
-//! 1. Gate on the estimated dead-byte ratio; below the threshold, skip.
+//! 1. Gate on the estimated dead-byte ratio; below the threshold, skip, and
+//!    so while the volume lacks the free space the live values take.
 //! 2. Open generation `N+1` and publish it as the active append target,
 //!    together with a fresh MemTable.
 //! 3. Seal every generation `<= N`, so no new pointer into them can appear.
@@ -25,6 +26,7 @@
 //! All steps are performed without holding any write-path locks for extended
 //! periods, so normal reads and writes are never stalled.
 
+use crate::control::resources::{Resources, SpaceWait};
 use crate::core::engine_runtime::spawn_io;
 use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::engine::LsmStorageEngine;
@@ -166,6 +168,11 @@ pub struct Janitor {
     /// no older version holds them.
     retired: Mutex<Vec<Arc<VLog>>>,
 
+    /// Where the free space of the value log's volume comes from.
+    resources: Resources,
+    /// Cycles skipped for want of disk space.
+    space: SpaceWait,
+
     /// Test-only pause point between opening the rebuilt readers and
     /// installing them.
     #[cfg(test)]
@@ -200,6 +207,7 @@ impl Janitor {
         flush_lock: Option<Arc<tokio::sync::Mutex<()>>>,
         maintenance_lock: Option<Arc<tokio::sync::Mutex<()>>>,
         write_drain: Option<WriteDrain>,
+        resources: Resources,
     ) -> Self {
         Self {
             version,
@@ -218,6 +226,8 @@ impl Janitor {
             maintenance_lock,
             write_drain,
             retired: Mutex::new(Vec::new()),
+            resources,
+            space: SpaceWait::default(),
             #[cfg(test)]
             install_hook: None,
             #[cfg(test)]
@@ -280,9 +290,10 @@ impl Janitor {
     /// Runs one GC cycle.
     ///
     /// Returns [`GcStats`] describing what happened.  If the dead-byte ratio
-    /// is below the threshold the cycle is a no-op. Every run, a skipped one
-    /// included, first deletes the retired generations no version holds any
-    /// more.
+    /// is below the threshold, or the value log's volume has less free space
+    /// than the live values take, the cycle is a no-op. Every run, a skipped
+    /// one included, first deletes the retired generations no version holds
+    /// any more.
     pub async fn run_gc(&self) -> Result<GcStats> {
         self.delete_retired_generations(false).await;
 
@@ -313,6 +324,19 @@ impl Janitor {
         {
             return Ok(GcStats::skipped());
         }
+
+        // The live values are what the copy below writes.
+        let vlog_dir = self.vlog_base_path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        if let Some(free) = self.resources.free_space(vlog_dir).filter(|&free| free < probe_live) {
+            if self.space.skipped() {
+                tracing::warn!(
+                    "Value log cleanup waits for disk space: {free} bytes free in {}, its live values take {probe_live}.",
+                    vlog_dir.display()
+                );
+            }
+            return Ok(GcStats::skipped());
+        }
+        self.space.ran();
 
         eprintln!(
             "[Janitor] Starting GC: generations={source_ids:?}, vlog_size={vlog_size}, dead(est)={dead_bytes} ({:.1}%)",
@@ -899,6 +923,7 @@ mod tests {
             None,
             None,
             None,
+            Resources::default(),
         )
     }
 

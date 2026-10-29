@@ -25,6 +25,8 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: Backups include relational domains (schema, rows, AUTOINCREMENT state); scope accepts `rel` and `rel:<domain>`.
 - Built-in MCP server with OAuth sign-in (opt-in, `[mcp]` config section).
 - `storage.wal_max_size` caps the write-ahead log of each engine (default 256 MiB); the shards holding the oldest segment flush and the segment is dropped when the cap is reached, and a segment open for five minutes is closed the same way.
+- The server watches free disk space and its own memory use; below configurable thresholds it logs a warning, then refuses writes with 507 and `Retry-After` while reads continue, and resumes on its own. `GET /health` reports `degraded` with the numbers in a new `resources` field, which `GET /store-api/metrics` carries too.
+- `[resources]` settings `disk_free_warn`, `disk_free_block`, `disk_free_resume`, `memory_budget` take sizes and percentages.
 
 ### Changed
 
@@ -66,6 +68,8 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: Backup archives use manifest format v2 (shard count, LSN cut); v1 archives remain restorable.
 - The storage hub submits writes for other log files while a commit is still in flight.
 - **BREAKING** API: domain listings return the domains the API key has permissions on instead of 403 for non-admin keys; JSON and relational domain details are readable with a domain permission.
+- A failed fsync of the write-ahead log or value log stops the service with exit code 3 so the next start recovers from the write-ahead log; a start without room to recover exits with code 4, and the systemd unit does not restart after it.
+- **BREAKING** API: writes during a disk or memory shortage answer 507 Insufficient Storage instead of 500.
 
 ### Removed
 

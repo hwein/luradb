@@ -305,9 +305,10 @@ impl RelCrossEngineSweeper {
         self.engine.control.get().is_some_and(|control| control.restore_running())
     }
 
-    /// Skipped while a restore runs: a domain it replaces is briefly gone.
+    /// Skipped while a restore runs: a domain it replaces is briefly gone;
+    /// and while writes are refused for want of disk space or memory.
     pub async fn sweep_tick(&self) -> anyhow::Result<()> {
-        if self.restore_running() {
+        if self.restore_running() || self.engine.engine().writes_refused() {
             return Ok(());
         }
         for dom in self.engine.domains.list_domains() {
@@ -1051,6 +1052,32 @@ mod tests {
             e.kv.finalize_domain_deletion("d").await.unwrap();
             e.kv.create_domain("d").await.unwrap();
             assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null, "nulled stays nulled");
+        })
+    }
+
+    // Test 6: while writes are refused, a sweep writes nothing; the next one
+    // after the block nulls the cell.
+    #[test]
+    fn test_sweep_waits_while_writes_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let e = env().await;
+            e.rel.create_domain("d").await.unwrap();
+            e.kv.create_domain("d").await.unwrap();
+            kv_put(&e.kv, "d", b"k", b"v").await;
+            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
+            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k')").await;
+            e.kv.delete_domain("d").await.unwrap();
+
+            let resources = e.rel.engine().resources();
+            resources.block_for_test(false, false);
+            let lsn = e.rel.engine().last_applied_lsn();
+            sweep_once(&e.rel, 100).await;
+            assert_eq!(e.rel.engine().last_applied_lsn(), lsn, "no write during the block");
+            assert_ne!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
+
+            resources.unblock_for_test();
+            sweep_once(&e.rel, 100).await;
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
         })
     }
 

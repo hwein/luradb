@@ -3,9 +3,10 @@
 //! Errors from the domain/engine layer embed an HTTP status code as a numeric
 //! prefix in the message string (e.g. "404 Not Found: …"). `ApiError` reads
 //! that prefix and produces the appropriate HTTP response, including a
-//! `Retry-After: 1` header for 429 and `Cache-Control: no-store` for 428
-//! responses.
+//! `Retry-After: 1` header for 429, `Retry-After: 5` for 507 and
+//! `Cache-Control: no-store` for 428 responses.
 
+use crate::control::resources::{WriteBlocked, RETRY_AFTER_SECS};
 use crate::control::DomainError;
 use axum::{
     extract::{ConnectInfo, Request, State},
@@ -32,10 +33,21 @@ impl ApiError {
     }
 }
 
+impl From<WriteBlocked> for ApiError {
+    fn from(e: WriteBlocked) -> Self {
+        ApiError::new(StatusCode::INSUFFICIENT_STORAGE, e.to_string())
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if let Some(blocked) = WriteBlocked::in_chain(&e) {
+            return blocked.into();
+        }
         let msg = e.to_string();
-        let status = if msg.starts_with("429") {
+        let status = if msg.starts_with("507") {
+            StatusCode::INSUFFICIENT_STORAGE
+        } else if msg.starts_with("429") {
             StatusCode::TOO_MANY_REQUESTS
         } else if msg.starts_with("410") {
             StatusCode::GONE
@@ -80,6 +92,9 @@ impl IntoResponse for ApiError {
         if self.0 == StatusCode::TOO_MANY_REQUESTS {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, "1".parse().unwrap());
+        }
+        if self.0 == StatusCode::INSUFFICIENT_STORAGE {
+            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
         }
         // RFC 6585 section 3: a 428 must not be stored by a cache.
         if self.0 == StatusCode::PRECONDITION_REQUIRED {
@@ -323,6 +338,20 @@ mod tests {
     fn api_error_maps_400_prefix_to_bad_request() {
         let err = ApiError::from(anyhow::anyhow!("400 Bad Request: key must be valid UTF-8"));
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    // A write refused for want of disk space answers 507 with Retry-After: 5
+    // and the refusal's text, behind added context too.
+    #[tokio::test]
+    async fn a_refused_write_maps_to_507_with_retry_after() {
+        let resources = crate::control::resources::Resources::default();
+        resources.block_for_test(false, false);
+        let refused = anyhow::Error::from(resources.check_write().unwrap_err()).context("writing the batch");
+        let resp = ApiError::from(refused).into_response();
+        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "5");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, "507 Insufficient Storage: write blocked: disk space below threshold, retry in 5 s");
     }
 
     #[test]

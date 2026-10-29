@@ -21,6 +21,7 @@ use crate::{
     config::{BlockCacheConfig, LuraConfig},
     control::{
         checkpoint::{Holder, WalCheckpoint, WAL_CHECKPOINT_INTERVAL},
+        resources::{self, ResourceWatch, Resources, RESOURCE_WATCH_INTERVAL},
         system, ControlPlane, Engine, Owners, Shard, ShardCommand, ShardOwners,
     },
     core::{
@@ -101,8 +102,8 @@ struct Cluster {
     /// Each enabled engine's write-ahead log.
     wals: Vec<(Engine, WriteAheadLog)>,
     system_store: Arc<LsmStorageEngine>,
-    /// Checkpoints the write-ahead logs and removes the expired OAuth codes
-    /// and tokens from the system store.
+    /// Watches disk space and memory, checkpoints the write-ahead logs and
+    /// removes the expired OAuth codes and tokens from the system store.
     system_loops: shard::Loops,
     shm_manager: Option<Arc<ShmManager>>,
     shm: Option<ShmServices>,
@@ -262,6 +263,17 @@ async fn bootstrap(
     let capacity = config.multicore.shard_queue_capacity;
     let shard_0 = Lane::new(capacity);
     let wal_limit = config.storage.wal_max_bytes()?;
+
+    // Before any data file opens: the data directories, the volumes they lie
+    // on, the room to recover there and the memory budget.
+    let base = std::env::current_dir().context("reading the working directory")?;
+    #[cfg(not(test))]
+    let probe: Arc<dyn resources::Probe> = Arc::new(resources::SystemProbe);
+    // Tests read a roomy fake unless they set one for the server.
+    #[cfg(test)]
+    let probe = super::test_hook::probe(&config.storage.system_dir);
+    let (watch, notices) = ResourceWatch::start(config, &base, probe)?;
+    resources::log(&notices);
     coop::init(config.multicore.cpu_offload_threads);
 
     // The storage hub before every engine: it writes all their WALs. The
@@ -281,6 +293,9 @@ async fn bootstrap(
     layout::migrate(config, &system_store, shards).await?;
     system::check_shard_count(&system_store, shards).await?;
     tracing::info!("System store ready.");
+    if let Some(notice) = watch.fixed_memory_notice(&resources::fixed_memory(config, shards)) {
+        resources::log(&[notice]);
+    }
     let (lanes, jobs): (Vec<Lane>, Vec<_>) =
         std::iter::once(shard_0).chain((1..shards).map(|_| Lane::new(capacity))).unzip();
 
@@ -299,7 +314,11 @@ async fn bootstrap(
         vlog: PathBuf::from(&config.storage.vlog_path),
         sstables: PathBuf::from(&config.storage.sstable_dir),
     };
-    let kv = recovery::open_sharded(&kv_files, shards, wal(WalTarget::Kv), || kv_options(config, &memory)).await?;
+    // Each data instance refuses its client writes while the watch says so.
+    let resources = watch.resources();
+    let gated = |options: LsmEngineOptions| LsmEngineOptions { resources: resources.clone(), ..options };
+    let kv_gated = || gated(kv_options(config, &memory));
+    let kv = recovery::open_sharded(&kv_files, shards, wal(WalTarget::Kv), kv_gated).await?;
     let mut wals = vec![(Engine::Kv, WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Kv))];
     let json = if config.json.enabled {
         let files = EngineFiles {
@@ -307,7 +326,7 @@ async fn bootstrap(
             vlog: PathBuf::from(&config.json.vlog_path),
             sstables: PathBuf::from(&config.json.sstable_dir),
         };
-        let options = || JsonEngine::lsm_options(&config.json, memory.block_cache());
+        let options = || gated(JsonEngine::lsm_options(&config.json, memory.block_cache()));
         wals.push((Engine::Json, WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Json)));
         Some(recovery::open_sharded(&files, shards, wal(WalTarget::Json), options).await?)
     } else {
@@ -320,7 +339,7 @@ async fn bootstrap(
             vlog: PathBuf::from(&config.rel.vlog_path),
             sstables: PathBuf::from(&config.rel.sstable_dir),
         };
-        let options = || RelEngine::lsm_options(&config.rel, memory.block_cache());
+        let options = || gated(RelEngine::lsm_options(&config.rel, memory.block_cache()));
         wals.push((Engine::Rel, WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Rel)));
         Some(recovery::open_sharded(&files, shards, wal(WalTarget::Rel), options).await?)
     } else {
@@ -366,7 +385,7 @@ async fn bootstrap(
     }
     drop((kv, json, rel));
 
-    let prepared = prepare_control(config, config_path, &threads, readies, &system_store).await;
+    let prepared = prepare_control(config, config_path, &threads, readies, &system_store, resources).await;
     let Prepared { states, trusted_cidrs, loops, shm_manager } = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
@@ -374,6 +393,13 @@ async fn bootstrap(
             return Err(e);
         }
     };
+
+    // The first reading before any client or background writer runs; the
+    // shards' own start writes, a default domain for one, went in before.
+    let watch = Arc::new(parking_lot::Mutex::new(watch));
+    resources::log(&watch.lock().tick());
+    #[cfg(test)]
+    super::test_hook::register_watch(&config.storage.system_dir, Arc::clone(&watch));
 
     // Released, the shards start their purgers and sweepers; then SHM.
     let mut reports = Vec::with_capacity(starts.len());
@@ -383,6 +409,13 @@ async fn bootstrap(
         reports.push(report);
     }
     let mut system_loops = shard::Loops::new();
+    system_loops.spawn("ResourceWatch", RESOURCE_WATCH_INTERVAL, move || {
+        let watch = Arc::clone(&watch);
+        async move {
+            resources::log(&watch.lock().tick());
+            Ok(())
+        }
+    });
     let logs = wals
         .iter()
         .map(|(engine, _)| (Holder::Shards(*engine), WalTarget::from(*engine)))
@@ -451,6 +484,7 @@ async fn prepare_control(
     threads: &[ShardThread],
     readies: Vec<oneshot::Receiver<anyhow::Result<ShardOwners>>>,
     system_store: &Arc<LsmStorageEngine>,
+    resources: Resources,
 ) -> anyhow::Result<Prepared> {
     let mut owners = Vec::with_capacity(readies.len());
     for ready in readies {
@@ -481,7 +515,7 @@ async fn prepare_control(
         .map(|(owners, thread)| Shard { owners: owners.clone(), commands: thread.commands.clone() })
         .collect();
     let owners_auth = Owners { shards, auth: Arc::clone(&auth_cache) };
-    let control = ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus).await?;
+    let control = ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus, resources).await?;
 
     let loops = spawn_loops(config);
     let backup_manager = init_backup(config, &control, &loops);

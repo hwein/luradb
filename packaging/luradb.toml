@@ -77,6 +77,25 @@ wal_queue_capacity = 1024
 # Default: "256 MiB"
 wal_max_size = "256 MiB"
 
+# Disk and memory shortage. Every second the server reads the free space of each volume
+# its data paths lie on and its own anonymous memory. Below the warn threshold it logs a
+# warning and /health reports "degraded"; below the block threshold every write answers
+# 507 with Retry-After: 5 while reads go on, until each volume is above the resume
+# threshold again. A disk threshold is a size ("2 GB"), a percentage of the volume ("5%")
+# or both, the smaller one counting ("15% max 10 GB"); per volume block <= resume <= warn
+# and block >= 64 MiB, or the server does not start.
+[resources]
+# Free space below which the server warns. Default: "15% max 10 GB"
+disk_free_warn = "15% max 10 GB"
+# Free space below which the server refuses writes. Default: "5% max 2 GB"
+disk_free_block = "5% max 2 GB"
+# Free space each volume needs before refused writes resume. Default: "10% max 4 GB"
+disk_free_resume = "10% max 4 GB"
+# Anonymous memory the server may use: a percentage of the host's memory, or of its
+# cgroup's memory.max when that is lower, or a size; at least 256 MiB. Writes warn from
+# 80 %, are refused from 95 % and resume below 90 % of it. Default: "75%"
+memory_budget = "75%"
+
 [io_engine]
 # Registers I/O buffers with the storage engine thread's io_uring ring; not
 # used on the data path yet. The storage thread — a dedicated io_uring thread

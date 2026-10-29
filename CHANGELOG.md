@@ -93,6 +93,8 @@ All notable changes to LuraDB are documented in this file.
 - JSON search no longer returns documents that stopped matching the filter while the search ran; results and `total` come from one consistent state.
 - The value log, new data files and their directories are synced before the write-ahead log is cleared at start and stop and before compaction or value-log cleanup delete old files, so a power loss loses no confirmed write.
 - A flush syncs its directory before the manifest names the new data file, so a power loss right after a flush no longer prevents the next start.
+- Each write-ahead log is cut back once it reaches 64 MiB, so it no longer grows until the next restart.
+- Recovery reads the write-ahead log buffered and replays it many times faster.
 
 ### Security
 

@@ -52,7 +52,10 @@ api_key = "@GENERATED_ON_INSTALL@"
 db_path = "/var/lib/luradb/luradb.db"
 # Write-ahead log. A failed write may leave luradb.wal.unsafe-end (the log's file name
 # plus .unsafe-end), marking where the next start cuts the log; never delete it by hand,
-# or recovery reads that write. Default: luradb.wal
+# or recovery reads that write. Once the log reaches 64 MiB the running server cuts it
+# back, with luradb.wal.tmp briefly beside the file, or beside its target for a symlink;
+# never delete that by hand either. The path may be a symlink, but not a second hard
+# link to the log. Default: luradb.wal
 wal_path = "/var/lib/luradb/luradb.wal"
 # Value log for large values. Default: luradb.vlog
 vlog_path = "/var/lib/luradb/luradb.vlog"
@@ -61,7 +64,10 @@ sstable_dir = "/var/lib/luradb/sstables"
 # Directory of the system store, which keeps the users, API key hashes and permissions
 # apart from domain data. A failed write may leave wal.unsafe-end beside its write-ahead
 # log wal, marking where the next start cuts the log; never delete it by hand, or
-# recovery reads that write. Default: luradb_sys beside the SSTable directory
+# recovery reads that write. Once wal reaches 64 MiB the running server cuts it back,
+# with wal.tmp briefly beside it, or beside its target for a symlink; never delete that
+# by hand either. wal may be a symlink, but not a second hard link to the log.
+# Default: luradb_sys beside the SSTable directory
 system_dir = "/var/lib/luradb/luradb_sys"
 # Writes waiting for the storage thread, which writes the write-ahead logs of all
 # engines; a full queue holds further writes back. 1 to 65536. Default: 1024
@@ -187,6 +193,9 @@ enabled = true
 # Write-ahead log; relative paths resolve against the working directory. A failed write
 # may leave luradb_json.wal.unsafe-end (the log's file name plus .unsafe-end), marking
 # where the next start cuts the log; never delete it by hand, or recovery reads that write.
+# Once the log reaches 64 MiB the running server cuts it back, with luradb_json.wal.tmp
+# briefly beside the file, or beside its target for a symlink; never delete that by hand
+# either. The path may be a symlink, but not a second hard link to the log.
 wal_path = "luradb_json.wal"
 # Value log for large documents.
 vlog_path = "luradb_json.vlog"
@@ -210,6 +219,9 @@ enabled = true
 # Write-ahead log; relative paths resolve against the working directory. A failed write
 # may leave luradb_rel.wal.unsafe-end (the log's file name plus .unsafe-end), marking
 # where the next start cuts the log; never delete it by hand, or recovery reads that write.
+# Once the log reaches 64 MiB the running server cuts it back, with luradb_rel.wal.tmp
+# briefly beside the file, or beside its target for a symlink; never delete that by hand
+# either. The path may be a symlink, but not a second hard link to the log.
 wal_path = "luradb_rel.wal"
 # Value log for large rows.
 vlog_path = "luradb_rel.vlog"

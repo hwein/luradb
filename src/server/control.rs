@@ -3,9 +3,9 @@
 //! engine's write-ahead log onto the data shards' instances, starts the
 //! shards and releases them once the control plane is attached to all of
 //! them. It then serves the requests without a domain and the shared-memory
-//! clients and, at the end, stops shared memory, drains the shards,
-//! truncates each write-ahead log whose engine flushed on every shard, and
-//! stops the hub.
+//! clients, checkpoints every write-ahead log once it grows long and, at the
+//! end, stops shared memory, drains the shards, truncates each write-ahead
+//! log whose engine flushed on every shard, and stops the hub.
 
 use super::{
     layout,
@@ -18,7 +18,10 @@ use crate::{
     backup,
     bridge::{self, Job, Lane},
     config::{BlockCacheConfig, LuraConfig},
-    control::{system, ControlPlane, Engine, Owners, Shard, ShardCommand, ShardOwners},
+    control::{
+        checkpoint::{Holder, WalCheckpoint, WAL_CHECKPOINT_INTERVAL},
+        system, ControlPlane, Engine, Owners, Shard, ShardCommand, ShardOwners,
+    },
     core::{
         coop,
         storage_thread::{self, StorageHandle, StorageThread, StorageThreadConfig, WalTarget},
@@ -97,7 +100,8 @@ struct Cluster {
     /// Each enabled engine's write-ahead log.
     wals: Vec<(Engine, WriteAheadLog)>,
     system_store: Arc<LsmStorageEngine>,
-    /// Removes the expired OAuth codes and tokens from the system store.
+    /// Checkpoints the write-ahead logs and removes the expired OAuth codes
+    /// and tokens from the system store.
     system_loops: shard::Loops,
     shm_manager: Option<Arc<ShmManager>>,
     shm: Option<ShmServices>,
@@ -109,19 +113,22 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// Stops the system store's sweeper and shared memory, then drains every
-    /// shard — the shard's requests end first — and truncates the
-    /// write-ahead log of each engine whose final flush succeeded on all
-    /// shards; then shuts the system store
-    /// down, stops the storage hub, once, joins the shard threads and only
-    /// then lets go of the data directories.
+    /// Stops the log checkpoints, the system store's sweeper and shared
+    /// memory, then drains every shard — the shard's requests end first — and
+    /// truncates the write-ahead log of each engine whose final flush
+    /// succeeded on all shards; then shuts the system store down, stops the
+    /// storage hub, once, joins the shard threads and only then lets go of
+    /// the data directories.
     async fn shutdown(self) {
         #[cfg(test)]
         let system_dir = self.system_dir.clone();
         let Cluster { shards, loops, wals, system_store, system_loops, shm_manager, shm, mut storage_thread, lock, .. } =
             self;
         loops.store(true, Ordering::Relaxed);
+        // A checkpoint in progress ends here, before the shards drain.
         system_loops.stop().await;
+        #[cfg(test)]
+        super::test_hook::record(&system_dir, "system loops stopped".to_string());
 
         // The publisher and the dispatcher take cuts and write through the
         // shards: both end before the shards drain.
@@ -374,6 +381,17 @@ async fn bootstrap(
         reports.push(report);
     }
     let mut system_loops = shard::Loops::new();
+    let logs = wals
+        .iter()
+        .map(|(engine, _)| (Holder::Shards(*engine), WalTarget::from(*engine)))
+        .chain([(Holder::System, WalTarget::Sys)])
+        .map(|(holder, target)| (holder, WriteAheadLog::with_storage_handle(hub.clone(), target)))
+        .collect();
+    let checkpoint = Arc::new(WalCheckpoint::new(Arc::clone(&states[0].control), logs));
+    system_loops.spawn("WalCheckpoint", WAL_CHECKPOINT_INTERVAL, move || {
+        let checkpoint = Arc::clone(&checkpoint);
+        async move { checkpoint.tick().await }
+    });
     if config.mcp.enabled && config.mcp.oauth_enabled && config.ttl_sweeper.enabled {
         let sweeper = Arc::new(TtlSweeper::new(Arc::clone(&system_store), config.ttl_sweeper.batch_size));
         let interval = std::time::Duration::from_secs(config.ttl_sweeper.interval_secs);

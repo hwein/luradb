@@ -231,6 +231,44 @@ mod tests {
         })
     }
 
+    // Auth records written before and after a checkpoint tick over a log
+    // past the limit are all there after a crash; the checkpoint left only
+    // the later ones in the log.
+    #[test]
+    fn auth_records_survive_a_checkpoint_and_a_crash() {
+        use crate::control::checkpoint::{Holder, WalCheckpoint};
+        use crate::control::{ControlPlane, Owners};
+        crate::core::engine_runtime::block_on(async {
+            const LIMIT: u64 = 16 * 1024;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sys");
+            let (sys, hub) = open_on(&dir, true).await;
+            let hub = hub.unwrap();
+            let auth = Arc::new(crate::auth::AuthCache::new(Arc::clone(&sys), None));
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
+            let control = ControlPlane::start(Owners { shards: Vec::new(), auth }, Arc::clone(&sys), bus).await.unwrap();
+            let checkpoints =
+                WalCheckpoint::new(control, vec![(Holder::System, hub.wal(WalTarget::Sys))]).with_limit(LIMIT);
+            let user = |i: usize| format!("{PREFIX_USER}user-{i}").into_bytes();
+            for i in 0..200 {
+                sys.put(&user(i), format!("record {i} of zoé ✓").repeat(4).as_bytes()).await.unwrap();
+            }
+            assert!(std::fs::metadata(dir.join(WAL_FILE)).unwrap().len() > LIMIT);
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!(std::fs::read(dir.join(WAL_FILE)).unwrap(), crate::core::wal::WAL_MAGIC);
+            sys.put(&user(200), b"after the checkpoint").await.unwrap();
+            sys.stop_background_tasks().await;
+            drop((checkpoints, sys, hub));
+
+            let (sys, _hub) = open_on(&dir, true).await;
+            for i in 0..200 {
+                assert_eq!(sys.get(&user(i)).await.unwrap(), Some(format!("record {i} of zoé ✓").repeat(4).into_bytes()));
+            }
+            assert_eq!(sys.get(&user(200)).await.unwrap(), Some(b"after the checkpoint".to_vec()));
+            sys.shutdown().await;
+        })
+    }
+
     #[test]
     fn shard_count_is_recorded_on_first_start_and_survives_a_restart() {
         crate::core::engine_runtime::block_on(async {

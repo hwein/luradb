@@ -70,14 +70,42 @@ pub enum IoRequest {
     SetLsnStart { engine: WalTarget, lsn: u64, response: oneshot::Sender<Result<()>> },
     /// Respond with the LSN of the last record durable in `engine`'s WAL.
     WalHeadLsn { engine: WalTarget, response: oneshot::Sender<Result<u64>> },
+    /// Respond with where `engine`'s WAL ends after every append queued
+    /// before this request.
+    WalMark { engine: WalTarget, response: oneshot::Sender<Result<WalMark>> },
+    /// Drop the records of `engine`'s WAL before `offset`: the new file the
+    /// checkpoint prepared beside the log, with the header and the bytes
+    /// from `offset` to `prepared`, gets the bytes from `prepared` to the
+    /// cursor and replaces the log. Refused unless `generation` is the
+    /// log's, header, `offset`, `prepared` and cursor are in order, and the
+    /// prepared file is as long as that says.
+    WalCutBefore {
+        engine: WalTarget,
+        generation: u64,
+        offset: u64,
+        prepared: u64,
+        response: oneshot::Sender<Result<()>>,
+    },
     /// Drain pending requests, then stop the thread.
     Shutdown,
+}
+
+/// Where a WAL ended: its generation, which every cut back raises, its
+/// cursor and the LSN of its last record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalMark {
+    pub generation: u64,
+    pub offset: u64,
+    pub lsn: u64,
 }
 
 /// Async, clonable interface to the storage thread.
 #[derive(Clone)]
 pub struct StorageHandle {
     request_tx: Sender<IoRequest>,
+    /// Each WAL's path with every symlink resolved; a cut back prepares its
+    /// new file beside it.
+    paths: Arc<[(WalTarget, PathBuf)]>,
 }
 
 /// A slot reserved in the request channel for one append to `engine`'s WAL.
@@ -123,6 +151,50 @@ impl StorageHandle {
         self.request(|response| IoRequest::WalHeadLsn { engine, response }).await
     }
 
+    /// Where `engine`'s WAL ends, after every append queued before this request.
+    pub async fn wal_mark(&self, engine: WalTarget) -> Result<WalMark> {
+        self.request(|response| IoRequest::WalMark { engine, response }).await
+    }
+
+    /// Drops the records of `engine`'s WAL before `mark`. The new file with
+    /// the records confirmed so far is prepared here, on the blocking pool;
+    /// the hub adds only what came in since, so it stands still for the
+    /// tail alone. A failed preparation leaves the log whole and no request
+    /// reaches the hub.
+    pub async fn wal_cut_before(&self, engine: WalTarget, mark: WalMark) -> Result<()> {
+        let WalMark { generation, offset, .. } = mark;
+        let end = self.wal_mark(engine).await?;
+        if end.generation != generation || end.offset < offset {
+            return Err(anyhow!(
+                "the mark at {offset} bytes of generation {generation} does not fit the {engine:?} write-ahead log \
+                 of generation {} ending at {} bytes",
+                end.generation,
+                end.offset
+            ));
+        }
+        let path = self.wal_path(engine)?;
+        let started = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || prepare_cut(&path, offset, end.offset))
+            .await
+            .context("the preparation of the cut did not finish")?
+            .with_context(|| format!("preparing the new file of the {engine:?} write-ahead log"))?;
+        tracing::debug!(
+            "Prepared the cut of the {engine:?} write-ahead log beside the log, copying {} bytes, in {:?}.",
+            end.offset - offset,
+            started.elapsed()
+        );
+        self.request(|response| IoRequest::WalCutBefore { engine, generation, offset, prepared: end.offset, response })
+            .await
+    }
+
+    fn wal_path(&self, engine: WalTarget) -> Result<PathBuf> {
+        self.paths
+            .iter()
+            .find(|(target, _)| *target == engine)
+            .map(|(_, path)| path.clone())
+            .ok_or_else(|| anyhow!("the storage thread has no write-ahead log open for the {engine:?} engine"))
+    }
+
     async fn request<T>(&self, request: impl FnOnce(oneshot::Sender<Result<T>>) -> IoRequest) -> Result<T> {
         let (tx, rx) = oneshot::channel();
         self.request_tx.send(request(tx)).await.map_err(|_| anyhow!("storage thread shut down"))?;
@@ -148,7 +220,7 @@ impl StorageThread {
         // the stamps follow the LSNs. A replacement channel must keep that.
         let (request_tx, request_rx) = mpsc::channel(config.channel_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let thread_shutdown = Arc::clone(&shutdown);
         let wal_count = wals.len();
 
@@ -160,12 +232,12 @@ impl StorageThread {
             .context("failed to spawn storage thread")?;
 
         match ready_rx.recv() {
-            Ok(Ok(sqpoll_active)) => {
+            Ok(Ok(Ready { sqpoll_active, paths })) => {
                 tracing::info!(
                     "Storage thread ready (SQPOLL {}, {wal_count} write-ahead logs).",
                     if sqpoll_active { "active" } else { "disabled" }
                 );
-                let handle = StorageHandle { request_tx: request_tx.clone() };
+                let handle = StorageHandle { request_tx: request_tx.clone(), paths: paths.into() };
                 Ok((Self { join_handle: Some(join_handle), request_tx, shutdown }, handle))
             }
             Ok(Err(e)) => {
@@ -200,10 +272,24 @@ impl Drop for StorageThread {
     }
 }
 
+/// What the thread reports once its WALs are open.
+struct Ready {
+    sqpoll_active: bool,
+    /// The resolved path of each WAL.
+    paths: Vec<(WalTarget, PathBuf)>,
+}
+
 /// One engine's WAL file and its append cursor.
 struct WalFile {
     engine: WalTarget,
     file: File,
+    /// The log's path with every symlink resolved: a cut back renames its
+    /// new file onto this one.
+    canonical: PathBuf,
+    /// The directory of `canonical` is not the marker's.
+    canonical_dir_apart: bool,
+    /// Raised by every cut back, so a mark of an earlier file never fits.
+    generation: u64,
     /// Where a failed cut records `offset` for the next start.
     marker: PathBuf,
     offset: u64,
@@ -212,8 +298,9 @@ struct WalFile {
     /// The file has no header — a log of the earlier format — and takes no
     /// append until a truncate writes one.
     awaits_truncate: bool,
-    /// Bytes a failed append left past `offset`, or the unsafe-end marker,
-    /// may still be there; the next append cuts first.
+    /// Bytes a failed append left past `offset`, the unsafe-end marker or an
+    /// unsynced rename of a cut back may still be there; the next append
+    /// cuts first.
     unsafe_end: bool,
     /// Requests for this file, in channel order, not run yet.
     queued: VecDeque<IoRequest>,
@@ -262,27 +349,38 @@ pub(crate) struct Faults {
     /// The next removal of the unsafe-end marker removes it, then fails to
     /// sync its directory.
     pub(crate) unmark_sync: bool,
-    /// Directory syncs the removals of the unsafe-end marker have attempted,
-    /// the injected failure included.
-    pub(crate) unmark_syncs: u64,
+    /// The directories the removals of the unsafe-end marker have synced, in
+    /// order, the injected failure included.
+    pub(crate) unmark_syncs: Vec<PathBuf>,
     /// Until reset, the chain of this engine's file stays on its way once
     /// its completions are reaped: its appends wait for their answer.
     pub(crate) held: Option<WalTarget>,
+    /// The next cut back fails right before it renames its new file.
+    pub(crate) cut_copy: bool,
+    /// The next cut back renames its new file, then fails to sync the
+    /// directory.
+    pub(crate) cut_sync: bool,
+    /// The next update of a fixed-file slot to a new file fails.
+    pub(crate) files_update: bool,
+    /// The next release of a fixed-file slot fails.
+    pub(crate) files_release: bool,
+    /// Slots that keep a replaced file open, each logged.
+    pub(crate) leaked_slots: u64,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// (fail the next sync, syncs attempted) of the marker removal running on
-    /// this thread, set while its [`DirSyncProbe`] lives.
-    static DIR_SYNC_PROBE: std::cell::Cell<Option<(bool, u64)>> = const { std::cell::Cell::new(None) };
+    /// (fail the next sync, directories synced) of the marker removal running
+    /// on this thread, set while its [`DirSyncProbe`] lives.
+    static DIR_SYNC_PROBE: std::cell::RefCell<Option<(bool, Vec<PathBuf>)>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 impl Faults {
-    /// Lets the directory syncs on this thread see `unmark_sync` and count
+    /// Lets the directory syncs on this thread see `unmark_sync` and record
     /// into `unmark_syncs` until the returned probe drops.
     pub(crate) fn probe_unmark_syncs(&mut self) -> DirSyncProbe<'_> {
-        DIR_SYNC_PROBE.set(Some((std::mem::take(&mut self.unmark_sync), 0)));
+        DIR_SYNC_PROBE.set(Some((std::mem::take(&mut self.unmark_sync), Vec::new())));
         DirSyncProbe(self)
     }
 }
@@ -293,9 +391,9 @@ pub(crate) struct DirSyncProbe<'a>(&'a mut Faults);
 #[cfg(test)]
 impl Drop for DirSyncProbe<'_> {
     fn drop(&mut self) {
-        if let Some((fail, syncs)) = DIR_SYNC_PROBE.take() {
+        if let Some((fail, synced)) = DIR_SYNC_PROBE.take() {
             self.0.unmark_sync |= fail;
-            self.0.unmark_syncs += syncs;
+            self.0.unmark_syncs.extend(synced);
         }
     }
 }
@@ -340,6 +438,8 @@ impl StorageState {
         wal.file.sync_all()
     }
 
+    /// Removes the marker and syncs its directory, and the directory a cut
+    /// back renamed into when that is another one.
     fn unmark(&mut self, index: usize) -> std::io::Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.faults.unmark) {
@@ -347,7 +447,59 @@ impl StorageState {
         }
         #[cfg(test)]
         let _probe = self.faults.probe_unmark_syncs();
-        unmark_unsafe_end(&self.wals[index].marker)
+        let wal = &self.wals[index];
+        unmark_unsafe_end(&wal.marker)?;
+        if wal.canonical_dir_apart {
+            sync_dir(&wal.canonical).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("syncing the directory of {}: {e}", wal.canonical.display()))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Puts `file` in place of the file of WAL `index`. A fixed-file slot
+    /// that cannot take it is released, and every WAL goes on with raw
+    /// descriptors.
+    fn swap_file(&mut self, index: usize, file: File) {
+        // A slot holds a reference of its own: closing the old descriptor
+        // here does not free the old file while its slot still names it.
+        self.wals[index].file = file;
+        if !self.fixed_files {
+            return;
+        }
+        let (engine, fd) = (self.wals[index].engine, self.wals[index].file.as_raw_fd());
+        let failed = match self.update_slot(index, fd) {
+            Ok(1) => return,
+            Ok(n) => std::io::Error::other(format!("{n} slots updated instead of 1")),
+            Err(e) => e,
+        };
+        tracing::warn!(
+            "Updating the fixed-file slot of the {engine:?} write-ahead log failed: {failed}; \
+             every write-ahead log uses raw file descriptors from now on."
+        );
+        if let Err(e) = self.update_slot(index, -1).and_then(|n| match n {
+            1 => Ok(()),
+            n => Err(std::io::Error::other(format!("{n} slots released instead of 1"))),
+        }) {
+            tracing::warn!(
+                "Releasing the fixed-file slot of the {engine:?} write-ahead log failed as well: {e}; \
+                 the replaced file stays on disk until the next start."
+            );
+            #[cfg(test)]
+            {
+                self.faults.leaked_slots += 1;
+            }
+        }
+        self.fixed_files = false;
+    }
+
+    /// Points fixed-file slot `index` at `fd`, or frees it for `-1`.
+    fn update_slot(&mut self, index: usize, fd: RawFd) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if std::mem::take(if fd < 0 { &mut self.faults.files_release } else { &mut self.faults.files_update }) {
+            return Err(std::io::Error::other("injected fixed-file slot failure"));
+        }
+        self.ring.submitter().register_files_update(index as u32, &[fd])
     }
 }
 
@@ -363,7 +515,7 @@ fn storage_thread_main(
     wals: Vec<(WalTarget, PathBuf)>,
     mut request_rx: Receiver<IoRequest>,
     shutdown: Arc<AtomicBool>,
-    ready_tx: std::sync::mpsc::Sender<Result<bool>>,
+    ready_tx: std::sync::mpsc::Sender<Result<Ready>>,
 ) {
     if config.cpu >= 0 {
         if let Err(e) = pin_to_cpu(config.cpu) {
@@ -373,7 +525,8 @@ fn storage_thread_main(
 
     let mut state = match open_state(&config, &wals) {
         Ok((state, sqpoll_active)) => {
-            let _ = ready_tx.send(Ok(sqpoll_active));
+            let paths = state.wals.iter().map(|wal| (wal.engine, wal.canonical.clone())).collect();
+            let _ = ready_tx.send(Ok(Ready { sqpoll_active, paths }));
             state
         }
         Err(e) => {
@@ -398,6 +551,13 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
     let mut files = Vec::with_capacity(wals.len());
     for (engine, path) in wals {
         let file = open_rw(path)?;
+        let resolved = std::fs::canonicalize(path)
+            .and_then(|canonical| Ok((std::fs::canonicalize(dir_of(path))? != dir_of(&canonical), canonical)));
+        let (canonical_dir_apart, canonical) =
+            resolved.with_context(|| format!("resolving the write-ahead log path {}", path.display()))?;
+        // The new file of a cut back that a crash interrupted.
+        let tmp = with_suffix(&canonical, ".tmp");
+        remove_if_there(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
         let marker = unsafe_end_marker(path);
         apply_unsafe_end_marker(path, &file).with_context(|| {
             format!("applying the unsafe-end marker {} to the write-ahead log {}", marker.display(), path.display())
@@ -408,6 +568,9 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
         files.push(WalFile {
             engine: *engine,
             file,
+            canonical,
+            canonical_dir_apart,
+            generation: 0,
             marker,
             offset,
             lsn: 0,
@@ -516,7 +679,9 @@ fn accept(state: &mut StorageState, request: IoRequest) -> bool {
         }
         IoRequest::WalTruncate { engine, .. }
         | IoRequest::SetLsnStart { engine, .. }
-        | IoRequest::WalHeadLsn { engine, .. } => *engine,
+        | IoRequest::WalHeadLsn { engine, .. }
+        | IoRequest::WalMark { engine, .. }
+        | IoRequest::WalCutBefore { engine, .. } => *engine,
     };
     match state.wal_index(engine) {
         Ok(index) => state.wals[index].queued.push_back(request),
@@ -531,10 +696,15 @@ fn refuse(request: IoRequest, e: anyhow::Error) {
         IoRequest::WalAppend { response, .. } => {
             let _ = response.send(Err(anyhow!("WAL append failed: {e}")));
         }
-        IoRequest::WalTruncate { response, .. } | IoRequest::SetLsnStart { response, .. } => {
+        IoRequest::WalTruncate { response, .. }
+        | IoRequest::SetLsnStart { response, .. }
+        | IoRequest::WalCutBefore { response, .. } => {
             let _ = response.send(Err(e));
         }
         IoRequest::WalHeadLsn { response, .. } => {
+            let _ = response.send(Err(e));
+        }
+        IoRequest::WalMark { response, .. } => {
             let _ = response.send(Err(e));
         }
         IoRequest::Shutdown => {}
@@ -586,6 +756,13 @@ fn start_queued(state: &mut StorageState) {
                 }
                 Some(IoRequest::WalHeadLsn { response, .. }) => {
                     let _ = response.send(Ok(state.wals[index].lsn));
+                }
+                Some(IoRequest::WalMark { response, .. }) => {
+                    let WalFile { generation, offset, lsn, .. } = state.wals[index];
+                    let _ = response.send(Ok(WalMark { generation, offset, lsn }));
+                }
+                Some(IoRequest::WalCutBefore { generation, offset, prepared, response, .. }) => {
+                    let _ = response.send(do_cut_before(state, index, generation, offset, prepared));
                 }
                 Some(IoRequest::Shutdown) | None => break,
             }
@@ -882,6 +1059,7 @@ fn log_failed_cut(engine: WalTarget, cursor: u64, error: &std::io::Error) {
 fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     let index = state.wal_index(engine)?;
     let wal = &mut state.wals[index];
+    wal.generation += 1;
     if wal.awaits_truncate {
         write_header(&wal.file)?;
         wal.awaits_truncate = false;
@@ -897,6 +1075,150 @@ fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     }
     state.wals[index].unsafe_end = false;
     Ok(())
+}
+
+/// Replaces WAL `index` with the file the checkpoint prepared beside the
+/// resolved path — the header and the bytes from `offset` to `prepared` —
+/// once the bytes from `prepared` to the cursor are added, synced and the
+/// file is renamed onto the log. Up to the rename a failure leaves the log
+/// as it was and removes the prepared file. After it the hub writes to the
+/// new file; until its directory is synced and the marker is gone, the
+/// log's end stays unsafe and the next append secures it first.
+fn do_cut_before(state: &mut StorageState, index: usize, generation: u64, offset: u64, prepared: u64) -> Result<()> {
+    let started = std::time::Instant::now();
+    let wal = &state.wals[index];
+    let (engine, before) = (wal.engine, wal.offset);
+    let tmp = with_suffix(&wal.canonical, ".tmp");
+    let fits = if wal.awaits_truncate {
+        Err(anyhow!("the {engine:?} write-ahead log has the format of an earlier version and takes no cut"))
+    } else if generation != wal.generation {
+        Err(anyhow!(
+            "the mark of generation {generation} does not fit the {engine:?} write-ahead log of generation {}",
+            wal.generation
+        ))
+    } else if !(WAL_HEADER_LEN..=prepared).contains(&offset) || prepared > before {
+        Err(anyhow!(
+            "a cut at {offset} bytes prepared up to {prepared} lies outside the records of the {engine:?} \
+             write-ahead log, which ends at {before}"
+        ))
+    } else {
+        Ok(())
+    };
+    let file = match fits.and_then(|()| {
+        finish_cut_file(state, index, &tmp, offset, prepared)
+            .map_err(|e| anyhow!("cutting the {engine:?} write-ahead log back to the bytes after {offset} failed: {e}"))
+    }) {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = remove_if_there(&tmp);
+            return Err(e);
+        }
+    };
+    state.swap_file(index, file);
+    let copied = before - prepared;
+    let wal = &mut state.wals[index];
+    wal.offset = WAL_HEADER_LEN + before - offset;
+    wal.generation += 1;
+    let after = wal.offset;
+    let secured = secure_cut(state, index);
+    tracing::debug!(
+        "Cut the {engine:?} write-ahead log from {before} to {after} bytes, copying {copied} bytes, in {:?}.",
+        started.elapsed()
+    );
+    if let Err(e) = secured {
+        state.wals[index].unsafe_end = true;
+        log_failed_cut(engine, after, &e);
+        return Err(e.into());
+    }
+    state.wals[index].unsafe_end = false;
+    #[cfg(test)]
+    crate::storage::test_trace::record(&state.wals[index].canonical, "cut");
+    Ok(())
+}
+
+/// Writes the new file of a cut beside the log at `canonical`: the header
+/// and the log's bytes from `offset` to `end`, with the log's permissions,
+/// synced. Runs outside the hub, which never changes bytes it confirmed. A
+/// failure removes the file again.
+pub(crate) fn prepare_cut(canonical: &Path, offset: u64, end: u64) -> std::io::Result<()> {
+    let tmp = with_suffix(canonical, ".tmp");
+    let prepare = || {
+        let log = File::open(canonical)?;
+        let file = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+        file.set_permissions(log.metadata()?.permissions())?;
+        file.write_all_at(&WAL_MAGIC, 0)?;
+        copy_range(&log, offset, &file, WAL_HEADER_LEN, end - offset)?;
+        file.sync_all()
+    };
+    prepare().inspect_err(|_| {
+        let _ = remove_if_there(&tmp);
+    })
+}
+
+/// Opens the prepared file at `tmp`, checks it holds the header and the
+/// bytes from `offset` to `prepared`, adds the bytes of WAL `index` from
+/// `prepared` to the cursor, syncs it and renames it onto the log.
+fn finish_cut_file(
+    state: &mut StorageState,
+    index: usize,
+    tmp: &Path,
+    offset: u64,
+    prepared: u64,
+) -> std::io::Result<File> {
+    let wal = &state.wals[index];
+    let file = OpenOptions::new().read(true).write(true).open(tmp)?;
+    let (len, expected) = (file.metadata()?.len(), WAL_HEADER_LEN + prepared - offset);
+    if len != expected {
+        return Err(std::io::Error::other(format!(
+            "the prepared file {} holds {len} bytes instead of {expected}",
+            tmp.display()
+        )));
+    }
+    copy_range(&wal.file, prepared, &file, expected, wal.offset - prepared)?;
+    file.sync_all()?;
+    #[cfg(test)]
+    if std::mem::take(&mut state.faults.cut_copy) {
+        return Err(std::io::Error::other("injected failure before the rename"));
+    }
+    let wal = &state.wals[index];
+    std::fs::rename(tmp, &wal.canonical)?;
+    Ok(file)
+}
+
+/// Copies `len` bytes in the kernel, without a round trip through the hub.
+fn copy_range(from: &File, from_offset: u64, to: &File, to_offset: u64, len: u64) -> std::io::Result<()> {
+    let (mut from_offset, mut to_offset) = (from_offset as libc::loff_t, to_offset as libc::loff_t);
+    let mut left = len;
+    while left > 0 {
+        let chunk = left.min(1 << 30) as usize;
+        // SAFETY: both descriptors belong to open files; the kernel only
+        // reads and advances the two offsets.
+        let copied =
+            unsafe { libc::copy_file_range(from.as_raw_fd(), &mut from_offset, to.as_raw_fd(), &mut to_offset, chunk, 0) };
+        match copied {
+            0 => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            n if n < 0 => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+            n => left -= n as u64,
+        }
+    }
+    Ok(())
+}
+
+/// Syncs the directory the cut back renamed into, then removes the marker.
+fn secure_cut(state: &mut StorageState, index: usize) -> std::io::Result<()> {
+    #[cfg(test)]
+    if std::mem::take(&mut state.faults.cut_sync) {
+        return Err(std::io::Error::other("injected directory sync failure after the rename"));
+    }
+    let canonical = &state.wals[index].canonical;
+    sync_dir(canonical)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("syncing the directory of {}: {e}", canonical.display())))?;
+    state.unmark(index)
 }
 
 /// Starts an empty log with the header and completes a torn one; returns
@@ -988,18 +1310,35 @@ pub(crate) fn unmark_unsafe_end(marker: &Path) -> std::io::Result<()> {
 
 /// A rename or removal survives a power loss only once its directory is synced.
 fn sync_dir(file: &Path) -> std::io::Result<()> {
+    let dir = dir_of(file);
     #[cfg(test)]
-    if let Some((fail, syncs)) = DIR_SYNC_PROBE.get() {
-        DIR_SYNC_PROBE.set(Some((false, syncs + 1)));
-        if fail {
+    {
+        let probed = DIR_SYNC_PROBE.with_borrow_mut(|probe| {
+            probe.as_mut().map(|(fail, synced)| {
+                synced.push(dir.to_path_buf());
+                std::mem::take(fail)
+            })
+        });
+        if probed == Some(true) {
             return Err(std::io::Error::other("injected directory sync failure"));
         }
     }
-    let dir = match file.parent() {
+    File::open(dir)?.sync_all()
+}
+
+/// The directory that holds `file`.
+fn dir_of(file: &Path) -> &Path {
+    match file.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
-    };
-    File::open(dir)?.sync_all()
+    }
+}
+
+fn remove_if_there(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    }
 }
 
 /// Applies the unsafe-end marker a failed cut left beside `log` before the
@@ -2028,13 +2367,13 @@ mod tests {
         assert!(!marker.exists());
         assert!(state.wals[0].unsafe_end);
 
-        let syncs = state.faults.unmark_syncs;
+        let syncs = state.faults.unmark_syncs.len();
         let record = delete_record(4, b"kept-two");
         let end = start + 8 + record.len() as u64;
         let (batch, mut kept) = record_appends(WalTarget::Kv, vec![record]);
         process_batch(&mut state, batch);
         assert_eq!(kept[0].try_recv().unwrap().unwrap().0, start);
-        assert_eq!(state.faults.unmark_syncs, syncs + 1);
+        assert_eq!(state.faults.unmark_syncs.len(), syncs + 1);
         assert!(!state.wals[0].unsafe_end);
         assert_eq!(std::fs::metadata(&wals[0].1).unwrap().len(), end);
     }
@@ -2084,6 +2423,469 @@ mod tests {
 
         open_state(&cfg(false, 64), &wals).unwrap();
         assert!(!tmp.exists());
+    }
+
+    /// Appends `records` to `engine`'s WAL as one batch; each one's offset and LSN.
+    fn append_all(state: &mut StorageState, engine: WalTarget, records: &[&[u8]]) -> Vec<(u64, u64)> {
+        let (batch, receivers) = record_appends(engine, records.iter().map(|record| record.to_vec()).collect());
+        process_batch(state, batch);
+        receivers.into_iter().map(|mut rx| rx.try_recv().unwrap().unwrap()).collect()
+    }
+
+    fn mark_of(state: &mut StorageState, engine: WalTarget) -> WalMark {
+        let (response, mut marked) = oneshot::channel();
+        process_batch(state, vec![IoRequest::WalMark { engine, response }]);
+        marked.try_recv().unwrap().unwrap()
+    }
+
+    /// Prepares the new file up to the current end, as a checkpoint does,
+    /// then has the hub finish the cut.
+    fn cut_before(state: &mut StorageState, engine: WalTarget, mark: WalMark) -> Result<()> {
+        let end = mark_of(state, engine);
+        let canonical = state.wals[state.wal_index(engine).unwrap()].canonical.clone();
+        if mark.offset <= end.offset {
+            prepare_cut(&canonical, mark.offset, end.offset).unwrap();
+        }
+        hub_cut(state, engine, mark, end.offset)
+    }
+
+    /// The hub's part of a cut alone: `prepared` names the end of the bytes
+    /// the new file beside the log holds already.
+    fn hub_cut(state: &mut StorageState, engine: WalTarget, mark: WalMark, prepared: u64) -> Result<()> {
+        let (response, mut cut) = oneshot::channel();
+        let WalMark { generation, offset, .. } = mark;
+        process_batch(state, vec![IoRequest::WalCutBefore { engine, generation, offset, prepared, response }]);
+        cut.try_recv().unwrap()
+    }
+
+    // The checkpoint prepares the new file with the records up to the end it
+    // saw; the hub adds only what came since. The result is the same as a
+    // cut made by the hub alone.
+    #[test]
+    fn test_the_hub_adds_only_the_records_after_the_prepared_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"first"]);
+        let mark = mark_of(&mut state, WalTarget::Kv);
+        append_all(&mut state, WalTarget::Kv, &[b"second"]);
+        let end = mark_of(&mut state, WalTarget::Kv);
+        append_all(&mut state, WalTarget::Kv, &[b"third"]);
+        let log = std::fs::read(&wals[0].1).unwrap();
+
+        prepare_cut(&state.wals[0].canonical, mark.offset, end.offset).unwrap();
+        let tmp = dir.path().join("Kv.wal.tmp");
+        assert_eq!(std::fs::read(&tmp).unwrap(), log_of(&[(2, b"second")]));
+        assert_eq!(std::fs::metadata(&tmp).unwrap().permissions(), std::fs::metadata(&wals[0].1).unwrap().permissions());
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log, "the preparation leaves the log alone");
+
+        hub_cut(&mut state, WalTarget::Kv, mark, end.offset).unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log_of(&[(2, b"second"), (3, b"third")]));
+        assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+        assert_eq!(append_all(&mut state, WalTarget::Kv, &[b"fourth"]), [(8 + 8 + 6 + 8 + 5, 4)]);
+    }
+
+    // A prepared file of the wrong length, a missing one, a prepared end
+    // outside the mark and the cursor, and a mark of an earlier file each
+    // refuse the cut: the log stays byte for byte, and no prepared file is
+    // left, so a file prepared for an earlier log is never renamed.
+    #[test]
+    fn test_the_hub_refuses_a_prepared_file_that_does_not_fit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let tmp = dir.path().join("Kv.wal.tmp");
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"first"]);
+        let mark = mark_of(&mut state, WalTarget::Kv);
+        append_all(&mut state, WalTarget::Kv, &[b"second"]);
+        let end = mark_of(&mut state, WalTarget::Kv);
+        let log = std::fs::read(&wals[0].1).unwrap();
+        let canonical = state.wals[0].canonical.clone();
+
+        std::fs::write(&tmp, log_of(&[(2, b"second"), (9, b"stale")])).unwrap();
+        let err = hub_cut(&mut state, WalTarget::Kv, mark, end.offset).unwrap_err();
+        assert!(err.to_string().contains("bytes instead of"), "{err}");
+        assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+
+        let err = hub_cut(&mut state, WalTarget::Kv, mark, end.offset).unwrap_err();
+        assert!(err.to_string().contains("No such file"), "{err}");
+
+        for prepared in [mark.offset - 1, end.offset + 1] {
+            prepare_cut(&canonical, mark.offset, end.offset).unwrap();
+            let err = hub_cut(&mut state, WalTarget::Kv, mark, prepared).unwrap_err();
+            assert!(err.to_string().contains("outside"), "{err}");
+            assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+        }
+
+        let earlier = WalMark { generation: mark.generation.wrapping_sub(1), ..mark };
+        prepare_cut(&canonical, mark.offset, end.offset).unwrap();
+        let err = hub_cut(&mut state, WalTarget::Kv, earlier, end.offset).unwrap_err();
+        assert!(err.to_string().contains("generation"), "{err}");
+        assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+        assert_eq!(mark_of(&mut state, WalTarget::Kv), end);
+        assert_eq!(append_all(&mut state, WalTarget::Kv, &[b"third"]), [(log.len() as u64, 3)]);
+    }
+
+    // A preparation that fails leaves no file beside the log and the log as
+    // it was.
+    #[test]
+    fn test_a_failed_preparation_leaves_nothing_beside_the_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"first"]);
+        let end = mark_of(&mut state, WalTarget::Kv);
+        let log = std::fs::read(&wals[0].1).unwrap();
+
+        // The log ends before the prepared end: the copy runs out of bytes.
+        assert!(prepare_cut(&state.wals[0].canonical, WAL_HEADER_LEN, end.offset + 1).is_err());
+        assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+    }
+
+    /// A log with the header and `records`, each framed with its LSN.
+    fn log_of(records: &[(u64, &[u8])]) -> Vec<u8> {
+        [&WAL_MAGIC[..], &framed(records)].concat()
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    // A cut before the mark taken after record 1 leaves records 2 and 3
+    // behind the header; the next append gets LSN 4 at the new end, and
+    // recovery reads 2, 3 and 4.
+    #[test]
+    fn test_a_cut_keeps_the_records_after_the_mark() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            let [one, two, three, four] = ["one", "two", "three", "four"].map(|key| delete_record(1, key.as_bytes()));
+            append_all(&mut state, WalTarget::Kv, &[&one]);
+            let mark = mark_of(&mut state, WalTarget::Kv);
+            assert_eq!(mark, WalMark { generation: 0, offset: 8 + 8 + one.len() as u64, lsn: 1 });
+            append_all(&mut state, WalTarget::Kv, &[&two, &three]);
+
+            cut_before(&mut state, WalTarget::Kv, mark).unwrap();
+            let kept = log_of(&[(2, &two), (3, &three)]);
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), kept);
+            assert_eq!(append_all(&mut state, WalTarget::Kv, &[&four]), [(kept.len() as u64, 4)]);
+            assert_eq!(recovered_keys(&wals[0].1).await, ["two", "three", "four"]);
+            assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+        })
+    }
+
+    // A cut before a mark at the end leaves the header alone; the LSNs go on.
+    #[test]
+    fn test_a_cut_at_the_end_leaves_the_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"first", b"second"]);
+        let mark = mark_of(&mut state, WalTarget::Kv);
+
+        cut_before(&mut state, WalTarget::Kv, mark).unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), WAL_MAGIC);
+        assert_eq!(append_all(&mut state, WalTarget::Kv, &[b"third"]), [(8, 3)]);
+        assert_eq!(mark_of(&mut state, WalTarget::Kv).generation, 1);
+    }
+
+    /// The mark a start takes before the first append.
+    const AT_THE_START: WalMark = WalMark { generation: 0, offset: WAL_HEADER_LEN, lsn: 0 };
+
+    // A cut while a failed append left bytes past the cursor and a marker
+    // copies the confirmed bytes alone, removes the marker and leaves the
+    // end safe.
+    #[test]
+    fn test_a_cut_drops_the_bytes_past_the_cursor_and_the_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let marker = dir.path().join("Kv.wal.unsafe-end");
+        let (mut state, _) = state_after_a_failed_cut(&wals);
+        assert!(marker.exists());
+
+        cut_before(&mut state, WalTarget::Kv, AT_THE_START).unwrap();
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log_of(&[(1, &delete_record(1, b"kept-one"))]));
+        assert!(!marker.exists());
+        assert!(!state.wals[0].unsafe_end);
+    }
+
+    // A cut whose marker removal fails swaps the file and fails; the end
+    // stays unsafe and the next append removes the marker before it writes.
+    #[test]
+    fn test_a_cut_whose_marker_removal_fails_leaves_the_end_unsafe() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let marker = dir.path().join("Kv.wal.unsafe-end");
+            let (mut state, start) = state_after_a_failed_cut(&wals);
+
+            state.faults.unmark = true;
+            assert!(cut_before(&mut state, WalTarget::Kv, AT_THE_START).is_err());
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log_of(&[(1, &delete_record(1, b"kept-one"))]));
+            assert!(state.wals[0].unsafe_end);
+            assert!(marker.exists());
+
+            let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(3, b"kept-two")]);
+            process_batch(&mut state, batch);
+            assert_eq!(kept[0].try_recv().unwrap().unwrap().0, start);
+            assert!(!marker.exists());
+            assert_eq!(recovered_keys(&wals[0].1).await, ["kept-one", "kept-two"]);
+        })
+    }
+
+    // A restart after a cut whose marker removal failed cuts no confirmed
+    // record: the marker's cursor is at least the new file's length.
+    #[test]
+    fn test_a_restart_after_a_cut_with_a_marker_left_keeps_every_confirmed_record() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let marker = dir.path().join("Kv.wal.unsafe-end");
+            let (mut state, _) = state_after_a_failed_cut(&wals);
+            state.faults.unmark = true;
+            assert!(cut_before(&mut state, WalTarget::Kv, AT_THE_START).is_err());
+            let log = std::fs::read(&wals[0].1).unwrap();
+            drop(state);
+
+            open_state(&cfg(false, 64), &wals).unwrap();
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+            assert!(!marker.exists());
+            assert_eq!(recovered_keys(&wals[0].1).await, ["kept-one"]);
+        })
+    }
+
+    // A failure before the rename leaves the log byte for byte, no
+    // temporary file and the generation as it was.
+    #[test]
+    fn test_a_cut_that_fails_before_the_rename_changes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"first"]);
+        let mark = mark_of(&mut state, WalTarget::Kv);
+        append_all(&mut state, WalTarget::Kv, &[b"second"]);
+        let log = std::fs::read(&wals[0].1).unwrap();
+
+        state.faults.cut_copy = true;
+        assert!(cut_before(&mut state, WalTarget::Kv, mark).is_err());
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+        assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+        assert_eq!(mark_of(&mut state, WalTarget::Kv).generation, mark.generation);
+        assert_eq!(append_all(&mut state, WalTarget::Kv, &[b"third"]), [(log.len() as u64, 3)]);
+    }
+
+    // A directory sync that fails after the rename, or a marker removal that
+    // fails, fails the cut with the new file and cursor in place; the end
+    // stays unsafe, and the next append syncs the directory before it writes.
+    #[test]
+    fn test_a_cut_that_fails_after_the_rename_is_secured_by_the_next_append() {
+        for fail_the_sync in [true, false] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            append_all(&mut state, WalTarget::Kv, &[b"first"]);
+            let mark = mark_of(&mut state, WalTarget::Kv);
+            append_all(&mut state, WalTarget::Kv, &[b"second"]);
+
+            state.faults.cut_sync = fail_the_sync;
+            state.faults.unmark = !fail_the_sync;
+            assert!(cut_before(&mut state, WalTarget::Kv, mark).is_err());
+            let kept = log_of(&[(2, b"second")]);
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), kept);
+            assert_eq!(state.wals[0].offset, kept.len() as u64);
+            assert!(state.wals[0].unsafe_end);
+
+            let synced = state.faults.unmark_syncs.len();
+            assert_eq!(append_all(&mut state, WalTarget::Kv, &[b"third"]), [(kept.len() as u64, 3)]);
+            assert_eq!(state.faults.unmark_syncs[synced..], [dir.path().to_path_buf()]);
+            assert!(!state.wals[0].unsafe_end);
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log_of(&[(2, b"second"), (3, b"third")]));
+        }
+    }
+
+    // The new file of a cut a crash interrupted is removed at the start; the
+    // log stays as it is.
+    #[test]
+    fn test_start_removes_the_new_file_of_an_interrupted_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let log = log_of(&[(1, b"kept")]);
+        std::fs::write(&wals[0].1, &log).unwrap();
+        std::fs::write(dir.path().join("Kv.wal.tmp"), WAL_MAGIC).unwrap();
+
+        let (state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+        assert_eq!(state.wals[0].offset, log.len() as u64);
+    }
+
+    // The new file of an interrupted cut goes before the unsafe-end marker
+    // is applied: a marker the start cannot read fails it with the new file
+    // already gone, and a readable one cuts the log back to its confirmed
+    // bytes.
+    #[test]
+    fn test_start_removes_the_new_file_of_an_interrupted_cut_before_the_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let (tmp, marker) = (dir.path().join("Kv.wal.tmp"), dir.path().join("Kv.wal.unsafe-end"));
+        let log = log_of(&[(1, b"kept")]);
+        std::fs::write(&wals[0].1, [&log[..], b"unconfirmed"].concat()).unwrap();
+        std::fs::write(&tmp, WAL_MAGIC).unwrap();
+        std::fs::write(&marker, [0, 0, 7]).unwrap();
+
+        assert!(open_state(&cfg(false, 64), &wals).is_err());
+        assert!(!tmp.exists(), "the new file must go before the marker is read");
+
+        std::fs::write(&tmp, WAL_MAGIC).unwrap();
+        std::fs::write(&marker, (log.len() as u64).to_be_bytes()).unwrap();
+        let (state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        assert_eq!(names_in(dir.path()), ["Kv.wal"]);
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+        assert_eq!(state.wals[0].offset, log.len() as u64);
+    }
+
+    // A cut is refused, the log unchanged, at an offset outside the header
+    // and the cursor, on a log of the earlier format and with a mark taken
+    // before a truncate.
+    #[test]
+    fn test_a_cut_outside_the_records_of_the_current_file_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"first"]);
+        let mark = mark_of(&mut state, WalTarget::Kv);
+        let log = std::fs::read(&wals[0].1).unwrap();
+        for offset in [WAL_HEADER_LEN - 1, mark.offset + 1] {
+            let err = cut_before(&mut state, WalTarget::Kv, WalMark { offset, ..mark }).unwrap_err();
+            assert!(err.to_string().contains("outside"), "{err}");
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+        }
+
+        let (response, mut truncated) = oneshot::channel();
+        process_batch(&mut state, vec![IoRequest::WalTruncate { engine: WalTarget::Kv, response }]);
+        truncated.try_recv().unwrap().unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"second-with-a-longer-record"]);
+        let log = std::fs::read(&wals[0].1).unwrap();
+        let err = cut_before(&mut state, WalTarget::Kv, mark).unwrap_err();
+        assert!(err.to_string().contains("generation"), "{err}");
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), log);
+
+        let earlier = delete_record(1, b"earlier");
+        std::fs::write(&wals[0].1, &earlier).unwrap();
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        let mark = mark_of(&mut state, WalTarget::Kv);
+        let err = cut_before(&mut state, WalTarget::Kv, WalMark { offset: WAL_HEADER_LEN, ..mark }).unwrap_err();
+        assert!(err.to_string().contains("earlier version"), "{err}");
+        assert_eq!(std::fs::read(&wals[0].1).unwrap(), earlier);
+    }
+
+    // After a cut the appends land in the new file, through the fixed-file
+    // slot and through raw descriptors.
+    #[test]
+    fn test_appends_after_a_cut_land_in_the_new_file() {
+        for fixed_files in [true, false] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv, WalTarget::Json]);
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            assert!(state.fixed_files);
+            state.fixed_files = fixed_files;
+            append_all(&mut state, WalTarget::Kv, &[b"first"]);
+            let mark = mark_of(&mut state, WalTarget::Kv);
+
+            cut_before(&mut state, WalTarget::Kv, mark).unwrap();
+            append_all(&mut state, WalTarget::Kv, &[b"second"]);
+            append_all(&mut state, WalTarget::Json, &[b"json"]);
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log_of(&[(2, b"second")]), "fixed files {fixed_files}");
+            assert_eq!(std::fs::read(&wals[1].1).unwrap(), log_of(&[(1, b"json")]));
+            assert_eq!(state.fixed_files, fixed_files);
+        }
+    }
+
+    // A fixed-file slot that cannot take the new file is released and every
+    // log goes on with raw descriptors; a release that fails too is logged.
+    #[test]
+    fn test_a_failed_slot_update_after_a_cut_switches_to_raw_descriptors() {
+        for release_fails in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv, WalTarget::Json]);
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            append_all(&mut state, WalTarget::Kv, &[b"first"]);
+            let mark = mark_of(&mut state, WalTarget::Kv);
+
+            state.faults.files_update = true;
+            state.faults.files_release = release_fails;
+            cut_before(&mut state, WalTarget::Kv, mark).unwrap();
+            assert!(!state.fixed_files);
+            assert_eq!(state.faults.leaked_slots, u64::from(release_fails));
+            append_all(&mut state, WalTarget::Kv, &[b"second"]);
+            append_all(&mut state, WalTarget::Json, &[b"json"]);
+            assert_eq!(std::fs::read(&wals[0].1).unwrap(), log_of(&[(2, b"second")]));
+            assert_eq!(std::fs::read(&wals[1].1).unwrap(), log_of(&[(1, b"json")]));
+        }
+    }
+
+    /// A key-value WAL configured at `<dir>/link/Kv.wal`, a symlink to
+    /// `<dir>/real/Kv.wal`; the configured paths and the target's directory.
+    fn symlinked_wal(dir: &Path) -> (Vec<(WalTarget, PathBuf)>, PathBuf) {
+        let (link, real) = (dir.join("link"), dir.join("real"));
+        std::fs::create_dir_all(&link).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(real.join("Kv.wal"), link.join("Kv.wal")).unwrap();
+        std::fs::write(real.join("Kv.wal"), WAL_MAGIC).unwrap();
+        (vec![(WalTarget::Kv, link.join("Kv.wal"))], std::fs::canonicalize(real).unwrap())
+    }
+
+    // A log configured as a symlink into another directory stays one: the
+    // cut renames onto its target, the new file of an interrupted cut lies
+    // beside the target, and the marker beside the configured path.
+    #[test]
+    fn test_a_cut_keeps_a_symlinked_log_a_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (wals, real) = symlinked_wal(dir.path());
+        std::fs::write(real.join("Kv.wal.tmp"), WAL_MAGIC).unwrap();
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        assert_eq!(names_in(&real), ["Kv.wal"]);
+        append_all(&mut state, WalTarget::Kv, &[b"first"]);
+        let mark = mark_of(&mut state, WalTarget::Kv);
+        append_all(&mut state, WalTarget::Kv, &[b"second"]);
+
+        cut_before(&mut state, WalTarget::Kv, mark).unwrap();
+        assert!(std::fs::symlink_metadata(&wals[0].1).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(real.join("Kv.wal")).unwrap(), log_of(&[(2, b"second")]));
+        assert_eq!(names_in(&real), ["Kv.wal"]);
+
+        state.faults = Faults { sync: true, cut: true, ..Faults::default() };
+        let (batch, _) = record_appends(WalTarget::Kv, vec![b"lost".to_vec()]);
+        process_batch(&mut state, batch);
+        assert_eq!(names_in(&dir.path().join("link")), ["Kv.wal", "Kv.wal.unsafe-end"]);
+        assert_eq!(names_in(&real), ["Kv.wal"]);
+    }
+
+    // With the log a symlink into another directory, a cut whose directory
+    // sync fails after the rename leaves the next append to sync the
+    // marker's directory and the target's before it confirms.
+    #[test]
+    fn test_the_next_append_syncs_both_directories_of_a_symlinked_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (wals, real) = symlinked_wal(dir.path());
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        append_all(&mut state, WalTarget::Kv, &[b"first"]);
+        let mark = mark_of(&mut state, WalTarget::Kv);
+
+        state.faults.cut_sync = true;
+        assert!(cut_before(&mut state, WalTarget::Kv, mark).is_err());
+        assert!(state.wals[0].unsafe_end);
+        assert_eq!(append_all(&mut state, WalTarget::Kv, &[b"second"]), [(8, 2)]);
+        assert_eq!(state.faults.unmark_syncs, [dir.path().join("link"), real]);
+        assert!(!state.wals[0].unsafe_end);
     }
 
     // A ring without room for a write and its fdatasync stops the start.

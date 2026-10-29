@@ -3,14 +3,14 @@ use crate::core::storage_thread::{
     appends_refused, apply_unsafe_end_marker, ensure_header, mark_unsafe_end, unmark_unsafe_end, unsafe_end_marker,
     Faults,
 };
-use crate::core::storage_thread::{StorageHandle, WalPermit, WalTarget};
+use crate::core::storage_thread::{StorageHandle, WalMark, WalPermit, WalTarget};
 use std::io::SeekFrom;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
 #[cfg(test)]
@@ -35,6 +35,13 @@ pub const WAL_HEADER_LEN: u64 = WAL_MAGIC.len() as u64;
 /// checks a value against before it ever reaches the WAL. 64 MiB (the JSON bulk body cap) is the largest of these; 96 MiB
 /// gives it headroom no legitimate write can reach.
 pub const WAL_MAX_FIELD_LEN: usize = 96 * 1024 * 1024;
+
+/// [`recover`] reads the log through a buffer of this size: its fields are
+/// 1 to 8 bytes each, and a read per field made recovery slow.
+const RECOVERY_READ_BUFFER: usize = 1024 * 1024;
+
+/// The log as [`recover`] reads it.
+type LogReader = BufReader<File>;
 
 #[derive(Error, Debug)]
 pub enum WalError {
@@ -96,7 +103,7 @@ pub struct Recovered {
 /// records get the LSNs 1 to n in file order.
 pub async fn recover(path: impl AsRef<Path>) -> Result<Recovered, WalError> {
     let mut file = match File::open(path.as_ref()).await {
-        Ok(f) => f,
+        Ok(f) => BufReader::with_capacity(RECOVERY_READ_BUFFER, f),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Recovered::default()),
         Err(e) => return Err(e.into()),
     };
@@ -131,7 +138,7 @@ pub async fn recover(path: impl AsRef<Path>) -> Result<Recovered, WalError> {
 
 /// The next `N` bytes of the log, `None` at its end; fewer than `N` bytes
 /// before the end are a torn record.
-async fn read_next<const N: usize>(file: &mut File) -> Result<Option<[u8; N]>, WalError> {
+async fn read_next<const N: usize>(file: &mut LogReader) -> Result<Option<[u8; N]>, WalError> {
     let mut buf = [0; N];
     let mut filled = 0;
     while filled < N {
@@ -146,7 +153,7 @@ async fn read_next<const N: usize>(file: &mut File) -> Result<Option<[u8; N]>, W
 
 /// Reads the rest of one record of `entry_type` and adds its entries with `lsn`.
 async fn read_record(
-    file: &mut File,
+    file: &mut LogReader,
     entry_type: u8,
     lsn: u64,
     entries: &mut Vec<(u64, WalEntry)>,
@@ -197,7 +204,7 @@ async fn read_record(
     Ok(())
 }
 
-async fn read_len_prefixed(file: &mut File) -> Result<Vec<u8>, WalError> {
+async fn read_len_prefixed(file: &mut LogReader) -> Result<Vec<u8>, WalError> {
     let len = file.read_u32().await? as usize;
     if len > WAL_MAX_FIELD_LEN {
         return Err(field_too_long_error(len));
@@ -364,6 +371,25 @@ impl WriteAheadLog {
         }
     }
 
+    /// Where the log ends, after every append queued before this call.
+    pub async fn mark(&self) -> Result<WalMark, WalError> {
+        match &self.inner {
+            #[cfg(test)]
+            WalMode::Local(_) => Err(no_checkpoint_error()),
+            WalMode::Remote { handle, engine } => handle.wal_mark(*engine).await.map_err(wal_remote_err),
+        }
+    }
+
+    /// Drops the records before `mark` from the log; the records after it
+    /// stay, and so do the LSNs.
+    pub async fn cut_before(&self, mark: &WalMark) -> Result<(), WalError> {
+        match &self.inner {
+            #[cfg(test)]
+            WalMode::Local(_) => Err(no_checkpoint_error()),
+            WalMode::Remote { handle, engine } => handle.wal_cut_before(*engine, *mark).await.map_err(wal_remote_err),
+        }
+    }
+
     /// Truncates the WAL file back to its header, effectively clearing it.
     /// The LSNs go on where they were.
     ///
@@ -388,6 +414,14 @@ impl WriteAheadLog {
 /// Maps a storage-thread `anyhow` error back into the WAL's error type.
 fn wal_remote_err(e: anyhow::Error) -> WalError {
     WalError::Io(std::io::Error::other(e.to_string()))
+}
+
+#[cfg(test)]
+fn no_checkpoint_error() -> WalError {
+    WalError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the local WAL committer takes no checkpoint",
+    ))
 }
 
 #[cfg(test)]
@@ -991,12 +1025,12 @@ mod tests {
             assert!(!marker.exists());
             assert!(wal.unsafe_end);
 
-            let syncs = wal.faults.unmark_syncs;
+            let syncs = wal.faults.unmark_syncs.len();
             let record = delete_record(b"kept-two");
             let end = start + 8 + record.len() as u64;
             let kept = commit_group(&mut wal, vec![record]).await;
             assert_eq!(offset(&kept), start);
-            assert_eq!(wal.faults.unmark_syncs, syncs + 1);
+            assert_eq!(wal.faults.unmark_syncs.len(), syncs + 1);
             assert!(!wal.unsafe_end);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), end);
         })
@@ -1173,6 +1207,57 @@ mod tests {
                     "expected a torn record, got: {err}"
                 );
             }
+        })
+    }
+
+    // The local committer takes no checkpoint: a mark and a cut both fail
+    // and leave the log as it is.
+    #[test]
+    fn test_the_local_committer_takes_no_mark_and_no_cut() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let wal = WriteAheadLog::new(&path).await.unwrap();
+            wal.append(b"kept").await.unwrap();
+            assert!(wal.mark().await.is_err());
+            let mark = WalMark { generation: 0, offset: WAL_HEADER_LEN, lsn: 0 };
+            assert!(wal.cut_before(&mark).await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), log_of(&[(1, b"kept")]));
+        })
+    }
+
+    /// A SET record of `key` and `value` without expiry.
+    fn set_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut record = vec![1u8];
+        record.extend_from_slice(&7u64.to_be_bytes());
+        record.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        record.extend_from_slice(key);
+        record.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        record.extend_from_slice(value);
+        record.extend_from_slice(&0u64.to_be_bytes());
+        record
+    }
+
+    // A record that crosses the edge of the read buffer and a value longer
+    // than the buffer read back unchanged.
+    #[test]
+    fn test_recover_reads_records_across_and_beyond_the_read_buffer() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            // Header, LSN frame and the SET fields around the value take 42 bytes.
+            let filler = vec![b'f'; RECOVERY_READ_BUFFER - 42 - 5];
+            let large: Vec<u8> = (0..2 * RECOVERY_READ_BUFFER + 3).map(|i| i as u8).collect();
+            let records = [set_record(b"a", &filler), set_record(b"across", "clé".as_bytes()), set_record(b"b", &large)];
+            let log = log_of(&[(1, &records[0]), (2, &records[1]), (3, &records[2])]);
+            assert!(log.len() > 2 * RECOVERY_READ_BUFFER);
+
+            let recovered = recover(write_log(&dir, &log)).await.unwrap();
+            let set = |key: &[u8], value: &[u8]| WalEntry::Set { timestamp: 7, key: key.to_vec(), value: value.to_vec(), expire_at: 0 };
+            assert_eq!(
+                recovered.entries,
+                [(1, set(b"a", &filler)), (2, set(b"across", "clé".as_bytes())), (3, set(b"b", &large))]
+            );
+            assert_eq!(recovered.max_lsn, 3);
         })
     }
 

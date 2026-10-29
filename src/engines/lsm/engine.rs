@@ -367,6 +367,9 @@ pub(crate) struct TestHooks {
     /// Parks `flush_memtable` between its manifest change in memory and its
     /// own save of the manifest.
     pub before_flush_save: Option<Arc<TestHook>>,
+    /// Parks a TTL sweep between the re-check of a candidate that found it
+    /// expired and the write of its tombstone.
+    pub after_sweep_recheck: Option<Arc<TestHook>>,
 }
 
 /// LSM-Tree Storage Engine with MVCC and background maintenance.
@@ -480,6 +483,10 @@ pub struct LsmStorageEngine {
     /// a write.
     maintenance_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Checkpoints that marked the WAL while this instance held its writes
+    /// back; raised under that hold.
+    checkpoints: AtomicU64,
+
     #[cfg(test)]
     pub(crate) hooks: TestHooks,
 }
@@ -575,6 +582,7 @@ impl LsmStorageEngine {
             last_applied_lsn: AtomicU64::new(wal_max_lsn),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
+            checkpoints: AtomicU64::new(0),
             #[cfg(test)]
             hooks: TestHooks::default(),
         };
@@ -978,6 +986,32 @@ impl LsmStorageEngine {
         let snap = self.manifest.read().clone();
         self.manifest_manager.save(&snap).await.context("Manifest save error")?;
         self.sync_vlog_and_dirs().await.context("Sync error")
+    }
+
+    /// Cuts the WAL of an instance that writes it alone back to what came
+    /// after a mark: the mark is taken while the instance holds its writes
+    /// back, then everything is persisted. A failure leaves the WAL whole.
+    pub async fn checkpoint(&self) -> Result<()> {
+        let mark = {
+            let _hold = self.hold_for_checkpoint().await;
+            self.wal.mark().await?
+        };
+        self.persist_all().await?;
+        Ok(self.wal.cut_before(&mark).await?)
+    }
+
+    /// Holds every later write back once the ones in flight have applied,
+    /// like [`Self::drain_writes`], and counts a checkpoint: a sweeper
+    /// tombstone checked before it is not written after it.
+    pub(crate) async fn hold_for_checkpoint(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        let hold = self.in_flight_writes.write().await;
+        self.checkpoints.fetch_add(1, Ordering::AcqRel);
+        hold
+    }
+
+    /// Checkpoints counted so far; see [`Self::write_tombstone_at`].
+    pub(crate) fn checkpoint_count(&self) -> u64 {
+        self.checkpoints.load(Ordering::Acquire)
     }
 
     /// The LSN of the last record durable in this engine's WAL.
@@ -1406,26 +1440,37 @@ impl LsmStorageEngine {
     /// Sweeper-exclusive — [`Self::write_tombstone`] does not delegate here.
     /// Holds the in-flight guard like every other WAL writer, so a drain
     /// waits for it.
+    ///
+    /// `checkpoint` is [`Self::checkpoint_count`] from before the re-check
+    /// that found the key expired. Has a checkpoint been counted since, its
+    /// mark may lie between the re-check and this record, and the replay
+    /// after a crash would put this record above a newer value the
+    /// checkpoint dropped from the WAL: nothing is written, no event goes
+    /// out, and `false` tells the sweeper to check the key again next tick.
     pub(super) async fn write_tombstone_at(
         &self,
         memtable: &Arc<MemTable>,
         key: &[u8],
         timestamp: Timestamp,
-    ) -> Result<()> {
+        checkpoint: u64,
+    ) -> Result<bool> {
         let _guard = self.in_flight_writes.read().await;
+        if self.checkpoint_count() != checkpoint {
+            return Ok(false);
+        }
         let permit = self.wal.reserve().await?;
         let (_, lsn) = permit.send(Self::encode_tombstone_wal_record(timestamp, key)).await?;
 
         let inserted = memtable.set_if_absent(key.to_vec(), timestamp, Value::Tombstone);
         self.applied(lsn);
         if !inserted {
-            return Ok(());
+            return Ok(true);
         }
         self.raise_change_epoch();
 
         // Broadcast after the apply is visible — see `write_kv_pair_admitted`.
         self.publish_change(key, OpType::Delete);
-        Ok(())
+        Ok(true)
     }
 
     /// Appends a SET_NULL entry to the WAL and inserts a NULL marker into the
@@ -2710,7 +2755,7 @@ mod tests {
             engine.put(b"k", b"client").await.unwrap();
             let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
             let memtable = engine.pin_memtable();
-            engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
+            engine.write_tombstone_at(&memtable, b"k", client_ts, engine.checkpoint_count()).await.unwrap();
             assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
             drop(engine);
 
@@ -4844,7 +4889,7 @@ mod tests {
             engine.write_batch(batch).await.unwrap();
             assert_eq!(engine.last_applied_lsn(), 5);
             let memtable = engine.pin_memtable();
-            engine.write_tombstone_at(&memtable, b"c", Timestamp::new(1)).await.unwrap();
+            engine.write_tombstone_at(&memtable, b"c", Timestamp::new(1), engine.checkpoint_count()).await.unwrap();
             assert_eq!(engine.last_applied_lsn(), 6);
 
             let recovered = crate::core::wal::recover(dir.path().join("wal.log")).await.unwrap();
@@ -4954,7 +4999,7 @@ mod tests {
             let slot = wal.reserve().await.unwrap();
             let sweeper = compio::runtime::spawn({
                 let (engine, memtable) = (Arc::clone(&engine), Arc::clone(&memtable));
-                async move { engine.write_tombstone_at(&memtable, b"k", Timestamp::new(1)).await.unwrap() }
+                async move { engine.write_tombstone_at(&memtable, b"k", Timestamp::new(1), engine.checkpoint_count()).await.unwrap() }
             });
             for _ in 0..100 {
                 if engine.in_flight_writes.try_write().is_err() {
@@ -6032,9 +6077,9 @@ mod tests {
         })
     }
 
-    async fn assert_raises_change_epoch(
+    async fn assert_raises_change_epoch<T>(
         engine: &LsmStorageEngine,
-        write: impl std::future::Future<Output = Result<()>>,
+        write: impl std::future::Future<Output = Result<T>>,
     ) {
         let before = engine.change_epoch();
         write.await.unwrap();
@@ -6063,7 +6108,7 @@ mod tests {
             let (engine, _dir) = make_engine().await;
             let memtable = engine.pin_memtable();
             let stamp = engine.next_timestamp().await;
-            assert_raises_change_epoch(&engine, engine.write_tombstone_at(&memtable, b"k", stamp)).await;
+            assert_raises_change_epoch(&engine, engine.write_tombstone_at(&memtable, b"k", stamp, engine.checkpoint_count())).await;
         })
     }
 

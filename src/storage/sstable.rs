@@ -219,7 +219,7 @@ pub struct SSTableReader {
     pub file_id: u64,
     retired: AtomicBool,
     #[cfg(test)]
-    blocks_read: std::sync::atomic::AtomicUsize,
+    pub(crate) blocks_read: std::sync::atomic::AtomicUsize,
 }
 
 impl SSTableReader {

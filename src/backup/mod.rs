@@ -332,6 +332,13 @@ impl BackupManager {
         }
     }
 
+    /// Whether a backup may start now: always while writes go in; while they
+    /// are refused for want of disk space or memory, only into a backup
+    /// directory on a volume of its own with room.
+    pub fn backup_allowed(&self) -> bool {
+        self.control.resources().backup_allowed()
+    }
+
     /// The currently running job, if any (backup list's `running` field and
     /// the busy check share this).
     pub fn running_job(&self) -> Option<RunningJobInfo> {

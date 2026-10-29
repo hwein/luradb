@@ -406,7 +406,10 @@ async fn resolve(
 }
 
 fn error_response(request_id: u64, err: anyhow::Error) -> ShmResponse {
-    let message = err.to_string();
+    let message = match crate::control::resources::WriteBlocked::in_chain(&err) {
+        Some(blocked) => blocked.to_string(),
+        None => err.to_string(),
+    };
     ShmResponse::Error { request_id, code: http_code(&message), message }
 }
 
@@ -425,7 +428,9 @@ fn response_request_id(r: &ShmResponse) -> u64 {
 /// Maps the engine layer's `"<code> …"` message prefixes to HTTP-analog status
 /// codes — same convention as `api::middleware::ApiError`.
 fn http_code(msg: &str) -> u32 {
-    if msg.starts_with("429") {
+    if msg.starts_with("507") {
+        507
+    } else if msg.starts_with("429") {
         429
     } else if msg.starts_with("410") {
         410
@@ -1077,6 +1082,32 @@ mod tests {
                     assert_eq!(code, 400);
                 }
                 other => panic!("expected 400 Error, got {other:?}"),
+            }
+        })
+    }
+
+    // Test 5: while writes are refused, a put answers the protocol's error
+    // with 507 and the refusal's text; a read goes on.
+    #[test]
+    fn test_dispatch_put_while_writes_are_refused_is_507() {
+        crate::core::engine_runtime::block_on(async {
+            let mut h = harness().await;
+            h.registry.create_domain("d1").await.unwrap();
+            h.registry.store("d1").await.unwrap().put(b"k", b"v").await.unwrap();
+            h.registry.engine().resources().block_for_test(false, false);
+
+            let put = ShmCommand::Put { request_id: 12, domain: "d1".into(), key: b"k".to_vec(), value: b"w".to_vec(), ttl_secs: 0 };
+            match send_and_dispatch(&mut h, put).await {
+                ShmResponse::Error { request_id, code, message } => {
+                    assert_eq!((request_id, code), (12, 507));
+                    assert_eq!(message, "507 Insufficient Storage: write blocked: disk space below threshold, retry in 5 s");
+                }
+                other => panic!("expected a 507 Error, got {other:?}"),
+            }
+            let get = ShmCommand::Get { request_id: 13, domain: "d1".into(), key: b"k".to_vec() };
+            match send_and_dispatch(&mut h, get).await {
+                ShmResponse::GetOk { value: ShmGetValue::Present(value), .. } => assert_eq!(value, b"v"),
+                other => panic!("expected the value, got {other:?}"),
             }
         })
     }

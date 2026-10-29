@@ -280,7 +280,7 @@ mod tests {
             let sys = open_with_wal(&dir, hub.wal(WalTarget::Sys)).await.unwrap();
             let auth = Arc::new(crate::auth::AuthCache::new(Arc::clone(&sys), None));
             let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
-            let control = ControlPlane::start(Owners { shards: Vec::new(), auth }, Arc::clone(&sys), bus).await.unwrap();
+            let control = ControlPlane::start(Owners { shards: Vec::new(), auth }, Arc::clone(&sys), bus, Default::default()).await.unwrap();
             let checkpoints = WalCheckpoint::new(control, vec![(Holder::System, hub.wal(WalTarget::Sys))], 3 * SEGMENT);
             let user = |i: usize| format!("{PREFIX_USER}user-{i}").into_bytes();
             let record = |i: usize| format!("record {i} of zoé ✓").repeat(4).into_bytes();
@@ -305,6 +305,33 @@ mod tests {
             }
             assert_eq!(sys.get(&user(200)).await.unwrap(), Some(b"after the checkpoint".to_vec()));
             sys.shutdown().await;
+        })
+    }
+
+    // Test 6: while the data shards refuse writes, the system store, on a
+    // state of its own, writes on: its TTL sweep removes the expired entries.
+    #[test]
+    fn the_system_ttl_sweep_runs_while_the_shards_refuse_writes() {
+        use crate::control::resources::Resources;
+        use crate::engines::lsm::ttl_sweeper::TtlSweeper;
+        crate::core::engine_runtime::block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let shards = Resources::default();
+            let files = crate::control::testing::kv_shard_files(tmp.path());
+            let wal = Arc::new(WriteAheadLog::new(&files.wal).await.unwrap());
+            let options = LsmEngineOptions { resources: shards.clone(), ..LsmEngineOptions::default() };
+            let kv = crate::server::recovery::open_instance(&files, 0, wal, options).await.unwrap();
+            let sys = open(&tmp.path().join("sys")).await.unwrap();
+            let code = "__sys:oauth:code:clé".as_bytes();
+            sys.put_expired_for_test(code, b"expired").await.unwrap();
+
+            let lsn = sys.last_applied_lsn();
+
+            shards.block_for_test(false, false);
+            assert!(kv.put(b"k", b"v").await.is_err(), "the shards refuse writes");
+            TtlSweeper::new(Arc::clone(&sys), 500).sweep_tick().await.unwrap();
+            assert_eq!(sys.last_applied_lsn(), lsn + 1, "the sweep wrote its tombstone");
+            assert_eq!(sys.get(code).await.unwrap(), None);
         })
     }
 

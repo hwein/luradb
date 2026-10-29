@@ -1,6 +1,10 @@
 [Unit]
 Description=LuraDB multi-model database
 After=network.target
+# At most three starts within five minutes, manual ones included; after that systemd
+# refuses to start the service until `systemctl reset-failed luradb`.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -18,8 +22,13 @@ UMask=0027
 LimitNOFILE=65536
 # io_uring registered buffers need memlock.
 LimitMEMLOCK=infinity
+# Exit code 3: the disk failed to make written data durable (fsync); the restart
+# recovers every confirmed write from the write-ahead log. Exit code 4: a volume lacks
+# the free space the recovery needs; no restart until space is freed and the service is
+# started again.
 Restart=on-failure
 RestartSec=2
+RestartPreventExitStatus=4
 
 # Hardening — deliberately WITHOUT SystemCallFilter: io_uring syscalls must stay allowed.
 # /dev/shm stays writable under ProtectSystem=strict (SHM feature).

@@ -29,8 +29,12 @@ impl TtlSweeper {
         Self { engine, batch_size, cursor: Mutex::new(Vec::new()) }
     }
 
-    /// One sweep cycle.
+    /// One sweep cycle; none while writes are refused for want of disk space
+    /// or memory, where a tombstone would only take space.
     pub async fn sweep_tick(&self) -> Result<()> {
+        if self.engine.writes_refused() {
+            return Ok(());
+        }
         // 1./2. One freeze check, then pin — after this the tick never causes
         // a freeze itself, so no tombstone can land in a newer source than a
         // concurrent write to the same key.
@@ -154,6 +158,24 @@ mod tests {
 
             assert_eq!(drained_deletes(&mut rx), vec![b"k".to_vec()]);
             assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
+    }
+
+    // Test 6: while writes are refused, a tick writes no tombstone; the
+    // first tick after the block does.
+    #[test]
+    fn test_no_tick_while_writes_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"v").await.unwrap();
+            let lsn = engine.last_applied_lsn();
+            engine.resources().block_for_test(false, false);
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), lsn, "no tombstone during the block");
+
+            engine.resources().unblock_for_test();
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
             assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
         })
     }

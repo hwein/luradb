@@ -4,6 +4,7 @@
 //! MemTable, WAL, VLog, SSTable levels, compaction, and the Janitor GC.
 
 use crate::config::BlockCacheConfig;
+use crate::control::resources::{Resources, SpaceWait};
 use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::memtable::{MemTable, Value};
 use crate::engines::lsm::reader::{
@@ -97,6 +98,10 @@ pub struct LsmEngineOptions {
     /// The data shard the instance belongs to; its watch stream's epoch
     /// carries it.
     pub shard: u16,
+    /// Refuses the client writes while disk space or memory runs short, and
+    /// says how much space compaction and value log cleanup find. The system
+    /// store keeps the default, so its writes, sign-ins and keys, go on.
+    pub resources: Resources,
 }
 
 /// Where a new engine's unflushed writes come from.
@@ -483,6 +488,11 @@ pub struct LsmStorageEngine {
     /// a write.
     maintenance_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Refuses the client writes while disk space or memory runs short.
+    resources: Resources,
+    /// Compactions skipped for want of disk space.
+    compaction_space: SpaceWait,
+
     /// The largest the active MemTable grew during the replay.
     #[cfg(test)]
     pub(crate) replay_peak: std::sync::atomic::AtomicUsize,
@@ -512,6 +522,7 @@ impl LsmStorageEngine {
             block_cache: block_cache_config,
             recovery,
             shard,
+            resources,
         } = options;
 
         let mut version = Self::discover_vlog_generations(vlog, &vlog_path).await?;
@@ -569,6 +580,8 @@ impl LsmStorageEngine {
             last_applied_lsn: Arc::new(AtomicU64::new(0)),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
+            resources,
+            compaction_space: SpaceWait::default(),
             #[cfg(test)]
             replay_peak: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -728,21 +741,26 @@ impl LsmStorageEngine {
     }
 
     /// Syncs every vLog generation of the current version, then the
-    /// directories of the SSTables, the manifest and the vLog.
+    /// directories of the SSTables, the manifest and the vLog; a failed
+    /// sync stops the server.
     async fn sync_vlog_and_dirs(&self) -> Result<()> {
         self.sync_vlog_generations().await?;
         let vlog_dir = self.vlog_path.parent().unwrap_or(Path::new(""));
-        crate::storage::sync_dirs(&[self.file_manager.dir(), self.manifest_manager.dir(), vlog_dir]).await
+        crate::storage::sync_dirs_or_stop(&[self.file_manager.dir(), self.manifest_manager.dir(), vlog_dir]).await
     }
 
     /// Syncs every vLog generation of the current version: a frozen MemTable
-    /// may point into a generation the Janitor sealed without a sync.
+    /// may point into a generation the Janitor sealed without a sync. A
+    /// failed sync stops the server: a second one of the same file proves
+    /// nothing.
     async fn sync_vlog_generations(&self) -> Result<()> {
         let version = self.version();
         let mut generations: Vec<&Arc<VLog>> = version.vlog.values().collect();
         generations.sort_by_key(|vlog| vlog.id());
         for vlog in generations {
-            vlog.sync().await?;
+            if let Err(e) = vlog.sync().await {
+                return Err(crate::storage::fatal_sync_error(vlog.path(), &e));
+            }
         }
         Ok(())
     }
@@ -868,6 +886,7 @@ impl LsmStorageEngine {
             Some(Arc::clone(&self.flush_lock)),
             Some(Arc::clone(&self.maintenance_lock)),
             Some((Arc::clone(&self.in_flight_writes), Arc::clone(&self.last_applied_lsn))),
+            self.resources.clone(),
         )
     }
 
@@ -1023,9 +1042,9 @@ impl LsmStorageEngine {
     /// A failed `flush_memtable` puts its MemTable back among the immutables,
     /// but nothing persisted its data. A failed manifest save after an
     /// earlier flush installed its SSTable leaves the table in L0 and in no
-    /// MANIFEST on disk, where the next startup would not find it. A failed
-    /// sync leaves bytes or names the next startup may not find after a power
-    /// loss. Each way the WAL is the only durable copy, and this fails.
+    /// MANIFEST on disk, where the next startup would not find it. Either way
+    /// the WAL is the only durable copy, and this fails. A failed sync stops
+    /// the server, which leaves the WAL to the next start as well.
     pub async fn persist_all(&self) -> Result<()> {
         self.flush_all_memtables().await.context("Flush error")?;
         // A no-op unless a flush's own save failed: the manifest carries the
@@ -1312,6 +1331,17 @@ impl LsmStorageEngine {
         self.in_flight_writes.read().await
     }
 
+    /// Whether the client writes are refused for want of disk space or
+    /// memory; the background writers that only write tombstones wait then.
+    pub fn writes_refused(&self) -> bool {
+        self.resources.check_write().is_err()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resources(&self) -> &Resources {
+        &self.resources
+    }
+
     /// Highest LSN of a WAL record whose write reached the MemTable.
     pub fn last_applied_lsn(&self) -> u64 {
         self.last_applied_lsn.load(Ordering::Acquire)
@@ -1342,7 +1372,9 @@ impl LsmStorageEngine {
     }
 
     /// [`Self::write_kv_pair`] that first runs `admit` under the in-flight
-    /// guard; an error from it refuses the write before the stamp and the WAL.
+    /// guard; an error from it refuses the write before the stamp and the WAL,
+    /// as does a shortage of disk space or memory. A write that holds the
+    /// guard when the shortage begins goes through.
     pub(super) async fn write_kv_pair_admitted(
         &self,
         key: &[u8],
@@ -1361,6 +1393,7 @@ impl LsmStorageEngine {
         // but need the guard all the same — the stamp ordering applies to
         // every write.
         let _guard = self.in_flight_writes.read().await;
+        self.resources.check_write()?;
         admit()?;
 
         // Reserve, then stamp: a full WAL queue and a saturated clock are
@@ -1426,6 +1459,7 @@ impl LsmStorageEngine {
         // `write_kv_pair_admitted`.
         self.maybe_freeze_memtable().await?;
         let _guard = self.in_flight_writes.read().await;
+        self.resources.check_write()?;
         admit()?;
 
         // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
@@ -1506,6 +1540,7 @@ impl LsmStorageEngine {
         // `write_kv_pair_admitted`.
         self.maybe_freeze_memtable().await?;
         let _guard = self.in_flight_writes.read().await;
+        self.resources.check_write()?;
         admit()?;
 
         // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
@@ -1634,6 +1669,7 @@ impl LsmStorageEngine {
         // before the shared stamp and held through every `memtable.set` in
         // Phase 2 below.
         let _guard = self.in_flight_writes.read().await;
+        self.resources.check_write()?;
         admit()?;
 
         // Reserve, then stamp, no `.await` up to `send` — see `write_kv_pair_admitted`.
@@ -2030,8 +2066,8 @@ impl LsmStorageEngine {
         // Before the manifest changes in memory, not just before its save: a
         // compaction or GC cycle may save the shared manifest from then on,
         // and a saved manifest must name only files whose names are on disk.
-        // Before the install, so a failure still hands the MemTable back.
-        crate::storage::sync_dirs(&[self.file_manager.dir()]).await?;
+        // A failed sync stops the server.
+        crate::storage::sync_dirs_or_stop(&[self.file_manager.dir()]).await?;
         // The watermark the save below raises covers this MemTable's values.
         self.sync_vlog_generations().await?;
 
@@ -2124,17 +2160,20 @@ impl LsmStorageEngine {
             }
         };
 
-        self.compact_level(source_level).await?;
         // Only a level that actually got compacted counts -- mirrors the
         // Janitor's `GcStats::ran` distinction so this stays an activity
         // signal instead of a poll-interval counter.
-        self.compaction_runs.fetch_add(1, Ordering::Relaxed);
+        if !self.compact_level(source_level).await?.is_empty() {
+            self.compaction_runs.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
     /// Compacts `source_level` into `source_level + 1`, returning the file ids
     /// removed from the working set (the merged source + target inputs) so the
-    /// caller can deregister exactly those from the `IoEngine`.
+    /// caller can deregister exactly those from the `IoEngine`. Waits, with
+    /// nothing removed, while the SSTable volume has less free space than its
+    /// inputs take, the most its output can take.
     pub async fn compact_level(&self, source_level: usize) -> Result<Vec<u64>> {
         // Whole run under the maintenance lock: a GC cycle either sees this
         // compaction's output from its start or not at all, so it can neither
@@ -2158,6 +2197,19 @@ impl LsmStorageEngine {
         if src_metas.is_empty() {
             return Ok(Vec::new());
         }
+        let inputs: u64 = src_metas.iter().chain(&tgt_metas).map(|meta| meta.file_size).sum();
+        let dir = self.file_manager.dir();
+        if let Some(free) = self.resources.free_space(dir).filter(|&free| free < inputs) {
+            if self.compaction_space.skipped() {
+                tracing::warn!(
+                    "Compaction of level {source_level} waits for disk space: {free} bytes free in {}, \
+                     its inputs take {inputs}.",
+                    dir.display()
+                );
+            }
+            return Ok(Vec::new());
+        }
+        self.compaction_space.ran();
 
         // Load SSTables from disk.
         let use_mmap = self.engine_config.use_mmap;
@@ -7121,7 +7173,7 @@ mod tests {
 
     // persist_all saves the manifest a flush changed, then syncs every vLog
     // generation and the SSTable and vLog directories; a failed sync of a
-    // generation or a directory fails it.
+    // generation or a directory stops the server, naming it.
     #[test]
     fn test_persist_all_saves_the_manifest_then_syncs_generations_and_directories() {
         crate::core::engine_runtime::block_on(async {
@@ -7149,13 +7201,15 @@ mod tests {
                 ]
             );
 
-            for unsyncable in [gen2, dir.path().join("vlog")] {
+            let unsyncables = [gen2, dir.path().join("vlog")];
+            for unsyncable in &unsyncables {
                 engine.put(b"b", &vlog_value(b'b')).await.unwrap();
-                test_fault::fail_syncs_of(&unsyncable);
+                test_fault::fail_syncs_of(unsyncable);
                 let persisted = engine.persist_all().await;
-                test_fault::allow_syncs_of(&unsyncable);
+                test_fault::allow_syncs_of(unsyncable);
                 assert!(persisted.is_err(), "a failed sync of {} fails it", unsyncable.display());
             }
+            assert_eq!(test_fault::stops_under(dir.path()), unsyncables);
         })
     }
 
@@ -7192,6 +7246,7 @@ mod tests {
             test_fault::fail_syncs_of(&sst);
             engine.shutdown().await;
             test_fault::allow_syncs_of(&sst);
+            assert_eq!(test_fault::stops_under(dir.path()), [sst], "a failed sync stops the server");
             assert_eq!(std::fs::read(&wal_path).unwrap(), wal, "a failed sync leaves the WAL as it was");
             drop(engine); // crash
 
@@ -7221,6 +7276,7 @@ mod tests {
             let started = engine_split(dir.path()).await;
             test_fault::allow_syncs_of(&vlog_path);
             assert!(started.is_err(), "a failed sync stops the start");
+            assert_eq!(test_fault::stops_under(dir.path()), std::slice::from_ref(&vlog_path));
             assert_eq!(std::fs::read(&wal_path).unwrap(), wal, "the WAL stays as it was");
             assert_eq!(test_trace::steps(dir.path()), ["sync sst"]);
             drop(started);
@@ -7574,11 +7630,11 @@ mod tests {
         })
     }
 
-    // A flush whose SSTable directory does not sync fails before the
-    // manifest names its table and hands its MemTable back; once the
-    // directory syncs again, the next flush succeeds.
+    // A flush whose SSTable directory does not sync stops the server before
+    // the manifest names its table, naming the directory; the start after
+    // the stop reads every value back from the WAL.
     #[test]
-    fn test_flush_with_an_unsyncable_directory_hands_its_memtable_back() {
+    fn test_flush_with_an_unsyncable_directory_stops_the_server() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let sst = dir.path().join("sst");
@@ -7594,21 +7650,12 @@ mod tests {
             let flushed = engine.flush_memtable().await;
             test_fault::allow_syncs_of(&sst);
 
-            assert!(flushed.is_err());
-            let version = engine.version();
-            assert_eq!(version.immutables.len(), 1, "the MemTable is back among the immutables");
-            assert!(version.flushing.is_empty());
-            assert_eq!(version.levels[0].len(), 1, "L0 holds only the earlier table");
+            assert!(flushed.unwrap_err().to_string().starts_with("data sync failed on"));
+            assert_eq!(test_fault::stops_under(dir.path()), [sst]);
             let level0: Vec<u64> = engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
             assert_eq!(level0, vec![first], "the manifest in memory is unchanged");
             assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest, "the manifest on disk is unchanged");
-
-            let second = engine.flush_memtable().await.unwrap().unwrap();
-            assert!(engine.version().immutables.is_empty());
-            assert_eq!(saved_level0(dir.path()).await, vec![first, second]);
-            assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
-            assert_eq!(engine.get(b"b").await.unwrap(), Some(vlog_value(b'b')));
-            drop(engine); // crash
+            drop(engine); // the stop
 
             let engine = engine_split(dir.path()).await.unwrap();
             assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
@@ -7731,6 +7778,7 @@ mod tests {
             let flushed = engine.flush_memtable().await;
             test_fault::allow_syncs_of(&gen2);
             assert!(flushed.is_err());
+            assert_eq!(test_fault::stops_under(dir.path()), std::slice::from_ref(&gen2), "the failed sync stops the server");
             assert_eq!(std::fs::read(dir.path().join("sst").join("MANIFEST")).unwrap(), manifest);
             let level0: Vec<u64> = engine.manifest.read().get_level(0).iter().map(|m| m.file_id).collect();
             assert_eq!(level0, [first]);
@@ -7743,6 +7791,140 @@ mod tests {
             assert_eq!(saved_level0(dir.path()).await, [first, second]);
             assert_eq!(saved_flushed_lsn(dir.path()).await, 2);
             assert_eq!(engine.get(b"b").await.unwrap(), Some(vlog_value(b'b')));
+        })
+    }
+
+    // Test 5: while writes are refused, every client write of an instance
+    // fails with the refusal before the WAL; an instance on its own state,
+    // the system store's case, writes on; after the block, writes go in.
+    #[test]
+    fn test_client_writes_are_refused_while_resources_run_short() {
+        use crate::control::resources::{Resources, WriteBlocked};
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let resources = Resources::default();
+            let options = LsmEngineOptions { resources: resources.clone(), ..Default::default() };
+            let engine = engine_split_with(dir.path(), options).await.unwrap();
+            engine.put(b"kept", b"v").await.unwrap();
+            let lsn = engine.last_applied_lsn();
+
+            resources.block_for_test(false, false);
+            assert!(engine.writes_refused());
+            let refusals = [
+                engine.put(b"k", b"v").await,
+                engine.put_with_ttl(b"k", b"v", 60).await,
+                engine.set_null(b"k").await,
+                StorageEngine::set(&engine, b"k", b"v").await,
+                StorageEngine::delete(&engine, b"kept").await,
+                engine.write_batch(vec![BatchOp::Delete { key: b"kept".to_vec() }]).await,
+            ];
+            for refused in refusals {
+                let err = refused.unwrap_err();
+                assert!(WriteBlocked::in_chain(&err).is_some(), "{err}");
+            }
+            assert_eq!(engine.last_applied_lsn(), lsn, "nothing reached the WAL");
+            assert_eq!(engine.get(b"kept").await.unwrap(), Some(b"v".to_vec()));
+
+            let other = tempfile::TempDir::new().unwrap();
+            engine_split(other.path()).await.unwrap().put(b"k", b"v").await.unwrap();
+
+            resources.unblock_for_test();
+            engine.put(b"k", b"v").await.unwrap();
+        })
+    }
+
+    // Test 6: while writes are refused, a flush still writes the MemTable
+    // filled before as an SSTable and raises the flushed LSN.
+    #[test]
+    fn test_a_flush_runs_while_writes_are_refused() {
+        use crate::control::resources::Resources;
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let resources = Resources::default();
+            let options = LsmEngineOptions { resources: resources.clone(), ..Default::default() };
+            let engine = engine_split_with(dir.path(), options).await.unwrap();
+            engine.put(b"a", b"1").await.unwrap();
+            engine.put(b"b", &vlog_value(b'b')).await.unwrap();
+            assert_eq!(engine.flushed_lsn(), 0);
+
+            resources.block_for_test(false, false);
+            let table = flush_new_table(&engine).await;
+            assert_eq!(saved_level0(dir.path()).await, [table]);
+            assert_eq!((engine.flushed_lsn(), saved_flushed_lsn(dir.path()).await), (2, 2));
+            assert_eq!(engine.get(b"b").await.unwrap(), Some(vlog_value(b'b')));
+        })
+    }
+
+    // Test 4: a write past the gate when the block begins goes through; the
+    // next one is refused.
+    #[test]
+    fn test_a_write_past_the_gate_when_the_block_begins_goes_through() {
+        use crate::control::resources::Resources;
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let resources = Resources::default();
+            let options = LsmEngineOptions { resources: resources.clone(), ..Default::default() };
+            let mut engine = engine_split_with(dir.path(), options).await.unwrap();
+            let hook = Arc::new(TestHook::default());
+            engine.hooks = TestHooks { before_kv_pair_apply: Some((b"held".to_vec(), Arc::clone(&hook))), ..Default::default() };
+            let engine = Arc::new(engine);
+            let writer = {
+                let engine = Arc::clone(&engine);
+                compio::runtime::spawn(async move { engine.put(b"held", b"v").await })
+            };
+            hook.reached.notified().await;
+            resources.block_for_test(false, false);
+            hook.release.notify_one();
+            writer.await.unwrap().unwrap();
+            assert!(engine.put(b"late", b"v").await.is_err());
+            assert_eq!(engine.get(b"held").await.unwrap(), Some(b"v".to_vec()));
+        })
+    }
+
+    // Test 6: a compaction waits while the SSTable volume has less free
+    // space than its inputs take, and runs once it has.
+    #[test]
+    fn test_compaction_waits_for_room_for_its_inputs() {
+        use crate::control::resources::tests::{FakeProbe, GB};
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let probe = FakeProbe::new();
+            probe.mount(dir.path(), 100 * GB, 10);
+            let resources = crate::control::resources::Resources::with_probe(probe.clone());
+            let engine = engine_split_with(dir.path(), LsmEngineOptions { resources, ..Default::default() }).await.unwrap();
+            engine.put(b"a", b"1").await.unwrap();
+            flush_new_table(&engine).await;
+            engine.put(b"b", b"2").await.unwrap();
+            flush_new_table(&engine).await;
+
+            assert!(engine.compact_level(0).await.unwrap().is_empty(), "waits for room");
+            assert_eq!(engine.manifest.read().get_level(0).len(), 2);
+
+            probe.set_free(dir.path(), 50 * GB);
+            assert_eq!(engine.compact_level(0).await.unwrap().len(), 2);
+            assert!(engine.manifest.read().get_level(0).is_empty());
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+        })
+    }
+
+    // Test 6: a GC cycle waits while the value log's volume has less free
+    // space than the live values take, and runs once it has.
+    #[test]
+    fn test_gc_waits_for_room_for_its_live_values() {
+        use crate::control::resources::tests::{FakeProbe, GB};
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let probe = FakeProbe::new();
+            probe.mount(dir.path(), 100 * GB, 4095);
+            let resources = crate::control::resources::Resources::with_probe(probe.clone());
+            let engine = Arc::new(engine_split_with(dir.path(), LsmEngineOptions { resources, ..Default::default() }).await.unwrap());
+            engine.put(b"a", &vlog_value(b'a')).await.unwrap();
+            flush_new_table(&engine).await;
+
+            assert!(!engine.build_janitor(gc_always()).run_gc().await.unwrap().ran, "waits for room");
+            probe.set_free(dir.path(), 4096);
+            assert!(engine.build_janitor(gc_always()).run_gc().await.unwrap().ran);
+            assert_eq!(engine.get(b"a").await.unwrap(), Some(vlog_value(b'a')));
         })
     }
 

@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 pub struct LuraConfig {
     pub server: ServerConfig,
     pub storage: StorageConfig,
+    pub resources: ResourcesConfig,
     pub io_engine: IoEngineConfig,
     pub buffer_pool: BufferPoolConfig,
     pub lsm: LsmConfig,
@@ -88,6 +89,9 @@ impl LuraConfig {
         }
         if self.backup.enabled {
             entries.push(("backup.dir", self.backup.dir.as_str(), false));
+        }
+        if !self.log.path.is_empty() {
+            entries.push(("log.path", self.log.path.as_str(), false));
         }
         let paths = entries
             .into_iter()
@@ -403,6 +407,118 @@ pub fn parse_size(text: &str) -> anyhow::Result<u64> {
     let digits: u128 = format!("{whole}{fraction}").parse().map_err(|_| invalid())?;
     let bytes = digits.checked_mul(unit).ok_or_else(invalid)? / 10u128.pow(fraction.len() as u32);
     u64::try_from(bytes).map_err(|_| invalid())
+}
+
+/// Disk and memory thresholds of the resource watch, each a [`Threshold`].
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResourcesConfig {
+    /// Free space of a data volume below which the server warns.
+    pub disk_free_warn: String,
+    /// Free space of a data volume below which the server refuses writes.
+    pub disk_free_block: String,
+    /// Free space every data volume needs before refused writes resume.
+    pub disk_free_resume: String,
+    /// Anonymous memory the server may use, of the host's or its cgroup's memory.
+    pub memory_budget: String,
+}
+
+impl Default for ResourcesConfig {
+    fn default() -> Self {
+        Self {
+            disk_free_warn: "15% max 10 GB".to_string(),
+            disk_free_block: "5% max 2 GB".to_string(),
+            disk_free_resume: "10% max 4 GB".to_string(),
+            memory_budget: "75%".to_string(),
+        }
+    }
+}
+
+pub const MIN_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+
+impl ResourcesConfig {
+    /// Startup validation: every key parses; an absolute memory budget takes
+    /// at least [`MIN_MEMORY_BUDGET`]. The order of the disk thresholds is
+    /// checked per volume, once its size is known.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.disk_thresholds()?;
+        self.memory_budget().map(drop)
+    }
+
+    /// Warn, block and resume threshold, in this order.
+    pub fn disk_thresholds(&self) -> anyhow::Result<[Threshold; 3]> {
+        Ok([
+            threshold("disk_free_warn", &self.disk_free_warn)?,
+            threshold("disk_free_block", &self.disk_free_block)?,
+            threshold("disk_free_resume", &self.disk_free_resume)?,
+        ])
+    }
+
+    pub fn memory_budget(&self) -> anyhow::Result<Threshold> {
+        let budget = threshold("memory_budget", &self.memory_budget)?;
+        if let Threshold::Bytes(bytes) = budget {
+            anyhow::ensure!(
+                bytes >= MIN_MEMORY_BUDGET,
+                "invalid config: resources.memory_budget ({}) must be at least 256 MiB",
+                self.memory_budget
+            );
+        }
+        Ok(budget)
+    }
+}
+
+fn threshold(key: &str, text: &str) -> anyhow::Result<Threshold> {
+    Threshold::parse(text).map_err(|e| anyhow::anyhow!("invalid config: resources.{key} ({text}) {e}"))
+}
+
+/// A size in bytes or a percentage of a total, optionally capped by a size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Threshold {
+    Bytes(u64),
+    Percent { percent: f64, max: Option<u64> },
+}
+
+impl Threshold {
+    /// Reads a size as [`parse_size`] does (`"2 GB"`), a percentage above 0 up
+    /// to 100 (`"5%"`, `"2.5%"`), or a percentage with a cap
+    /// (`"15% max 10 GB"`, the keyword in any case).
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let invalid = || {
+            anyhow::anyhow!(
+                "needs a size such as \"2 GB\", a percentage above 0 up to 100 such as \"5%\", \
+                 or a percentage with a cap such as \"15% max 10 GB\""
+            )
+        };
+        let Some((number, rest)) = text.split_once('%') else {
+            return parse_size(text).map(Self::Bytes).map_err(|_| invalid());
+        };
+        let number = number.trim();
+        let is_decimal = !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && number.matches('.').count() <= 1;
+        let percent: f64 = if is_decimal { number.parse().map_err(|_| invalid())? } else { return Err(invalid()) };
+        if !(percent > 0.0 && percent <= 100.0) {
+            return Err(invalid());
+        }
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok(Self::Percent { percent, max: None });
+        }
+        let cap = rest.get(..3).filter(|keyword| keyword.eq_ignore_ascii_case("max")).ok_or_else(invalid)?;
+        let max = parse_size(&rest[cap.len()..]).map_err(|_| invalid())?;
+        Ok(Self::Percent { percent, max: Some(max) })
+    }
+
+    /// The threshold in bytes for a `total` of bytes.
+    pub fn of(&self, total: u64) -> u64 {
+        match *self {
+            Self::Bytes(bytes) => bytes,
+            Self::Percent { percent, max } => {
+                let share = (total as f64 * percent / 100.0) as u64;
+                max.map_or(share, |max| share.min(max))
+            }
+        }
+    }
 }
 
 /// Registered-buffer I/O on the engine thread's io_uring ring.
@@ -1731,6 +1847,56 @@ mod tests {
         }
     }
 
+    // A threshold is a size, a percentage of the volume, or a percentage
+    // capped by a size; anything else stops the start and names the forms.
+    #[test]
+    fn test_resource_thresholds_take_sizes_and_percentages() {
+        let percent = |percent, max| Threshold::Percent { percent, max };
+        for (text, expected) in [
+            ("2 GB", Threshold::Bytes(2_000_000_000)),
+            ("512 MiB", Threshold::Bytes(512 << 20)),
+            ("5%", percent(5.0, None)),
+            ("2.5%", percent(2.5, None)),
+            ("100 %", percent(100.0, None)),
+            ("15% max 10 GB", percent(15.0, Some(10_000_000_000))),
+            ("15%  MAX 10GB", percent(15.0, Some(10_000_000_000))),
+        ] {
+            assert_eq!(Threshold::parse(text).unwrap(), expected, "{text}");
+        }
+        for text in ["5", "0%", "101%", "max 1 GB", "5% max", "", "%", "-5%", "1e1%", "5% min 1 GB", "5%%"] {
+            let err = Threshold::parse(text).unwrap_err().to_string();
+            assert!(err.contains("\"15% max 10 GB\""), "{text}: {err}");
+        }
+
+        const GB: u64 = 1_000_000_000;
+        assert_eq!(percent(15.0, Some(10 * GB)).of(20 * GB), 3 * GB);
+        assert_eq!(percent(15.0, Some(10 * GB)).of(2000 * GB), 10 * GB);
+        assert_eq!(percent(2.5, None).of(1000), 25);
+        assert_eq!(Threshold::Bytes(4 * GB).of(20 * GB), 4 * GB);
+    }
+
+    // The resource section defaults to thresholds for small and large hosts;
+    // each key names itself when it does not parse, and an absolute memory
+    // budget takes at least 256 MiB.
+    #[test]
+    fn test_resources_defaults_and_validation() {
+        let config = LuraConfig::default().resources;
+        assert_eq!(
+            [&config.disk_free_warn, &config.disk_free_block, &config.disk_free_resume, &config.memory_budget],
+            ["15% max 10 GB", "5% max 2 GB", "10% max 4 GB", "75%"]
+        );
+        config.validate().unwrap();
+
+        for key in ["disk_free_warn", "disk_free_block", "disk_free_resume", "memory_budget"] {
+            let config: LuraConfig = toml::from_str(&format!("[resources]\n{key} = \"5\"\n")).unwrap();
+            assert_invalid(config.resources.validate(), &format!("resources.{key} (5)"), "\"15% max 10 GB\"");
+        }
+        let config: LuraConfig = toml::from_str("[resources]\nmemory_budget = \"100 MiB\"\n").unwrap();
+        assert_invalid(config.resources.validate(), "resources.memory_budget (100 MiB)", "at least 256 MiB");
+        let config: LuraConfig = toml::from_str("[resources]\nmemory_budget = \"3 GB\"\n").unwrap();
+        assert_eq!(config.resources.memory_budget().unwrap(), Threshold::Bytes(3_000_000_000));
+    }
+
     // The write-ahead log cap defaults to 256 MiB and takes no less than
     // 128 MiB; a value below or without a unit stops the start.
     #[test]
@@ -2210,6 +2376,19 @@ mod tests {
         config.backup.dir = config.rel.sstable_dir.clone();
         let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("backup.dir") && err.contains("rel.sstable_dir"), "{err}");
+    }
+
+    // The log directory is a data path too, once set.
+    #[test]
+    fn test_validate_data_paths_log_path_collision_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = LuraConfig::default();
+        config.log.path = config.storage.sstable_dir.clone();
+        let err = config.validate_data_paths(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("log.path") && err.contains("storage.sstable_dir"), "{err}");
+
+        config.log.path = "logs".to_string();
+        config.validate_data_paths(tmp.path()).unwrap();
     }
 
     #[test]
@@ -3052,6 +3231,17 @@ flag = true
     const SHIPPED_CONFIG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/packaging/luradb.toml"));
     const DEV_CONFIG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/luradb.toml"));
 
+    // The shipped config sets the resource thresholds to their defaults.
+    #[test]
+    fn test_shipped_config_sets_the_resource_defaults() {
+        let (config, _) = LuraConfig::parse(SHIPPED_CONFIG).unwrap();
+        let defaults = ResourcesConfig::default();
+        assert_eq!(config.resources.disk_free_warn, defaults.disk_free_warn);
+        assert_eq!(config.resources.disk_free_block, defaults.disk_free_block);
+        assert_eq!(config.resources.disk_free_resume, defaults.disk_free_resume);
+        assert_eq!(config.resources.memory_budget, defaults.memory_budget);
+    }
+
     // Test 1: the gate on the real files.
     #[test]
     fn test_config_gate_on_shipped_and_dev_config() {
@@ -3077,6 +3267,7 @@ flag = true
             config.log.validate().unwrap();
             config.backup.validate().unwrap();
             config.storage.validate().unwrap();
+            config.resources.validate().unwrap();
             config.validate_data_paths(tmp.path()).unwrap();
             config.auth.validate(&config.server).unwrap();
             config.cors.validate().unwrap();

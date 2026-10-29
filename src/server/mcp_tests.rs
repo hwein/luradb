@@ -490,6 +490,36 @@ fn kv_get_returns_null_empty_and_binary_values() {
     );
 }
 
+// Test 4 (MCP): while writes are refused for want of disk space, a write
+// tool fails with the 507 text; a read tool answers.
+#[test]
+fn a_write_tool_fails_with_507_while_writes_are_refused() {
+    use crate::control::resources::tests::{FakeProbe, GB};
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = mcp_config(dir.path(), |cfg| cfg.mcp.read_only = false);
+    let system_dir = cfg.storage.system_dir.clone();
+    let probe = FakeProbe::new();
+    probe.mount(dir.path(), 100 * GB, 50 * GB);
+    super::test_hook::use_probe(&system_dir, Arc::clone(&probe));
+    let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+    let (rest, mcp) = (server.http_addr.unwrap(), server.mcp_addr.expect("MCP listener enabled"));
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (status, _) = super::tests::request(rest, &http("PUT", "/store-api/kv/default/keys/k", &[], "clé")).await;
+        assert_eq!(status, 200);
+        let mut client = Client::new(mcp, None);
+        assert_eq!(client.initialize().await.status, 200);
+        probe.set_free(dir.path(), GB);
+        super::test_hook::tick_resources(&system_dir);
+
+        let put = client.call("kv_put", json!({"domain": "default", "key": "k", "value": "v"})).await;
+        assert!(put.is_error(), "{}", put.text());
+        assert!(put.text().contains("507 Insufficient Storage: write blocked: disk space below threshold"), "{}", put.text());
+        let read = client.call("kv_get", json!({"domain": "default", "key": "k"})).await;
+        assert_eq!(read.result()["structuredContent"], json!({"value": "clé"}), "{}", read.text());
+    });
+    server.shutdown().unwrap();
+}
+
 // An answer above 1 MiB is a tool error, not a truncated result.
 #[test]
 fn a_result_above_one_mib_is_a_tool_error() {

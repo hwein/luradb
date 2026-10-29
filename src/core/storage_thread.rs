@@ -345,6 +345,10 @@ struct WalFile {
     /// may still be there; the next append cuts first, and the segment
     /// takes the next append before any rotation.
     unsafe_end: bool,
+    /// The file or marker whose sync failed, and how: the hub stops the
+    /// server as soon as the end of the failed append is safe for the next
+    /// start.
+    failed_sync: Option<(PathBuf, String)>,
     /// Requests for this file, in channel order, not run yet.
     queued: VecDeque<IoRequest>,
     /// The write on its way to this file; at most one at a time.
@@ -390,6 +394,8 @@ pub(crate) struct Faults {
     pub(crate) max_write_len: Option<usize>,
     /// The next cut back to the cursor fails and leaves the file as it is.
     pub(crate) cut: bool,
+    /// The next write of the unsafe-end marker fails and writes nothing.
+    pub(crate) mark: bool,
     /// The next removal of the unsafe-end marker fails and leaves it.
     pub(crate) unmark: bool,
     /// The next removal of the unsafe-end marker removes it, then fails to
@@ -456,15 +462,19 @@ impl StorageState {
         self.wals.iter().all(|wal| wal.queued.is_empty() && wal.pending.is_none())
     }
 
-    /// The file's end stays unsafe until the cut and the marker removal both succeed.
-    fn cut_to_cursor(&mut self, index: usize) -> std::io::Result<()> {
+    /// The file's end stays unsafe until the cut and the marker removal both
+    /// succeed; a failed cut records the cursor in the marker.
+    fn cut_to_cursor(&mut self, index: usize) -> Result<(), CutFailed> {
         self.wals[index].unsafe_end = true;
-        if let Err(e) = self.cut_file(index) {
-            let wal = &self.wals[index];
-            mark_unsafe_end(&wal.marker, wal.offset);
-            return Err(e);
+        if let Err(error) = self.cut_file(index) {
+            let marked = self.mark(index);
+            return Err(CutFailed { error, secured: marked });
         }
-        self.unmark(index)?;
+        if let Err(error) = self.unmark(index) {
+            let marker = self.wals[index].marker.clone();
+            self.note_sync(index, marker, &error);
+            return Err(CutFailed { error, secured: true });
+        }
         self.wals[index].unsafe_end = false;
         Ok(())
     }
@@ -476,7 +486,30 @@ impl StorageState {
         }
         let wal = &self.wals[index];
         wal.file.set_len(wal.offset)?;
-        wal.file.sync_all()
+        if let Err(e) = wal.file.sync_all() {
+            let segment = segment_path(&wal.dir, wal.segment);
+            self.fail_sync(index, segment, &e);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Records the cursor in the marker; whether the marker holds it now.
+    fn mark(&mut self, index: usize) -> bool {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults.mark) {
+            tracing::error!("Writing the unsafe-end marker failed: injected marker failure.");
+            return false;
+        }
+        let wal = &self.wals[index];
+        let marker = wal.marker.clone();
+        match mark_unsafe_end(&marker, wal.offset) {
+            Ok(()) => true,
+            Err(e) => {
+                self.note_sync(index, marker, &e);
+                false
+            }
+        }
     }
 
     /// Removes the marker and syncs its directory, the segments' one.
@@ -488,6 +521,27 @@ impl StorageState {
         #[cfg(test)]
         let _probe = self.faults.probe_unmark_syncs();
         unmark_unsafe_end(&self.wals[index].marker)
+    }
+
+    /// Notes the failed sync of `path`, a file of WAL `index`; the first one
+    /// counts.
+    fn fail_sync(&mut self, index: usize, path: PathBuf, error: &dyn std::fmt::Display) {
+        self.wals[index].failed_sync.get_or_insert_with(|| (path, error.to_string()));
+    }
+
+    /// [`Self::fail_sync`] when `error` comes from a sync.
+    fn note_sync(&mut self, index: usize, path: PathBuf, error: &std::io::Error) {
+        if is_sync_error(error) {
+            self.fail_sync(index, path, error);
+        }
+    }
+
+    /// Stops the server for the failed sync of WAL `index`, if there was one;
+    /// the caller has made the end of the failed append safe for the next
+    /// start. Returns only in tests, with the stop's error.
+    fn stop_after_failed_sync(&mut self, index: usize) -> Option<anyhow::Error> {
+        let (path, error) = self.wals[index].failed_sync.take()?;
+        Some(crate::storage::fatal_sync_error(&path, &error))
     }
 
     /// Puts `file` in place of the file of WAL `index`. A fixed-file slot
@@ -751,6 +805,7 @@ fn open_log(engine: WalTarget, path: &Path) -> Result<WalFile> {
         // The recovery sets the counter past the records of the segment.
         lsn: start_lsn,
         unsafe_end: false,
+        failed_sync: None,
         queued: VecDeque::new(),
         pending: None,
     })
@@ -1231,14 +1286,21 @@ fn take_reaped(state: &mut StorageState) {
 /// The index of `engine`'s file, once its end is safe for an append at the
 /// cursor. A segment that reached the segment size is left for the next one
 /// first, never with an unsafe end; a failed rotation leaves the appends in
-/// the current segment.
+/// the current segment. After a failed sync whose append's end was not safe
+/// yet, the cut that makes it safe stops the server.
 fn ready_to_append(state: &mut StorageState, engine: WalTarget) -> Result<usize> {
     let index = state.wal_index(engine)?;
     if state.wals[index].unsafe_end {
-        if let Err(cut) = state.cut_to_cursor(index) {
-            log_failed_cut(engine, state.wals[index].offset, &cut);
-            return Err(cut.into());
+        let cut = state.cut_to_cursor(index);
+        if let Err(failed) = &cut {
+            log_failed_cut(engine, state.wals[index].offset, &failed.error);
         }
+        if cut.as_ref().map_or_else(|failed| failed.secured, |()| true) {
+            if let Some(stop) = state.stop_after_failed_sync(index) {
+                return Err(stop);
+            }
+        }
+        cut.map_err(|failed| failed.error)?;
     }
     let offset = state.wals[index].offset;
     if offset >= state.segment_bytes && offset > WAL_HEADER_LEN {
@@ -1313,7 +1375,9 @@ fn segments_of(state: &StorageState, index: usize) -> WalSegments {
 /// Takes in the results of `p`'s chain — of its write and of its fdatasync —
 /// and returns the outcome of the write once it has one: the offset it
 /// starts at, or the failure, its file cut back to the cursor. `None` leaves
-/// a rest to write.
+/// a rest to write. A failed fdatasync stops the server once the end of the
+/// write is safe for the next start: the file cut back, or the cursor in the
+/// marker; until then the next append makes it safe first.
 fn take_chain(state: &mut StorageState, p: &mut Pending, (wrote, synced): (i32, i32)) -> Option<Result<u64>> {
     if wrote > 0 {
         p.landed += wrote as usize;
@@ -1323,17 +1387,31 @@ fn take_chain(state: &mut StorageState, p: &mut Pending, (wrote, synced): (i32, 
             return None;
         }
     }
-    let failure = match (wrote, synced) {
-        (wrote, _) if wrote < 0 => Some(std::io::Error::from_raw_os_error(-wrote)),
-        (0, _) => Some(std::io::Error::new(std::io::ErrorKind::WriteZero, "io_uring write returned 0")),
-        (_, synced) if synced < 0 => Some(std::io::Error::from_raw_os_error(-synced)),
+    let (failure, sync_failed) = match (wrote, synced) {
+        (wrote, _) if wrote < 0 => (Some(std::io::Error::from_raw_os_error(-wrote)), false),
+        (0, _) => (Some(std::io::Error::new(std::io::ErrorKind::WriteZero, "io_uring write returned 0")), false),
+        (_, synced) if synced < 0 => (Some(std::io::Error::from_raw_os_error(-synced)), true),
         #[cfg(test)]
-        _ if std::mem::take(&mut state.faults.sync) => Some(std::io::Error::other("injected fdatasync failure")),
-        _ => None,
+        _ if std::mem::take(&mut state.faults.sync) => (Some(std::io::Error::other("injected fdatasync failure")), true),
+        _ => (None, false),
     };
     if let Some(e) = failure {
-        if let Err(cut) = state.cut_to_cursor(p.index) {
-            log_failed_cut(p.write.engine, p.start, &cut);
+        if sync_failed {
+            let wal = &state.wals[p.index];
+            let segment = segment_path(&wal.dir, wal.segment);
+            state.fail_sync(p.index, segment, &e);
+        }
+        let secured = match state.cut_to_cursor(p.index) {
+            Ok(()) => true,
+            Err(cut) => {
+                log_failed_cut(p.write.engine, p.start, &cut.error);
+                cut.secured
+            }
+        };
+        if secured {
+            if let Some(stop) = state.stop_after_failed_sync(p.index) {
+                return Some(Err(stop));
+            }
         }
         return Some(Err(e.into()));
     }
@@ -1342,6 +1420,34 @@ fn take_chain(state: &mut StorageState, p: &mut Pending, (wrote, synced): (i32, 
     wal.offset += p.write.data.len() as u64;
     wal.lsn += p.write.parts.len() as u64;
     Some(Ok(p.start))
+}
+
+/// A cut back to the cursor that failed.
+struct CutFailed {
+    error: std::io::Error,
+    /// The next start finds the end safe all the same: the file is cut and
+    /// only the marker removal failed, or the marker holds the cursor.
+    secured: bool,
+}
+
+/// A failed sync among the errors of the hub's file operations.
+#[derive(Debug)]
+struct SyncError(std::io::Error);
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for SyncError {}
+
+fn sync_error(e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), SyncError(e))
+}
+
+fn is_sync_error(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<SyncError>())
 }
 
 /// Every failed cut, marker removal included, is logged: the file's end stays
@@ -1354,17 +1460,23 @@ fn log_failed_cut(engine: WalTarget, cursor: u64, error: &std::io::Error) {
 }
 
 /// Cuts the segment appends go to back to a header that starts after its
-/// last LSN.
+/// last LSN. A failed sync stops the server: everything the segment held is
+/// in SSTables, and the next start finds either.
 fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     let index = state.wal_index(engine)?;
     let wal = &mut state.wals[index];
     wal.file.write_all_at(&wal_header(wal.lsn), 0)?;
     wal.file.set_len(WAL_HEADER_LEN)?;
     wal.offset = WAL_HEADER_LEN;
-    wal.file.sync_all()?;
+    if let Err(e) = wal.file.sync_all() {
+        return Err(crate::storage::fatal_sync_error(&segment_path(&wal.dir, wal.segment), &e));
+    }
     if let Err(e) = state.unmark(index) {
         state.wals[index].unsafe_end = true;
         log_failed_cut(engine, 0, &e);
+        if is_sync_error(&e) {
+            return Err(crate::storage::fatal_sync_error(&state.wals[index].marker, &e));
+        }
         return Err(e.into());
     }
     state.wals[index].unsafe_end = false;
@@ -1414,15 +1526,15 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Records `cursor` in `marker` unless a marker is there already. A failure
-/// is logged; nothing more can be done about it.
-pub(crate) fn mark_unsafe_end(marker: &Path, cursor: u64) {
-    if let Err(e) = write_marker(marker, cursor) {
+/// is logged and returned, a failed sync as one.
+pub(crate) fn mark_unsafe_end(marker: &Path, cursor: u64) -> std::io::Result<()> {
+    write_marker(marker, cursor).inspect_err(|e| {
         tracing::error!(
             "Writing the unsafe-end marker {} failed: {e}; a restart before the next \
              successful cut may read the failed append back.",
             marker.display()
         );
-    }
+    })
 }
 
 /// Written beside its final name and renamed into place, so the marker is
@@ -1435,14 +1547,14 @@ fn write_marker(marker: &Path, cursor: u64) -> std::io::Result<()> {
     let tmp = with_suffix(marker, ".tmp");
     let mut file = File::create(&tmp)?;
     file.write_all(&cursor.to_be_bytes())?;
-    file.sync_all()?;
+    file.sync_all().map_err(sync_error)?;
     std::fs::rename(&tmp, marker)?;
-    sync_dir(marker)
+    sync_dir(marker).map_err(sync_error)
 }
 
 /// Removes `marker` and syncs its directory. A missing marker gets the sync
 /// too: a retry after a failed sync finds the marker gone, and only the sync
-/// keeps it gone after a power loss.
+/// keeps it gone after a power loss. A failed sync is returned as one.
 pub(crate) fn unmark_unsafe_end(marker: &Path) -> std::io::Result<()> {
     let failed =
         |step: &str, e: std::io::Error| std::io::Error::new(e.kind(), format!("{step} {}: {e}", marker.display()));
@@ -1450,7 +1562,7 @@ pub(crate) fn unmark_unsafe_end(marker: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         removed => removed.map_err(|e| failed("removing", e))?,
     }
-    sync_dir(marker).map_err(|e| failed("syncing the directory after removing", e))
+    sync_dir(marker).map_err(|e| sync_error(failed("syncing the directory after removing", e)))
 }
 
 /// A rename or removal survives a power loss only once its directory is synced.
@@ -1670,6 +1782,18 @@ mod tests {
     /// The unsafe-end marker of the first segment of `log`.
     fn marker_of(log: &Path) -> PathBuf {
         unsafe_end_marker(&segment_1(log))
+    }
+
+    /// The paths in the log directory `log` whose failed syncs stopped the
+    /// server.
+    fn stops_in(log: &Path) -> Vec<PathBuf> {
+        crate::storage::test_fault::stops_under(&std::fs::canonicalize(log).unwrap())
+    }
+
+    /// The file `name` in the log directory `log` as the hub names it,
+    /// symlinks resolved.
+    fn in_log(log: &Path, name: &str) -> PathBuf {
+        std::fs::canonicalize(log).unwrap().join(name)
     }
 
     /// A log directory `log` whose segment 1 holds `bytes`.
@@ -2410,9 +2534,9 @@ mod tests {
         })
     }
 
-    // A failed append leaves nothing behind the log's end: after a long run
-    // whose fdatasync fails and a shorter run that succeeds, recovery reads
-    // the shorter run alone.
+    // A failed fdatasync cuts its run back and stops the server once, naming
+    // the segment; nothing stays behind the log's end: after the long run
+    // and a shorter one that succeeds, recovery reads the shorter run alone.
     #[test]
     fn test_failed_append_leaves_no_tail_behind_a_shorter_one() {
         crate::core::engine_runtime::block_on(async {
@@ -2426,8 +2550,10 @@ mod tests {
             process_batch(&mut state, batch);
             for mut rx in failed {
                 let err = rx.try_recv().unwrap().unwrap_err();
-                assert!(err.to_string().starts_with("WAL append failed"), "{err}");
+                assert!(err.to_string().starts_with("WAL append failed: data sync failed on"), "{err}");
             }
+            assert_eq!(stops_in(&wals[0].1), [in_log(&wals[0].1, "00000001.wal")]);
+            assert_eq!(std::fs::metadata(segment_1(&wals[0].1)).unwrap().len(), WAL_HEADER_LEN, "cut back first");
 
             let (batch, mut kept) = record_appends(WalTarget::Kv, vec![delete_record(2, b"kept")]);
             process_batch(&mut state, batch);
@@ -2461,8 +2587,10 @@ mod tests {
         })
     }
 
-    /// A hub over `wals` after an append whose cut failed: the key-value WAL
-    /// holds `kept-one`, which ends at the returned cursor, and a tail past it.
+    /// A hub over `wals` after an append whose fdatasync and cut failed: the
+    /// key-value WAL holds `kept-one`, which ends at the returned cursor, and
+    /// a tail past it; the marker holds the cursor, so the failed sync
+    /// stopped the server.
     fn state_after_a_failed_cut(wals: &[(WalTarget, PathBuf)]) -> (StorageState, u64) {
         let (mut state, _) = open_state(&cfg(false, 64), wals).unwrap();
         let (batch, _) = record_appends(WalTarget::Kv, vec![delete_record(1, b"kept-one")]);
@@ -2474,7 +2602,41 @@ mod tests {
         process_batch(&mut state, batch);
         assert!(failed[0].try_recv().unwrap().is_err());
         assert!(std::fs::metadata(segment_1(&wals[0].1)).unwrap().len() > start);
+        assert_eq!(stops_in(&wals[0].1), [in_log(&wals[0].1, "00000001.wal")]);
         (state, start)
+    }
+
+    // Test 7: an fdatasync that fails while neither the cut nor the marker
+    // succeeds does not stop the server: the end stays unsafe. The next
+    // append cuts first and stops then, its own records unwritten; recovery
+    // after the crash reads the confirmed records alone.
+    #[test]
+    fn test_a_failed_fdatasync_stops_once_the_end_is_safe() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let log = wals[0].1.as_path();
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            let (batch, _) = record_appends(WalTarget::Kv, vec![delete_record(1, b"kept")]);
+            process_batch(&mut state, batch);
+            let start = state.wals[0].offset;
+
+            state.faults = Faults { sync: true, cut: true, mark: true, ..Faults::default() };
+            let (batch, mut failed) = record_appends(WalTarget::Kv, vec![delete_record(2, b"lost")]);
+            process_batch(&mut state, batch);
+            assert!(failed[0].try_recv().unwrap().is_err());
+            assert!(stops_in(log).is_empty(), "no stop with an unsafe end");
+            assert!(state.wals[0].unsafe_end && !marker_of(log).exists());
+
+            let (batch, mut next) = record_appends(WalTarget::Kv, vec![delete_record(3, b"next")]);
+            process_batch(&mut state, batch);
+            let err = next[0].try_recv().unwrap().unwrap_err();
+            assert!(err.to_string().contains("data sync failed on"), "{err}");
+            assert_eq!(stops_in(log), [in_log(log, "00000001.wal")]);
+            assert_eq!(std::fs::metadata(segment_1(log)).unwrap().len(), start);
+            drop(state); // crash
+            assert_eq!(recovered_keys(log).await, ["kept"]);
+        })
     }
 
     // A failed cut leaves the cursor in a marker beside the log; the next
@@ -2595,8 +2757,9 @@ mod tests {
         assert!(!marker.exists());
     }
 
-    // A removal whose directory sync fails fails the cut; the retry finds the
-    // marker gone and still syncs the directory before it confirms an append.
+    // A removal whose directory sync fails fails the cut and, the file cut
+    // back, stops the server, naming the marker; the retry finds the marker
+    // gone and still syncs the directory before it confirms an append.
     #[test]
     fn test_a_failed_directory_sync_after_the_marker_removal_fails_the_cut() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2608,7 +2771,9 @@ mod tests {
         state.faults.unmark_sync = true;
         let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(3, b"refused")]);
         process_batch(&mut state, batch);
-        assert!(refused[0].try_recv().unwrap().is_err());
+        assert!(refused[0].try_recv().unwrap().unwrap_err().to_string().contains("data sync failed on"));
+        let segment = in_log(&wals[0].1, "00000001.wal");
+        assert_eq!(stops_in(&wals[0].1), [segment.clone(), unsafe_end_marker(&segment)]);
         assert!(!marker.exists());
         assert!(state.wals[0].unsafe_end);
 
@@ -2907,6 +3072,8 @@ mod tests {
         let names = ["00000001.wal", "00000002.wal", "00000003.wal", "00000003.wal.unsafe-end"];
         assert_eq!(names_in(&real.join("Kv.wal")), names);
         assert_eq!(names_in(&dir.path().join("link")), ["Kv.wal"]);
+        let stops = crate::storage::test_fault::stops_under(&real);
+        assert_eq!(stops, [real.join("Kv.wal").join("00000003.wal")], "the stop names the target");
     }
 
     // A segment whose end is unsafe after a failed append is never left: a

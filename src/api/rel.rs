@@ -23,6 +23,12 @@ use utoipa::ToSchema;
 
 impl From<RelStoreError> for ApiError {
     fn from(e: RelStoreError) -> Self {
+        if let Some(blocked) = match &e {
+            RelStoreError::StorageError(cause) => crate::control::resources::WriteBlocked::in_chain(cause),
+            _ => None,
+        } {
+            return blocked.into();
+        }
         let status = match &e {
             // 400 — frontend/DDL/DML/SELECT/JOIN/expand input errors.
             RelStoreError::StatementTooLong { .. }

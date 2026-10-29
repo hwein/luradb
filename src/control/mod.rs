@@ -5,6 +5,7 @@
 //! samples and write-ahead log checkpoints across the data shards.
 
 pub mod checkpoint;
+pub mod resources;
 pub mod slots;
 pub mod system;
 
@@ -472,6 +473,7 @@ pub struct ControlPlane {
     restoring: AtomicBool,
     /// The last ping sent to each data shard, by shard index.
     pings: Mutex<Vec<Option<Shared<BoxFuture<'static, bool>>>>>,
+    resources: resources::Resources,
 }
 
 /// Marks a restore as running until it drops, on every exit path.
@@ -488,7 +490,12 @@ impl ControlPlane {
     /// engines of every shard — before any purger runs, so none finishes a
     /// deletion behind its back — and starts the worker on the current
     /// runtime.
-    pub async fn start(owners: Owners, system: Arc<LsmStorageEngine>, bus: Arc<GlobalEventBus>) -> anyhow::Result<Arc<Self>> {
+    pub async fn start(
+        owners: Owners,
+        system: Arc<LsmStorageEngine>,
+        bus: Arc<GlobalEventBus>,
+        resources: resources::Resources,
+    ) -> anyhow::Result<Arc<Self>> {
         let Owners { shards, auth } = owners;
         let (commands, inbox) = mpsc::unbounded_channel();
         let control = Arc::new(Self {
@@ -500,6 +507,7 @@ impl ControlPlane {
             shards,
             rounds: tokio::sync::Mutex::new(()),
             restoring: AtomicBool::new(false),
+            resources,
         });
         for Shard { owners, .. } in &control.shards {
             owners.kv.attach_control_plane(Arc::clone(&control));
@@ -683,6 +691,10 @@ impl ControlPlane {
             }
         });
         futures::future::join_all(pings).await
+    }
+
+    pub fn resources(&self) -> &resources::Resources {
+        &self.resources
     }
 
     /// The current directory; later changes do not show in it.
@@ -914,7 +926,7 @@ pub(crate) mod testing {
         let system = system::open(&dir.join("sys")).await.unwrap();
         let auth = Arc::new(AuthCache::new(Arc::clone(&system), None));
         let owners = Owners { shards, auth: Arc::clone(&auth) };
-        (ControlPlane::start(owners, system, bus).await.unwrap(), auth)
+        (ControlPlane::start(owners, system, bus, Default::default()).await.unwrap(), auth)
     }
 
     /// A key-value domain registry on an engine of its own under `dir/kv`.
@@ -2258,6 +2270,28 @@ mod tests {
         })
     }
 
+    // Test 6: while the shards refuse writes, a checkpoint tick still has
+    // them persist and drops every segment before the one appended to.
+    #[test]
+    fn segments_go_while_the_shards_refuse_writes() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let keys = fill_segments(&s, 3).await;
+            let active = s.hub.wal(crate::core::storage_thread::WalTarget::Kv).segments().await.unwrap().active().segment;
+            for engine in &s.engines {
+                engine.resources().block_for_test(false, false);
+                assert!(engine.writes_refused());
+            }
+
+            assert_eq!(s.checkpoints(1).run().await, []);
+            assert_eq!(s.segment_files()[0].0, active);
+
+            let confirmed = reads(&s.engines, &keys).await;
+            let (engines, _hub, _dir) = s.crash().await;
+            assert_eq!(reads(&engines, &keys).await, confirmed);
+        })
+    }
+
     // A removal that fails fails the tick and keeps the segment's file; the
     // next tick removes it and reports that, and every write is there.
     #[test]
@@ -2520,6 +2554,7 @@ mod tests {
             rounds: tokio::sync::Mutex::new(()),
             restoring: AtomicBool::new(false),
             pings: Mutex::default(),
+            resources: Default::default(),
         };
         (control, inbox)
     }

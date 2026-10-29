@@ -188,7 +188,7 @@ async fn make_control() -> (Arc<ControlPlane>, StorageThread, tempfile::TempDir)
     let auth = Arc::new(AuthCache::new(Arc::clone(&system), None));
     let bus = Arc::new(GlobalEventBus::new(64, 64));
     let owners = Owners { shards: vec![Shard { owners, commands }], auth };
-    let control = ControlPlane::start(owners, system, bus).await.expect("control plane");
+    let control = ControlPlane::start(owners, system, bus, Default::default()).await.expect("control plane");
     (control, hub, dir)
 }
 

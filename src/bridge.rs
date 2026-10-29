@@ -4,10 +4,12 @@
 //! shipped from the frontend runtime — the other reads to the reader pool,
 //! writes to the shard's thread, writes without a domain to the control
 //! plane — relaying both body streams frame by frame. A point read that would
-//! touch the disk is handed to the pool instead.
+//! touch the disk is handed to the pool instead. While disk space or memory
+//! runs short, it answers the writes itself.
 
 use crate::api::middleware::ApiError;
 use crate::auth::middleware::extract_domain;
+use crate::control::resources::Resources;
 use crate::control::slots;
 use crate::core::coop;
 use axum::body::{Body, BodyDataStream, Bytes, HttpBody};
@@ -170,6 +172,15 @@ pub fn route_class(method: &Method, path: &str) -> RouteClass {
     }
 }
 
+/// The writes that go on while the others are refused for want of disk
+/// space or memory: sign-in and keys, whose few records the system store
+/// takes from its reserve, and backup deletion, which frees space.
+pub fn passes_write_block(method: &Method, path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+    path.starts_with("/store-api/auth/")
+        || (method == Method::DELETE && matches!(segments[..], ["", "store-api", "backups", id] if !id.is_empty()))
+}
+
 fn is_point_read(path: &str) -> bool {
     let segments: Vec<&str> = path.split('/').collect();
     let non_empty = |segment: &str| !segment.is_empty();
@@ -213,13 +224,15 @@ pub struct ShardRouter {
     /// Answers the point reads of shard `k` with `inline[k]` when set;
     /// without them they go with the other reads.
     inline: Option<Vec<Router>>,
+    /// Refuses the writes while disk space or memory runs short, when set.
+    resources: Option<Resources>,
 }
 
 impl ShardRouter {
     /// A router over the data shards behind `shards`, by shard index.
     pub fn new(shards: Vec<EngineDispatch>) -> Self {
         assert!(!shards.is_empty() && shards.len() <= usize::from(u16::MAX), "1 to 65535 data shards");
-        Self { shards, control: None, reader: None, inline: None }
+        Self { shards, control: None, reader: None, inline: None, resources: None }
     }
 
     /// Ships the writes without a domain to `control`.
@@ -239,6 +252,20 @@ impl ShardRouter {
     pub fn with_inline(self, routers: Vec<Router>) -> Self {
         assert_eq!(routers.len(), self.shards.len(), "one inline router per data shard");
         Self { inline: Some(routers), ..self }
+    }
+
+    /// Answers the writes with 507 while `resources` refuses them, but those
+    /// [`passes_write_block`] names and a backup onto a volume with room.
+    pub fn with_resources(self, resources: Resources) -> Self {
+        Self { resources: Some(resources), ..self }
+    }
+
+    /// The answer to a write `resources` refuses, without shipping it.
+    fn refused(&self, method: &Method, path: &str) -> Option<Response> {
+        let resources = self.resources.as_ref()?;
+        let blocked = resources.check_write().err()?;
+        let backup = method == Method::POST && path == "/store-api/backups" && resources.backup_allowed();
+        (!backup && !passes_write_block(method, path)).then(|| ApiError::from(blocked).into_response())
     }
 
     /// The data shard of the domain `path` names; `None` for a path without
@@ -262,6 +289,11 @@ impl Service<Request<Body>> for ShardRouter {
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let path = req.uri().path();
         let class = route_class(req.method(), path);
+        if class == RouteClass::Write {
+            if let Some(refused) = self.refused(req.method(), path) {
+                return futures::future::ready(Ok(refused)).boxed();
+            }
+        }
         let domain_shard = self.shard_of(path);
         // Reads without a domain see shard 0's engines.
         let shard = domain_shard.unwrap_or(0);
@@ -917,6 +949,53 @@ mod tests {
 
     async fn text_of(resp: Response) -> String {
         String::from_utf8(frames_of(resp.into_body()).await.concat()).unwrap()
+    }
+
+    // Test 4 (bridge): while writes are refused, a write answers 507 with
+    // Retry-After: 5 and its reason, without reaching a handler; reads, the
+    // search, sign-in and keys and backup deletion pass, a new backup only
+    // onto a volume with room; once writes go in again, so does the write.
+    #[tokio::test]
+    async fn refused_writes_answer_507_at_the_bridge() {
+        use axum::routing::{delete, put};
+        let ran = || async { "ran" };
+        let router = Router::new()
+            .route("/store-api/kv/{domain}/keys/{key}", get(ran).put(ran))
+            .route("/store-api/json/{domain}/search", post(ran))
+            .route("/store-api/auth/users", post(ran))
+            .route("/store-api/backups", post(ran))
+            .route("/store-api/backups/{id}", delete(ran))
+            .route("/store-api/domains/{name}", put(ran));
+        let resources = Resources::default();
+        let ship = ShardRouter::new(vec![EngineDispatch::Inline(router)]).with_resources(resources.clone());
+        let call = |method: Method, path: &'static str| {
+            let ship = ship.clone();
+            async move { ship.oneshot(Request::builder().method(method).uri(path).body(Body::empty()).unwrap()).await.unwrap() }
+        };
+
+        resources.block_for_test(false, false);
+        for (method, path) in [(Method::PUT, "/store-api/kv/d/keys/k"), (Method::PUT, "/store-api/domains/d"), (Method::POST, "/store-api/backups")] {
+            let resp = call(method.clone(), path).await;
+            assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE, "{method} {path}");
+            assert_eq!(resp.headers()[header::RETRY_AFTER], "5");
+            assert_eq!(text_of(resp).await, "507 Insufficient Storage: write blocked: disk space below threshold, retry in 5 s");
+        }
+        for (method, path) in [
+            (Method::GET, "/store-api/kv/d/keys/k"),
+            (Method::POST, "/store-api/json/d/search"),
+            (Method::POST, "/store-api/auth/users"),
+            (Method::DELETE, "/store-api/backups/bk_1"),
+        ] {
+            assert_eq!(text_of(call(method.clone(), path).await).await, "ran", "{method} {path}");
+        }
+
+        resources.block_for_test(false, true);
+        assert_eq!(text_of(call(Method::POST, "/store-api/backups").await).await, "ran");
+        resources.block_for_test(true, false);
+        assert_eq!(call(Method::POST, "/store-api/backups").await.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        resources.unblock_for_test();
+        assert_eq!(text_of(call(Method::PUT, "/store-api/kv/d/keys/k").await).await, "ran");
     }
 
     // With a reader pool, reads run on its workers and

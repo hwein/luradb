@@ -164,6 +164,23 @@ sudo usermod -aG luradb <username>
 
 Log in again for the group membership to take effect.
 
+## Disk and memory shortage
+
+Once a second LuraDB reads the free space of every volume its data paths lie on (data files, write-ahead logs, log and backup directories) and its own anonymous memory (`RssAnon`), and compares them with `[resources]` in `/etc/luradb/luradb.toml`:
+
+- **Warning:** a volume has less free space than `disk_free_warn` (default 15 % of the volume, at most 10 GB), or the memory reaches 80 % of `memory_budget`. The log shows a WARN line naming the volume or the memory, and `/health` answers 200 with `status: "degraded"` and the numbers in `resources`. Nothing is refused yet.
+- **Writes refused:** a volume has less free space than `disk_free_block` (default 5 %, at most 2 GB), or the memory reaches 95 %. The log shows an ERROR line, repeated every minute while this lasts. Every write answers `507 Insufficient Storage` with `Retry-After: 5`, deletes, DDL, imports, restores and the write tools of MCP included; shared-memory clients get the same error. Reads, searches, SQL `SELECT`, `/health`, the metrics, backup downloads and deletions and sign-ins go on. A new backup runs only into a `backup.dir` on another volume above its warn threshold, and not while memory is short. Compaction and the cleanups of the value log and the write-ahead log go on and free space where they can.
+- **Back to normal:** once every volume has more free space than `disk_free_resume` (default 10 %, at most 4 GB) and the memory is below 90 % for two seconds in a row, writes are accepted again, with an INFO line.
+
+A delete does not free space at once: it writes a marker that compaction removes later. Faster ways out are deleting old backups (`DELETE /store-api/backups/{id}`), moving files off the volume or growing it. To cap the memory of the service on the system side as well, set `MemoryHigh=` in a drop-in (`sudo systemctl edit luradb`).
+
+The service stops with its own exit code in two cases:
+
+- **3:** the disk reported an error while making written data durable (`fsync`). The log shows `data sync failed on <path>`; systemd starts the service again, and the start recovers every confirmed write from the write-ahead log.
+- **4:** at the start, a volume has less free space than the recovery needs (`not enough free disk space to recover`). systemd does not restart the service; free space, then run `sudo systemctl start luradb`.
+
+The unit allows three starts within five minutes, manual ones included; after that systemd refuses further starts until `sudo systemctl reset-failed luradb`.
+
 ## Update
 
 ```sh

@@ -1036,8 +1036,12 @@ impl DomainPurger {
         Self { engine, registry, batch_size }
     }
 
-    /// Performs one purge cycle: finds deleting domains and tombstones their keys.
+    /// Performs one purge cycle: finds deleting domains and tombstones their
+    /// keys; none while writes are refused for want of disk space or memory.
     pub async fn purge_tick(&self) -> Result<()> {
+        if self.engine.writes_refused() {
+            return Ok(());
+        }
         for domain in self.registry.list_deleting_domains() {
             let prefix = domain.system_prefix.clone();
             let all_keys = self.engine.scan_keys(&prefix).await?;
@@ -1346,6 +1350,29 @@ mod tests {
 
             let remaining = engine.scan_keys(&prefix).await.unwrap();
             assert!(remaining.is_empty(), "All domain keys must be removed after purge");
+            assert!(registry.get_domain("purge-test").await.unwrap().is_none());
+        })
+    }
+
+    // Test 6: while writes are refused, a purge tick writes nothing; after
+    // the block the purge goes on.
+    #[test]
+    fn test_no_purge_while_writes_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.create_domain("purge-test").await.unwrap();
+            registry.store("purge-test").await.unwrap().put(b"key1", b"val1").await.unwrap();
+            registry.delete_domain("purge-test").await.unwrap();
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), 100);
+
+            engine.resources().block_for_test(false, false);
+            let lsn = engine.last_applied_lsn();
+            purger.purge_tick().await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), lsn, "no tombstone during the block");
+
+            engine.resources().unblock_for_test();
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
             assert!(registry.get_domain("purge-test").await.unwrap().is_none());
         })
     }

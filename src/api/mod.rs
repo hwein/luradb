@@ -54,10 +54,45 @@ impl Modify for BearerAuth {
     }
 }
 
+/// Declares 507 on every operation a shortage of disk space or memory
+/// refuses: the writes the bridge answers itself, and the SQL route, whose
+/// writes the engine refuses.
+struct WriteBlockedResponses;
+
+impl Modify for WriteBlockedResponses {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use axum::http::Method;
+        use crate::bridge::{passes_write_block, route_class, RouteClass};
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            let operations =
+                [(Method::POST, &mut item.post), (Method::PUT, &mut item.put), (Method::PATCH, &mut item.patch), (Method::DELETE, &mut item.delete)];
+            for (method, operation) in operations {
+                let Some(operation) = operation else { continue };
+                let refused = route_class(&method, path) == RouteClass::Write || path.ends_with("/sql");
+                if refused && !passes_write_block(&method, path) {
+                    operation.responses.responses.insert("507".to_string(), write_blocked_response().into());
+                }
+            }
+        }
+    }
+}
+
+fn write_blocked_response() -> utoipa::openapi::Response {
+    use utoipa::openapi::{schema::{ObjectBuilder, Type}, ContentBuilder, HeaderBuilder, ResponseBuilder};
+    ResponseBuilder::new()
+        .description(
+            "Insufficient Storage — disk space or memory runs short; the write was not applied. \
+             Reads go on; retry after the seconds in Retry-After.",
+        )
+        .header("Retry-After", HeaderBuilder::new().schema(Some(ObjectBuilder::new().schema_type(Type::Integer))).build())
+        .content("text/plain", ContentBuilder::new().schema(Some(ObjectBuilder::new().schema_type(Type::String))).build())
+        .build()
+}
+
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Breaking bumps the middle digit, anything else the last. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.13.1";
+pub const API_VERSION: &str = "0.14.0";
 
 struct VersionInfo;
 
@@ -398,7 +433,7 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         // Global event stream
         events::get_events,
     ),
-    modifiers(&BearerAuth, &VersionInfo),
+    modifiers(&BearerAuth, &VersionInfo, &WriteBlockedResponses),
     components(
         schemas(
             metrics::VersionResponse,
@@ -484,7 +519,9 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             server version; the latter is in the `x-luradb-server-version` extension. \
             Runtime check: GET /version. \
             Under overload, any endpoint may answer 503 Service Unavailable (text/plain) \
-            with `Retry-After: 1`; the request was not processed and may be retried."
+            with `Retry-After: 1`; the request was not processed and may be retried. \
+            While disk space or memory runs short, writes answer 507 Insufficient Storage \
+            (text/plain) with `Retry-After: 5` and are not applied; reads go on."
     )
 )]
 pub struct ApiDoc;
@@ -650,6 +687,36 @@ mod contract_tests {
                 &serde_json::json!("#/components/schemas/DocumentResponse"),
                 "{schema}.documents.items: {items_ref}"
             );
+        }
+    }
+
+    // Test 4 (contract): the writes a shortage of disk space or memory
+    // refuses declare 507 with Retry-After, the SQL route included; reads,
+    // the searches, sign-in and keys, and backup deletion do not.
+    #[test]
+    fn refused_writes_declare_507_and_the_rest_do_not() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let response = |path: &str, method: &str| json["paths"][path][method]["responses"]["507"].clone();
+        for (path, method) in [
+            ("/store-api/kv/{domain}/keys/{key}", "put"),
+            ("/store-api/kv/{domain}/keys/{key}", "delete"),
+            ("/store-api/domains", "post"),
+            ("/store-api/rel/{domain}/sql", "post"),
+            ("/store-api/backups", "post"),
+            ("/store-api/backups/{id}/restore", "post"),
+        ] {
+            let declared = response(path, method);
+            assert!(declared["headers"]["Retry-After"].is_object(), "{method} {path}: {declared}");
+            assert_eq!(declared["content"]["text/plain"]["schema"]["type"], "string", "{method} {path}");
+        }
+        for (path, method) in [
+            ("/store-api/kv/{domain}/keys/{key}", "get"),
+            ("/store-api/json/{domain}/search", "post"),
+            ("/store-api/auth/users", "post"),
+            ("/store-api/backups/{id}", "delete"),
+            ("/health", "get"),
+        ] {
+            assert!(response(path, method).is_null(), "{method} {path}");
         }
     }
 

@@ -13,6 +13,7 @@
 
 pub mod window;
 
+use crate::control::resources::ResourceReport;
 use crate::engines::lsm::engine::EngineHeartbeatData;
 use parking_lot::{RwLock, RwLockReadGuard};
 use serde::Serialize;
@@ -49,7 +50,8 @@ impl Default for MetricsConfig {
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct HeartbeatMetrics {
-    /// `ok`, or `degraded` while a data shard does not answer.
+    /// `ok`, or `degraded` while a data shard does not answer or disk space
+    /// or memory runs short (`resources`).
     pub status: &'static str,
     pub uptime_secs: u64,
     pub version: &'static str,
@@ -59,6 +61,8 @@ pub struct HeartbeatMetrics {
     pub l0_sstable_count: usize,
     /// Every data shard, by id.
     pub shards: Vec<ShardHealth>,
+    /// Free disk space of each data volume and the server's own memory.
+    pub resources: ResourceReport,
 }
 
 /// A data shard as `GET /health` reports it: `ok` once it answered its
@@ -551,10 +555,18 @@ impl MetricsStore {
     }
 
     /// Builds a `HeartbeatMetrics` snapshot from the live data of every data
-    /// shard's engine, summed, and whether each shard answered, by index.
-    pub fn heartbeat(&self, engines: &[EngineHeartbeatData], domain_count: usize, answered: &[bool]) -> HeartbeatMetrics {
+    /// shard's engine, summed, whether each shard answered, by index, and
+    /// the resource state.
+    pub fn heartbeat(
+        &self,
+        engines: &[EngineHeartbeatData],
+        domain_count: usize,
+        answered: &[bool],
+        resources: ResourceReport,
+    ) -> HeartbeatMetrics {
+        let healthy = answered.iter().all(|&ok| ok) && resources.state == "ok";
         HeartbeatMetrics {
-            status: if answered.iter().all(|&ok| ok) { "ok" } else { "degraded" },
+            status: if healthy { "ok" } else { "degraded" },
             uptime_secs: now_secs().saturating_sub(self.started_at),
             version: LURADB_VERSION,
             domain_count,
@@ -565,6 +577,7 @@ impl MetricsStore {
                 .zip(answered)
                 .map(|(id, &ok)| ShardHealth { id, status: if ok { "ok" } else { "timeout" } })
                 .collect(),
+            resources,
         }
     }
 }

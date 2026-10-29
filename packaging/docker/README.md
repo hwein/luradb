@@ -93,3 +93,20 @@ Docker's default seccomp profile blocks the io_uring syscalls LuraDB
 requires; `compose.yaml` carries the exemption (`security_opt:
 seccomp=unconfined`). A bare `docker run` without that option fails at
 startup.
+
+## Exit codes and restarts
+
+The stock `compose.yaml` sets no `restart:` policy, so a stopped container
+stays stopped. LuraDB stops with its own exit code in two cases:
+
+- **3:** the disk reported an error while making written data durable
+  (`fsync`). A new start recovers every confirmed write from the
+  write-ahead log, so restarting is right.
+- **4:** at the start, a volume has less free space than the recovery needs
+  (`not enough free disk space to recover`). Every further start fails the
+  same way until space is freed.
+
+Docker's restart policies cannot leave out an exit code: with `restart:
+unless-stopped` or `restart: always`, an exit 4 restarts in a loop.
+`restart: on-failure:3` restarts after an exit 3, and after any failure at
+most three times.

@@ -746,6 +746,9 @@ struct LocalWal {
     /// Bytes a failed append left past `offset`, or the unsafe-end marker,
     /// may still be there; the next append cuts first.
     unsafe_end: bool,
+    /// How a sync of the file failed: the server stops as soon as the end
+    /// of the failed group is safe for the next open.
+    failed_sync: Option<String>,
     faults: Faults,
 }
 
@@ -772,50 +775,87 @@ impl LocalWal {
             lsn: start_lsn.unwrap_or(0),
             awaits_truncate: start_lsn.is_none(),
             unsafe_end: false,
+            failed_sync: None,
             faults: Faults::default(),
         })
     }
 
     /// A failed write or sync cuts the file back to the cursor, which stays
-    /// where it was.
+    /// where it was. A failed sync stops the server once the end is safe:
+    /// the file cut back or the cursor in the marker; until then the next
+    /// group makes it safe first.
     async fn write_at_cursor(&mut self, data: &[u8]) -> std::io::Result<()> {
         if self.awaits_truncate {
             return Err(appends_refused());
         }
         if self.unsafe_end {
-            if let Err(cut) = self.cut_to_cursor().await {
-                self.log_failed_cut(&cut);
-                return Err(cut);
+            let cut = self.cut_to_cursor().await;
+            if let Err((failed, _)) = &cut {
+                self.log_failed_cut(failed);
             }
+            if cut.as_ref().map_or_else(|(_, secured)| *secured, |()| true) {
+                if let Some(stop) = self.stop_after_failed_sync() {
+                    return Err(stop);
+                }
+            }
+            cut.map_err(|(failed, _)| failed)?;
         }
-        let result = async {
+        let written = async {
             self.file.seek(std::io::SeekFrom::Start(self.offset)).await?;
             self.file.write_all(data).await?;
-            self.file.flush().await?;
-            if std::mem::take(&mut self.faults.sync) {
-                return Err(std::io::Error::other("injected fsync failure"));
-            }
-            self.file.sync_all().await
+            self.file.flush().await
         }
         .await;
+        let result = match written {
+            Ok(()) => {
+                let synced = if std::mem::take(&mut self.faults.sync) {
+                    Err(std::io::Error::other("injected fsync failure"))
+                } else {
+                    self.file.sync_all().await
+                };
+                if let Err(e) = &synced {
+                    self.failed_sync.get_or_insert_with(|| e.to_string());
+                }
+                synced
+            }
+            failed => failed,
+        };
         if result.is_err() {
-            if let Err(cut) = self.cut_to_cursor().await {
-                self.log_failed_cut(&cut);
+            let secured = match self.cut_to_cursor().await {
+                Ok(()) => true,
+                Err((failed, secured)) => {
+                    self.log_failed_cut(&failed);
+                    secured
+                }
+            };
+            if secured {
+                if let Some(stop) = self.stop_after_failed_sync() {
+                    return Err(stop);
+                }
             }
         }
         result
     }
 
-    /// The file's end stays unsafe until the cut and the marker removal both succeed.
-    async fn cut_to_cursor(&mut self) -> std::io::Result<()> {
+    /// The file's end stays unsafe until the cut and the marker removal both
+    /// succeed. `Err` says whether the next open finds the end safe all the
+    /// same: the file cut, or the cursor in the marker.
+    async fn cut_to_cursor(&mut self) -> Result<(), (std::io::Error, bool)> {
         self.unsafe_end = true;
         if let Err(e) = self.cut_file().await {
-            mark_unsafe_end(&self.marker, self.offset);
-            return Err(e);
+            let marked = !std::mem::take(&mut self.faults.mark) && mark_unsafe_end(&self.marker, self.offset).is_ok();
+            return Err((e, marked));
         }
-        self.unmark()?;
+        self.unmark().map_err(|e| (e, true))?;
         self.unsafe_end = false;
         Ok(())
+    }
+
+    /// Stops the server for a failed sync, if there was one. Returns only in
+    /// tests, with the stop's error.
+    fn stop_after_failed_sync(&mut self) -> Option<std::io::Error> {
+        let error = self.failed_sync.take()?;
+        Some(std::io::Error::other(crate::storage::fatal_sync_error(&self.path, &error)))
     }
 
     async fn cut_file(&mut self) -> std::io::Result<()> {
@@ -1130,6 +1170,7 @@ mod tests {
             assert!(results.iter().all(Result::is_err));
             assert_eq!(wal.offset, 28);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), 28);
+            assert_eq!(crate::storage::test_fault::stops_under(dir.path()), std::slice::from_ref(&path), "the failed sync stops the server");
 
             assert_eq!(commit_group(&mut wal, vec![b"next".to_vec()]).await[0].as_ref().unwrap(), &(28, 2));
         })
@@ -1148,6 +1189,7 @@ mod tests {
             wal.faults.sync = true;
             let long = vec![delete_record(b"lost-with-a-long-key"), delete_record(b"lost-as-well")];
             assert!(commit_group(&mut wal, long).await.iter().all(Result::is_err));
+            assert_eq!(crate::storage::test_fault::stops_under(dir.path()), std::slice::from_ref(&path));
 
             let kept = commit_group(&mut wal, vec![delete_record(b"kept")]).await;
             assert_eq!(kept[0].as_ref().unwrap(), &(16, 1));
@@ -1186,6 +1228,7 @@ mod tests {
         wal.faults = Faults { sync: true, cut: true, ..Faults::default() };
         assert!(commit_group(&mut wal, vec![delete_record(b"lost-with-a-long-key")]).await[0].is_err());
         assert!(std::fs::metadata(path).unwrap().len() > start);
+        assert_eq!(crate::storage::test_fault::stops_under(path), [path.to_path_buf()], "the marker holds the cursor");
         (wal, start)
     }
 

@@ -23,6 +23,12 @@ use utoipa::ToSchema;
 
 impl From<JsonStoreError> for ApiError {
     fn from(e: JsonStoreError) -> Self {
+        if let Some(blocked) = match &e {
+            JsonStoreError::StorageError(cause) => crate::control::resources::WriteBlocked::in_chain(cause),
+            _ => None,
+        } {
+            return blocked.into();
+        }
         // A failed precondition carries the current ETag, if the document exists.
         let current_etag = match &e {
             JsonStoreError::VersionConflict { actual, .. } => actual.clone(),

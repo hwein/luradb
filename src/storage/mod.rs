@@ -29,11 +29,60 @@ pub fn sync_dir(dir: &Path) -> anyhow::Result<()> {
 /// [`sync_dir`] for each of `dirs`, in order and each once, on the blocking
 /// pool so the engine thread keeps serving.
 pub async fn sync_dirs(dirs: &[&Path]) -> anyhow::Result<()> {
+    match first_failed_sync(dirs).await? {
+        Some((_, e)) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// [`sync_dirs`] for directories the server goes on using: a failed sync
+/// stops it ([`fatal_sync_error`]).
+pub async fn sync_dirs_or_stop(dirs: &[&Path]) -> anyhow::Result<()> {
+    match first_failed_sync(dirs).await? {
+        Some((dir, e)) => Err(fatal_sync_error(&dir, e.root_cause())),
+        None => Ok(()),
+    }
+}
+
+/// Syncs `dirs` as [`sync_dirs`] does, up to the first that fails.
+async fn first_failed_sync(dirs: &[&Path]) -> anyhow::Result<Option<(PathBuf, anyhow::Error)>> {
     let mut unique: Vec<PathBuf> = Vec::with_capacity(dirs.len());
     for dir in dirs {
         if !unique.iter().any(|seen| seen == dir) {
             unique.push(dir.to_path_buf());
         }
     }
-    tokio::task::spawn_blocking(move || unique.iter().try_for_each(|dir| sync_dir(dir))).await?
+    let synced = tokio::task::spawn_blocking(move || {
+        unique.into_iter().find_map(|dir| sync_dir(&dir).err().map(|e| (dir, e)))
+    });
+    Ok(synced.await?)
+}
+
+/// The exit code of a stop after a failed sync.
+pub const EXIT_SYNC_FAILED: u8 = 3;
+
+/// Stops the server after a failed sync of a file or directory it would go
+/// on using — a write-ahead log segment, a value log, a data directory, an
+/// unsafe-end marker: the kernel may have dropped the pages it could not
+/// write, and a second sync could then succeed without them. Writes the
+/// failure to the server log and to stderr, flushes the log file and exits
+/// with [`EXIT_SYNC_FAILED`]; the next start recovers from the write-ahead
+/// log. In tests the stop is recorded and its error returned instead.
+pub fn fatal_sync_error(path: &Path, error: &dyn std::fmt::Display) -> anyhow::Error {
+    let line = format!(
+        "data sync failed on {}: {error}; stopping so the next start recovers from the write-ahead log",
+        path.display()
+    );
+    tracing::error!("{line}");
+    #[cfg(test)]
+    {
+        test_fault::record_stop(path);
+        anyhow::anyhow!(line)
+    }
+    #[cfg(not(test))]
+    {
+        eprintln!("{line}");
+        crate::logging::flush();
+        std::process::exit(i32::from(EXIT_SYNC_FAILED))
+    }
 }

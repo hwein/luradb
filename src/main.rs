@@ -2,10 +2,12 @@ use clap::Parser;
 use luradb::{
     api::ApiDoc,
     config::{resolve_config_path, LuraConfig},
+    control::resources::{NoRoomToRecover, EXIT_NO_ROOM_TO_RECOVER},
     core::coop,
     logging,
     server::{self, Server},
 };
+use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::signal;
 use utoipa::OpenApi;
@@ -55,7 +57,26 @@ async fn shutdown_signal() {
     tracing::info!("Shutdown signal received. Starting graceful shutdown...");
 }
 
-fn main() -> anyhow::Result<()> {
+/// Exit code 1 for a failed start, 4 when a volume lacks the room to
+/// recover; a failed sync exits with 3 from where it happens.
+fn main() -> ExitCode {
+    let code = match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            eprintln!("Error: {e:?}");
+            if e.downcast_ref::<NoRoomToRecover>().is_some() {
+                ExitCode::from(EXIT_NO_ROOM_TO_RECOVER)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    };
+    logging::flush();
+    code
+}
+
+fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.dump_openapi {
         println!("{}", ApiDoc::openapi().to_pretty_json().expect("OpenAPI spec must serialize"));
@@ -68,6 +89,7 @@ fn main() -> anyhow::Result<()> {
     config.log.validate()?;
     config.backup.validate()?;
     config.storage.validate()?;
+    config.resources.validate()?;
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to determine the current working directory: {e}"))?;
     config.validate_data_paths(&cwd)?;
@@ -79,7 +101,7 @@ fn main() -> anyhow::Result<()> {
     config.shm.validate_registration_socket(&config.server)?;
     config.multicore.validate(coop::available_cores())?;
     let mcp_warnings = config.mcp.validate(&config.server, &config.auth)?;
-    let _log_guard = logging::init_logging(&config.log)?;
+    logging::init_logging(&config.log)?;
 
     if let Some(shards) = cli.migrate_shards {
         server::migrate_shards(&config, shards)?;

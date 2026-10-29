@@ -177,7 +177,7 @@ A delete does not free space at once: it writes a marker that compaction removes
 The service stops with its own exit code in two cases:
 
 - **3:** the disk reported an error while making written data durable (`fsync`). The log shows `data sync failed on <path>`; systemd starts the service again, and the start recovers every confirmed write from the write-ahead log.
-- **4:** at the start, a volume has less free space than the recovery needs (`not enough free disk space to recover`). systemd does not restart the service; free space, then run `sudo systemctl start luradb`.
+- **4:** at the start, a volume has less free space than the recovery needs (`not enough free disk space to recover`). systemd does not restart the service; free space, then run `sudo systemctl start luradb`. A start below `disk_free_block` with room for the recovery does not stop: the service starts with writes refused (`507`) and reads going on.
 
 The unit allows three starts within five minutes, manual ones included; after that systemd refuses further starts until `sudo systemctl reset-failed luradb`.
 

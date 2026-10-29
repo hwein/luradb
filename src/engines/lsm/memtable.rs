@@ -8,7 +8,7 @@ use crate::storage::format::{is_expired, ValuePointer, VersionState};
 use crossbeam_skiplist::SkipMap;
 use std::cell::Cell;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Counted size of a vLog-offloaded value: its on-disk vLog pointer.
@@ -73,6 +73,9 @@ pub struct MemTable {
     map: Arc<SkipMap<Vec<u8>, Value>>,
     /// Encoded internal keys plus counted value bytes of all entries.
     size_bytes: AtomicUsize,
+    /// The LSN up to which the instance had applied all of its records when
+    /// this MemTable was rotated out; 0 before.
+    lsn_watermark: AtomicU64,
 }
 
 impl MemTable {
@@ -81,7 +84,17 @@ impl MemTable {
         Self {
             map: Arc::new(SkipMap::new()),
             size_bytes: AtomicUsize::new(0),
+            lsn_watermark: AtomicU64::new(0),
         }
+    }
+
+    /// Set by the rotation that freezes this MemTable.
+    pub fn set_lsn_watermark(&self, lsn: u64) {
+        self.lsn_watermark.store(lsn, Ordering::Release);
+    }
+
+    pub fn lsn_watermark(&self) -> u64 {
+        self.lsn_watermark.load(Ordering::Acquire)
     }
 
     /// Inserts a key-value pair with a timestamp (MVCC).

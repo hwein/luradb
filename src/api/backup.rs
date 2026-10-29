@@ -225,8 +225,8 @@ pub struct BackupDetailResponse {
 
 /// Per engine, a write-ahead-log position that every write in the archive is
 /// at or below; 0 for an engine outside the scope and for format version 1.
-/// Positions restart at 1 after a clean shutdown, so they compare only within
-/// one run of the server.
+/// Positions keep growing across restarts, so they compare across runs of
+/// the server.
 #[derive(Serialize, ToSchema)]
 pub struct LsnCutResponse {
     pub kv: u64,
@@ -459,8 +459,8 @@ pub async fn get_backup(
 ///   on, so an archive restores into any shard count.
 /// - `lsn_cut`: `{kv, json, rel}`, per engine a write-ahead-log position that
 ///   every write in the archive is at or below (a lower bound of the cut);
-///   0 for an engine outside the scope. Positions restart at 1 after a clean
-///   shutdown, so they compare only within one run of the server.
+///   0 for an engine outside the scope. Positions keep growing across
+///   restarts, so they compare across runs of the server.
 /// - `kv_snapshot_ts`, `json_snapshot_ts`, `rel_snapshot_ts`: per engine,
 ///   the newest read-snapshot stamp among the data shards; 0 for an engine
 ///   outside the scope.

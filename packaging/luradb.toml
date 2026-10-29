@@ -55,7 +55,8 @@ db_path = "/var/lib/luradb/luradb.db"
 # or recovery reads that write. Once the log reaches 64 MiB the running server cuts it
 # back, with luradb.wal.tmp briefly beside the file, or beside its target for a symlink;
 # never delete that by hand either. The path may be a symlink, but not a second hard
-# link to the log. Default: luradb.wal
+# link to the log. Its header records where its sequence numbers start; an earlier
+# LuraDB version does not start on a log this version wrote. Default: luradb.wal
 wal_path = "/var/lib/luradb/luradb.wal"
 # Value log for large values. Default: luradb.vlog
 vlog_path = "/var/lib/luradb/luradb.vlog"
@@ -195,7 +196,9 @@ enabled = true
 # where the next start cuts the log; never delete it by hand, or recovery reads that write.
 # Once the log reaches 64 MiB the running server cuts it back, with luradb_json.wal.tmp
 # briefly beside the file, or beside its target for a symlink; never delete that by hand
-# either. The path may be a symlink, but not a second hard link to the log.
+# either. The path may be a symlink, but not a second hard link to the log. Its header
+# records where its sequence numbers start; an earlier LuraDB version does not start on
+# a log this version wrote.
 wal_path = "luradb_json.wal"
 # Value log for large documents.
 vlog_path = "luradb_json.vlog"
@@ -221,7 +224,9 @@ enabled = true
 # where the next start cuts the log; never delete it by hand, or recovery reads that write.
 # Once the log reaches 64 MiB the running server cuts it back, with luradb_rel.wal.tmp
 # briefly beside the file, or beside its target for a symlink; never delete that by hand
-# either. The path may be a symlink, but not a second hard link to the log.
+# either. The path may be a symlink, but not a second hard link to the log. Its header
+# records where its sequence numbers start; an earlier LuraDB version does not start on
+# a log this version wrote.
 wal_path = "luradb_rel.wal"
 # Value log for large rows.
 vlog_path = "luradb_rel.vlog"

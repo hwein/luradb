@@ -16,10 +16,24 @@ use tokio::io::AsyncWriteExt;
 #[cfg(test)]
 use tokio::sync::{mpsc, oneshot};
 
-/// The first bytes of every log this version writes. A log without them has
-/// the earlier format, whose first byte is a record type from 1 to 4.
-pub const WAL_MAGIC: [u8; 8] = *b"LURAWAL\x02";
-pub const WAL_HEADER_LEN: u64 = WAL_MAGIC.len() as u64;
+/// The first bytes of every log this version writes, followed by the LSN of
+/// the last record before the log's first one (`u64`, big-endian): the LSNs
+/// go on across restarts. Earlier versions read such a log as one of the
+/// first format and refuse it.
+pub const WAL_MAGIC: [u8; 8] = *b"LURAWAL\x03";
+pub const WAL_HEADER_LEN: u64 = WAL_MAGIC.len() as u64 + 8;
+/// The header of the previous format: the magic alone, LSNs from 1 after
+/// each clean stop. A log with neither header has the first format, whose
+/// first byte is a record type from 1 to 4.
+const PREVIOUS_WAL_MAGIC: [u8; 8] = *b"LURAWAL\x02";
+
+/// The header of a log whose first record follows `start_lsn`.
+pub fn wal_header(start_lsn: u64) -> [u8; WAL_HEADER_LEN as usize] {
+    let mut header = [0; WAL_HEADER_LEN as usize];
+    header[..WAL_MAGIC.len()].copy_from_slice(&WAL_MAGIC);
+    header[WAL_MAGIC.len()..].copy_from_slice(&start_lsn.to_be_bytes());
+    header
+}
 
 /// Hard ceiling on any single length-prefixed WAL field (a key or a value)
 /// read during recovery. Without it, a corrupt tail turns garbage bytes into
@@ -81,59 +95,160 @@ impl WalEntry {
             WalEntry::Set { key, .. } | WalEntry::Delete { key, .. } | WalEntry::SetNull { key, .. } => key,
         }
     }
+
+    /// The stamp the entry writes under.
+    pub fn timestamp(&self) -> u64 {
+        match self {
+            WalEntry::Set { timestamp, .. }
+            | WalEntry::Delete { timestamp, .. }
+            | WalEntry::SetNull { timestamp, .. } => *timestamp,
+        }
+    }
 }
 
-/// What [`recover`] read from a log.
-#[derive(Debug, Default)]
-pub struct Recovered {
-    /// Each entry with the LSN of its record; the ops of a batch share one.
-    pub entries: Vec<(u64, WalEntry)>,
-    /// The highest LSN in the log, 0 for a log without records.
-    pub max_lsn: u64,
+/// A log as [`recover`] reads it, one entry at a time: it holds one record
+/// in memory, never the log.
+pub struct WalReader {
+    /// `None` once the log is read to its end, or for a missing one.
+    file: Option<LogReader>,
+    /// The records carry an LSN frame; a log of the first format has none.
+    framed: bool,
+    /// The log has this version's header.
+    lsns_continue: bool,
+    /// LSN of the record read last.
+    lsn: u64,
+    max_lsn: u64,
+    /// The entries of the record read last not handed out yet.
+    record: std::vec::IntoIter<(u64, WalEntry)>,
 }
 
-/// Recovers database state by reading and parsing all entries from the WAL.
+impl WalReader {
+    fn empty() -> Self {
+        Self {
+            file: None,
+            framed: false,
+            lsns_continue: false,
+            lsn: 0,
+            max_lsn: 0,
+            record: Vec::new().into_iter(),
+        }
+    }
+
+    /// The next entry with the LSN of its record, `None` at the end of the
+    /// log; the ops of a batch share one LSN. After an error the log reads
+    /// as ended.
+    pub async fn next(&mut self) -> Option<Result<(u64, WalEntry), WalError>> {
+        if let Some(entry) = self.record.next() {
+            return Some(Ok(entry));
+        }
+        match self.next_record().await {
+            Ok(Some(entries)) => {
+                self.max_lsn = self.max_lsn.max(self.lsn);
+                self.record = entries.into_iter();
+                self.record.next().map(Ok)
+            }
+            Ok(None) => {
+                self.file = None;
+                None
+            }
+            Err(e) => {
+                self.file = None;
+                Some(Err(e))
+            }
+        }
+    }
+
+    /// The entries of the next record, `None` at the end of the log.
+    async fn next_record(&mut self) -> Result<Option<Vec<(u64, WalEntry)>>, WalError> {
+        let Some(file) = self.file.as_mut() else { return Ok(None) };
+        // A clean end of the log can only fall before a record.
+        let entry_type = if self.framed {
+            let Some(frame) = read_next::<8>(file).await? else { return Ok(None) };
+            self.lsn = u64::from_be_bytes(frame);
+            file.read_u8().await?
+        } else {
+            let Some([entry_type]) = read_next::<1>(file).await? else { return Ok(None) };
+            self.lsn += 1;
+            entry_type
+        };
+        let mut entries = Vec::new();
+        read_record(file, entry_type, self.lsn, &mut entries).await?;
+        Ok(Some(entries))
+    }
+
+    /// The highest LSN read so far, at least the start LSN of the header;
+    /// the log's highest once [`Self::next`] returned `None`.
+    pub fn max_lsn(&self) -> u64 {
+        self.max_lsn
+    }
+
+    /// The log's LSNs go on from those of the logs before it, as this
+    /// version writes them. A log of an earlier format numbers its records
+    /// from 1 after each clean stop, so they say nothing about what the
+    /// SSTables hold.
+    pub fn lsns_continue(&self) -> bool {
+        self.lsns_continue
+    }
+}
+
+/// Opens the write-ahead log at `path` for recovery; a missing log reads as
+/// an empty one.
 ///
-/// This function is designed to be called once at startup. It reads the entire
-/// log from disk and reconstructs the in-memory operations needed to restore
-/// the MemTable to its pre-shutdown state.
-///
-/// A log that starts with [`WAL_MAGIC`] frames every record with its LSN,
-/// `[lsn:u64][type:u8]...`; a log of the earlier format has neither, and its
-/// records get the LSNs 1 to n in file order.
-pub async fn recover(path: impl AsRef<Path>) -> Result<Recovered, WalError> {
+/// A log that starts with [`WAL_MAGIC`] or the previous format's header
+/// frames every record with its LSN, `[lsn:u64][type:u8]...`; a log of the
+/// first format has neither, and its records get the LSNs 1 to n in file
+/// order.
+pub async fn recover(path: impl AsRef<Path>) -> Result<WalReader, WalError> {
+    let mut reader = WalReader::empty();
     let mut file = match File::open(path.as_ref()).await {
         Ok(f) => BufReader::with_capacity(RECOVERY_READ_BUFFER, f),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Recovered::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(reader),
         Err(e) => return Err(e.into()),
     };
 
-    let framed = match read_next::<8>(&mut file).await? {
-        Some(head) => head == WAL_MAGIC,
-        None => return Ok(Recovered::default()),
+    reader.framed = match read_next::<8>(&mut file).await? {
+        Some(WAL_MAGIC) => {
+            // A header cut short before or inside its start LSN came from a
+            // crash while it was written, into a file without records.
+            let mut start = [0; 8];
+            let mut filled = 0;
+            while filled < start.len() {
+                match file.read(&mut start[filled..]).await? {
+                    0 => return Ok(reader),
+                    n => filled += n,
+                }
+            }
+            reader.max_lsn = u64::from_be_bytes(start);
+            reader.lsns_continue = true;
+            true
+        }
+        Some(head) => head == PREVIOUS_WAL_MAGIC,
+        None => return Ok(reader),
     };
-    if !framed {
+    if !reader.framed {
         file.seek(SeekFrom::Start(0)).await?;
     }
+    reader.file = Some(file);
+    Ok(reader)
+}
 
-    let mut recovered = Recovered::default();
-    let mut lsn = 0;
-    loop {
-        // A clean end of the log can only fall before a record.
-        let entry_type = if framed {
-            let Some(frame) = read_next::<8>(&mut file).await? else { break };
-            lsn = u64::from_be_bytes(frame);
-            file.read_u8().await?
-        } else {
-            let Some([entry_type]) = read_next::<1>(&mut file).await? else { break };
-            lsn += 1;
-            entry_type
-        };
-        read_record(&mut file, entry_type, lsn, &mut recovered.entries).await?;
-        recovered.max_lsn = recovered.max_lsn.max(lsn);
+/// Every entry of a log and its highest LSN, read in full.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct Recovered {
+    pub(crate) entries: Vec<(u64, WalEntry)>,
+    pub(crate) max_lsn: u64,
+}
+
+/// Tests only: [`recover`] read to the end of the log.
+#[cfg(test)]
+pub(crate) async fn recover_all(path: impl AsRef<Path>) -> Result<Recovered, WalError> {
+    let mut reader = recover(path).await?;
+    let mut entries = Vec::new();
+    while let Some(entry) = reader.next().await {
+        entries.push(entry?);
     }
-
-    Ok(recovered)
+    Ok(Recovered { entries, max_lsn: reader.max_lsn() })
 }
 
 /// The next `N` bytes of the log, `None` at its end; fewer than `N` bytes
@@ -445,8 +560,8 @@ struct LocalWal {
     offset: u64,
     /// LSN of the last record written; the next append gets the one after it.
     lsn: u64,
-    /// The file has no header — a log of the earlier format — and takes no
-    /// append until a truncate writes one.
+    /// The file has the header of an earlier format or none, and takes no
+    /// append until a truncate writes this version's.
     awaits_truncate: bool,
     /// Bytes a failed append left past `offset`, or the unsafe-end marker,
     /// may still be there; the next append cuts first.
@@ -464,7 +579,7 @@ impl LocalWal {
             .truncate(false)
             .open(path)?;
         apply_unsafe_end_marker(path, &file).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-        let awaits_truncate = !ensure_header(&file)?;
+        let start_lsn = ensure_header(&file)?;
 
         let mut file = File::from_std(file);
         let offset = file.metadata().await?.len();
@@ -474,8 +589,8 @@ impl LocalWal {
             path: path.to_path_buf(),
             marker: unsafe_end_marker(path),
             offset,
-            lsn: 0,
-            awaits_truncate,
+            lsn: start_lsn.unwrap_or(0),
+            awaits_truncate: start_lsn.is_none(),
             unsafe_end: false,
             faults: Faults::default(),
         })
@@ -647,19 +762,18 @@ async fn commit_append_group(
     }
 }
 
-/// Cuts the log back to its header, or replaces a log of the earlier format
-/// with the header alone.
+/// Cuts the log back to a header that starts after the last LSN, or
+/// replaces a log of an earlier format with that header alone.
 #[cfg(test)]
 async fn do_truncate(wal: &mut LocalWal) -> Result<(), WalError> {
     if wal.awaits_truncate {
         wal.file.set_len(0).await?;
-        wal.file.seek(SeekFrom::Start(0)).await?;
-        wal.file.write_all(&WAL_MAGIC).await?;
-        wal.file.flush().await?;
-        wal.awaits_truncate = false;
-    } else {
-        wal.file.set_len(WAL_HEADER_LEN).await?;
     }
+    wal.file.seek(SeekFrom::Start(0)).await?;
+    wal.file.write_all(&wal_header(wal.lsn)).await?;
+    wal.file.flush().await?;
+    wal.file.set_len(WAL_HEADER_LEN).await?;
+    wal.awaits_truncate = false;
     wal.offset = WAL_HEADER_LEN;
     wal.file.sync_all().await?;
     if let Err(e) = wal.unmark() {
@@ -679,9 +793,10 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    /// The bytes of a log holding `records`, each framed with its LSN.
+    /// The bytes of a log holding `records`, each framed with its LSN, behind
+    /// a header that starts right before the first of them.
     fn log_of(records: &[(u64, &[u8])]) -> Vec<u8> {
-        let mut log = WAL_MAGIC.to_vec();
+        let mut log = wal_header(records.first().map_or(0, |(lsn, _)| lsn - 1)).to_vec();
         for (lsn, payload) in records {
             log.extend_from_slice(&lsn.to_be_bytes());
             log.extend_from_slice(payload);
@@ -711,11 +826,11 @@ mod tests {
 
             assert_eq!(appended.len(), 100);
             for (i, (offset, lsn)) in appended.iter().enumerate() {
-                assert_eq!(*offset, 8 + (i as u64) * 18);
+                assert_eq!(*offset, WAL_HEADER_LEN + (i as u64) * 18);
                 assert_eq!(*lsn, i as u64 + 1);
             }
             drop(wal);
-            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len(), 8 + 1800);
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap().len() as u64, WAL_HEADER_LEN + 1800);
         })
     }
 
@@ -727,10 +842,10 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let wal = WriteAheadLog::new(dir.path().join("wal")).await.unwrap();
 
-            assert_eq!(wal.append(b"abcde").await.unwrap(), (8, 1));
-            assert_eq!(wal.append(b"fgh").await.unwrap(), (21, 2));
+            assert_eq!(wal.append(b"abcde").await.unwrap(), (16, 1));
+            assert_eq!(wal.append(b"fgh").await.unwrap(), (29, 2));
             wal.truncate().await.unwrap();
-            assert_eq!(wal.append(b"XY").await.unwrap(), (8, 3));
+            assert_eq!(wal.append(b"XY").await.unwrap(), (16, 3));
 
             drop(wal);
             assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), log_of(&[(3, b"XY".as_slice())]));
@@ -750,7 +865,7 @@ mod tests {
     // commit_append_group's try_recv() drain is guaranteed to then find the
     // Truncate. No sleeps, no thread races, no flake.
     //
-    // The returned offset (21, not 8) is the actual proof: it's only possible
+    // The returned offset (29, not 16) is the actual proof: it's only possible
     // if the group committed at the pre-truncate offset before truncation
     // reset it, i.e. exactly the "commit group, then truncate" contract.
     #[test]
@@ -761,17 +876,17 @@ mod tests {
 
             // A record behind the header so the assertion below can distinguish
             // "group committed, then truncated" from "truncated, then committed".
-            assert_eq!(wal.append(b"AAAAA").await.unwrap(), (8, 1));
+            assert_eq!(wal.append(b"AAAAA").await.unwrap(), (16, 1));
 
             let (append_result, truncate_result) =
                 tokio::join!(wal.append(b"BBB"), wal.truncate());
 
-            assert_eq!(append_result.unwrap(), (21, 2));
+            assert_eq!(append_result.unwrap(), (29, 2));
             truncate_result.unwrap();
-            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), WAL_MAGIC);
+            assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), wal_header(2));
 
             // Offset and file state stay consistent after the mid-group truncate.
-            assert_eq!(wal.append(b"XY").await.unwrap(), (8, 3));
+            assert_eq!(wal.append(b"XY").await.unwrap(), (16, 3));
             drop(wal);
             assert_eq!(std::fs::read(dir.path().join("wal")).unwrap(), log_of(&[(3, b"XY".as_slice())]));
         })
@@ -808,7 +923,7 @@ mod tests {
     }
 
     async fn recovered_keys(path: &Path) -> Vec<String> {
-        recover(path)
+        recover_all(path)
             .await
             .unwrap()
             .entries
@@ -828,15 +943,15 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("wal");
             let mut wal = LocalWal::open(&path).await.unwrap();
-            assert_eq!(commit_group(&mut wal, vec![b"kept".to_vec()]).await[0].as_ref().unwrap(), &(8, 1));
+            assert_eq!(commit_group(&mut wal, vec![b"kept".to_vec()]).await[0].as_ref().unwrap(), &(16, 1));
 
             wal.faults.sync = true;
             let results = commit_group(&mut wal, vec![b"lost-one".to_vec(), b"lost-two".to_vec()]).await;
             assert!(results.iter().all(Result::is_err));
-            assert_eq!(wal.offset, 20);
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), 20);
+            assert_eq!(wal.offset, 28);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 28);
 
-            assert_eq!(commit_group(&mut wal, vec![b"next".to_vec()]).await[0].as_ref().unwrap(), &(20, 2));
+            assert_eq!(commit_group(&mut wal, vec![b"next".to_vec()]).await[0].as_ref().unwrap(), &(28, 2));
         })
     }
 
@@ -855,7 +970,7 @@ mod tests {
             assert!(commit_group(&mut wal, long).await.iter().all(Result::is_err));
 
             let kept = commit_group(&mut wal, vec![delete_record(b"kept")]).await;
-            assert_eq!(kept[0].as_ref().unwrap(), &(8, 1));
+            assert_eq!(kept[0].as_ref().unwrap(), &(16, 1));
             assert_eq!(recovered_keys(&path).await, ["kept"]);
         })
     }
@@ -961,7 +1076,7 @@ mod tests {
             assert!(marker.exists());
 
             do_truncate(&mut wal).await.unwrap();
-            assert_eq!(std::fs::read(&path).unwrap(), WAL_MAGIC);
+            assert_eq!(std::fs::read(&path).unwrap(), wal_header(1));
             assert!(!marker.exists());
             assert!(!wal.unsafe_end);
         })
@@ -1037,7 +1152,7 @@ mod tests {
     }
 
     // Builds a raw DELETE record: [type=2][ts:u64][key_len:u32][key]. Used
-    // directly (bypassing WriteAheadLog::append) to hand `recover()` a
+    // directly (bypassing WriteAheadLog::append) to hand `recover_all()` a
     // length-prefixed field with a chosen, possibly corrupt, length.
     fn raw_delete_record(key_len_field: u32, key: &[u8]) -> Vec<u8> {
         let mut raw = Vec::new();
@@ -1058,7 +1173,7 @@ mod tests {
             let path = dir.path().join("wal");
             std::fs::write(&path, raw_delete_record((WAL_MAX_FIELD_LEN + 1) as u32, &[])).unwrap();
 
-            let err = recover(&path).await.unwrap_err();
+            let err = recover_all(&path).await.unwrap_err();
             assert!(
                 err.to_string().contains("exceeds maximum"),
                 "expected a field-too-long error, got: {err}"
@@ -1076,7 +1191,7 @@ mod tests {
             let key = vec![b'k'; WAL_MAX_FIELD_LEN];
             std::fs::write(&path, raw_delete_record(WAL_MAX_FIELD_LEN as u32, &key)).unwrap();
 
-            let entries = recover(&path).await.unwrap().entries;
+            let entries = recover_all(&path).await.unwrap().entries;
             assert_eq!(entries.len(), 1);
             match &entries[0].1 {
                 WalEntry::Delete { key: k, .. } => assert_eq!(k.len(), WAL_MAX_FIELD_LEN),
@@ -1121,7 +1236,7 @@ mod tests {
     fn test_recover_reads_a_log_of_the_earlier_format_with_lsns_one_to_n() {
         crate::core::engine_runtime::block_on(async {
             let dir = TempDir::new().unwrap();
-            let recovered = recover(write_log(&dir, V1_LOG)).await.unwrap();
+            let recovered = recover_all(write_log(&dir, V1_LOG)).await.unwrap();
             assert_eq!(recovered.entries, v1_log_entries());
             assert_eq!(recovered.max_lsn, 5);
         })
@@ -1142,7 +1257,7 @@ mod tests {
             drop(wal);
 
             assert!(std::fs::read(&path).unwrap().starts_with(&WAL_MAGIC));
-            let recovered = recover(&path).await.unwrap();
+            let recovered = recover_all(&path).await.unwrap();
             assert_eq!(recovered.entries, v1_log_entries());
             assert_eq!(recovered.max_lsn, 5);
         })
@@ -1158,7 +1273,7 @@ mod tests {
                 let record = &V1_LOG[bounds[0]..bounds[1]];
                 types.push(record[0]);
 
-                let recovered = recover(write_log(&dir, record)).await.unwrap();
+                let recovered = recover_all(write_log(&dir, record)).await.unwrap();
                 let expected: Vec<_> =
                     v1_log_entries().into_iter().filter(|(lsn, _)| *lsn == i as u64 + 1).map(|(_, e)| (1, e)).collect();
                 assert_eq!(recovered.entries, expected);
@@ -1170,20 +1285,85 @@ mod tests {
         })
     }
 
-    // A missing log, an empty one and one with the header alone hold no entries.
+    // A missing log, an empty one, one with a header cut short and one with
+    // the header alone hold no entries; the header alone gives its start LSN.
     #[test]
     fn test_recover_reads_no_entries_from_an_empty_log() {
         crate::core::engine_runtime::block_on(async {
             let dir = TempDir::new().unwrap();
-            let missing = recover(dir.path().join("missing")).await.unwrap();
+            let missing = recover_all(dir.path().join("missing")).await.unwrap();
             assert!(missing.entries.is_empty());
             assert_eq!(missing.max_lsn, 0);
-            for log in [&[][..], &WAL_MAGIC[..]] {
-                let recovered = recover(write_log(&dir, log)).await.unwrap();
+            for (log, max_lsn) in [(&[][..], 0), (&WAL_MAGIC[..], 0), (&wal_header(50)[..11], 0), (&wal_header(0)[..], 0), (&wal_header(50)[..], 50)] {
+                let recovered = recover_all(write_log(&dir, log)).await.unwrap();
                 assert!(recovered.entries.is_empty());
-                assert_eq!(recovered.max_lsn, 0);
+                assert_eq!(recovered.max_lsn, max_lsn);
             }
         })
+    }
+
+    // A log that holds records after its start LSN reads them with their
+    // LSNs and reports the last; the previous format's header frames records
+    // the same way, without a start LSN.
+    #[test]
+    fn test_recover_reads_the_records_after_the_start_lsn() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let log = log_of(&[(51, &V1_LOG[..33])]);
+            assert_eq!(log[..WAL_HEADER_LEN as usize], wal_header(50));
+            let recovered = recover_all(write_log(&dir, &log)).await.unwrap();
+            assert_eq!(recovered.entries, v1_log_entries().into_iter().take(1).map(|(_, e)| (51, e)).collect::<Vec<_>>());
+            assert_eq!(recovered.max_lsn, 51);
+
+            let previous = [&PREVIOUS_WAL_MAGIC[..], &log[WAL_HEADER_LEN as usize..]].concat();
+            let recovered = recover_all(write_log(&dir, &previous)).await.unwrap();
+            assert_eq!(recovered.entries.len(), 1);
+            assert_eq!(recovered.max_lsn, 51);
+        })
+    }
+
+    // The reader hands out one entry at a time, the ops of a batch with the
+    // LSN of their record, and knows the log's highest LSN at its end; only
+    // a log of this version's format has LSNs that go on across logs.
+    #[test]
+    fn test_the_reader_hands_out_one_entry_at_a_time() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let log = log_of(&[(8, &V1_LOG[..33]), (9, &V1_LOG[101..148])]);
+            let mut reader = recover(write_log(&dir, &log)).await.unwrap();
+            assert!(reader.lsns_continue());
+            assert_eq!(reader.max_lsn(), 7, "the start LSN before the first record");
+            let mut lsns = Vec::new();
+            while let Some(entry) = reader.next().await {
+                lsns.push(entry.unwrap().0);
+                assert_eq!(reader.max_lsn(), *lsns.last().unwrap());
+            }
+            assert_eq!(lsns, [8, 9, 9]);
+            assert!(reader.next().await.is_none());
+
+            let previous = [&PREVIOUS_WAL_MAGIC[..], &log[WAL_HEADER_LEN as usize..]].concat();
+            assert!(!recover(write_log(&dir, &previous)).await.unwrap().lsns_continue());
+            assert!(!recover(write_log(&dir, V1_LOG)).await.unwrap().lsns_continue());
+        })
+    }
+
+    /// How a version before this one reads the start of a log: the previous
+    /// format's header, or else a record type of the first format.
+    fn read_as_previous_version(log: &[u8]) -> Result<(), WalError> {
+        if log.starts_with(&PREVIOUS_WAL_MAGIC) || matches!(log.first(), None | Some(1..=4)) {
+            return Ok(());
+        }
+        Err(invalid_entry_error())
+    }
+
+    // A version before this one refuses a log of this one: its first byte is
+    // no record type.
+    #[test]
+    fn test_a_previous_version_refuses_a_log_of_this_version() {
+        assert!(read_as_previous_version(&[&PREVIOUS_WAL_MAGIC[..], b"rest"].concat()).is_ok());
+        assert!(read_as_previous_version(V1_LOG).is_ok());
+        let err = read_as_previous_version(&wal_header(0)).unwrap_err();
+        assert!(err.to_string().contains("Invalid WAL entry type"), "{err}");
     }
 
     // A record cut short at the end of the log fails recovery in either
@@ -1198,10 +1378,10 @@ mod tests {
                 &V1_LOG[..V1_LOG.len() - 1],
                 &framed[..framed.len() - 1],
                 &frame_alone,
-                &frame_alone[..12],
+                &frame_alone[..20],
             ];
             for log in torn {
-                let err = recover(write_log(&dir, log)).await.unwrap_err();
+                let err = recover_all(write_log(&dir, log)).await.unwrap_err();
                 assert!(
                     matches!(&err, WalError::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
                     "expected a torn record, got: {err}"
@@ -1251,7 +1431,7 @@ mod tests {
             let log = log_of(&[(1, &records[0]), (2, &records[1]), (3, &records[2])]);
             assert!(log.len() > 2 * RECOVERY_READ_BUFFER);
 
-            let recovered = recover(write_log(&dir, &log)).await.unwrap();
+            let recovered = recover_all(write_log(&dir, &log)).await.unwrap();
             let set = |key: &[u8], value: &[u8]| WalEntry::Set { timestamp: 7, key: key.to_vec(), value: value.to_vec(), expire_at: 0 };
             assert_eq!(
                 recovered.entries,
@@ -1269,11 +1449,11 @@ mod tests {
             let path = dir.path().join("wal");
             let wal = WriteAheadLog::new(&path).await.unwrap();
             wal.set_lsn_start(41).await.unwrap();
-            assert_eq!(wal.append(&delete_record(b"first")).await.unwrap(), (8, 42));
+            assert_eq!(wal.append(&delete_record(b"first")).await.unwrap(), (16, 42));
             assert_eq!(wal.append(&delete_record(b"second")).await.unwrap().1, 43);
             drop(wal);
 
-            let recovered = recover(&path).await.unwrap();
+            let recovered = recover_all(&path).await.unwrap();
             assert_eq!(recovered.entries.iter().map(|(lsn, _)| *lsn).collect::<Vec<_>>(), [42, 43]);
             assert_eq!(recovered.max_lsn, 43);
         })
@@ -1292,7 +1472,7 @@ mod tests {
             wal.truncate().await.unwrap();
 
             wal.set_lsn_start(0).await.unwrap();
-            assert_eq!(wal.append(&delete_record(b"d")).await.unwrap(), (8, 4));
+            assert_eq!(wal.append(&delete_record(b"d")).await.unwrap(), (16, 4));
         })
     }
 
@@ -1371,7 +1551,7 @@ mod tests {
                 }
                 drop(wal);
 
-                let logged: Vec<(u64, u64)> = recover(&path)
+                let logged: Vec<(u64, u64)> = recover_all(&path)
                     .await
                     .unwrap()
                     .entries

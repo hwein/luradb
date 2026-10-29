@@ -48,6 +48,12 @@ pub struct Manifest {
 
     /// Sequence number for manifest versions
     pub version: u64,
+
+    /// The LSN up to which every record of this instance's write-ahead log
+    /// is in the SSTables listed here; recovery replays only the records
+    /// above it. Manifests written before this field load as 0.
+    #[serde(default)]
+    pub flushed_lsn: u64,
 }
 
 impl Manifest {
@@ -56,6 +62,15 @@ impl Manifest {
         Self {
             levels: Vec::new(),
             version: 0,
+            flushed_lsn: 0,
+        }
+    }
+
+    /// Raises [`Self::flushed_lsn`] to `lsn`; never lowers it.
+    pub fn raise_flushed_lsn(&mut self, lsn: u64) {
+        if lsn > self.flushed_lsn {
+            self.flushed_lsn = lsn;
+            self.version += 1;
         }
     }
 
@@ -428,7 +443,7 @@ mod tests {
             // Same version as what's already on disk, but different content --
             // constructed directly (not via add_sstable) so staleness comes from
             // the version alone, not a mutation this manager never saw.
-            let stale = Manifest { levels: vec![vec![meta(99)]], version: 1 };
+            let stale = Manifest { levels: vec![vec![meta(99)]], version: 1, flushed_lsn: 0 };
             reopened.save(&stale).await?;
 
             let on_disk = ManifestManager::new(temp_dir.path()).load().await?;

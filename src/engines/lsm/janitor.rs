@@ -53,6 +53,9 @@ use tokio::sync::watch;
 pub type FlushBarrier =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
+/// The engine's write drain and its last applied LSN.
+pub(crate) type WriteDrain = (Arc<tokio::sync::RwLock<()>>, Arc<AtomicU64>);
+
 /// Tuning parameters for the Janitor background task.
 #[derive(Debug, Clone)]
 pub struct JanitorConfig {
@@ -154,9 +157,10 @@ pub struct Janitor {
 
     /// The engine's write drain (`in_flight_writes`): held while a new active
     /// generation and its fresh MemTable are installed, so no writer sits
-    /// between its stamp and its apply across that rotation.
-    /// `None` only for fixtures without writers.
-    write_drain: Option<Arc<tokio::sync::RwLock<()>>>,
+    /// between its stamp and its apply across that rotation, together with
+    /// the engine's last applied LSN, the watermark of the MemTable rotated
+    /// out. `None` only for fixtures without writers.
+    write_drain: Option<WriteDrain>,
 
     /// Generations already out of the current version whose files wait until
     /// no older version holds them.
@@ -195,7 +199,7 @@ impl Janitor {
         flush_barrier: Option<FlushBarrier>,
         flush_lock: Option<Arc<tokio::sync::Mutex<()>>>,
         maintenance_lock: Option<Arc<tokio::sync::Mutex<()>>>,
-        write_drain: Option<Arc<tokio::sync::RwLock<()>>>,
+        write_drain: Option<WriteDrain>,
     ) -> Self {
         Self {
             version,
@@ -444,11 +448,14 @@ impl Janitor {
     /// Installs `vlog` as the active generation with a fresh MemTable, under
     /// the engine's write drain (see [`Self::write_drain`]).
     async fn activate(&self, vlog: Arc<VLog>) {
-        let _drain = match &self.write_drain {
-            Some(drain) => Some(drain.write().await),
-            None => None,
+        let (_drain, watermark) = match &self.write_drain {
+            Some((drain, applied)) => {
+                let guard = drain.write().await;
+                (Some(guard), applied.load(Ordering::Acquire))
+            }
+            None => (None, 0),
         };
-        self.version.install(|v| v.with_active_vlog(vlog));
+        self.version.install(|v| v.with_active_vlog(vlog, watermark));
     }
 
     /// Collects all live value pointers `(file_id, offset, len)` from every

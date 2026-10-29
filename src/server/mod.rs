@@ -13,7 +13,7 @@ mod mcp_oauth_tests;
 #[cfg(test)]
 mod mcp_tests;
 mod migrate;
-mod recovery;
+pub(crate) mod recovery;
 mod shard;
 #[cfg(test)]
 mod write_phases;
@@ -1366,6 +1366,27 @@ mod tests {
         let events = test_hook::recorded(&system_dir);
         let stopped = events.iter().position(|e| e == "shm stopped").expect("shared memory stopped");
         for shard in 0..shards {
+            let draining = format!("shard {shard} draining");
+            let draining = events.iter().position(|e| *e == draining).expect("a draining shard");
+            assert!(stopped < draining, "{events:?}");
+        }
+    }
+
+    // Shutdown stops the control plane's loops, the write-ahead log
+    // checkpoints among them, before any shard drains: a checkpoint in
+    // progress ends before the final flush and the cut at the stop.
+    #[test]
+    fn the_log_checkpoints_stop_before_the_shards_drain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.multicore.shards = 2;
+        let system_dir = cfg.storage.system_dir.clone();
+        let server = Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap();
+
+        server.shutdown().unwrap();
+        let events = test_hook::recorded(&system_dir);
+        let stopped = events.iter().position(|e| e == "system loops stopped").expect("the loops stopped");
+        for shard in 0..2 {
             let draining = format!("shard {shard} draining");
             let draining = events.iter().position(|e| *e == draining).expect("a draining shard");
             assert!(stopped < draining, "{events:?}");

@@ -16,17 +16,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The configured files of one engine; the shards' files derive from them.
-pub(super) struct EngineFiles {
-    pub(super) wal: PathBuf,
-    pub(super) vlog: PathBuf,
-    pub(super) sstables: PathBuf,
+pub(crate) struct EngineFiles {
+    pub(crate) wal: PathBuf,
+    pub(crate) vlog: PathBuf,
+    pub(crate) sstables: PathBuf,
 }
 
 /// Opens the `shards` instances of one engine, all on the log `wal` hands
 /// out a handle to, and gives each the records of `files.wal` whose keys its
 /// shard owns. Every instance has flushed its records when this returns; the
 /// log is left for the caller to truncate.
-pub(super) async fn open_sharded(
+pub(crate) async fn open_sharded(
     files: &EngineFiles,
     shards: u16,
     wal: impl Fn() -> WriteAheadLog,
@@ -46,7 +46,7 @@ pub(super) async fn open_sharded(
 }
 
 /// The instance of data shard `shard` on `files`, recovered by the caller.
-pub(super) async fn open_instance(
+pub(crate) async fn open_instance(
     files: &EngineFiles,
     shard: usize,
     wal: Arc<WriteAheadLog>,

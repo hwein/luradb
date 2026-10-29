@@ -1,9 +1,10 @@
 //! Control plane: runs the rare, global mutations — domain create and delete
 //! in every engine, auth changes — one at a time on a single worker task,
 //! holds the directory of all domains, owns the system store, is the one
-//! publisher of the global event stream and takes consistent cuts and metrics
-//! samples across the data shards.
+//! publisher of the global event stream and takes consistent cuts, metrics
+//! samples and write-ahead log checkpoints across the data shards.
 
+pub mod checkpoint;
 pub mod slots;
 pub mod system;
 
@@ -40,6 +41,17 @@ impl Engine {
             Engine::Kv => "kv",
             Engine::Json => "json",
             Engine::Rel => "rel",
+        }
+    }
+}
+
+/// The write-ahead log an engine writes on the storage hub.
+impl From<Engine> for crate::core::storage_thread::WalTarget {
+    fn from(engine: Engine) -> Self {
+        match engine {
+            Engine::Kv => Self::Kv,
+            Engine::Json => Self::Json,
+            Engine::Rel => Self::Rel,
         }
     }
 }
@@ -280,6 +292,17 @@ pub enum ShardCommand {
     /// answers with a sample of the shard's metrics, taken while its writes
     /// are held back.
     Sample { drained: oneshot::Sender<()>, sample: oneshot::Receiver<()>, reply: oneshot::Sender<MetricsSample> },
+    /// Like `Confirm`, but counts a checkpoint on the instance of `engine`
+    /// while its writes are held back and answers once `release` fires.
+    HoldForCheckpoint {
+        engine: Engine,
+        drained: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Persists everything the instance of `engine` has applied, in a task
+    /// of its own beside the commands after it, and answers with the result.
+    Persist { engine: Engine, reply: oneshot::Sender<anyhow::Result<()>> },
     /// Applies `write` to the key-value domain `domain` in a task of its own,
     /// beside the commands after it, and answers with the result.
     WriteKv { domain: String, write: KvWrite, reply: oneshot::Sender<anyhow::Result<()>> },
@@ -362,6 +385,26 @@ pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedRecei
                 let taken = owners.kv.metrics().sample();
                 drop(drains);
                 let _ = reply.send(taken);
+            }
+            ShardCommand::HoldForCheckpoint { engine, drained, release, reply } => {
+                if let Some(instance) = owners.instance(engine) {
+                    let hold = instance.hold_for_checkpoint().await;
+                    let _ = drained.send(());
+                    let _ = release.await;
+                    drop(hold);
+                    let _ = reply.send(());
+                }
+            }
+            ShardCommand::Persist { engine, reply } => {
+                let instance = owners.instance(engine).cloned();
+                compio::runtime::spawn(async move {
+                    let persisted = match instance {
+                        Some(instance) => instance.persist_all().await,
+                        None => Err(DomainError::Disabled(engine).into()),
+                    };
+                    let _ = reply.send(persisted);
+                })
+                .detach();
             }
             ShardCommand::WriteKv { domain, write, reply } => {
                 let registry = Arc::clone(&owners.kv);
@@ -523,8 +566,8 @@ impl ControlPlane {
             .with_context(|| format!("the {} engine is disabled", engine.as_str()))?
             .wal_head_lsn()
             .await?;
-        let reads = self
-            .held_round(|drained, register, reply| ShardCommand::Confirm { engine, drained, register, reply })
+        let (_, reads) = self
+            .held_round(|drained, register, reply| ShardCommand::Confirm { engine, drained, register, reply }, async {})
             .await?;
         // The pins go only now: the read snapshots protect the versions from here.
         drop(pins);
@@ -538,8 +581,8 @@ impl ControlPlane {
     /// one. Reads count as they come. Waits for at most one group commit per
     /// shard.
     pub async fn sample_metrics(&self) -> anyhow::Result<MetricsSample> {
-        let samples =
-            self.held_round(|drained, sample, reply| ShardCommand::Sample { drained, sample, reply }).await?;
+        let (_, samples) =
+            self.held_round(|drained, sample, reply| ShardCommand::Sample { drained, sample, reply }, async {}).await?;
         samples
             .into_iter()
             .reduce(|mut all, sample| {
@@ -549,14 +592,39 @@ impl ControlPlane {
             .context("no data shard runs")
     }
 
+    /// Cuts `engine`'s write-ahead log `wal` back to the records after a mark
+    /// taken while every data shard holds the engine's writes back and has
+    /// counted a checkpoint, once every shard has persisted its instance. A
+    /// shard that fails or does not answer leaves the log whole.
+    pub async fn checkpoint(&self, engine: Engine, wal: &crate::core::wal::WriteAheadLog) -> anyhow::Result<()> {
+        let (mark, _) = self
+            .held_round(
+                |drained, release, reply| ShardCommand::HoldForCheckpoint { engine, drained, release, reply },
+                wal.mark(),
+            )
+            .await?;
+        let mark = mark?;
+        let persisted = futures::future::join_all(
+            self.shards.iter().map(|shard| shard.request(|reply| ShardCommand::Persist { engine, reply })),
+        )
+        .await;
+        for (k, persisted) in persisted.into_iter().enumerate() {
+            persisted
+                .and_then(|persisted| persisted)
+                .with_context(|| format!("shard {k} could not persist the {} engine", engine.as_str()))?;
+        }
+        Ok(wal.cut_before(&mark).await?)
+    }
+
     /// Sends every data shard the command `make` builds from its three
-    /// channels, waits until all of them hold their writes back, then lets
-    /// them go on and returns their answers, by shard index. Rounds run one
-    /// after the other.
-    async fn held_round<T>(
+    /// channels, waits until all of them hold their writes back, runs
+    /// `while_held`, then lets them go on and returns its output and their
+    /// answers, by shard index. Rounds run one after the other.
+    async fn held_round<T, R>(
         &self,
         make: impl Fn(oneshot::Sender<()>, oneshot::Receiver<()>, oneshot::Sender<T>) -> ShardCommand,
-    ) -> anyhow::Result<Vec<T>> {
+        while_held: impl std::future::Future<Output = R>,
+    ) -> anyhow::Result<(R, Vec<T>)> {
         let _round = self.rounds.lock().await;
         let mut drained = Vec::with_capacity(self.shards.len());
         let mut releases = Vec::with_capacity(self.shards.len());
@@ -574,10 +642,12 @@ impl ControlPlane {
             answers.push(answer);
         }
         futures::future::try_join_all(drained).await.context("a data shard did not hold its writes back")?;
+        let held = while_held.await;
         for release in releases {
             let _ = release.send(());
         }
-        futures::future::try_join_all(answers).await.context("a data shard did not answer")
+        let answers = futures::future::try_join_all(answers).await.context("a data shard did not answer")?;
+        Ok((held, answers))
     }
 
     /// The engines of every data shard, by shard index.
@@ -882,6 +952,13 @@ pub(crate) mod testing {
         Arc::new(DomainRegistry::recover(engine, config, metrics).await.unwrap())
     }
 
+    /// The files of the key-value shards of [`kv_shards`] under `dir`, laid
+    /// out as the server lays them out.
+    pub(crate) fn kv_shard_files(dir: &Path) -> crate::server::recovery::EngineFiles {
+        let base = dir.join("kv-shards");
+        crate::server::recovery::EngineFiles { wal: dir.join("kv.wal"), vlog: base.join("vlog"), sstables: base }
+    }
+
     /// `n` data shards' key-value engines writing one log through `hub`,
     /// `tune` applied to engine `k` before it is shared; only the shard that
     /// owns the default domain creates it.
@@ -891,18 +968,14 @@ pub(crate) mod testing {
         n: u16,
         mut tune: impl FnMut(usize, &mut LsmStorageEngine),
     ) -> Vec<ShardOwners> {
-        use crate::engines::lsm::engine::{LsmEngineOptions, Recovery};
+        use crate::engines::lsm::engine::LsmEngineOptions;
+        let files = kv_shard_files(dir);
         let mut shards = Vec::new();
         for k in 0..usize::from(n) {
-            let at = dir.join(format!("kv-{k}"));
-            let fm = Arc::new(crate::storage::file_manager::FileManager::new(&at).await.unwrap());
-            let mm = Arc::new(crate::storage::manifest::ManifestManager::new(&at));
-            let vlog_path = at.join("vlog");
-            let vlog = Arc::new(crate::storage::vlog::VLog::new(&vlog_path).await.unwrap());
             let wal = Arc::new(hub.wal(crate::core::storage_thread::WalTarget::Kv));
-            let options = LsmEngineOptions { recovery: Recovery::External, ..LsmEngineOptions::default() };
-            let mut engine =
-                LsmStorageEngine::new(wal, dir.join("kv.wal"), vlog, vlog_path, fm, mm, options).await.unwrap();
+            let mut engine = crate::server::recovery::open_instance(&files, k, wal, LsmEngineOptions::default())
+                .await
+                .unwrap();
             tune(k, &mut engine);
             let owns_default = usize::from(slots::shard_of_domain("default", n)) == k;
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
@@ -919,8 +992,10 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
     use crate::auth::{hash_api_key, UserRole};
+    use crate::control::checkpoint::Report;
     use crate::core::events::GlobalEvent;
     use crate::engines::lsm::domain::DomainPurger;
+    use crate::engines::lsm::reader::GetResult;
     use crate::engines::StorageEngine;
     use serde_json::json;
     use std::time::Duration;
@@ -1402,7 +1477,9 @@ mod tests {
     /// `Confirm` back while `hold_confirms` of that shard is set, and keeps
     /// its `Sample`s back while `hold_samples` is set, to pass them on in
     /// reverse order once it is cleared; likewise its `Ping`s while
-    /// `hold_pings` is set, in order.
+    /// `hold_pings` is set, in order. It holds a `Persist` back while
+    /// `hold_persists` is set and drops it unanswered while `drop_persists`
+    /// is set.
     struct TwoShards {
         control: Arc<ControlPlane>,
         engines: Vec<Arc<LsmStorageEngine>>,
@@ -1411,8 +1488,10 @@ mod tests {
         hold_confirms: Vec<tokio::sync::watch::Sender<bool>>,
         hold_samples: Vec<tokio::sync::watch::Sender<bool>>,
         hold_pings: Vec<tokio::sync::watch::Sender<bool>>,
-        _hub: crate::core::storage_thread::TestHub,
-        _dir: tempfile::TempDir,
+        hold_persists: Vec<tokio::sync::watch::Sender<bool>>,
+        drop_persists: Vec<tokio::sync::watch::Sender<bool>>,
+        hub: crate::core::storage_thread::TestHub,
+        dir: tempfile::TempDir,
     }
 
     /// The name of a shard command, as [`TwoShards`] records it.
@@ -1423,6 +1502,8 @@ mod tests {
             ShardCommand::Pin { .. } => "pin",
             ShardCommand::Confirm { .. } => "confirm",
             ShardCommand::Sample { .. } => "sample",
+            ShardCommand::HoldForCheckpoint { .. } => "hold",
+            ShardCommand::Persist { .. } => "persist",
             ShardCommand::WriteKv { .. } => "write",
             ShardCommand::Ping { .. } => "ping",
             ShardCommand::Drain { .. } => "drain",
@@ -1443,6 +1524,8 @@ mod tests {
             let mut hold_confirms = Vec::new();
             let mut hold_samples = Vec::new();
             let mut hold_pings = Vec::new();
+            let mut hold_persists = Vec::new();
+            let mut drop_persists = Vec::new();
             let mut shards = Vec::new();
             for (k, owners) in owners.into_iter().enumerate() {
                 let (to_shard, inbox) = mpsc::unbounded_channel();
@@ -1453,6 +1536,10 @@ mod tests {
                 hold_samples.push(hold);
                 let (hold, mut pings_held) = tokio::sync::watch::channel(false);
                 hold_pings.push(hold);
+                let (hold, mut persists_held) = tokio::sync::watch::channel(false);
+                hold_persists.push(hold);
+                let (dropping, persists_dropped) = tokio::sync::watch::channel(false);
+                drop_persists.push(dropping);
                 let (relay, mut relayed) = mpsc::unbounded_channel::<ShardCommand>();
                 let log = Arc::clone(&commands);
                 compio::runtime::spawn(async move {
@@ -1467,7 +1554,12 @@ mod tests {
                                 if name == "confirm" {
                                     let _ = held.wait_for(|held| !held).await;
                                 }
-                                if name == "sample" && *samples_held.borrow() {
+                                if name == "persist" {
+                                    let _ = persists_held.wait_for(|held| !held).await;
+                                }
+                                if name == "persist" && *persists_dropped.borrow() {
+                                    drop(command);
+                                } else if name == "sample" && *samples_held.borrow() {
                                     kept.push(command);
                                 } else if name == "ping" && *pings_held.borrow() {
                                     kept_pings.push(command);
@@ -1505,9 +1597,38 @@ mod tests {
                 hold_confirms,
                 hold_samples,
                 hold_pings,
-                _hub: hub,
-                _dir: dir,
+                hold_persists,
+                drop_persists,
+                hub,
+                dir,
             }
+        }
+
+        fn wal_path(&self) -> std::path::PathBuf {
+            self.dir.path().join("kv.wal")
+        }
+
+        /// Checkpoint ticks over the key-value log at `limit` bytes.
+        fn checkpoints(&self, limit: u64) -> Arc<checkpoint::WalCheckpoint> {
+            let wal = self.hub.wal(crate::core::storage_thread::WalTarget::Kv);
+            let logs = vec![(checkpoint::Holder::Shards(Engine::Kv), wal)];
+            Arc::new(checkpoint::WalCheckpoint::new(Arc::clone(&self.control), logs).with_limit(limit))
+        }
+
+        /// Drops everything without a flush or a cut, as a crash does, and
+        /// recovers both shards' instances from the files left behind, on a
+        /// new hub.
+        async fn crash(self) -> (Vec<Arc<LsmStorageEngine>>, crate::core::storage_thread::TestHub, tempfile::TempDir) {
+            use crate::core::storage_thread::{TestHub, WalTarget};
+            let dir = self.dir;
+            drop(self.hub);
+            let hub = TestHub::start(&[(WalTarget::Kv, &dir.path().join("kv.wal"))]);
+            let files = testing::kv_shard_files(dir.path());
+            let options = crate::engines::lsm::engine::LsmEngineOptions::default;
+            let engines = crate::server::recovery::open_sharded(&files, 2, || hub.wal(WalTarget::Kv), options)
+                .await
+                .unwrap();
+            (engines, hub, dir)
         }
 
         fn state(&self, name: &str) -> Option<Lifecycle> {
@@ -1903,6 +2024,285 @@ mod tests {
             hold(false);
             // Upper bound against hanging only.
             assert_eq!(s.control.ping_shards(|_| Duration::from_secs(30)).await, [true, true]);
+        })
+    }
+
+    /// The key `key` of the domain `domain`, as the domain layer writes it.
+    fn data_key(domain: &str, key: &str) -> Vec<u8> {
+        format!("d:{:016x}:{key}", crate::engines::lsm::domain::fnv64(domain.as_bytes())).into_bytes()
+    }
+
+    /// A domain of each of the two shards.
+    fn two_domains() -> [String; 2] {
+        [0, 1].map(|k| slots::domain_name_for_shard(k, 2, 5))
+    }
+
+    /// What a read of each key returns on the instance of its shard.
+    async fn reads(engines: &[Arc<LsmStorageEngine>], keys: &[(usize, Vec<u8>)]) -> Vec<(GetResult, u64, u64)> {
+        let mut reads = Vec::with_capacity(keys.len());
+        for (k, key) in keys {
+            reads.push(engines[*k].get_latest_with_stamp(key).await.unwrap());
+        }
+        reads
+    }
+
+    /// Waits until shard `k` got its `count`-th `Persist`.
+    async fn until_persists(s: &TwoShards, k: usize, count: usize) {
+        let wait = async {
+            while s.commands_of(k).iter().filter(|name| **name == "persist").count() < count {
+                tokio::task::yield_now().await;
+            }
+        };
+        // Upper bound against hanging only.
+        compio::time::timeout(Duration::from_secs(30), wait).await.expect("no persist reaches the shard");
+    }
+
+    const LARGE: &str = "clé ✓ value stored in the value log ";
+
+    // Writes of every kind on both shards, far past four times the limit,
+    // a tick each time the log reaches it: each tick leaves the log below the
+    // limit with only records after its mark, a write while a shard persists
+    // stays in the log, and after a crash every confirmed write is there with
+    // its value and stamp and every deleted one is gone.
+    #[test]
+    fn a_crash_after_writes_past_the_limit_keeps_every_confirmed_write() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::engines::lsm::engine::BatchOp;
+            const LIMIT: u64 = 4096;
+            let s = TwoShards::new(|_, _| {}).await;
+            let checkpoints = s.checkpoints(LIMIT);
+            let wal_len = || std::fs::metadata(s.wal_path()).unwrap().len();
+            let domains = two_domains();
+            let large = LARGE.repeat(40);
+            let (mut keys, mut deleted, mut ticks, mut round) = (Vec::new(), Vec::new(), 0, 0);
+            while ticks < 4 {
+                for (k, engine) in s.engines.iter().enumerate() {
+                    let key = |name: &str| data_key(&domains[k], &format!("{name}-{round}"));
+                    engine.put(&key("small"), "clé".as_bytes()).await.unwrap();
+                    engine.put(&key("large"), large.as_bytes()).await.unwrap();
+                    engine.set_null(&key("nulled")).await.unwrap();
+                    engine.put(&key("gone"), b"v").await.unwrap();
+                    engine.delete(&key("gone")).await.unwrap();
+                    let batch = vec![
+                        BatchOp::Put { key: key("batch"), value: b"1".to_vec() },
+                        BatchOp::Delete { key: key("small") },
+                    ];
+                    engine.write_batch(batch).await.unwrap();
+                    keys.extend(["large", "nulled", "batch"].map(|name| (k, key(name))));
+                    deleted.extend(["small", "gone"].map(|name| (k, key(name))));
+                    if wal_len() >= LIMIT {
+                        let head = engine.wal_head_lsn().await.unwrap();
+                        assert_eq!(checkpoints.run().await, []);
+                        ticks += 1;
+                        assert!(wal_len() < LIMIT);
+                        let recovered = crate::core::wal::recover(s.wal_path()).await.unwrap();
+                        assert!(recovered.entries.iter().all(|(lsn, _)| *lsn > head));
+                    }
+                }
+                round += 1;
+            }
+
+            s.hold_persists[1].send_replace(true);
+            let head = s.engines[1].wal_head_lsn().await.unwrap();
+            let tick = compio::runtime::spawn({
+                let checkpoints = s.checkpoints(1);
+                async move { checkpoints.run().await }
+            });
+            until_persists(&s, 1, ticks + 1).await;
+            let during = data_key(&domains[1], "during");
+            s.engines[1].put(&during, b"v").await.unwrap();
+            keys.push((1, during.clone()));
+            s.hold_persists[1].send_replace(false);
+            assert_eq!(tick.await.unwrap(), []);
+            let recovered = crate::core::wal::recover(s.wal_path()).await.unwrap();
+            assert_eq!(recovered.entries.len(), 1);
+            assert!(recovered.entries[0].0 > head);
+            assert_eq!(recovered.entries[0].1.key(), during);
+
+            let confirmed = reads(&s.engines, &keys).await;
+            let (engines, _hub, _dir) = s.crash().await;
+            assert_eq!(reads(&engines, &keys).await, confirmed);
+            for read in reads(&engines, &deleted).await {
+                assert_eq!(read.0, GetResult::Absent);
+            }
+        })
+    }
+
+    // A write whose value log append failed after its record went into the
+    // log is cut with the log by the next checkpoint: after a crash it is
+    // gone, and the confirmed writes are there.
+    #[test]
+    fn a_write_whose_value_failed_before_the_mark_is_gone_after_a_crash() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::new(|_, _| {}).await;
+            let [domain, _] = two_domains();
+            let (failed, kept) = (data_key(&domain, "failed"), data_key(&domain, "kept"));
+            let large = LARGE.repeat(40);
+            let engine = &s.engines[0];
+            let active = Arc::clone(&engine.version().active_vlog);
+            let full = Arc::new(crate::storage::vlog::VLog::new("/dev/full").await.unwrap());
+            engine.install(|v| v.with_active_vlog(full));
+            assert!(engine.put(&failed, large.as_bytes()).await.is_err());
+            engine.install(|v| v.with_active_vlog(active));
+            engine.put(&kept, large.as_bytes()).await.unwrap();
+            assert_eq!(s.checkpoints(1).run().await, []);
+
+            let (engines, _hub, _dir) = s.crash().await;
+            assert_eq!(engines[0].get(&failed).await.unwrap(), None);
+            assert_eq!(engines[0].get(&kept).await.unwrap(), Some(large.into_bytes()));
+        })
+    }
+
+    // Values before a checkpoint's mark that a value log cleanup moves
+    // afterwards are all there after a crash.
+    #[test]
+    fn values_moved_by_a_cleanup_after_a_checkpoint_survive_a_crash() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::new(|_, _| {}).await;
+            let [domain, _] = two_domains();
+            let keys: Vec<_> = (0..3).map(|i| (0, data_key(&domain, &format!("large-{i}")))).collect();
+            for (round, value) in ["old", "new"].iter().enumerate() {
+                for (_, key) in &keys[round..] {
+                    s.engines[0].put(key, format!("{value} {}", LARGE.repeat(40)).as_bytes()).await.unwrap();
+                }
+            }
+            assert_eq!(s.checkpoints(1).run().await, []);
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::WAL_MAGIC);
+            let config = crate::engines::lsm::janitor::JanitorConfig {
+                check_interval_secs: 3600,
+                dead_bytes_threshold: 0.0,
+                min_vlog_size_bytes: 0,
+            };
+            assert!(s.engines[0].build_janitor(config).run_gc().await.unwrap().ran);
+
+            let confirmed = reads(&s.engines, &keys).await;
+            let (engines, _hub, _dir) = s.crash().await;
+            assert_eq!(reads(&engines, &keys).await, confirmed);
+            assert!(confirmed.iter().all(|read| matches!(read.0, GetResult::Present(_))));
+        })
+    }
+
+    // A flush that fails on shard 1 fails the checkpoint: no cut, the log
+    // byte for byte. Once the flush works again, the next tick cuts it and
+    // reports that.
+    #[test]
+    fn a_failed_flush_on_one_shard_leaves_the_log_whole_until_the_next_tick() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::storage::test_fault;
+            let s = TwoShards::new(|_, _| {}).await;
+            let checkpoints = s.checkpoints(1);
+            for (k, domain) in two_domains().iter().enumerate() {
+                s.engines[k].put(&data_key(domain, "k"), b"v").await.unwrap();
+            }
+            let log = std::fs::read(s.wal_path()).unwrap();
+            let unwritable = testing::kv_shard_files(s.dir.path()).sstables.join("shard_1");
+            test_fault::fail_writes_in(&unwritable);
+            let reports = checkpoints.run().await;
+            test_fault::allow_writes_in(&unwritable);
+
+            assert!(
+                matches!(&reports[..], [Report::Stuck { log: "kv", bytes: Some(bytes), .. }] if *bytes == log.len() as u64),
+                "{reports:?}"
+            );
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), log);
+            assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 1 }]);
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::WAL_MAGIC);
+        })
+    }
+
+    // A new file the checkpoint cannot prepare beside the log fails the
+    // checkpoint before the hub hears of it: the log stays byte for byte,
+    // the next tick cuts it, and after a crash every write is there.
+    #[test]
+    fn a_failed_preparation_leaves_the_log_whole_until_the_next_tick() {
+        crate::core::engine_runtime::block_on(async {
+            let s = TwoShards::new(|_, _| {}).await;
+            let checkpoints = s.checkpoints(1);
+            let keys: Vec<_> = two_domains().iter().enumerate().map(|(k, domain)| (k, data_key(domain, "k"))).collect();
+            for (k, key) in &keys {
+                s.engines[*k].put(key, b"v").await.unwrap();
+            }
+            let log = std::fs::read(s.wal_path()).unwrap();
+            // The new file of the cut cannot be created where a directory is.
+            let mut blocked = std::fs::canonicalize(s.wal_path()).unwrap().into_os_string();
+            blocked.push(".tmp");
+            std::fs::create_dir(&blocked).unwrap();
+
+            let reports = checkpoints.run().await;
+            assert!(
+                matches!(&reports[..], [Report::Stuck { log: "kv", error, .. }] if error.contains("preparing")),
+                "{reports:?}"
+            );
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), log);
+            std::fs::remove_dir(&blocked).unwrap();
+
+            assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 1 }]);
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::WAL_MAGIC);
+
+            let (engines, _hub, _dir) = s.crash().await;
+            for (k, key) in &keys {
+                assert_eq!(engines[*k].get(key).await.unwrap(), Some(b"v".to_vec()));
+            }
+        })
+    }
+
+    // A log whose checkpoint fails tick after tick is reported on the first
+    // failure and once every 60 ticks: twice in 120 ticks; the first tick
+    // that succeeds reports that once.
+    #[test]
+    fn a_checkpoint_failing_120_times_is_reported_twice() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::storage::test_fault;
+            let s = TwoShards::new(|_, _| {}).await;
+            let checkpoints = s.checkpoints(1);
+            s.engines[1].put(&data_key(&two_domains()[1], "k"), b"v").await.unwrap();
+            let unwritable = testing::kv_shard_files(s.dir.path()).sstables.join("shard_1");
+            test_fault::fail_writes_in(&unwritable);
+            let mut reports = Vec::new();
+            for _ in 0..120 {
+                reports.extend(checkpoints.run().await);
+            }
+            test_fault::allow_writes_in(&unwritable);
+
+            assert_eq!(reports.len(), 2, "{reports:?}");
+            assert!(reports.iter().all(|report| matches!(report, Report::Stuck { log: "kv", .. })));
+            assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 120 }]);
+            assert_eq!(checkpoints.run().await, []);
+        })
+    }
+
+    // Every shard persists its instance before the log is cut; a shard that
+    // does not answer leaves the log uncut.
+    #[test]
+    fn a_checkpoint_cuts_the_log_only_after_every_shard_persisted() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::storage::test_trace;
+            let s = TwoShards::new(|_, _| {}).await;
+            let checkpoints = s.checkpoints(1);
+            let domains = two_domains();
+            for (k, domain) in domains.iter().enumerate() {
+                s.engines[k].put(&data_key(domain, "k"), b"v").await.unwrap();
+            }
+            test_trace::watch(s.dir.path());
+            assert_eq!(checkpoints.run().await, []);
+            let steps = test_trace::steps(s.dir.path());
+            assert_eq!(steps.last().map(String::as_str), Some("cut kv.wal"), "{steps:?}");
+            for k in 0..2 {
+                for step in [format!("save kv-shards/shard_{k}/MANIFEST"), format!("sync kv-shards/shard_{k}")] {
+                    assert!(steps.contains(&step), "{step} missing in {steps:?}");
+                }
+            }
+
+            s.drop_persists[1].send_replace(true);
+            for (k, domain) in domains.iter().enumerate() {
+                s.engines[k].put(&data_key(domain, "later"), b"v").await.unwrap();
+            }
+            let log = std::fs::read(s.wal_path()).unwrap();
+            test_trace::watch(s.dir.path());
+            let reports = checkpoints.run().await;
+            assert!(matches!(&reports[..], [Report::Stuck { log: "kv", .. }]), "{reports:?}");
+            assert_eq!(std::fs::read(s.wal_path()).unwrap(), log);
+            assert!(!test_trace::steps(s.dir.path()).iter().any(|step| step.starts_with("cut")));
         })
     }
 

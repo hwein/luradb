@@ -255,14 +255,6 @@ fn options(config: &LuraConfig, engine: Engine, memory: &MemorySplit) -> LsmEngi
     }
 }
 
-fn wal_target(engine: Engine) -> WalTarget {
-    match engine {
-        Engine::Kv => WalTarget::Kv,
-        Engine::Json => WalTarget::Json,
-        Engine::Rel => WalTarget::Rel,
-    }
-}
-
 /// Builds the new layout in the staging directory of every root, then makes
 /// it durable.
 async fn build(
@@ -281,7 +273,7 @@ async fn build(
     }
     let memory = MemorySplit::of(config, marker.shards);
     for (engine, files) in engines {
-        let wal = Arc::new(WriteAheadLog::with_storage_handle(hub.clone(), wal_target(*engine)));
+        let wal = Arc::new(WriteAheadLog::with_storage_handle(hub.clone(), (*engine).into()));
         copy(files, from, marker, &wal, || options(config, *engine, &memory))
             .await
             .with_context(|| format!("copy the {} engine", engine.as_str()))?;

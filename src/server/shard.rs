@@ -13,7 +13,7 @@ use crate::{
         buffer_pool::BufferPoolManager,
         disk_manager::DiskManager,
         engine_runtime,
-        io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID, WAL_LOGICAL_ID},
+        io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID},
     },
     engines::json::{domain as json_domain, JsonEngine},
     engines::lsm::{
@@ -161,7 +161,7 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
     storage.buffer_pool = Some(Arc::new(BufferPoolManager::new(*buffer_pool_pages, disk_manager)));
     if shard == 0 && shards == 1 {
         let vlog_path = layout::shard_file(Path::new(&config.storage.vlog_path), 0);
-        storage.io_engine = init_io_engine(config, Path::new(&config.storage.wal_path), &vlog_path).await;
+        storage.io_engine = init_io_engine(config, &vlog_path).await;
         if let Some(io_engine) = storage.io_engine.as_mut() {
             kv.register_sstables_with_io_engine(io_engine).await?;
         }
@@ -217,8 +217,10 @@ async fn close(storage: &Storage) -> Vec<(Engine, anyhow::Result<()>)> {
     flushed
 }
 
-/// The registered buffers, with the WAL and the value log registered.
-async fn init_io_engine(cfg: &LuraConfig, wal_path: &Path, vlog_path: &Path) -> Option<IoEngine> {
+/// The registered buffers, with the value log registered. The write-ahead
+/// log is not: the storage hub writes it, and a descriptor here would keep
+/// the file a checkpoint replaced on disk.
+async fn init_io_engine(cfg: &LuraConfig, vlog_path: &Path) -> Option<IoEngine> {
     if !cfg.io_engine.enabled {
         return None;
     }
@@ -229,11 +231,7 @@ async fn init_io_engine(cfg: &LuraConfig, wal_path: &Path, vlog_path: &Path) -> 
             return None;
         }
     };
-    let registered = match engine.register_file(WAL_LOGICAL_ID, wal_path).await {
-        Ok(()) => engine.register_file(VLOG_LOGICAL_ID, vlog_path).await,
-        err => err,
-    };
-    match registered {
+    match engine.register_file(VLOG_LOGICAL_ID, vlog_path).await {
         Ok(()) => {
             tracing::info!(
                 "IoEngine ready: {REGISTERED_BUFFER_COUNT} registered buffers x {REGISTERED_BUFFER_SIZE} bytes."
@@ -242,7 +240,7 @@ async fn init_io_engine(cfg: &LuraConfig, wal_path: &Path, vlog_path: &Path) -> 
         }
         Err(e) => {
             tracing::warn!(
-                "IoEngine disabled: WAL/VLog registration failed: {e}. Continuing without registered buffers."
+                "IoEngine disabled: value log registration failed: {e}. Continuing without registered buffers."
             );
             None
         }

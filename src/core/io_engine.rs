@@ -26,10 +26,9 @@ use std::rc::Rc;
 pub const REGISTERED_BUFFER_COUNT: usize = 128;
 pub const REGISTERED_BUFFER_SIZE: usize = 64 * 1024;
 
-/// SSTable ids are allocated upwards from 0 (`FileManager`), so the WAL and
-/// VLog get reserved ids at the top of the range — one shared namespace,
-/// no collisions.
-pub const WAL_LOGICAL_ID: u64 = u64::MAX;
+/// SSTable ids are allocated upwards from 0 (`FileManager`), so the VLog
+/// gets a reserved id at the top of the range — one shared namespace, no
+/// collisions.
 pub const VLOG_LOGICAL_ID: u64 = u64::MAX - 1;
 
 /// Maps a logical file id to an open file handle.
@@ -99,7 +98,7 @@ impl IoEngine {
     }
 
     /// Opens and tracks the file at `path` under `logical_id` (SSTables:
-    /// their file id; WAL/VLog: [`WAL_LOGICAL_ID`]/[`VLOG_LOGICAL_ID`]).
+    /// their file id; VLog: [`VLOG_LOGICAL_ID`]).
     pub async fn register_file(&mut self, logical_id: u64, path: &Path) -> Result<()> {
         self.file_handles.register_file(logical_id, path).await
     }

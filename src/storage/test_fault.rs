@@ -1,6 +1,7 @@
 //! Directories in which file creation fails, as in a read-only directory but
-//! for any user, root included, files and directories whose sync fails, and
-//! the stops failed syncs caused: tests share the process.
+//! for any user, root included, single files whose creation fails, files and
+//! directories whose sync fails, and the stops failed syncs caused: tests
+//! share the process.
 
 use std::collections::HashSet;
 use std::io;
@@ -20,15 +21,28 @@ pub(crate) fn allow_writes_in(dir: &Path) {
     dirs().lock().unwrap().remove(dir);
 }
 
-/// Fails for a file directly in a registered directory; its subdirectories
-/// stay writable, as with a read-only one.
+fn unwritable() -> &'static Mutex<HashSet<PathBuf>> {
+    static PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(Default::default)
+}
+
+/// Creating the file `path` fails until [`allow_writes_of`].
+pub(crate) fn fail_writes_of(path: &Path) {
+    unwritable().lock().unwrap().insert(path.to_path_buf());
+}
+
+pub(crate) fn allow_writes_of(path: &Path) {
+    unwritable().lock().unwrap().remove(path);
+}
+
+/// Fails for a registered file and for a file directly in a registered
+/// directory; its subdirectories stay writable, as with a read-only one.
 pub(crate) fn check(path: &Path) -> io::Result<()> {
-    match path.parent() {
-        Some(dir) if dirs().lock().unwrap().contains(dir) => {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("test fault: {}", path.display())))
-        }
-        _ => Ok(()),
+    let in_dir = path.parent().is_some_and(|dir| dirs().lock().unwrap().contains(dir));
+    if in_dir || unwritable().lock().unwrap().contains(path) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("test fault: {}", path.display())));
     }
+    Ok(())
 }
 
 fn unsyncable() -> &'static Mutex<HashSet<PathBuf>> {

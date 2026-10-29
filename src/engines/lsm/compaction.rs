@@ -26,10 +26,11 @@
 //! - **L2+**: triggers when total size exceeds `l1_max_size * level_size_ratio^(n-1)`.
 
 use crate::engines::lsm::key::{InternalKey, Timestamp};
-use crate::storage::sstable::{SSTableBuilder, SSTableReader};
+use crate::storage::sstable::{SSTableBuilder, SSTableIterator, SSTableReader};
 use crate::storage::format::{is_expired, DataBlockValue, ValuePointer, TOMBSTONE_OFFSET};
 use crate::storage::manifest::{Manifest, SSTableMetadata};
 use anyhow::Result;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 /// Configuration for the leveled compaction strategy.
@@ -95,32 +96,27 @@ impl CompactionJob {
         Self { source_sstables, target_sstables, config }
     }
 
-    /// Runs the compaction job and returns the raw bytes of the new SSTables.
+    /// Starts the compaction; [`CompactionRun::next_sstable`] builds its
+    /// output files one at a time.
     ///
     /// Tables enter the merge newest first, in the read path's order: the
     /// sources reversed, then the targets, which sit one level below and are
     /// older than every source. Of identical internal keys (a stamp tie) only
     /// the newest source's entry is kept, the one reads see.
-    pub fn compact(&self) -> Result<Vec<Vec<u8>>> {
-        let mut all_entries: Vec<(Vec<u8>, DataBlockValue)> = Vec::new();
-
-        for sstable in self.source_sstables.iter().rev().chain(&self.target_sstables) {
-            for entry in sstable.iter() {
-                let (key, dbv) = entry?;
-                all_entries.push((key.to_vec(), dbv));
-            }
-        }
-
-        // Sort by InternalKey encoding: same user key → newest version first;
-        // stable, so identical keys keep the table order above.
-        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
-        all_entries.dedup_by(|later, first| later.0 == first.0);
-
-        let filtered = self.filter_entries(all_entries)?;
-        self.build_sstables(filtered)
+    pub fn compact(&self) -> Result<CompactionRun<'_>> {
+        let tables = self.source_sstables.iter().rev().chain(&self.target_sstables);
+        Ok(CompactionRun {
+            job: self,
+            merge: Merge::new(tables.map(|table| table.iter()).collect())?,
+            group: GroupFilter::default(),
+            next_entry: None,
+            #[cfg(test)]
+            peak_held_entries: 0,
+        })
     }
 
-    /// Filters the merged, sorted entry stream (newest version first per key).
+    /// Filters the merged entry stream (newest version first per key) one
+    /// entry at a time; `group` holds the state of the current user key.
     ///
     /// Per user-key group:
     /// 1. **Version deduplication**: keep versions down to and including the
@@ -130,40 +126,27 @@ impl CompactionJob {
     ///    active snapshots) and the job is bottommost; otherwise retain.
     /// 3. **TTL**: expired values are dropped only by a bottommost job and only
     ///    while no older version of the key survives them.
-    fn filter_entries(
+    fn filter_entry(
         &self,
-        entries: Vec<(Vec<u8>, DataBlockValue)>,
-    ) -> Result<Vec<(Vec<u8>, DataBlockValue)>> {
-        let mut result = Vec::new();
-        let mut last_user_key: Option<Vec<u8>> = None;
-        let mut group_done = false;
+        group: &mut GroupFilter,
+        encoded_key: Vec<u8>,
+        dbv: DataBlockValue,
+    ) -> Option<(Vec<u8>, DataBlockValue)> {
+        let user_key = InternalKey::extract_user_key(&encoded_key)?;
+        let timestamp = InternalKey::extract_timestamp(&encoded_key)?;
 
-        for (encoded_key, dbv) in entries {
-            let Some(user_key) = InternalKey::extract_user_key(&encoded_key) else {
-                continue;
-            };
-            let Some(timestamp) = InternalKey::extract_timestamp(&encoded_key) else {
-                continue;
-            };
-
-            let new_key = last_user_key.as_deref() != Some(user_key);
-            if new_key {
-                last_user_key = Some(user_key.to_vec());
-                group_done = false;
-            }
-
-            if group_done {
-                continue;
-            }
-
-            let oldest_kept = self.shadows_older_versions(timestamp);
-            if let Some(kept) = self.retain_version(encoded_key, dbv, timestamp, oldest_kept) {
-                result.push(kept);
-            }
-            group_done = oldest_kept;
+        if group.user_key.as_deref() != Some(user_key) {
+            group.user_key = Some(user_key.to_vec());
+            group.done = false;
         }
 
-        Ok(result)
+        if group.done {
+            return None;
+        }
+
+        let oldest_kept = self.shadows_older_versions(timestamp);
+        group.done = oldest_kept;
+        self.retain_version(encoded_key, dbv, timestamp, oldest_kept)
     }
 
     /// Whether a version at `timestamp` hides every older version of its key
@@ -233,50 +216,168 @@ impl CompactionJob {
         // Live, non-expired value: keep it.
         Some((encoded_key, dbv))
     }
+}
 
-    /// Serialises filtered entries into one or more SSTable byte buffers.
+/// A running compaction: merges and filters its inputs as a stream and holds
+/// at most one output file in memory.
+pub struct CompactionRun<'a> {
+    job: &'a CompactionJob,
+    merge: Merge<'a>,
+    group: GroupFilter,
+    /// The entry that opens the next file, read while closing the last one.
+    next_entry: Option<(Vec<u8>, DataBlockValue)>,
+    #[cfg(test)]
+    peak_held_entries: usize,
+}
+
+impl CompactionRun<'_> {
+    /// Builds the next output SSTable, `None` once the inputs are exhausted.
     ///
     /// A file is only cut behind the last version of a user key: the read path
     /// treats the tables of a level as key-disjoint and would otherwise pick an
     /// older version from a sibling file.
-    fn build_sstables(&self, entries: Vec<(Vec<u8>, DataBlockValue)>) -> Result<Vec<Vec<u8>>> {
-        let max_sstable_size = self.config.max_sstable_size;
-
-        let mut sstables: Vec<Vec<u8>> = Vec::new();
+    pub fn next_sstable(&mut self) -> Result<Option<Vec<u8>>> {
         let mut builder = SSTableBuilder::new();
         let mut current_size: usize = 0;
+        let mut last_user_key: Vec<u8> = Vec::new();
+        #[cfg(test)]
+        let mut entries_in_file = 0;
 
-        let mut entries = entries.into_iter().peekable();
-        while let Some((key, dbv)) = entries.next() {
-            let entry_size = match &dbv {
+        while let Some((key, dbv)) = self.next_filtered()? {
+            #[cfg(test)]
+            {
+                let held = entries_in_file + 1 + self.merge.heads.len();
+                self.peak_held_entries = self.peak_held_entries.max(held);
+            }
+
+            let user_key = InternalKey::extract_user_key(&key).unwrap_or_default();
+            let full = current_size > 0 && current_size >= self.job.config.max_sstable_size;
+            if full && user_key != last_user_key {
+                self.next_entry = Some((key, dbv));
+                return Ok(Some(builder.finish()?));
+            }
+            last_user_key.clear();
+            last_user_key.extend_from_slice(user_key);
+
+            current_size += key.len() + match &dbv {
                 DataBlockValue::Pointer(_) => std::mem::size_of::<ValuePointer>(),
                 DataBlockValue::Inline { data, .. } => data.len() + 8,
             };
-            current_size += key.len() + entry_size;
-
-            let group_ends = entries.peek().is_none_or(|(next_key, _)| {
-                InternalKey::extract_user_key(next_key) != InternalKey::extract_user_key(&key)
-            });
-
             match dbv {
                 DataBlockValue::Pointer(vp) => builder.add(key, vp),
-                DataBlockValue::Inline { data, expire_at } => {
-                    builder.add_inline(key, data, expire_at)
-                }
+                DataBlockValue::Inline { data, expire_at } => builder.add_inline(key, data, expire_at),
             }
-
-            if group_ends && current_size >= max_sstable_size {
-                sstables.push(builder.finish()?);
-                builder = SSTableBuilder::new();
-                current_size = 0;
+            #[cfg(test)]
+            {
+                entries_in_file += 1;
             }
         }
 
         if current_size > 0 {
-            sstables.push(builder.finish()?);
+            return Ok(Some(builder.finish()?));
         }
+        Ok(None)
+    }
 
-        Ok(sstables)
+    fn next_filtered(&mut self) -> Result<Option<(Vec<u8>, DataBlockValue)>> {
+        if let Some(entry) = self.next_entry.take() {
+            return Ok(Some(entry));
+        }
+        while let Some((key, dbv)) = self.merge.next()? {
+            if let Some(kept) = self.job.filter_entry(&mut self.group, key, dbv) {
+                return Ok(Some(kept));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Most entries the run held at once: those of the file it was building,
+    /// the one in hand and the waiting heads of its inputs.
+    #[cfg(test)]
+    pub(crate) fn peak_held_entries(&self) -> usize {
+        self.peak_held_entries
+    }
+}
+
+/// State of the user-key group the filter is in.
+#[derive(Default)]
+struct GroupFilter {
+    user_key: Option<Vec<u8>>,
+    done: bool,
+}
+
+/// The first unread entry of one input table.
+struct Head {
+    key: Vec<u8>,
+    table: usize,
+    value: DataBlockValue,
+}
+
+/// Reversed for the max-heap: the smallest internal key comes first, and of
+/// identical keys the one of the table that entered the merge first.
+impl Ord for Head {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&other.key, other.table).cmp(&(&self.key, self.table))
+    }
+}
+
+impl PartialOrd for Head {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Head {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Head {}
+
+/// k-way merge of the input tables in internal key order; of identical
+/// internal keys only the first is yielded.
+struct Merge<'a> {
+    tables: Vec<SSTableIterator<'a>>,
+    heads: BinaryHeap<Head>,
+    /// Table whose head was yielded last; it is read on only at the next
+    /// call, so no more than one entry per table waits at any time.
+    yielded: Option<usize>,
+    last_key: Option<Vec<u8>>,
+}
+
+impl<'a> Merge<'a> {
+    fn new(tables: Vec<SSTableIterator<'a>>) -> Result<Self> {
+        let mut merge = Self { tables, heads: BinaryHeap::new(), yielded: None, last_key: None };
+        for table in 0..merge.tables.len() {
+            merge.read_head(table)?;
+        }
+        Ok(merge)
+    }
+
+    fn read_head(&mut self, table: usize) -> Result<()> {
+        if let Some(entry) = self.tables[table].next() {
+            let (key, value) = entry?;
+            self.heads.push(Head { key: key.to_vec(), table, value });
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<(Vec<u8>, DataBlockValue)>> {
+        loop {
+            if let Some(table) = self.yielded.take() {
+                self.read_head(table)?;
+            }
+            let Some(head) = self.heads.pop() else {
+                return Ok(None);
+            };
+            self.yielded = Some(head.table);
+            if self.last_key.as_ref() == Some(&head.key) {
+                continue;
+            }
+            self.last_key = Some(head.key.clone());
+            return Ok(Some((head.key, head.value)));
+        }
     }
 }
 
@@ -370,8 +471,22 @@ pub fn select_sstables_for_level_compaction(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    impl CompactionJob {
+        /// The filter over a whole entry list, newest version first per key.
+        fn filter_entries(
+            &self,
+            entries: Vec<(Vec<u8>, DataBlockValue)>,
+        ) -> Result<Vec<(Vec<u8>, DataBlockValue)>> {
+            let mut group = GroupFilter::default();
+            Ok(entries
+                .into_iter()
+                .filter_map(|(key, dbv)| self.filter_entry(&mut group, key, dbv))
+                .collect())
+        }
+    }
 
     fn make_vp(offset: u64) -> DataBlockValue {
         DataBlockValue::Pointer(ValuePointer {
@@ -780,6 +895,356 @@ mod tests {
             DataBlockValue::Inline { data, .. } => assert_eq!(data, b"v1"),
             _ => panic!("Expected Inline variant"),
         }
+        Ok(())
+    }
+
+    fn inline(data: &[u8]) -> DataBlockValue {
+        DataBlockValue::Inline { data: data.to_vec(), expire_at: 0 }
+    }
+
+    /// An in-memory SSTable of `entries`, given in any order.
+    fn table(mut entries: Vec<(Vec<u8>, DataBlockValue)>) -> Arc<SSTableReader> {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut builder = SSTableBuilder::new();
+        for (key, value) in entries {
+            match value {
+                DataBlockValue::Pointer(vp) => builder.add(key, vp),
+                DataBlockValue::Inline { data, expire_at } => builder.add_inline(key, data, expire_at),
+            }
+        }
+        Arc::new(SSTableReader::open(builder.finish().unwrap()).unwrap())
+    }
+
+    /// Every output file of `job`, built one at a time.
+    fn outputs(job: &CompactionJob) -> Result<Vec<Vec<u8>>> {
+        let mut run = job.compact()?;
+        let mut files = Vec::new();
+        while let Some(file) = run.next_sstable()? {
+            files.push(file);
+        }
+        Ok(files)
+    }
+
+    /// The entries of `files` in order, each as user key, stamp and value.
+    fn contents(files: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, u64, DataBlockValue)>> {
+        let mut entries = Vec::new();
+        for file in files {
+            let reader = SSTableReader::open(file.clone())?;
+            for entry in reader.iter() {
+                let (key, value) = entry?;
+                let user_key = InternalKey::extract_user_key(key).unwrap().to_vec();
+                let timestamp = InternalKey::extract_timestamp(key).unwrap().as_u64();
+                entries.push((user_key, timestamp, value));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// The compaction as it ran before it streamed: every entry in memory,
+    /// sorted, deduplicated, filtered and cut into files. The streaming
+    /// merge must produce the same bytes.
+    pub(crate) fn compact_in_memory(job: &CompactionJob) -> Result<Vec<Vec<u8>>> {
+        let mut all_entries: Vec<(Vec<u8>, DataBlockValue)> = Vec::new();
+        for sstable in job.source_sstables.iter().rev().chain(&job.target_sstables) {
+            for entry in sstable.iter() {
+                let (key, dbv) = entry?;
+                all_entries.push((key.to_vec(), dbv));
+            }
+        }
+        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        all_entries.dedup_by(|later, first| later.0 == first.0);
+
+        let mut filtered = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+        let mut group_done = false;
+        for (encoded_key, dbv) in all_entries {
+            let Some(user_key) = InternalKey::extract_user_key(&encoded_key) else {
+                continue;
+            };
+            let Some(timestamp) = InternalKey::extract_timestamp(&encoded_key) else {
+                continue;
+            };
+            if last_user_key.as_deref() != Some(user_key) {
+                last_user_key = Some(user_key.to_vec());
+                group_done = false;
+            }
+            if group_done {
+                continue;
+            }
+            let oldest_kept = job.shadows_older_versions(timestamp);
+            if let Some(kept) = job.retain_version(encoded_key, dbv, timestamp, oldest_kept) {
+                filtered.push(kept);
+            }
+            group_done = oldest_kept;
+        }
+
+        let mut sstables = Vec::new();
+        let mut builder = SSTableBuilder::new();
+        let mut current_size: usize = 0;
+        let mut entries = filtered.into_iter().peekable();
+        while let Some((key, dbv)) = entries.next() {
+            let entry_size = match &dbv {
+                DataBlockValue::Pointer(_) => std::mem::size_of::<ValuePointer>(),
+                DataBlockValue::Inline { data, .. } => data.len() + 8,
+            };
+            current_size += key.len() + entry_size;
+            let group_ends = entries.peek().is_none_or(|(next_key, _)| {
+                InternalKey::extract_user_key(next_key) != InternalKey::extract_user_key(&key)
+            });
+            match dbv {
+                DataBlockValue::Pointer(vp) => builder.add(key, vp),
+                DataBlockValue::Inline { data, expire_at } => builder.add_inline(key, data, expire_at),
+            }
+            if group_ends && current_size >= job.config.max_sstable_size {
+                sstables.push(builder.finish()?);
+                builder = SSTableBuilder::new();
+                current_size = 0;
+            }
+        }
+        if current_size > 0 {
+            sstables.push(builder.finish()?);
+        }
+        Ok(sstables)
+    }
+
+    // Stamp ties across overlapping tables go to the newest source, the
+    // targets come last; every other entry keeps internal key order.
+    #[test]
+    fn test_merge_orders_overlapping_tables_and_breaks_ties_by_newest_table() -> Result<()> {
+        let oldest = table(vec![
+            (encode(b"a", 10), inline(b"a-oldest")),
+            (encode(b"b", 20), inline(b"b-oldest")),
+            (encode(b"c", 5), inline(b"c-oldest")),
+        ]);
+        let middle = table(vec![
+            (encode(b"a", 10), inline(b"a-middle")),
+            (encode(b"b", 25), inline(b"b-middle")),
+            (encode(b"d", 7), inline(b"d-middle")),
+        ]);
+        let newest = table(vec![
+            (encode(b"a", 10), inline(b"a-newest")),
+            (encode(b"b", 20), inline(b"b-newest")),
+            (encode(b"c", 5), tombstone_vp()),
+        ]);
+        let target = table(vec![
+            (encode(b"b", 20), inline(b"b-target")),
+            (encode(b"e", 1), inline(b"e-target")),
+        ]);
+        // Every version lies above the watermark and survives, so the
+        // output shows the whole merge.
+        let cfg = CompactionConfig {
+            low_watermark: Some(Timestamp::new(0)),
+            max_sstable_size: 40,
+            ..Default::default()
+        };
+        let job = CompactionJob::new(vec![oldest, middle, newest], vec![target], cfg);
+
+        let files = outputs(&job)?;
+        assert_eq!(
+            contents(&files)?,
+            vec![
+                (b"a".to_vec(), 10, inline(b"a-newest")),
+                (b"b".to_vec(), 25, inline(b"b-middle")),
+                (b"b".to_vec(), 20, inline(b"b-newest")),
+                (b"c".to_vec(), 5, tombstone_vp()),
+                (b"d".to_vec(), 7, inline(b"d-middle")),
+                (b"e".to_vec(), 1, inline(b"e-target")),
+            ]
+        );
+        assert_eq!(files.len(), 3, "files end behind b and c");
+        assert_eq!(files, compact_in_memory(&job)?);
+        Ok(())
+    }
+
+    // The filter keeps its state per user key across tables and file ends:
+    // version cut-off at the watermark, tombstone and TTL GC only bottommost.
+    #[test]
+    fn test_filter_on_the_merged_stream_matches_the_rules() -> Result<()> {
+        let expired = || DataBlockValue::Inline { data: b"gone".to_vec(), expire_at: 1 };
+        let live_until = unix_now() + 3600;
+        let tables = || {
+            let older = table(vec![
+                (encode(b"k1", 150), inline(b"v150")),
+                (encode(b"k1", 90), inline(b"v90")),
+                (encode(b"k2", 80), tombstone_vp()),
+                (encode(b"k3", 60), inline(b"v60")),
+            ]);
+            let newer = table(vec![
+                (encode(b"k1", 50), inline(b"v50")),
+                (encode(b"k2", 40), inline(b"v40")),
+                (encode(b"k3", 120), tombstone_vp()),
+            ]);
+            let target = table(vec![
+                (encode(b"k4", 70), expired()),
+                (encode(b"k5", 70), DataBlockValue::Inline { data: b"v70".to_vec(), expire_at: live_until }),
+            ]);
+            (vec![older, newer], vec![target])
+        };
+        let config = |bottommost| CompactionConfig {
+            low_watermark: Some(Timestamp::new(100)),
+            bottommost,
+            max_sstable_size: 30,
+            ..Default::default()
+        };
+
+        let (sources, targets) = tables();
+        let job = CompactionJob::new(sources, targets, config(true));
+        let files = outputs(&job)?;
+        assert_eq!(
+            contents(&files)?,
+            vec![
+                (b"k1".to_vec(), 150, inline(b"v150")),
+                (b"k1".to_vec(), 90, inline(b"v90")),
+                (b"k3".to_vec(), 120, tombstone_vp()),
+                (b"k3".to_vec(), 60, inline(b"v60")),
+                (b"k5".to_vec(), 70, DataBlockValue::Inline { data: b"v70".to_vec(), expire_at: live_until }),
+            ]
+        );
+        assert!(files.len() > 1);
+        assert_eq!(files, compact_in_memory(&job)?);
+
+        let (sources, targets) = tables();
+        let job = CompactionJob::new(sources, targets, config(false));
+        let files = outputs(&job)?;
+        let kept: Vec<(Vec<u8>, u64)> = contents(&files)?.into_iter().map(|(key, ts, _)| (key, ts)).collect();
+        assert_eq!(
+            kept,
+            vec![
+                (b"k1".to_vec(), 150),
+                (b"k1".to_vec(), 90),
+                (b"k2".to_vec(), 80),
+                (b"k3".to_vec(), 120),
+                (b"k3".to_vec(), 60),
+                (b"k4".to_vec(), 70),
+                (b"k5".to_vec(), 70),
+            ],
+            "not bottommost: the tombstone and the expired value stay"
+        );
+        assert_eq!(files, compact_in_memory(&job)?);
+        Ok(())
+    }
+
+    /// `tables` overlapping tables that share the keys `0..keys` round-robin,
+    /// each key with a small inline value.
+    fn interleaved_tables(tables: usize, keys: usize) -> Vec<Arc<SSTableReader>> {
+        (0..tables)
+            .map(|t| {
+                table(
+                    (t..keys)
+                        .step_by(tables)
+                        .map(|i| (encode(format!("key-{i:04}").as_bytes(), 10), inline(b"val!")))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn blocks_read(tables: &[Arc<SSTableReader>]) -> usize {
+        tables.iter().map(|t| t.blocks_read.load(std::sync::atomic::Ordering::Relaxed)).sum()
+    }
+
+    // 1200 entries of 28 bytes over three tables of two blocks each; files
+    // are cut at 480 entries.
+    fn file_by_file_job() -> (CompactionJob, Vec<Arc<SSTableReader>>) {
+        let tables = interleaved_tables(3, 1200);
+        let max_sstable_size = 1200 * 28 * 2 / 5;
+        let config = CompactionConfig { max_sstable_size, ..Default::default() };
+        (CompactionJob::new(tables.clone(), vec![], config), tables)
+    }
+
+    // Inputs of 2.5 times the file size give three files, and the first is
+    // done before the last input block is read.
+    #[test]
+    fn test_first_output_file_is_done_before_the_last_input_block_is_read() -> Result<()> {
+        let (job, tables) = file_by_file_job();
+        let mut run = job.compact()?;
+
+        let first = run.next_sstable()?.expect("a first file");
+        let read_for_first = blocks_read(&tables);
+        let mut files = vec![first];
+        while let Some(file) = run.next_sstable()? {
+            files.push(file);
+        }
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(blocks_read(&tables), 6, "two blocks per table");
+        assert!(read_for_first < 6, "the first file took {read_for_first} of 6 blocks");
+        assert_eq!(files, compact_in_memory(&job)?);
+        Ok(())
+    }
+
+    // The run holds the entries of one output file plus one per input,
+    // never all of them.
+    #[test]
+    fn test_run_holds_one_output_file_and_the_input_heads() -> Result<()> {
+        let (job, tables) = file_by_file_job();
+        let mut run = job.compact()?;
+        let mut largest_file = 0;
+        while let Some(file) = run.next_sstable()? {
+            largest_file = largest_file.max(SSTableReader::open(file)?.iter().count());
+        }
+
+        assert_eq!(largest_file, 480);
+        let peak = run.peak_held_entries();
+        assert!(peak <= largest_file + tables.len(), "held {peak} entries at once");
+        Ok(())
+    }
+
+    /// Deterministic pseudo-random numbers below `bound`.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// A table of random versions of `key-000..key-079` with stamps up to
+    /// 40, so tables share keys and identical internal keys; values are
+    /// inline, vLog pointers, tombstones, NULLs and expired or live TTLs.
+    fn random_table(rng: &mut Lcg, entries: usize) -> Arc<SSTableReader> {
+        let mut versions = std::collections::BTreeMap::new();
+        for _ in 0..entries {
+            let key = encode(format!("key-{:03}", rng.below(80)).as_bytes(), 1 + rng.below(40));
+            let value = match rng.below(6) {
+                0 => make_vp(rng.below(1 << 20)),
+                1 => tombstone_vp(),
+                2 => null_vp(),
+                3 => DataBlockValue::Inline { data: vec![b'e'; 5], expire_at: 1 },
+                4 => DataBlockValue::Inline { data: vec![b't'; 5], expire_at: unix_now() + 3600 },
+                _ => DataBlockValue::Inline { data: vec![b'v'; rng.below(40) as usize], expire_at: 0 },
+            };
+            versions.insert(key, value);
+        }
+        table(versions.into_iter().collect())
+    }
+
+    // The streaming run writes the same bytes as the in-memory compaction
+    // for every watermark, depth and file size.
+    #[test]
+    fn test_streaming_output_is_byte_identical_to_the_in_memory_compaction() -> Result<()> {
+        let mut rng = Lcg(53);
+        let sources: Vec<_> = (0..4).map(|_| random_table(&mut rng, 120)).collect();
+        let targets: Vec<_> = (0..2).map(|_| random_table(&mut rng, 200)).collect();
+
+        let mut split = false;
+        for low_watermark in [None, Some(Timestamp::new(0)), Some(Timestamp::new(20))] {
+            for bottommost in [true, false] {
+                for max_sstable_size in [0, 1, 600, usize::MAX] {
+                    let config = CompactionConfig { low_watermark, bottommost, max_sstable_size, ..Default::default() };
+                    let job = CompactionJob::new(sources.clone(), targets.clone(), config);
+                    let files = outputs(&job)?;
+                    split |= files.len() > 2;
+                    assert_eq!(
+                        files,
+                        compact_in_memory(&job)?,
+                        "watermark {low_watermark:?}, bottommost {bottommost}, file size {max_sstable_size}"
+                    );
+                }
+            }
+        }
+        assert!(split, "some runs must cut several files");
         Ok(())
     }
 }

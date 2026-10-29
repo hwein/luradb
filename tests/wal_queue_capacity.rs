@@ -21,6 +21,7 @@
 use luradb::core::engine_runtime;
 use luradb::core::storage_thread::{
     StorageThread, StorageThreadConfig, WalTarget, RING_DEPTH, SQPOLL_ENABLED, SQPOLL_IDLE_MS, STORAGE_THREAD_CPU,
+    WAL_SEGMENT_BYTES,
 };
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::engine::LsmEngineOptions;
@@ -46,6 +47,7 @@ async fn run_cell(capacity: usize, writers: usize, writes: usize) -> (f64, Durat
         ring_depth: RING_DEPTH,
         channel_capacity: capacity,
         cpu: STORAGE_THREAD_CPU,
+        segment_bytes: WAL_SEGMENT_BYTES,
     };
     let (mut hub, handle) = StorageThread::new(config, vec![(WalTarget::Kv, wal_path.clone())]).unwrap();
     let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));

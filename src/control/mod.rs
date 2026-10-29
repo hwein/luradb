@@ -292,17 +292,10 @@ pub enum ShardCommand {
     /// answers with a sample of the shard's metrics, taken while its writes
     /// are held back.
     Sample { drained: oneshot::Sender<()>, sample: oneshot::Receiver<()>, reply: oneshot::Sender<MetricsSample> },
-    /// Like `Confirm` for the instance of `engine`: holds its writes back
-    /// and answers once `release` fires.
-    HoldForCheckpoint {
-        engine: Engine,
-        drained: oneshot::Sender<()>,
-        release: oneshot::Receiver<()>,
-        reply: oneshot::Sender<()>,
-    },
-    /// Persists everything the instance of `engine` has applied, in a task
-    /// of its own beside the commands after it, and answers with the result.
-    Persist { engine: Engine, reply: oneshot::Sender<anyhow::Result<()>> },
+    /// Raises the flushed LSN of the instance of `engine` to `up_to`, an LSN
+    /// durable in the engine's write-ahead log, in a task of its own beside
+    /// the commands after it, and answers with the result.
+    Persist { engine: Engine, up_to: u64, reply: oneshot::Sender<anyhow::Result<()>> },
     /// Applies `write` to the key-value domain `domain` in a task of its own,
     /// beside the commands after it, and answers with the result.
     WriteKv { domain: String, write: KvWrite, reply: oneshot::Sender<anyhow::Result<()>> },
@@ -386,20 +379,11 @@ pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedRecei
                 drop(drains);
                 let _ = reply.send(taken);
             }
-            ShardCommand::HoldForCheckpoint { engine, drained, release, reply } => {
-                if let Some(instance) = owners.instance(engine) {
-                    let hold = instance.drain_writes().await;
-                    let _ = drained.send(());
-                    let _ = release.await;
-                    drop(hold);
-                    let _ = reply.send(());
-                }
-            }
-            ShardCommand::Persist { engine, reply } => {
+            ShardCommand::Persist { engine, up_to, reply } => {
                 let instance = owners.instance(engine).cloned();
                 compio::runtime::spawn(async move {
                     let persisted = match instance {
-                        Some(instance) => instance.persist_all().await,
+                        Some(instance) => instance.raise_flushed_lsn(up_to).await,
                         None => Err(DomainError::Disabled(engine).into()),
                     };
                     let _ = reply.send(persisted);
@@ -592,28 +576,26 @@ impl ControlPlane {
             .context("no data shard runs")
     }
 
-    /// Cuts `engine`'s write-ahead log `wal` back to the records after a mark
-    /// taken while every data shard holds the engine's writes back, once
-    /// every shard has persisted its instance. A shard that fails or does
-    /// not answer leaves the log whole.
-    pub async fn checkpoint(&self, engine: Engine, wal: &crate::core::wal::WriteAheadLog) -> anyhow::Result<()> {
-        let (mark, _) = self
-            .held_round(
-                |drained, release, reply| ShardCommand::HoldForCheckpoint { engine, drained, release, reply },
-                wal.mark(),
-            )
-            .await?;
-        let mark = mark?;
+    /// The flushed LSN of the instance of `engine` on each data shard, by
+    /// shard index; `None` when the engine is disabled.
+    pub fn flushed_lsns(&self, engine: Engine) -> Option<Vec<u64>> {
+        self.shard_owners().map(|owners| owners.instance(engine).map(|instance| instance.flushed_lsn())).collect()
+    }
+
+    /// Raises the flushed LSN of the instance of `engine` to `up_to` on the
+    /// data shards `shards`, all at once; `up_to` must be durable in the
+    /// engine's write-ahead log.
+    pub async fn persist_up_to(&self, engine: Engine, shards: &[usize], up_to: u64) -> anyhow::Result<()> {
         let persisted = futures::future::join_all(
-            self.shards.iter().map(|shard| shard.request(|reply| ShardCommand::Persist { engine, reply })),
+            shards.iter().map(|&k| self.shards[k].request(|reply| ShardCommand::Persist { engine, up_to, reply })),
         )
         .await;
-        for (k, persisted) in persisted.into_iter().enumerate() {
+        for (k, persisted) in shards.iter().zip(persisted) {
             persisted
                 .and_then(|persisted| persisted)
                 .with_context(|| format!("shard {k} could not persist the {} engine", engine.as_str()))?;
         }
-        Ok(wal.cut_before(&mark).await?)
+        Ok(())
     }
 
     /// Sends every data shard the command `make` builds from its three
@@ -1502,7 +1484,6 @@ mod tests {
             ShardCommand::Pin { .. } => "pin",
             ShardCommand::Confirm { .. } => "confirm",
             ShardCommand::Sample { .. } => "sample",
-            ShardCommand::HoldForCheckpoint { .. } => "hold",
             ShardCommand::Persist { .. } => "persist",
             ShardCommand::WriteKv { .. } => "write",
             ShardCommand::Ping { .. } => "ping",
@@ -1512,11 +1493,16 @@ mod tests {
 
     impl TwoShards {
         async fn new(tune: impl FnMut(usize, &mut LsmStorageEngine)) -> Self {
+            Self::with_segments(tune, crate::core::storage_thread::WAL_SEGMENT_BYTES).await
+        }
+
+        /// [`Self::new`] with log segments of `segment_bytes`.
+        async fn with_segments(tune: impl FnMut(usize, &mut LsmStorageEngine), segment_bytes: u64) -> Self {
             let dir = tempfile::TempDir::new().unwrap();
-            let hub = crate::core::storage_thread::TestHub::start(&[(
-                crate::core::storage_thread::WalTarget::Kv,
-                &dir.path().join("kv.wal"),
-            )]);
+            let hub = crate::core::storage_thread::TestHub::with_segment_bytes(
+                &[(crate::core::storage_thread::WalTarget::Kv, &dir.path().join("kv.wal"))],
+                segment_bytes,
+            );
             let owners = testing::kv_shards(dir.path(), &hub, 2, tune).await;
             let engines = owners.iter().map(|shard| Arc::clone(shard.kv.engine())).collect();
             let registries = owners.iter().map(|shard| Arc::clone(&shard.kv)).collect();
@@ -1608,11 +1594,27 @@ mod tests {
             self.dir.path().join("kv.wal")
         }
 
-        /// Checkpoint ticks over the key-value log at `limit` bytes.
+        /// The segments of the key-value log on disk: each one's number and
+        /// size.
+        fn segment_files(&self) -> Vec<(u64, u64)> {
+            crate::core::wal::segments_in(&self.wal_path())
+                .unwrap()
+                .into_iter()
+                .map(|(n, path)| (n, std::fs::metadata(path).unwrap().len()))
+                .collect()
+        }
+
+        /// Whether the key-value log is one segment that holds its header
+        /// alone.
+        fn holds_only_a_header(&self) -> bool {
+            matches!(self.segment_files()[..], [(_, crate::core::wal::WAL_HEADER_LEN)])
+        }
+
+        /// Checkpoint ticks over the key-value log, capped at `limit` bytes.
         fn checkpoints(&self, limit: u64) -> Arc<checkpoint::WalCheckpoint> {
             let wal = self.hub.wal(crate::core::storage_thread::WalTarget::Kv);
             let logs = vec![(checkpoint::Holder::Shards(Engine::Kv), wal)];
-            Arc::new(checkpoint::WalCheckpoint::new(Arc::clone(&self.control), logs).with_limit(limit))
+            Arc::new(checkpoint::WalCheckpoint::new(Arc::clone(&self.control), logs, limit))
         }
 
         /// Drops everything without a flush or a cut, as a crash does, and
@@ -2058,24 +2060,28 @@ mod tests {
     }
 
     const LARGE: &str = "clé ✓ value stored in the value log ";
+    /// The segment size of the logs in these tests.
+    const SEGMENT: u64 = 2048;
+    /// What the age check of the checkpoint waits for.
+    const FIVE_MINUTES: Duration = Duration::from_secs(5 * 60);
 
-    // Writes of every kind on both shards, far past four times the limit,
-    // a tick each time the log reaches it: each tick leaves the log below the
-    // limit with only records after its mark, a write while a shard persists
-    // stays in the log, and after a crash every confirmed write is there with
-    // its value and stamp and every deleted one is gone.
+    // Writes of every kind on both shards over many segments, a tick after
+    // each round, with a cap of three segments: each tick leaves the
+    // segments below the cap, a write while a shard persists stays in the
+    // log, and after a crash every confirmed write is there with its value
+    // and stamp and every deleted one is gone.
     #[test]
-    fn a_crash_after_writes_past_the_limit_keeps_every_confirmed_write() {
+    fn a_crash_after_writes_past_the_cap_keeps_every_confirmed_write() {
         crate::core::engine_runtime::block_on(async {
             use crate::engines::lsm::engine::BatchOp;
-            const LIMIT: u64 = 4096;
-            let s = TwoShards::new(|_, _| {}).await;
+            const LIMIT: u64 = 3 * SEGMENT;
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
             let checkpoints = s.checkpoints(LIMIT);
-            let wal_len = || std::fs::metadata(s.wal_path()).unwrap().len();
+            let total = || s.segment_files().iter().map(|(_, bytes)| bytes).sum::<u64>();
             let domains = two_domains();
             let large = LARGE.repeat(40);
-            let (mut keys, mut deleted, mut ticks, mut round) = (Vec::new(), Vec::new(), 0, 0);
-            while ticks < 4 {
+            let (mut keys, mut deleted, mut round) = (Vec::new(), Vec::new(), 0);
+            while s.segment_files()[0].0 < 6 {
                 for (k, engine) in s.engines.iter().enumerate() {
                     let key = |name: &str| data_key(&domains[k], &format!("{name}-{round}"));
                     engine.put(&key("small"), "clé".as_bytes()).await.unwrap();
@@ -2090,38 +2096,43 @@ mod tests {
                     engine.write_batch(batch).await.unwrap();
                     keys.extend(["large", "nulled", "batch"].map(|name| (k, key(name))));
                     deleted.extend(["small", "gone"].map(|name| (k, key(name))));
-                    if wal_len() >= LIMIT {
-                        let head = engine.wal_head_lsn().await.unwrap();
-                        assert_eq!(checkpoints.run().await, []);
-                        ticks += 1;
-                        assert!(wal_len() < LIMIT);
-                        let mut log = crate::core::wal::recover(s.wal_path()).await.unwrap();
-                        while let Some(entry) = log.next().await {
-                            assert!(entry.unwrap().0 > head);
-                        }
-                        assert!(log.max_lsn() >= head, "the header starts at the cut");
-                    }
                 }
+                assert_eq!(checkpoints.run().await, []);
+                // A prepared segment holds its header alone.
+                assert!(total() < LIMIT + crate::core::wal::WAL_HEADER_LEN, "round {round}: {:?}", s.segment_files());
                 round += 1;
+                assert!(round < 100, "no segment goes: {:?}", s.segment_files());
             }
 
+            // Shard 1 is behind on the segment that closes here, so a tick
+            // with the smallest cap drops every closed segment and has shard
+            // 1 persist on the way.
+            let before = data_key(&domains[1], "before");
+            s.engines[1].put(&before, b"v").await.unwrap();
+            keys.push((1, before));
+            s.hub.wal(crate::core::storage_thread::WalTarget::Kv).rotate().await.unwrap();
+            let persists = s.commands_of(1).iter().filter(|name| **name == "persist").count();
             s.hold_persists[1].send_replace(true);
-            let head = s.engines[1].wal_head_lsn().await.unwrap();
             let tick = compio::runtime::spawn({
                 let checkpoints = s.checkpoints(1);
                 async move { checkpoints.run().await }
             });
-            until_persists(&s, 1, ticks + 1).await;
+            until_persists(&s, 1, persists + 1).await;
             let during = data_key(&domains[1], "during");
             s.engines[1].put(&during, b"v").await.unwrap();
             keys.push((1, during.clone()));
             s.hold_persists[1].send_replace(false);
             assert_eq!(tick.await.unwrap(), []);
-            let mut log = crate::core::wal::recover(s.wal_path()).await.unwrap();
-            let (lsn, entry) = log.next().await.unwrap().unwrap();
-            assert!(lsn > head);
-            assert_eq!(entry.key(), during);
-            assert!(log.next().await.is_none());
+            // The segment appended to, read alone: the one prepared after it
+            // starts at LSN 0 until the hub opens it.
+            let segments = s.hub.wal(crate::core::storage_thread::WalTarget::Kv).segments().await.unwrap();
+            let active = crate::core::wal::segment_path(&segments.dir, segments.active().segment);
+            let mut reader = crate::core::wal::recover(active).await.unwrap();
+            let mut last = None;
+            while let Some(entry) = reader.next().await {
+                last = Some(entry.unwrap().1);
+            }
+            assert_eq!(last.as_ref().map(|entry| entry.key()), Some(during.as_slice()));
 
             let confirmed = reads(&s.engines, &keys).await;
             let (engines, _hub, _dir) = s.crash().await;
@@ -2133,10 +2144,10 @@ mod tests {
     }
 
     // A write whose value log append failed after its record went into the
-    // log is cut with the log by the next checkpoint: after a crash it is
-    // gone, and the confirmed writes are there.
+    // log goes with its segment, which the age check closes and drops:
+    // after a crash it is gone, and the confirmed writes are there.
     #[test]
-    fn a_write_whose_value_failed_before_the_mark_is_gone_after_a_crash() {
+    fn a_write_whose_value_failed_is_gone_after_its_segment_and_a_crash() {
         crate::core::engine_runtime::block_on(async {
             let s = TwoShards::new(|_, _| {}).await;
             let [domain, _] = two_domains();
@@ -2149,7 +2160,10 @@ mod tests {
             assert!(engine.put(&failed, large.as_bytes()).await.is_err());
             engine.install(|v| v.with_active_vlog(active, engine.last_applied_lsn()));
             engine.put(&kept, large.as_bytes()).await.unwrap();
-            assert_eq!(s.checkpoints(1).run().await, []);
+            let checkpoints = s.checkpoints(u64::MAX);
+            checkpoints.skew_clock(FIVE_MINUTES);
+            assert_eq!(checkpoints.run().await, []);
+            assert!(s.holds_only_a_header());
 
             let (engines, _hub, _dir) = s.crash().await;
             assert_eq!(engines[0].get(&failed).await.unwrap(), None);
@@ -2157,10 +2171,10 @@ mod tests {
         })
     }
 
-    // Values before a checkpoint's mark that a value log cleanup moves
-    // afterwards are all there after a crash.
+    // Values of a dropped segment that a value log cleanup moves afterwards
+    // are all there after a crash.
     #[test]
-    fn values_moved_by_a_cleanup_after_a_checkpoint_survive_a_crash() {
+    fn values_moved_by_a_cleanup_after_a_dropped_segment_survive_a_crash() {
         crate::core::engine_runtime::block_on(async {
             let s = TwoShards::new(|_, _| {}).await;
             let [domain, _] = two_domains();
@@ -2170,8 +2184,10 @@ mod tests {
                     s.engines[0].put(key, format!("{value} {}", LARGE.repeat(40)).as_bytes()).await.unwrap();
                 }
             }
-            assert_eq!(s.checkpoints(1).run().await, []);
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::wal_header(s.engines[0].wal_head_lsn().await.unwrap()));
+            let checkpoints = s.checkpoints(u64::MAX);
+            checkpoints.skew_clock(FIVE_MINUTES);
+            assert_eq!(checkpoints.run().await, []);
+            assert!(s.holds_only_a_header());
             let config = crate::engines::lsm::janitor::JanitorConfig {
                 check_interval_secs: 3600,
                 dead_bytes_threshold: 0.0,
@@ -2186,67 +2202,267 @@ mod tests {
         })
     }
 
-    // A flush that fails on shard 1 fails the checkpoint: no cut, the log
-    // byte for byte. Once the flush works again, the next tick cuts it and
+    /// Writes on both shards until the key-value log of `s` has segments
+    /// before the one appended to; the keys written, by shard.
+    async fn fill_segments(s: &TwoShards, segments: u64) -> Vec<(usize, Vec<u8>)> {
+        let domains = two_domains();
+        let mut keys = Vec::new();
+        for i in 0.. {
+            if s.segment_files().iter().filter(|(_, bytes)| *bytes > crate::core::wal::WAL_HEADER_LEN).count() as u64
+                >= segments
+            {
+                break;
+            }
+            for (k, domain) in domains.iter().enumerate() {
+                let key = data_key(domain, &format!("k{i}"));
+                s.engines[k].put(&key, LARGE.repeat(8).as_bytes()).await.unwrap();
+                keys.push((k, key));
+            }
+        }
+        keys
+    }
+
+    /// The bytes of every segment of the key-value log of `s`, in order.
+    fn log_bytes(s: &TwoShards) -> Vec<u8> {
+        crate::core::wal::segments_in(&s.wal_path()).unwrap().into_iter().flat_map(|(_, path)| std::fs::read(path).unwrap()).collect()
+    }
+
+    // Records over three segments: while shard 0 has none of its records in
+    // SSTables, no segment goes, even once shard 1 has all of its there;
+    // once shard 0 flushes too, every segment before the one appended to
+    // goes, each removal synced, and after a crash every write is there.
+    #[test]
+    fn a_segment_goes_once_every_shard_has_its_records_in_sstables() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::storage::test_trace;
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(u64::MAX);
+            let keys = fill_segments(&s, 3).await;
+            let active = s.hub.wal(crate::core::storage_thread::WalTarget::Kv).segments().await.unwrap().active().segment;
+
+            s.engines[1].flush_all_memtables().await.unwrap();
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!(s.segment_files()[0].0, 1, "shard 0 has none of its records in SSTables");
+
+            s.engines[0].flush_all_memtables().await.unwrap();
+            test_trace::watch(&s.wal_path());
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!(s.segment_files()[0].0, active);
+            let removals: Vec<String> = (1..active).flat_map(|n| [format!("unlink {n:08}.wal"), "sync .".to_string()]).collect();
+            let steps = test_trace::steps(&s.wal_path());
+            assert!(steps.starts_with(&removals), "{steps:?}");
+
+            let confirmed = reads(&s.engines, &keys).await;
+            let (engines, _hub, _dir) = s.crash().await;
+            assert_eq!(reads(&engines, &keys).await, confirmed);
+        })
+    }
+
+    // A removal that fails fails the tick and keeps the segment's file; the
+    // next tick removes it and reports that, and every write is there.
+    #[test]
+    fn a_failed_removal_is_retried_by_the_next_tick() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::storage::test_fault;
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(u64::MAX);
+            let keys = fill_segments(&s, 2).await;
+            for engine in &s.engines {
+                engine.flush_all_memtables().await.unwrap();
+            }
+            let log = log_bytes(&s);
+            let dir = std::fs::canonicalize(s.wal_path()).unwrap();
+            test_fault::fail_writes_in(&dir);
+            let reports = checkpoints.run().await;
+            test_fault::allow_writes_in(&dir);
+
+            assert!(matches!(&reports[..], [Report::Stuck { log: "kv", bytes: Some(_), .. }]), "{reports:?}");
+            assert_eq!(log_bytes(&s), log, "the log stays whole");
+            assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 1 }]);
+            assert!(s.segment_files()[0].0 > 1);
+
+            let (engines, _hub, _dir) = s.crash().await;
+            for (k, key) in &keys {
+                assert!(engines[*k].get(key).await.unwrap().is_some());
+            }
+        })
+    }
+
+    // With a cap of three segments, shard 0 writes and flushes while shard 1
+    // wrote nothing: once the cap is reached only shard 1, behind on the
+    // oldest segment, gets a Persist; shard 0 is not held back, a write
+    // there goes through meanwhile. Shard 1 raises its flushed LSN without an
+    // SSTable, and the segment goes. The segments never pass the cap by more
+    // than the largest record, also one larger than a segment.
+    #[test]
+    fn the_cap_has_only_the_shards_behind_persist() {
+        crate::core::engine_runtime::block_on(async {
+            const LIMIT: u64 = 3 * SEGMENT;
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(LIMIT);
+            let total = || s.segment_files().iter().map(|(_, bytes)| bytes).sum::<u64>();
+            let [domain, _] = two_domains();
+            let tables = || {
+                let dir = testing::kv_shard_files(s.dir.path()).sstables.join("shard_1");
+                std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().path().extension() == Some("sst".as_ref())).count()
+            };
+            let shard_1_tables = tables();
+            let mut keys = Vec::new();
+            for i in 0..40 {
+                let value = if i == 20 { LARGE.repeat(150) } else { LARGE.repeat(8) };
+                let key = data_key(&domain, &format!("k{i}"));
+                s.engines[0].put(&key, value.as_bytes()).await.unwrap();
+                keys.push((0, key));
+                s.engines[0].flush_all_memtables().await.unwrap();
+                let bound = LIMIT + SEGMENT.max(value.len() as u64 + 128);
+                assert!(total() <= bound, "write {i}: {:?}", s.segment_files());
+                assert_eq!(checkpoints.run().await, []);
+            }
+            assert!(s.segment_files()[0].0 > 1, "no segment went: {:?}", s.segment_files());
+            assert!(!s.commands_of(0).contains(&"persist"), "{:?}", s.commands_of(0));
+            assert!(s.commands_of(1).contains(&"persist"));
+            assert_eq!(tables(), shard_1_tables, "shard 1 had nothing to write");
+
+            // The segment closed here ends past the flushed LSN of shard 1.
+            s.hub.wal(crate::core::storage_thread::WalTarget::Kv).rotate().await.unwrap();
+            s.hold_persists[1].send_replace(true);
+            let persists = s.commands_of(1).iter().filter(|name| **name == "persist").count();
+            let tick = compio::runtime::spawn({
+                let checkpoints = s.checkpoints(1);
+                async move { checkpoints.run().await }
+            });
+            until_persists(&s, 1, persists + 1).await;
+            let during = data_key(&domain, "during");
+            s.engines[0].put(&during, b"v").await.unwrap();
+            keys.push((0, during));
+            s.hold_persists[1].send_replace(false);
+            assert_eq!(tick.await.unwrap(), []);
+
+            let confirmed = reads(&s.engines, &keys).await;
+            let (engines, _hub, _dir) = s.crash().await;
+            assert_eq!(reads(&engines, &keys).await, confirmed);
+        })
+    }
+
+    // Right after a rotation the segment appended to holds its header alone;
+    // the next tick prepares the one after it all the same, so the hub finds
+    // it however soon the segment fills.
+    #[test]
+    fn the_tick_after_a_rotation_prepares_the_next_segment_at_once() {
+        crate::core::engine_runtime::block_on(async {
+            let header = crate::core::wal::WAL_HEADER_LEN;
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(u64::MAX);
+            let [domain, _] = two_domains();
+            s.engines[0].put(&data_key(&domain, "k"), b"v").await.unwrap();
+            s.hub.wal(crate::core::storage_thread::WalTarget::Kv).rotate().await.unwrap();
+            assert_eq!(s.segment_files()[1..], [(2, header)]);
+
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!(s.segment_files()[1..], [(2, header), (3, header)]);
+        })
+    }
+
+    // With a cap of three segments and two full closed ones, the segments
+    // stay below the cap, yet the closed ones plus a full one reach it: the
+    // tick has both shards, behind on the oldest segment, persist and drops
+    // it, so the segment that fills until the next tick keeps the log within
+    // a segment of the cap.
+    #[test]
+    fn the_cap_has_the_shards_persist_a_segment_before_it_is_reached() {
+        crate::core::engine_runtime::block_on(async {
+            const LIMIT: u64 = 3 * SEGMENT;
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(LIMIT);
+            let wal = s.hub.wal(crate::core::storage_thread::WalTarget::Kv);
+            let closed_bytes = |segments: &crate::core::storage_thread::WalSegments| {
+                segments.closed().iter().map(|segment| segment.bytes).sum::<u64>()
+            };
+            fill_segments(&s, 3).await;
+            let segments = wal.segments().await.unwrap();
+            assert!(segments.total_bytes() < LIMIT, "{segments:?}");
+            assert!(closed_bytes(&segments) + SEGMENT >= LIMIT, "{segments:?}");
+
+            assert_eq!(checkpoints.run().await, []);
+            assert!(s.segment_files()[0].0 > 1, "no segment went: {:?}", s.segment_files());
+            assert!(s.commands_of(0).contains(&"persist"), "{:?}", s.commands_of(0));
+            assert!(s.commands_of(1).contains(&"persist"), "{:?}", s.commands_of(1));
+            let segments = wal.segments().await.unwrap();
+            assert!(closed_bytes(&segments) + SEGMENT < LIMIT, "{segments:?}");
+        })
+    }
+
+    // The age check on an injected clock: a segment with records, five
+    // minutes open, is closed, the shard behind on it persists, and the log
+    // is one empty segment; an empty one stays however old; one written to
+    // once a minute is closed after five minutes all the same. Each next
+    // segment is prepared, never created by the hub.
+    #[test]
+    fn a_segment_with_records_goes_after_five_minutes() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::storage::test_trace;
+            let s = TwoShards::new(|_, _| {}).await;
+            test_trace::watch(&s.wal_path());
+            let checkpoints = s.checkpoints(u64::MAX);
+            let [_, domain] = two_domains();
+            let key = |i: u32| data_key(&domain, &format!("k{i}"));
+            s.engines[1].put(&key(0), b"v").await.unwrap();
+            checkpoints.skew_clock(FIVE_MINUTES - Duration::from_secs(60));
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!(s.segment_files()[0].0, 1);
+            checkpoints.skew_clock(FIVE_MINUTES);
+            assert_eq!(checkpoints.run().await, []);
+            assert!(s.holds_only_a_header());
+            assert_eq!(s.segment_files()[0].0, 2);
+            assert!(s.commands_of(1).contains(&"persist"));
+
+            checkpoints.skew_clock(2 * FIVE_MINUTES);
+            assert_eq!(checkpoints.run().await, []);
+            let header = crate::core::wal::WAL_HEADER_LEN;
+            assert_eq!(s.segment_files(), [(2, header), (3, header)], "an empty segment stays, the next one prepared");
+
+            checkpoints.skew_clock(Duration::ZERO);
+            for minute in 1..=5 {
+                s.engines[1].put(&key(minute), b"v").await.unwrap();
+                checkpoints.skew_clock(Duration::from_secs(60 * u64::from(minute)));
+                assert_eq!(checkpoints.run().await, []);
+                assert_eq!(s.segment_files()[0].0 == 2, minute < 5, "minute {minute}");
+            }
+            assert!(s.holds_only_a_header());
+            let steps = test_trace::steps(&s.wal_path());
+            assert!(!steps.iter().any(|step| step.starts_with("create ")), "{steps:?}");
+
+            let (engines, _hub, _dir) = s.crash().await;
+            for i in 0..=5 {
+                assert_eq!(engines[1].get(&key(i)).await.unwrap(), Some(b"v".to_vec()), "k{i}");
+            }
+        })
+    }
+
+    // A flush that fails on shard 1 fails the checkpoint: no segment goes.
+    // Once the flush works again, the next tick drops the segments and
     // reports that.
     #[test]
     fn a_failed_flush_on_one_shard_leaves_the_log_whole_until_the_next_tick() {
         crate::core::engine_runtime::block_on(async {
             use crate::storage::test_fault;
-            let s = TwoShards::new(|_, _| {}).await;
-            let checkpoints = s.checkpoints(1);
-            for (k, domain) in two_domains().iter().enumerate() {
-                s.engines[k].put(&data_key(domain, "k"), b"v").await.unwrap();
-            }
-            let log = std::fs::read(s.wal_path()).unwrap();
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(SEGMENT);
+            fill_segments(&s, 2).await;
+            let log = log_bytes(&s);
+            let total = s.hub.wal(crate::core::storage_thread::WalTarget::Kv).segments().await.unwrap().total_bytes();
             let unwritable = testing::kv_shard_files(s.dir.path()).sstables.join("shard_1");
             test_fault::fail_writes_in(&unwritable);
             let reports = checkpoints.run().await;
             test_fault::allow_writes_in(&unwritable);
 
             assert!(
-                matches!(&reports[..], [Report::Stuck { log: "kv", bytes: Some(bytes), .. }] if *bytes == log.len() as u64),
+                matches!(&reports[..], [Report::Stuck { log: "kv", bytes: Some(bytes), .. }] if *bytes == total),
                 "{reports:?}"
             );
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), log);
+            assert!(log_bytes(&s).starts_with(&log), "no segment went");
             assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 1 }]);
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::wal_header(s.engines[0].wal_head_lsn().await.unwrap()));
-        })
-    }
-
-    // A new file the checkpoint cannot prepare beside the log fails the
-    // checkpoint before the hub hears of it: the log stays byte for byte,
-    // the next tick cuts it, and after a crash every write is there.
-    #[test]
-    fn a_failed_preparation_leaves_the_log_whole_until_the_next_tick() {
-        crate::core::engine_runtime::block_on(async {
-            let s = TwoShards::new(|_, _| {}).await;
-            let checkpoints = s.checkpoints(1);
-            let keys: Vec<_> = two_domains().iter().enumerate().map(|(k, domain)| (k, data_key(domain, "k"))).collect();
-            for (k, key) in &keys {
-                s.engines[*k].put(key, b"v").await.unwrap();
-            }
-            let log = std::fs::read(s.wal_path()).unwrap();
-            // The new file of the cut cannot be created where a directory is.
-            let mut blocked = std::fs::canonicalize(s.wal_path()).unwrap().into_os_string();
-            blocked.push(".tmp");
-            std::fs::create_dir(&blocked).unwrap();
-
-            let reports = checkpoints.run().await;
-            assert!(
-                matches!(&reports[..], [Report::Stuck { log: "kv", error, .. }] if error.contains("preparing")),
-                "{reports:?}"
-            );
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), log);
-            std::fs::remove_dir(&blocked).unwrap();
-
-            assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 1 }]);
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), crate::core::wal::wal_header(s.engines[0].wal_head_lsn().await.unwrap()));
-
-            let (engines, _hub, _dir) = s.crash().await;
-            for (k, key) in &keys {
-                assert_eq!(engines[*k].get(key).await.unwrap(), Some(b"v".to_vec()));
-            }
+            assert!(s.segment_files()[0].0 > 1);
         })
     }
 
@@ -2257,9 +2473,9 @@ mod tests {
     fn a_checkpoint_failing_120_times_is_reported_twice() {
         crate::core::engine_runtime::block_on(async {
             use crate::storage::test_fault;
-            let s = TwoShards::new(|_, _| {}).await;
-            let checkpoints = s.checkpoints(1);
-            s.engines[1].put(&data_key(&two_domains()[1], "k"), b"v").await.unwrap();
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(SEGMENT);
+            fill_segments(&s, 2).await;
             let unwritable = testing::kv_shard_files(s.dir.path()).sstables.join("shard_1");
             test_fault::fail_writes_in(&unwritable);
             let mut reports = Vec::new();
@@ -2275,38 +2491,20 @@ mod tests {
         })
     }
 
-    // Every shard persists its instance before the log is cut; a shard that
-    // does not answer leaves the log uncut.
+    // A shard that does not answer its Persist fails the tick and keeps
+    // every segment.
     #[test]
-    fn a_checkpoint_cuts_the_log_only_after_every_shard_persisted() {
+    fn a_shard_without_an_answer_keeps_every_segment() {
         crate::core::engine_runtime::block_on(async {
-            use crate::storage::test_trace;
-            let s = TwoShards::new(|_, _| {}).await;
-            let checkpoints = s.checkpoints(1);
-            let domains = two_domains();
-            for (k, domain) in domains.iter().enumerate() {
-                s.engines[k].put(&data_key(domain, "k"), b"v").await.unwrap();
-            }
-            test_trace::watch(s.dir.path());
-            assert_eq!(checkpoints.run().await, []);
-            let steps = test_trace::steps(s.dir.path());
-            assert_eq!(steps.last().map(String::as_str), Some("cut kv.wal"), "{steps:?}");
-            for k in 0..2 {
-                for step in [format!("save kv-shards/shard_{k}/MANIFEST"), format!("sync kv-shards/shard_{k}")] {
-                    assert!(steps.contains(&step), "{step} missing in {steps:?}");
-                }
-            }
-
+            let s = TwoShards::with_segments(|_, _| {}, SEGMENT).await;
+            let checkpoints = s.checkpoints(SEGMENT);
+            fill_segments(&s, 2).await;
             s.drop_persists[1].send_replace(true);
-            for (k, domain) in domains.iter().enumerate() {
-                s.engines[k].put(&data_key(domain, "later"), b"v").await.unwrap();
-            }
-            let log = std::fs::read(s.wal_path()).unwrap();
-            test_trace::watch(s.dir.path());
+            let log = log_bytes(&s);
             let reports = checkpoints.run().await;
             assert!(matches!(&reports[..], [Report::Stuck { log: "kv", .. }]), "{reports:?}");
-            assert_eq!(std::fs::read(s.wal_path()).unwrap(), log);
-            assert!(!test_trace::steps(s.dir.path()).iter().any(|step| step.starts_with("cut")));
+            assert!(log_bytes(&s).starts_with(&log), "no segment went");
+            assert_eq!(s.segment_files()[0].0, 1);
         })
     }
 

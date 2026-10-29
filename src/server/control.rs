@@ -3,9 +3,10 @@
 //! engine's write-ahead log onto the data shards' instances, starts the
 //! shards and releases them once the control plane is attached to all of
 //! them. It then serves the requests without a domain and the shared-memory
-//! clients, checkpoints every write-ahead log once it grows long and, at the
+//! clients, drops the write-ahead log segments the SSTables hold and, at the
 //! end, stops shared memory, drains the shards, truncates each write-ahead
-//! log whose engine flushed on every shard, and stops the hub.
+//! log whose engine flushed on every shard to one empty segment, and stops
+//! the hub.
 
 use super::{
     layout,
@@ -260,6 +261,7 @@ async fn bootstrap(
     // First: a capacity the channel rejects must fail while nothing runs yet.
     let capacity = config.multicore.shard_queue_capacity;
     let shard_0 = Lane::new(capacity);
+    let wal_limit = config.storage.wal_max_bytes()?;
     coop::init(config.multicore.cpu_offload_threads);
 
     // The storage hub before every engine: it writes all their WALs. The
@@ -387,7 +389,7 @@ async fn bootstrap(
         .chain([(Holder::System, WalTarget::Sys)])
         .map(|(holder, target)| (holder, WriteAheadLog::with_storage_handle(hub.clone(), target)))
         .collect();
-    let checkpoint = Arc::new(WalCheckpoint::new(Arc::clone(&states[0].control), logs));
+    let checkpoint = Arc::new(WalCheckpoint::new(Arc::clone(&states[0].control), logs, wal_limit));
     system_loops.spawn("WalCheckpoint", WAL_CHECKPOINT_INTERVAL, move || {
         let checkpoint = Arc::clone(&checkpoint);
         async move { checkpoint.tick().await }
@@ -570,7 +572,7 @@ pub(super) fn kv_options(cfg: &LuraConfig, memory: &MemorySplit) -> LsmEngineOpt
 }
 
 /// The storage hub: a dedicated OS thread driving a SQPOLL io_uring ring. It
-/// owns the WAL file of every enabled engine and writes them all; no engine
+/// owns the WAL of every enabled engine and writes them all; no engine
 /// runs without it.
 pub(super) fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageThread, StorageHandle)> {
     let st_config = StorageThreadConfig {
@@ -579,6 +581,7 @@ pub(super) fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageT
         ring_depth: storage_thread::RING_DEPTH,
         channel_capacity: cfg.storage.wal_queue_capacity,
         cpu: storage_thread::STORAGE_THREAD_CPU,
+        segment_bytes: storage_thread::WAL_SEGMENT_BYTES,
     };
     let mut wals = vec![
         (WalTarget::Kv, PathBuf::from(&cfg.storage.wal_path)),

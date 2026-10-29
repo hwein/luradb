@@ -323,6 +323,9 @@ pub struct StorageConfig {
     /// Writes the queue to the storage thread holds for the write-ahead logs
     /// of all engines; a full queue holds further writes back.
     pub wal_queue_capacity: usize,
+    /// Size cap of the write-ahead log of each engine, with a unit; see
+    /// [`parse_size`].
+    pub wal_max_size: String,
 }
 
 impl Default for StorageConfig {
@@ -334,6 +337,7 @@ impl Default for StorageConfig {
             sstable_dir: "luradb_sstables".to_string(),
             system_dir: "luradb_sys".to_string(),
             wal_queue_capacity: 1024,
+            wal_max_size: "256 MiB".to_string(),
         }
     }
 }
@@ -342,17 +346,63 @@ impl Default for StorageConfig {
 /// slot per queued write up front.
 const MAX_WAL_QUEUE_CAPACITY: usize = 65_536;
 
+/// Smallest `storage.wal_max_size`: two segments, so the one to drop is
+/// never the one written.
+const MIN_WAL_MAX_SIZE: u64 = 128 * 1024 * 1024;
+
 impl StorageConfig {
     /// Startup validation: the queue needs a slot, and no more than
-    /// [`MAX_WAL_QUEUE_CAPACITY`].
+    /// [`MAX_WAL_QUEUE_CAPACITY`]; the log cap is a size of at least
+    /// [`MIN_WAL_MAX_SIZE`].
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             (1..=MAX_WAL_QUEUE_CAPACITY).contains(&self.wal_queue_capacity),
             "invalid config: storage.wal_queue_capacity ({}) must be 1 to {MAX_WAL_QUEUE_CAPACITY}",
             self.wal_queue_capacity
         );
-        Ok(())
+        self.wal_max_bytes().map(drop)
     }
+
+    /// `wal_max_size` in bytes.
+    pub fn wal_max_bytes(&self) -> anyhow::Result<u64> {
+        let size = &self.wal_max_size;
+        let bytes = parse_size(size).map_err(|e| anyhow::anyhow!("invalid config: storage.wal_max_size ({size}) {e}"))?;
+        anyhow::ensure!(
+            bytes >= MIN_WAL_MAX_SIZE,
+            "invalid config: storage.wal_max_size ({size}) must be at least 128 MiB"
+        );
+        Ok(bytes)
+    }
+}
+
+/// Reads a size such as `"256 MiB"`: a whole or decimal number, optional
+/// spaces and one of the units B, kB, KiB, MB, MiB, GB, GiB, TB, TiB in any
+/// case, SI ones in powers of 1000, binary ones in powers of 1024. A
+/// fraction of a byte is dropped.
+pub fn parse_size(text: &str) -> anyhow::Result<u64> {
+    let invalid = || anyhow::anyhow!("needs a number and a unit (B, kB, KiB, MB, MiB, GB, GiB, TB or TiB), as in \"256 MiB\"");
+    let text = text.trim();
+    let split = text.find(|c: char| !c.is_ascii_digit() && c != '.').ok_or_else(invalid)?;
+    let (number, unit) = text.split_at(split);
+    let unit: u128 = match unit.trim_start().to_ascii_lowercase().as_str() {
+        "b" => 1,
+        "kb" => 1000,
+        "kib" => 1 << 10,
+        "mb" => 1000u128.pow(2),
+        "mib" => 1 << 20,
+        "gb" => 1000u128.pow(3),
+        "gib" => 1 << 30,
+        "tb" => 1000u128.pow(4),
+        "tib" => 1 << 40,
+        _ => return Err(invalid()),
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty() || fraction.contains('.') || fraction.len() > 18 {
+        return Err(invalid());
+    }
+    let digits: u128 = format!("{whole}{fraction}").parse().map_err(|_| invalid())?;
+    let bytes = digits.checked_mul(unit).ok_or_else(invalid)? / 10u128.pow(fraction.len() as u32);
+    u64::try_from(bytes).map_err(|_| invalid())
 }
 
 /// Registered-buffer I/O on the engine thread's io_uring ring.
@@ -1655,6 +1705,48 @@ mod tests {
                 &format!("storage.wal_queue_capacity ({capacity})"),
                 "1 to 65536",
             );
+        }
+    }
+
+    // Sizes take a whole or decimal number, optional spaces and an SI or a
+    // binary unit in any case; a bare number and an unknown unit fail.
+    #[test]
+    fn test_parse_size_reads_numbers_with_a_unit() {
+        for (text, bytes) in [
+            ("0.5 GiB", 512 * 1024 * 1024),
+            ("512 mb", 512_000_000),
+            ("1 GB", 1_000_000_000),
+            ("256 MiB", 256 * 1024 * 1024),
+            ("128MiB", 128 * 1024 * 1024),
+            ("7 b", 7),
+            ("1.5 kB", 1500),
+            ("2 KiB", 2048),
+            ("1 TiB", 1 << 40),
+            ("3 tb", 3_000_000_000_000),
+        ] {
+            assert_eq!(parse_size(text).unwrap(), bytes, "{text}");
+        }
+        for text in ["512", "1 XB", "", "MiB", "1.2.3 MiB", "-1 MiB", "1e3 B", "99999999999999999999 TiB"] {
+            assert!(parse_size(text).is_err(), "{text}");
+        }
+    }
+
+    // The write-ahead log cap defaults to 256 MiB and takes no less than
+    // 128 MiB; a value below or without a unit stops the start.
+    #[test]
+    fn test_storage_wal_max_size_has_a_minimum() {
+        let config = LuraConfig::default();
+        assert_eq!(config.storage.wal_max_size, "256 MiB");
+        assert_eq!(config.storage.wal_max_bytes().unwrap(), 256 * 1024 * 1024);
+        for size in ["0.5 GiB", "512 mb", "1 GB", "128 MiB"] {
+            let config: LuraConfig = toml::from_str(&format!("[storage]\nwal_max_size = \"{size}\"\n")).unwrap();
+            assert!(config.storage.validate().is_ok(), "{size}");
+        }
+        let config: LuraConfig = toml::from_str("[storage]\nwal_max_size = \"64 MiB\"\n").unwrap();
+        assert_invalid(config.storage.validate(), "storage.wal_max_size (64 MiB)", "at least 128 MiB");
+        for size in ["512", "1 XB"] {
+            let config: LuraConfig = toml::from_str(&format!("[storage]\nwal_max_size = \"{size}\"\n")).unwrap();
+            assert_invalid(config.storage.validate(), &format!("storage.wal_max_size ({size})"), "unit");
         }
     }
 

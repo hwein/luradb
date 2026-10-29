@@ -1,7 +1,8 @@
 //! Data directory layout: every engine keeps the files of data shard `k` —
 //! value log, SSTables, page file — in a `shard_<k>/` directory beside the
-//! configured path; its write-ahead log stays a single file. A data directory
-//! from before this layout moves into `shard_0/` on the first start.
+//! configured path; its write-ahead log, one directory of segments at its
+//! configured path, serves all shards. A data directory from before this
+//! layout moves into `shard_0/` on the first start.
 
 use crate::config::LuraConfig;
 use crate::control::system;

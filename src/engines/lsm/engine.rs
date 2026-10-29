@@ -596,36 +596,38 @@ impl LsmStorageEngine {
     /// Replays the log at `path` onto `instances`, which share it, before
     /// any write: each entry above its owner's flushed LSN, one at a time; a
     /// MemTable at the size threshold is flushed at once. A log of an
-    /// earlier format goes in whole. On return every instance has flushed
-    /// what it took and the next write continues the log's LSNs; the caller
-    /// truncates the log.
+    /// earlier format goes in whole, ahead of the segments that replaced
+    /// it. On return every instance has flushed what it took, its flushed
+    /// LSN is the log's last and the next write continues the log's LSNs;
+    /// the caller truncates the log.
     pub(crate) async fn replay_wal(
         path: &Path,
         instances: &[Self],
         owner: impl Fn(u64, &WalEntry) -> Result<usize>,
     ) -> Result<()> {
-        let mut log = crate::core::wal::recover(path).await?;
-        let flushed: Vec<Option<u64>> =
-            instances.iter().map(|instance| log.lsns_continue().then(|| instance.flushed_lsn())).collect();
         let mut replayed = vec![false; instances.len()];
         // `done` is the LSN of the last record read in full: every instance
         // has applied all of its entries up to it.
-        let (mut done, mut current) = (0, 0);
-        while let Some(next) = log.next().await {
-            let (lsn, entry) = next?;
-            if lsn != current {
-                (done, current) = (current, lsn);
+        let (mut done, mut current, mut max_lsn) = (0, 0, 0);
+        for mut log in crate::core::wal::recover_path(path).await? {
+            let flushed: Vec<Option<u64>> =
+                instances.iter().map(|instance| log.lsns_continue().then(|| instance.flushed_lsn())).collect();
+            while let Some(next) = log.next().await {
+                let (lsn, entry) = next?;
+                if lsn != current {
+                    (done, current) = (current, lsn);
+                }
+                let index = owner(lsn, &entry)?;
+                let instance = &instances[index];
+                if flushed[index].is_some_and(|flushed| lsn <= flushed) {
+                    instance.hlc.seed(entry.timestamp());
+                    continue;
+                }
+                instance.replay_entry(entry, done).await?;
+                replayed[index] = true;
             }
-            let index = owner(lsn, &entry)?;
-            let instance = &instances[index];
-            if flushed[index].is_some_and(|flushed| lsn <= flushed) {
-                instance.hlc.seed(entry.timestamp());
-                continue;
-            }
-            instance.replay_entry(entry, done).await?;
-            replayed[index] = true;
+            max_lsn = max_lsn.max(log.max_lsn());
         }
-        let max_lsn = log.max_lsn();
         if let Some(first) = instances.first() {
             // Before the first append: new records continue the LSNs of the
             // log and of the tables, which a log of an earlier format may
@@ -634,8 +636,9 @@ impl LsmStorageEngine {
             first.wal.set_lsn_start(max_lsn.max(flushed)).await?;
         }
         for (instance, replayed) in instances.iter().zip(replayed) {
+            // One without records here saves its manifest alone.
+            instance.raise_flushed_lsn(max_lsn).await?;
             if replayed {
-                instance.raise_flushed_lsn(max_lsn).await?;
                 instance.sync_vlog_and_dirs().await?;
             }
             instance.last_applied_lsn.fetch_max(max_lsn, Ordering::Release);
@@ -1030,18 +1033,6 @@ impl LsmStorageEngine {
         let snap = self.manifest.read().clone();
         self.manifest_manager.save(&snap).await.context("Manifest save error")?;
         self.sync_vlog_and_dirs().await.context("Sync error")
-    }
-
-    /// Cuts the WAL of an instance that writes it alone back to what came
-    /// after a mark: the mark is taken while the instance holds its writes
-    /// back, then everything is persisted. A failure leaves the WAL whole.
-    pub async fn checkpoint(&self) -> Result<()> {
-        let mark = {
-            let _hold = self.drain_writes().await;
-            self.wal.mark().await?
-        };
-        self.persist_all().await?;
-        Ok(self.wal.cut_before(&mark).await?)
     }
 
     /// The LSN of the last record durable in this engine's WAL.
@@ -4851,21 +4842,21 @@ mod tests {
                 engine.put(b"gone", b"x").await.unwrap();
                 engine.delete(b"gone").await.unwrap();
             }
-            let header = crate::core::wal::WAL_HEADER_LEN;
-            assert!(std::fs::metadata(&wal_path).unwrap().len() > header, "the writes are only in the WAL");
+            let (header, segment) = (crate::core::wal::WAL_HEADER_LEN, crate::core::wal::segment_path(&wal_path, 1));
+            assert!(std::fs::metadata(&segment).unwrap().len() > header, "the writes are only in the WAL");
 
             let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
             let engine = engine_on_hub(&dir, &hub).await;
             assert_eq!(engine.get(b"small").await.unwrap(), Some("clé ✓".as_bytes().to_vec()));
             assert_eq!(engine.get(b"big").await.unwrap(), Some(big));
             assert_eq!(engine.get(b"gone").await.unwrap(), None);
-            assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), header);
+            assert_eq!(std::fs::metadata(&segment).unwrap().len(), header);
         })
     }
 
     // A WAL of the earlier format: the start replays it, flushes it and
-    // replaces it with the header; the writes after it are LSN-framed, and
-    // the next start reads them back.
+    // replaces it with a segment directory that holds the header alone; the
+    // writes after it are LSN-framed, and the next start reads them back.
     #[test]
     fn test_start_upgrades_a_wal_of_the_earlier_format() {
         crate::core::engine_runtime::block_on(async {
@@ -4875,7 +4866,9 @@ mod tests {
             {
                 let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
                 let engine = engine_on_hub(&dir, &hub).await;
-                assert_eq!(std::fs::read(&wal_path).unwrap(), crate::core::wal::wal_header(5));
+                let segment = crate::core::wal::segment_path(&wal_path, 1);
+                assert_eq!(std::fs::read(segment).unwrap(), crate::core::wal::wal_header(5));
+                assert!(!dir.path().join("wal.log.migrating").exists());
                 assert_eq!(engine.last_applied_lsn(), 5, "the five records of the old WAL");
                 engine.put(b"after", b"upgrade").await.unwrap();
                 assert_eq!(engine.last_applied_lsn(), 6);
@@ -4998,13 +4991,14 @@ mod tests {
     }
 
     // The LSNs go on across a clean stop, whose log keeps its header alone,
-    // across a checkpoint's cut and across the cut of a start; a crash after
-    // each loses no write.
+    // across the drop of a segment and across the truncate of a start; a
+    // crash after each loses no write.
     #[test]
-    fn test_the_lsns_go_on_across_a_stop_a_checkpoint_and_a_start() {
+    fn test_the_lsns_go_on_across_a_stop_a_dropped_segment_and_a_start() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let wal_path = dir.path().join("wal.log");
+            let segment = |n| crate::core::wal::segment_path(&wal_path, n);
             let start = || async {
                 let hub = TestHub::start(&[(WalTarget::Kv, &wal_path)]);
                 (engine_on_hub(&dir, &hub).await, hub)
@@ -5019,13 +5013,17 @@ mod tests {
             }
             engine.shutdown().await;
             drop((engine, hub));
-            assert_eq!(std::fs::read(&wal_path).unwrap(), crate::core::wal::wal_header(50));
+            assert_eq!(std::fs::read(segment(1)).unwrap(), crate::core::wal::wal_header(50));
 
             let (engine, hub) = start().await;
             put(&engine, 51).await;
             assert_eq!(engine.last_applied_lsn(), 51);
-            engine.checkpoint().await.unwrap();
-            assert_eq!(std::fs::read(&wal_path).unwrap(), crate::core::wal::wal_header(51));
+            engine.wal.rotate().await.unwrap();
+            engine.raise_flushed_lsn(51).await.unwrap();
+            let segments = engine.wal.segments().await.unwrap();
+            engine.wal.drop_segments_before(&segments.dir, segments.active().segment).await.unwrap();
+            assert!(!segment(1).exists());
+            assert_eq!(std::fs::read(segment(2)).unwrap(), crate::core::wal::wal_header(51));
             drop((engine, hub)); // crash
 
             let (engine, hub) = start().await;
@@ -5034,7 +5032,7 @@ mod tests {
             drop((engine, hub)); // crash
 
             let (engine, hub) = start().await;
-            assert_eq!(std::fs::read(&wal_path).unwrap(), crate::core::wal::wal_header(52));
+            assert_eq!(std::fs::read(segment(2)).unwrap(), crate::core::wal::wal_header(52));
             put(&engine, 53).await;
             assert_eq!(engine.last_applied_lsn(), 53);
             drop((engine, hub)); // crash

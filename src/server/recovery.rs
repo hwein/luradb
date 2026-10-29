@@ -356,7 +356,12 @@ mod tests {
             } // crash
             let whole = files(&base.path().join("whole"));
             copy_tree(&base.path().join("streamed"), &base.path().join("whole"));
-            assert!(std::fs::metadata(&streamed.wal).unwrap().len() > 2 * 8 * THRESHOLD as u64);
+            let logged: u64 = crate::core::wal::segments_in(&streamed.wal)
+                .unwrap()
+                .iter()
+                .map(|(_, segment)| std::fs::metadata(segment).unwrap().len())
+                .sum();
+            assert!(logged > 2 * 8 * THRESHOLD as u64);
 
             let with_threshold = |threshold| {
                 move || LsmEngineOptions {
@@ -390,6 +395,115 @@ mod tests {
                 assert_eq!(instance.hlc().peek(), wholes[shard].hlc().peek());
             }
             assert_eq!(versions(&shards, &keys).await, versions(&wholes, &keys).await);
+        })
+    }
+
+    /// The number and size of each segment of the log directory `log`.
+    fn segment_files(log: &Path) -> Vec<(u64, u64)> {
+        let segments = crate::core::wal::segments_in(log).unwrap();
+        segments.into_iter().map(|(n, path)| (n, std::fs::metadata(path).unwrap().len())).collect()
+    }
+
+    // A start after a crash with four segments replays every record past
+    // each instance's flushed LSN; its truncate then leaves the last
+    // segment alone, holding its header, and the hub appends to it.
+    #[test]
+    fn a_start_after_a_crash_replays_four_segments_and_keeps_the_last() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = files(dir.path());
+            let domains = [domain_name_for_shard(0, 2, 3), domain_name_for_shard(1, 2, 3)];
+            let mut keys = Vec::new();
+            {
+                let hub = TestHub::with_segment_bytes(&[(WalTarget::Kv, &files.wal)], 512);
+                let shards = open_sharded(&files, 2, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+                for i in 0.. {
+                    if segment_files(&files.wal).len() >= 4 {
+                        break;
+                    }
+                    for (shard, domain) in domains.iter().enumerate() {
+                        let key = data_key(domain, &format!("k{i}"));
+                        shards[shard].put(&key, "clé ✓".repeat(10).as_bytes()).await.unwrap();
+                        keys.push((shard, key));
+                    }
+                    if i == 3 {
+                        shards[1].flush_all_memtables().await.unwrap();
+                    }
+                }
+            } // crash
+            let confirmed = keys.len();
+
+            let hub = TestHub::start(&[(WalTarget::Kv, &files.wal)]);
+            let shards = open_sharded(&files, 2, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+            hub.wal(WalTarget::Kv).truncate().await.unwrap();
+            let found = versions(&shards, &keys).await;
+            assert_eq!(found.iter().filter(|(read, _, _)| matches!(read, GetResult::Present(_))).count(), confirmed);
+            assert_eq!(segment_files(&files.wal), [(4, crate::core::wal::WAL_HEADER_LEN)]);
+            assert_eq!(hub.wal(WalTarget::Kv).segments().await.unwrap().active().segment, 4);
+        })
+    }
+
+    // A log of an earlier version, a single file with records, v2 or v3:
+    // the start replays it from where it moved, and the truncate after it
+    // removes it and leaves segment 1 alone, holding a header that starts at
+    // the log's last LSN.
+    #[test]
+    fn a_start_migrates_a_single_file_log_to_segments() {
+        crate::core::engine_runtime::block_on(async {
+            for version in [2u8, 3] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let files = files(dir.path());
+                let domains = [domain_name_for_shard(0, 1, 3)];
+                crash_after_writes(&files, &domains).await;
+                let mut log = std::fs::read(&files.wal).unwrap();
+                if version == 2 {
+                    log.splice(..crate::core::wal::WAL_HEADER_LEN as usize, *b"LURAWAL\x02");
+                }
+                std::fs::write(&files.wal, &log).unwrap();
+                let max_lsn = crate::core::wal::recover_all(&files.wal).await.unwrap().max_lsn;
+
+                let hub = TestHub::start(&[(WalTarget::Kv, &files.wal)]);
+                let shards = open_sharded(&files, 1, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+                assert!(dir.path().join("wal.migrating").exists(), "v{version}: kept until the truncate");
+                hub.wal(WalTarget::Kv).truncate().await.unwrap();
+
+                assert!(!dir.path().join("wal.migrating").exists(), "v{version}");
+                assert_eq!(segment_files(&files.wal), [(1, crate::core::wal::WAL_HEADER_LEN)], "v{version}");
+                let segment = std::fs::read(crate::core::wal::segment_path(&files.wal, 1)).unwrap();
+                assert_eq!(segment, crate::core::wal::wal_header(max_lsn), "v{version}");
+                let large = shards[0].get(&data_key(&domains[0], "large")).await.unwrap();
+                assert_eq!(large, Some("clé ✓".repeat(400).into_bytes()), "v{version}");
+            }
+        })
+    }
+
+    // A crash after the single-file log moved aside, before its directory
+    // was there, or after it was, before the truncate removed the file: the
+    // next start replays the moved file, its truncate removes it and the
+    // header starts at the file's last LSN.
+    #[test]
+    fn a_start_after_an_interrupted_migration_finishes_it() {
+        crate::core::engine_runtime::block_on(async {
+            for directory_there in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let files = files(dir.path());
+                let domains = [domain_name_for_shard(0, 1, 3)];
+                crash_after_writes(&files, &domains).await;
+                let max_lsn = crate::core::wal::recover_all(&files.wal).await.unwrap().max_lsn;
+                std::fs::rename(&files.wal, dir.path().join("wal.migrating")).unwrap();
+                if directory_there {
+                    std::fs::create_dir(&files.wal).unwrap();
+                    std::fs::write(crate::core::wal::segment_path(&files.wal, 1), crate::core::wal::wal_header(0)).unwrap();
+                }
+
+                let hub = TestHub::start(&[(WalTarget::Kv, &files.wal)]);
+                let shards = open_sharded(&files, 1, || hub.wal(WalTarget::Kv), LsmEngineOptions::default).await.unwrap();
+                hub.wal(WalTarget::Kv).truncate().await.unwrap();
+                assert!(!dir.path().join("wal.migrating").exists());
+                let segment = std::fs::read(crate::core::wal::segment_path(&files.wal, 1)).unwrap();
+                assert_eq!(segment, crate::core::wal::wal_header(max_lsn), "directory there {directory_there}");
+                assert!(shards[0].get(&data_key(&domains[0], "large")).await.unwrap().is_some());
+            }
         })
     }
 

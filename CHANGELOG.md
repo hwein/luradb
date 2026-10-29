@@ -70,6 +70,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: domain listings return the domains the API key has permissions on instead of 403 for non-admin keys; JSON and relational domain details are readable with a domain permission.
 - A failed fsync of the write-ahead log or value log stops the service with exit code 3 so the next start recovers from the write-ahead log; a start without room to recover exits with code 4, and the systemd unit does not restart after it.
 - **BREAKING** API: writes during a disk or memory shortage answer 507 Insufficient Storage instead of 500.
+- A start on a volume below the block threshold but with room for the recovery now starts with writes refused instead of exiting with code 4.
 
 ### Removed
 

@@ -2596,11 +2596,10 @@ mod tests {
         server.shutdown().unwrap();
     }
 
-    // Test 8: a start on a volume with less free space than the block
-    // threshold plus the write-ahead log recovering onto it fails with
-    // `NoRoomToRecover`, the exit code 4 error, before any engine opens.
-    // Without a log to recover, a start below the block threshold refuses
-    // writes from the outset.
+    // Test 8: a start on a volume with less free space than the write-ahead
+    // log recovering onto it fails with `NoRoomToRecover`, the exit code 4
+    // error, before any engine opens. With room for the log, a start below
+    // the block threshold refuses writes from the outset.
     #[test]
     fn a_start_without_room_to_recover_fails_with_exit_code_4() {
         use crate::control::resources::{tests::{FakeProbe, GB}, NoRoomToRecover};
@@ -2611,7 +2610,7 @@ mod tests {
         std::fs::create_dir_all(log).unwrap();
         std::fs::write(&segment, crate::core::wal::wal_header(0)).unwrap();
         let probe = FakeProbe::new();
-        probe.mount(dir.path(), 100 * GB, 2 * GB + 15);
+        probe.mount(dir.path(), 100 * GB, 15);
         test_hook::use_probe(&cfg.storage.system_dir, Arc::clone(&probe));
         let cfg = Arc::new(cfg);
 
@@ -2619,7 +2618,6 @@ mod tests {
         assert!(err.downcast_ref::<NoRoomToRecover>().is_some(), "{err:#}");
         assert!(std::fs::read_dir(dir.path().join("sstables")).unwrap().next().is_none(), "no engine was opened");
 
-        std::fs::remove_file(&segment).unwrap();
         probe.set_free(dir.path(), GB);
         let server = Server::start(cfg, &dir.path().join("luradb.toml")).unwrap();
         let addr = server.http_addr.expect("HTTP listener enabled");

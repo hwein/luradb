@@ -323,7 +323,7 @@ pub const EXIT_NO_ROOM_TO_RECOVER: u8 = 4;
 #[derive(Debug, thiserror::Error)]
 #[error(
     "not enough free disk space to recover: {volume} has {free} bytes free, the start needs {needed} \
-     (the block threshold and the write-ahead logs that recover onto the volume)"
+     (the write-ahead logs that recover onto the volume)"
 )]
 pub struct NoRoomToRecover {
     volume: String,
@@ -406,10 +406,9 @@ impl ResourceWatch {
     /// directory, relative ones under `base`, and the parents of the data
     /// files; finds the volumes they lie on and resolves the thresholds on
     /// each; refuses a volume the recovery writes to with less free than the
-    /// block threshold plus the write-ahead logs recovering onto it
-    /// ([`NoRoomToRecover`]); resolves the memory budget. Returns the watch,
-    /// whose state stays normal until its first [`Self::tick`], and its
-    /// start lines.
+    /// write-ahead logs recovering onto it ([`NoRoomToRecover`]); resolves
+    /// the memory budget. Returns the watch, whose state stays normal until
+    /// its first [`Self::tick`], and its start lines.
     pub fn start(config: &LuraConfig, base: &Path, probe: Arc<dyn Probe>) -> anyhow::Result<(Self, Vec<Notice>)> {
         let paths = create_data_dirs(config, base)?;
         let [warn, block, resume] = config.resources.disk_thresholds()?;
@@ -436,13 +435,12 @@ impl ResourceWatch {
             let on_volume = |path: &PathBuf| {
                 existing(path).and_then(|path| probe.space(&path).ok()).is_some_and(|space| space.device == volume.device)
             };
-            let recovering: u64 = engines
+            let needed: u64 = engines
                 .iter()
                 .filter(|engine| on_volume(&engine.sstables) || on_volume(&engine.vlog))
                 .map(|engine| wal_bytes(&engine.wal))
                 .sum();
-            let needed = volume.block + recovering;
-            if recovering > 0 && volume.space.free < needed {
+            if volume.space.free < needed {
                 return Err(NoRoomToRecover {
                     volume: volume.path.display().to_string(),
                     free: volume.space.free,
@@ -1103,10 +1101,9 @@ pub(crate) mod tests {
     }
 
     // Test 8: the start creates the data directories before it asks for any
-    // volume; a volume the recovery writes to needs the block threshold plus
-    // the write-ahead logs recovering onto it, or the start fails with
-    // `NoRoomToRecover`. A short volume without SSTables or value logs
-    // starts, and in the block.
+    // volume; a volume the recovery writes to needs the write-ahead logs
+    // recovering onto it, or the start fails with `NoRoomToRecover`. With
+    // that room, a volume below the block threshold starts, and in the block.
     #[test]
     fn test_the_start_needs_room_to_recover_on_the_volume_of_the_tables() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1119,24 +1116,24 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let probe = FakeProbe::new();
         probe.mount(dir.path(), 100 * GB, 50 * GB);
-        probe.mount(&data, 100 * GB, 2 * GB + 2999);
+        probe.mount(&data, 100 * GB, 2999);
         probe.mount(&wal, 100 * GB, 50 * GB);
         let err = ResourceWatch::start(&config, Path::new("/"), Arc::clone(&probe) as Arc<dyn Probe>).err().unwrap();
         let refused = err.downcast_ref::<NoRoomToRecover>().expect("NoRoomToRecover");
-        assert_eq!(refused.needed, 2 * GB + 3000);
+        assert_eq!(refused.needed, 3000);
         assert!(err.to_string().starts_with("not enough free disk space to recover"), "{err}");
         for name in ["db", "data/sstables", "data/sys", "wal"] {
             assert!(dir.path().join(name).is_dir(), "{name}");
         }
         assert!(!probe.asked.lock().is_empty() && probe.asked.lock().iter().all(|(_, existed)| *existed));
 
-        probe.set_free(&data, 2 * GB + 3000);
+        probe.set_free(&data, 3000);
         started(&config, &probe);
 
-        probe.set_free(&wal, GB);
+        probe.set_free(&data, GB);
         let (mut watch, _) = started(&config, &probe);
         watch.tick();
-        assert_eq!(watch.resources().level(), Level::Blocked, "the short log volume blocks writes");
+        assert_eq!(watch.resources().level(), Level::Blocked, "room to recover, below the block threshold");
     }
 
     // Test 6: a job that keeps waiting for disk space logs its first skip

@@ -30,7 +30,7 @@ use crate::storage::sstable::{SSTableBuilder, SSTableReader};
 use crate::storage::format::VersionState;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
-use crate::storage::write_failures::{WriteError, WriteFailures};
+use crate::storage::write_failures::{FailedIo, WriteError, WriteFailures};
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -517,8 +517,8 @@ pub struct LsmStorageEngine {
     resources: Resources,
     /// Compactions skipped for want of disk space.
     compaction_space: SpaceWait,
-    /// The value log appends and the flushes' SSTable writes that failed in
-    /// a row, reported where the WAL reports its own.
+    /// The value log appends and the flushes' SSTable writes and syncs that
+    /// failed in a row, reported where the WAL reports its own.
     vlog_failures: WriteFailures,
     flush_failures: WriteFailures,
     /// Failed flushes and compactions in a row, for their log lines.
@@ -2126,9 +2126,10 @@ impl LsmStorageEngine {
             }
             Err(e) => {
                 return Err(match e.downcast_ref::<WriteError>() {
-                    Some(failed) if self.flush_failures.stops_for(&failed.path, &failed.error) => {
-                        crate::storage::fatal_write_error(&failed.path, &failed.error)
-                    }
+                    Some(failed) if self.flush_failures.stops_for(&failed.path, &failed.error) => match failed.failed {
+                        FailedIo::Write => crate::storage::fatal_write_error(&failed.path, &failed.error),
+                        FailedIo::Sync => crate::storage::fatal_sync_error(&failed.path, &failed.error),
+                    },
                     _ => e,
                 });
             }
@@ -7354,6 +7355,52 @@ mod tests {
 
             assert!(engine.flush_memtable().await.unwrap().is_some(), "the flush goes on once it can write");
             assert_eq!(engine.get(b"k").await.unwrap().as_deref(), Some(&b"v"[..]));
+        })
+    }
+
+    // Test 2: a flush whose new SSTable cannot be synced counts as a failed
+    // write of its temporary file: the health report names it meanwhile, the
+    // third in a row stops the server with a sync error, a flush in between
+    // starts the row anew.
+    #[test]
+    fn test_failed_flush_syncs_stop_at_the_third_in_a_row() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sst = dir.path().join("sst");
+            let engine = engine_split(dir.path()).await.unwrap();
+            let io = engine.wal.io_failures().clone();
+            let temporary = |path: &str| Path::new(path).parent() == Some(sst.as_path()) && path.ends_with(".sst.tmp");
+
+            engine.put(b"a", b"v").await.unwrap();
+            engine.freeze_active_memtable();
+            test_fault::fail_next_syncs_in(&sst, 2);
+            for failures in 1..=2 {
+                assert!(engine.flush_memtable().await.is_err());
+                let report = io.report().unwrap();
+                assert_eq!(report.failures, failures);
+                assert!(temporary(&report.path), "{report:?}");
+            }
+            assert!(engine.flush_memtable().await.unwrap().is_some());
+            assert_eq!(io.report(), None);
+
+            engine.put(b"b", b"v").await.unwrap();
+            engine.freeze_active_memtable();
+            test_fault::fail_next_syncs_in(&sst, 3);
+            for failures in 1..=2 {
+                assert!(engine.flush_memtable().await.is_err());
+                assert_eq!(io.report().unwrap().failures, failures);
+            }
+            assert!(test_fault::stops_under(dir.path()).is_empty(), "a success starts the row anew");
+
+            let err = engine.flush_memtable().await.unwrap_err();
+            let stops = test_fault::stops_under(dir.path());
+            assert_eq!(stops.len(), 1, "{stops:?}");
+            assert!(temporary(&stops[0].display().to_string()), "{stops:?}");
+            let stopped = format!("data sync failed on {}", stops[0].display());
+            assert!(format!("{err:#}").contains(&stopped), "{err:#}");
+
+            assert!(engine.flush_memtable().await.unwrap().is_some(), "the flush goes on once it can sync");
+            assert_eq!(engine.get(b"b").await.unwrap().as_deref(), Some(&b"v"[..]));
         })
     }
 

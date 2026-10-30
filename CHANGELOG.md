@@ -75,6 +75,7 @@ All notable changes to LuraDB are documented in this file.
 - Compaction merges SSTables as a stream and writes one output file at a time; its memory no longer grows with the size of its inputs.
 - Compaction writes each data block as soon as it is complete; a compaction holds one block, the index and the Bloom filter of the file it is writing, not the whole output file.
 - A data write that fails with a read-only file system, or three times in a row with another I/O error, stops the service with exit code 3 so the next start recovers from the write-ahead log; the flush retries once a second instead of ten times, logs its error once and then every 60th time, and leaves no temporary files behind; the start removes temporary files an earlier run left.
+- A failed sync of a newly written SSTable counts like a failed write: `/health` reports it as degraded, and the third in a row stops the service with exit code 3.
 
 ### Removed
 

@@ -94,8 +94,8 @@ impl FileManager {
     /// Writes an SSTable to disk atomically.
     ///
     /// This uses a temporary file and atomic rename to ensure crash safety.
-    /// A failure deletes the temporary file; a failed creation, write or
-    /// rename comes as a [`WriteError`].
+    /// A failure deletes the temporary file; a failed creation, write, sync
+    /// or rename comes as a [`WriteError`].
     ///
     /// # Arguments
     /// * `file_id` - The file ID for this SSTable
@@ -210,8 +210,10 @@ async fn write_and_rename(temp_path: &Path, final_path: &Path, data: Vec<u8>) ->
     let compio::BufResult(written, data) = file.write_all_at(data, 0).await;
     written.map_err(WriteError::of(temp_path)).context("Failed to write data")?;
     #[cfg(test)]
-    crate::storage::test_fault::check_sync(temp_path).context("Failed to sync data")?;
-    file.sync_all().await.context("Failed to sync data")?;
+    crate::storage::test_fault::check_sync(temp_path)
+        .map_err(WriteError::sync_of(temp_path))
+        .context("Failed to sync data")?;
+    file.sync_all().await.map_err(WriteError::sync_of(temp_path)).context("Failed to sync data")?;
 
     #[cfg(test)]
     crate::storage::test_fault::check(final_path).map_err(WriteError::of(final_path)).context("Failed to rename file")?;
@@ -512,11 +514,13 @@ mod tests {
         })
     }
 
-    // Test 3: a flush whose sync or rename fails leaves no temporary file;
-    // the failed rename is a write error, the failed sync is not.
+    // Test 1: a flush whose sync or rename fails leaves no temporary file;
+    // the failed sync is a write error of the temporary file marked as a
+    // sync, the failed rename one of the final file.
     #[test]
     fn test_write_sstable_failing_to_sync_or_rename_leaves_no_file() -> Result<()> {
         use crate::storage::test_fault;
+        use crate::storage::write_failures::FailedIo;
         crate::core::engine_runtime::block_on(async {
             let temp_dir = TempDir::new()?;
             let manager = FileManager::new(temp_dir.path()).await?;
@@ -525,14 +529,17 @@ mod tests {
             test_fault::fail_syncs_of(&manager.temp_path(unsyncable));
             let synced = manager.write_sstable(unsyncable, b"data".to_vec()).await;
             test_fault::allow_syncs_of(&manager.temp_path(unsyncable));
-            assert!(synced.unwrap_err().downcast_ref::<WriteError>().is_none());
+            let failed = synced.unwrap_err();
+            let failed = failed.downcast_ref::<WriteError>().map(|e| (e.path.clone(), e.failed));
+            assert_eq!(failed, Some((manager.temp_path(unsyncable), FailedIo::Sync)));
 
             let unrenamable = manager.allocate_file_id();
             test_fault::fail_writes_of(&manager.file_path(unrenamable));
             let renamed = manager.write_sstable(unrenamable, b"data".to_vec()).await;
             test_fault::allow_writes_of(&manager.file_path(unrenamable));
             let failed = renamed.unwrap_err();
-            assert_eq!(failed.downcast_ref::<WriteError>().map(|e| e.path.clone()), Some(manager.file_path(unrenamable)));
+            let failed = failed.downcast_ref::<WriteError>().map(|e| (e.path.clone(), e.failed));
+            assert_eq!(failed, Some((manager.file_path(unrenamable), FailedIo::Write)));
 
             assert!(files_in(temp_dir.path()).is_empty());
             Ok(())

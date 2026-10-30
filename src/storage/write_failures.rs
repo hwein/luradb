@@ -87,19 +87,33 @@ impl Drop for WriteFailures {
     }
 }
 
-/// A failed write, creation or rename of the file `path`, told apart from
-/// a failed sync.
+/// The operation of a [`WriteError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedIo {
+    /// A creation, write or rename.
+    Write,
+    Sync,
+}
+
+/// A failed write of the file `path` that counts towards
+/// [`WriteFailures::stops_for`].
 #[derive(Debug, thiserror::Error)]
 #[error("{error}")]
 pub struct WriteError {
     pub path: PathBuf,
     pub error: std::io::Error,
+    pub failed: FailedIo,
 }
 
 impl WriteError {
-    /// The error of `path` for `map_err`.
+    /// The failed creation, write or rename of `path`, for `map_err`.
     pub fn of(path: &Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
-        move |error| Self { path: path.to_path_buf(), error }
+        move |error| Self { path: path.to_path_buf(), error, failed: FailedIo::Write }
+    }
+
+    /// The failed sync of `path`, for `map_err`.
+    pub fn sync_of(path: &Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
+        move |error| Self { path: path.to_path_buf(), error, failed: FailedIo::Sync }
     }
 }
 

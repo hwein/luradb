@@ -33,14 +33,7 @@ impl BloomFilter {
     /// # Returns
     /// A new Bloom filter sized appropriately for the given parameters
     pub fn new(num_items: usize, false_positive_rate: f64) -> Self {
-        // Calculate optimal number of bits: m = -n * ln(p) / (ln(2)^2)
-        // Round up to the nearest multiple of 8 so that num_bits == bits.len() * 8
-        // exactly.  This is critical for round-trip serialisation: from_bytes()
-        // reconstructs num_bits as bits.len() * 8, so unless num_bits was already
-        // a multiple of 8 the hash positions used by contains() would differ from
-        // those used during insert(), producing false negatives.
-        let num_bits = ((-(num_items as f64) * false_positive_rate.ln()
-            / (std::f64::consts::LN_2.powi(2))).ceil() as u64 + 7) & !7;
+        let num_bits = Self::bits_for(num_items, false_positive_rate);
 
         // Calculate optimal number of hash functions: k = m / n * ln(2)
         let num_hashes = ((num_bits as f64 / num_items as f64)
@@ -53,6 +46,31 @@ impl BloomFilter {
             num_hashes,
             num_bits,
         }
+    }
+
+    fn bits_for(num_items: usize, false_positive_rate: f64) -> u64 {
+        // Calculate optimal number of bits: m = -n * ln(p) / (ln(2)^2)
+        // Round up to the nearest multiple of 8 so that num_bits == bits.len() * 8
+        // exactly.  This is critical for round-trip serialisation: from_bytes()
+        // reconstructs num_bits as bits.len() * 8, so unless num_bits was already
+        // a multiple of 8 the hash positions used by contains() would differ from
+        // those used during insert(), producing false negatives.
+        ((-(num_items as f64) * false_positive_rate.ln()
+            / (std::f64::consts::LN_2.powi(2))).ceil() as u64 + 7) & !7
+    }
+
+    /// The most items a filter of this size was sized for at
+    /// `false_positive_rate`: the largest `n` whose [`Self::new`] takes no
+    /// more bits than this filter has.
+    pub fn capacity(&self, false_positive_rate: f64) -> usize {
+        // n = m * ln(2)^2 / -ln(p); one above it covers float rounding.
+        let estimate = (self.num_bits as f64 * std::f64::consts::LN_2.powi(2)
+            / -false_positive_rate.ln()) as usize;
+        let mut n = estimate + 1;
+        while n > 0 && Self::bits_for(n, false_positive_rate) > self.num_bits {
+            n -= 1;
+        }
+        n
     }
 
     /// Creates a Bloom filter from raw data.
@@ -223,5 +241,20 @@ mod tests {
     fn test_from_bytes_empty_bits_does_not_panic() {
         let filter = BloomFilter::from_bytes(Vec::new(), 3);
         assert!(filter.contains(b"x"));
+    }
+
+    // Read back from the stored bits, the capacity covers the items the filter
+    // was sized for, and a filter sized for it takes exactly as many bits.
+    #[test]
+    fn test_capacity_covers_the_items_the_filter_was_sized_for() {
+        for (n, expected) in [(0, 0), (1, 1), (257, 257), (10_000, 10_000), (1_000_000, 1_000_000)] {
+            let sized = BloomFilter::new(n, 0.01);
+            let stored = BloomFilter::from_bytes(sized.as_bytes().to_vec(), sized.num_hashes());
+            let capacity = stored.capacity(0.01);
+            assert_eq!(capacity, expected, "sized for {n}");
+            assert_eq!(BloomFilter::new(capacity, 0.01).as_bytes().len(), sized.as_bytes().len());
+        }
+        // 24 bits hold two items (19.2 bits) but not three (28.8 bits).
+        assert_eq!(BloomFilter::from_bytes(vec![0; 3], 1).capacity(0.01), 2);
     }
 }

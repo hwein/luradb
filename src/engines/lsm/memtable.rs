@@ -241,7 +241,6 @@ impl MemTable {
     }
 
     /// Returns the number of entries in the MemTable.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }

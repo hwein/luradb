@@ -72,6 +72,7 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: writes during a disk or memory shortage answer 507 Insufficient Storage instead of 500.
 - A start on a volume below the block threshold but with room for the recovery now starts with writes refused instead of exiting with code 4.
 - Compaction merges SSTables as a stream and writes one output file at a time; its memory no longer grows with the size of its inputs.
+- Compaction writes each data block as soon as it is complete; a compaction holds one block, the index and the Bloom filter of the file it is writing, not the whole output file.
 
 ### Removed
 

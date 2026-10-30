@@ -126,6 +126,26 @@ impl FileManager {
         .await
     }
 
+    /// Creates the temporary file of SSTable `file_id` for a writer that
+    /// renames it into place once finished.
+    pub async fn begin_sstable(&self, file_id: u64) -> Result<SSTableFileWriter> {
+        let temp_path = self.temp_path(file_id);
+        let path = temp_path.clone();
+        spawn_io(async move {
+            #[cfg(test)]
+            crate::storage::test_fault::check(&path)?;
+            OpenOptions::new().write(true).create(true).truncate(true).open(&path).await.map(drop)
+        })
+        .await
+        .context("Failed to create temporary file")?;
+        Ok(SSTableFileWriter {
+            temp_path,
+            final_path: self.file_path(file_id),
+            offset: 0,
+            buffer: Vec::with_capacity(WRITE_BUFFER_SIZE),
+        })
+    }
+
     /// Reads an SSTable from disk.
     ///
     /// # Arguments
@@ -172,6 +192,87 @@ impl FileManager {
     /// Returns the base directory.
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+}
+
+/// Bytes an [`SSTableFileWriter`] collects before it writes them.
+const WRITE_BUFFER_SIZE: usize = 1 << 20;
+
+/// Writes an SSTable piece by piece into its temporary file. Holds no open
+/// file between writes: compio's files are not `Send`, so each write opens
+/// it in its own I/O task.
+pub struct SSTableFileWriter {
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    /// File offset of the first byte in `buffer`.
+    offset: u64,
+    buffer: Vec<u8>,
+}
+
+impl SSTableFileWriter {
+    /// Appends `bytes` to the file.
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        crate::storage::test_fault::check(&self.temp_path).context("Failed to write data")?;
+        if self.buffer.len() + bytes.len() > WRITE_BUFFER_SIZE {
+            self.write_buffer().await?;
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn write_buffer(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let path = self.temp_path.clone();
+        let offset = self.offset;
+        let buffer = std::mem::take(&mut self.buffer);
+        let mut buffer = spawn_io(async move {
+            let mut file = OpenOptions::new().write(true).open(&path).await?;
+            let compio::BufResult(written, buffer) = file.write_all_at(buffer, offset).await;
+            written.map(|()| buffer)
+        })
+        .await
+        .context("Failed to write data")?;
+        self.offset += buffer.len() as u64;
+        buffer.clear();
+        self.buffer = buffer;
+        Ok(())
+    }
+
+    /// Writes what is left, syncs the file and renames it into place; on an
+    /// error the temporary file is deleted.
+    pub async fn finish(mut self) -> Result<()> {
+        let finished = self.sync_and_rename().await;
+        if finished.is_err() {
+            self.abort().await;
+        }
+        finished
+    }
+
+    async fn sync_and_rename(&mut self) -> Result<()> {
+        self.write_buffer().await?;
+        let temp_path = self.temp_path.clone();
+        let final_path = self.final_path.clone();
+        spawn_io(async move {
+            let file = OpenOptions::new().write(true).open(&temp_path).await.context("Failed to sync data")?;
+            #[cfg(test)]
+            crate::storage::test_fault::check_sync(&temp_path).context("Failed to sync data")?;
+            file.sync_all().await.context("Failed to sync data")?;
+            #[cfg(test)]
+            crate::storage::test_fault::check(&final_path).context("Failed to rename file")?;
+            compio::fs::rename(&temp_path, &final_path).await.context("Failed to rename file")
+        })
+        .await
+    }
+
+    /// Deletes the temporary file.
+    pub async fn abort(self) {
+        let path = self.temp_path.clone();
+        if let Err(e) = spawn_io(async move { compio::fs::remove_file(path).await }).await {
+            tracing::warn!("cannot delete {}: {e}", self.temp_path.display());
+        }
     }
 }
 
@@ -255,6 +356,101 @@ mod tests {
             let next_id = manager.allocate_file_id();
             assert_eq!(next_id, 3); // Should continue from highest existing ID
 
+            Ok(())
+        })
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // Pieces smaller and larger than the write buffer land in order in one
+    // file under its final name.
+    #[test]
+    fn test_sstable_writer_writes_the_pieces_in_order() -> Result<()> {
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let manager = FileManager::new(temp_dir.path()).await?;
+            let file_id = manager.allocate_file_id();
+
+            let mut writer = manager.begin_sstable(file_id).await?;
+            let mut expected = Vec::new();
+            for i in 0..600usize {
+                let len = if i == 300 { WRITE_BUFFER_SIZE * 3 / 2 } else { 4096 + i % 13 };
+                let piece = vec![(i % 251) as u8; len];
+                writer.write(&piece).await?;
+                expected.extend_from_slice(&piece);
+            }
+            writer.finish().await?;
+
+            assert!(expected.len() > 3 * WRITE_BUFFER_SIZE);
+            assert_eq!(std::fs::read(manager.file_path(file_id))?, expected);
+            assert_eq!(files_in(temp_dir.path()), [format!("sstable_{file_id:06}.sst")]);
+            Ok(())
+        })
+    }
+
+    // A temporary file that cannot be created or written: nothing stays once
+    // the writer is aborted.
+    #[test]
+    fn test_sstable_writer_failing_to_write_leaves_no_file() -> Result<()> {
+        use crate::storage::test_fault;
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let manager = FileManager::new(temp_dir.path()).await?;
+
+            let file_id = manager.allocate_file_id();
+            let uncreatable = manager.temp_path(file_id);
+            test_fault::fail_writes_of(&uncreatable);
+            let begun = manager.begin_sstable(file_id).await;
+            test_fault::allow_writes_of(&uncreatable);
+            assert!(begun.is_err());
+
+            let file_id = manager.allocate_file_id();
+            let mut writer = manager.begin_sstable(file_id).await?;
+            writer.write(b"first block").await?;
+            test_fault::fail_writes_of(&manager.temp_path(file_id));
+            let written = writer.write(b"second block").await;
+            test_fault::allow_writes_of(&manager.temp_path(file_id));
+            assert!(written.is_err());
+            writer.abort().await;
+
+            assert!(files_in(temp_dir.path()).is_empty());
+            Ok(())
+        })
+    }
+
+    // A failed sync or rename ends the finish without a file left.
+    #[test]
+    fn test_sstable_writer_failing_to_finish_leaves_no_file() -> Result<()> {
+        use crate::storage::test_fault;
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let manager = FileManager::new(temp_dir.path()).await?;
+
+            let unsyncable = manager.allocate_file_id();
+            let mut writer = manager.begin_sstable(unsyncable).await?;
+            writer.write(b"block").await?;
+            test_fault::fail_syncs_of(&manager.temp_path(unsyncable));
+            let synced = writer.finish().await;
+            test_fault::allow_syncs_of(&manager.temp_path(unsyncable));
+            assert!(synced.is_err());
+
+            let unrenamable = manager.allocate_file_id();
+            let mut writer = manager.begin_sstable(unrenamable).await?;
+            writer.write(b"block").await?;
+            test_fault::fail_writes_of(&manager.file_path(unrenamable));
+            let renamed = writer.finish().await;
+            test_fault::allow_writes_of(&manager.file_path(unrenamable));
+            assert!(renamed.is_err());
+
+            assert!(files_in(temp_dir.path()).is_empty());
             Ok(())
         })
     }

@@ -1,6 +1,6 @@
 use crate::core::coop;
 use crate::engines::lsm::block_cache::{BlockCacheKey, CachedBlock, StripedBlockCache};
-use crate::engines::lsm::key::Timestamp;
+use crate::engines::lsm::key::{InternalKey, Timestamp};
 use crate::storage::format::{
     ArchivedDataBlockValue, BlockHandle, BloomFilter, CachedValue, DataBlock, DataBlockValue,
     IndexBlock, NULL_OFFSET, SSTableFooter, TOMBSTONE_OFFSET, ValuePointer, VersionState,
@@ -13,6 +13,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const BLOCK_SIZE_TARGET: usize = 4096; // 4KB target for data blocks
+const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 
 /// True until `key` lies behind the run of keys that start with `prefix`.
 #[inline]
@@ -50,53 +51,73 @@ fn mvcc_inv_ts(key: &[u8]) -> u64 {
     }
 }
 
-pub struct SSTableBuilder {
-    data_blocks: Vec<DataBlock>,
-    current_block: DataBlock,
-    // (last_key, block_handle)
-    index: IndexBlock,
-    total_keys: usize,
+/// What a finished SSTable holds, known without reading it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SSTableSummary {
+    pub file_size: u64,
+    /// Smallest and largest encoded key, empty without entries.
+    pub smallest_key: Vec<u8>,
+    pub largest_key: Vec<u8>,
+    /// Highest raw MVCC timestamp of the keys.
+    pub max_timestamp: u64,
+    pub total_keys: usize,
 }
 
-impl Default for SSTableBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Builds an SSTable of keys added in sorted order. [`Self::take_encoded`]
+/// encodes the full data blocks and hands their bytes over, so that the
+/// builder keeps only the open block, the index and the Bloom filter.
+pub struct SSTableBuilder {
+    current_block: DataBlock,
+    /// Full blocks the next `take_encoded` or `finish` encodes.
+    full_blocks: Vec<DataBlock>,
+    index: IndexBlock,
+    /// Encoded bytes not handed over yet; they end at file offset `offset`.
+    encoded: Vec<u8>,
+    offset: u64,
+    filter: BloomFilterImpl,
+    total_keys: usize,
+    largest_key: Vec<u8>,
+    max_timestamp: u64,
 }
 
 impl SSTableBuilder {
-    pub fn new() -> Self {
+    /// A builder whose Bloom filter is sized for `filter_capacity` keys; more
+    /// keys raise its false positive rate.
+    pub fn new(filter_capacity: usize) -> Self {
         Self {
-            data_blocks: Vec::new(),
-            current_block: DataBlock {
-                entries: Vec::new(),
-            },
-            index: IndexBlock {
-                entries: Vec::new(),
-            },
+            current_block: DataBlock { entries: Vec::new() },
+            full_blocks: Vec::new(),
+            index: IndexBlock { entries: Vec::new() },
+            encoded: Vec::new(),
+            offset: 0,
+            filter: BloomFilterImpl::new(filter_capacity, BLOOM_FALSE_POSITIVE_RATE),
             total_keys: 0,
+            largest_key: Vec::new(),
+            max_timestamp: 0,
         }
     }
 
     /// Adds a key-value pointer pair (large value in VLog) to the SSTable.
     /// Keys must be added in sorted order.
     pub fn add(&mut self, key: Vec<u8>, value_pointer: ValuePointer) {
-        self.total_keys += 1;
-        self.current_block
-            .entries
-            .push((key, DataBlockValue::Pointer(value_pointer)));
-        if self.current_block.entries.len() * 16 > BLOCK_SIZE_TARGET {
-            self.finish_block();
-        }
+        self.push(key, DataBlockValue::Pointer(value_pointer));
     }
 
     /// Adds a key with inline value data (small value, no VLog) to the SSTable.
     /// Keys must be added in sorted order.
     pub fn add_inline(&mut self, key: Vec<u8>, data: Vec<u8>, expire_at: u64) {
+        self.push(key, DataBlockValue::Inline { data, expire_at });
+    }
+
+    fn push(&mut self, key: Vec<u8>, value: DataBlockValue) {
+        // Keyed on the user key so that reads at any snapshot timestamp hit.
+        self.filter.insert(mvcc_user_key(&key));
         self.total_keys += 1;
-        self.current_block
-            .entries
-            .push((key, DataBlockValue::Inline { data, expire_at }));
+        // Raw value, not `Timestamp::cmp` — that one sorts newest first.
+        if let Some(ts) = InternalKey::extract_timestamp(&key) {
+            self.max_timestamp = self.max_timestamp.max(ts.as_u64());
+        }
+        self.current_block.entries.push((key, value));
         if self.current_block.entries.len() * 16 > BLOCK_SIZE_TARGET {
             self.finish_block();
         }
@@ -106,72 +127,67 @@ impl SSTableBuilder {
         if self.current_block.entries.is_empty() {
             return;
         }
-        let block = std::mem::replace(
-            &mut self.current_block,
-            DataBlock {
-                entries: Vec::new(),
-            },
-        );
-
-        if let Some((first_key, _)) = block.entries.first() {
-            let handle = BlockHandle { offset: 0, size: 0 };
-            self.index
-                .entries
-                .push((first_key.clone(), handle));
-        }
-        self.data_blocks.push(block);
+        let block = std::mem::replace(&mut self.current_block, DataBlock { entries: Vec::new() });
+        self.full_blocks.push(block);
     }
 
-    /// Serializes the SSTable to a byte vector.
-    pub fn finish(mut self) -> anyhow::Result<Vec<u8>> {
-        self.finish_block();
+    /// Encodes the full blocks and hands over the bytes not handed over yet;
+    /// they continue the file where the last call's bytes ended.
+    pub fn take_encoded(&mut self) -> Result<Vec<u8>> {
+        self.encode_full_blocks()?;
+        Ok(std::mem::take(&mut self.encoded))
+    }
 
-        let mut buf = AlignedVec::new();
-
-        fn pad_to_align8(buf: &mut AlignedVec) {
-            let misalign = buf.len() % 8;
-            if misalign != 0 {
-                buf.extend_from_slice(&[0u8; 8][..8 - misalign]);
+    fn encode_full_blocks(&mut self) -> Result<()> {
+        for block in std::mem::take(&mut self.full_blocks) {
+            let bytes = rkyv::to_bytes::<rancor::Error>(&block)?;
+            let handle = BlockHandle { offset: self.offset, size: bytes.len() as u64 };
+            if let (Some((first_key, _)), Some((last_key, _))) = (block.entries.first(), block.entries.last()) {
+                self.index.entries.push((first_key.clone(), handle));
+                self.largest_key.clone_from(last_key);
             }
+            self.append(&bytes);
+            self.pad_to_align8();
         }
+        Ok(())
+    }
 
-        for (i, data_block) in self.data_blocks.iter().enumerate() {
-            let block_bytes = rkyv::to_bytes::<rancor::Error>(data_block)?;
+    fn append(&mut self, bytes: &[u8]) {
+        self.encoded.extend_from_slice(bytes);
+        self.offset += bytes.len() as u64;
+    }
 
-            let block_offset = buf.len() as u64;
-            let block_len = block_bytes.len() as u64;
-            self.index.entries[i].1.offset = block_offset;
-            self.index.entries[i].1.size = block_len;
-
-            buf.extend_from_slice(&block_bytes);
-            pad_to_align8(&mut buf);
+    fn pad_to_align8(&mut self) {
+        let misalign = (self.offset % 8) as usize;
+        if misalign != 0 {
+            self.append(&[0u8; 8][..8 - misalign]);
         }
+    }
+
+    /// Serializes the SSTable: every byte [`Self::take_encoded`] has not
+    /// handed over, the whole table if it was never called.
+    pub fn finish(self) -> Result<Vec<u8>> {
+        Ok(self.finish_with_summary()?.0)
+    }
+
+    /// [`Self::finish`] plus the summary of the whole table.
+    pub fn finish_with_summary(mut self) -> Result<(Vec<u8>, SSTableSummary)> {
+        self.finish_block();
+        self.encode_full_blocks()?;
 
         let index_bytes = rkyv::to_bytes::<rancor::Error>(&self.index)?;
-        let index_handle = BlockHandle {
-            offset: buf.len() as u64,
-            size: index_bytes.len() as u64,
-        };
-        buf.extend_from_slice(&index_bytes);
-        pad_to_align8(&mut buf);
+        let index_handle = BlockHandle { offset: self.offset, size: index_bytes.len() as u64 };
+        self.append(&index_bytes);
+        self.pad_to_align8();
 
-        // Sized for the keys actually written; keyed on the user key so that
-        // reads at any snapshot timestamp hit.
-        let mut filter = BloomFilterImpl::new(self.total_keys, 0.01);
-        for (key, _) in self.data_blocks.iter().flat_map(|block| &block.entries) {
-            filter.insert(mvcc_user_key(key));
-        }
         let bloom_filter = BloomFilter {
-            data: filter.as_bytes().to_vec(),
-            num_hashes: filter.num_hashes(),
+            data: self.filter.as_bytes().to_vec(),
+            num_hashes: self.filter.num_hashes(),
         };
         let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter)?;
-        let bloom_filter_handle = BlockHandle {
-            offset: buf.len() as u64,
-            size: bloom_bytes.len() as u64,
-        };
-        buf.extend_from_slice(&bloom_bytes);
-        pad_to_align8(&mut buf);
+        let bloom_filter_handle = BlockHandle { offset: self.offset, size: bloom_bytes.len() as u64 };
+        self.append(&bloom_bytes);
+        self.pad_to_align8();
 
         let footer = SSTableFooter {
             index_handle,
@@ -179,12 +195,24 @@ impl SSTableBuilder {
             checksum: 0,
         };
         let footer_bytes = rkyv::to_bytes::<rancor::Error>(&footer)?;
-        let footer_offset = buf.len() as u64;
-        buf.extend_from_slice(&footer_bytes);
+        let footer_offset = self.offset;
+        self.append(&footer_bytes);
+        self.append(&footer_offset.to_le_bytes());
 
-        buf.extend_from_slice(&footer_offset.to_le_bytes());
+        let summary = SSTableSummary {
+            file_size: self.offset,
+            smallest_key: self.index.entries.first().map(|(key, _)| key.clone()).unwrap_or_default(),
+            largest_key: self.largest_key,
+            max_timestamp: self.max_timestamp,
+            total_keys: self.total_keys,
+        };
+        Ok((self.encoded, summary))
+    }
 
-        Ok(buf.into_vec())
+    /// Entries the builder holds unencoded.
+    #[cfg(test)]
+    pub(crate) fn held_entries(&self) -> usize {
+        self.full_blocks.iter().chain([&self.current_block]).map(|block| block.entries.len()).sum()
     }
 }
 
@@ -320,6 +348,11 @@ impl SSTableReader {
             #[cfg(test)]
             blocks_read: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// The most keys the table's Bloom filter was sized for.
+    pub fn bloom_capacity(&self) -> usize {
+        self.bloom_filter.capacity(BLOOM_FALSE_POSITIVE_RATE)
     }
 
     /// Sets the file ID used as part of the block cache key.
@@ -812,7 +845,7 @@ mod tests {
     // block; pointers and the tombstone sentinel map to their variants.
     #[test]
     fn test_get_with_cache_returns_cached_value_variants() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(4);
         builder.add_inline(b"inline-key".to_vec(), b"hello-inline".to_vec(), 99);
         builder.add(
             b"pointer-key".to_vec(),
@@ -869,7 +902,7 @@ mod tests {
     fn test_get_with_cache_and_ts_uninverts_timestamp() -> anyhow::Result<()> {
         use crate::engines::lsm::key::InternalKey;
 
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(2);
         // Same user key, two versions. Encoded order is newest-first (the
         // inverted timestamp of the larger raw value sorts smaller), so the
         // ts=2000 entry must be added before the ts=1000 one.
@@ -899,7 +932,7 @@ mod tests {
     // blocks referencing the mapping.
     #[test]
     fn test_open_mmap_roundtrip() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(2);
         builder.add_inline(b"mkey".to_vec(), b"mval".to_vec(), 0);
         builder.add(
             b"pkey".to_vec(),
@@ -933,7 +966,7 @@ mod tests {
     // inline reads hit it from then on. An owned table sits in memory.
     #[tokio::test]
     async fn test_inline_read_gives_up_on_an_uncached_mapped_block() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add_inline(b"mkey".to_vec(), b"mval".to_vec(), 0);
         let bytes = builder.finish()?;
         let dir = tempfile::TempDir::new()?;
@@ -959,7 +992,7 @@ mod tests {
     fn mapped_table_with_a_cached_block(
         dir: &tempfile::TempDir,
     ) -> anyhow::Result<(SSTableReader, StripedBlockCache, CachedBlock)> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add_inline(b"mkey".to_vec(), b"mval".to_vec(), 0);
         let path = dir.path().join("table.sst");
         std::fs::write(&path, builder.finish()?)?;
@@ -1019,7 +1052,7 @@ mod tests {
     async fn test_only_an_inline_read_of_a_mapped_table_asks_whether_pages_are_resident() -> anyhow::Result<()> {
         let dir = tempfile::TempDir::new()?;
         let (mapped, cache, _) = mapped_table_with_a_cached_block(&dir)?;
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add_inline(b"mkey".to_vec(), b"mval".to_vec(), 0);
         let owned = SSTableReader::open(builder.finish()?)?;
         let owned_cache = StripedBlockCache::new(1024 * 1024, 0.1, 100);
@@ -1044,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_build_and_read_sstable() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(200);
         builder.add(
             b"key1".to_vec(),
             ValuePointer { file_id: 1, value_offset: 100, value_len: 10, expire_at: 0 },
@@ -1111,7 +1144,7 @@ mod tests {
 
     #[test]
     fn test_sstable_reader() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(100);
         for i in 1..=100 {
             builder.add(
                 format!("key{:03}", i).into_bytes(),
@@ -1148,7 +1181,7 @@ mod tests {
 
     #[test]
     fn test_inline_entry_read_without_vlog() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         let inline_data = b"small_value".to_vec();
         builder.add_inline(b"inline_key".to_vec(), inline_data.clone(), 0);
         let buf = builder.finish()?;
@@ -1170,7 +1203,7 @@ mod tests {
     // must be rejected with an `Err`, not panic (untrusted on-disk bytes).
     #[test]
     fn test_from_data_rejects_overflowing_index_handle() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add(
             b"key1".to_vec(),
             ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
@@ -1203,7 +1236,7 @@ mod tests {
     // Analog for bloom_filter_handle.
     #[test]
     fn test_from_data_rejects_overflowing_bloom_filter_handle() -> anyhow::Result<()> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add(
             b"key1".to_vec(),
             ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
@@ -1237,7 +1270,7 @@ mod tests {
     // points at an overflowing BlockHandle, to exercise the read path
     // (as opposed to the footer handles covered above).
     fn build_sstable_with_corrupt_block_handle() -> anyhow::Result<Vec<u8>> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add(
             b"key1".to_vec(),
             ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
@@ -1322,7 +1355,7 @@ mod tests {
     // corrupted/crafted bloom block (as opposed to bloom.rs's own unit test
     // for the from_bytes/hash defense-in-depth layer).
     fn build_sstable_with_empty_bloom_block(num_hashes: u32) -> anyhow::Result<Vec<u8>> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add(
             b"key1".to_vec(),
             ValuePointer { file_id: 1, value_offset: 1, value_len: 1, expire_at: 0 },
@@ -1421,7 +1454,7 @@ mod tests {
             .map(|(user_key, ts, live)| (encode(&user_key, ts), live))
             .collect();
         stored.sort();
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(stored.len());
         for (key, live) in stored {
             if live {
                 builder.add_inline(key, b"v".to_vec(), 0);
@@ -1603,7 +1636,7 @@ mod tests {
 
     /// `count` keys `spaced_key(first)`, `spaced_key(first + step)`, ... written at `ts`.
     fn spaced_table(first: usize, step: usize, count: usize, ts: u64) -> anyhow::Result<SSTableReader> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(count);
         for i in 0..count {
             builder.add_inline(encode(&spaced_key(first + i * step), ts), b"v".to_vec(), 0);
         }
@@ -1753,6 +1786,208 @@ mod tests {
         assert!(older.get_with_cache_and_ts(&key, &cache)?.is_some());
         let blocks_read = newer.blocks_read.load(Ordering::Relaxed);
         assert!(blocks_read <= 1, "read {blocks_read} blocks of the newer table");
+        Ok(())
+    }
+
+    /// The builder as it was before it streamed: every block stays in memory
+    /// until `finish` encodes the whole file.
+    struct InMemoryBuilder {
+        data_blocks: Vec<DataBlock>,
+        current_block: DataBlock,
+        index: IndexBlock,
+        filter_capacity: usize,
+    }
+
+    impl InMemoryBuilder {
+        fn new(filter_capacity: usize) -> Self {
+            Self {
+                data_blocks: Vec::new(),
+                current_block: DataBlock { entries: Vec::new() },
+                index: IndexBlock { entries: Vec::new() },
+                filter_capacity,
+            }
+        }
+
+        fn add(&mut self, key: Vec<u8>, value: DataBlockValue) {
+            self.current_block.entries.push((key, value));
+            if self.current_block.entries.len() * 16 > BLOCK_SIZE_TARGET {
+                self.finish_block();
+            }
+        }
+
+        fn finish_block(&mut self) {
+            if self.current_block.entries.is_empty() {
+                return;
+            }
+            let block = std::mem::replace(&mut self.current_block, DataBlock { entries: Vec::new() });
+            if let Some((first_key, _)) = block.entries.first() {
+                self.index.entries.push((first_key.clone(), BlockHandle { offset: 0, size: 0 }));
+            }
+            self.data_blocks.push(block);
+        }
+
+        fn finish(mut self) -> anyhow::Result<Vec<u8>> {
+            self.finish_block();
+
+            let mut buf = AlignedVec::new();
+
+            fn pad_to_align8(buf: &mut AlignedVec) {
+                let misalign = buf.len() % 8;
+                if misalign != 0 {
+                    buf.extend_from_slice(&[0u8; 8][..8 - misalign]);
+                }
+            }
+
+            for (i, data_block) in self.data_blocks.iter().enumerate() {
+                let block_bytes = rkyv::to_bytes::<rancor::Error>(data_block)?;
+
+                let block_offset = buf.len() as u64;
+                let block_len = block_bytes.len() as u64;
+                self.index.entries[i].1.offset = block_offset;
+                self.index.entries[i].1.size = block_len;
+
+                buf.extend_from_slice(&block_bytes);
+                pad_to_align8(&mut buf);
+            }
+
+            let index_bytes = rkyv::to_bytes::<rancor::Error>(&self.index)?;
+            let index_handle = BlockHandle {
+                offset: buf.len() as u64,
+                size: index_bytes.len() as u64,
+            };
+            buf.extend_from_slice(&index_bytes);
+            pad_to_align8(&mut buf);
+
+            let mut filter = BloomFilterImpl::new(self.filter_capacity, 0.01);
+            for (key, _) in self.data_blocks.iter().flat_map(|block| &block.entries) {
+                filter.insert(mvcc_user_key(key));
+            }
+            let bloom_filter = BloomFilter {
+                data: filter.as_bytes().to_vec(),
+                num_hashes: filter.num_hashes(),
+            };
+            let bloom_bytes = rkyv::to_bytes::<rancor::Error>(&bloom_filter)?;
+            let bloom_filter_handle = BlockHandle {
+                offset: buf.len() as u64,
+                size: bloom_bytes.len() as u64,
+            };
+            buf.extend_from_slice(&bloom_bytes);
+            pad_to_align8(&mut buf);
+
+            let footer = SSTableFooter {
+                index_handle,
+                bloom_filter_handle,
+                checksum: 0,
+            };
+            let footer_bytes = rkyv::to_bytes::<rancor::Error>(&footer)?;
+            let footer_offset = buf.len() as u64;
+            buf.extend_from_slice(&footer_bytes);
+
+            buf.extend_from_slice(&footer_offset.to_le_bytes());
+
+            Ok(buf.into_vec())
+        }
+    }
+
+    fn add_entry(builder: &mut SSTableBuilder, key: Vec<u8>, value: DataBlockValue) {
+        match value {
+            DataBlockValue::Pointer(vp) => builder.add(key, vp),
+            DataBlockValue::Inline { data, expire_at } => builder.add_inline(key, data, expire_at),
+        }
+    }
+
+    /// `count` sorted entries stamped 1 to 9: vLog pointers, tombstones and
+    /// inline values of odd lengths, some with an expiry.
+    fn mixed_entries(count: usize) -> Vec<(Vec<u8>, DataBlockValue)> {
+        (0..count)
+            .map(|i| {
+                let key = encode(format!("key-{i:05}").as_bytes(), 1 + (i as u64 * 7) % 9);
+                let value = match i % 4 {
+                    0 => DataBlockValue::Pointer(ValuePointer {
+                        file_id: 2, value_offset: i as u64 * 100, value_len: 90, expire_at: 0,
+                    }),
+                    1 => DataBlockValue::Pointer(ValuePointer {
+                        file_id: 0, value_offset: TOMBSTONE_OFFSET, value_len: 0, expire_at: 0,
+                    }),
+                    2 => DataBlockValue::Inline { data: vec![b'v'; i % 13], expire_at: i as u64 },
+                    _ => DataBlockValue::Inline { data: "clé".into(), expire_at: 0 },
+                };
+                (key, value)
+            })
+            .collect()
+    }
+
+    // Every byte as the in-memory builder wrote it with the same filter
+    // capacity (the key count, as a flush sizes it, or more), whether the
+    // full blocks are taken as they fill or all at the end; a block is handed
+    // over as soon as it is full.
+    #[test]
+    fn test_streaming_builder_writes_the_bytes_of_the_in_memory_builder() -> anyhow::Result<()> {
+        let fixture = |n| -> Vec<(Vec<u8>, DataBlockValue)> {
+            match n {
+                0 => Vec::new(),
+                1 => mixed_entries(1),
+                2 => mixed_entries(3 * ENTRIES_PER_BLOCK + 17),
+                _ => [b"a".as_slice(), b"bb", b"ccc"]
+                    .into_iter()
+                    .map(|key| (key.to_vec(), DataBlockValue::Inline { data: b"v".to_vec(), expire_at: 0 }))
+                    .collect(),
+            }
+        };
+
+        for n in 0..4 {
+            let count = fixture(n).len();
+            for capacity in [count, 2 * count + 100] {
+                let mut in_memory = InMemoryBuilder::new(capacity);
+                for (key, value) in fixture(n) {
+                    in_memory.add(key, value);
+                }
+                let expected = in_memory.finish()?;
+
+                let mut whole = SSTableBuilder::new(capacity);
+                for (key, value) in fixture(n) {
+                    add_entry(&mut whole, key, value);
+                }
+                assert_eq!(whole.finish()?, expected, "{count} entries at once, capacity {capacity}");
+
+                let mut streaming = SSTableBuilder::new(capacity);
+                let mut streamed = Vec::new();
+                let mut handed_over = Vec::new();
+                for (added, (key, value)) in (1..).zip(fixture(n)) {
+                    add_entry(&mut streaming, key, value);
+                    let encoded = streaming.take_encoded()?;
+                    if !encoded.is_empty() {
+                        handed_over.push(added);
+                    }
+                    streamed.extend(encoded);
+                }
+                let (tail, summary) = streaming.finish_with_summary()?;
+                streamed.extend(tail);
+                assert_eq!(streamed, expected, "{count} entries streamed, capacity {capacity}");
+                let full_blocks: Vec<usize> = (1..=count / ENTRIES_PER_BLOCK).map(|b| b * ENTRIES_PER_BLOCK).collect();
+                assert_eq!(handed_over, full_blocks);
+                assert_eq!(summary.file_size, expected.len() as u64);
+                assert_eq!(summary.total_keys, count);
+            }
+        }
+        Ok(())
+    }
+
+    // The summary carries the key range and newest stamp of the entries.
+    #[test]
+    fn test_builder_summary_describes_the_entries() -> anyhow::Result<()> {
+        let count = 2 * ENTRIES_PER_BLOCK + 5;
+        let mut builder = SSTableBuilder::new(count);
+        for (key, value) in mixed_entries(count) {
+            add_entry(&mut builder, key, value);
+        }
+        let (_, summary) = builder.finish_with_summary()?;
+        assert_eq!(summary.smallest_key, encode(b"key-00000", 1));
+        assert_eq!(summary.largest_key, mixed_entries(count).pop().unwrap().0);
+        assert_eq!(summary.max_timestamp, 9);
+
+        let (_, empty) = SSTableBuilder::new(0).finish_with_summary()?;
+        assert_eq!((empty.smallest_key, empty.largest_key, empty.max_timestamp, empty.total_keys), (vec![], vec![], 0, 0));
         Ok(())
     }
 

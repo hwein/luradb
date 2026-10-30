@@ -1989,7 +1989,7 @@ impl LsmStorageEngine {
     /// Builds the SSTable of an already-claimed MemTable, installs it in L0 and
     /// persists the manifest. Any error leaves the claim to [`Self::abort_flush`].
     async fn write_memtable_to_l0(&self, memtable_to_flush: &Arc<MemTable>) -> Result<u64> {
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(memtable_to_flush.len());
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
         let mut max_timestamp = 0u64;
@@ -2217,7 +2217,7 @@ impl LsmStorageEngine {
         let tgt_sstables = self.open_sstable_readers(&tgt_metas, use_mmap).await?;
 
         let job = CompactionJob::new(src_sstables, tgt_sstables, config);
-        let new_metas = self.write_compacted_sstables(&job, target_level, use_mmap).await?;
+        let new_metas = self.write_compacted_sstables(&job, target_level).await?;
 
         // Before the manifest changes in memory, not just before its save: a
         // flush may save the shared manifest from then on, and a saved
@@ -2278,41 +2278,43 @@ impl LsmStorageEngine {
         Ok(sstables)
     }
 
-    /// Builds, writes and syncs `job`'s output SSTables one at a time and
-    /// returns their target-level metadata. On an error it deletes the files
-    /// it wrote: no manifest names them yet.
+    /// Writes and syncs `job`'s output SSTables one at a time and returns
+    /// their target-level metadata. On an error it deletes the files it
+    /// wrote, the unfinished one included: no manifest names them yet.
     async fn write_compacted_sstables(
         &self,
         job: &CompactionJob,
         target_level: usize,
-        use_mmap: bool,
     ) -> Result<Vec<SSTableMetadata>> {
         let mut written = Vec::new();
         let result = async {
             let mut run = job.compact()?;
             let mut new_metas = Vec::new();
-            while let Some(sstable_data) = run.next_sstable()? {
+            // A temporary file only once an entry for it is known.
+            while run.has_next()? {
                 let file_id = self.file_manager.allocate_file_id();
-                let file_size = sstable_data.len() as u64;
-                let sstable_data = self.file_manager.write_sstable(file_id, sstable_data).await?;
-                written.push(file_id);
-
-                // Transient reader for the key range only; serving readers are
-                // opened in the rebuild below.
-                let sstable = if use_mmap {
-                    SSTableReader::open_mmap(&self.file_manager.file_path(file_id))?
-                } else {
-                    SSTableReader::open(sstable_data)?
+                let mut writer = self.file_manager.begin_sstable(file_id).await?;
+                let summary = match run.next_sstable(&mut writer).await {
+                    Ok(Some(summary)) => summary,
+                    Ok(None) => {
+                        writer.abort().await;
+                        break;
+                    }
+                    Err(e) => {
+                        writer.abort().await;
+                        return Err(e);
+                    }
                 };
-                let (smallest_key, largest_key, max_timestamp) = Self::sstable_key_range(&sstable)?;
+                writer.finish().await?;
+                written.push(file_id);
 
                 new_metas.push(SSTableMetadata {
                     file_id,
                     level: target_level,
-                    smallest_key,
-                    largest_key,
-                    file_size,
-                    max_timestamp,
+                    smallest_key: summary.smallest_key,
+                    largest_key: summary.largest_key,
+                    file_size: summary.file_size,
+                    max_timestamp: summary.max_timestamp,
                 });
             }
             Ok(new_metas)
@@ -2331,7 +2333,8 @@ impl LsmStorageEngine {
 
     /// Smallest/largest encoded key in `sstable` (empty vecs when it has none)
     /// plus its highest raw MVCC timestamp (`SSTableMetadata::max_timestamp`).
-    fn sstable_key_range(sstable: &SSTableReader) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+    #[cfg(test)]
+    pub(crate) fn sstable_key_range(sstable: &SSTableReader) -> Result<(Vec<u8>, Vec<u8>, u64)> {
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
         let mut max_timestamp = 0u64;
@@ -7981,22 +7984,42 @@ mod tests {
         })
     }
 
-    // A compaction whose second output file cannot be written deletes the
+    // A compaction whose second output file cannot be created deletes the
     // first one, keeps its inputs and leaves the manifest as it was.
     #[test]
     fn test_compaction_failing_on_its_second_file_deletes_the_first() {
+        compaction_failing_on_its_second_file("sst.tmp", test_fault::fail_writes_of, test_fault::allow_writes_of);
+    }
+
+    // Likewise when the second file is written but cannot be synced, and
+    // its temporary file goes too.
+    #[test]
+    fn test_compaction_failing_to_sync_its_second_file_deletes_both() {
+        compaction_failing_on_its_second_file("sst.tmp", test_fault::fail_syncs_of, test_fault::allow_syncs_of);
+    }
+
+    // Likewise when the second file cannot be renamed into place.
+    #[test]
+    fn test_compaction_failing_to_rename_its_second_file_deletes_both() {
+        compaction_failing_on_its_second_file("sst", test_fault::fail_writes_of, test_fault::allow_writes_of);
+    }
+
+    /// Compacts two tables into three files while `fail` holds for the
+    /// second file's name with `extension`; the compaction fails without a
+    /// file of its own left.
+    fn compaction_failing_on_its_second_file(extension: &str, fail: fn(&Path), allow: fn(&Path)) {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let sst = dir.path().join("sst");
             let engine = engine_split_with(dir.path(), compaction_file_size(2000)).await.unwrap();
             let inputs = two_overlapping_tables(&engine).await;
             let first_output = inputs[1] + 1;
-            let second_output = sst.join(format!("sstable_{:06}.sst.tmp", first_output + 1));
+            let second_output = sst.join(format!("sstable_{:06}.{extension}", first_output + 1));
 
             test_trace::watch(dir.path());
-            test_fault::fail_writes_of(&second_output);
+            fail(&second_output);
             let compacted = engine.compact_level(0).await;
-            test_fault::allow_writes_of(&second_output);
+            allow(&second_output);
 
             assert!(compacted.is_err());
             assert_eq!(test_trace::steps(dir.path()), [format!("delete sst/sstable_{first_output:06}.sst")]);

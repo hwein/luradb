@@ -81,6 +81,7 @@ jobs:
           $(cat /tmp/commits.txt)"
           claude -p "$prompt" \
             --max-turns 400 \
+            --max-budget-usd 25 \
             --allowedTools "Read,Grep,Glob,Bash(git:*),Bash(gh:*),Bash(cargo:*),Bash(ls:*),Bash(wc:*)" \
             --output-format json > /tmp/review.json
           jq -r '.result' /tmp/review.json >> "$GITHUB_STEP_SUMMARY"

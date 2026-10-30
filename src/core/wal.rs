@@ -3,6 +3,9 @@ use crate::core::storage_thread::{
     apply_unsafe_end_marker, ensure_header, mark_unsafe_end, unmark_unsafe_end, unsafe_end_marker, Faults,
 };
 use crate::core::storage_thread::{StorageHandle, WalMark, WalPermit, WalSegments, WalTarget};
+use crate::storage::write_failures::IoFailures;
+#[cfg(test)]
+use crate::storage::write_failures::WriteFailures;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::SeekFrom;
@@ -523,6 +526,7 @@ enum WalMode {
 
 pub struct WriteAheadLog {
     inner: WalMode,
+    io: IoFailures,
 }
 
 /// A slot reserved in the queue to the log; [`Self::send`] fills it.
@@ -563,17 +567,25 @@ impl WriteAheadLog {
     /// Tests only: [`Self::new`] with a queue of `capacity` records.
     #[cfg(test)]
     pub async fn with_capacity(path: impl AsRef<Path>, capacity: usize) -> Result<Self, WalError> {
-        let wal = LocalWal::open(path.as_ref()).await?;
+        let io = IoFailures::default();
+        let wal = LocalWal::open(path.as_ref(), &io).await?;
         let (sender, receiver) = mpsc::channel(capacity);
         compio::runtime::spawn(run_committer(wal, receiver)).detach();
 
-        Ok(Self { inner: WalMode::Local(sender) })
+        Ok(Self { inner: WalMode::Local(sender), io })
     }
 
     /// Routes all I/O of `engine`'s WAL through the storage hub. The hub owns
     /// the file; this WAL keeps no file handle of its own.
     pub fn with_storage_handle(handle: StorageHandle, engine: WalTarget) -> Self {
-        Self { inner: WalMode::Remote { handle, engine } }
+        let io = handle.io_failures().clone();
+        Self { inner: WalMode::Remote { handle, engine }, io }
+    }
+
+    /// Where the log's failed writes are reported; the engine writing to it
+    /// reports its own there too.
+    pub fn io_failures(&self) -> &IoFailures {
+        &self.io
     }
 
     /// Waits for a slot in the queue to the log. A writer reserves before it
@@ -749,12 +761,13 @@ struct LocalWal {
     /// How a sync of the file failed: the server stops as soon as the end
     /// of the failed group is safe for the next open.
     failed_sync: Option<String>,
+    write_failures: WriteFailures,
     faults: Faults,
 }
 
 #[cfg(test)]
 impl LocalWal {
-    async fn open(path: &Path) -> Result<Self, WalError> {
+    async fn open(path: &Path, io: &IoFailures) -> Result<Self, WalError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -776,6 +789,7 @@ impl LocalWal {
             awaits_truncate: start_lsn.is_none(),
             unsafe_end: false,
             failed_sync: None,
+            write_failures: WriteFailures::new(io),
             faults: Faults::default(),
         })
     }
@@ -783,7 +797,8 @@ impl LocalWal {
     /// A failed write or sync cuts the file back to the cursor, which stays
     /// where it was. A failed sync stops the server once the end is safe:
     /// the file cut back or the cursor in the marker; until then the next
-    /// group makes it safe first.
+    /// group makes it safe first. A failed write that stops the server
+    /// ([`WriteFailures::stops_for`]) stops it after the cut.
     async fn write_at_cursor(&mut self, data: &[u8]) -> std::io::Result<()> {
         if self.awaits_truncate {
             return Err(appends_refused());
@@ -800,12 +815,24 @@ impl LocalWal {
             }
             cut.map_err(|(failed, _)| failed)?;
         }
-        let written = async {
-            self.file.seek(std::io::SeekFrom::Start(self.offset)).await?;
-            self.file.write_all(data).await?;
-            self.file.flush().await
-        }
-        .await;
+        let written = match self.faults.write.take() {
+            Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            None => {
+                async {
+                    self.file.seek(std::io::SeekFrom::Start(self.offset)).await?;
+                    self.file.write_all(data).await?;
+                    self.file.flush().await
+                }
+                .await
+            }
+        };
+        let stops = match &written {
+            Ok(()) => {
+                self.write_failures.succeeded();
+                false
+            }
+            Err(e) => self.write_failures.stops_for(&self.path, e),
+        };
         let result = match written {
             Ok(()) => {
                 let synced = if std::mem::take(&mut self.faults.sync) {
@@ -820,7 +847,7 @@ impl LocalWal {
             }
             failed => failed,
         };
-        if result.is_err() {
+        if let Err(e) = &result {
             let secured = match self.cut_to_cursor().await {
                 Ok(()) => true,
                 Err((failed, secured)) => {
@@ -828,6 +855,9 @@ impl LocalWal {
                     secured
                 }
             };
+            if stops {
+                return Err(std::io::Error::other(crate::storage::fatal_write_error(&self.path, e)));
+            }
             if secured {
                 if let Some(stop) = self.stop_after_failed_sync() {
                     return Err(stop);
@@ -1162,7 +1192,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("wal");
-            let mut wal = LocalWal::open(&path).await.unwrap();
+            let mut wal = LocalWal::open(&path, &IoFailures::default()).await.unwrap();
             assert_eq!(commit_group(&mut wal, vec![b"kept".to_vec()]).await[0].as_ref().unwrap(), &(16, 1));
 
             wal.faults.sync = true;
@@ -1184,7 +1214,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("wal");
-            let mut wal = LocalWal::open(&path).await.unwrap();
+            let mut wal = LocalWal::open(&path, &IoFailures::default()).await.unwrap();
 
             wal.faults.sync = true;
             let long = vec![delete_record(b"lost-with-a-long-key"), delete_record(b"lost-as-well")];
@@ -1194,6 +1224,33 @@ mod tests {
             let kept = commit_group(&mut wal, vec![delete_record(b"kept")]).await;
             assert_eq!(kept[0].as_ref().unwrap(), &(16, 1));
             assert_eq!(recovered_keys(&path).await, ["kept"]);
+        })
+    }
+
+    // Test 1: a write failing on a read-only file system stops the server
+    // at once; another I/O error at the third failure in a row, a success in
+    // between starts the row anew; a full file system never.
+    #[test]
+    fn test_failed_writes_stop_on_a_read_only_file_system_or_the_third_in_a_row() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal");
+            let mut wal = LocalWal::open(&path, &IoFailures::default()).await.unwrap();
+            let stops = || crate::storage::test_fault::stops_under(dir.path());
+            for errno in [Some(libc::ENOSPC), Some(libc::ENOSPC), Some(libc::ENOSPC), Some(libc::EIO), Some(libc::EIO), None, Some(libc::EIO), Some(libc::EIO)] {
+                wal.faults.write = errno;
+                assert_eq!(commit_group(&mut wal, vec![delete_record(b"key")]).await[0].is_ok(), errno.is_none());
+            }
+            assert!(stops().is_empty(), "a success starts the row anew");
+
+            wal.faults.write = Some(libc::EIO);
+            let failed = commit_group(&mut wal, vec![delete_record(b"key")]).await;
+            assert!(failed[0].as_ref().unwrap_err().to_string().contains("data write failed on"), "{failed:?}");
+            assert_eq!(stops(), std::slice::from_ref(&path));
+
+            wal.faults.write = Some(libc::EROFS);
+            assert!(commit_group(&mut wal, vec![delete_record(b"key")]).await[0].is_err());
+            assert_eq!(stops(), [path.clone(), path]);
         })
     }
 
@@ -1221,7 +1278,7 @@ mod tests {
     /// The local committer at `path` after a group whose cut failed: the log
     /// holds `kept-one`, which ends at the returned cursor, and a tail past it.
     async fn wal_after_a_failed_cut(path: &Path) -> (LocalWal, u64) {
-        let mut wal = LocalWal::open(path).await.unwrap();
+        let mut wal = LocalWal::open(path, &IoFailures::default()).await.unwrap();
         assert!(commit_group(&mut wal, vec![delete_record(b"kept-one")]).await[0].is_ok());
         let start = wal.offset;
 
@@ -1244,7 +1301,7 @@ mod tests {
             assert_eq!(std::fs::read(&marker).unwrap(), start.to_be_bytes());
             drop(wal);
 
-            let mut wal = LocalWal::open(&path).await.unwrap();
+            let mut wal = LocalWal::open(&path, &IoFailures::default()).await.unwrap();
             assert_eq!(std::fs::metadata(&path).unwrap().len(), start);
             assert_eq!(wal.offset, start);
             assert!(!marker.exists());

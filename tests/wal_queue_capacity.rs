@@ -48,6 +48,7 @@ async fn run_cell(capacity: usize, writers: usize, writes: usize) -> (f64, Durat
         channel_capacity: capacity,
         cpu: STORAGE_THREAD_CPU,
         segment_bytes: WAL_SEGMENT_BYTES,
+        io: Default::default(),
     };
     let (mut hub, handle) = StorageThread::new(config, vec![(WalTarget::Kv, wal_path.clone())]).unwrap();
     let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));

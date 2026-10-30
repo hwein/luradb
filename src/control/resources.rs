@@ -5,6 +5,7 @@
 
 use crate::config::{LuraConfig, MIN_MEMORY_BUDGET};
 use crate::control::system;
+use crate::storage::write_failures::IoFailures;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::os::unix::ffi::OsStrExt;
@@ -19,7 +20,7 @@ pub const RESOURCE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// What a refused write tells the client to wait, in seconds.
 pub const RETRY_AFTER_SECS: u64 = 5;
 /// A state that lasts repeats its log line every this many ticks.
-const REPEAT_TICKS: u64 = 60;
+pub(crate) const REPEAT_TICKS: u64 = 60;
 const MIN_DISK_FREE_BLOCK: u64 = 64 * 1024 * 1024;
 /// Memory warns from, refuses writes from and resumes below these shares of
 /// the budget, in percent.
@@ -80,6 +81,7 @@ struct Shared {
     report: RwLock<ResourceReport>,
     /// The watch's probe; the host's without a watch.
     probe: Option<Arc<dyn Probe>>,
+    io: IoFailures,
 }
 
 impl Resources {
@@ -119,6 +121,11 @@ impl Resources {
     /// The state for the health report and the metrics.
     pub fn report(&self) -> ResourceReport {
         self.0.report.read().clone()
+    }
+
+    /// The failed writes of the data files, for the health report.
+    pub fn io(&self) -> &IoFailures {
+        &self.0.io
     }
 
     /// The bytes free on the volume of `path`, which exists; `None` when

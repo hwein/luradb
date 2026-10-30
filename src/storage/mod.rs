@@ -4,6 +4,7 @@ pub mod vlog;
 pub mod bloom;
 pub mod file_manager;
 pub mod manifest;
+pub mod write_failures;
 #[cfg(test)]
 pub(crate) mod test_fault;
 #[cfg(test)]
@@ -58,7 +59,7 @@ async fn first_failed_sync(dirs: &[&Path]) -> anyhow::Result<Option<(PathBuf, an
     Ok(synced.await?)
 }
 
-/// The exit code of a stop after a failed sync.
+/// The exit code of a stop after a failed sync or lasting write failures.
 pub const EXIT_SYNC_FAILED: u8 = 3;
 
 /// Stops the server after a failed sync of a file or directory it would go
@@ -69,8 +70,20 @@ pub const EXIT_SYNC_FAILED: u8 = 3;
 /// with [`EXIT_SYNC_FAILED`]; the next start recovers from the write-ahead
 /// log. In tests the stop is recorded and its error returned instead.
 pub fn fatal_sync_error(path: &Path, error: &dyn std::fmt::Display) -> anyhow::Error {
+    stop("sync", path, error)
+}
+
+/// Stops the server as [`fatal_sync_error`] does after writes of a data
+/// file it goes on using failed for good
+/// ([`write_failures::WriteFailures::stops_for`]): a restart heals a
+/// passing fault of the device.
+pub fn fatal_write_error(path: &Path, error: &dyn std::fmt::Display) -> anyhow::Error {
+    stop("write", path, error)
+}
+
+fn stop(failed: &str, path: &Path, error: &dyn std::fmt::Display) -> anyhow::Error {
     let line = format!(
-        "data sync failed on {}: {error}; stopping so the next start recovers from the write-ahead log",
+        "data {failed} failed on {}: {error}; stopping so the next start recovers from the write-ahead log",
         path.display()
     );
     tracing::error!("{line}");

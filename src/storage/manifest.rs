@@ -228,27 +228,36 @@ impl ManifestManager {
         let data = serde_json::to_vec_pretty(manifest)
             .context("Failed to serialize manifest")?;
 
-        // One I/O task from the temporary file to the rename, holding the
-        // guard: it runs to its end even if the caller is dropped, and the
-        // next save cannot touch the temporary file before.
+        // One I/O task from the temporary file to the rename or its removal,
+        // holding the guard: it runs to its end even if the caller is
+        // dropped, and the next save cannot touch the temporary file before.
         spawn_io(async move {
-            #[cfg(test)]
-            crate::storage::test_fault::check(&temp_path).context("Failed to create temporary manifest")?;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)
-                .await
-                .context("Failed to create temporary manifest")?;
+            let saved: Result<()> = async {
+                #[cfg(test)]
+                crate::storage::test_fault::check(&temp_path).context("Failed to create temporary manifest")?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&temp_path)
+                    .await
+                    .context("Failed to create temporary manifest")?;
 
-            file.write_all_at(data, 0).await.0.context("Failed to write manifest")?;
-            file.sync_all().await.context("Failed to sync manifest")?;
+                file.write_all_at(data, 0).await.0.context("Failed to write manifest")?;
+                #[cfg(test)]
+                crate::storage::test_fault::check_sync(&temp_path).context("Failed to sync manifest")?;
+                file.sync_all().await.context("Failed to sync manifest")?;
 
-            // Atomic rename
-            compio::fs::rename(&temp_path, &manifest_path)
-                .await
-                .context("Failed to rename manifest")?;
+                // Atomic rename
+                compio::fs::rename(&temp_path, &manifest_path)
+                    .await
+                    .context("Failed to rename manifest")
+            }
+            .await;
+            if saved.is_err() {
+                crate::storage::file_manager::remove_temporary(&temp_path).await;
+                return saved;
+            }
             #[cfg(test)]
             crate::storage::test_trace::record(&manifest_path, "save");
 
@@ -506,6 +515,29 @@ mod tests {
         assert_eq!(on_disk.version, newer.version);
         assert_eq!(on_disk.total_sstables(), 2, "the stale save must have been skipped");
         Ok(())
+    }
+
+    // A save whose sync fails deletes its temporary file and leaves the
+    // manifest on disk as it was.
+    #[test]
+    fn test_a_failed_save_leaves_no_temporary_file() -> Result<()> {
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let manager = ManifestManager::new(temp_dir.path());
+            let mut manifest = Manifest::new();
+            manifest.add_sstable(meta(1));
+            manager.save(&manifest).await?;
+
+            manifest.add_sstable(meta(2));
+            let temp_path = temp_dir.path().join("MANIFEST.tmp");
+            crate::storage::test_fault::fail_syncs_of(&temp_path);
+            let saved = manager.save(&manifest).await;
+            crate::storage::test_fault::allow_syncs_of(&temp_path);
+            assert!(saved.is_err());
+            assert!(!temp_path.exists());
+            assert_eq!(ManifestManager::new(temp_dir.path()).load().await?.total_sstables(), 1);
+            Ok(())
+        })
     }
 
     // Normal path: sequential, non-racing saves each carry a higher version

@@ -27,6 +27,7 @@ All notable changes to LuraDB are documented in this file.
 - `storage.wal_max_size` caps the write-ahead log of each engine (default 256 MiB); the shards holding the oldest segment flush and the segment is dropped when the cap is reached, and a segment open for five minutes is closed the same way.
 - The server watches free disk space and its own memory use; below configurable thresholds it logs a warning, then refuses writes with 507 and `Retry-After` while reads continue, and resumes on its own. `GET /health` reports `degraded` with the numbers in a new `resources` field, which `GET /store-api/metrics` carries too.
 - `[resources]` settings `disk_free_warn`, `disk_free_block`, `disk_free_resume`, `memory_budget` take sizes and percentages.
+- `GET /health` reports `degraded` with a new `io` field (`path`, `failures`) while writes of a data file keep failing (API 0.14.1).
 
 ### Changed
 
@@ -73,6 +74,7 @@ All notable changes to LuraDB are documented in this file.
 - A start on a volume below the block threshold but with room for the recovery now starts with writes refused instead of exiting with code 4.
 - Compaction merges SSTables as a stream and writes one output file at a time; its memory no longer grows with the size of its inputs.
 - Compaction writes each data block as soon as it is complete; a compaction holds one block, the index and the Bloom filter of the file it is writing, not the whole output file.
+- A data write that fails with a read-only file system, or three times in a row with another I/O error, stops the service with exit code 3 so the next start recovers from the write-ahead log; the flush retries once a second instead of ten times, logs its error once and then every 60th time, and leaves no temporary files behind; the start removes temporary files an earlier run left.
 
 ### Removed
 

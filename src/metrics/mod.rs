@@ -14,6 +14,7 @@
 pub mod window;
 
 use crate::control::resources::ResourceReport;
+use crate::storage::write_failures::IoReport;
 use crate::engines::lsm::engine::EngineHeartbeatData;
 use parking_lot::{RwLock, RwLockReadGuard};
 use serde::Serialize;
@@ -50,8 +51,9 @@ impl Default for MetricsConfig {
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct HeartbeatMetrics {
-    /// `ok`, or `degraded` while a data shard does not answer or disk space
-    /// or memory runs short (`resources`).
+    /// `ok`, or `degraded` while a data shard does not answer, disk space
+    /// or memory runs short (`resources`) or writes of a data file fail
+    /// (`io`).
     pub status: &'static str,
     pub uptime_secs: u64,
     pub version: &'static str,
@@ -63,6 +65,10 @@ pub struct HeartbeatMetrics {
     pub shards: Vec<ShardHealth>,
     /// Free disk space of each data volume and the server's own memory.
     pub resources: ResourceReport,
+    /// Only while writes of a data file fail: the file with the most
+    /// failures in a row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoReport>,
 }
 
 /// A data shard as `GET /health` reports it: `ok` once it answered its
@@ -555,16 +561,17 @@ impl MetricsStore {
     }
 
     /// Builds a `HeartbeatMetrics` snapshot from the live data of every data
-    /// shard's engine, summed, whether each shard answered, by index, and
-    /// the resource state.
+    /// shard's engine, summed, whether each shard answered, by index, the
+    /// resource state and the failing writes.
     pub fn heartbeat(
         &self,
         engines: &[EngineHeartbeatData],
         domain_count: usize,
         answered: &[bool],
         resources: ResourceReport,
+        io: Option<IoReport>,
     ) -> HeartbeatMetrics {
-        let healthy = answered.iter().all(|&ok| ok) && resources.state == "ok";
+        let healthy = answered.iter().all(|&ok| ok) && resources.state == "ok" && io.is_none();
         HeartbeatMetrics {
             status: if healthy { "ok" } else { "degraded" },
             uptime_secs: now_secs().saturating_sub(self.started_at),
@@ -578,6 +585,7 @@ impl MetricsStore {
                 .map(|(id, &ok)| ShardHealth { id, status: if ok { "ok" } else { "timeout" } })
                 .collect(),
             resources,
+            io,
         }
     }
 }

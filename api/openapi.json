@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.14.0",
+    "version": "0.14.1",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -20,11 +20,11 @@
           "Metrics"
         ],
         "summary": "`GET /health` — public heartbeat endpoint.",
-        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, in\n`shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms, and in `resources` the free disk space of\neach data volume and the server's own memory. No authentication required.",
+        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, in\n`shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms, in `resources` the free disk space of each\ndata volume and the server's own memory, and in `io`, while writes of a\ndata file fail, the file and its failures in a row. No authentication\nrequired.",
         "operationId": "health",
         "responses": {
           "200": {
-            "description": "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory",
+            "description": "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory. Also `degraded` while writes of a data file fail; `io` names the file and its failures in a row (the server stops at the third, or at the first on a read-only file system)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6200,6 +6200,17 @@
             "format": "int64",
             "minimum": 0
           },
+          "io": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IoReport",
+                "description": "Only while writes of a data file fail: the file with the most\nfailures in a row."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "l0_sstable_count": {
             "type": "integer",
             "minimum": 0
@@ -6217,7 +6228,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`ok`, or `degraded` while a data shard does not answer or disk space\nor memory runs short (`resources`)."
+            "description": "`ok`, or `degraded` while a data shard does not answer, disk space\nor memory runs short (`resources`) or writes of a data file fail\n(`io`)."
           },
           "uptime_secs": {
             "type": "integer",
@@ -6271,6 +6282,26 @@
           },
           "type": {
             "type": "string"
+          }
+        }
+      },
+      "IoReport": {
+        "type": "object",
+        "description": "`io` of `GET /health`.",
+        "required": [
+          "path",
+          "failures"
+        ],
+        "properties": {
+          "failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Its failed writes in a row.",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "description": "The data file whose last write failed."
           }
         }
       },

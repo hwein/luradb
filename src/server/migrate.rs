@@ -107,7 +107,7 @@ async fn migrate(config: &LuraConfig, shards: u16) -> anyhow::Result<()> {
         );
     }
 
-    let (mut storage_thread, hub) = start_storage_thread(config)?;
+    let (mut storage_thread, hub) = start_storage_thread(config, Default::default())?;
     let opened = system::open_with_wal(system_dir, WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Sys)).await;
     let result = match opened {
         Ok(sys) => {

@@ -92,7 +92,7 @@ fn write_blocked_response() -> utoipa::openapi::Response {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Breaking bumps the middle digit, anything else the last. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.14.0";
+pub const API_VERSION: &str = "0.14.1";
 
 struct VersionInfo;
 

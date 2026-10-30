@@ -24,13 +24,15 @@ const SHARD_PING_TIMEOUT: Duration = Duration::from_millis(250);
 ///
 /// Returns a JSON snapshot of system vitals, summed over the data shards, in
 /// `shards` the status of each data shard: `ok` once it answered, `timeout`
-/// when it did not within 250 ms, and in `resources` the free disk space of
-/// each data volume and the server's own memory. No authentication required.
+/// when it did not within 250 ms, in `resources` the free disk space of each
+/// data volume and the server's own memory, and in `io`, while writes of a
+/// data file fail, the file and its failures in a row. No authentication
+/// required.
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory", body = crate::metrics::HeartbeatMetrics),
+        (status = 200, description = "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory. Also `degraded` while writes of a data file fail; `io` names the file and its failures in a row (the server stops at the third, or at the first on a read-only file system)", body = crate::metrics::HeartbeatMetrics),
         (status = 503, description = "A data shard did not answer within 250 ms; the full report with status `degraded`; its `shards` list names the shard with status `timeout`", body = crate::metrics::HeartbeatMetrics),
     ),
     security(()),
@@ -46,7 +48,8 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
     let engines: Vec<_> = state.control.shard_owners().map(|owners| owners.kv.engine().heartbeat_data()).collect();
     let directory = state.control.directory();
     let domain_count = directory.domains(Engine::Kv).filter(|d| d.state == Lifecycle::Active).count();
-    let hb = state.metrics.heartbeat(&engines, domain_count, &answered, state.control.resources().report());
+    let resources = state.control.resources();
+    let hb = state.metrics.heartbeat(&engines, domain_count, &answered, resources.report(), resources.io().report());
     let status = if answered.iter().all(|&ok| ok) { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, Json(serde_json::to_value(hb).unwrap_or_else(|_| json!({"status": "ok"}))))
 }
@@ -269,6 +272,32 @@ mod tests {
     async fn scrape(state: AppState) -> Value {
         let Ok(Json(body)) = get_metrics(State(state)).await else { panic!("the metrics scrape failed") };
         body
+    }
+
+    // Test 5: while writes of a data file fail in a row, /health stays 200
+    // with status `degraded` and names the file and its failures in `io`;
+    // once a write succeeds, `io` goes and the status is `ok` again.
+    #[test]
+    fn test_health_is_degraded_while_writes_of_a_data_file_fail() {
+        use crate::storage::write_failures::WriteFailures;
+        crate::core::engine_runtime::block_on(async {
+            let (state, _dir) = make_state().await;
+            let (status, Json(body)) = health(State(state.clone())).await;
+            assert_eq!((status, &body["status"], body.get("io")), (StatusCode::OK, &json!("ok"), None), "{body}");
+
+            let failures = WriteFailures::new(state.control.resources().io());
+            let eio = std::io::Error::from_raw_os_error(libc::EIO);
+            for _ in 0..2 {
+                failures.stops_for(std::path::Path::new("/data/vlog.log"), &eio);
+            }
+            let (status, Json(body)) = health(State(state.clone())).await;
+            assert_eq!((status, &body["status"]), (StatusCode::OK, &json!("degraded")), "{body}");
+            assert_eq!(body["io"], json!({ "path": "/data/vlog.log", "failures": 2 }));
+
+            failures.succeeded();
+            let (_, Json(body)) = health(State(state)).await;
+            assert_eq!((&body["status"], body.get("io")), (&json!("ok"), None), "{body}");
+        })
     }
 
     // Minimal KV-only AppState (json_engine/rel_engine disabled) -- enough to

@@ -14,6 +14,7 @@ pub fn start_hub(wals: &[(WalTarget, &Path)]) -> (StorageThread, StorageHandle) 
         channel_capacity: StorageConfig::default().wal_queue_capacity,
         cpu: STORAGE_THREAD_CPU,
         segment_bytes: WAL_SEGMENT_BYTES,
+        io: Default::default(),
     };
     let wals = wals.iter().map(|(target, path)| (*target, path.to_path_buf())).collect();
     StorageThread::new(config, wals).expect("storage hub")

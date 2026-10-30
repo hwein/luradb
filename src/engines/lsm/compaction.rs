@@ -26,7 +26,8 @@
 //! - **L2+**: triggers when total size exceeds `l1_max_size * level_size_ratio^(n-1)`.
 
 use crate::engines::lsm::key::{InternalKey, Timestamp};
-use crate::storage::sstable::{SSTableBuilder, SSTableIterator, SSTableReader};
+use crate::storage::file_manager::SSTableFileWriter;
+use crate::storage::sstable::{SSTableBuilder, SSTableIterator, SSTableReader, SSTableSummary};
 use crate::storage::format::{is_expired, DataBlockValue, ValuePointer, TOMBSTONE_OFFSET};
 use crate::storage::manifest::{Manifest, SSTableMetadata};
 use anyhow::Result;
@@ -96,7 +97,7 @@ impl CompactionJob {
         Self { source_sstables, target_sstables, config }
     }
 
-    /// Starts the compaction; [`CompactionRun::next_sstable`] builds its
+    /// Starts the compaction; [`CompactionRun::next_sstable`] writes its
     /// output files one at a time.
     ///
     /// Tables enter the merge newest first, in the read path's order: the
@@ -110,9 +111,15 @@ impl CompactionJob {
             merge: Merge::new(tables.map(|table| table.iter()).collect())?,
             group: GroupFilter::default(),
             next_entry: None,
+            filter_capacity_left: self.input_filter_capacity(),
             #[cfg(test)]
             peak_held_entries: 0,
         })
+    }
+
+    /// Bounds the keys the job writes: every one of them is a key of an input.
+    fn input_filter_capacity(&self) -> usize {
+        self.source_sstables.iter().chain(&self.target_sstables).map(|table| table.bloom_capacity()).sum()
     }
 
     /// Filters the merged entry stream (newest version first per key) one
@@ -219,34 +226,44 @@ impl CompactionJob {
 }
 
 /// A running compaction: merges and filters its inputs as a stream and holds
-/// at most one output file in memory.
+/// one data block, the index and the Bloom filter of the file it writes.
 pub struct CompactionRun<'a> {
     job: &'a CompactionJob,
     merge: Merge<'a>,
     group: GroupFilter,
-    /// The entry that opens the next file, read while closing the last one.
+    /// The entry that opens the next file, read ahead by `has_next` or while
+    /// closing the last file.
     next_entry: Option<(Vec<u8>, DataBlockValue)>,
+    /// The inputs' filter capacity less the keys of the files written so far.
+    filter_capacity_left: usize,
     #[cfg(test)]
     peak_held_entries: usize,
 }
 
 impl CompactionRun<'_> {
-    /// Builds the next output SSTable, `None` once the inputs are exhausted.
+    /// Whether an entry is left for another output file.
+    pub fn has_next(&mut self) -> Result<bool> {
+        if self.next_entry.is_none() {
+            self.next_entry = self.next_filtered()?;
+        }
+        Ok(self.next_entry.is_some())
+    }
+
+    /// Writes the next output SSTable through `writer`, each data block as
+    /// soon as it is full; `None` once the inputs are exhausted.
     ///
     /// A file is only cut behind the last version of a user key: the read path
     /// treats the tables of a level as key-disjoint and would otherwise pick an
     /// older version from a sibling file.
-    pub fn next_sstable(&mut self) -> Result<Option<Vec<u8>>> {
-        let mut builder = SSTableBuilder::new();
+    pub async fn next_sstable(&mut self, writer: &mut SSTableFileWriter) -> Result<Option<SSTableSummary>> {
+        let mut builder = SSTableBuilder::new(self.filter_capacity_left.max(1));
         let mut current_size: usize = 0;
         let mut last_user_key: Vec<u8> = Vec::new();
-        #[cfg(test)]
-        let mut entries_in_file = 0;
 
         while let Some((key, dbv)) = self.next_filtered()? {
             #[cfg(test)]
             {
-                let held = entries_in_file + 1 + self.merge.heads.len();
+                let held = builder.held_entries() + 1 + self.merge.heads.len();
                 self.peak_held_entries = self.peak_held_entries.max(held);
             }
 
@@ -254,7 +271,7 @@ impl CompactionRun<'_> {
             let full = current_size > 0 && current_size >= self.job.config.max_sstable_size;
             if full && user_key != last_user_key {
                 self.next_entry = Some((key, dbv));
-                return Ok(Some(builder.finish()?));
+                break;
             }
             last_user_key.clear();
             last_user_key.extend_from_slice(user_key);
@@ -267,16 +284,19 @@ impl CompactionRun<'_> {
                 DataBlockValue::Pointer(vp) => builder.add(key, vp),
                 DataBlockValue::Inline { data, expire_at } => builder.add_inline(key, data, expire_at),
             }
-            #[cfg(test)]
-            {
-                entries_in_file += 1;
+            let encoded = builder.take_encoded()?;
+            if !encoded.is_empty() {
+                writer.write(&encoded).await?;
             }
         }
 
-        if current_size > 0 {
-            return Ok(Some(builder.finish()?));
+        if current_size == 0 {
+            return Ok(None);
         }
-        Ok(None)
+        let (tail, summary) = builder.finish_with_summary()?;
+        self.filter_capacity_left = self.filter_capacity_left.saturating_sub(summary.total_keys);
+        writer.write(&tail).await?;
+        Ok(Some(summary))
     }
 
     fn next_filtered(&mut self) -> Result<Option<(Vec<u8>, DataBlockValue)>> {
@@ -473,6 +493,10 @@ pub fn select_sstables_for_level_compaction(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::core::engine_runtime::block_on;
+    use crate::engines::lsm::engine::LsmStorageEngine;
+    use crate::storage::file_manager::FileManager;
+    use crate::storage::test_fault;
 
     impl CompactionJob {
         /// The filter over a whole entry list, newest version first per key.
@@ -905,7 +929,7 @@ pub(crate) mod tests {
     /// An in-memory SSTable of `entries`, given in any order.
     fn table(mut entries: Vec<(Vec<u8>, DataBlockValue)>) -> Arc<SSTableReader> {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(entries.len());
         for (key, value) in entries {
             match value {
                 DataBlockValue::Pointer(vp) => builder.add(key, vp),
@@ -915,14 +939,36 @@ pub(crate) mod tests {
         Arc::new(SSTableReader::open(builder.finish().unwrap()).unwrap())
     }
 
-    /// Every output file of `job`, built one at a time.
-    fn outputs(job: &CompactionJob) -> Result<Vec<Vec<u8>>> {
-        let mut run = job.compact()?;
-        let mut files = Vec::new();
-        while let Some(file) = run.next_sstable()? {
-            files.push(file);
+    /// Writes the next output file of `run` into `files`; returns the file
+    /// as read back and the summary of its writing.
+    async fn write_next(run: &mut CompactionRun<'_>, files: &FileManager) -> Result<Option<(Vec<u8>, SSTableSummary)>> {
+        if !run.has_next()? {
+            return Ok(None);
         }
-        Ok(files)
+        let file_id = files.allocate_file_id();
+        let mut writer = files.begin_sstable(file_id).await?;
+        let summary = run.next_sstable(&mut writer).await?.expect("has_next promised an entry");
+        writer.finish().await?;
+        Ok(Some((std::fs::read(files.file_path(file_id))?, summary)))
+    }
+
+    /// Every output file of `job` as written to disk, with its summary.
+    fn written(job: &CompactionJob) -> Result<Vec<(Vec<u8>, SSTableSummary)>> {
+        block_on(async {
+            let dir = tempfile::TempDir::new()?;
+            let files = FileManager::new(dir.path()).await?;
+            let mut run = job.compact()?;
+            let mut written = Vec::new();
+            while let Some(file) = write_next(&mut run, &files).await? {
+                written.push(file);
+            }
+            Ok(written)
+        })
+    }
+
+    /// Every output file of `job` as written to disk.
+    fn outputs(job: &CompactionJob) -> Result<Vec<Vec<u8>>> {
+        Ok(written(job)?.into_iter().map(|(file, _)| file).collect())
     }
 
     /// The entries of `files` in order, each as user key, stamp and value.
@@ -979,10 +1025,13 @@ pub(crate) mod tests {
         }
 
         let mut sstables = Vec::new();
-        let mut builder = SSTableBuilder::new();
+        let mut capacity_left = job.input_filter_capacity();
+        let mut builder = SSTableBuilder::new(capacity_left.max(1));
+        let mut file_keys = 0;
         let mut current_size: usize = 0;
         let mut entries = filtered.into_iter().peekable();
         while let Some((key, dbv)) = entries.next() {
+            file_keys += 1;
             let entry_size = match &dbv {
                 DataBlockValue::Pointer(_) => std::mem::size_of::<ValuePointer>(),
                 DataBlockValue::Inline { data, .. } => data.len() + 8,
@@ -997,7 +1046,9 @@ pub(crate) mod tests {
             }
             if group_ends && current_size >= job.config.max_sstable_size {
                 sstables.push(builder.finish()?);
-                builder = SSTableBuilder::new();
+                capacity_left = capacity_left.saturating_sub(file_keys);
+                builder = SSTableBuilder::new(capacity_left.max(1));
+                file_keys = 0;
                 current_size = 0;
             }
         }
@@ -1152,41 +1203,100 @@ pub(crate) mod tests {
         (CompactionJob::new(tables.clone(), vec![], config), tables)
     }
 
-    // Inputs of 2.5 times the file size give three files, and the first is
-    // done before the last input block is read.
+    // Of a single output file, the first data block goes to the file writer
+    // before the last input block is read: a write fault ends the run with
+    // input blocks unread.
     #[test]
-    fn test_first_output_file_is_done_before_the_last_input_block_is_read() -> Result<()> {
+    fn test_first_data_block_is_written_before_the_last_input_block_is_read() -> Result<()> {
+        let tables = interleaved_tables(3, 1200);
+        let config = CompactionConfig { max_sstable_size: usize::MAX, ..Default::default() };
+        let job = CompactionJob::new(tables.clone(), vec![], config);
+        block_on(async {
+            let dir = tempfile::TempDir::new()?;
+            let files = FileManager::new(dir.path()).await?;
+            let mut run = job.compact()?;
+            assert!(run.has_next()?);
+            let file_id = files.allocate_file_id();
+            let mut writer = files.begin_sstable(file_id).await?;
+
+            let temp_path = dir.path().join(format!("sstable_{file_id:06}.sst.tmp"));
+            test_fault::fail_writes_of(&temp_path);
+            let written = run.next_sstable(&mut writer).await;
+            test_fault::allow_writes_of(&temp_path);
+            writer.abort().await;
+
+            assert!(written.is_err(), "the first block reaches the writer");
+            let read = blocks_read(&tables);
+            assert!(read < 6, "{read} of 6 input blocks read");
+            Ok(())
+        })
+    }
+
+    // Inputs of 2.5 times the file size give three files of up to 480
+    // entries; the run holds no more than a data block of 257 entries, the
+    // entry in hand and one per input.
+    #[test]
+    fn test_run_holds_one_data_block_and_the_input_heads() -> Result<()> {
         let (job, tables) = file_by_file_job();
-        let mut run = job.compact()?;
+        let (files, peak) = block_on(async {
+            let dir = tempfile::TempDir::new()?;
+            let file_manager = FileManager::new(dir.path()).await?;
+            let mut run = job.compact()?;
+            let mut files = Vec::new();
+            while let Some((file, _)) = write_next(&mut run, &file_manager).await? {
+                files.push(file);
+            }
+            anyhow::Ok((files, run.peak_held_entries()))
+        })?;
 
-        let first = run.next_sstable()?.expect("a first file");
-        let read_for_first = blocks_read(&tables);
-        let mut files = vec![first];
-        while let Some(file) = run.next_sstable()? {
-            files.push(file);
-        }
-
-        assert_eq!(files.len(), 3);
+        let largest_file = files.iter().map(|file| SSTableReader::open(file.clone()).unwrap().iter().count()).max();
+        assert_eq!((files.len(), largest_file), (3, Some(480)));
         assert_eq!(blocks_read(&tables), 6, "two blocks per table");
-        assert!(read_for_first < 6, "the first file took {read_for_first} of 6 blocks");
+        assert!(peak <= 257 + 1 + tables.len(), "held {peak} entries at once");
         assert_eq!(files, compact_in_memory(&job)?);
         Ok(())
     }
 
-    // The run holds the entries of one output file plus one per input,
-    // never all of them.
+    // Each file's filter is sized for the keys the inputs may still hold:
+    // their 3 × 400 less the keys of the files before it. Every key of a file
+    // passes that file's filter.
     #[test]
-    fn test_run_holds_one_output_file_and_the_input_heads() -> Result<()> {
-        let (job, tables) = file_by_file_job();
-        let mut run = job.compact()?;
-        let mut largest_file = 0;
-        while let Some(file) = run.next_sstable()? {
-            largest_file = largest_file.max(SSTableReader::open(file)?.iter().count());
+    fn test_each_file_filter_is_sized_for_the_keys_left_to_write() -> Result<()> {
+        let (job, _) = file_by_file_job();
+        let readers = outputs(&job)?.into_iter().map(SSTableReader::open).collect::<Result<Vec<_>>>()?;
+        let capacities: Vec<usize> = readers.iter().map(|reader| reader.bloom_capacity()).collect();
+        assert_eq!(capacities, vec![1200, 720, 240]);
+        for reader in &readers {
+            for entry in reader.iter() {
+                let (key, _) = entry?;
+                assert!(reader.get(key)?.is_some(), "{key:?} must pass the filter of its file");
+            }
         }
+        Ok(())
+    }
 
-        assert_eq!(largest_file, 480);
-        let peak = run.peak_held_entries();
-        assert!(peak <= largest_file + tables.len(), "held {peak} entries at once");
+    // Each file's summary is what reading the file back finds, over stamp
+    // ties and files of several blocks.
+    #[test]
+    fn test_summary_of_each_file_matches_the_file() -> Result<()> {
+        let mut rng = Lcg(54);
+        let sources: Vec<_> = (0..4).map(|_| random_table(&mut rng, 400)).collect();
+        let targets: Vec<_> = (0..2).map(|_| random_table(&mut rng, 600)).collect();
+
+        for max_sstable_size in [20_000, usize::MAX] {
+            let config = CompactionConfig { low_watermark: Some(Timestamp::new(0)), max_sstable_size, ..Default::default() };
+            let written = written(&CompactionJob::new(sources.clone(), targets.clone(), config))?;
+            assert!(written.iter().any(|(_, summary)| summary.total_keys > 257), "a file of several blocks");
+            for (file, summary) in written {
+                let reader = SSTableReader::open(file.clone())?;
+                assert_eq!(summary.file_size, file.len() as u64);
+                assert_eq!(summary.total_keys, reader.iter().count());
+                assert_eq!(
+                    LsmStorageEngine::sstable_key_range(&reader)?,
+                    (summary.smallest_key, summary.largest_key, summary.max_timestamp)
+                );
+            }
+        }
         Ok(())
     }
 

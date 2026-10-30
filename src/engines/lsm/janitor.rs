@@ -597,7 +597,7 @@ impl Janitor {
         let data = self.file_manager.read_sstable(meta.file_id).await?;
         let reader = SSTableReader::open(data)?;
 
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(reader.bloom_capacity());
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
 
@@ -786,7 +786,7 @@ mod tests {
 
         let file_manager = Arc::new(FileManager::new(dir).await.unwrap());
         let file_id = file_manager.allocate_file_id();
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(1);
         builder.add(
             b"live-key".to_vec(),
             ValuePointer { file_id: 1, value_offset: live_off, value_len: 100, expire_at: 0 },
@@ -934,7 +934,7 @@ mod tests {
         level: usize,
     ) -> SSTableMetadata {
         let file_id = file_manager.allocate_file_id();
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::new(entries.len());
         for (key, off, len) in entries {
             builder.add(
                 key.to_vec(),

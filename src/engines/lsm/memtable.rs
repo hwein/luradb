@@ -235,6 +235,17 @@ impl MemTable {
         self.size_bytes.load(Ordering::Relaxed)
     }
 
+    /// vLog bytes the offloaded values of all entries take.
+    pub fn pointer_bytes(&self) -> u64 {
+        self.map
+            .iter()
+            .map(|entry| match entry.value() {
+                Value::Pointer { len, .. } => *len as u64,
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Returns true if the MemTable is empty.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
@@ -314,5 +325,20 @@ mod tests {
         memtable.set(b"key".to_vec(), Timestamp::new(100), Value::Inline(b"new".to_vec(), None));
 
         assert_eq!(memtable.size_bytes(), 3 + 8 + 3);
+    }
+
+    // Only offloaded values have bytes in the vLog; their `len` is what counts.
+    #[test]
+    fn test_memtable_pointer_bytes_counts_only_pointers() {
+        let memtable = MemTable::new();
+        assert_eq!(memtable.pointer_bytes(), 0);
+
+        memtable.set(b"a".to_vec(), Timestamp::new(100), Value::Pointer { file_id: 1, offset: 0, len: 700, expire_at: None });
+        memtable.set(b"a".to_vec(), Timestamp::new(200), Value::Pointer { file_id: 1, offset: 700, len: 300, expire_at: Some(9) });
+        memtable.set(b"b".to_vec(), Timestamp::new(100), Value::Inline(vec![b'I'; 50], None));
+        memtable.set(b"c".to_vec(), Timestamp::new(100), Value::Null);
+        memtable.set(b"d".to_vec(), Timestamp::new(100), Value::Tombstone);
+
+        assert_eq!(memtable.pointer_bytes(), 1000);
     }
 }

@@ -110,6 +110,7 @@ All notable changes to LuraDB are documented in this file.
 - A flush syncs its directory before the manifest names the new data file, so a power loss right after a flush no longer prevents the next start.
 - Each write-ahead log is cut back once it reaches 64 MiB, so it no longer grows until the next restart.
 - Recovery reads the write-ahead log buffered and replays it many times faster.
+- Value log cleanup no longer counts values still in MemTables as dead, so it no longer copies the whole value log on pure inserts without freeing anything.
 
 ### Security
 

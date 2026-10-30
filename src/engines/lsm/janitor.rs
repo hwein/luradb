@@ -297,21 +297,22 @@ impl Janitor {
     pub async fn run_gc(&self) -> Result<GcStats> {
         self.delete_retired_generations(false).await;
 
-        let (source_ids, vlog_size) = {
+        let (source_ids, vlog_size, memtable_live) = {
             let version = self.version.get();
-            (version.vlog_ids(), version.vlog_size())
+            let memtable_live: u64 = version.memtables_newest_first().map(|m| m.pointer_bytes()).sum();
+            (version.vlog_ids(), version.vlog_size(), memtable_live)
         };
 
-        // Trigger heuristic only: values that are still MemTable-resident count
-        // as dead here, which can make the GC run earlier but never costs data
-        // (the authoritative live set is collected after the barrier below).
+        // An estimate: overwritten versions still count as live; the
+        // authoritative live set is collected after the barrier below.
         let probe = self.manifest.read().clone();
-        let probe_live: u64 = self
-            .collect_live_pointers(&probe)
-            .await?
-            .iter()
-            .map(|(_, _, len)| *len as u64)
-            .sum();
+        let probe_live: u64 = memtable_live
+            + self
+                .collect_live_pointers(&probe)
+                .await?
+                .iter()
+                .map(|(_, _, len)| *len as u64)
+                .sum::<u64>();
         let dead_bytes = vlog_size.saturating_sub(probe_live);
         let dead_ratio = if vlog_size > 0 {
             dead_bytes as f64 / vlog_size as f64
@@ -755,6 +756,8 @@ fn live_bytes_per_generation(source_ids: &[u32], live: &[(u32, u64, u32)]) -> Ve
 mod tests {
     use super::*;
     use crate::config::BlockCacheConfig;
+    use crate::engines::lsm::key::Timestamp;
+    use crate::engines::lsm::memtable::{MemTable, Value};
     use crate::engines::lsm::version::Version;
     use crate::storage::format::ValuePointer;
     use crate::storage::vlog::VLogError;
@@ -1007,6 +1010,66 @@ mod tests {
             assert!(!generation_path(&vlog_path, 2).exists());
             assert_eq!(manifest.read().get_level(0)[0].file_id, meta.file_id);
             assert!(file_manager.read_sstable(meta.file_id).await.is_ok());
+        })
+    }
+
+    /// MemTable naming `len` vLog bytes of generation 1 from `offset` on.
+    fn pointer_memtable(offset: u64, len: usize) -> Arc<MemTable> {
+        let memtable = MemTable::new();
+        memtable.set(b"mem-key".to_vec(), Timestamp::new(1), Value::Pointer { file_id: 1, offset, len, expire_at: None });
+        Arc::new(memtable)
+    }
+
+    /// Runs one GC cycle over generation 1 with 1000 bytes: the first 100
+    /// named by an SSTable, the other 900 only by what `place_memtables`
+    /// puts into the version (threshold 0.3).
+    async fn gc_ran_with_memtables(place_memtables: impl FnOnce(&mut Version)) -> bool {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vlog_path = dir.path().join("vlog");
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let sst_off = vlog.append(&[b'S'; 100]).await.unwrap();
+        vlog.append(&vec![b'M'; 900]).await.unwrap();
+
+        let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
+        let meta = write_pointer_sstable(&file_manager, &[(b"sst-key", sst_off, 100)], 0).await;
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(meta.clone());
+        let reader = LsmStorageEngine::open_sstable_reader(&file_manager, meta.file_id, false).await.unwrap();
+        let mut version = Version::new(vlog).with_levels(vec![(0, vec![Arc::new(reader)])]);
+        place_memtables(&mut version);
+
+        let janitor = build_janitor(
+            dir.path(),
+            Arc::new(VersionCell::new(version)),
+            vlog_path,
+            Arc::new(RwLock::new(manifest)),
+            file_manager,
+            JanitorConfig { check_interval_secs: 3600, dead_bytes_threshold: 0.3, min_vlog_size_bytes: 1 },
+            Arc::new(AtomicU64::new(0)),
+        );
+        janitor.run_gc().await.unwrap().ran
+    }
+
+    // Test 1: values still in the active MemTable are live, so 90 % of the
+    // vLog there keeps the GC from running; without them they are dead.
+    #[test]
+    fn test_gc_counts_active_memtable_values_as_live() {
+        crate::core::engine_runtime::block_on(async {
+            assert!(!gc_ran_with_memtables(|v| v.memtable = pointer_memtable(100, 900)).await, "only 10 % dead");
+            assert!(gc_ran_with_memtables(|_| {}).await, "90 % dead");
+        })
+    }
+
+    // Test 2: frozen MemTables and those of a flush in flight count the same.
+    #[test]
+    fn test_gc_counts_immutable_and_flushing_memtable_values_as_live() {
+        crate::core::engine_runtime::block_on(async {
+            let ran = gc_ran_with_memtables(|v| {
+                v.immutables.push(pointer_memtable(100, 450));
+                v.flushing.push(pointer_memtable(550, 450));
+            })
+            .await;
+            assert!(!ran, "only 10 % dead");
         })
     }
 

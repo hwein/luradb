@@ -4,6 +4,7 @@
 //! atomic writes, and crash-safe operations.
 
 use crate::core::engine_runtime::spawn_io;
+use crate::storage::write_failures::WriteError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, Context};
@@ -38,6 +39,11 @@ impl FileManager {
         // Create directory if it doesn't exist
         let dir = base_dir.clone();
         spawn_io(async move { compio::fs::create_dir_all(dir).await }).await?;
+
+        let removed = remove_temporary_files(&base_dir)?;
+        if removed > 0 {
+            tracing::info!("Removed {removed} temporary files left in {}.", base_dir.display());
+        }
 
         // Find the highest existing file ID
         let next_file_id = Self::scan_existing_files(&base_dir)?;
@@ -88,6 +94,8 @@ impl FileManager {
     /// Writes an SSTable to disk atomically.
     ///
     /// This uses a temporary file and atomic rename to ensure crash safety.
+    /// A failure deletes the temporary file; a failed creation, write or
+    /// rename comes as a [`WriteError`].
     ///
     /// # Arguments
     /// * `file_id` - The file ID for this SSTable
@@ -99,29 +107,14 @@ impl FileManager {
         let temp_path = self.temp_path(file_id);
         let final_path = self.file_path(file_id);
 
-        // One I/O task from the temporary file to the rename: it runs to its
-        // end even if the caller is dropped.
+        // One I/O task from the temporary file to the rename or its removal:
+        // it runs to its end even if the caller is dropped.
         spawn_io(async move {
-            #[cfg(test)]
-            crate::storage::test_fault::check(&temp_path).context("Failed to create temporary file")?;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)
-                .await
-                .context("Failed to create temporary file")?;
-
-            let compio::BufResult(written, data) = file.write_all_at(data, 0).await;
-            written.context("Failed to write data")?;
-            file.sync_all().await.context("Failed to sync data")?;
-
-            // Atomic rename to final location
-            compio::fs::rename(&temp_path, &final_path)
-                .await
-                .context("Failed to rename file")?;
-
-            Ok(data)
+            let written = write_and_rename(&temp_path, &final_path, data).await;
+            if written.is_err() {
+                remove_temporary(&temp_path).await;
+            }
+            written
         })
         .await
     }
@@ -193,6 +186,72 @@ impl FileManager {
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
+}
+
+/// Writes `data` into `temp_path`, syncs it and renames it to `final_path`.
+async fn write_and_rename(temp_path: &Path, final_path: &Path, data: Vec<u8>) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    {
+        use crate::storage::test_fault;
+        test_fault::check(temp_path)
+            .and_then(|()| test_fault::check_write(temp_path))
+            .map_err(WriteError::of(temp_path))
+            .context("Failed to create temporary file")?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(temp_path)
+        .await
+        .map_err(WriteError::of(temp_path))
+        .context("Failed to create temporary file")?;
+
+    let compio::BufResult(written, data) = file.write_all_at(data, 0).await;
+    written.map_err(WriteError::of(temp_path)).context("Failed to write data")?;
+    #[cfg(test)]
+    crate::storage::test_fault::check_sync(temp_path).context("Failed to sync data")?;
+    file.sync_all().await.context("Failed to sync data")?;
+
+    #[cfg(test)]
+    crate::storage::test_fault::check(final_path).map_err(WriteError::of(final_path)).context("Failed to rename file")?;
+    compio::fs::rename(temp_path, final_path)
+        .await
+        .map_err(WriteError::of(final_path))
+        .context("Failed to rename file")?;
+    Ok(data)
+}
+
+/// Deletes the temporary file a failed write left, if there is one.
+pub(crate) async fn remove_temporary(path: &Path) {
+    match compio::fs::remove_file(path).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!("cannot delete {}: {e}", path.display());
+        }
+        _ => {}
+    }
+}
+
+/// Deletes the temporary SSTable and manifest files in `dir`, which a write
+/// the process did not finish left; returns how many.
+fn remove_temporary_files(dir: &Path) -> Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let temporary = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".tmp"))
+            .is_some_and(|stem| stem == "MANIFEST" || parse_sstable_id(stem).is_some());
+        if !temporary {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!("cannot delete {}: {e}", path.display()),
+        }
+    }
+    Ok(removed)
 }
 
 /// Bytes an [`SSTableFileWriter`] collects before it writes them.
@@ -270,9 +329,7 @@ impl SSTableFileWriter {
     /// Deletes the temporary file.
     pub async fn abort(self) {
         let path = self.temp_path.clone();
-        if let Err(e) = spawn_io(async move { compio::fs::remove_file(path).await }).await {
-            tracing::warn!("cannot delete {}: {e}", self.temp_path.display());
-        }
+        spawn_io(async move { remove_temporary(&path).await }).await;
     }
 }
 
@@ -451,6 +508,52 @@ mod tests {
             assert!(renamed.is_err());
 
             assert!(files_in(temp_dir.path()).is_empty());
+            Ok(())
+        })
+    }
+
+    // Test 3: a flush whose sync or rename fails leaves no temporary file;
+    // the failed rename is a write error, the failed sync is not.
+    #[test]
+    fn test_write_sstable_failing_to_sync_or_rename_leaves_no_file() -> Result<()> {
+        use crate::storage::test_fault;
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let manager = FileManager::new(temp_dir.path()).await?;
+
+            let unsyncable = manager.allocate_file_id();
+            test_fault::fail_syncs_of(&manager.temp_path(unsyncable));
+            let synced = manager.write_sstable(unsyncable, b"data".to_vec()).await;
+            test_fault::allow_syncs_of(&manager.temp_path(unsyncable));
+            assert!(synced.unwrap_err().downcast_ref::<WriteError>().is_none());
+
+            let unrenamable = manager.allocate_file_id();
+            test_fault::fail_writes_of(&manager.file_path(unrenamable));
+            let renamed = manager.write_sstable(unrenamable, b"data".to_vec()).await;
+            test_fault::allow_writes_of(&manager.file_path(unrenamable));
+            let failed = renamed.unwrap_err();
+            assert_eq!(failed.downcast_ref::<WriteError>().map(|e| e.path.clone()), Some(manager.file_path(unrenamable)));
+
+            assert!(files_in(temp_dir.path()).is_empty());
+            Ok(())
+        })
+    }
+
+    // Test 3: a start deletes the temporary SSTable and manifest files a write left, and
+    // no other file; it counts them for its log line.
+    #[test]
+    fn test_start_deletes_the_temporary_sstable_files_left() -> Result<()> {
+        crate::core::engine_runtime::block_on(async {
+            let temp_dir = TempDir::new()?;
+            let leave = |names: &[&str]| names.iter().try_for_each(|name| std::fs::write(temp_dir.path().join(name), b"x"));
+            leave(&["sstable_000003.sst.tmp", "sstable_000007.sst.tmp", "sstable_000005.sst", "MANIFEST.tmp", "notes.tmp"])?;
+
+            let manager = FileManager::new(temp_dir.path()).await?;
+            assert_eq!(files_in(temp_dir.path()), ["notes.tmp", "sstable_000005.sst"]);
+            assert_eq!(manager.allocate_file_id(), 6);
+
+            leave(&["sstable_000008.sst.tmp", "sstable_000009.sst.tmp"])?;
+            assert_eq!(remove_temporary_files(temp_dir.path())?, 2);
             Ok(())
         })
     }

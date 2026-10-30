@@ -17,6 +17,7 @@ use crate::core::wal::{
 };
 #[cfg(test)]
 use crate::storage::test_trace;
+use crate::storage::write_failures::{IoFailures, WriteFailures};
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use io_uring::{opcode, squeue, types, IoUring};
@@ -47,7 +48,7 @@ const REAP_WAIT: types::Timespec = types::Timespec::new().nsec(50_000);
 pub const WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Runtime parameters for [`StorageThread::new`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StorageThreadConfig {
     pub sqpoll_enabled: bool,
     pub sqpoll_idle_ms: u32,
@@ -57,6 +58,9 @@ pub struct StorageThreadConfig {
     pub cpu: i32,
     /// [`WAL_SEGMENT_BYTES`] outside tests.
     pub segment_bytes: u64,
+    /// Where the logs' failed writes are reported; handed on to the
+    /// engines writing through the hub.
+    pub io: IoFailures,
 }
 
 /// The engine a write-ahead log belongs to; the hub keeps one log directory per engine.
@@ -148,6 +152,7 @@ impl WalSegments {
 #[derive(Clone)]
 pub struct StorageHandle {
     request_tx: Sender<IoRequest>,
+    io: IoFailures,
 }
 
 /// A slot reserved in the request channel for one append to `engine`'s WAL.
@@ -240,6 +245,11 @@ impl StorageHandle {
         self.request(|response| IoRequest::WalMark { engine, response }).await
     }
 
+    /// Where the hub reports failed writes, [`StorageThreadConfig::io`].
+    pub fn io_failures(&self) -> &IoFailures {
+        &self.io
+    }
+
     async fn request<T>(&self, request: impl FnOnce(oneshot::Sender<Result<T>>) -> IoRequest) -> Result<T> {
         let (tx, rx) = oneshot::channel();
         self.request_tx.send(request(tx)).await.map_err(|_| anyhow!("storage thread shut down"))?;
@@ -268,6 +278,7 @@ impl StorageThread {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let thread_shutdown = Arc::clone(&shutdown);
         let wal_count = wals.len();
+        let io = config.io.clone();
 
         let join_handle = std::thread::Builder::new()
             .name("luradb-storage".into())
@@ -282,7 +293,7 @@ impl StorageThread {
                     "Storage thread ready (SQPOLL {}, {wal_count} write-ahead logs).",
                     if sqpoll_active { "active" } else { "disabled" }
                 );
-                let handle = StorageHandle { request_tx: request_tx.clone() };
+                let handle = StorageHandle { request_tx: request_tx.clone(), io };
                 Ok((Self { join_handle: Some(join_handle), request_tx, shutdown }, handle))
             }
             Ok(Err(e)) => {
@@ -347,8 +358,13 @@ struct WalFile {
     unsafe_end: bool,
     /// The file or marker whose sync failed, and how: the hub stops the
     /// server as soon as the end of the failed append is safe for the next
-    /// start.
+    /// start, or once securing it failed for good.
     failed_sync: Option<(PathBuf, String)>,
+    /// The appends' writes that failed in a row.
+    write_failures: WriteFailures,
+    /// The cuts after a failed append whose marker failed as well, in a
+    /// row: once they stop the server, it stops without a safe end.
+    secure_failures: WriteFailures,
     /// Requests for this file, in channel order, not run yet.
     queued: VecDeque<IoRequest>,
     /// The write on its way to this file; at most one at a time.
@@ -389,6 +405,9 @@ struct StorageState {
 pub(crate) struct Faults {
     /// The next sync fails after its write has landed.
     pub(crate) sync: bool,
+    /// The next write is reported failed with this OS error once its bytes
+    /// landed; the cut after it removes them.
+    pub(crate) write: Option<i32>,
     /// Until reset, each write of the hub lands at most this many bytes, as
     /// a short write would.
     pub(crate) max_write_len: Option<usize>,
@@ -467,13 +486,22 @@ impl StorageState {
     fn cut_to_cursor(&mut self, index: usize) -> Result<(), CutFailed> {
         self.wals[index].unsafe_end = true;
         if let Err(error) = self.cut_file(index) {
-            let marked = self.mark(index);
-            return Err(CutFailed { error, secured: marked });
+            return Err(match self.mark(index) {
+                Ok(()) => {
+                    self.wals[index].secure_failures.succeeded();
+                    CutFailed { error, secured: true, stops: false }
+                }
+                Err(marking) => {
+                    let wal = &self.wals[index];
+                    CutFailed { error, secured: false, stops: wal.secure_failures.stops_for(&wal.marker, &marking) }
+                }
+            });
         }
+        self.wals[index].secure_failures.succeeded();
         if let Err(error) = self.unmark(index) {
             let marker = self.wals[index].marker.clone();
             self.note_sync(index, marker, &error);
-            return Err(CutFailed { error, secured: true });
+            return Err(CutFailed { error, secured: true, stops: false });
         }
         self.wals[index].unsafe_end = false;
         Ok(())
@@ -494,22 +522,19 @@ impl StorageState {
         Ok(())
     }
 
-    /// Records the cursor in the marker; whether the marker holds it now.
-    fn mark(&mut self, index: usize) -> bool {
+    /// Records the cursor in the marker.
+    fn mark(&mut self, index: usize) -> std::io::Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.faults.mark) {
             tracing::error!("Writing the unsafe-end marker failed: injected marker failure.");
-            return false;
+            return Err(std::io::Error::other("injected marker failure"));
         }
-        let wal = &self.wals[index];
-        let marker = wal.marker.clone();
-        match mark_unsafe_end(&marker, wal.offset) {
-            Ok(()) => true,
-            Err(e) => {
-                self.note_sync(index, marker, &e);
-                false
-            }
+        let (marker, offset) = (self.wals[index].marker.clone(), self.wals[index].offset);
+        let marked = mark_unsafe_end(&marker, offset);
+        if let Err(e) = &marked {
+            self.note_sync(index, marker, e);
         }
+        marked
     }
 
     /// Removes the marker and syncs its directory, the segments' one.
@@ -536,12 +561,27 @@ impl StorageState {
         }
     }
 
-    /// Stops the server for the failed sync of WAL `index`, if there was one;
-    /// the caller has made the end of the failed append safe for the next
-    /// start. Returns only in tests, with the stop's error.
-    fn stop_after_failed_sync(&mut self, index: usize) -> Option<anyhow::Error> {
-        let (path, error) = self.wals[index].failed_sync.take()?;
-        Some(crate::storage::fatal_sync_error(&path, &error))
+    /// Stops the server after a cut of WAL `index`, if it must: for a failed
+    /// sync once the end of the failed append is safe for the next start,
+    /// and without a safe end once securing it failed for good. Returns only
+    /// in tests, with the stop's error.
+    fn stop_after_cut(&mut self, index: usize, cut: &Result<(), CutFailed>) -> Option<anyhow::Error> {
+        let wal = &mut self.wals[index];
+        match cut {
+            Err(failed) if !failed.secured => {
+                if !failed.stops {
+                    return None;
+                }
+                Some(match wal.failed_sync.take() {
+                    Some((path, error)) => crate::storage::fatal_sync_error(&path, &error),
+                    None => crate::storage::fatal_write_error(&segment_path(&wal.dir, wal.segment), &failed.error),
+                })
+            }
+            _ => {
+                let (path, error) = wal.failed_sync.take()?;
+                Some(crate::storage::fatal_sync_error(&path, &error))
+            }
+        }
     }
 
     /// Puts `file` in place of the file of WAL `index`. A fixed-file slot
@@ -641,7 +681,7 @@ fn open_state(config: &StorageThreadConfig, wals: &[(WalTarget, PathBuf)]) -> Re
     for (engine, path) in wals {
         move_single_file_aside(path)
             .with_context(|| format!("moving the write-ahead log {} of an earlier version aside", path.display()))?;
-        files.push(open_log(*engine, path).with_context(|| format!("opening the write-ahead log {}", path.display()))?);
+        files.push(open_log(*engine, path, &config.io).with_context(|| format!("opening the write-ahead log {}", path.display()))?);
     }
     // Register the WALs once as fixed files so the kernel skips the fd lookup
     // per op; on failure fall back to raw fds.
@@ -726,7 +766,7 @@ fn create_segment(dir: &Path, n: u64, start_lsn: u64) -> std::io::Result<File> {
 /// segments a checkpoint left half prepared, drops a last segment without
 /// records that follows another, refuses an unsafe-end marker beside any
 /// segment but the last, applies the last one's, and opens the last one.
-fn open_log(engine: WalTarget, path: &Path) -> Result<WalFile> {
+fn open_log(engine: WalTarget, path: &Path, io: &IoFailures) -> Result<WalFile> {
     let location = log_location(path)?;
     if create_dir_if_missing(&location)? {
         sync_dir(&location)?;
@@ -806,6 +846,8 @@ fn open_log(engine: WalTarget, path: &Path) -> Result<WalFile> {
         lsn: start_lsn,
         unsafe_end: false,
         failed_sync: None,
+        write_failures: WriteFailures::new(io),
+        secure_failures: WriteFailures::new(io),
         queued: VecDeque::new(),
         pending: None,
     })
@@ -1287,7 +1329,8 @@ fn take_reaped(state: &mut StorageState) {
 /// cursor. A segment that reached the segment size is left for the next one
 /// first, never with an unsafe end; a failed rotation leaves the appends in
 /// the current segment. After a failed sync whose append's end was not safe
-/// yet, the cut that makes it safe stops the server.
+/// yet, the cut that makes it safe stops the server, as does the cut whose
+/// failure ends the attempts to secure it.
 fn ready_to_append(state: &mut StorageState, engine: WalTarget) -> Result<usize> {
     let index = state.wal_index(engine)?;
     if state.wals[index].unsafe_end {
@@ -1295,10 +1338,8 @@ fn ready_to_append(state: &mut StorageState, engine: WalTarget) -> Result<usize>
         if let Err(failed) = &cut {
             log_failed_cut(engine, state.wals[index].offset, &failed.error);
         }
-        if cut.as_ref().map_or_else(|failed| failed.secured, |()| true) {
-            if let Some(stop) = state.stop_after_failed_sync(index) {
-                return Err(stop);
-            }
+        if let Some(stop) = state.stop_after_cut(index, &cut) {
+            return Err(stop);
         }
         cut.map_err(|failed| failed.error)?;
     }
@@ -1377,8 +1418,12 @@ fn segments_of(state: &StorageState, index: usize) -> WalSegments {
 /// starts at, or the failure, its file cut back to the cursor. `None` leaves
 /// a rest to write. A failed fdatasync stops the server once the end of the
 /// write is safe for the next start: the file cut back, or the cursor in the
-/// marker; until then the next append makes it safe first.
+/// marker; until then the next append makes it safe first. A failed write
+/// that stops the server ([`WriteFailures::stops_for`]) stops it after the
+/// cut, safe or not.
 fn take_chain(state: &mut StorageState, p: &mut Pending, (wrote, synced): (i32, i32)) -> Option<Result<u64>> {
+    #[cfg(test)]
+    let wrote = state.faults.write.take().map_or(wrote, |errno| -errno);
     if wrote > 0 {
         p.landed += wrote as usize;
         // A short write cancels the fdatasync behind it; the rest goes in the
@@ -1396,27 +1441,29 @@ fn take_chain(state: &mut StorageState, p: &mut Pending, (wrote, synced): (i32, 
         _ => (None, false),
     };
     if let Some(e) = failure {
-        if sync_failed {
-            let wal = &state.wals[p.index];
-            let segment = segment_path(&wal.dir, wal.segment);
-            state.fail_sync(p.index, segment, &e);
-        }
-        let secured = match state.cut_to_cursor(p.index) {
-            Ok(()) => true,
-            Err(cut) => {
-                log_failed_cut(p.write.engine, p.start, &cut.error);
-                cut.secured
-            }
+        let wal = &state.wals[p.index];
+        let segment = segment_path(&wal.dir, wal.segment);
+        let stops = if sync_failed {
+            state.fail_sync(p.index, segment.clone(), &e);
+            false
+        } else {
+            wal.write_failures.stops_for(&segment, &e)
         };
-        if secured {
-            if let Some(stop) = state.stop_after_failed_sync(p.index) {
-                return Some(Err(stop));
-            }
+        let cut = state.cut_to_cursor(p.index);
+        if let Err(failed) = &cut {
+            log_failed_cut(p.write.engine, p.start, &failed.error);
+        }
+        if stops {
+            return Some(Err(crate::storage::fatal_write_error(&segment, &e)));
+        }
+        if let Some(stop) = state.stop_after_cut(p.index, &cut) {
+            return Some(Err(stop));
         }
         return Some(Err(e.into()));
     }
     state.stats.fdatasyncs += 1;
     let wal = &mut state.wals[p.index];
+    wal.write_failures.succeeded();
     wal.offset += p.write.data.len() as u64;
     wal.lsn += p.write.parts.len() as u64;
     Some(Ok(p.start))
@@ -1428,6 +1475,9 @@ struct CutFailed {
     /// The next start finds the end safe all the same: the file is cut and
     /// only the marker removal failed, or the marker holds the cursor.
     secured: bool,
+    /// Unsecured, and the marker's failure stops the server
+    /// ([`WriteFailures::stops_for`]).
+    stops: bool,
 }
 
 /// A failed sync among the errors of the hub's file operations.
@@ -1465,8 +1515,14 @@ fn log_failed_cut(engine: WalTarget, cursor: u64, error: &std::io::Error) {
 fn do_wal_truncate(state: &mut StorageState, engine: WalTarget) -> Result<()> {
     let index = state.wal_index(engine)?;
     let wal = &mut state.wals[index];
-    wal.file.write_all_at(&wal_header(wal.lsn), 0)?;
-    wal.file.set_len(WAL_HEADER_LEN)?;
+    if let Err(e) = wal.file.write_all_at(&wal_header(wal.lsn), 0).and_then(|()| wal.file.set_len(WAL_HEADER_LEN)) {
+        let segment = segment_path(&wal.dir, wal.segment);
+        if wal.write_failures.stops_for(&segment, &e) {
+            return Err(crate::storage::fatal_write_error(&segment, &e));
+        }
+        return Err(e.into());
+    }
+    wal.write_failures.succeeded();
     wal.offset = WAL_HEADER_LEN;
     if let Err(e) = wal.file.sync_all() {
         return Err(crate::storage::fatal_sync_error(&segment_path(&wal.dir, wal.segment), &e));
@@ -1722,6 +1778,7 @@ impl TestHub {
             channel_capacity: crate::config::StorageConfig::default().wal_queue_capacity,
             cpu: STORAGE_THREAD_CPU,
             segment_bytes,
+            io: IoFailures::default(),
         };
         let wals = wals.iter().map(|(engine, path)| (*engine, path.to_path_buf())).collect();
         let (thread, handle) = StorageThread::new(config, wals).expect("test storage hub");
@@ -1761,6 +1818,7 @@ mod tests {
             channel_capacity: capacity,
             cpu: -1,
             segment_bytes: WAL_SEGMENT_BYTES,
+            io: IoFailures::default(),
         }
     }
 
@@ -2637,6 +2695,84 @@ mod tests {
             drop(state); // crash
             assert_eq!(recovered_keys(log).await, ["kept"]);
         })
+    }
+
+    // Test 2: after a failed fdatasync, the cut and the marker fail three
+    // times in a row: the hub stops without a safe end. Recovery after the
+    // crash reads every confirmed record; the unconfirmed one may follow,
+    // a torn one never.
+    #[test]
+    fn test_securing_the_end_failing_three_times_stops_without_a_safe_end() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+            let log = wals[0].1.as_path();
+            let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+            append_all(&mut state, WalTarget::Kv, &[&delete_record(1, b"kept")]);
+
+            state.faults = Faults { sync: true, cut: true, mark: true, ..Faults::default() };
+            let (batch, mut failed) = record_appends(WalTarget::Kv, vec![delete_record(2, b"unconfirmed")]);
+            process_batch(&mut state, batch);
+            assert!(failed[0].try_recv().unwrap().is_err());
+            for attempt in 2..=3 {
+                assert!(stops_in(log).is_empty(), "no stop before the third failure");
+                (state.faults.cut, state.faults.mark) = (true, true);
+                let (batch, mut refused) = record_appends(WalTarget::Kv, vec![delete_record(3, b"refused")]);
+                process_batch(&mut state, batch);
+                let err = refused[0].try_recv().unwrap().unwrap_err();
+                assert_eq!(err.to_string().contains("data sync failed on"), attempt == 3, "{err}");
+            }
+            assert_eq!(stops_in(log), [in_log(log, "00000001.wal")]);
+            drop(state); // crash
+            let keys = recovered_keys(log).await;
+            assert!(keys == ["kept"] || keys == ["kept", "unconfirmed"], "{keys:?}");
+        })
+    }
+
+    /// Appends one record with the next write of the hub failing with
+    /// `errno`, if any.
+    fn append_failing(state: &mut StorageState, errno: Option<i32>) -> Result<(u64, u64)> {
+        state.faults.write = errno;
+        let (batch, mut appended) = record_appends(WalTarget::Kv, vec![delete_record(1, b"key")]);
+        process_batch(state, batch);
+        appended[0].try_recv().unwrap()
+    }
+
+    // Test 1: a write failing on a read-only file system stops the server at
+    // once, naming the segment; nothing of it stays in the log.
+    #[test]
+    fn test_a_write_failing_on_a_read_only_file_system_stops_at_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let log = wals[0].1.as_path();
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+
+        let err = append_failing(&mut state, Some(libc::EROFS)).unwrap_err();
+        assert!(err.to_string().contains("data write failed on"), "{err}");
+        assert_eq!(stops_in(log), [in_log(log, "00000001.wal")]);
+        assert_eq!(std::fs::metadata(segment_1(log)).unwrap().len(), WAL_HEADER_LEN);
+    }
+
+    // Test 1: another I/O error stops at the third failed write in a row, a
+    // write that succeeds in between starts the row anew; a full file system
+    // never stops.
+    #[test]
+    fn test_writes_failing_with_an_io_error_stop_at_the_third_in_a_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
+        let log = wals[0].1.as_path();
+        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+
+        for _ in 0..4 {
+            assert!(append_failing(&mut state, Some(libc::ENOSPC)).is_err());
+        }
+        for errno in [Some(libc::EIO), Some(libc::EIO), None, Some(libc::EIO), Some(libc::EIO)] {
+            assert_eq!(append_failing(&mut state, errno).is_ok(), errno.is_none());
+        }
+        assert!(stops_in(log).is_empty(), "a success starts the row anew");
+        let err = append_failing(&mut state, Some(libc::EIO)).unwrap_err();
+        assert!(err.to_string().contains("data write failed on"), "{err}");
+        assert_eq!(stops_in(log), [in_log(log, "00000001.wal")]);
     }
 
     // A failed cut leaves the cursor in a marker beside the log; the next

@@ -1,9 +1,9 @@
 //! Directories in which file creation fails, as in a read-only directory but
 //! for any user, root included, single files whose creation fails, files and
-//! directories whose sync fails, and the stops failed syncs caused: tests
-//! share the process.
+//! directories whose sync fails, writes that fail with a given error, and the
+//! stops failed syncs and writes caused: tests share the process.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -66,17 +66,45 @@ pub(crate) fn check_sync(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn failing_writes() -> &'static Mutex<HashMap<PathBuf, (i32, u32)>> {
+    static WRITES: OnceLock<Mutex<HashMap<PathBuf, (i32, u32)>>> = OnceLock::new();
+    WRITES.get_or_init(Default::default)
+}
+
+/// The next `count` writes of the file `path`, or of the files directly in
+/// the directory `path`, fail with the OS error `errno` and write nothing.
+pub(crate) fn fail_next_writes(path: &Path, errno: i32, count: u32) {
+    failing_writes().lock().unwrap().insert(path.to_path_buf(), (errno, count));
+}
+
+pub(crate) fn check_write(path: &Path) -> io::Result<()> {
+    let mut writes = failing_writes().lock().unwrap();
+    for key in [Some(path), path.parent()].into_iter().flatten() {
+        if let Some((errno, left)) = writes.get_mut(key) {
+            let (errno, done) = (*errno, *left <= 1);
+            *left = left.saturating_sub(1);
+            if done {
+                writes.remove(key);
+            }
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+    }
+    Ok(())
+}
+
 fn stops() -> &'static Mutex<Vec<PathBuf>> {
     static STOPS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
     STOPS.get_or_init(Default::default)
 }
 
-/// A stop after a failed sync of `path`, in place of the process exit.
+/// A stop after a failed sync or failed writes of `path`, in place of the
+/// process exit.
 pub(crate) fn record_stop(path: &Path) {
     stops().lock().unwrap().push(path.to_path_buf());
 }
 
-/// The paths below `root` whose failed syncs stopped the server, in order.
+/// The paths below `root` whose failed syncs or writes stopped the server,
+/// in order.
 pub(crate) fn stops_under(root: &Path) -> Vec<PathBuf> {
     stops().lock().unwrap().iter().filter(|path| path.starts_with(root)).cloned().collect()
 }

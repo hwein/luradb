@@ -4,7 +4,7 @@
 //! MemTable, WAL, VLog, SSTable levels, compaction, and the Janitor GC.
 
 use crate::config::BlockCacheConfig;
-use crate::control::resources::{Resources, SpaceWait};
+use crate::control::resources::{Resources, SpaceWait, REPEAT_TICKS};
 use crate::engines::lsm::block_cache::StripedBlockCache;
 use crate::engines::lsm::memtable::{MemTable, Value};
 use crate::engines::lsm::reader::{
@@ -30,6 +30,7 @@ use crate::storage::sstable::{SSTableBuilder, SSTableReader};
 use crate::storage::format::VersionState;
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::{Manifest, ManifestManager, SSTableMetadata};
+use crate::storage::write_failures::{WriteError, WriteFailures};
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -207,18 +208,42 @@ async fn scan_memtable_for_prefix(
 ///
 /// A `Sealed` error means the Janitor swapped the active generation between the
 /// lookup and the append; it publishes the new generation before sealing the
-/// old one, so a single retry converges.
-async fn append_to_active(versions: &VersionCell, value: &[u8]) -> Result<(u32, u64)> {
+/// old one, so a single retry converges. A failed write counts in `failures`
+/// and may stop the server.
+async fn append_to_active(versions: &VersionCell, value: &[u8], failures: &WriteFailures) -> Result<(u32, u64)> {
     loop {
         let active = Arc::clone(&versions.get().active_vlog);
         match active.append(value).await {
-            Ok(offset) => return Ok((active.id(), offset)),
+            Ok(offset) => {
+                failures.succeeded();
+                return Ok((active.id(), offset));
+            }
             Err(VLogError::Sealed { id }) => anyhow::ensure!(
                 versions.get().active_vlog.id() != id,
                 "active value log generation {id} is sealed"
             ),
+            Err(VLogError::Io(e)) if failures.stops_for(active.path(), &e) => {
+                return Err(crate::storage::fatal_write_error(active.path(), &e));
+            }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// Counts the failures in a row of a background job: the first and every
+/// 60th after it get a log line.
+#[derive(Default)]
+struct FailureLog(AtomicU64);
+
+impl FailureLog {
+    /// Counts a failure; whether it gets a log line.
+    fn failed(&self) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed).is_multiple_of(REPEAT_TICKS)
+    }
+
+    /// The job succeeded: the next failure starts a new row.
+    fn succeeded(&self) {
+        self.0.store(0, Ordering::Relaxed);
     }
 }
 
@@ -492,6 +517,13 @@ pub struct LsmStorageEngine {
     resources: Resources,
     /// Compactions skipped for want of disk space.
     compaction_space: SpaceWait,
+    /// The value log appends and the flushes' SSTable writes that failed in
+    /// a row, reported where the WAL reports its own.
+    vlog_failures: WriteFailures,
+    flush_failures: WriteFailures,
+    /// Failed flushes and compactions in a row, for their log lines.
+    flush_errors: FailureLog,
+    compaction_errors: FailureLog,
 
     /// The largest the active MemTable grew during the replay.
     #[cfg(test)]
@@ -552,6 +584,8 @@ impl LsmStorageEngine {
         ));
 
         let (shutdown_tx, _) = watch::channel(false);
+        let (vlog_failures, flush_failures) =
+            (WriteFailures::new(wal.io_failures()), WriteFailures::new(wal.io_failures()));
         let engine = Self {
             version: Arc::new(VersionCell::new(version)),
             wal,
@@ -582,6 +616,10 @@ impl LsmStorageEngine {
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             resources,
             compaction_space: SpaceWait::default(),
+            vlog_failures,
+            flush_failures,
+            flush_errors: FailureLog::default(),
+            compaction_errors: FailureLog::default(),
             #[cfg(test)]
             replay_peak: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -690,7 +728,7 @@ impl LsmStorageEngine {
             WalEntry::Set { timestamp, key, value, expire_at } => {
                 let expire_at = if expire_at == 0 { None } else { Some(expire_at) };
                 let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
-                    let (file_id, offset) = append_to_active(&self.version, &value).await?;
+                    let (file_id, offset) = append_to_active(&self.version, &value, &self.vlog_failures).await?;
                     Value::Pointer { file_id, offset, len: value.len(), expire_at }
                 } else {
                     Value::Inline(value, expire_at)
@@ -893,20 +931,34 @@ impl LsmStorageEngine {
     async fn background_flush_loop(&self) {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         while !self.shutdown.load(Ordering::Relaxed) {
-            let has_immutable = !self.version().immutables.is_empty();
-            if has_immutable {
-                if let Err(e) = self.flush_memtable().await {
-                    eprintln!("[Engine] Flush error: {e}");
-                }
-            }
+            let wait = self.flush_turn().await;
             // Woken immediately on shutdown instead of sleeping out the
             // full interval; `changed()` cannot miss a signal sent while this
             // loop was doing the work above (no lost-wakeup, unlike Notify).
             tokio::select! {
-                _ = sleep(Duration::from_millis(self.engine_config.flush_check_interval_ms)) => {}
+                _ = sleep(wait) => {}
                 _ = shutdown_rx.changed() => {}
             }
         }
+    }
+
+    /// Flushes the oldest immutable MemTable, if there is one, and returns
+    /// how long the flush loop waits for its next turn: after a failure the
+    /// compaction interval, so a failing disk is not tried ten times a
+    /// second.
+    async fn flush_turn(&self) -> Duration {
+        if !self.version().immutables.is_empty() {
+            match self.flush_memtable().await {
+                Ok(_) => self.flush_errors.succeeded(),
+                Err(e) => {
+                    if self.flush_errors.failed() {
+                        eprintln!("[Engine] Flush error: {e}");
+                    }
+                    return Duration::from_millis(self.engine_config.compaction_check_interval_ms);
+                }
+            }
+        }
+        Duration::from_millis(self.engine_config.flush_check_interval_ms)
     }
 
     async fn background_compaction_loop(&self) {
@@ -917,8 +969,13 @@ impl LsmStorageEngine {
                 should_compact(&manifest, &self.compaction_config)
             };
             if needs {
-                if let Err(e) = self.compact_next_level().await {
-                    eprintln!("[Engine] Compaction error: {e}");
+                match self.compact_next_level().await {
+                    Ok(_) => self.compaction_errors.succeeded(),
+                    Err(e) => {
+                        if self.compaction_errors.failed() {
+                            eprintln!("[Engine] Compaction error: {e}");
+                        }
+                    }
                 }
             }
             tokio::select! {
@@ -1415,7 +1472,7 @@ impl LsmStorageEngine {
         let (_, lsn) = permit.send(log_entry).await?;
 
         let resolved = if value.len() >= self.engine_config.vlog_inline_threshold {
-            let (file_id, offset) = append_to_active(&self.version, value).await?;
+            let (file_id, offset) = append_to_active(&self.version, value, &self.vlog_failures).await?;
             Value::Pointer { file_id, offset, len: value.len(), expire_at }
         } else {
             Value::Inline(value.to_vec(), expire_at)
@@ -1627,7 +1684,7 @@ impl LsmStorageEngine {
             resolved.push(match op {
                 BatchOp::Put { key, value } => {
                     if value.len() >= self.engine_config.vlog_inline_threshold {
-                        let (file_id, offset) = append_to_active(&self.version, &value).await?;
+                        let (file_id, offset) = append_to_active(&self.version, &value, &self.vlog_failures).await?;
                         (key, Value::Pointer { file_id, offset, len: value.len(), expire_at: None })
                     } else {
                         (key, Value::Inline(value, None))
@@ -2062,7 +2119,20 @@ impl LsmStorageEngine {
         }
 
         // The bytes come back, so the non-mmap reader below needs no copy.
-        let sstable_data = self.file_manager.write_sstable(file_id, sstable_data).await?;
+        let sstable_data = match self.file_manager.write_sstable(file_id, sstable_data).await {
+            Ok(data) => {
+                self.flush_failures.succeeded();
+                data
+            }
+            Err(e) => {
+                return Err(match e.downcast_ref::<WriteError>() {
+                    Some(failed) if self.flush_failures.stops_for(&failed.path, &failed.error) => {
+                        crate::storage::fatal_write_error(&failed.path, &failed.error)
+                    }
+                    _ => e,
+                });
+            }
+        };
         // Before the manifest changes in memory, not just before its save: a
         // compaction or GC cycle may save the shared manifest from then on,
         // and a saved manifest must name only files whose names are on disk.
@@ -7187,6 +7257,104 @@ mod tests {
     async fn flush_new_table(engine: &LsmStorageEngine) -> u64 {
         engine.freeze_active_memtable();
         engine.flush_memtable().await.unwrap().unwrap()
+    }
+
+    // Test 4: of 180 failures in a row, the first and every 60th get a log
+    // line; a success starts a new row.
+    #[test]
+    fn test_failures_in_a_row_log_the_first_and_every_60th() {
+        let log = FailureLog::default();
+        let logged: Vec<u32> = (0..180).filter(|_| log.failed()).collect();
+        assert_eq!(logged, [0, 60, 120]);
+        log.succeeded();
+        assert!(log.failed());
+    }
+
+    // Test 4: after a failed flush the flush loop waits a compaction
+    // interval, otherwise a flush interval.
+    #[test]
+    fn test_a_failed_flush_retries_at_the_compaction_interval() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let engine = engine_split(dir.path()).await.unwrap();
+            let flush = Duration::from_millis(engine.engine_config.flush_check_interval_ms);
+            let compaction = Duration::from_millis(engine.engine_config.compaction_check_interval_ms);
+            assert_ne!(flush, compaction);
+            assert_eq!(engine.flush_turn().await, flush, "nothing to flush");
+
+            engine.put(b"k", b"v").await.unwrap();
+            engine.freeze_active_memtable();
+            test_fault::fail_next_writes(&dir.path().join("sst"), libc::ENOSPC, 180);
+            for _ in 0..180 {
+                assert_eq!(engine.flush_turn().await, compaction);
+            }
+            assert_eq!(engine.flush_turn().await, flush);
+            assert!(engine.version().immutables.is_empty());
+        })
+    }
+
+    // Test 1: a value log append failing on a read-only file system stops
+    // the server at once, naming the value log; another I/O error at the
+    // third failure in a row, a success in between starts the row anew; a
+    // full file system never.
+    #[test]
+    fn test_failed_value_log_appends_stop_on_a_read_only_file_system_or_the_third_in_a_row() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog_path = dir.path().join("vlog").join("vlog.log");
+            let engine = engine_split(dir.path()).await.unwrap();
+            for (errno, failures) in [(libc::ENOSPC, 4), (libc::EIO, 2), (libc::EIO, 0), (libc::EIO, 2)] {
+                if failures == 0 {
+                    engine.put(b"k", &vlog_value(b'k')).await.unwrap();
+                    continue;
+                }
+                test_fault::fail_next_writes(&vlog_path, errno, failures);
+                for _ in 0..failures {
+                    assert!(engine.put(b"k", &vlog_value(b'k')).await.is_err());
+                }
+            }
+            assert!(test_fault::stops_under(dir.path()).is_empty(), "a success starts the row anew");
+
+            test_fault::fail_next_writes(&vlog_path, libc::EIO, 1);
+            let err = engine.put(b"k", &vlog_value(b'k')).await.unwrap_err();
+            assert!(format!("{err:#}").contains("data write failed on"), "{err:#}");
+            assert_eq!(test_fault::stops_under(dir.path()), std::slice::from_ref(&vlog_path));
+
+            test_fault::fail_next_writes(&vlog_path, libc::EROFS, 1);
+            assert!(engine.put(b"k", &vlog_value(b'k')).await.is_err());
+            assert_eq!(test_fault::stops_under(dir.path()), [vlog_path.clone(), vlog_path]);
+        })
+    }
+
+    // Test 1: a flush whose SSTable cannot be written on a read-only file
+    // system stops the server at once, naming the file; another I/O error at
+    // the third failed flush in a row; a full file system never.
+    #[test]
+    fn test_failed_flush_writes_stop_on_a_read_only_file_system_or_the_third_in_a_row() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sst = dir.path().join("sst");
+            let engine = engine_split(dir.path()).await.unwrap();
+            engine.put(b"k", b"v").await.unwrap();
+            engine.freeze_active_memtable();
+            for errno in [libc::ENOSPC, libc::ENOSPC, libc::ENOSPC, libc::EIO, libc::EIO] {
+                test_fault::fail_next_writes(&sst, errno, 1);
+                assert!(engine.flush_memtable().await.is_err());
+            }
+            assert!(test_fault::stops_under(dir.path()).is_empty());
+
+            test_fault::fail_next_writes(&sst, libc::EIO, 1);
+            let err = engine.flush_memtable().await.unwrap_err();
+            assert!(format!("{err:#}").contains("data write failed on"), "{err:#}");
+            test_fault::fail_next_writes(&sst, libc::EROFS, 1);
+            assert!(engine.flush_memtable().await.is_err());
+            let stops = test_fault::stops_under(dir.path());
+            assert_eq!(stops.len(), 2, "{stops:?}");
+            assert!(stops.iter().all(|stop| stop.parent() == Some(sst.as_path())), "{stops:?}");
+
+            assert!(engine.flush_memtable().await.unwrap().is_some(), "the flush goes on once it can write");
+            assert_eq!(engine.get(b"k").await.unwrap().as_deref(), Some(&b"v"[..]));
+        })
     }
 
     // persist_all saves the manifest a flush changed, then syncs every vLog

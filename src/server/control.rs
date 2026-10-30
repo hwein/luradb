@@ -40,6 +40,7 @@ use crate::{
     engines::rel::RelEngine,
     ipc::{self, ShmManager},
     logging,
+    storage::write_failures::IoFailures,
     uds,
 };
 use anyhow::Context;
@@ -282,7 +283,7 @@ async fn bootstrap(
         .await
         .with_context(|| format!("create storage.system_dir {}", config.storage.system_dir))?;
     let lock = system::lock_data_dir(Path::new(&config.storage.system_dir))?;
-    let (storage_thread, hub) = start_storage_thread(config)?;
+    let (storage_thread, hub) = start_storage_thread(config, watch.resources().io().clone())?;
 
     // The system store before the engines: data laid out for another shard
     // count, or halfway through a change of it, must not be opened at all.
@@ -607,8 +608,9 @@ pub(super) fn kv_options(cfg: &LuraConfig, memory: &MemorySplit) -> LsmEngineOpt
 
 /// The storage hub: a dedicated OS thread driving a SQPOLL io_uring ring. It
 /// owns the WAL of every enabled engine and writes them all; no engine
-/// runs without it.
-pub(super) fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageThread, StorageHandle)> {
+/// runs without it. The failed writes of the logs and of the engines
+/// writing through it are reported to `io`.
+pub(super) fn start_storage_thread(cfg: &LuraConfig, io: IoFailures) -> anyhow::Result<(StorageThread, StorageHandle)> {
     let st_config = StorageThreadConfig {
         sqpoll_enabled: storage_thread::SQPOLL_ENABLED,
         sqpoll_idle_ms: storage_thread::SQPOLL_IDLE_MS,
@@ -616,6 +618,7 @@ pub(super) fn start_storage_thread(cfg: &LuraConfig) -> anyhow::Result<(StorageT
         channel_capacity: cfg.storage.wal_queue_capacity,
         cpu: storage_thread::STORAGE_THREAD_CPU,
         segment_bytes: storage_thread::WAL_SEGMENT_BYTES,
+        io,
     };
     let mut wals = vec![
         (WalTarget::Kv, PathBuf::from(&cfg.storage.wal_path)),

@@ -118,6 +118,8 @@ impl VLog {
         if value.is_empty() {
             return Ok(self.offset.load(Ordering::SeqCst));
         }
+        #[cfg(test)]
+        crate::storage::test_fault::check_write(&self.path)?;
 
         let offset = self.offset.fetch_add(value.len() as u64, Ordering::SeqCst);
         // Done before the pointer is handed out: reads go through `reader`,

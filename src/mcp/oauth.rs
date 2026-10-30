@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-/// Failed sign-ins from one client IP after which the sign-in page answers
-/// 429 ...
+/// Failed sign-ins from one sender (see [`ip_key`]) after which the sign-in
+/// page answers 429 ...
 const MAX_FAILED_SIGN_INS: usize = 5;
 /// ... for this long after the first of them.
 const FAILURE_WINDOW_SECS: u64 = 15 * 60;
@@ -34,7 +34,7 @@ const MAX_CLIENT_NAME_CHARS: usize = 100;
 const MAX_REDIRECT_URIS: usize = 10;
 /// ... each at most this long.
 const MAX_REDIRECT_URI_CHARS: usize = 2048;
-/// Registrations one client IP may make ...
+/// Registrations one sender (see [`ip_key`]) may make ...
 const MAX_REGISTRATIONS: usize = 10;
 /// ... within this long.
 const REGISTRATION_WINDOW_SECS: u64 = 60 * 60;
@@ -123,39 +123,40 @@ fn path_of(public_url: &str) -> &str {
     rest.find('/').map_or("", |i| &rest[i..])
 }
 
-/// Failed and pending sign-ins by client IP, as Unix seconds.
+/// Failed and pending sign-ins by [`ip_key`], as Unix seconds.
 #[derive(Default)]
 struct Failures(Mutex<HashMap<IpAddr, Vec<u64>>>);
 
 impl Failures {
-    fn recent(map: &mut HashMap<IpAddr, Vec<u64>>, ip: IpAddr, now: u64) -> usize {
+    fn recent(map: &mut HashMap<IpAddr, Vec<u64>>, key: IpAddr, now: u64) -> usize {
         map.retain(|_, times| {
             times.retain(|t| now.saturating_sub(*t) < FAILURE_WINDOW_SECS);
             !times.is_empty()
         });
-        map.get(&ip).map_or(0, Vec::len)
+        map.get(&key).map_or(0, Vec::len)
     }
 
     fn blocked(&self, ip: IpAddr, now: u64) -> bool {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        Self::recent(&mut map, ip, now) >= MAX_FAILED_SIGN_INS
+        Self::recent(&mut map, ip_key(ip), now) >= MAX_FAILED_SIGN_INS
     }
 
     /// Counts an attempt as failed before it is checked, unless `ip` is
     /// blocked: concurrent attempts then never exceed the limit.
     fn reserve(&self, ip: IpAddr, now: u64) -> bool {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if Self::recent(&mut map, ip, now) >= MAX_FAILED_SIGN_INS {
+        let key = ip_key(ip);
+        if Self::recent(&mut map, key, now) >= MAX_FAILED_SIGN_INS {
             return false;
         }
-        map.entry(ip).or_default().push(now);
+        map.entry(key).or_default().push(now);
         true
     }
 
     /// Takes back the attempt reserved at `now`; it did not fail.
     fn release(&self, ip: IpAddr, now: u64) {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(times) = map.get_mut(&ip) {
+        if let Some(times) = map.get_mut(&ip_key(ip)) {
             if let Some(i) = times.iter().rposition(|t| *t == now) {
                 times.remove(i);
             }
@@ -163,7 +164,7 @@ impl Failures {
     }
 }
 
-/// Recent and pending registrations by [`registration_key`], as Unix seconds.
+/// Recent and pending registrations by [`ip_key`], as Unix seconds.
 #[derive(Default)]
 struct Registrations(Mutex<RegistrationTimes>);
 
@@ -174,10 +175,10 @@ struct RegistrationTimes {
     swept: u64,
 }
 
-/// The key a client IP's registrations count under: an IPv4 address as it
-/// is, also mapped into IPv6; an IPv6 address by its /64 prefix, as one
-/// subscriber usually gets a whole /64.
-fn registration_key(ip: IpAddr) -> IpAddr {
+/// The key a client IP's registrations and failed sign-ins count under: an
+/// IPv4 address as it is, also mapped into IPv6; an IPv6 address by its /64
+/// prefix, as one subscriber usually gets a whole /64.
+fn ip_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -203,7 +204,7 @@ impl Registrations {
             });
             times.swept = now;
         }
-        let list = times.by_key.entry(registration_key(ip)).or_default();
+        let list = times.by_key.entry(ip_key(ip)).or_default();
         list.retain(recent);
         if list.len() >= MAX_REGISTRATIONS {
             let oldest = list.iter().min().copied().unwrap_or(now);
@@ -216,7 +217,7 @@ impl Registrations {
     /// Takes back the registration reserved at `now`; it was not made.
     fn release(&self, ip: IpAddr, now: u64) {
         let mut times = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let key = registration_key(ip);
+        let key = ip_key(ip);
         if let Some(list) = times.by_key.get_mut(&key) {
             if let Some(i) = list.iter().rposition(|t| *t == now) {
                 list.remove(i);
@@ -753,9 +754,9 @@ mod tests {
     #[test]
     fn ipv6_counts_per_64_and_mapped_ipv4_as_ipv4() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert_eq!(registration_key(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
-        assert_eq!(registration_key(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
-        assert_eq!(registration_key(ip("192.0.2.1")), ip("192.0.2.1"));
+        assert_eq!(ip_key(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+        assert_eq!(ip_key(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
+        assert_eq!(ip_key(ip("192.0.2.1")), ip("192.0.2.1"));
 
         let registrations = Registrations::default();
         for i in 0..MAX_REGISTRATIONS {
@@ -805,6 +806,28 @@ mod tests {
         assert!(!failures.blocked(other, 1010));
         assert!(failures.blocked(ip, 1000 + FAILURE_WINDOW_SECS - 1));
         assert!(!failures.blocked(ip, 1000 + MAX_FAILED_SIGN_INS as u64 - 1 + FAILURE_WINDOW_SECS));
+    }
+
+    #[test]
+    fn failures_count_per_64_and_mapped_ipv4_as_ipv4() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let failures = Failures::default();
+        for i in 0..MAX_FAILED_SIGN_INS {
+            let from = ip(&format!("2001:db8:1:2::{:x}", 1 + i % 2));
+            assert!(failures.reserve(from, 1000 + i as u64));
+        }
+        assert!(failures.blocked(ip("2001:db8:1:2:ffff::3"), 1010));
+        assert!(!failures.reserve(ip("2001:db8:1:2:ffff::3"), 1010));
+        assert!(!failures.blocked(ip("2001:db8:1:3::1"), 1010));
+        assert!(failures.reserve(ip("2001:db8:1:3::1"), 1010));
+
+        for i in 0..MAX_FAILED_SIGN_INS {
+            assert!(failures.reserve(ip("::ffff:192.0.2.1"), 1000 + i as u64));
+        }
+        assert!(failures.blocked(ip("192.0.2.1"), 1010));
+        assert!(!failures.reserve(ip("192.0.2.1"), 1010));
+        failures.release(ip("192.0.2.1"), 1000);
+        assert!(!failures.blocked(ip("::ffff:192.0.2.1"), 1010));
     }
 
     // Attempts in flight hold their place: no more than five are ever

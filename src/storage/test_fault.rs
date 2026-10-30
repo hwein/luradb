@@ -1,7 +1,8 @@
 //! Directories in which file creation fails, as in a read-only directory but
-//! for any user, root included, single files whose creation fails, files and
-//! directories whose sync fails, writes that fail with a given error, and the
-//! stops failed syncs and writes caused: tests share the process.
+//! for any user, root included, single files whose creation fails, files,
+//! directories and files in a directory whose sync fails, writes that fail
+//! with a given error, and the stops failed syncs and writes caused: tests
+//! share the process.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -59,9 +60,31 @@ pub(crate) fn allow_syncs_of(path: &Path) {
     unsyncable().lock().unwrap().remove(path);
 }
 
+fn failing_syncs() -> &'static Mutex<HashMap<PathBuf, u32>> {
+    static SYNCS: OnceLock<Mutex<HashMap<PathBuf, u32>>> = OnceLock::new();
+    SYNCS.get_or_init(Default::default)
+}
+
+/// The next `count` syncs of the files directly in the directory `dir` fail.
+pub(crate) fn fail_next_syncs_in(dir: &Path, count: u32) {
+    failing_syncs().lock().unwrap().insert(dir.to_path_buf(), count);
+}
+
 pub(crate) fn check_sync(path: &Path) -> io::Result<()> {
+    let failed = || Err(io::Error::other(format!("test fault: sync of {}", path.display())));
     if unsyncable().lock().unwrap().contains(path) {
-        return Err(io::Error::other(format!("test fault: sync of {}", path.display())));
+        return failed();
+    }
+    let mut syncs = failing_syncs().lock().unwrap();
+    if let Some(dir) = path.parent() {
+        if let Some(left) = syncs.get_mut(dir) {
+            if *left <= 1 {
+                syncs.remove(dir);
+            } else {
+                *left -= 1;
+            }
+            return failed();
+        }
     }
     Ok(())
 }

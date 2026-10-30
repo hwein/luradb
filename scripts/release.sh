@@ -13,6 +13,7 @@ CHANGELOG_JSON="$SCRIPT_DIR/changelog-json.sh"
 
 DRY_RUN=0
 MODE="final"
+REPORT=""
 
 TMP_DIRS=()
 cleanup() {
@@ -29,12 +30,16 @@ trap cleanup EXIT
 usage() {
     local exit_code="${1:-1}"
     cat <<'EOF'
-Usage: scripts/release.sh [rc|--hotfix] [--dry-run]
+Usage: scripts/release.sh [rc|--hotfix] [--report <file>] [--dry-run]
 
   (no argument)    final mode: next -> main, tag vX.Y.Z, next to X.Y.(Z+1)-dev
   rc               rc mode: prerelease tag vX.Y.Z-rc.N on next
   --hotfix         hotfix mode: on hotfix/vX.Y.Z, merge into main, tag vX.Y.Z
+  --report <file>  final mode only
   --dry-run        shows the full plan without changing anything
+
+final releases require --report: the JSON report of the release test run against
+the rc tag that points at HEAD (fields: tag, commit, verdict)
 EOF
     exit "$exit_code"
 }
@@ -119,6 +124,24 @@ check_clean_and_synced() {
         # base == remote_rev: local is ahead of $upstream (the normal case
         # for unpushed release commits) — not a violation, no abort.
     fi
+}
+
+# The report must be a passing run against an annotated tag on exactly HEAD.
+check_release_report() {
+    [ -n "$REPORT" ] || die "final releases require --report <file> (the release test report)"
+    [ -r "$REPORT" ] || die "report not readable: $REPORT"
+    local verdict commit tag head
+    verdict=$(jq -r '.verdict // empty' "$REPORT") || die "report is not valid JSON: $REPORT"
+    commit=$(jq -r '.commit // empty' "$REPORT")
+    tag=$(jq -r '.tag // empty' "$REPORT")
+    [ "$verdict" = "pass" ] || die "report verdict is not pass: '${verdict}'"
+    head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+    [ "$commit" = "$head" ] || die "report commit '${commit}' is not HEAD ($head)"
+    [ -n "$tag" ] || die "report has no tag"
+    [ "$(git -C "$REPO_ROOT" cat-file -t "refs/tags/$tag" 2>/dev/null)" = "tag" ] \
+        || die "report tag '${tag}' is not an annotated tag"
+    [ "$(git -C "$REPO_ROOT" rev-parse "refs/tags/$tag^{commit}")" = "$commit" ] \
+        || die "report tag '${tag}' does not point at the report commit"
 }
 
 check_tests() {
@@ -358,6 +381,7 @@ run_final() {
     fi
 
     check_clean_and_synced
+    check_release_report
     check_tests
     check_unreleased_nonempty
     check_changelog_json
@@ -508,15 +532,26 @@ run_hotfix() {
     log "Then delete $branch: git branch -d $branch"
 }
 
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         rc) MODE="rc" ;;
         --hotfix) MODE="hotfix" ;;
         --dry-run) DRY_RUN=1 ;;
+        --report)
+            [ $# -ge 2 ] || { printf -- '--report needs a file\n\n' >&2; usage 1; }
+            REPORT="$2"
+            shift
+            ;;
         -h|--help) usage 0 ;;
-        *) printf 'Unknown argument: %s\n\n' "$arg" >&2; usage 1 ;;
+        *) printf 'Unknown argument: %s\n\n' "$1" >&2; usage 1 ;;
     esac
+    shift
 done
+
+if [ -n "$REPORT" ] && [ "$MODE" != "final" ]; then
+    printf -- '--report applies to final releases only\n\n' >&2
+    usage 1
+fi
 
 case "$MODE" in
     final)  run_final ;;

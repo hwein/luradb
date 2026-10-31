@@ -25,9 +25,9 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: Backups include relational domains (schema, rows, AUTOINCREMENT state); scope accepts `rel` and `rel:<domain>`.
 - Built-in MCP server with OAuth sign-in (opt-in, `[mcp]` config section).
 - `storage.wal_max_size` caps the write-ahead log of each engine (default 256 MiB); the shards holding the oldest segment flush and the segment is dropped when the cap is reached, and a segment open for five minutes is closed the same way.
-- The server watches free disk space and its own memory use; below configurable thresholds it logs a warning, then refuses writes with 507 and `Retry-After` while reads continue, and resumes on its own. `GET /health` reports `degraded` with the numbers in a new `resources` field, which `GET /store-api/metrics` carries too.
+- The server watches free disk space and its own memory use; below configurable thresholds it logs a warning, then refuses writes with 507 and `Retry-After` while reads continue, and resumes on its own. `GET /health` reports `degraded` with the states in a new `resources` field, and `GET /store-api/metrics` carries the numbers and paths in its `resources`.
 - `[resources]` settings `disk_free_warn`, `disk_free_block`, `disk_free_resume`, `memory_budget` take sizes and percentages.
-- `GET /health` reports `degraded` with a new `io` field (`path`, `failures`) while writes of a data file keep failing (API 0.14.1).
+- `GET /health` reports `degraded` with a new `io` field (`failures`) while writes of a data file keep failing, and `GET /store-api/metrics` names the file in its `io` (`path`, `failures`).
 
 ### Changed
 

@@ -2460,11 +2460,12 @@ mod tests {
         );
     }
 
-    // Test 4 (health): while disk space runs short, /health stays 200 with
-    // status `degraded` and names the volume in `resources`; the metrics
-    // carry the same block.
+    // While disk space runs short, /health stays 200 with status `degraded`
+    // and gives the states in `resources`, without volume, path or number;
+    // the metrics carry the full report.
     #[test]
     fn health_stays_200_and_degraded_while_disk_space_runs_short() {
+        use crate::api::metrics::tests::assert_health_discloses_no_paths_or_sizes;
         use crate::control::resources::tests::{FakeProbe, GB};
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = test_config(dir.path());
@@ -2484,14 +2485,19 @@ mod tests {
             let (status, body) = request(addr, &get("/health")).await;
             let body = serde_json::from_slice::<Value>(&body).unwrap();
             assert_eq!((status, &body["status"]), (200, &json!("degraded")), "{body}");
-            let disk = &body["resources"]["disk"][0];
-            assert_eq!((&body["resources"]["state"], &disk["state"]), (&json!("warning"), &json!("warning")), "{body}");
-            assert_eq!((&disk["size_bytes"], &disk["free_bytes"]), (&json!(100 * GB), &json!(9 * GB)));
-            assert_eq!(body["resources"]["memory"]["state"], json!("ok"));
+            assert_eq!(body["resources"], json!({ "state": "warning", "disk_state": "warning", "memory_state": "ok" }));
+            assert_health_discloses_no_paths_or_sizes(&body);
 
             let (status, body) = request(addr, &get("/store-api/metrics")).await;
             let body = serde_json::from_slice::<Value>(&body).unwrap();
             assert_eq!((status, &body["resources"]["state"]), (200, &json!("warning")), "{body}");
+            let disk = &body["resources"]["disk"][0];
+            assert!(disk["path"].as_str().unwrap().starts_with('/'), "{body}");
+            assert_eq!((&disk["size_bytes"], &disk["free_bytes"], &disk["state"]), (&json!(100 * GB), &json!(9 * GB), &json!("warning")));
+            let memory = &body["resources"]["memory"];
+            assert!(memory["rss_anon_bytes"].is_u64() && memory["budget_bytes"].is_u64(), "{body}");
+            assert_eq!(memory["state"], json!("ok"));
+            assert_eq!(body.get("io"), None);
         });
         server.shutdown().unwrap();
     }
@@ -2570,8 +2576,13 @@ mod tests {
             assert_eq!(request(addr, &with_body("POST", "/store-api/json/default/search", &search)).await.0, 200);
             let (status, body) = request(addr, &get("/health")).await;
             let body = serde_json::from_slice::<Value>(&body).unwrap();
-            assert_eq!((status, &body["status"], &body["resources"]["state"]), (200, &json!("degraded"), &json!("blocked")));
-            assert_eq!(request(addr, &get("/store-api/metrics")).await.0, 200);
+            assert_eq!((status, &body["status"]), (200, &json!("degraded")), "{body}");
+            assert_eq!(body["resources"], json!({ "state": "blocked", "disk_state": "blocked", "memory_state": "ok" }));
+            crate::api::metrics::tests::assert_health_discloses_no_paths_or_sizes(&body);
+            let (status, body) = request(addr, &get("/store-api/metrics")).await;
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            let disk = &body["resources"]["disk"][0];
+            assert_eq!((status, &disk["state"], &disk["free_bytes"]), (200, &json!("blocked"), &json!(GB)), "{body}");
             assert_eq!(request(addr, &get(&format!("/store-api/backups/{id}/download"))).await.0, 200);
             let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
             assert_eq!(request(addr, &user).await.0, 201);

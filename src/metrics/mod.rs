@@ -13,8 +13,8 @@
 
 pub mod window;
 
-use crate::control::resources::ResourceReport;
-use crate::storage::write_failures::IoReport;
+use crate::control::resources::{ResourceReport, ResourceState};
+use crate::storage::write_failures::{IoReport, IoState};
 use crate::engines::lsm::engine::EngineHeartbeatData;
 use parking_lot::{RwLock, RwLockReadGuard};
 use serde::Serialize;
@@ -63,12 +63,11 @@ pub struct HeartbeatMetrics {
     pub l0_sstable_count: usize,
     /// Every data shard, by id.
     pub shards: Vec<ShardHealth>,
-    /// Free disk space of each data volume and the server's own memory.
-    pub resources: ResourceReport,
-    /// Only while writes of a data file fail: the file with the most
-    /// failures in a row.
+    /// Whether disk space and the server's own memory are short.
+    pub resources: ResourceState,
+    /// Only while writes of a data file fail: the most failures in a row.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub io: Option<IoReport>,
+    pub io: Option<IoState>,
 }
 
 /// A data shard as `GET /health` reports it: `ok` once it answered its
@@ -584,8 +583,8 @@ impl MetricsStore {
                 .zip(answered)
                 .map(|(id, &ok)| ShardHealth { id, status: if ok { "ok" } else { "timeout" } })
                 .collect(),
-            resources,
-            io,
+            resources: ResourceState::from(&resources),
+            io: io.as_ref().map(IoState::from),
         }
     }
 }

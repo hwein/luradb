@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.14.1",
+    "version": "0.14.2",
     "x-luradb-server-version": "0.4.1-dev"
   },
   "paths": {
@@ -20,11 +20,11 @@
           "Metrics"
         ],
         "summary": "`GET /health` — public heartbeat endpoint.",
-        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, in\n`shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms, in `resources` the free disk space of each\ndata volume and the server's own memory, and in `io`, while writes of a\ndata file fail, the file and its failures in a row. No authentication\nrequired.",
+        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, in\n`shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms, in `resources` the state of disk space\n(the worst of all data volumes) and of the server's own memory, and in\n`io`, while writes of a data file fail, their failures in a row. It names\nno path and gives no size; `GET /store-api/metrics` does. No\nauthentication required.",
         "operationId": "health",
         "responses": {
           "200": {
-            "description": "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory. Also `degraded` while writes of a data file fail; `io` names the file and its failures in a row (the server stops at the third, or at the first on a read-only file system)",
+            "description": "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold (`warning`), or below a block threshold (`blocked`), while writes answer 507 and reads go on; `resources` gives the state of the disk space and of the memory, without volume, path or number. Also `degraded` while writes of a data file fail; `io` gives their failures in a row, without the file (the server stops at the third, or at the first on a read-only file system)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3848,7 +3848,7 @@
           "Metrics"
         ],
         "summary": "`GET /metrics` — system + all domain metrics. Admin only.",
-        "description": "`engines` is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.\n\n`shm` covers the shared-memory snapshot publisher, all zero while SHM is\noff: `snapshot_publishes_total`, `snapshot_publish_skips_total` (a client\nwas still reading the buffer due for overwriting),\n`snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot\nis not being updated) and `clients_kicked_total` (clients disconnected after\n`shm.kick_blocking_client_after_secs`).\n\n`resources` is the disk and memory state `GET /health` reports.",
+        "description": "`engines` is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.\n\n`shm` covers the shared-memory snapshot publisher, all zero while SHM is\noff: `snapshot_publishes_total`, `snapshot_publish_skips_total` (a client\nwas still reading the buffer due for overwriting),\n`snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot\nis not being updated) and `clients_kicked_total` (clients disconnected after\n`shm.kick_blocking_client_after_secs`).\n\n`resources` is the full disk and memory report, of which `GET /health`\ngives the states only: per data volume `path`, `size_bytes`, `free_bytes`\nand `state`, and for the memory `rss_anon_bytes`, `budget_bytes` and\n`state`. `io` appears only while writes of a data file fail: the file\nwith the most failures in a row, `path` and `failures`.",
         "operationId": "get_metrics",
         "responses": {
           "200": {
@@ -6058,37 +6058,6 @@
           }
         }
       },
-      "DiskReport": {
-        "type": "object",
-        "description": "A volume in the resource report.",
-        "required": [
-          "path",
-          "size_bytes",
-          "free_bytes",
-          "state"
-        ],
-        "properties": {
-          "free_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Free to the server, without the space reserved for root.",
-            "minimum": 0
-          },
-          "path": {
-            "type": "string",
-            "description": "A data path on the volume."
-          },
-          "size_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "state": {
-            "type": "string",
-            "description": "`ok`, `warning` or `blocked`."
-          }
-        }
-      },
       "DocumentListResponse": {
         "type": "object",
         "required": [
@@ -6203,8 +6172,8 @@
           "io": {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/IoReport",
-                "description": "Only while writes of a data file fail: the file with the most\nfailures in a row."
+                "$ref": "#/components/schemas/IoState",
+                "description": "Only while writes of a data file fail: the most failures in a row."
               },
               {
                 "type": "null"
@@ -6216,8 +6185,8 @@
             "minimum": 0
           },
           "resources": {
-            "$ref": "#/components/schemas/ResourceReport",
-            "description": "Free disk space of each data volume and the server's own memory."
+            "$ref": "#/components/schemas/ResourceState",
+            "description": "Whether disk space and the server's own memory are short."
           },
           "shards": {
             "type": "array",
@@ -6285,23 +6254,18 @@
           }
         }
       },
-      "IoReport": {
+      "IoState": {
         "type": "object",
-        "description": "`io` of `GET /health`.",
+        "description": "`io` of `GET /health`: the failed writes in a row, without the file.",
         "required": [
-          "path",
           "failures"
         ],
         "properties": {
           "failures": {
             "type": "integer",
             "format": "int32",
-            "description": "Its failed writes in a row.",
+            "description": "Failed writes in a row of the data file with the most.",
             "minimum": 0
-          },
-          "path": {
-            "type": "string",
-            "description": "The data file whose last write failed."
           }
         }
       },
@@ -6546,31 +6510,6 @@
           }
         }
       },
-      "MemoryReport": {
-        "type": "object",
-        "description": "The server's anonymous memory against its budget.",
-        "required": [
-          "rss_anon_bytes",
-          "budget_bytes",
-          "state"
-        ],
-        "properties": {
-          "budget_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "rss_anon_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "state": {
-            "type": "string",
-            "description": "`ok`, `warning` or `blocked`."
-          }
-        }
-      },
       "PermissionItem": {
         "type": "object",
         "description": "One entry of a user's domain permission matrix. `store_type`/`access` are\nlowercase and match the write-endpoint vocabulary exactly (`parse_store_type`,\n`access` parsing in `set_permission`) — usable as-is in a follow-up request.",
@@ -6639,24 +6578,22 @@
           }
         }
       },
-      "ResourceReport": {
+      "ResourceState": {
         "type": "object",
-        "description": "`resources` of `GET /health` and `GET /store-api/metrics`.",
+        "description": "`resources` of `GET /health`: the states of the report, without volumes,\npaths or numbers.",
         "required": [
           "state",
-          "disk",
-          "memory"
+          "disk_state",
+          "memory_state"
         ],
         "properties": {
-          "disk": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DiskReport"
-            },
-            "description": "Every volume a data path lies on."
+          "disk_state": {
+            "type": "string",
+            "description": "The worst state of the data volumes: `ok`, `warning` or `blocked`."
           },
-          "memory": {
-            "$ref": "#/components/schemas/MemoryReport"
+          "memory_state": {
+            "type": "string",
+            "description": "`ok`, `warning` or `blocked`."
           },
           "state": {
             "type": "string",

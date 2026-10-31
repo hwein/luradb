@@ -112,14 +112,24 @@ impl CompactionJob {
             group: GroupFilter::default(),
             next_entry: None,
             filter_capacity_left: self.input_filter_capacity(),
+            data_bytes_left: self.input_data_bytes(),
             #[cfg(test)]
             peak_held_entries: 0,
         })
     }
 
-    /// Bounds the keys the job writes: every one of them is a key of an input.
+    /// Bounds the keys the job writes: every one of them is a key of an input,
+    /// and an input holds no more than its filter or its blocks take.
     fn input_filter_capacity(&self) -> usize {
-        self.source_sstables.iter().chain(&self.target_sstables).map(|table| table.bloom_capacity()).sum()
+        self.inputs().map(|table| table.bloom_capacity().min(table.key_count_bound())).sum()
+    }
+
+    fn input_data_bytes(&self) -> u64 {
+        self.inputs().map(|table| table.data_bytes()).sum()
+    }
+
+    fn inputs(&self) -> impl Iterator<Item = &Arc<SSTableReader>> {
+        self.source_sstables.iter().chain(&self.target_sstables)
     }
 
     /// Filters the merged entry stream (newest version first per key) one
@@ -236,6 +246,8 @@ pub struct CompactionRun<'a> {
     next_entry: Option<(Vec<u8>, DataBlockValue)>,
     /// The inputs' filter capacity less the keys of the files written so far.
     filter_capacity_left: usize,
+    /// The inputs' data bytes less those of the files written so far.
+    data_bytes_left: u64,
     #[cfg(test)]
     peak_held_entries: usize,
 }
@@ -256,7 +268,11 @@ impl CompactionRun<'_> {
     /// treats the tables of a level as key-disjoint and would otherwise pick an
     /// older version from a sibling file.
     pub async fn next_sstable(&mut self, writer: &mut SSTableFileWriter) -> Result<Option<SSTableSummary>> {
-        let mut builder = SSTableBuilder::new(self.filter_capacity_left.max(1));
+        let mut builder = SSTableBuilder::new(output_filter_capacity(
+            self.filter_capacity_left,
+            self.data_bytes_left,
+            self.job.config.max_sstable_size,
+        ));
         let mut current_size: usize = 0;
         let mut last_user_key: Vec<u8> = Vec::new();
 
@@ -295,6 +311,7 @@ impl CompactionRun<'_> {
         }
         let (tail, summary) = builder.finish_with_summary()?;
         self.filter_capacity_left = self.filter_capacity_left.saturating_sub(summary.total_keys);
+        self.data_bytes_left = self.data_bytes_left.saturating_sub(summary.data_bytes);
         writer.write(&tail).await?;
         Ok(Some(summary))
     }
@@ -317,6 +334,28 @@ impl CompactionRun<'_> {
     pub(crate) fn peak_held_entries(&self) -> usize {
         self.peak_held_entries
     }
+}
+
+/// Spare factor on a file's estimated share of the keys: the file size counts
+/// raw key and value bytes, the data bytes their encoding, up to about three
+/// times as many for small inline values.
+const ESTIMATE_MARGIN: u128 = 3;
+
+/// Filter capacity of the next output file: its share of `keys_left` by the
+/// file size against the inputs' `data_bytes_left`, with margin. An
+/// underestimate only raises the file's false positive rate.
+fn output_filter_capacity(keys_left: usize, data_bytes_left: u64, max_sstable_size: usize) -> usize {
+    let estimate = if max_sstable_size == 0 {
+        // Every user key gets its own file.
+        1
+    } else if data_bytes_left == 0 {
+        // The outputs' blocks took more bytes than the inputs' did.
+        keys_left
+    } else {
+        let share = (keys_left as u128 * max_sstable_size as u128).div_ceil(u128::from(data_bytes_left));
+        usize::try_from(share.saturating_mul(ESTIMATE_MARGIN)).unwrap_or(usize::MAX)
+    };
+    keys_left.min(estimate).max(1)
 }
 
 /// State of the user-key group the filter is in.
@@ -1024,14 +1063,14 @@ pub(crate) mod tests {
             group_done = oldest_kept;
         }
 
+        let max_size = job.config.max_sstable_size;
         let mut sstables = Vec::new();
         let mut capacity_left = job.input_filter_capacity();
-        let mut builder = SSTableBuilder::new(capacity_left.max(1));
-        let mut file_keys = 0;
+        let mut data_bytes_left = job.input_data_bytes();
+        let mut builder = SSTableBuilder::new(output_filter_capacity(capacity_left, data_bytes_left, max_size));
         let mut current_size: usize = 0;
         let mut entries = filtered.into_iter().peekable();
         while let Some((key, dbv)) = entries.next() {
-            file_keys += 1;
             let entry_size = match &dbv {
                 DataBlockValue::Pointer(_) => std::mem::size_of::<ValuePointer>(),
                 DataBlockValue::Inline { data, .. } => data.len() + 8,
@@ -1044,11 +1083,12 @@ pub(crate) mod tests {
                 DataBlockValue::Pointer(vp) => builder.add(key, vp),
                 DataBlockValue::Inline { data, expire_at } => builder.add_inline(key, data, expire_at),
             }
-            if group_ends && current_size >= job.config.max_sstable_size {
-                sstables.push(builder.finish()?);
-                capacity_left = capacity_left.saturating_sub(file_keys);
-                builder = SSTableBuilder::new(capacity_left.max(1));
-                file_keys = 0;
+            if group_ends && current_size >= max_size {
+                let (file, summary) = builder.finish_with_summary()?;
+                sstables.push(file);
+                capacity_left = capacity_left.saturating_sub(summary.total_keys);
+                data_bytes_left = data_bytes_left.saturating_sub(summary.data_bytes);
+                builder = SSTableBuilder::new(output_filter_capacity(capacity_left, data_bytes_left, max_size));
                 current_size = 0;
             }
         }
@@ -1257,21 +1297,128 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    // Each file's filter is sized for the keys the inputs may still hold:
-    // their 3 × 400 less the keys of the files before it. Every key of a file
-    // passes that file's filter.
+    // Each file's filter is sized for its share of the 3 × 400 keys left,
+    // taken from the data bytes left with a margin of three: 594, 594, then
+    // the 240 keys left. Together they stay below twice the input keys, each
+    // covers the keys of its file, and every key passes its file's filter.
     #[test]
-    fn test_each_file_filter_is_sized_for_the_keys_left_to_write() -> Result<()> {
+    fn test_each_file_filter_is_sized_for_its_share_of_the_keys_left() -> Result<()> {
         let (job, _) = file_by_file_job();
-        let readers = outputs(&job)?.into_iter().map(SSTableReader::open).collect::<Result<Vec<_>>>()?;
-        let capacities: Vec<usize> = readers.iter().map(|reader| reader.bloom_capacity()).collect();
-        assert_eq!(capacities, vec![1200, 720, 240]);
-        for reader in &readers {
+        let mut capacities = Vec::new();
+        for (file, summary) in written(&job)? {
+            let reader = SSTableReader::open(file)?;
+            assert!(reader.bloom_capacity() >= summary.total_keys, "{} keys", summary.total_keys);
             for entry in reader.iter() {
                 let (key, _) = entry?;
                 assert!(reader.get(key)?.is_some(), "{key:?} must pass the filter of its file");
             }
+            capacities.push(reader.bloom_capacity());
         }
+        assert!(capacities.iter().sum::<usize>() <= 2 * 1200);
+        assert_eq!(capacities, vec![594, 594, 240]);
+        Ok(())
+    }
+
+    /// The filter capacity of each output file of `job`.
+    fn output_capacities(job: &CompactionJob) -> Result<Vec<usize>> {
+        let mut capacities = Vec::new();
+        for file in outputs(job)? {
+            let reader = SSTableReader::open(file)?;
+            for entry in reader.iter() {
+                let (key, _) = entry?;
+                assert!(reader.get(key)?.is_some(), "{key:?} must pass the filter of its file");
+            }
+            capacities.push(reader.bloom_capacity());
+        }
+        Ok(capacities)
+    }
+
+    // The special cases of the estimate: no data bytes left give every key
+    // left, a size limit of 0 gives one, an empty budget still gives one, an
+    // unlimited size gives the keys left, and the worked example gives 594.
+    #[test]
+    fn test_output_filter_capacity_special_cases() {
+        assert_eq!(output_filter_capacity(1200, 0, 13_440), 1200);
+        assert_eq!(output_filter_capacity(0, 0, 13_440), 1);
+        assert_eq!(output_filter_capacity(1200, 81_672, 0), 1);
+        assert_eq!(output_filter_capacity(1200, 81_672, usize::MAX), 1200);
+        assert_eq!(output_filter_capacity(1200, 81_672, 13_440), 594);
+    }
+
+    // Without a size limit the one file gets every input key; with a limit
+    // of 0 each key gets its own file and a filter for one key.
+    #[test]
+    fn test_filter_of_unlimited_and_zero_file_sizes() -> Result<()> {
+        let unlimited = CompactionConfig { max_sstable_size: usize::MAX, ..Default::default() };
+        let job = CompactionJob::new(interleaved_tables(3, 1200), vec![], unlimited);
+        assert_eq!(output_capacities(&job)?, vec![1200]);
+
+        let zero = CompactionConfig { max_sstable_size: 0, ..Default::default() };
+        let job = CompactionJob::new(interleaved_tables(3, 30), vec![], zero);
+        assert_eq!(output_capacities(&job)?, vec![1; 30]);
+        Ok(())
+    }
+
+    // One file per key: each output block costs more bytes than its entry
+    // took in the two input blocks, so the data bytes left run out before
+    // the keys do. From then on each file gets the filter for all keys left.
+    #[test]
+    fn test_filter_takes_the_keys_left_once_the_data_bytes_run_out() -> Result<()> {
+        let input = table((0..300).map(|i| (encode(format!("k{i:03}").as_bytes(), 1), inline(b"v"))).collect());
+        assert_eq!(input.key_count_bound(), 2 * 257);
+        let config = CompactionConfig { max_sstable_size: 1, ..Default::default() };
+        let capacities = output_capacities(&CompactionJob::new(vec![input], vec![], config))?;
+        assert_eq!(capacities.len(), 300);
+        assert_eq!(capacities[0], 3, "a share of one key, times three");
+        let rest = capacities.iter().rev().zip(1..).take_while(|(capacity, left)| **capacity == *left).count();
+        assert!(rest > 1, "capacities {capacities:?}");
+        Ok(())
+    }
+
+    /// A table of the keys `key-0000..key-0999` written at `ts`, its filter
+    /// sized for `filter_capacity` keys.
+    fn thousand_keys(ts: u64, filter_capacity: usize) -> Arc<SSTableReader> {
+        let mut builder = SSTableBuilder::new(filter_capacity);
+        for i in 0..1000 {
+            builder.add_inline(encode(format!("key-{i:04}").as_bytes(), ts), b"val!".to_vec(), 0);
+        }
+        Arc::new(SSTableReader::open(builder.finish().unwrap()).unwrap())
+    }
+
+    /// The single output file of compacting `sources` into `targets`.
+    fn compact_into_one(sources: Vec<Arc<SSTableReader>>, targets: Vec<Arc<SSTableReader>>) -> Result<Arc<SSTableReader>> {
+        let config = CompactionConfig {
+            low_watermark: Some(Timestamp::new(u64::MAX)),
+            max_sstable_size: usize::MAX,
+            ..Default::default()
+        };
+        let mut files = outputs(&CompactionJob::new(sources, targets, config))?;
+        assert_eq!(files.len(), 1);
+        Ok(Arc::new(SSTableReader::open(files.remove(0))?))
+    }
+
+    // Overwriting the same 1000 keys round after round keeps the filter of
+    // the compacted file at their count plus at most one block of slack.
+    #[test]
+    fn test_filter_does_not_grow_over_repeated_compactions() -> Result<()> {
+        let mut output = compact_into_one(vec![thousand_keys(1, 1000)], vec![])?;
+        let mut capacities = vec![output.bloom_capacity()];
+        for round in 2..=20 {
+            let bound = 1000 + output.key_count_bound();
+            output = compact_into_one(vec![thousand_keys(round, 1000)], vec![output])?;
+            assert!(output.bloom_capacity() <= bound, "round {round}: {} > {bound}", output.bloom_capacity());
+            capacities.push(output.bloom_capacity());
+        }
+        assert_eq!(capacities[19], capacities[2], "capacities {capacities:?}");
+        Ok(())
+    }
+
+    // An input whose filter was sized for 50 000 keys but holds 1000 counts
+    // with its four blocks of up to 257 entries.
+    #[test]
+    fn test_oversized_input_filter_shrinks_to_its_blocks() -> Result<()> {
+        let output = compact_into_one(vec![thousand_keys(2, 1000)], vec![thousand_keys(1, 50_000)])?;
+        assert_eq!(output.bloom_capacity(), 1028 + 1000);
         Ok(())
     }
 

@@ -598,7 +598,7 @@ impl Janitor {
         let data = self.file_manager.read_sstable(meta.file_id).await?;
         let reader = SSTableReader::open(data)?;
 
-        let mut builder = SSTableBuilder::new(reader.bloom_capacity());
+        let mut builder = SSTableBuilder::new(reader.iter().count());
         let mut smallest_key: Option<Vec<u8>> = None;
         let mut largest_key: Option<Vec<u8>> = None;
 
@@ -893,6 +893,39 @@ mod tests {
             }
             assert_eq!(std::fs::metadata(active.path()).unwrap().len(), 140);
             assert_eq!(active.read(0, 100).unwrap(), fx.live_val);
+        })
+    }
+
+    // A rebuilt table's filter is sized for the entries it holds, not for
+    // the oversized filter of the table it replaces.
+    #[test]
+    fn test_rebuild_sizes_the_filter_for_the_entries() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let fx = gc_fixture(dir.path()).await;
+            let file_manager = &fx.janitor.file_manager;
+
+            let file_id = file_manager.allocate_file_id();
+            let mut builder = SSTableBuilder::new(50_000);
+            for i in 0..1000 {
+                builder.add(
+                    format!("key-{i:04}").into_bytes(),
+                    ValuePointer { file_id: 1, value_offset: i, value_len: 1, expire_at: 0 },
+                );
+            }
+            let sst = file_manager.write_sstable(file_id, builder.finish().unwrap()).await.unwrap();
+            let meta = SSTableMetadata {
+                file_id,
+                level: 1,
+                smallest_key: b"key-0000".to_vec(),
+                largest_key: b"key-0999".to_vec(),
+                file_size: sst.len() as u64,
+                max_timestamp: 0,
+            };
+
+            let rebuilt = fx.janitor.rebuild_sstable(&meta, 1, &HashMap::new(), 2).await.unwrap();
+            let reader = SSTableReader::open(file_manager.read_sstable(rebuilt.file_id).await.unwrap()).unwrap();
+            assert_eq!(reader.bloom_capacity(), 1000);
         })
     }
 

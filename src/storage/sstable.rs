@@ -13,6 +13,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const BLOCK_SIZE_TARGET: usize = 4096; // 4KB target for data blocks
+/// A data block closes at this many entries, whatever their size.
+const MAX_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE_TARGET / 16 + 1;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 
 /// True until `key` lies behind the run of keys that start with `prefix`.
@@ -61,6 +63,8 @@ pub struct SSTableSummary {
     /// Highest raw MVCC timestamp of the keys.
     pub max_timestamp: u64,
     pub total_keys: usize,
+    /// Bytes of the encoded data blocks, without their alignment.
+    pub data_bytes: u64,
 }
 
 /// Builds an SSTable of keys added in sorted order. [`Self::take_encoded`]
@@ -76,6 +80,7 @@ pub struct SSTableBuilder {
     offset: u64,
     filter: BloomFilterImpl,
     total_keys: usize,
+    data_bytes: u64,
     largest_key: Vec<u8>,
     max_timestamp: u64,
 }
@@ -92,6 +97,7 @@ impl SSTableBuilder {
             offset: 0,
             filter: BloomFilterImpl::new(filter_capacity, BLOOM_FALSE_POSITIVE_RATE),
             total_keys: 0,
+            data_bytes: 0,
             largest_key: Vec::new(),
             max_timestamp: 0,
         }
@@ -118,7 +124,7 @@ impl SSTableBuilder {
             self.max_timestamp = self.max_timestamp.max(ts.as_u64());
         }
         self.current_block.entries.push((key, value));
-        if self.current_block.entries.len() * 16 > BLOCK_SIZE_TARGET {
+        if self.current_block.entries.len() >= MAX_ENTRIES_PER_BLOCK {
             self.finish_block();
         }
     }
@@ -142,6 +148,7 @@ impl SSTableBuilder {
         for block in std::mem::take(&mut self.full_blocks) {
             let bytes = rkyv::to_bytes::<rancor::Error>(&block)?;
             let handle = BlockHandle { offset: self.offset, size: bytes.len() as u64 };
+            self.data_bytes += handle.size;
             if let (Some((first_key, _)), Some((last_key, _))) = (block.entries.first(), block.entries.last()) {
                 self.index.entries.push((first_key.clone(), handle));
                 self.largest_key.clone_from(last_key);
@@ -205,6 +212,7 @@ impl SSTableBuilder {
             largest_key: self.largest_key,
             max_timestamp: self.max_timestamp,
             total_keys: self.total_keys,
+            data_bytes: self.data_bytes,
         };
         Ok((self.encoded, summary))
     }
@@ -353,6 +361,16 @@ impl SSTableReader {
     /// The most keys the table's Bloom filter was sized for.
     pub fn bloom_capacity(&self) -> usize {
         self.bloom_filter.capacity(BLOOM_FALSE_POSITIVE_RATE)
+    }
+
+    /// The most entries the table can hold: its data blocks, full each.
+    pub fn key_count_bound(&self) -> usize {
+        self.index.entries.len() * MAX_ENTRIES_PER_BLOCK
+    }
+
+    /// Bytes of the encoded data blocks, without their alignment.
+    pub fn data_bytes(&self) -> u64 {
+        self.index.entries.iter().map(|entry| u64::from(entry.1.size)).sum()
     }
 
     /// Sets the file ID used as part of the block cache key.
@@ -1429,9 +1447,6 @@ mod tests {
         Ok(())
     }
 
-    /// The builder closes a data block at this many entries.
-    const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE_TARGET / 16 + 1;
-
     /// One stored version: user key, write timestamp, `false` for a tombstone.
     type Version = (Vec<u8>, u64, bool);
 
@@ -1522,11 +1537,11 @@ mod tests {
     // which sort before it, end the block before: the scan must start there.
     #[test]
     fn test_prefix_scan_starts_before_a_block_that_opens_with_the_prefix_key() -> anyhow::Result<()> {
-        let mut versions = numbered("aa", ENTRIES_PER_BLOCK - 2);
+        let mut versions = numbered("aa", MAX_ENTRIES_PER_BLOCK - 2);
         for key in ["abc", "abd", "ab", "ac"] {
             versions.push(version(key, 10, true));
         }
-        versions.extend(numbered("z:", ENTRIES_PER_BLOCK));
+        versions.extend(numbered("z:", MAX_ENTRIES_PER_BLOCK));
         let reader = build_table(versions)?;
         assert_eq!(reader.index.entries[1].0.as_slice(), encode(b"ab", 10), "layout precondition");
 
@@ -1610,9 +1625,9 @@ mod tests {
 
     #[test]
     fn test_prefix_scan_between_two_blocks_reads_at_most_one_block() -> anyhow::Result<()> {
-        let mut versions = numbered("a:", ENTRIES_PER_BLOCK);
-        versions.extend(numbered("c:", ENTRIES_PER_BLOCK));
-        versions.extend(numbered("e:", ENTRIES_PER_BLOCK));
+        let mut versions = numbered("a:", MAX_ENTRIES_PER_BLOCK);
+        versions.extend(numbered("c:", MAX_ENTRIES_PER_BLOCK));
+        versions.extend(numbered("e:", MAX_ENTRIES_PER_BLOCK));
         let reader = build_table(versions)?;
         assert_eq!(reader.index.entries.len(), 3, "layout precondition");
 
@@ -1674,7 +1689,7 @@ mod tests {
     // it: neither the entry nor the block may end the read of `a`.
     #[test]
     fn test_point_read_passes_a_longer_key_that_sorts_first() -> anyhow::Result<()> {
-        let mut versions = numbered("0", ENTRIES_PER_BLOCK);
+        let mut versions = numbered("0", MAX_ENTRIES_PER_BLOCK);
         versions.extend([version("ab", 20, true), version("a", 10, true)]);
         let reader = build_table(versions)?;
         assert_eq!(reader.index.entries[1].0.as_slice(), encode(b"ab", 20), "layout precondition");
@@ -1691,7 +1706,7 @@ mod tests {
     #[test]
     fn test_point_read_follows_versions_into_the_next_block() -> anyhow::Result<()> {
         let mut versions = numbered("a:", 10);
-        versions.extend((1..=ENTRIES_PER_BLOCK as u64).map(|i| version("m", 10 * i, true)));
+        versions.extend((1..=MAX_ENTRIES_PER_BLOCK as u64).map(|i| version("m", 10 * i, true)));
         versions.extend(numbered("z:", 10));
         let reader = build_table(versions)?;
         assert_eq!(reader.index.entries.len(), 2, "layout precondition");
@@ -1706,9 +1721,9 @@ mod tests {
     /// `ab@20` ends the first block and the older `ab@10`, a tombstone, opens
     /// the second; the third opens with `a`, which sorts behind both.
     fn table_with_versions_across_a_block_boundary() -> anyhow::Result<SSTableReader> {
-        let mut versions = numbered("aa", ENTRIES_PER_BLOCK - 1);
+        let mut versions = numbered("aa", MAX_ENTRIES_PER_BLOCK - 1);
         versions.extend([version("ab", 20, true), version("ab", 10, false)]);
-        versions.extend(numbered("ac", ENTRIES_PER_BLOCK - 1));
+        versions.extend(numbered("ac", MAX_ENTRIES_PER_BLOCK - 1));
         versions.push(version("a", 10, true));
         let reader = build_table(versions)?;
         assert_eq!(reader.index.entries.len(), 3, "layout precondition");
@@ -1927,7 +1942,7 @@ mod tests {
             match n {
                 0 => Vec::new(),
                 1 => mixed_entries(1),
-                2 => mixed_entries(3 * ENTRIES_PER_BLOCK + 17),
+                2 => mixed_entries(3 * MAX_ENTRIES_PER_BLOCK + 17),
                 _ => [b"a".as_slice(), b"bb", b"ccc"]
                     .into_iter()
                     .map(|key| (key.to_vec(), DataBlockValue::Inline { data: b"v".to_vec(), expire_at: 0 }))
@@ -1964,7 +1979,7 @@ mod tests {
                 let (tail, summary) = streaming.finish_with_summary()?;
                 streamed.extend(tail);
                 assert_eq!(streamed, expected, "{count} entries streamed, capacity {capacity}");
-                let full_blocks: Vec<usize> = (1..=count / ENTRIES_PER_BLOCK).map(|b| b * ENTRIES_PER_BLOCK).collect();
+                let full_blocks: Vec<usize> = (1..=count / MAX_ENTRIES_PER_BLOCK).map(|b| b * MAX_ENTRIES_PER_BLOCK).collect();
                 assert_eq!(handed_over, full_blocks);
                 assert_eq!(summary.file_size, expected.len() as u64);
                 assert_eq!(summary.total_keys, count);
@@ -1976,7 +1991,7 @@ mod tests {
     // The summary carries the key range and newest stamp of the entries.
     #[test]
     fn test_builder_summary_describes_the_entries() -> anyhow::Result<()> {
-        let count = 2 * ENTRIES_PER_BLOCK + 5;
+        let count = 2 * MAX_ENTRIES_PER_BLOCK + 5;
         let mut builder = SSTableBuilder::new(count);
         for (key, value) in mixed_entries(count) {
             add_entry(&mut builder, key, value);
@@ -1988,6 +2003,34 @@ mod tests {
 
         let (_, empty) = SSTableBuilder::new(0).finish_with_summary()?;
         assert_eq!((empty.smallest_key, empty.largest_key, empty.max_timestamp, empty.total_keys), (vec![], vec![], 0, 0));
+        Ok(())
+    }
+
+    // The index bounds the entry count to less than a block above it; the
+    // data bytes are the encoded blocks without their alignment, the same
+    // when read back as the builder counted them.
+    #[test]
+    fn test_key_count_bound_and_data_bytes_describe_the_file() -> anyhow::Result<()> {
+        for count in [0, 1, 257, 258, 10_000] {
+            let mut builder = SSTableBuilder::new(count);
+            for (key, value) in mixed_entries(count) {
+                add_entry(&mut builder, key, value);
+            }
+            let (bytes, summary) = builder.finish_with_summary()?;
+            let reader = SSTableReader::open(bytes)?;
+
+            let bound = reader.key_count_bound();
+            assert!(count <= bound && bound < count + 257, "{count} entries, bound {bound}");
+
+            let data_bytes = reader.data_bytes();
+            assert_eq!(data_bytes, summary.data_bytes, "{count} entries");
+            let data_end = u64::from(reader.footer.index_handle.offset);
+            let blocks = reader.index.entries.len() as u64;
+            assert!(
+                data_bytes <= data_end && data_end <= data_bytes + 7 * blocks,
+                "{count} entries: {data_bytes} data bytes before offset {data_end}"
+            );
+        }
         Ok(())
     }
 

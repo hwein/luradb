@@ -91,6 +91,10 @@ version_gt() {
     return 1
 }
 
+check_tools() {
+    command -v jq >/dev/null 2>&1 || die "jq is required (apt install jq)"
+}
+
 check_branch() {
     local branch="$1" current
     current=$(current_branch)
@@ -126,7 +130,7 @@ check_clean_and_synced() {
     fi
 }
 
-# The report must be a passing run against an annotated tag on exactly HEAD.
+# The report must be a passing run against an annotated rc tag on exactly HEAD.
 check_release_report() {
     [ -n "$REPORT" ] || die "final releases require --report <file> (the release test report)"
     [ -r "$REPORT" ] || die "report not readable: $REPORT"
@@ -138,6 +142,8 @@ check_release_report() {
     head=$(git -C "$REPO_ROOT" rev-parse HEAD)
     [ "$commit" = "$head" ] || die "report commit '${commit}' is not HEAD ($head)"
     [ -n "$tag" ] || die "report has no tag"
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]] \
+        || die "report tag '${tag}' is not an rc tag (vX.Y.Z-rc.N)"
     [ "$(git -C "$REPO_ROOT" cat-file -t "refs/tags/$tag" 2>/dev/null)" = "tag" ] \
         || die "report tag '${tag}' is not an annotated tag"
     [ "$(git -C "$REPO_ROOT" rev-parse "refs/tags/$tag^{commit}")" = "$commit" ] \
@@ -552,6 +558,8 @@ if [ -n "$REPORT" ] && [ "$MODE" != "final" ]; then
     printf -- '--report applies to final releases only\n\n' >&2
     usage 1
 fi
+
+check_tools
 
 case "$MODE" in
     final)  run_final ;;

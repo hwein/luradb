@@ -93,6 +93,48 @@ version_gt() {
 
 check_tools() {
     command -v jq >/dev/null 2>&1 || die "jq is required (apt install jq)"
+    command -v curl >/dev/null 2>&1 || die "curl is required (apt install curl)"
+}
+
+github_api_url() {
+    local repo_url
+    repo_url=$(resolve_repo_url)
+    printf 'https://api.github.com/repos/%s' "${repo_url#https://github.com/}"
+}
+
+# The pushed tag only triggers the Release workflow; the GitHub release with
+# its assets exists once that workflow has passed. Waits for it (unauthenticated
+# API, polled once a minute) and fails loudly when the workflow is red.
+wait_for_release_workflow() {
+    local tag="$1" api status conclusion html_url assets deadline line
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] wait for the Release workflow of %s and check the GitHub release\n' "$tag"
+        return
+    fi
+    api=$(github_api_url)
+    step "waiting for the Release workflow of $tag (up to 45 min)"
+    deadline=$(( $(date +%s) + 45 * 60 ))
+    status=""
+    while :; do
+        line=$(curl -fsS "$api/actions/workflows/release.yml/runs?event=push&branch=$tag&per_page=1" \
+            | jq -r '.workflow_runs[0] | select(. != null) | [.status, (.conclusion // "-"), .html_url] | @tsv' \
+            2>/dev/null || true)
+        if [ -n "$line" ]; then
+            IFS=$'\t' read -r status conclusion html_url <<<"$line"
+            [ "$status" = "completed" ] && break
+            log "   workflow $status ..."
+        else
+            log "   workflow not started yet ..."
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] || die "the Release workflow of $tag did not finish in time — check ${html_url:-the Actions page}"
+        sleep 60
+    done
+    if [ "$conclusion" != "success" ]; then
+        die "the Release workflow of $tag ended with '$conclusion' — no GitHub release was published. Fix the cause on next and cut the next rc. Details: $html_url"
+    fi
+    assets=$(curl -fsS "$api/releases/tags/$tag" | jq -r '.assets | length' 2>/dev/null || echo 0)
+    [ "$assets" -gt 0 ] || die "the Release workflow passed but no GitHub release with assets exists for $tag: $html_url"
+    log "Release $tag published with $assets assets: $(resolve_repo_url)/releases/tag/$tag"
 }
 
 check_branch() {
@@ -447,6 +489,7 @@ run_rc() {
     if resume_tag=$(detect_pending_push_rc); then
         log "Detected a half-finished rc state (tag $resume_tag local, push pending) — catching up the push only."
         push_atomic next "$resume_tag"
+        wait_for_release_workflow "$resume_tag"
         return
     fi
 
@@ -473,6 +516,7 @@ run_rc() {
     commit_paths "chore(release): $tag" Cargo.toml Cargo.lock api/openapi.json
     create_tag "$tag" "LuraDB $tag"
     push_atomic next "$tag"
+    wait_for_release_workflow "$tag"
 }
 
 detect_pending_push_hotfix() {

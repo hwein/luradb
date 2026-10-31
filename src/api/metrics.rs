@@ -24,15 +24,16 @@ const SHARD_PING_TIMEOUT: Duration = Duration::from_millis(250);
 ///
 /// Returns a JSON snapshot of system vitals, summed over the data shards, in
 /// `shards` the status of each data shard: `ok` once it answered, `timeout`
-/// when it did not within 250 ms, in `resources` the free disk space of each
-/// data volume and the server's own memory, and in `io`, while writes of a
-/// data file fail, the file and its failures in a row. No authentication
-/// required.
+/// when it did not within 250 ms, in `resources` the state of disk space
+/// (the worst of all data volumes) and of the server's own memory, and in
+/// `io`, while writes of a data file fail, their failures in a row. It names
+/// no path and gives no size; `GET /store-api/metrics` does. No
+/// authentication required.
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold, or below a block threshold, while writes answer 507 and reads go on; `resources` names the volume or the memory. Also `degraded` while writes of a data file fail; `io` names the file and its failures in a row (the server stops at the third, or at the first on a read-only file system)", body = crate::metrics::HeartbeatMetrics),
+        (status = 200, description = "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold (`warning`), or below a block threshold (`blocked`), while writes answer 507 and reads go on; `resources` gives the state of the disk space and of the memory, without volume, path or number. Also `degraded` while writes of a data file fail; `io` gives their failures in a row, without the file (the server stops at the third, or at the first on a read-only file system)", body = crate::metrics::HeartbeatMetrics),
         (status = 503, description = "A data shard did not answer within 250 ms; the full report with status `degraded`; its `shards` list names the shard with status `timeout`", body = crate::metrics::HeartbeatMetrics),
     ),
     security(()),
@@ -125,7 +126,11 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 /// is not being updated) and `clients_kicked_total` (clients disconnected after
 /// `shm.kick_blocking_client_after_secs`).
 ///
-/// `resources` is the disk and memory state `GET /health` reports.
+/// `resources` is the full disk and memory report, of which `GET /health`
+/// gives the states only: per data volume `path`, `size_bytes`, `free_bytes`
+/// and `state`, and for the memory `rss_anon_bytes`, `budget_bytes` and
+/// `state`. `io` appears only while writes of a data file fail: the file
+/// with the most failures in a row, `path` and `failures`.
 //
 // Every field is the sum over the data shards; the latency percentiles are
 // those of the shards' windows merged. The `system` block's
@@ -210,15 +215,20 @@ pub async fn get_metrics(State(state): State<AppState>) -> Result<Json<Value>, A
         })
     });
 
-    Ok(Json(json!({
+    let resources = state.control.resources();
+    let mut body = json!({
         "system": system,
         "domains": domains,
         "engines": engines,
         "block_cache": block_cache,
         "backup": backup,
         "shm": shm,
-        "resources": state.control.resources().report(),
-    })))
+        "resources": resources.report(),
+    });
+    if let Some(io) = resources.io().report() {
+        body["io"] = json!(io);
+    }
+    Ok(Json(body))
 }
 
 /// `GET /metrics/domains/{name}` — metrics for one domain. Admin or domain user.
@@ -250,7 +260,7 @@ pub async fn get_domain_metrics(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::wal::WriteAheadLog;
     use crate::engines::lsm::domain::{DomainConfig, DomainRegistry};
@@ -274,9 +284,43 @@ mod tests {
         body
     }
 
-    // Test 5: while writes of a data file fail in a row, /health stays 200
-    // with status `degraded` and names the file and its failures in `io`;
-    // once a write succeeds, `io` goes and the status is `ok` again.
+    /// Panics when a `GET /health` body holds a string that starts with `/`,
+    /// or, in `resources` and `io`, a `path` key or a key ending in `_bytes`.
+    pub(crate) fn assert_health_discloses_no_paths_or_sizes(body: &Value) {
+        fn strings_are_no_paths(value: &Value, at: &str) {
+            match value {
+                Value::String(text) => assert!(!text.starts_with('/'), "{at} is a path: {text}"),
+                Value::Array(items) => {
+                    items.iter().enumerate().for_each(|(i, item)| strings_are_no_paths(item, &format!("{at}[{i}]")))
+                }
+                Value::Object(fields) => fields.iter().for_each(|(key, item)| strings_are_no_paths(item, &format!("{at}.{key}"))),
+                _ => {}
+            }
+        }
+        fn keys_are_no_paths_or_sizes(value: &Value, at: &str) {
+            match value {
+                Value::Array(items) => {
+                    items.iter().enumerate().for_each(|(i, item)| keys_are_no_paths_or_sizes(item, &format!("{at}[{i}]")))
+                }
+                Value::Object(fields) => {
+                    for (key, item) in fields {
+                        assert!(key != "path" && !key.ends_with("_bytes"), "{at}.{key} discloses a path or a size");
+                        keys_are_no_paths_or_sizes(item, &format!("{at}.{key}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        strings_are_no_paths(body, "body");
+        for block in ["resources", "io"] {
+            keys_are_no_paths_or_sizes(&body[block], block);
+        }
+    }
+
+    // While writes of a data file fail in a row, /health stays 200 with
+    // status `degraded` and gives the failures in `io`, without the file;
+    // the metrics name the file too. Once a write succeeds, `io` goes and the
+    // status is `ok` again.
     #[test]
     fn test_health_is_degraded_while_writes_of_a_data_file_fail() {
         use crate::storage::write_failures::WriteFailures;
@@ -284,6 +328,7 @@ mod tests {
             let (state, _dir) = make_state().await;
             let (status, Json(body)) = health(State(state.clone())).await;
             assert_eq!((status, &body["status"], body.get("io")), (StatusCode::OK, &json!("ok"), None), "{body}");
+            assert_eq!(scrape(state.clone()).await.get("io"), None);
 
             let failures = WriteFailures::new(state.control.resources().io());
             let eio = std::io::Error::from_raw_os_error(libc::EIO);
@@ -292,11 +337,15 @@ mod tests {
             }
             let (status, Json(body)) = health(State(state.clone())).await;
             assert_eq!((status, &body["status"]), (StatusCode::OK, &json!("degraded")), "{body}");
-            assert_eq!(body["io"], json!({ "path": "/data/vlog.log", "failures": 2 }));
+            assert_eq!(body["io"], json!({ "failures": 2 }));
+            assert_eq!(body["resources"], json!({ "state": "ok", "disk_state": "ok", "memory_state": "ok" }));
+            assert_health_discloses_no_paths_or_sizes(&body);
+            assert_eq!(scrape(state.clone()).await["io"], json!({ "path": "/data/vlog.log", "failures": 2 }));
 
             failures.succeeded();
-            let (_, Json(body)) = health(State(state)).await;
+            let (_, Json(body)) = health(State(state.clone())).await;
             assert_eq!((&body["status"], body.get("io")), (&json!("ok"), None), "{body}");
+            assert_eq!(scrape(state).await.get("io"), None);
         })
     }
 

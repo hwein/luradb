@@ -176,8 +176,8 @@ impl SpaceWait {
     }
 }
 
-/// `resources` of `GET /health` and `GET /store-api/metrics`.
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+/// `resources` of `GET /store-api/metrics`.
+#[derive(Debug, Clone, Serialize)]
 pub struct ResourceReport {
     /// `ok`, `warning` (below a warn threshold) or `blocked` (writes refused).
     pub state: &'static str,
@@ -192,8 +192,35 @@ impl Default for ResourceReport {
     }
 }
 
-/// A volume in the resource report.
+/// `resources` of `GET /health`: the states of the report, without volumes,
+/// paths or numbers.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ResourceState {
+    /// `ok`, `warning` (below a warn threshold) or `blocked` (writes refused).
+    pub state: &'static str,
+    /// The worst state of the data volumes: `ok`, `warning` or `blocked`.
+    pub disk_state: &'static str,
+    /// `ok`, `warning` or `blocked`.
+    pub memory_state: &'static str,
+}
+
+impl From<&ResourceReport> for ResourceState {
+    fn from(report: &ResourceReport) -> Self {
+        let rank = |state: &str| match state {
+            "blocked" => 2,
+            "warning" => 1,
+            _ => 0,
+        };
+        Self {
+            state: report.state,
+            disk_state: report.disk.iter().map(|disk| disk.state).max_by_key(|state| rank(state)).unwrap_or(Level::Normal.name()),
+            memory_state: report.memory.state,
+        }
+    }
+}
+
+/// A volume in the resource report.
+#[derive(Debug, Clone, Serialize)]
 pub struct DiskReport {
     /// A data path on the volume.
     pub path: String,
@@ -205,7 +232,7 @@ pub struct DiskReport {
 }
 
 /// The server's anonymous memory against its budget.
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MemoryReport {
     pub rss_anon_bytes: u64,
     pub budget_bytes: u64,
@@ -1197,5 +1224,31 @@ pub(crate) mod tests {
         config.resources.memory_budget = "64 GiB".into();
         let (watch, _) = started(&config, &probe);
         assert_eq!(watch.fixed_memory_notice(&items), None);
+    }
+
+    // The health states are the worst of all volumes, `ok` without one, and
+    // the state of the memory.
+    #[test]
+    fn test_the_health_states_take_the_worst_volume() {
+        let volume = |state| DiskReport { path: "/data".into(), size_bytes: 1, free_bytes: 1, state };
+        let report = |disk: Vec<DiskReport>, memory: &'static str| ResourceReport {
+            state: "warning",
+            disk,
+            memory: MemoryReport { rss_anon_bytes: 1, budget_bytes: 2, state: memory },
+        };
+        let states = |report: ResourceReport| serde_json::to_value(ResourceState::from(&report)).unwrap();
+
+        assert_eq!(
+            states(report(vec![volume("ok"), volume("blocked"), volume("warning")], "warning")),
+            serde_json::json!({ "state": "warning", "disk_state": "blocked", "memory_state": "warning" })
+        );
+        assert_eq!(
+            states(report(vec![volume("ok"), volume("warning")], "blocked")),
+            serde_json::json!({ "state": "warning", "disk_state": "warning", "memory_state": "blocked" })
+        );
+        assert_eq!(
+            states(report(Vec::new(), "ok")),
+            serde_json::json!({ "state": "warning", "disk_state": "ok", "memory_state": "ok" })
+        );
     }
 }

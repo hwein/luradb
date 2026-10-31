@@ -1,6 +1,6 @@
 //! Failed writes of the data files the server goes on using: how many in a
-//! row each had, when they stop the server, and which file the health report
-//! names meanwhile.
+//! row each had, when they stop the server, and which file the metrics
+//! name meanwhile.
 
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -11,8 +11,8 @@ use std::sync::Arc;
 /// stops it at the first.
 pub const FAILURES_TO_STOP: u32 = 3;
 
-/// The rows of failed writes going on, for the health report; clones share
-/// them.
+/// The rows of failed writes going on, for the health report and the
+/// metrics; clones share them.
 #[derive(Debug, Clone, Default)]
 pub struct IoFailures(Arc<Mutex<Vec<(u64, IoReport)>>>);
 
@@ -36,13 +36,26 @@ impl IoFailures {
     }
 }
 
-/// `io` of `GET /health`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+/// `io` of `GET /store-api/metrics`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct IoReport {
     /// The data file whose last write failed.
     pub path: String,
     /// Its failed writes in a row.
     pub failures: u32,
+}
+
+/// `io` of `GET /health`: the failed writes in a row, without the file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct IoState {
+    /// Failed writes in a row of the data file with the most.
+    pub failures: u32,
+}
+
+impl From<&IoReport> for IoState {
+    fn from(report: &IoReport) -> Self {
+        Self { failures: report.failures }
+    }
 }
 
 /// The failed writes in a row of one data file, or of the files one job

@@ -1376,6 +1376,8 @@ mod tests {
             }
 
             // The rest of the management surface stays admin-only.
+            let resp = send(&app, Method::GET, "/store-api/metrics", Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
             let resp = authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/metrics", None).await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
             let resp = authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/config", None).await;

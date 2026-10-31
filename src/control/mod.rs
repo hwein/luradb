@@ -1624,9 +1624,14 @@ mod tests {
 
         /// Checkpoint ticks over the key-value log, capped at `limit` bytes.
         fn checkpoints(&self, limit: u64) -> Arc<checkpoint::WalCheckpoint> {
+            self.checkpoints_with(limit, Arc::default())
+        }
+
+        /// [`Self::checkpoints`] serving the flush requests of `relief`.
+        fn checkpoints_with(&self, limit: u64, relief: Arc<resources::Relief>) -> Arc<checkpoint::WalCheckpoint> {
             let wal = self.hub.wal(crate::core::storage_thread::WalTarget::Kv);
             let logs = vec![(checkpoint::Holder::Shards(Engine::Kv), wal)];
-            Arc::new(checkpoint::WalCheckpoint::new(Arc::clone(&self.control), logs, limit))
+            Arc::new(checkpoint::WalCheckpoint::new(Arc::clone(&self.control), logs, limit, relief))
         }
 
         /// Drops everything without a flush or a cut, as a crash does, and
@@ -2522,6 +2527,92 @@ mod tests {
             assert!(reports.iter().all(|report| matches!(report, Report::Stuck { log: "kv", .. })));
             assert_eq!(checkpoints.run().await, [Report::Recovered { log: "kv", failures: 120 }]);
             assert_eq!(checkpoints.run().await, []);
+        })
+    }
+
+    /// Shard `k`'s `Persist`s so far.
+    fn persists(s: &TwoShards, k: usize) -> usize {
+        s.commands_of(k).iter().filter(|name| **name == "persist").count()
+    }
+
+    /// One write on each shard.
+    async fn write_on_both(s: &TwoShards, key: &str) {
+        for (k, domain) in two_domains().iter().enumerate() {
+            s.engines[k].put(&data_key(domain, key), b"v").await.unwrap();
+        }
+    }
+
+    // Without a flush request, records in a young segment stay; with one,
+    // the tick closes the segment, has every shard persist once, drops the
+    // segment and marks the request done.
+    #[test]
+    fn a_flush_request_closes_a_young_segment() {
+        crate::core::engine_runtime::block_on(async {
+            use std::sync::atomic::Ordering;
+            let s = TwoShards::new(|_, _| {}).await;
+            let relief = Arc::new(resources::Relief::default());
+            let checkpoints = s.checkpoints_with(u64::MAX, Arc::clone(&relief));
+            write_on_both(&s, "k").await;
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!(s.segment_files()[0].0, 1);
+            assert_eq!((persists(&s, 0), persists(&s, 1)), (0, 0));
+
+            relief.requested.store(1, Ordering::Release);
+            assert_eq!(checkpoints.run().await, []);
+            assert!(s.holds_only_a_header(), "{:?}", s.segment_files());
+            assert_eq!(s.segment_files()[0].0, 2);
+            assert_eq!((persists(&s, 0), persists(&s, 1)), (1, 1));
+            assert_eq!(relief.flushed.load(Ordering::Acquire), 1);
+        })
+    }
+
+    // A flush request with the records in a closed segment and none in the
+    // one appended to raises every shard to the last LSN without a
+    // rotation and drops the closed segment; a request with no record left
+    // to persist leaves the log alone. Both are marked done.
+    #[test]
+    fn a_flush_request_persists_a_closed_segment_without_a_rotation() {
+        crate::core::engine_runtime::block_on(async {
+            use std::sync::atomic::Ordering;
+            let s = TwoShards::new(|_, _| {}).await;
+            let wal = s.hub.wal(crate::core::storage_thread::WalTarget::Kv);
+            let relief = Arc::new(resources::Relief::default());
+            let checkpoints = s.checkpoints_with(u64::MAX, Arc::clone(&relief));
+            write_on_both(&s, "k").await;
+            wal.rotate().await.unwrap();
+            let active = wal.segments().await.unwrap().active().segment;
+
+            relief.requested.store(1, Ordering::Release);
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!(wal.segments().await.unwrap().active().segment, active, "no rotation");
+            assert_eq!(s.segment_files()[0].0, active, "the closed segment went");
+            assert_eq!((persists(&s, 0), persists(&s, 1)), (1, 1));
+            assert_eq!(relief.flushed.load(Ordering::Acquire), 1);
+
+            let segments = s.segment_files();
+            relief.requested.store(2, Ordering::Release);
+            assert_eq!(checkpoints.run().await, []);
+            assert_eq!((persists(&s, 0), persists(&s, 1)), (1, 1), "nothing left to persist");
+            assert_eq!(s.segment_files(), segments);
+            assert_eq!(relief.flushed.load(Ordering::Acquire), 2);
+        })
+    }
+
+    // A shard that does not answer the Persist of a flush request fails the
+    // tick; the request is marked done all the same.
+    #[test]
+    fn a_failed_flush_request_is_marked_done() {
+        crate::core::engine_runtime::block_on(async {
+            use std::sync::atomic::Ordering;
+            let s = TwoShards::new(|_, _| {}).await;
+            let relief = Arc::new(resources::Relief::default());
+            let checkpoints = s.checkpoints_with(u64::MAX, Arc::clone(&relief));
+            write_on_both(&s, "k").await;
+            s.drop_persists[1].send_replace(true);
+            relief.requested.store(1, Ordering::Release);
+            let reports = checkpoints.run().await;
+            assert!(matches!(&reports[..], [Report::Stuck { log: "kv", .. }]), "{reports:?}");
+            assert_eq!(relief.flushed.load(Ordering::Acquire), 1);
         })
     }
 

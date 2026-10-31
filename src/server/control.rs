@@ -399,6 +399,7 @@ async fn bootstrap(
     // shards' own start writes, a default domain for one, went in before.
     let watch = Arc::new(parking_lot::Mutex::new(watch));
     resources::log(&watch.lock().tick());
+    let relief = watch.lock().relief();
     #[cfg(test)]
     super::test_hook::register_watch(&config.storage.system_dir, Arc::clone(&watch));
 
@@ -423,7 +424,7 @@ async fn bootstrap(
         .chain([(Holder::System, WalTarget::Sys)])
         .map(|(holder, target)| (holder, WriteAheadLog::with_storage_handle(hub.clone(), target)))
         .collect();
-    let checkpoint = Arc::new(WalCheckpoint::new(Arc::clone(&states[0].control), logs, wal_limit));
+    let checkpoint = Arc::new(WalCheckpoint::new(Arc::clone(&states[0].control), logs, wal_limit, relief));
     system_loops.spawn("WalCheckpoint", WAL_CHECKPOINT_INTERVAL, move || {
         let checkpoint = Arc::clone(&checkpoint);
         async move { checkpoint.tick().await }

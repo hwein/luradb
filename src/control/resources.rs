@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +27,27 @@ const MIN_DISK_FREE_BLOCK: u64 = 64 * 1024 * 1024;
 const MEMORY_WARN_PERCENT: u64 = 80;
 const MEMORY_BLOCK_PERCENT: u64 = 95;
 const MEMORY_RESUME_PERCENT: u64 = 90;
+/// While writes are refused for memory, the watch has the MemTables flushed
+/// and free heap returned to the kernel on the first tick and every this
+/// many ticks after it.
+const MEMORY_RELIEF_EVERY: u64 = 10;
+
+/// The flushes of every MemTable the watch asked for during a memory block,
+/// and how many of them the write-ahead log checkpoint has done.
+#[derive(Default)]
+pub struct Relief {
+    pub(crate) requested: AtomicU64,
+    pub(crate) flushed: AtomicU64,
+}
+
+/// How the watch returns free heap to the kernel.
+enum Trimmer {
+    /// `malloc_trim` on a short-lived thread: it locks every arena in turn
+    /// and must not hold up the control plane.
+    Thread,
+    #[cfg(test)]
+    Inline(Box<dyn Fn() + Send + Sync>),
+}
 
 /// How the server stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -433,6 +454,13 @@ pub struct ResourceWatch {
     /// Ticks in a row the readings allowed the next better level.
     ticks_above: u32,
     rss: u64,
+    relief: Arc<Relief>,
+    /// Ticks so far of a block that holds for memory.
+    memory_ticks: u64,
+    /// The flush request the last trim followed.
+    trimmed_for: u64,
+    trimmer: Trimmer,
+    trim_running: Arc<AtomicBool>,
 }
 
 impl ResourceWatch {
@@ -532,12 +560,22 @@ impl ResourceWatch {
             ticks_in_state: 0,
             ticks_above: 0,
             rss: 0,
+            relief: Arc::default(),
+            memory_ticks: 0,
+            trimmed_for: 0,
+            trimmer: Trimmer::Thread,
+            trim_running: Arc::default(),
         };
         Ok((watch, notices))
     }
 
     pub fn resources(&self) -> Resources {
         self.resources.clone()
+    }
+
+    /// The flush requests, for the write-ahead log checkpoint to serve.
+    pub fn relief(&self) -> Arc<Relief> {
+        Arc::clone(&self.relief)
     }
 
     /// The warning about memory every instance takes regardless of load,
@@ -555,8 +593,9 @@ impl ResourceWatch {
         )))
     }
 
-    /// Reads every probe, moves the state on and publishes it; returns the
-    /// lines for the server log. A probe that fails keeps its last value.
+    /// Reads every probe, moves the state on, publishes it and relieves a
+    /// memory block; returns the lines for the server log. A probe that
+    /// fails keeps its last value.
     pub fn tick(&mut self) -> Vec<Notice> {
         for volume in &mut self.volumes {
             if let Ok(space) = self.probe.space(&volume.path) {
@@ -605,7 +644,61 @@ impl ResourceWatch {
         }
         self.ticks_in_state = if self.level == previous { self.ticks_in_state + 1 } else { 0 };
         self.publish(&disk, memory);
-        self.notices(previous, &disk, memory)
+        let mut notices = self.notices(previous, &disk, memory);
+        notices.extend(self.relieve());
+        notices
+    }
+
+    /// During a block that holds for memory, asks for a flush of every
+    /// MemTable on its first tick and every [`MEMORY_RELIEF_EVERY`] ticks,
+    /// unless the last one is not done; once a flush is done, returns free
+    /// heap to the kernel. The line for the first tick.
+    fn relieve(&mut self) -> Option<Notice> {
+        let mut entry = None;
+        if self.reasons.1 {
+            let requested = self.relief.requested.load(Ordering::Acquire);
+            if self.memory_ticks.is_multiple_of(MEMORY_RELIEF_EVERY) && requested <= self.relief.flushed.load(Ordering::Acquire) {
+                self.relief.requested.store(requested + 1, Ordering::Release);
+            }
+            if self.memory_ticks == 0 {
+                entry = Some(Notice::info("Memory block: flushing MemTables and returning free heap to the kernel.".to_string()));
+            }
+            self.memory_ticks += 1;
+        } else {
+            self.memory_ticks = 0;
+        }
+        let requested = self.relief.requested.load(Ordering::Acquire);
+        if requested > self.trimmed_for && self.relief.flushed.load(Ordering::Acquire) == requested && self.trim() {
+            self.trimmed_for = requested;
+        }
+        entry
+    }
+
+    /// Starts a trim unless one runs; whether it started.
+    fn trim(&self) -> bool {
+        if self.trim_running.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let running = Arc::clone(&self.trim_running);
+        match &self.trimmer {
+            Trimmer::Thread => {
+                let spawned = std::thread::Builder::new().name("luradb-trim".to_string()).spawn(move || {
+                    // Safe: takes no pointers and only touches the allocator.
+                    unsafe { libc::malloc_trim(0) };
+                    running.store(false, Ordering::Release);
+                });
+                if spawned.is_err() {
+                    self.trim_running.store(false, Ordering::Release);
+                }
+                spawned.is_ok()
+            }
+            #[cfg(test)]
+            Trimmer::Inline(trim) => {
+                trim();
+                running.store(false, Ordering::Release);
+                true
+            }
+        }
     }
 
     fn publish(&self, disk: &[Reading], memory: Reading) {
@@ -1250,5 +1343,213 @@ pub(crate) mod tests {
             states(report(Vec::new(), "ok")),
             serde_json::json!({ "state": "warning", "disk_state": "ok", "memory_state": "ok" })
         );
+    }
+
+    const RELIEF_LINE: &str = "Memory block: flushing MemTables and returning free heap to the kernel.";
+
+    /// A watch over one volume below `dir` with a memory budget of 1 GiB,
+    /// whose trims run inline, count in the counter returned and set the
+    /// probe's memory to `rss_after_trim`.
+    fn memory_watch(probe: &Arc<FakeProbe>, dir: &Path, rss_after_trim: u64) -> (ResourceWatch, Arc<AtomicU64>) {
+        probe.mount(dir, 100 * GB, 50 * GB);
+        let mut config = config_in(dir);
+        config.resources.memory_budget = "1 GiB".into();
+        let (mut watch, _) = started(&config, probe);
+        let trims = Arc::new(AtomicU64::new(0));
+        let (counted, probe) = (Arc::clone(&trims), Arc::clone(probe));
+        watch.trimmer = Trimmer::Inline(Box::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            probe.set_rss(rss_after_trim);
+        }));
+        (watch, trims)
+    }
+
+    /// The ticks, counted from 1, that raised the flush request and those
+    /// that trimmed, and every notice, over `ticks` ticks with `after`
+    /// called after each one with its number.
+    fn run_ticks(
+        watch: &mut ResourceWatch,
+        trims: &AtomicU64,
+        ticks: u64,
+        mut after: impl FnMut(u64, &Relief),
+    ) -> (Vec<u64>, Vec<u64>, Vec<Notice>) {
+        let relief = watch.relief();
+        let (mut requests, mut trimmed, mut notices) = (Vec::new(), Vec::new(), Vec::new());
+        for tick in 1..=ticks {
+            let (requested, trimmed_before) = (relief.requested.load(Ordering::Acquire), trims.load(Ordering::Relaxed));
+            notices.extend(watch.tick());
+            if relief.requested.load(Ordering::Acquire) > requested {
+                requests.push(tick);
+            }
+            if trims.load(Ordering::Relaxed) > trimmed_before {
+                trimmed.push(tick);
+            }
+            after(tick, &relief);
+        }
+        (requests, trimmed, notices)
+    }
+
+    fn relief_lines(notices: &[Notice]) -> usize {
+        lines(notices, tracing::Level::INFO).iter().filter(|line| **line == RELIEF_LINE).count()
+    }
+
+    // Test 1: a memory block asks for a flush on its first tick and trims
+    // once that is done; the memory measured after the trim lifts the block
+    // with the usual hysteresis, without a write.
+    #[test]
+    fn test_a_memory_block_lifts_after_a_flush_and_a_trim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 70 / 100);
+        let resources = watch.resources();
+        let relief = watch.relief();
+        probe.set_rss(GIB * 96 / 100);
+
+        let notices = watch.tick();
+        assert_eq!(resources.level(), Level::Blocked);
+        assert!(resources.check_write().unwrap_err().to_string().contains("memory budget exhausted"));
+        assert_eq!(relief.requested.load(Ordering::Acquire), 1);
+        assert_eq!(relief_lines(&notices), 1, "{notices:?}");
+        relief.flushed.store(1, Ordering::Release);
+
+        watch.tick();
+        assert_eq!(trims.load(Ordering::Relaxed), 1);
+        assert_eq!(resources.report().memory.rss_anon_bytes, GIB * 96 / 100, "measured before the trim");
+        assert_eq!(resources.level(), Level::Blocked);
+
+        watch.tick();
+        assert_eq!((resources.level(), watch.ticks_above), (Level::Blocked, 1));
+        watch.tick();
+        assert_eq!(resources.level(), Level::Warning);
+        watch.tick();
+        assert_eq!((resources.level(), watch.ticks_above), (Level::Warning, 1));
+        watch.tick();
+        assert_eq!(resources.level(), Level::Normal);
+        assert_eq!((trims.load(Ordering::Relaxed), relief.requested.load(Ordering::Acquire)), (1, 1));
+    }
+
+    // Test 2: a lasting memory block asks for a flush every ten ticks and
+    // trims on the tick after each finished one; the INFO line comes once.
+    #[test]
+    fn test_a_lasting_memory_block_relieves_every_ten_ticks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 96 / 100);
+        probe.set_rss(GIB * 96 / 100);
+        let (requests, trimmed, notices) = run_ticks(&mut watch, &trims, 25, |_, relief| {
+            relief.flushed.store(relief.requested.load(Ordering::Acquire), Ordering::Release);
+        });
+        assert_eq!(requests, [1, 11, 21]);
+        assert_eq!(trimmed, [2, 12, 22]);
+        assert_eq!(relief_lines(&notices), 1);
+    }
+
+    // Test 3: while the last flush is not done, no new one is asked for and
+    // nothing is trimmed; once it is, the next tick trims and the next
+    // request comes on its turn.
+    #[test]
+    fn test_no_new_request_or_trim_while_a_flush_runs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 96 / 100);
+        probe.set_rss(GIB * 96 / 100);
+        let relief = watch.relief();
+        let (requests, trimmed, _) = run_ticks(&mut watch, &trims, 21, |tick, relief| {
+            if tick == 11 {
+                assert_eq!(relief.requested.load(Ordering::Acquire), 1);
+            }
+            if tick == 15 {
+                relief.flushed.store(1, Ordering::Release);
+            }
+        });
+        assert_eq!(requests, [1, 21]);
+        assert_eq!(trimmed, [16]);
+        assert_eq!(relief.requested.load(Ordering::Acquire), 2);
+    }
+
+    // Test 3a: memory short during a disk block adds its reason, and the
+    // relief starts on that tick.
+    #[test]
+    fn test_relief_starts_when_memory_joins_a_disk_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 96 / 100);
+        let resources = watch.resources();
+        let relief = watch.relief();
+        let flushed = |_: u64, relief: &Relief| relief.flushed.store(relief.requested.load(Ordering::Acquire), Ordering::Release);
+        probe.set_free(dir.path(), GB);
+        let (requests, _, notices) = run_ticks(&mut watch, &trims, 4, flushed);
+        assert_eq!(resources.level(), Level::Blocked);
+        assert_eq!((requests, relief_lines(&notices)), (vec![], 0));
+
+        probe.set_rss(GIB * 96 / 100);
+        let notices = watch.tick();
+        assert_eq!((relief.requested.load(Ordering::Acquire), relief_lines(&notices)), (1, 1));
+        assert!(resources.check_write().unwrap_err().to_string().contains("disk space below threshold and memory"));
+        relief.flushed.store(1, Ordering::Release);
+
+        // Ticks 6 to 15.
+        let (requests, _, notices) = run_ticks(&mut watch, &trims, 10, flushed);
+        assert_eq!((requests, relief_lines(&notices)), (vec![10], 0));
+    }
+
+    // Test 4: a disk block alone asks for no flush and trims nothing.
+    #[test]
+    fn test_a_disk_block_alone_relieves_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, trims) = memory_watch(&probe, dir.path(), 0);
+        probe.set_free(dir.path(), GB);
+        let (requests, trimmed, notices) = run_ticks(&mut watch, &trims, 20, |_, relief| {
+            relief.flushed.store(relief.requested.load(Ordering::Acquire), Ordering::Release);
+        });
+        assert_eq!(watch.resources().level(), Level::Blocked);
+        assert_eq!((requests, trimmed, relief_lines(&notices)), (vec![], vec![], 0));
+        assert_eq!(watch.relief().requested.load(Ordering::Acquire), 0);
+    }
+
+    // Test 6: a trim due while another runs waits for the next tick; it
+    // runs once per request. The next request comes on its turn.
+    #[test]
+    fn test_one_trim_at_a_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 96 / 100);
+        probe.set_rss(GIB * 96 / 100);
+        let relief = watch.relief();
+        watch.tick();
+        relief.flushed.store(1, Ordering::Release);
+        watch.trim_running.store(true, Ordering::Release);
+        watch.tick();
+        assert_eq!((trims.load(Ordering::Relaxed), watch.trimmed_for), (0, 0));
+
+        watch.trim_running.store(false, Ordering::Release);
+        watch.tick();
+        assert_eq!((trims.load(Ordering::Relaxed), watch.trimmed_for), (1, 1));
+        for _ in 4..=11 {
+            watch.tick();
+        }
+        assert_eq!((trims.load(Ordering::Relaxed), relief.requested.load(Ordering::Acquire)), (1, 2));
+    }
+
+    // The trim of a server runs on a thread of its own, which clears the
+    // running flag when it is done.
+    #[test]
+    fn test_the_server_trims_on_a_thread_of_its_own() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, _) = memory_watch(&probe, dir.path(), 0);
+        watch.trimmer = Trimmer::Thread;
+        probe.set_rss(GIB * 96 / 100);
+        watch.tick();
+        watch.relief().flushed.store(1, Ordering::Release);
+        watch.tick();
+        assert_eq!(watch.trimmed_for, 1);
+        // Upper bound against hanging only.
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while watch.trim_running.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < until, "the trim thread does not end");
+            std::thread::yield_now();
+        }
     }
 }

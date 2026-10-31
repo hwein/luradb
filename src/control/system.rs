@@ -281,7 +281,8 @@ mod tests {
             let auth = Arc::new(crate::auth::AuthCache::new(Arc::clone(&sys), None));
             let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
             let control = ControlPlane::start(Owners { shards: Vec::new(), auth }, Arc::clone(&sys), bus, Default::default()).await.unwrap();
-            let checkpoints = WalCheckpoint::new(control, vec![(Holder::System, hub.wal(WalTarget::Sys))], 3 * SEGMENT);
+            let checkpoints =
+                WalCheckpoint::new(control, vec![(Holder::System, hub.wal(WalTarget::Sys))], 3 * SEGMENT, Default::default());
             let user = |i: usize| format!("{PREFIX_USER}user-{i}").into_bytes();
             let record = |i: usize| format!("record {i} of zoé ✓").repeat(4).into_bytes();
             let log = dir.join(WAL_FILE);

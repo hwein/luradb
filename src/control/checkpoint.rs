@@ -4,13 +4,16 @@
 //! prepared from the moment that one is in use, and once the closed segments
 //! plus a full one reach the size cap — or the current one holds records for
 //! five minutes — has the instances behind raise their flushed LSN, so the
-//! oldest segments can go.
+//! oldest segments can go. A flush request of the resource watch has them
+//! raise it to the end of every log at once.
 
+use super::resources::Relief;
 use super::{ControlPlane, Engine};
 use crate::core::storage_thread::{prepare_segment, WalSegments};
 use crate::core::wal::{segment_path, WriteAheadLog, WAL_HEADER_LEN};
 use anyhow::Context;
 use parking_lot::Mutex;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,6 +71,7 @@ pub struct WalCheckpoint {
     /// a full one below it, so the segment that fills until the next tick
     /// acts stays within one segment of it.
     limit: u64,
+    relief: Arc<Relief>,
     /// Added to the clock, so tests let segments age.
     #[cfg(test)]
     clock_skew: Mutex<Duration>,
@@ -75,13 +79,14 @@ pub struct WalCheckpoint {
 
 impl WalCheckpoint {
     /// Checkpoints `logs`, each held by its [`Holder`], with `limit` bytes
-    /// as the cap of its segments.
-    pub fn new(control: Arc<ControlPlane>, logs: Vec<(Holder, WriteAheadLog)>, limit: u64) -> Self {
+    /// as the cap of its segments, and serves the flush requests of `relief`.
+    pub fn new(control: Arc<ControlPlane>, logs: Vec<(Holder, WriteAheadLog)>, limit: u64, relief: Arc<Relief>) -> Self {
         let logs = logs.into_iter().map(|(holder, wal)| Log { holder, wal, failures: Mutex::new(0) }).collect();
         Self {
             control,
             logs,
             limit,
+            relief,
             #[cfg(test)]
             clock_skew: Mutex::new(Duration::ZERO),
         }
@@ -121,12 +126,15 @@ impl WalCheckpoint {
         Ok(())
     }
 
-    /// One tick: what it has to report.
+    /// One tick: what it has to report. A flush request waiting is done at
+    /// its end, also when a log failed.
     pub(super) async fn run(&self) -> Vec<Report> {
+        let requested = self.relief.requested.load(Ordering::Acquire);
+        let flush = requested > self.relief.flushed.load(Ordering::Acquire);
         let mut reports = Vec::new();
         for log in &self.logs {
             let name = log.holder.name();
-            let checkpointed = self.checkpoint(log).await;
+            let checkpointed = self.checkpoint(log, flush).await;
             let mut failures = log.failures.lock();
             match checkpointed {
                 Ok(()) if *failures > 0 => {
@@ -141,18 +149,21 @@ impl WalCheckpoint {
                 }
             }
         }
+        if flush {
+            self.relief.flushed.store(requested, Ordering::Release);
+        }
         reports
     }
 
-    /// One checkpoint of `log`; a failure comes with the size of its
-    /// segments, if they were read.
-    async fn checkpoint(&self, log: &Log) -> Result<(), (Option<u64>, anyhow::Error)> {
+    /// One checkpoint of `log`, with every record persisted when `flush`; a
+    /// failure comes with the size of its segments, if they were read.
+    async fn checkpoint(&self, log: &Log, flush: bool) -> Result<(), (Option<u64>, anyhow::Error)> {
         let segments = log.wal.segments().await.map_err(|e| (None, e.into()))?;
         let bytes = segments.total_bytes();
-        self.maintain(log, segments).await.map_err(|e| (Some(bytes), e))
+        self.maintain(log, segments, flush).await.map_err(|e| (Some(bytes), e))
     }
 
-    async fn maintain(&self, log: &Log, mut segments: WalSegments) -> anyhow::Result<()> {
+    async fn maintain(&self, log: &Log, mut segments: WalSegments, flush: bool) -> anyhow::Result<()> {
         // Files a failed removal left before the oldest segment the hub keeps.
         log.wal.drop_segments_before(&segments.dir, segments.segments[0].segment).await?;
         segments = self.drop_flushed(log, segments).await?;
@@ -174,7 +185,10 @@ impl WalCheckpoint {
         }
 
         let age = self.now().saturating_duration_since(segments.active_since);
-        if active.bytes > WAL_HEADER_LEN && age >= SEGMENT_MAX_AGE {
+        // The last LSN of the segment appended to is durable.
+        let last_lsn = segments.active().last_lsn;
+        let needs_flush = flush && last_lsn > self.flushed_lsns(log.holder)?.into_iter().min().unwrap_or(0);
+        if active.bytes > WAL_HEADER_LEN && (age >= SEGMENT_MAX_AGE || needs_flush) {
             prepare_next(&segments).await?;
             log.wal.rotate().await.context("closing the segment")?;
             let rotated = log.wal.segments().await?;
@@ -182,6 +196,9 @@ impl WalCheckpoint {
                 self.raise_behind(log, last.last_lsn).await?;
             }
             self.drop_flushed(log, rotated).await?;
+        } else if needs_flush {
+            self.raise_behind(log, last_lsn).await?;
+            self.drop_flushed(log, segments).await?;
         }
         Ok(())
     }

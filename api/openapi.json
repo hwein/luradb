@@ -11,7 +11,7 @@
       "identifier": "FSL-1.1-ALv2"
     },
     "version": "0.14.2",
-    "x-luradb-server-version": "0.5.0-rc.1"
+    "x-luradb-server-version": "0.5.0-rc.2"
   },
   "paths": {
     "/health": {

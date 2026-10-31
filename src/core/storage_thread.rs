@@ -2755,17 +2755,19 @@ mod tests {
 
     // Test 1: another I/O error stops at the third failed write in a row, a
     // write that succeeds in between starts the row anew; a full file system
-    // never stops.
+    // or quota never stops and leaves no failure in a row.
     #[test]
     fn test_writes_failing_with_an_io_error_stop_at_the_third_in_a_row() {
         let dir = tempfile::TempDir::new().unwrap();
         let wals = wal_paths(dir.path(), &[WalTarget::Kv]);
         let log = wals[0].1.as_path();
-        let (mut state, _) = open_state(&cfg(false, 64), &wals).unwrap();
+        let io = IoFailures::default();
+        let (mut state, _) = open_state(&StorageThreadConfig { io: io.clone(), ..cfg(false, 64) }, &wals).unwrap();
 
-        for _ in 0..4 {
-            assert!(append_failing(&mut state, Some(libc::ENOSPC)).is_err());
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::ENOSPC, libc::EDQUOT] {
+            assert!(append_failing(&mut state, Some(errno)).is_err());
         }
+        assert_eq!((io.report(), stops_in(log)), (None, Vec::new()), "a full file system or quota never stops");
         for errno in [Some(libc::EIO), Some(libc::EIO), None, Some(libc::EIO), Some(libc::EIO)] {
             assert_eq!(append_failing(&mut state, errno).is_ok(), errno.is_none());
         }

@@ -82,10 +82,11 @@ impl WriteFailures {
 
     /// Counts the failed write of `path`; whether it stops the server: on a
     /// read-only file system at once, with another I/O error at the
-    /// [`FAILURES_TO_STOP`]th in a row. A full file system neither counts
-    /// nor stops: writes are refused before the space runs out.
+    /// [`FAILURES_TO_STOP`]th in a row. A full file system or quota neither
+    /// counts nor stops: a full disk is refused before the space runs out, a
+    /// full quota is invisible to the resource watch.
     pub fn stops_for(&self, path: &Path, error: &std::io::Error) -> bool {
-        if error.raw_os_error() == Some(libc::ENOSPC) {
+        if matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)) {
             return false;
         }
         let failures = self.in_a_row.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -156,16 +157,34 @@ mod tests {
         assert!(failures.stops_for(path, &eio()));
     }
 
-    // A read-only file system stops at once, a full one never.
+    // A read-only file system stops at once, a full file system or quota never.
     #[test]
     fn a_read_only_file_system_stops_at_once_a_full_one_never() {
         let io = IoFailures::default();
         let failures = WriteFailures::new(&io);
-        for _ in 0..FAILURES_TO_STOP + 1 {
-            assert!(!failures.stops_for(Path::new("/data/wal"), &Error::from_raw_os_error(libc::ENOSPC)));
+        for errno in [libc::ENOSPC, libc::EDQUOT] {
+            for _ in 0..FAILURES_TO_STOP + 1 {
+                assert!(!failures.stops_for(Path::new("/data/wal"), &Error::from_raw_os_error(errno)));
+            }
         }
         assert_eq!(io.report(), None);
         assert!(failures.stops_for(Path::new("/data/wal"), &Error::from_raw_os_error(libc::EROFS)));
+    }
+
+    // Full-quota failures leave the row untouched: the third other I/O error
+    // after them stops.
+    #[test]
+    fn a_full_quota_does_not_count_towards_the_row() {
+        let io = IoFailures::default();
+        let failures = WriteFailures::new(&io);
+        let path = Path::new("/data/wal");
+        for _ in 0..FAILURES_TO_STOP {
+            assert!(!failures.stops_for(path, &Error::from_raw_os_error(libc::EDQUOT)));
+        }
+        assert_eq!(io.report(), None);
+        assert!(!failures.stops_for(path, &eio()));
+        assert!(!failures.stops_for(path, &eio()));
+        assert!(failures.stops_for(path, &eio()));
     }
 
     // The report names the file with the longest row; a dropped counter

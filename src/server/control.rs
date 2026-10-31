@@ -269,11 +269,12 @@ async fn bootstrap(
     // on, the room to recover there and the memory budget.
     let base = std::env::current_dir().context("reading the working directory")?;
     #[cfg(not(test))]
-    let probe: Arc<dyn resources::Probe> = Arc::new(resources::SystemProbe);
-    // Tests read a roomy fake unless they set one for the server.
+    let (probe, ticker): (Arc<dyn resources::Probe>, _) = (Arc::new(resources::SystemProbe), resources::Ticker::Interval);
+    // Tests read a roomy fake unless they set one for the server, and step
+    // its volume probes themselves.
     #[cfg(test)]
-    let probe = super::test_hook::probe(&config.storage.system_dir);
-    let (watch, notices) = ResourceWatch::start(config, &base, probe)?;
+    let (probe, ticker) = (super::test_hook::probe(&config.storage.system_dir), resources::Ticker::Steps);
+    let (watch, notices) = ResourceWatch::start(config, &base, probe, ticker)?;
     resources::log(&notices);
     coop::init(config.multicore.cpu_offload_threads);
 

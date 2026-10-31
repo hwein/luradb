@@ -617,11 +617,14 @@ pub(crate) mod test_hook {
         watches().lock().unwrap().insert(system_dir.to_string(), watch);
     }
 
-    /// One tick of the resource watch of the server on `system_dir`, as its
-    /// loop runs once a second.
+    /// One step of the volume probes and one tick of the resource watch of
+    /// the server on `system_dir`, as they run once a second.
     pub(crate) fn tick_resources(system_dir: &str) {
         let watch = watches().lock().unwrap().get(system_dir).cloned().expect("a running resource watch");
-        watch.lock().tick();
+        let probe = probes().lock().unwrap().get(system_dir).cloned().expect("a probe set with use_probe");
+        let mut watch = watch.lock();
+        watch.step_probes(&probe);
+        watch.tick();
     }
 
     fn events() -> &'static Mutex<HashMap<String, Vec<String>>> {

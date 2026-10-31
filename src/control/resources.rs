@@ -6,7 +6,7 @@
 use crate::config::{LuraConfig, MIN_MEMORY_BUDGET};
 use crate::control::system;
 use crate::storage::write_failures::IoFailures;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -21,6 +21,8 @@ pub const RESOURCE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 pub const RETRY_AFTER_SECS: u64 = 5;
 /// A state that lasts repeats its log line every this many ticks.
 pub(crate) const REPEAT_TICKS: u64 = 60;
+/// A volume probe without a reading for this many ticks hangs.
+const PROBE_STALL_TICKS: u64 = 5;
 const MIN_DISK_FREE_BLOCK: u64 = 64 * 1024 * 1024;
 /// Memory warns from, refuses writes from and resumes below these shares of
 /// the budget, in percent.
@@ -395,6 +397,61 @@ struct Volume {
     block: u64,
     resume: u64,
     space: Space,
+    /// Where its probe thread puts each reading.
+    slot: Arc<Mutex<ProbeSlot>>,
+    /// The sequence of the slot the last tick saw, and the ticks since it
+    /// changed.
+    sequence: u64,
+    stalled_ticks: u64,
+    /// The steps of its probe thread and how many were sent.
+    #[cfg(test)]
+    steps: Option<(std::sync::mpsc::Sender<()>, u64)>,
+}
+
+/// The last reading of a volume's probe thread; `sequence` counts its
+/// readings, failed ones included, which leave `space` as it was.
+#[derive(Clone, Copy)]
+struct ProbeSlot {
+    space: Space,
+    sequence: u64,
+}
+
+/// What paces the probe threads.
+pub enum Ticker {
+    /// A reading every [`RESOURCE_WATCH_INTERVAL`].
+    Interval,
+    /// A reading per step of `step_probes`.
+    #[cfg(test)]
+    Steps,
+}
+
+/// Reads the volume of `path` into `slot` once per beat, until `stop`: a
+/// step of `steps`, or [`RESOURCE_WATCH_INTERVAL`] without.
+fn probe_volume(
+    probe: Arc<dyn Probe>,
+    path: PathBuf,
+    slot: Arc<Mutex<ProbeSlot>>,
+    stop: Arc<AtomicBool>,
+    steps: Option<std::sync::mpsc::Receiver<()>>,
+) {
+    loop {
+        let beat = match &steps {
+            None => {
+                std::thread::sleep(RESOURCE_WATCH_INTERVAL);
+                true
+            }
+            Some(steps) => steps.recv().is_ok(),
+        };
+        if !beat || stop.load(Ordering::Acquire) {
+            return;
+        }
+        let space = probe.space(&path);
+        let mut slot = slot.lock();
+        if let Ok(space) = space {
+            slot.space = space;
+        }
+        slot.sequence += 1;
+    }
 }
 
 /// The files of one engine the recovery reads and writes.
@@ -439,9 +496,12 @@ impl Reading {
 }
 
 /// Reads the probes once a tick, sets the state of its [`Resources`] and
-/// says what the server log gets.
+/// says what the server log gets. Each volume has a probe thread of its own,
+/// so a hanging volume holds up nothing but that thread.
 pub struct ResourceWatch {
     probe: Arc<dyn Probe>,
+    /// Ends the probe threads at their next beat.
+    stop: Arc<AtomicBool>,
     volumes: Vec<Volume>,
     budget: u64,
     /// The volume of `backup.dir`, when backups are on.
@@ -469,9 +529,15 @@ impl ResourceWatch {
     /// files; finds the volumes they lie on and resolves the thresholds on
     /// each; refuses a volume the recovery writes to with less free than the
     /// write-ahead logs recovering onto it ([`NoRoomToRecover`]); resolves
-    /// the memory budget. Returns the watch, whose state stays normal until
-    /// its first [`Self::tick`], and its start lines.
-    pub fn start(config: &LuraConfig, base: &Path, probe: Arc<dyn Probe>) -> anyhow::Result<(Self, Vec<Notice>)> {
+    /// the memory budget; then starts a probe thread per volume, paced by
+    /// `ticker`. Returns the watch, whose state stays normal until its first
+    /// [`Self::tick`], and its start lines.
+    pub fn start(
+        config: &LuraConfig,
+        base: &Path,
+        probe: Arc<dyn Probe>,
+        ticker: Ticker,
+    ) -> anyhow::Result<(Self, Vec<Notice>)> {
         let paths = create_data_dirs(config, base)?;
         let [warn, block, resume] = config.resources.disk_thresholds()?;
         let mut volumes: Vec<Volume> = Vec::new();
@@ -489,7 +555,19 @@ impl ResourceWatch {
                 path.display(),
                 space.size
             );
-            volumes.push(Volume { path: path.clone(), device: space.device, warn, block, resume, space });
+            volumes.push(Volume {
+                path: path.clone(),
+                device: space.device,
+                warn,
+                block,
+                resume,
+                space,
+                slot: Arc::new(Mutex::new(ProbeSlot { space, sequence: 0 })),
+                sequence: 0,
+                stalled_ticks: 0,
+                #[cfg(test)]
+                steps: None,
+            });
         }
 
         let engines = engine_files(config, base);
@@ -549,9 +627,31 @@ impl ResourceWatch {
             .enabled
             .then(|| probe.space(&base.join(&config.backup.dir)).ok().map(|space| space.device))
             .flatten();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        for (n, volume) in volumes.iter_mut().enumerate() {
+            let steps = match ticker {
+                Ticker::Interval => None,
+                #[cfg(test)]
+                Ticker::Steps => {
+                    let (step, steps) = std::sync::mpsc::channel();
+                    volume.steps = Some((step, 0));
+                    Some(steps)
+                }
+            };
+            let (probe, path, slot, ends) = (Arc::clone(&probe), volume.path.clone(), Arc::clone(&volume.slot), Arc::clone(&stop));
+            let spawned = std::thread::Builder::new()
+                .name(format!("luradb-probe-{n}"))
+                .spawn(move || probe_volume(probe, path, slot, ends, steps));
+            if let Err(e) = spawned {
+                stop.store(true, Ordering::Release);
+                anyhow::bail!("starting the probe thread of {}: {e}", volume.path.display());
+            }
+        }
         let watch = Self {
             resources: Resources::with_probe(Arc::clone(&probe)),
             probe,
+            stop,
             volumes,
             budget,
             backup_device,
@@ -593,13 +693,32 @@ impl ResourceWatch {
         )))
     }
 
-    /// Reads every probe, moves the state on, publishes it and relieves a
-    /// memory block; returns the lines for the server log. A probe that
-    /// fails keeps its last value.
+    /// Takes the last reading of every volume probe thread and reads the
+    /// memory, moves the state on, publishes it and relieves a memory block;
+    /// returns the lines for the server log. A probe that fails or hangs
+    /// keeps its last value; a hang is logged.
     pub fn tick(&mut self) -> Vec<Notice> {
+        let mut notices = Vec::new();
         for volume in &mut self.volumes {
-            if let Ok(space) = self.probe.space(&volume.path) {
-                volume.space = space;
+            let ProbeSlot { space, sequence } = *volume.slot.lock();
+            if sequence != volume.sequence {
+                if volume.stalled_ticks >= PROBE_STALL_TICKS {
+                    notices.push(Notice::info(format!("The volume probe of {} answers again.", volume.path.display())));
+                }
+                (volume.space, volume.sequence, volume.stalled_ticks) = (space, sequence, 0);
+            } else {
+                volume.stalled_ticks += 1;
+                if volume.stalled_ticks >= PROBE_STALL_TICKS
+                    && (volume.stalled_ticks - PROBE_STALL_TICKS).is_multiple_of(REPEAT_TICKS)
+                {
+                    notices.push(Notice::warn(format!(
+                        "The volume probe of {} has not answered for {PROBE_STALL_TICKS} s; the resource watch \
+                         keeps its last reading ({} of {} bytes free).",
+                        volume.path.display(),
+                        volume.space.free,
+                        volume.space.size
+                    )));
+                }
             }
         }
         if let Ok(rss) = self.probe.rss_anon() {
@@ -644,7 +763,7 @@ impl ResourceWatch {
         }
         self.ticks_in_state = if self.level == previous { self.ticks_in_state + 1 } else { 0 };
         self.publish(&disk, memory);
-        let mut notices = self.notices(previous, &disk, memory);
+        notices.extend(self.notices(previous, &disk, memory));
         notices.extend(self.relieve());
         notices
     }
@@ -786,6 +905,14 @@ impl ResourceWatch {
     }
 }
 
+/// The probe threads end at their next beat; one in a hanging call stays
+/// until the process ends.
+impl Drop for ResourceWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
 /// The memory each instance holds regardless of load, by item.
 pub fn fixed_memory(config: &LuraConfig, shards: u16) -> Vec<(&'static str, u64)> {
     let shards = u64::from(shards);
@@ -903,19 +1030,24 @@ fn wal_bytes(path: &Path) -> u64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use parking_lot::Mutex;
+    use parking_lot::Condvar;
 
     pub(crate) const GB: u64 = 1_000_000_000;
     const GIB: u64 = 1 << 30;
 
     /// Volumes by path prefix, the longest match counting, and memory, all
     /// set by the test; records every path it was asked about and whether
-    /// it existed then.
+    /// it existed then. A blocked volume holds its calls until released, a
+    /// failing one answers with an error.
     pub(crate) struct FakeProbe {
         volumes: Mutex<Vec<(PathBuf, Space)>>,
         rss: Mutex<u64>,
         limits: Mutex<(u64, Option<u64>)>,
         asked: Mutex<Vec<(PathBuf, bool)>>,
+        /// Blocked volumes by root, and whether a call waits there now.
+        blocked: Mutex<Vec<(PathBuf, bool)>>,
+        released: Condvar,
+        failing: Mutex<Vec<PathBuf>>,
     }
 
     impl FakeProbe {
@@ -927,7 +1059,58 @@ pub(crate) mod tests {
                 rss: Mutex::new(0),
                 limits: Mutex::new((16 * GIB, None)),
                 asked: Mutex::new(Vec::new()),
+                blocked: Mutex::new(Vec::new()),
+                released: Condvar::new(),
+                failing: Mutex::new(Vec::new()),
             })
+        }
+
+        /// The root of the volume `path` lies on.
+        fn root_of(&self, path: &Path) -> PathBuf {
+            let volumes = self.volumes.lock();
+            let (root, _) = volumes
+                .iter()
+                .filter(|(root, _)| path.starts_with(root))
+                .max_by_key(|(root, _)| root.as_os_str().len())
+                .expect("the root volume");
+            root.clone()
+        }
+
+        fn canonical(root: &Path) -> PathBuf {
+            root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+        }
+
+        /// Calls for the volume of `root` wait until [`Self::release`].
+        fn block(&self, root: &Path) {
+            self.blocked.lock().push((Self::canonical(root), false));
+        }
+
+        fn release(&self, root: &Path) {
+            let root = Self::canonical(root);
+            self.blocked.lock().retain(|(blocked, _)| *blocked != root);
+            self.released.notify_all();
+        }
+
+        /// Whether a call for the volume of `path` waits at its block now.
+        fn parked(&self, path: &Path) -> bool {
+            let root = self.root_of(path);
+            self.blocked.lock().iter().any(|(blocked, waits)| *blocked == root && *waits)
+        }
+
+        fn set_failing(&self, root: &Path, failing: bool) {
+            let root = Self::canonical(root);
+            let mut roots = self.failing.lock();
+            roots.retain(|failing| *failing != root);
+            if failing {
+                roots.push(root);
+            }
+        }
+
+        /// The calls so far for paths on the volume of `root`.
+        fn calls(&self, root: &Path) -> usize {
+            let root = Self::canonical(root);
+            let asked: Vec<PathBuf> = self.asked.lock().iter().map(|(path, _)| path.clone()).collect();
+            asked.iter().filter(|path| self.root_of(path) == root).count()
         }
 
         /// A volume of its own below `root`.
@@ -958,13 +1141,17 @@ pub(crate) mod tests {
     impl Probe for FakeProbe {
         fn space(&self, path: &Path) -> std::io::Result<Space> {
             self.asked.lock().push((path.to_path_buf(), path.exists()));
-            let volumes = self.volumes.lock();
-            let (_, space) = volumes
-                .iter()
-                .filter(|(root, _)| path.starts_with(root))
-                .max_by_key(|(root, _)| root.as_os_str().len())
-                .expect("the root volume");
-            Ok(*space)
+            let root = self.root_of(path);
+            let mut blocked = self.blocked.lock();
+            while let Some(entry) = blocked.iter_mut().find(|(blocked, _)| *blocked == root) {
+                entry.1 = true;
+                self.released.wait(&mut blocked);
+            }
+            drop(blocked);
+            if self.failing.lock().contains(&root) {
+                return Err(std::io::Error::other("the volume does not answer"));
+            }
+            Ok(self.volumes.lock().iter().find(|(volume, _)| *volume == root).expect("the volume").1)
         }
 
         fn rss_anon(&self) -> std::io::Result<u64> {
@@ -990,13 +1177,211 @@ pub(crate) mod tests {
         config
     }
 
+    impl ResourceWatch {
+        /// Gives every probe thread a step and waits until each has read its
+        /// volume since, or until a call of it waits at a block of `probe`.
+        pub(crate) fn step_probes(&mut self, probe: &FakeProbe) {
+            for volume in &mut self.volumes {
+                let (step, sent) = volume.steps.as_mut().expect("a stepped watch");
+                step.send(()).expect("a running probe thread");
+                *sent += 1;
+                // A thread reads once per step, in order.
+                while volume.slot.lock().sequence < *sent && !probe.parked(&volume.path) {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
     fn started(config: &LuraConfig, probe: &Arc<FakeProbe>) -> (ResourceWatch, Vec<Notice>) {
-        ResourceWatch::start(config, Path::new("/"), Arc::clone(probe) as Arc<dyn Probe>).unwrap()
+        ResourceWatch::start(config, Path::new("/"), Arc::clone(probe) as Arc<dyn Probe>, Ticker::Steps).unwrap()
     }
 
     fn start_error(config: &LuraConfig, probe: &Arc<FakeProbe>) -> String {
         let probe = Arc::clone(probe) as Arc<dyn Probe>;
-        ResourceWatch::start(config, Path::new("/"), probe).err().expect("a start error").to_string()
+        ResourceWatch::start(config, Path::new("/"), probe, Ticker::Steps).err().expect("a start error").to_string()
+    }
+
+    /// A step of the probe threads, then a tick.
+    fn tick(watch: &mut ResourceWatch, probe: &FakeProbe) -> Vec<Notice> {
+        watch.step_probes(probe);
+        watch.tick()
+    }
+
+    /// A watch over two volumes, `dir` and `dir/wal` with 50 GB free of
+    /// 100 GB each; the path of the second.
+    fn two_volumes(dir: &Path, probe: &Arc<FakeProbe>) -> (ResourceWatch, PathBuf) {
+        let wal = dir.join("wal");
+        std::fs::create_dir_all(&wal).unwrap();
+        probe.mount(dir, 100 * GB, 50 * GB);
+        probe.mount(&wal, 100 * GB, 50 * GB);
+        let (watch, _) = started(&config_in(dir), probe);
+        (watch, wal)
+    }
+
+    /// The data path the watch names the volume of `root` by.
+    fn volume_path(watch: &ResourceWatch, probe: &FakeProbe, root: &Path) -> String {
+        let root = FakeProbe::canonical(root);
+        let volume = watch.volumes.iter().find(|v| probe.root_of(&v.path) == root).expect("the volume");
+        volume.path.display().to_string()
+    }
+
+    /// The bytes free on the volume of `root` in the report.
+    fn free_of(watch: &ResourceWatch, probe: &FakeProbe, root: &Path) -> u64 {
+        let path = volume_path(watch, probe, root);
+        watch.resources().report().disk.iter().find(|disk| disk.path == path).expect("the volume").free_bytes
+    }
+
+    // Test 1: a volume whose probe hangs holds up neither the tick nor the
+    // other volume: it keeps its first reading, the other and the memory
+    // move on.
+    #[test]
+    fn test_a_hanging_probe_does_not_hold_up_the_tick() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, wal) = two_volumes(dir.path(), &probe);
+        probe.block(dir.path());
+        for step in 1..=10 {
+            probe.set_free(dir.path(), step * GB);
+            probe.set_free(&wal, step * GB);
+            probe.set_rss(step);
+            tick(&mut watch, &probe);
+            assert_eq!(free_of(&watch, &probe, &wal), step * GB);
+            assert_eq!(free_of(&watch, &probe, dir.path()), 50 * GB, "the first reading");
+            assert_eq!(watch.resources().report().memory.rss_anon_bytes, step);
+        }
+        probe.release(dir.path());
+    }
+
+    // Test 2: a hang is reported on its fifth tick and every 60 ticks
+    // after; the probe answering again is reported once, and its values
+    // count again.
+    #[test]
+    fn test_a_hanging_probe_is_reported_and_its_return_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        let (mut watch, wal) = two_volumes(dir.path(), &probe);
+        let path = volume_path(&watch, &probe, &wal);
+        let stalled = format!(
+            "The volume probe of {path} has not answered for 5 s; the resource watch keeps its last reading \
+             (50000000000 of 100000000000 bytes free)."
+        );
+        probe.block(&wal);
+        let mut warned = Vec::new();
+        for tick_number in 1..=125 {
+            let notices = tick(&mut watch, &probe);
+            assert_eq!(lines(&notices, tracing::Level::INFO), Vec::<&str>::new());
+            let warnings = lines(&notices, tracing::Level::WARN);
+            assert!(warnings.iter().all(|line| *line == stalled), "{warnings:?}");
+            if !warnings.is_empty() {
+                warned.push((tick_number, warnings.len()));
+            }
+        }
+        assert_eq!(warned, [(5, 1), (65, 1), (125, 1)]);
+
+        probe.set_free(&wal, 40 * GB);
+        probe.release(&wal);
+        let notices = tick(&mut watch, &probe);
+        assert_eq!(lines(&notices, tracing::Level::INFO), [format!("The volume probe of {path} answers again.")]);
+        assert_eq!(free_of(&watch, &probe, &wal), 40 * GB);
+        probe.set_free(&wal, 30 * GB);
+        assert_eq!(tick(&mut watch, &probe), Vec::new());
+        assert_eq!(free_of(&watch, &probe, &wal), 30 * GB);
+    }
+
+    // Test 3: the state follows the last reading of a hanging probe: below
+    // the block threshold the block holds, above resume it ends after the
+    // usual two ticks.
+    #[test]
+    fn test_the_state_follows_the_last_reading_of_a_hanging_probe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        probe.mount(dir.path(), 100 * GB, 50 * GB);
+        let config = config_in(dir.path());
+        let (mut watch, _) = started(&config, &probe);
+        probe.set_free(dir.path(), GB);
+        tick(&mut watch, &probe);
+        probe.block(dir.path());
+        probe.set_free(dir.path(), 50 * GB);
+        for _ in 0..10 {
+            tick(&mut watch, &probe);
+            assert_eq!(watch.resources().level(), Level::Blocked);
+        }
+        probe.release(dir.path());
+
+        let (mut watch, _) = started(&config, &probe);
+        probe.set_free(dir.path(), GB);
+        tick(&mut watch, &probe);
+        probe.set_free(dir.path(), 5 * GB);
+        tick(&mut watch, &probe);
+        assert_eq!(watch.resources().level(), Level::Blocked, "one tick above resume");
+        probe.block(dir.path());
+        probe.set_free(dir.path(), GB);
+        tick(&mut watch, &probe);
+        assert_eq!(watch.resources().level(), Level::Warning, "the second tick on the last reading");
+        tick(&mut watch, &probe);
+        assert_eq!(watch.resources().level(), Level::Warning);
+        probe.release(dir.path());
+    }
+
+    // Test 4: a volume has one probe call at a time: a hanging call holds
+    // back the steps after it, then each step makes one call again.
+    #[test]
+    fn test_a_volume_has_one_probe_call_at_a_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        probe.mount(dir.path(), 100 * GB, 50 * GB);
+        let (mut watch, _) = started(&config_in(dir.path()), &probe);
+        let base = probe.calls(dir.path());
+        probe.block(dir.path());
+        for _ in 0..5 {
+            watch.step_probes(&probe);
+            assert_eq!(probe.calls(dir.path()), base + 1);
+        }
+        probe.release(dir.path());
+        watch.step_probes(&probe);
+        assert_eq!(probe.calls(dir.path()), base + 6, "one call per step");
+        watch.step_probes(&probe);
+        assert_eq!(probe.calls(dir.path()), base + 7);
+    }
+
+    // Test 5: a probe that fails counts as an answer: the volume keeps its
+    // last value and no hang is reported.
+    #[test]
+    fn test_a_failing_probe_keeps_the_last_value_without_a_hang() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        probe.mount(dir.path(), 100 * GB, 50 * GB);
+        let (mut watch, _) = started(&config_in(dir.path()), &probe);
+        probe.set_failing(dir.path(), true);
+        probe.set_free(dir.path(), 9 * GB);
+        for step in 1..=10 {
+            assert_eq!(tick(&mut watch, &probe), Vec::new());
+            assert_eq!(watch.volumes[0].slot.lock().sequence, step);
+            assert_eq!(free_of(&watch, &probe, dir.path()), 50 * GB);
+        }
+        probe.set_failing(dir.path(), false);
+        tick(&mut watch, &probe);
+        assert_eq!(free_of(&watch, &probe, dir.path()), 9 * GB);
+    }
+
+    // Test 6: once the watch is gone, a probe thread ends on its next step
+    // without another call.
+    #[test]
+    fn test_the_probe_threads_end_with_the_watch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = FakeProbe::new();
+        probe.mount(dir.path(), 100 * GB, 50 * GB);
+        let (mut watch, _) = started(&config_in(dir.path()), &probe);
+        tick(&mut watch, &probe);
+        let step = watch.volumes[0].steps.as_ref().unwrap().0.clone();
+        let calls = probe.calls(dir.path());
+        drop(watch);
+        // The send fails once the thread has ended and dropped its end.
+        while step.send(()).is_ok() {
+            std::thread::yield_now();
+        }
+        assert_eq!(probe.calls(dir.path()), calls);
     }
 
     fn lines(notices: &[Notice], level: tracing::Level) -> Vec<&str> {
@@ -1059,7 +1444,7 @@ pub(crate) mod tests {
         let resources = watch.resources();
         let mut level_after = |free: u64| {
             probe.set_free(dir.path(), free);
-            watch.tick();
+            tick(&mut watch, &probe);
             resources.level()
         };
         // Warn below 10 GB, block below 2 GB, resume above 4 GB.
@@ -1092,7 +1477,7 @@ pub(crate) mod tests {
         probe.mount(&dir.path().join("wal"), 100 * GB, 50 * GB);
         let (mut watch, _) = started(&config, &probe);
         probe.set_free(&dir.path().join("wal"), GB);
-        watch.tick();
+        tick(&mut watch, &probe);
         let report = watch.resources().report();
         assert_eq!(report.state, "blocked");
         let states: Vec<(&str, &str)> =
@@ -1116,7 +1501,7 @@ pub(crate) mod tests {
 
         probe.set_free(dir.path(), 3 * GB);
         probe.set_rss(GIB * 96 / 100);
-        let notices = watch.tick();
+        let notices = tick(&mut watch, &probe);
         assert_eq!(resources.level(), Level::Blocked);
         assert_eq!(
             resources.check_write().unwrap_err().to_string(),
@@ -1128,9 +1513,9 @@ pub(crate) mod tests {
 
         probe.set_free(dir.path(), GB);
         for _ in 0..REPEAT_TICKS - 1 {
-            watch.tick();
+            tick(&mut watch, &probe);
         }
-        let error = lines(&watch.tick(), tracing::Level::ERROR).concat();
+        let error = lines(&tick(&mut watch, &probe), tracing::Level::ERROR).concat();
         assert!(error.contains("disk ") && error.contains("memory rss"), "{error}");
         assert!(resources.check_write().unwrap_err().to_string().contains("disk space below threshold and memory"));
     }
@@ -1144,12 +1529,12 @@ pub(crate) mod tests {
         let config = config_in(dir.path());
         probe.set_limits(16 * GIB, Some(4 * GIB));
         let (mut watch, _) = started(&config, &probe);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(watch.resources().report().memory.budget_bytes, 3 * GIB);
 
         probe.set_limits(16 * GIB, None);
         let (mut watch, _) = started(&config, &probe);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(watch.resources().report().memory.budget_bytes, 12 * GIB);
 
         assert_eq!(memory_max("max\n"), None);
@@ -1177,7 +1562,7 @@ pub(crate) mod tests {
         probe.set_free(dir.path(), GB);
         let mut notices = Vec::new();
         for _ in 0..180 {
-            notices.extend(watch.tick());
+            notices.extend(tick(&mut watch, &probe));
         }
         let errors = lines(&notices, tracing::Level::ERROR);
         assert_eq!(errors.len(), 3, "{errors:?}");
@@ -1186,7 +1571,7 @@ pub(crate) mod tests {
         assert!(errors[0].starts_with(&reason), "{}", errors[0]);
 
         probe.set_free(dir.path(), 50 * GB);
-        let leaving: Vec<Notice> = (0..2).flat_map(|_| watch.tick()).collect();
+        let leaving: Vec<Notice> = (0..2).flat_map(|_| tick(&mut watch, &probe)).collect();
         assert_eq!(lines(&leaving, tracing::Level::INFO).len(), 1, "{leaving:?}");
         assert!(lines(&leaving, tracing::Level::INFO)[0].starts_with("Writes are accepted again"));
     }
@@ -1211,18 +1596,18 @@ pub(crate) mod tests {
 
         probe.set_free(dir.path(), GB);
         probe.set_rss(GIB * 92 / 100);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(resources.level(), Level::Blocked);
         assert!(resources.backup_allowed(), "memory above its resume share is no reason of the block");
 
         probe.set_free(&backups, 5 * GB);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert!(!resources.backup_allowed(), "the backup volume is below warn");
 
         probe.set_free(&backups, 50 * GB);
         probe.set_free(dir.path(), 50 * GB);
         probe.set_rss(GIB);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert!(resources.check_write().unwrap_err().to_string().contains("memory"));
         assert!(!resources.backup_allowed(), "short of memory");
     }
@@ -1245,7 +1630,7 @@ pub(crate) mod tests {
         probe.mount(dir.path(), 100 * GB, 50 * GB);
         probe.mount(&data, 100 * GB, 2999);
         probe.mount(&wal, 100 * GB, 50 * GB);
-        let err = ResourceWatch::start(&config, Path::new("/"), Arc::clone(&probe) as Arc<dyn Probe>).err().unwrap();
+        let err = ResourceWatch::start(&config, Path::new("/"), Arc::clone(&probe) as Arc<dyn Probe>, Ticker::Steps).err().unwrap();
         let refused = err.downcast_ref::<NoRoomToRecover>().expect("NoRoomToRecover");
         assert_eq!(refused.needed, 3000);
         assert!(err.to_string().starts_with("not enough free disk space to recover"), "{err}");
@@ -1259,7 +1644,7 @@ pub(crate) mod tests {
 
         probe.set_free(&data, GB);
         let (mut watch, _) = started(&config, &probe);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(watch.resources().level(), Level::Blocked, "room to recover, below the block threshold");
     }
 
@@ -1369,22 +1754,23 @@ pub(crate) mod tests {
     /// called after each one with its number.
     fn run_ticks(
         watch: &mut ResourceWatch,
+        probe: &FakeProbe,
         trims: &AtomicU64,
         ticks: u64,
         mut after: impl FnMut(u64, &Relief),
     ) -> (Vec<u64>, Vec<u64>, Vec<Notice>) {
         let relief = watch.relief();
         let (mut requests, mut trimmed, mut notices) = (Vec::new(), Vec::new(), Vec::new());
-        for tick in 1..=ticks {
+        for number in 1..=ticks {
             let (requested, trimmed_before) = (relief.requested.load(Ordering::Acquire), trims.load(Ordering::Relaxed));
-            notices.extend(watch.tick());
+            notices.extend(tick(watch, probe));
             if relief.requested.load(Ordering::Acquire) > requested {
-                requests.push(tick);
+                requests.push(number);
             }
             if trims.load(Ordering::Relaxed) > trimmed_before {
-                trimmed.push(tick);
+                trimmed.push(number);
             }
-            after(tick, &relief);
+            after(number, &relief);
         }
         (requests, trimmed, notices)
     }
@@ -1405,25 +1791,25 @@ pub(crate) mod tests {
         let relief = watch.relief();
         probe.set_rss(GIB * 96 / 100);
 
-        let notices = watch.tick();
+        let notices = tick(&mut watch, &probe);
         assert_eq!(resources.level(), Level::Blocked);
         assert!(resources.check_write().unwrap_err().to_string().contains("memory budget exhausted"));
         assert_eq!(relief.requested.load(Ordering::Acquire), 1);
         assert_eq!(relief_lines(&notices), 1, "{notices:?}");
         relief.flushed.store(1, Ordering::Release);
 
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(trims.load(Ordering::Relaxed), 1);
         assert_eq!(resources.report().memory.rss_anon_bytes, GIB * 96 / 100, "measured before the trim");
         assert_eq!(resources.level(), Level::Blocked);
 
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!((resources.level(), watch.ticks_above), (Level::Blocked, 1));
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(resources.level(), Level::Warning);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!((resources.level(), watch.ticks_above), (Level::Warning, 1));
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(resources.level(), Level::Normal);
         assert_eq!((trims.load(Ordering::Relaxed), relief.requested.load(Ordering::Acquire)), (1, 1));
     }
@@ -1436,7 +1822,7 @@ pub(crate) mod tests {
         let probe = FakeProbe::new();
         let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 96 / 100);
         probe.set_rss(GIB * 96 / 100);
-        let (requests, trimmed, notices) = run_ticks(&mut watch, &trims, 25, |_, relief| {
+        let (requests, trimmed, notices) = run_ticks(&mut watch, &probe, &trims, 25, |_, relief| {
             relief.flushed.store(relief.requested.load(Ordering::Acquire), Ordering::Release);
         });
         assert_eq!(requests, [1, 11, 21]);
@@ -1454,7 +1840,7 @@ pub(crate) mod tests {
         let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 96 / 100);
         probe.set_rss(GIB * 96 / 100);
         let relief = watch.relief();
-        let (requests, trimmed, _) = run_ticks(&mut watch, &trims, 21, |tick, relief| {
+        let (requests, trimmed, _) = run_ticks(&mut watch, &probe, &trims, 21, |tick, relief| {
             if tick == 11 {
                 assert_eq!(relief.requested.load(Ordering::Acquire), 1);
             }
@@ -1478,18 +1864,18 @@ pub(crate) mod tests {
         let relief = watch.relief();
         let flushed = |_: u64, relief: &Relief| relief.flushed.store(relief.requested.load(Ordering::Acquire), Ordering::Release);
         probe.set_free(dir.path(), GB);
-        let (requests, _, notices) = run_ticks(&mut watch, &trims, 4, flushed);
+        let (requests, _, notices) = run_ticks(&mut watch, &probe, &trims, 4, flushed);
         assert_eq!(resources.level(), Level::Blocked);
         assert_eq!((requests, relief_lines(&notices)), (vec![], 0));
 
         probe.set_rss(GIB * 96 / 100);
-        let notices = watch.tick();
+        let notices = tick(&mut watch, &probe);
         assert_eq!((relief.requested.load(Ordering::Acquire), relief_lines(&notices)), (1, 1));
         assert!(resources.check_write().unwrap_err().to_string().contains("disk space below threshold and memory"));
         relief.flushed.store(1, Ordering::Release);
 
         // Ticks 6 to 15.
-        let (requests, _, notices) = run_ticks(&mut watch, &trims, 10, flushed);
+        let (requests, _, notices) = run_ticks(&mut watch, &probe, &trims, 10, flushed);
         assert_eq!((requests, relief_lines(&notices)), (vec![10], 0));
     }
 
@@ -1500,7 +1886,7 @@ pub(crate) mod tests {
         let probe = FakeProbe::new();
         let (mut watch, trims) = memory_watch(&probe, dir.path(), 0);
         probe.set_free(dir.path(), GB);
-        let (requests, trimmed, notices) = run_ticks(&mut watch, &trims, 20, |_, relief| {
+        let (requests, trimmed, notices) = run_ticks(&mut watch, &probe, &trims, 20, |_, relief| {
             relief.flushed.store(relief.requested.load(Ordering::Acquire), Ordering::Release);
         });
         assert_eq!(watch.resources().level(), Level::Blocked);
@@ -1517,17 +1903,17 @@ pub(crate) mod tests {
         let (mut watch, trims) = memory_watch(&probe, dir.path(), GIB * 96 / 100);
         probe.set_rss(GIB * 96 / 100);
         let relief = watch.relief();
-        watch.tick();
+        tick(&mut watch, &probe);
         relief.flushed.store(1, Ordering::Release);
         watch.trim_running.store(true, Ordering::Release);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!((trims.load(Ordering::Relaxed), watch.trimmed_for), (0, 0));
 
         watch.trim_running.store(false, Ordering::Release);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!((trims.load(Ordering::Relaxed), watch.trimmed_for), (1, 1));
         for _ in 4..=11 {
-            watch.tick();
+            tick(&mut watch, &probe);
         }
         assert_eq!((trims.load(Ordering::Relaxed), relief.requested.load(Ordering::Acquire)), (1, 2));
     }
@@ -1541,9 +1927,9 @@ pub(crate) mod tests {
         let (mut watch, _) = memory_watch(&probe, dir.path(), 0);
         watch.trimmer = Trimmer::Thread;
         probe.set_rss(GIB * 96 / 100);
-        watch.tick();
+        tick(&mut watch, &probe);
         watch.relief().flushed.store(1, Ordering::Release);
-        watch.tick();
+        tick(&mut watch, &probe);
         assert_eq!(watch.trimmed_for, 1);
         // Upper bound against hanging only.
         let until = std::time::Instant::now() + Duration::from_secs(30);

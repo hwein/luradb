@@ -17,6 +17,8 @@ use std::time::Duration;
 
 /// How often the watch reads its probes.
 pub const RESOURCE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+// The hang messages count whole seconds.
+const _: () = assert!(RESOURCE_WATCH_INTERVAL.subsec_nanos() == 0);
 /// What a refused write tells the client to wait, in seconds.
 pub const RETRY_AFTER_SECS: u64 = 5;
 /// A state that lasts repeats its log line every this many ticks.
@@ -703,7 +705,11 @@ impl ResourceWatch {
             let ProbeSlot { space, sequence } = *volume.slot.lock();
             if sequence != volume.sequence {
                 if volume.stalled_ticks >= PROBE_STALL_TICKS {
-                    notices.push(Notice::info(format!("The volume probe of {} answers again.", volume.path.display())));
+                    notices.push(Notice::info(format!(
+                        "The volume probe of {} answers again after about {} s.",
+                        volume.path.display(),
+                        volume.stalled_ticks * RESOURCE_WATCH_INTERVAL.as_secs()
+                    )));
                 }
                 (volume.space, volume.sequence, volume.stalled_ticks) = (space, sequence, 0);
             } else {
@@ -712,9 +718,10 @@ impl ResourceWatch {
                     && (volume.stalled_ticks - PROBE_STALL_TICKS).is_multiple_of(REPEAT_TICKS)
                 {
                     notices.push(Notice::warn(format!(
-                        "The volume probe of {} has not answered for {PROBE_STALL_TICKS} s; the resource watch \
+                        "The volume probe of {} has not answered for at least {} s; the resource watch \
                          keeps its last reading ({} of {} bytes free).",
                         volume.path.display(),
+                        volume.stalled_ticks * RESOURCE_WATCH_INTERVAL.as_secs(),
                         volume.space.free,
                         volume.space.size
                     )));
@@ -1254,25 +1261,28 @@ pub(crate) mod tests {
     }
 
     // Test 2: a hang is reported on its fifth tick and every 60 ticks
-    // after; the probe answering again is reported once, and its values
-    // count again.
+    // after, each time with the seconds it has lasted at least; the probe
+    // answering again is reported once with the seconds it hung, and its
+    // values count again.
     #[test]
     fn test_a_hanging_probe_is_reported_and_its_return_too() {
         let dir = tempfile::TempDir::new().unwrap();
         let probe = FakeProbe::new();
         let (mut watch, wal) = two_volumes(dir.path(), &probe);
         let path = volume_path(&watch, &probe, &wal);
-        let stalled = format!(
-            "The volume probe of {path} has not answered for 5 s; the resource watch keeps its last reading \
-             (50000000000 of 100000000000 bytes free)."
-        );
+        let stalled = |seconds: u64| {
+            format!(
+                "The volume probe of {path} has not answered for at least {seconds} s; the resource watch keeps \
+                 its last reading (50000000000 of 100000000000 bytes free)."
+            )
+        };
         probe.block(&wal);
         let mut warned = Vec::new();
         for tick_number in 1..=125 {
             let notices = tick(&mut watch, &probe);
             assert_eq!(lines(&notices, tracing::Level::INFO), Vec::<&str>::new());
             let warnings = lines(&notices, tracing::Level::WARN);
-            assert!(warnings.iter().all(|line| *line == stalled), "{warnings:?}");
+            assert!(warnings.iter().all(|line| *line == stalled(tick_number)), "{warnings:?}");
             if !warnings.is_empty() {
                 warned.push((tick_number, warnings.len()));
             }
@@ -1282,7 +1292,10 @@ pub(crate) mod tests {
         probe.set_free(&wal, 40 * GB);
         probe.release(&wal);
         let notices = tick(&mut watch, &probe);
-        assert_eq!(lines(&notices, tracing::Level::INFO), [format!("The volume probe of {path} answers again.")]);
+        assert_eq!(
+            lines(&notices, tracing::Level::INFO),
+            [format!("The volume probe of {path} answers again after about 125 s.")]
+        );
         assert_eq!(free_of(&watch, &probe, &wal), 40 * GB);
         probe.set_free(&wal, 30 * GB);
         assert_eq!(tick(&mut watch, &probe), Vec::new());

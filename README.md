@@ -53,7 +53,7 @@ LuraDB is your friendly neighborhood database.
 
 ## Features
 
-| | |
+| Area | What you get |
 |---|---|
 | **Key-value** | TTL · prefix listings and counts · bulk delete · resumable watch stream (SSE) · `ETag` with `If-Match` / `If-None-Match: *`, optionally required per domain |
 | **JSON documents** | versioned documents with `ETag` · secondary indexes · search queries · NDJSON bulk load |

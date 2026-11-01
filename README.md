@@ -13,21 +13,15 @@ API — no proprietary protocol, no driver stack to install: every language
 and standard tool can talk to it out of the box, and the API is browsable
 down to the individual record.
 
-**Built for the small jobs, done well.** Typical homes for LuraDB:
+**Built for the small jobs, done well.**
 
-- The state store behind an installer, provisioning routine or automation
-  agent on a Linux machine — bare metal, WSL or a container.
-- The backend of a website or small web app: sessions and tokens with TTL,
-  a bunch of JSON documents, a few relational tables — without running
-  Redis, MongoDB and PostgreSQL side by side.
-- A local sidecar for services, scripts and cron jobs on the same host,
-  reachable over a Unix domain socket instead of the TCP stack.
-- Self-hosted services and home labs, where the database should install in
-  one step, run under systemd, log to journald — and otherwise stay out of
-  the way.
-- Prototypes and internal tools that want a real, persistent store in
-  minutes and can grow from keys to documents to tables without switching
-  systems.
+## Where LuraDB lives
+
+| | | |
+|---|---|---|
+| `REL` `JSON` `KV` **Your own service** — A backend that ships with your service: one package, one unit, a REST API it talks to directly. | `KV` **Sessions that clean up after themselves** — Sessions and tokens with a TTL expire on their own. No Redis on the side. | `REL` `JSON` `KV` **Memory for your agents** — Give AI agents a real store over MCP: keys for state, documents for context, tables for facts. |
+| `KV` **Flags that flip live** — Services watch a key and switch the moment it changes. No redeploy, no polling. | `REL` `JSON` **Catalogs with loose ends** — Fixed fields in a table, the messy attributes in JSON, linked in one row. | `REL` `JSON` `KV` **One customer, one domain** — Each tenant gets its own domain, its own API keys, its own permissions. |
+| `JSON` **The webhook inbox** — Catch every incoming payload as it is. Index it, search it later. | `JSON` `KV` **Throwaway database for pipelines** — A real, persistent store for CI runs, installers and playbooks. Seeded, used, gone. | `REL` `JSON` `KV` **On the host, out of the way** — Sidecar over a Unix socket, installed in one step, under systemd, logging to journald. |
 
 **What LuraDB is not.** LuraDB does not aim to be Oracle, PostgreSQL or
 MySQL — nor MongoDB, Cassandra or Spark. There is no analytical engine, no
@@ -39,6 +33,17 @@ their place by making the small case better, not by making LuraDB bigger.
 architecture is built on.
 
 LuraDB is your friendly neighborhood database.
+
+## Try it in two minutes
+
+- **Docker, any OS:** drop a `.deb` from the
+  [Releases](https://github.com/hwein/luradb/releases) into
+  `target/debian/`, run `docker compose up -d` —
+  [packaging/docker](packaging/docker/README.md).
+- **Linux host:** `sudo apt install ./luradb_*.deb`, start the service,
+  done — [Install](#install).
+- **Curl it:** `curl http://127.0.0.1:3000/health` — then the
+  [Quick tour](#quick-tour).
 
 ## Features
 

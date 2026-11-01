@@ -53,29 +53,15 @@ LuraDB is your friendly neighborhood database.
 
 ## Features
 
-- **Key-value:** keys with TTL, prefix listings and counts, bulk delete, a
-  resumable watch stream (SSE), and conditional writes: every key carries an
-  `ETag`, writes accept `If-Match` and `If-None-Match: *`, and a domain can
-  require them.
-- **JSON documents:** versioned documents with `ETag` and conditional
-  writes, secondary indexes, search queries, NDJSON bulk load.
-- **Slim relational (LuraSQL):** tables, indexes, views and left joins over
-  `/sql` and row endpoints, CSV/TSV import with inferred column types, and
-  KVREF/JSONREF columns that link rows to keys and documents.
-- **One API for all three:** domains, API keys with per-domain permissions,
-  a resumable stream of lifecycle and DDL events, metrics and health,
-  logical backups with schedules, retention and restore.
-- **Access paths:** HTTP, native HTTPS, a Unix domain socket for local
-  clients, CORS for browser clients, and a built-in MCP server for AI
-  assistants.
-- **Durability:** a write is confirmed only once it is in the write-ahead
-  log (group commit across engines, segments cleaned without a write
-  pause); a failed fsync or repeated data-file write errors stop the
-  service so the next start recovers from the log instead of serving data
-  it may have lost.
-- **Operations:** one binary, a `.deb` with systemd service, journald
-  logging, multicore data shards, and a watch on disk space and memory that
-  refuses writes before the host runs dry.
+| | |
+|---|---|
+| **Key-value** | TTL · prefix listings and counts · bulk delete · resumable watch stream (SSE) · `ETag` with `If-Match` / `If-None-Match: *`, optionally required per domain |
+| **JSON documents** | versioned documents with `ETag` · secondary indexes · search queries · NDJSON bulk load |
+| **Slim relational** | tables, indexes, views, left joins · `/sql` and row endpoints · CSV/TSV import with inferred types · KVREF/JSONREF columns linking rows to keys and documents |
+| **One API** | domains · API keys with per-domain permissions · event stream of lifecycle and DDL changes · metrics and health · logical backups with schedules, retention and restore |
+| **Access paths** | HTTP · native HTTPS · Unix domain socket · CORS · built-in MCP server for AI assistants |
+| **Durability** | a write is confirmed only once it is in the write-ahead log; a failed fsync stops the service so the next start recovers from the log |
+| **Operations** | one binary · `.deb` with systemd service · journald logging · multicore data shards · disk and memory watch that refuses writes before the host runs dry |
 
 ## Status
 

@@ -17,11 +17,33 @@ down to the individual record.
 
 ## Where LuraDB lives
 
-| | | |
-|---|---|---|
-| <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18"> **Your own service** — A backend that ships with your service: one package, one unit, a REST API it talks to directly. | <img src=".github/tag-kv.svg" alt="KV" height="18"> **Sessions that clean up after themselves** — Sessions and tokens with a TTL expire on their own. No Redis on the side. | <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18"> **Memory for your agents** — Give AI agents a real store over MCP: keys for state, documents for context, tables for facts. |
-| <img src=".github/tag-kv.svg" alt="KV" height="18"> **Flags that flip live** — Services watch a key and switch the moment it changes. No redeploy, no polling. | <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> **Catalogs with loose ends** — Fixed fields in a table, the messy attributes in JSON, linked in one row. | <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18"> **One customer, one domain** — Each tenant gets its own domain, its own API keys, its own permissions. |
-| <img src=".github/tag-json.svg" alt="JSON" height="18"> **The webhook inbox** — Catch every incoming payload as it is. Index it, search it later. | <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18"> **Throwaway database for pipelines** — A real, persistent store for CI runs, installers and playbooks. Seeded, used, gone. | <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18"> **On the host, out of the way** — Sidecar over a Unix socket, installed in one step, under systemd, logging to journald. |
+- **Your own service** — A backend that ships with your service: one
+  package, one unit, a REST API it talks to directly.
+  <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18">
+- **Sessions that clean up after themselves** — Sessions and tokens with a
+  TTL expire on their own. No Redis on the side.
+  <img src=".github/tag-kv.svg" alt="KV" height="18">
+- **Memory for your agents** — Give AI agents a real store over MCP: keys
+  for state, documents for context, tables for facts.
+  <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18">
+- **Flags that flip live** — Services watch a key and switch the moment it
+  changes. No redeploy, no polling.
+  <img src=".github/tag-kv.svg" alt="KV" height="18">
+- **Catalogs with loose ends** — Fixed fields in a table, the messy
+  attributes in JSON, linked in one row.
+  <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18">
+- **One customer, one domain** — Each tenant gets its own domain, its own
+  API keys, its own permissions.
+  <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18">
+- **The webhook inbox** — Catch every incoming payload as it is. Index it,
+  search it later.
+  <img src=".github/tag-json.svg" alt="JSON" height="18">
+- **Throwaway database for pipelines** — A real, persistent store for CI
+  runs, installers and playbooks. Seeded, used, gone.
+  <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18">
+- **On the host, out of the way** — Sidecar over a Unix socket, installed
+  in one step, under systemd, logging to journald.
+  <img src=".github/tag-rel.svg" alt="REL" height="18"> <img src=".github/tag-json.svg" alt="JSON" height="18"> <img src=".github/tag-kv.svg" alt="KV" height="18">
 
 **What LuraDB is not.** LuraDB does not aim to be Oracle, PostgreSQL or
 MySQL — nor MongoDB, Cassandra or Spark. There is no analytical engine, no

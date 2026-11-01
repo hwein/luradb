@@ -3,8 +3,6 @@
   <img src=".github/luradb-wordmark-light.svg" alt="LuraDB" height="40">
 </picture>
 
-#
-
 LuraDB is a Linux-first, REST-native multi-model database built on io_uring.
 One small, fast process covers the three shapes of data a typical backend
 needs: a key-value store (TTLs, watches), JSON documents (indexes, queries),
@@ -40,12 +38,45 @@ architecture is built on.
 
 LuraDB is your friendly neighborhood database.
 
+## Features
+
+- **Key-value:** keys with TTL, prefix listings and counts, bulk delete, a
+  resumable watch stream (SSE), and conditional writes: every key carries an
+  `ETag`, writes accept `If-Match` and `If-None-Match: *`, and a domain can
+  require them.
+- **JSON documents:** versioned documents with `ETag` and conditional
+  writes, secondary indexes, search queries, NDJSON bulk load.
+- **Slim relational (LuraSQL):** tables, indexes, views and left joins over
+  `/sql` and row endpoints, CSV/TSV import with inferred column types, and
+  KVREF/JSONREF columns that link rows to keys and documents.
+- **One API for all three:** domains, API keys with per-domain permissions,
+  a resumable stream of lifecycle and DDL events, metrics and health,
+  logical backups with schedules, retention and restore.
+- **Access paths:** HTTP, native HTTPS, a Unix domain socket for local
+  clients, CORS for browser clients, and a built-in MCP server for AI
+  assistants.
+- **Durability:** a write is confirmed only once it is in the write-ahead
+  log (group commit across engines, segments cleaned without a write
+  pause); a failed fsync or repeated data-file write errors stop the
+  service so the next start recovers from the log instead of serving data
+  it may have lost.
+- **Operations:** one binary, a `.deb` with systemd service, journald
+  logging, multicore data shards, and a watch on disk space and memory that
+  refuses writes before the host runs dry.
+
 ## Status
 
 LuraDB is `0.x`, pre-1.0 software. On-disk formats and the REST API can
 change between minor releases. See [CHANGELOG.md](CHANGELOG.md) for what
 changed in each release — entries touching the REST API are marked `API:`,
 breaking changes are marked **BREAKING**.
+
+0.5.0 changes the on-disk format: the write-ahead log becomes a directory
+of segments, engine files move into a shard directory, and users, API key
+hashes and permissions move into a separate system store. A data directory
+written by 0.4.0 is upgraded automatically on the first start — one way.
+Going back to 0.4.0 needs a backup taken before the upgrade, restored into
+the older version.
 
 ## Requirements
 
@@ -65,23 +96,21 @@ sudo apt install ./luradb_*.deb
 ```
 
 `apt` resolves the runtime dependencies, creates the `luradb` system user,
-generates an admin API key and starts the systemd service. The package
-ships its own `INSTALL.md` (`/usr/share/doc/luradb/INSTALL.md`) with the
-full walkthrough: service management, the admin key, the Unix-domain-socket
-path, updates and removal.
-
-Releases publish prebuilt binaries starting with the first tagged version;
-earlier, untagged history makes no binary guarantee.
-
-As an alternative to installing on the host, the same package can run in
-Docker — see [packaging/docker/README.md](packaging/docker/README.md).
+generates an admin API key and enables the systemd service without
+starting it, so you can review the config (bind address, data paths) before
+LuraDB first runs; a notice at the end of the install says where the config
+lives and how to start. The package ships its own `INSTALL.md`
+(`/usr/share/doc/luradb/INSTALL.md`) with the full walkthrough: service
+management, the admin key, HTTPS, the Unix-domain-socket path, updates and
+removal.
 
 ## Try it with Docker
 
 No Linux machine handy? Get a `.deb` — from the [Releases
 page](https://github.com/hwein/luradb/releases) or built yourself — drop
 it into `target/debian/` and run `docker compose up -d`; no Rust toolchain
-or package install on the host. See
+or package install on the host. The container shares its host's kernel, so
+the host (or the VM of Docker Desktop) needs Linux 6.1 or newer too. See
 [packaging/docker/README.md](packaging/docker/README.md) for the
 quickstart.
 
@@ -118,8 +147,15 @@ grep api_key luradb.toml
 curl -X PUT http://127.0.0.1:3000/store-api/kv/default/keys/hello \
   -H "Authorization: Bearer lura_changeme_in_production" \
   -d 'world'
-curl http://127.0.0.1:3000/store-api/kv/default/keys/hello \
+curl -i http://127.0.0.1:3000/store-api/kv/default/keys/hello \
   -H "Authorization: Bearer lura_changeme_in_production"
+
+# Conditional write: replace the key only if it still has the ETag
+# the read above returned (412 otherwise)
+curl -X PUT http://127.0.0.1:3000/store-api/kv/default/keys/hello \
+  -H "Authorization: Bearer lura_changeme_in_production" \
+  -H 'If-Match: "<etag from the read>"' \
+  -d 'world, again'
 
 # JSON documents: create one in the "default" domain
 curl -X POST http://127.0.0.1:3000/store-api/json/default/documents \
@@ -129,67 +165,57 @@ curl -X POST http://127.0.0.1:3000/store-api/json/default/documents \
 ```
 
 In development, a browsable Swagger UI is available at `/test-ui` (disabled
-by default; the dev `luradb.toml` turns it on explicitly). When
-`auth.enabled = true`, the UI needs a Bearer key too — it fetches
-`/api-docs/openapi.json` via a browser request, which now requires the same
-valid API key as the rest of the API. Use the UI's "Authorize" button to set
-the key.
+by default; the dev `luradb.toml` turns it on explicitly). With
+`auth.enabled = true`, the UI and `/api-docs/openapi.json` need the same
+valid API key as the rest of the API; use the UI's "Authorize" button to
+set it.
 
 Requests on one connection are processed in order (HTTP/1.1 pipelining and
 HTTP/2 alike); open several connections for parallelism.
 
+## MCP server
+
+LuraDB ships an MCP server for AI assistants and agents (opt-in, `[mcp]` in
+`luradb.toml`). It listens on its own port (3100 by default) on the
+server's bind address and offers tools to list and describe domains, read
+keys and documents, search, run SQL queries and read health and metrics.
+Writing keys, documents and rows (`read_only = false`) and creating
+domains, tables, views and indexes (`allow_ddl = true`) are separate
+opt-ins; no tool deletes a domain, table, view or index. Clients
+authenticate with an API key as Bearer token; clients that only speak OAuth
+sign in once on a LuraDB page with their key when `oauth_enabled = true`
+and `public_url` is set. Every tool runs with the permissions of that key.
+
 ## Multicore
 
 LuraDB spreads its domains over several data shards by name; each shard is
-one thread with its own storage engines. What that means for one domain:
+one thread with its own storage engines. For one domain that means: reads
+scale across cores — point reads run on the connection's thread, longer
+reads on a pool of reader threads — while writes of one domain run on
+exactly one core, the thread of its shard. Write parallelism is therefore
+at most the number of domains being written at the same time; spread
+independent write traffic over several domains.
 
-- **Reads scale across cores.** Point reads run on the thread that holds the
-  connection, longer reads on a pool of reader threads — both against the
-  domain's shard, from any number of connections at once.
-- **Writes of one domain run on exactly one core**, the thread of its shard.
-  Write parallelism is therefore at most the number of domains being written
-  at the same time; spread independent write traffic over several domains.
+The cores are split automatically between frontend workers (HTTP/TLS), data
+shards and reader threads; `[multicore]` in `luradb.toml` overrides each
+part. The shard count belongs to the data directory: the automatic setting
+keeps the count an existing directory was written with, also after an
+upgrade or a move to a host with another core count, and
+`luradb --migrate-shards N` changes it while the server is stopped. Sizes,
+memory per shard and the migration walkthrough:
+[INSTALL.md "Multicore"](packaging/INSTALL.md#multicore) and
+["Changing the shard count"](packaging/INSTALL.md#changing-the-shard-count).
 
-The cores are split automatically (`[multicore]` in `luradb.toml` overrides
-each part):
+## Disk and memory shortage
 
-| Part | Automatic size | 4 cores | 8 cores | 12 cores | 32 cores |
-| --- | --- | --- | --- | --- | --- |
-| Frontend workers (HTTP/TLS) | cores / 6, 2 to 4; 1 below 4 cores | 2 | 2 | 2 | 4 |
-| Data shards (new data directory) | cores / 4, 1 to 8 | 1 | 2 | 3 | 8 |
-| Reader threads | cores − 2 − frontend − shards, at least 1 | 1 | 2 | 5 | 18 |
-
-Two cores stay for the storage thread and background work.
-
-Memory per data shard: the block cache of each engine (64 MiB per engine)
-and the buffer pool (`buffer_pool.pool_size`) are split evenly across the
-shards, so their totals stay the same. The MemTable threshold
-(`lsm.memtable_size_threshold`) applies to every engine of every shard, so
-MemTable memory grows with the shard count: up to engines × shards ×
-threshold, plus MemTables being flushed.
-
-The shard count belongs to the data directory: the automatic setting keeps
-the count an existing data directory was written with, also after an
-upgrade or a move to a host with another core count, and a start with a
-different count set explicitly is refused. Shared memory (`[shm]`) serves
-all shards: each snapshot is taken at one consistent point across them, and
-so is every backup.
-
-### Changing the shard count
-
-The migration tool rewrites a stopped server's data directory for another
-number of data shards, more or fewer, down to 1, for all three engines:
-
-```bash
-luradb --config luradb.toml --migrate-shards 4
-```
-
-The server must have been shut down cleanly (otherwise start it once and
-stop it again), and the data directories need room for a second copy of the
-data while the tool builds the new layout next to the old one. Afterwards
-leave `[multicore].shards` at `0` or set it to the new count. A tool that
-stops halfway is finished by running the same command again; until then the
-server refuses to start. Backups restore into any shard count.
+The server checks the free space of its data volumes and its own memory
+use every second. Below the warn thresholds it logs a warning and
+`GET /health` reports `degraded`; below the block thresholds it refuses
+writes with `507 Insufficient Storage` and `Retry-After` while reads
+continue, and resumes on its own once there is room again. While memory is
+short it flushes its MemTables and returns heap to the kernel. Thresholds
+are set in `[resources]` in `luradb.toml`; details in
+[INSTALL.md "Disk and memory shortage"](packaging/INSTALL.md#disk-and-memory-shortage).
 
 ## Backups
 
@@ -204,8 +230,8 @@ one engine (`kv`, `json`, `rel`), one domain of one engine (`kv:<domain>`,
 KVREF and JSONREF columns link to the KV and JSON domain of the same name.
 They resolve after a restore when that domain is restored too or already
 exists; otherwise they read as missing and are cleared, as after deleting
-that domain. A restore
-under a new name (`into_domain`) links them to the domains of the new name.
+that domain. A restore under a new name (`into_domain`) links them to the
+domains of the new name.
 
 ## License
 

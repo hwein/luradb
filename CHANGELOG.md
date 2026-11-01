@@ -84,6 +84,7 @@ All notable changes to LuraDB are documented in this file.
 
 ### Fixed
 
+- `luradb --migrate-shards` no longer warns about a missing old layout when the config names the data directory both absolutely and relatively.
 - Snapshot reads no longer miss an older version when the key is a prefix of another key or contains bytes above 0xFD.
 - Point reads no longer slow down with the size of newer SSTables that do not hold the key.
 - Reads no longer miss keys while a MemTable flush or a compaction installs its result.

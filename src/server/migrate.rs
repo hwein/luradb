@@ -187,12 +187,19 @@ fn parent(path: &Path) -> PathBuf {
 }
 
 /// The directories holding `shard_<k>/` directories: the page files', and
-/// the value logs' and SSTables' of the engines on `files`.
+/// the value logs' and SSTables' of the engines on `files`. One entry per
+/// directory, however the config spells it (absolute and relative to the
+/// working directory name the same one).
 fn roots<'a>(config: &LuraConfig, files: impl Iterator<Item = &'a EngineFiles>) -> Vec<PathBuf> {
     let mut roots = vec![parent(Path::new(&config.storage.db_path))];
     for files in files {
         roots.push(parent(&files.vlog));
         roots.push(files.sstables.clone());
+    }
+    for root in &mut roots {
+        if let Ok(canonical) = std::fs::canonicalize(&*root) {
+            *root = canonical;
+        }
     }
     roots.sort();
     roots.dedup();
@@ -636,6 +643,36 @@ mod tests {
             .map(|entry| entry.path())
             .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("migrate_"))
             .collect()
+    }
+
+    /// The packaged config names the key-value files absolutely and the JSON
+    /// and relational files relative to the working directory: the same
+    /// directory under two spellings is one root, so its staging directory
+    /// is created and removed once.
+    #[test]
+    fn roots_name_a_directory_once_however_the_config_spells_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(data.join("sstables")).unwrap();
+        std::fs::create_dir_all(data.join("luradb_json_sstables")).unwrap();
+        let mut cfg = config(dir.path(), 2);
+        cfg.storage.db_path = data.join("luradb.db").to_string_lossy().into_owned();
+        let files = [
+            EngineFiles {
+                wal: data.join("luradb.wal"),
+                vlog: data.join("luradb.vlog"),
+                sstables: data.join("sstables"),
+            },
+            EngineFiles {
+                wal: data.join(".").join("luradb_json.wal"),
+                vlog: data.join(".").join("luradb_json.vlog"),
+                sstables: data.join(".").join("luradb_json_sstables"),
+            },
+        ];
+        assert_eq!(
+            roots(&cfg, files.iter()),
+            vec![data.clone(), data.join("luradb_json_sstables"), data.join("sstables")]
+        );
     }
 
     /// A data directory of one shard goes to two and back to one; after each

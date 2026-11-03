@@ -70,7 +70,7 @@ change between minor releases. See [CHANGELOG.md](CHANGELOG.md) for what
 changed in each release — entries touching the REST API are marked `API:`,
 breaking changes are marked **BREAKING**.
 
-0.5.0 changes the on-disk format: the write-ahead log becomes a directory
+0.5.1 changes the on-disk format: the write-ahead log becomes a directory
 of segments, engine files move into a shard directory, and users, API key
 hashes and permissions move into a separate system store. A data directory
 written by 0.4.0 is upgraded automatically on the first start — one way.

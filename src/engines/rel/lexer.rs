@@ -1,4 +1,4 @@
-//! Hand-written tokenizer for LuraSQL (spec rel/004 §2).
+//! Hand-written tokenizer for LuraSQL.
 //!
 //! Operates on `sql`'s bytes: every structural token (keyword, identifier,
 //! number, operator, punctuation, string delimiter) is ASCII, so byte-wise
@@ -8,8 +8,6 @@
 //! part of v1 (KISS).
 
 use super::error::RelStoreError;
-
-// ── Keywords ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
@@ -60,7 +58,7 @@ pub enum Keyword {
     CurrentTimestamp,
     True,
     False,
-    // Type names & aliases (concept 3.2) — resolved to `ColumnType` via
+    // Type names & aliases — resolved to `ColumnType` via
     // `ColumnType::from_sql_name(kw.as_str())` in the parser, not re-mapped here.
     Integer,
     Int,
@@ -153,7 +151,7 @@ impl Keyword {
     }
 
     /// Canonical uppercase spelling — used for syntax-error messages and to
-    /// delegate type-name resolution to `ColumnType::from_sql_name` (rel/003)
+    /// delegate type-name resolution to `ColumnType::from_sql_name`
     /// so the alias table lives in exactly one place.
     pub fn as_str(&self) -> &'static str {
         use Keyword::*;
@@ -224,7 +222,7 @@ impl Keyword {
         }
     }
 
-    /// True for tokens that can start a `type_name` production (grammar §4).
+    /// True for tokens that can start a `type_name` production.
     pub fn is_type_name(&self) -> bool {
         use Keyword::*;
         matches!(
@@ -248,8 +246,6 @@ impl Keyword {
         )
     }
 }
-
-// ── Tokens ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -309,10 +305,8 @@ fn syntax_err(pos: usize, msg: impl Into<String>) -> RelStoreError {
     }
 }
 
-// ── Tokenizer ────────────────────────────────────────────────────────────────
-
 /// Lexes `sql` into `(Token, byte_pos)` pairs. `max_statement_len` is checked
-/// first — over the limit, no token is produced at all (spec rel/004 §1).
+/// first — over the limit, no token is produced at all.
 pub fn tokenize(
     sql: &str,
     max_statement_len: usize,
@@ -375,7 +369,7 @@ pub fn tokenize(
             }
             // A leading '-' is part of a numeric literal only when immediately
             // followed by a digit — there are no arithmetic expressions, so
-            // this cannot be ambiguous with anything else (spec rel/004 §2).
+            // this cannot be ambiguous with anything else.
             b'-' if bytes.get(pos + 1).copied().is_some_and(|c| c.is_ascii_digit()) => {
                 scan_number(sql, &mut pos)?
             }
@@ -397,7 +391,7 @@ pub fn tokenize(
 }
 
 /// Counts `?` placeholders in an already-lexed token stream — the expected
-/// bind-parameter count for the binder's parameter-count guard (spec §5).
+/// bind-parameter count for the binder's parameter-count guard.
 pub fn count_params(tokens: &[(Token, usize)]) -> usize {
     tokens.iter().filter(|(t, _)| matches!(t, Token::Param(_))).count()
 }
@@ -543,7 +537,7 @@ fn scan_number(sql: &str, pos: &mut usize) -> Result<Token, RelStoreError> {
 }
 
 /// Scans `[a-zA-Z_][a-zA-Z0-9_]*`, lowercases it, and resolves it against the
-/// keyword table; anything else becomes an identifier (concept 3.5).
+/// keyword table; anything else becomes an identifier.
 fn scan_ident_or_keyword(sql: &str, pos: &mut usize) -> Token {
     let bytes = sql.as_bytes();
     let start = *pos;
@@ -688,8 +682,6 @@ mod tests {
         assert!(tokenize(&sql, 64).is_ok());
     }
 
-    // ── Prep work (spec quality/008): tokenize/scan_number error paths ─────────
-
     // A lone '!' (no following '=') is a syntax error, not silently consumed.
     #[test]
     fn test_bang_without_eq_is_syntax_error() {
@@ -748,7 +740,7 @@ mod tests {
         assert_eq!(toks("1."), vec![Token::Integer(1), Token::Dot]);
     }
 
-    // scan_number (004-F2): a real literal whose exponent overflows f64 to a
+    // scan_number: a real literal whose exponent overflows f64 to a
     // non-finite value is a syntax error, not a silent `Token::Real(inf)` that
     // would later corrupt the catalog.
     #[test]

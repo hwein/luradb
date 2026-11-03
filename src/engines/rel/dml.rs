@@ -1,5 +1,5 @@
-//! DML deep-binder, atomic write path, and PK-point SELECT (spec rel/005
-//! §5-12). INSERT/UPDATE/DELETE run under a per-table write lock (held across
+//! DML deep-binder and atomic write path. INSERT/UPDATE/DELETE run under a
+//! per-table write lock (held across
 //! candidate acquisition and the single `WriteBatch`), an MVCC snapshot for
 //! all check-reads. Value binding, the hand-written ISO-8601 parser and
 //! `now_millis` live here; the WHERE predicate is bound to a `Pred` (eval.rs).
@@ -13,16 +13,16 @@ use super::eval::{eval, Bool3, Pred, PredOperand};
 use super::keys;
 use super::row::{decode_row, encode_row};
 use super::types::{encode_sortable, ColumnType, ScalarValue};
+use super::select::ROW_YIELD_INTERVAL;
 use super::{ExecOutcome, RelEngine};
+use crate::core::coop::YieldEvery;
 use crate::engines::lsm::engine::BatchOp;
-use crate::engines::lsm::reader::Snapshot;
+use crate::engines::lsm::reader::{RegistrySnapshot, Snapshot};
 use crate::metrics::EngineKind;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-// ── Per-table write lock (spec §8.1) ────────────────────────────────────────
 
 type LockMap = HashMap<(Vec<u8>, u32), Arc<tokio::sync::Mutex<()>>>;
 
@@ -44,8 +44,6 @@ impl TableLocks {
     }
 }
 
-// ── Execution results (spec §14) ────────────────────────────────────────────
-
 #[derive(Debug)]
 pub struct DmlResult {
     pub affected: u64,
@@ -57,10 +55,10 @@ pub struct SelectResult {
     pub columns: Vec<(String, ColumnType)>,
     pub rows: Vec<Vec<ScalarValue>>,
     /// `true` iff the effective LIMIT was reduced by `max_limit`, or more
-    /// matching rows existed past OFFSET+LIMIT than were returned (rel/006
-    /// §6/§10). Always `false` for COUNT(*).
+    /// matching rows existed past OFFSET+LIMIT than were returned.
+    /// Always `false` for COUNT(*).
     pub limit_applied: bool,
-    /// REFERENCES target table name per output column (rel/009 §5 `expand`),
+    /// REFERENCES target table name per output column (for `expand`),
     /// parallel to `columns`; `None` where the column isn't a projected
     /// REFERENCES/KVREF/JSONREF link (always `None` for COUNT(*)'s single
     /// column). Engine-internal wiring for `expand`, not part of any public
@@ -68,14 +66,15 @@ pub struct SelectResult {
     pub(crate) column_refs: Vec<Option<String>>,
     /// Number of `LEFT JOIN` stages the statement itself used (0 outside
     /// join.rs). `expand` columns are charged against `max_join_depth` on
-    /// top of this count (rel/007 §8, rel/009 §5).
+    /// top of this count.
     pub(crate) joins_used: usize,
-    /// The MVCC snapshot the rows were read at (rel/005/006 `snapshot()` +
-    /// `get_with_snapshot`). `expand` resolution (rel/009 §5) reuses it so
-    /// referenced rows are read at the same point in time as the driving
-    /// SELECT, rather than a fresh (later) snapshot. `None` for COUNT(*),
-    /// which is never expand-eligible (`column_refs` is all-`None` there).
-    pub(crate) snapshot: Option<Snapshot>,
+    /// The registered MVCC snapshot the rows were read at
+    /// (`snapshot()` + `get_with_snapshot`). `expand` resolution
+    /// reads through it so referenced rows come from the same point in time as
+    /// the driving SELECT; as a guard it keeps that horizon registered until
+    /// the result drops. `None` for COUNT(*), which is never
+    /// expand-eligible (`column_refs` is all-`None` there).
+    pub(crate) snapshot: Option<RegistrySnapshot>,
 }
 
 /// A row selected for UPDATE/DELETE: its ROW key plus decoded values (in
@@ -94,17 +93,27 @@ pub(super) struct RowPlan {
 
 impl RowPlan {
     /// Builds an already-resolved row (no AUTOINCREMENT fill-in needed) — the
-    /// shape `rel/019`'s from-file import stages via [`RelEngine::stage_insert_row`].
+    /// shape the from-file import and a restore stage via
+    /// [`RelEngine::stage_insert_row`].
     pub(super) fn new(values: HashMap<u16, ScalarValue>) -> Self {
         Self { values, needs_auto: false }
     }
+}
+
+/// Which checks [`RelEngine::stage_insert_row`] runs on a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InsertChecks {
+    All,
+    /// A row from a backup: its `REFERENCES` targets and cross-engine links
+    /// held in the source and are not checked again.
+    Restore,
 }
 
 impl RelEngine {
     /// Dispatches a bound DML/SELECT statement. Table/index DDL is handled
     /// before this point (`ddl.rs`); `CREATE`/`DROP VIEW` are intercepted even
     /// earlier, in `RelEngine::execute`, since they need the raw SQL text
-    /// (rel/008 `view.rs`) — they can never reach here.
+    /// (`view.rs`) — they can never reach here.
     pub(super) async fn execute_dml(
         &self,
         domain: &str,
@@ -112,7 +121,7 @@ impl RelEngine {
         params: &[Value],
         auth: LinkAuth,
     ) -> Result<ExecOutcome, RelStoreError> {
-        // Spec general/019: one op with one latency sample per call, read for
+        // One op with one latency sample per call, read for
         // Select and write for Insert/Update/Delete -- DDL never reaches here.
         let is_read = matches!(stmt, Statement::Select(_));
         let start = std::time::Instant::now();
@@ -122,7 +131,7 @@ impl RelEngine {
             Statement::Delete(d) => self.exec_delete(domain, d, params).await.map(ExecOutcome::Dml),
             Statement::Select(s) => self.exec_select(domain, s, params, auth).await,
             Statement::CreateView(_) | Statement::DropView(_) => {
-                unreachable!("CREATE/DROP VIEW are dispatched in RelEngine::execute (rel/008 view.rs)")
+                unreachable!("CREATE/DROP VIEW are dispatched in RelEngine::execute (view.rs)")
             }
             _ => unreachable!("DDL is dispatched before execute_dml"),
         };
@@ -138,9 +147,9 @@ impl RelEngine {
     }
 
     /// Resolves a DML target to a table: view → `NotWritable`, missing →
-    /// `TableNotFound`, deleting/unknown domain → 410/404 (spec §1).
+    /// `TableNotFound`, deleting/unknown domain → 410/404.
     /// `pub(super)`: reused by the Row-Browse/Row-Write REST entry points
-    /// (rel/010 `rest_browse.rs`/`rest_write.rs`) to resolve the table schema
+    /// (`rest_browse.rs`/`rest_write.rs`) to resolve the table schema
     /// before synthesizing a bound Select/DML statement.
     pub(super) fn require_table(
         &self,
@@ -157,8 +166,6 @@ impl RelEngine {
             Err(e) => Err(e),
         }
     }
-
-    // ── INSERT (spec §8-9) ──────────────────────────────────────────────────
 
     async fn exec_insert(
         &self,
@@ -177,7 +184,7 @@ impl RelEngine {
 
         let lock = self.table_locks.get(prefix, schema.table_id);
         let _guard = lock.lock().await;
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot().await;
         let snap = snapshot.snapshot();
 
         // AUTOINCREMENT high-water: assign omitted PKs, raise for explicit ones.
@@ -191,9 +198,22 @@ impl RelEngine {
         let mut seen_unique: HashSet<(u32, Vec<u8>)> = HashSet::new();
         let mut last_pk = None;
 
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for row in &rows {
+            coop.tick().await;
             let pk_v = self
-                .stage_insert_row(domain, &schema, prefix, row, snap, &mut seen_pk, &mut seen_unique, &mut ops, auth)
+                .stage_insert_row(
+                    domain,
+                    &schema,
+                    prefix,
+                    row,
+                    snap,
+                    &mut seen_pk,
+                    &mut seen_unique,
+                    &mut ops,
+                    auth,
+                    InsertChecks::All,
+                )
                 .await?;
             if single {
                 last_pk = Some(pk_v);
@@ -212,10 +232,10 @@ impl RelEngine {
         Ok(DmlResult { affected: rows.len() as u64, last_pk })
     }
 
-    /// One INSERT row's checks and batch ops (spec §8-9): NOT NULL/text size
+    /// One INSERT row's checks and batch ops: NOT NULL/text size
     /// → PK dup → row size → UNIQUE → REFERENCES → cross-engine links → index
-    /// entries → row `Put`. Returns the row's PK, for `exec_insert`'s
-    /// single-row `last_pk`.
+    /// entries → row `Put`; `checks` may skip the two link checks. Returns
+    /// the row's PK, for `exec_insert`'s single-row `last_pk`.
     pub(super) async fn stage_insert_row(
         &self,
         domain: &str,
@@ -227,6 +247,7 @@ impl RelEngine {
         seen_unique: &mut HashSet<(u32, Vec<u8>)>,
         ops: &mut Vec<BatchOp>,
         auth: LinkAuth,
+        checks: InsertChecks,
     ) -> Result<ScalarValue, RelStoreError> {
         let pk_col = schema.columns.iter().find(|c| c.primary_key).expect("table has a PK");
         self.validate_not_null_and_text(schema, &row.values)?;
@@ -253,8 +274,10 @@ impl RelEngine {
         }
 
         self.check_row_unique(schema, &row.values, prefix, &pk_enc, seen_unique).await?;
-        self.check_row_references(domain, schema, &row.values, prefix, snap).await?;
-        self.check_row_cross_engine_links(domain, schema, &row.values, auth).await?;
+        if checks == InsertChecks::All {
+            self.check_row_references(domain, schema, &row.values, prefix, snap).await?;
+            self.check_row_cross_engine_links(domain, schema, &row.values, auth).await?;
+        }
 
         for k in row_index_keys(schema, &row.values, prefix, &pk_enc) {
             self.guard_key_len(&k)?;
@@ -263,8 +286,6 @@ impl RelEngine {
         ops.push(BatchOp::Put { key: row_key, value: row_bytes });
         Ok(pk_v)
     }
-
-    // ── UPDATE (spec §10) ───────────────────────────────────────────────────
 
     async fn exec_update(
         &self,
@@ -282,7 +303,7 @@ impl RelEngine {
         let quals = vec![schema.name.clone()];
         let lock = self.table_locks.get(prefix, schema.table_id);
         let _guard = lock.lock().await;
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot().await;
         let snap = snapshot.snapshot();
         let candidates = self
             .acquire_candidates(&dom, &schema, &upd.where_clause, &quals, params, snap)
@@ -290,7 +311,9 @@ impl RelEngine {
 
         let mut ops: Vec<BatchOp> = Vec::new();
         let mut seen_unique: HashSet<(u32, Vec<u8>)> = HashSet::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for cand in &candidates {
+            coop.tick().await;
             let old = values_by_col_id(&schema, &cand.values);
             let mut new = old.clone();
             for (c, v) in &sets {
@@ -321,7 +344,7 @@ impl RelEngine {
     }
 
     /// Re-validates every SET'd REFERENCES/KVREF/JSONREF cell against its
-    /// target (spec rel/012 §2); unchanged link cells stay "valid enough".
+    /// target; unchanged link cells stay "valid enough".
     async fn check_updated_references(
         &self,
         domain: &str,
@@ -343,7 +366,7 @@ impl RelEngine {
         Ok(())
     }
 
-    /// Diffs only indexes over changed columns (spec §8): UNIQUE re-check,
+    /// Diffs only indexes over changed columns: UNIQUE re-check,
     /// then delete-old/put-new index entries.
     async fn diff_update_indexes(
         &self,
@@ -381,8 +404,6 @@ impl RelEngine {
         Ok(())
     }
 
-    // ── DELETE (spec §11) ───────────────────────────────────────────────────
-
     async fn exec_delete(
         &self,
         domain: &str,
@@ -395,14 +416,16 @@ impl RelEngine {
 
         let lock = self.table_locks.get(prefix, schema.table_id);
         let _guard = lock.lock().await;
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot().await;
         let snap = snapshot.snapshot();
         let candidates = self
             .acquire_candidates(&dom, &schema, &del.where_clause, &quals, params, snap)
             .await?;
 
         let mut ops: Vec<BatchOp> = Vec::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for cand in &candidates {
+            coop.tick().await;
             let values = values_by_col_id(&schema, &cand.values);
             let pk_enc = pk_enc_of(&schema, &values)?;
             for k in row_index_keys(&schema, &values, prefix, &pk_enc) {
@@ -415,8 +438,6 @@ impl RelEngine {
         self.metrics.record_rel_dml_statement("delete");
         Ok(DmlResult { affected: candidates.len() as u64, last_pk: None })
     }
-
-    // ── Candidate acquisition (spec §7) ─────────────────────────────────────
 
     async fn acquire_candidates(
         &self,
@@ -448,7 +469,9 @@ impl RelEngine {
         let keys = self.engine.scan_keys(&keys::row_table_prefix(prefix, schema.table_id)).await?;
         let mut out = Vec::new();
         let mut scanned = 0u64;
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for key in keys {
+            coop.tick().await;
             let Some(bytes) = self.engine.get_with_snapshot(&key, snap).await?.into_option() else {
                 continue;
             };
@@ -465,8 +488,6 @@ impl RelEngine {
         self.metrics.record_rel_dml_scanned_rows(scanned);
         Ok(out)
     }
-
-    // ── Validation helpers (spec §8.4) ──────────────────────────────────────
 
     fn validate_not_null_and_text(
         &self,
@@ -581,11 +602,11 @@ impl RelEngine {
         Ok(())
     }
 
-    /// Cross-engine link validation (spec rel/012 §2): every non-NULL
+    /// Cross-engine link validation: every non-NULL
     /// KVREF/JSONREF cell must resolve to an existing key/document in the
-    /// same-named target domain. Runs inside the rel/005 §8 chain, before the
+    /// same-named target domain. Runs inside the DML check chain, before the
     /// `WriteBatch`, under the held table write lock — but the cross-engine
-    /// read is *not* part of the rel batch (no cross-engine atomicity, §6).
+    /// read is *not* part of the rel batch (no cross-engine atomicity).
     async fn check_row_cross_engine_links(
         &self,
         domain: &str,
@@ -606,12 +627,12 @@ impl RelEngine {
 
     /// Validates one non-NULL link value against its same-named target domain
     /// (existence suffices — a null-value key *exists*). Missing read access
-    /// (`auth`, spec rel/016) is rejected first, before any existence lookup
+    /// (`auth`) is rejected first, before any existence lookup
     /// and without charging the write-validation metric — otherwise an
-    /// unauthorized caller could distinguish an existing from a missing key,
-    /// exactly the oracle this spec closes. `DomainUnavailable`
+    /// unauthorized caller could distinguish an existing from a missing key
+    /// (an existence oracle). `DomainUnavailable`
     /// (disabled/gone/`Deleting`) and `Absent` (active but missing) map to the
-    /// two 409 variants (spec §2/§7).
+    /// two 409 variants.
     async fn validate_cross_engine_link(
         &self,
         domain: &str,
@@ -660,7 +681,7 @@ impl RelEngine {
         }
     }
 
-    async fn read_seq(
+    pub(super) async fn read_seq(
         &self,
         prefix: &[u8],
         table_id: u32,
@@ -681,7 +702,7 @@ impl RelEngine {
     }
 
     /// Commits a DML `WriteBatch` under the engine-global write guard, first
-    /// re-checking the domain is still active (spec rel/013 §3). A writer that
+    /// re-checking the domain is still active. A writer that
     /// passed `require_active` before a concurrent `delete_domain` must abort
     /// with 410/404 here rather than land keys after the purger finalized the
     /// domain — otherwise an orphan `ROW:` key could resurrect under a recreated
@@ -694,8 +715,6 @@ impl RelEngine {
         Ok(())
     }
 }
-
-// ── Column/value binding (spec §5) ──────────────────────────────────────────
 
 fn resolve_insert_columns(
     schema: &TableSchema,
@@ -775,7 +794,7 @@ fn build_row_plans(
     Ok(out)
 }
 
-/// AUTOINCREMENT high-water (spec §9): assigns the next sequence value to
+/// AUTOINCREMENT high-water: assigns the next sequence value to
 /// every row still needing one, raises the high-water for explicit larger
 /// PKs. Returns the new high-water for the caller's seq-key write-back.
 fn assign_autoincrement(
@@ -804,7 +823,7 @@ fn assign_autoincrement(
 }
 
 /// Binds every UPDATE assignment's target column and value, rejecting a SET
-/// on the PK column immediately (spec §10).
+/// on the PK column immediately.
 fn bind_update_assignments(
     schema: &TableSchema,
     assignments: &[Assignment],
@@ -831,13 +850,13 @@ fn bind_update_assignments(
     Ok(sets)
 }
 
-/// `pub(super)`: reused by the SELECT planner (rel/006 `plan.rs`) to bind a
+/// `pub(super)`: reused by the SELECT planner (`plan.rs`) to bind a
 /// sargable conjunct's literal/param side against its resolved column.
 pub(super) fn bind_value(col: &ColumnDef, op: &Operand, params: &[Value]) -> Result<ScalarValue, RelStoreError> {
     bind_operand_value(col.col_type, op, params, &col.name)
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn bind_operand_value(
     t: ColumnType,
     op: &Operand,
@@ -856,7 +875,7 @@ pub(super) fn bind_operand_value(
     }
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn coerce_literal(t: ColumnType, lit: &Literal, ctx: &str) -> Result<ScalarValue, RelStoreError> {
     match lit {
         Literal::Null => Ok(ScalarValue::Null),
@@ -884,7 +903,7 @@ pub(super) fn coerce_literal(t: ColumnType, lit: &Literal, ctx: &str) -> Result<
     }
 }
 
-pub(super) fn coerce_json(t: ColumnType, v: &Value, ctx: &str) -> Result<ScalarValue, RelStoreError> {
+pub(crate) fn coerce_json(t: ColumnType, v: &Value, ctx: &str) -> Result<ScalarValue, RelStoreError> {
     match v {
         Value::Null => Ok(ScalarValue::Null),
         Value::Bool(b) => match t.physical_type() {
@@ -927,11 +946,9 @@ fn timestamp_mismatch(ctx: &str) -> RelStoreError {
     }
 }
 
-// ── WHERE binding (spec §5-6) ───────────────────────────────────────────────
-
 /// Table name plus SELECT alias — the qualifiers a column ref may carry.
 ///
-/// `pub(super)`: reused by the SELECT executor (rel/006 `select.rs`/`plan.rs`).
+/// `pub(super)`: reused by the SELECT executor (`select.rs`/`plan.rs`).
 pub(super) fn accepted_quals(schema: &TableSchema, sel: &Select) -> Vec<String> {
     let mut q = vec![schema.name.clone()];
     if let Some(alias) = &sel.from.alias {
@@ -940,7 +957,7 @@ pub(super) fn accepted_quals(schema: &TableSchema, sel: &Select) -> Vec<String> 
     q
 }
 
-/// `pub(super)`: reused by the SELECT executor (rel/006 `select.rs`/`plan.rs`)
+/// `pub(super)`: reused by the SELECT executor (`select.rs`/`plan.rs`)
 /// for projection/ORDER BY binding and sargable-conjunct column resolution.
 pub(super) fn resolve_column<'a>(
     cref: &super::ast::ColumnRef,
@@ -961,8 +978,8 @@ pub(super) fn resolve_column<'a>(
     Ok((pos, &schema.columns[pos]))
 }
 
-/// `pub(super)`: the SELECT executor (rel/006 §4) reuses this WHERE binder
-/// unchanged for its residual predicate — rel/005's evaluator/binder is not
+/// `pub(super)`: the SELECT executor reuses this WHERE binder
+/// unchanged for its residual predicate — the evaluator/binder is not
 /// duplicated.
 pub(super) fn bind_predicate(
     expr: &Expr,
@@ -1062,7 +1079,7 @@ fn bind_pred_operand(
     }
 }
 
-/// WHERE-only (spec §6): a REAL-natured literal/param compared against an
+/// WHERE-only: a REAL-natured literal/param compared against an
 /// INTEGER-hinted column keeps its own REAL type instead of a lossy coercion
 /// down to INTEGER — `comparable`/`eval::cmp_scalars` widen the INTEGER side
 /// to `f64` at runtime instead (the one implicit widening). Every other hint
@@ -1072,8 +1089,8 @@ fn bind_pred_operand(
 /// operand binding does, so a REAL value written into an INTEGER column is
 /// still rejected as lossy.
 ///
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007
-/// `join.rs`), which mirrors this predicate binding for joined tables.
+/// `pub(super)`: reused by the multi-binding join WHERE binder
+/// (`join.rs`), which mirrors this predicate binding for joined tables.
 pub(super) fn widen_predicate_hint(hint: ColumnType, is_real_valued: bool) -> ColumnType {
     if hint == ColumnType::Integer && is_real_valued {
         ColumnType::Real
@@ -1082,7 +1099,7 @@ pub(super) fn widen_predicate_hint(hint: ColumnType, is_real_valued: bool) -> Co
     }
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn natural_type(op: &Operand, params: &[Value]) -> ColumnType {
     match op {
         Operand::Literal(Literal::Real(_)) => ColumnType::Real,
@@ -1105,7 +1122,7 @@ fn effective_type(op: &PredOperand, schema: &TableSchema) -> Option<ColumnType> 
     }
 }
 
-/// `pub(super)`: reused by the multi-binding join WHERE binder (rel/007 `join.rs`).
+/// `pub(super)`: reused by the multi-binding join WHERE binder (`join.rs`).
 pub(super) fn scalar_physical_type(v: &ScalarValue) -> Option<ColumnType> {
     match v {
         ScalarValue::Integer(_) => Some(ColumnType::Integer),
@@ -1118,7 +1135,7 @@ pub(super) fn scalar_physical_type(v: &ScalarValue) -> Option<ColumnType> {
 }
 
 /// `pub(super)`: reused by the ON type-check and the multi-binding join
-/// WHERE binder (rel/007 `join.rs`).
+/// WHERE binder (`join.rs`).
 pub(super) fn comparable(a: Option<ColumnType>, b: Option<ColumnType>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => {
@@ -1133,7 +1150,7 @@ pub(super) fn comparable(a: Option<ColumnType>, b: Option<ColumnType>) -> bool {
 }
 
 /// Recognizes `pk = literal|param` (either operand order); returns the bound PK
-/// value or `None` if the shape does not match (spec §7/§12).
+/// value or `None` if the shape does not match.
 fn try_pk_point(
     schema: &TableSchema,
     expr: &Expr,
@@ -1172,12 +1189,10 @@ fn is_pk_column(op: &Operand, pk: &ColumnDef, quals: &[String]) -> bool {
     }
 }
 
-/// `pub(super)`: reused by the SELECT planner (rel/006 `plan.rs`).
+/// `pub(super)`: reused by the SELECT planner (`plan.rs`).
 pub(super) fn is_value(op: &Operand) -> bool {
     matches!(op, Operand::Literal(_) | Operand::Param(_))
 }
-
-// ── Row helpers ──────────────────────────────────────────────────────────────
 
 fn values_by_col_id(schema: &TableSchema, values: &[ScalarValue]) -> HashMap<u16, ScalarValue> {
     schema.columns.iter().zip(values).map(|(c, v)| (c.col_id, v.clone())).collect()
@@ -1209,8 +1224,6 @@ fn row_index_keys(
     }
     out
 }
-
-// ── Time helpers (spec §5, no new crate) ────────────────────────────────────
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -1291,6 +1304,8 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 mod tests {
     use super::*;
     use crate::config::RelStoreConfig;
+    use crate::core::storage_thread::{TestHub, WalTarget};
+    use crate::engines::lsm::rate_limiter::DomainQuota;
     use crate::metrics::{MetricsConfig, MetricsStore};
     use serde_json::json;
     use std::path::Path;
@@ -1310,10 +1325,30 @@ mod tests {
         RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap()
     }
 
+    /// [`boot`]; with `on_hub` a fresh storage hub writes the WAL.
+    async fn boot_on(config: RelStoreConfig, on_hub: bool) -> (Arc<RelEngine>, Option<TestHub>) {
+        if !on_hub {
+            return (boot(config).await, None);
+        }
+        let hub = TestHub::start(&[(WalTarget::Rel, Path::new(&config.wal_path))]);
+        let metrics = MetricsStore::new(MetricsConfig::default());
+        let cross_engine = crate::engines::rel::CrossEngineResolver::disabled(Arc::clone(&metrics));
+        let wal = hub.wal(WalTarget::Rel);
+        let rel = RelEngine::bootstrap_with_wal(&config, DomainQuota::default(), wal, metrics, cross_engine).await.unwrap();
+        (rel, Some(hub))
+    }
+
     async fn make() -> (Arc<RelEngine>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let rel = boot(config_in(dir.path())).await;
         (rel, dir)
+    }
+
+    /// [`make`]; with `on_hub` a running storage hub writes the WAL.
+    async fn make_on(on_hub: bool) -> (Arc<RelEngine>, Option<TestHub>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (rel, hub) = boot_on(config_in(dir.path()), on_hub).await;
+        (rel, hub, dir)
     }
 
     async fn run(rel: &RelEngine, sql: &str, params: &[Value]) -> Result<ExecOutcome, RelStoreError> {
@@ -1374,391 +1409,497 @@ mod tests {
         rel.engine().scan_keys(&scan).await.unwrap().len()
     }
 
-    // 3. INSERT single row, then PK-point SELECT returns identical values.
-    #[tokio::test]
-    async fn test_insert_and_pk_select() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)").await;
-        let r = dml(&rel, "INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)", &[]).await;
-        assert_eq!(r.affected, 1);
-        assert_eq!(r.last_pk, Some(ScalarValue::Integer(1)));
+    // 3. INSERT single row, then PK-point SELECT returns identical values,
+    //    with the WAL local and on the storage hub.
+    #[test]
+    fn test_insert_and_pk_select() {
+        crate::core::engine_runtime::block_on(async {
+            for on_hub in [false, true] {
+                let (rel, _hub, _d) = make_on(on_hub).await;
+                ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)").await;
+                let r = dml(&rel, "INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)", &[]).await;
+                assert_eq!(r.affected, 1);
+                assert_eq!(r.last_pk, Some(ScalarValue::Integer(1)));
 
-        let s = sel(&rel, "SELECT * FROM t WHERE id = ?", &[json!(1)]).await;
-        assert_eq!(s.rows.len(), 1);
-        assert_eq!(
-            s.rows[0],
-            vec![
-                ScalarValue::Integer(1),
-                ScalarValue::Text("alice".into()),
-                ScalarValue::Integer(30)
-            ]
-        );
+                let s = sel(&rel, "SELECT * FROM t WHERE id = ?", &[json!(1)]).await;
+                assert_eq!(s.rows.len(), 1);
+                assert_eq!(
+                    s.rows[0],
+                    vec![
+                        ScalarValue::Integer(1),
+                        ScalarValue::Text("alice".into()),
+                        ScalarValue::Integer(30)
+                    ]
+                );
+            }
+        })
     }
 
-    // 4. Multi-row INSERT is atomic: one bad row (missing link) leaves none.
-    #[tokio::test]
-    async fn test_multi_row_insert_atomic() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO parent VALUES (1)").await;
-        ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
+    // 4. Multi-row INSERT is atomic: one bad row (missing link) leaves none,
+    //    with the WAL local and on the storage hub.
+    #[test]
+    fn test_multi_row_insert_atomic() {
+        crate::core::engine_runtime::block_on(async {
+            for on_hub in [false, true] {
+                let (rel, _hub, _d) = make_on(on_hub).await;
+                ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
+                ok(&rel, "INSERT INTO parent VALUES (1)").await;
+                ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
 
-        let e = err(&rel, "INSERT INTO child VALUES (1, 1), (2, 999)", &[]).await;
-        assert!(matches!(e, RelStoreError::LinkTargetMissing { .. }), "got: {e}");
-        assert_eq!(row_count(&rel, "child").await, 0, "no row of the statement survives");
+                let e = err(&rel, "INSERT INTO child VALUES (1, 1), (2, 999)", &[]).await;
+                assert!(matches!(e, RelStoreError::LinkTargetMissing { .. }), "got: {e}");
+                assert_eq!(row_count(&rel, "child").await, 0, "no row of the statement survives");
+            }
+        })
     }
 
     // 5. AUTOINCREMENT: sequential; explicit larger PK lifts the sequence;
-    //    DELETE never lowers it; the high-water survives a restart.
-    #[tokio::test]
-    async fn test_autoincrement_and_recovery() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(config_in(dir.path())).await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)").await;
-        assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (10)", &[]).await.last_pk, Some(ScalarValue::Integer(1)));
-        assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (20)", &[]).await.last_pk, Some(ScalarValue::Integer(2)));
-        ok(&rel, "INSERT INTO t (id, v) VALUES (100, 30)").await; // explicit lifts hw
-        assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (40)", &[]).await.last_pk, Some(ScalarValue::Integer(101)));
-        ok(&rel, "DELETE FROM t WHERE id = 101").await; // does not lower the sequence
-        assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (50)", &[]).await.last_pk, Some(ScalarValue::Integer(102)));
+    //    DELETE never lowers it; the high-water survives a restart -- with
+    //    the WAL local and on the storage hub.
+    #[test]
+    fn test_autoincrement_and_recovery() {
+        crate::core::engine_runtime::block_on(async {
+            for on_hub in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let (rel, hub) = boot_on(config_in(dir.path()), on_hub).await;
+                ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)").await;
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (10)", &[]).await.last_pk, Some(ScalarValue::Integer(1)));
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (20)", &[]).await.last_pk, Some(ScalarValue::Integer(2)));
+                ok(&rel, "INSERT INTO t (id, v) VALUES (100, 30)").await; // explicit lifts hw
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (40)", &[]).await.last_pk, Some(ScalarValue::Integer(101)));
+                ok(&rel, "DELETE FROM t WHERE id = 101").await; // does not lower the sequence
+                assert_eq!(dml(&rel, "INSERT INTO t (v) VALUES (50)", &[]).await.last_pk, Some(ScalarValue::Integer(102)));
 
-        rel.shutdown().await;
-        let rel = boot(config_in(dir.path())).await;
-        assert_eq!(
-            dml(&rel, "INSERT INTO t (v) VALUES (60)", &[]).await.last_pk,
-            Some(ScalarValue::Integer(103)),
-            "the high-water must survive the restart"
-        );
+                rel.shutdown().await;
+                drop(hub);
+                let (rel, _hub) = boot_on(config_in(dir.path()), on_hub).await;
+                assert_eq!(
+                    dml(&rel, "INSERT INTO t (v) VALUES (60)", &[]).await.last_pk,
+                    Some(ScalarValue::Integer(103)),
+                    "the high-water must survive the restart"
+                );
+            }
+        })
+    }
+
+    // Writes of an engine that stopped without a shutdown -- no flush, no
+    // truncate -- come back from the WAL the storage hub wrote.
+    #[test]
+    fn test_unflushed_writes_come_back_from_the_hub_written_wal() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (rel, hub) = boot_on(config_in(dir.path()), true).await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 'clé ✓')").await;
+            rel.engine().stop_background_tasks().await;
+            drop(rel);
+            drop(hub);
+            let wal_len = std::fs::metadata(dir.path().join("rel.wal")).unwrap().len();
+            assert!(wal_len > 0, "the writes are only in the WAL");
+
+            let (rel, _hub) = boot_on(config_in(dir.path()), true).await;
+            let s = sel(&rel, "SELECT name FROM t WHERE id = 1", &[]).await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Text("clé ✓".into())]]);
+            rel.shutdown().await;
+        })
     }
 
     // 6. DEFAULT: literal, CURRENT_TIMESTAMP (= insert time), DEFAULT NULL.
-    #[tokio::test]
-    async fn test_defaults() {
-        let (rel, _d) = make().await;
-        ok(
-            &rel,
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 7, \
+    #[test]
+    fn test_defaults() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(
+                &rel,
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 7, \
              ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, n TEXT DEFAULT NULL)",
-        )
-        .await;
-        let before = now_millis();
-        ok(&rel, "INSERT INTO t (id) VALUES (1)").await;
-        let after = now_millis();
+            )
+            .await;
+            let before = now_millis();
+            ok(&rel, "INSERT INTO t (id) VALUES (1)").await;
+            let after = now_millis();
 
-        let s = sel(&rel, "SELECT * FROM t WHERE id = 1", &[]).await;
-        let row = &s.rows[0];
-        assert_eq!(row[1], ScalarValue::Integer(7));
-        match row[2] {
-            ScalarValue::Timestamp(ms) => assert!(before <= ms && ms <= after, "insert-time ts"),
-            ref v => panic!("expected timestamp, got {v:?}"),
-        }
-        assert_eq!(row[3], ScalarValue::Null);
+            let s = sel(&rel, "SELECT * FROM t WHERE id = 1", &[]).await;
+            let row = &s.rows[0];
+            assert_eq!(row[1], ScalarValue::Integer(7));
+            match row[2] {
+                ScalarValue::Timestamp(ms) => assert!(before <= ms && ms <= after, "insert-time ts"),
+                ref v => panic!("expected timestamp, got {v:?}"),
+            }
+            assert_eq!(row[3], ScalarValue::Null);
+        })
     }
 
     // 7. NOT NULL: omitted or explicit NULL into a NOT NULL column → NotNull.
-    #[tokio::test]
-    async fn test_not_null() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)").await;
-        ok(&rel, "INSERT INTO t (id, name) VALUES (1, 'x')").await; // note → NULL ok
-        assert!(matches!(err(&rel, "INSERT INTO t (id, note) VALUES (2, 'y')", &[]).await, RelStoreError::NotNull { .. }));
-        assert!(matches!(err(&rel, "INSERT INTO t (id, name) VALUES (3, NULL)", &[]).await, RelStoreError::NotNull { .. }));
+    #[test]
+    fn test_not_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)").await;
+            ok(&rel, "INSERT INTO t (id, name) VALUES (1, 'x')").await; // note → NULL ok
+            assert!(matches!(err(&rel, "INSERT INTO t (id, note) VALUES (2, 'y')", &[]).await, RelStoreError::NotNull { .. }));
+            assert!(matches!(err(&rel, "INSERT INTO t (id, name) VALUES (3, NULL)", &[]).await, RelStoreError::NotNull { .. }));
+        })
     }
 
     // 8. Type check: REAL literal into INTEGER → TypeMismatch; INTEGER into
     //    REAL is widened.
-    #[tokio::test]
-    async fn test_type_check_and_widening() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER, r REAL)").await;
-        assert!(matches!(err(&rel, "INSERT INTO t (id, i) VALUES (1, 2.5)", &[]).await, RelStoreError::TypeMismatch { .. }));
-        ok(&rel, "INSERT INTO t (id, r) VALUES (2, 3)").await;
-        let s = sel(&rel, "SELECT r FROM t WHERE id = 2", &[]).await;
-        assert_eq!(s.rows[0][0], ScalarValue::Real(3.0));
+    #[test]
+    fn test_type_check_and_widening() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER, r REAL)").await;
+            assert!(matches!(err(&rel, "INSERT INTO t (id, i) VALUES (1, 2.5)", &[]).await, RelStoreError::TypeMismatch { .. }));
+            ok(&rel, "INSERT INTO t (id, r) VALUES (2, 3)").await;
+            let s = sel(&rel, "SELECT r FROM t WHERE id = 2", &[]).await;
+            assert_eq!(s.rows[0][0], ScalarValue::Real(3.0));
+        })
     }
 
     // 9. TIMESTAMP: ISO-8601 UTC string and millis number agree; non-UTC
     //    offset / garbage → TypeMismatch.
-    #[tokio::test]
-    async fn test_timestamp_input() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP)").await;
-        let ms = parse_iso8601_millis("2026-01-01T00:00:00Z").unwrap();
-        ok(&rel, "INSERT INTO t VALUES (1, '2026-01-01T00:00:00Z')").await;
-        ok(&rel, &format!("INSERT INTO t VALUES (2, {ms})")).await;
-        let a = sel(&rel, "SELECT ts FROM t WHERE id = 1", &[]).await;
-        let b = sel(&rel, "SELECT ts FROM t WHERE id = 2", &[]).await;
-        assert_eq!(a.rows[0][0], b.rows[0][0]);
-        assert_eq!(a.rows[0][0], ScalarValue::Timestamp(ms));
+    #[test]
+    fn test_timestamp_input() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP)").await;
+            let ms = parse_iso8601_millis("2026-01-01T00:00:00Z").unwrap();
+            ok(&rel, "INSERT INTO t VALUES (1, '2026-01-01T00:00:00Z')").await;
+            ok(&rel, &format!("INSERT INTO t VALUES (2, {ms})")).await;
+            let a = sel(&rel, "SELECT ts FROM t WHERE id = 1", &[]).await;
+            let b = sel(&rel, "SELECT ts FROM t WHERE id = 2", &[]).await;
+            assert_eq!(a.rows[0][0], b.rows[0][0]);
+            assert_eq!(a.rows[0][0], ScalarValue::Timestamp(ms));
 
-        assert!(matches!(err(&rel, "INSERT INTO t VALUES (3, '2026-01-01T00:00:00+02:00')", &[]).await, RelStoreError::TypeMismatch { .. }));
-        assert!(matches!(err(&rel, "INSERT INTO t VALUES (4, 'nonsense')", &[]).await, RelStoreError::TypeMismatch { .. }));
+            assert!(matches!(err(&rel, "INSERT INTO t VALUES (3, '2026-01-01T00:00:00+02:00')", &[]).await, RelStoreError::TypeMismatch { .. }));
+            assert!(matches!(err(&rel, "INSERT INTO t VALUES (4, 'nonsense')", &[]).await, RelStoreError::TypeMismatch { .. }));
+        })
     }
 
     // 10. PK collision: duplicate insert and within-statement duplicate → 409.
-    #[tokio::test]
-    async fn test_pk_collision() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO t VALUES (1)").await;
-        assert!(matches!(err(&rel, "INSERT INTO t VALUES (1)", &[]).await, RelStoreError::DuplicateKey { .. }));
-        assert!(matches!(err(&rel, "INSERT INTO t VALUES (2), (2)", &[]).await, RelStoreError::DuplicateKey { .. }));
+    #[test]
+    fn test_pk_collision() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO t VALUES (1)").await;
+            assert!(matches!(err(&rel, "INSERT INTO t VALUES (1)", &[]).await, RelStoreError::DuplicateKey { .. }));
+            assert!(matches!(err(&rel, "INSERT INTO t VALUES (2), (2)", &[]).await, RelStoreError::DuplicateKey { .. }));
+        })
     }
 
     // 11. UNIQUE: collision → 409; multiple NULLs in a UNIQUE column allowed.
-    #[tokio::test]
-    async fn test_unique_and_nulls() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, x INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5, 0)").await;
-        assert!(matches!(err(&rel, "INSERT INTO t VALUES (2, 5, 0)", &[]).await, RelStoreError::UniqueViolation { .. }));
-        ok(&rel, "INSERT INTO t VALUES (3, NULL, 0)").await;
-        ok(&rel, "INSERT INTO t VALUES (4, NULL, 0)").await; // multiple NULLs ok
+    #[test]
+    fn test_unique_and_nulls() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, x INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5, 0)").await;
+            assert!(matches!(err(&rel, "INSERT INTO t VALUES (2, 5, 0)", &[]).await, RelStoreError::UniqueViolation { .. }));
+            ok(&rel, "INSERT INTO t VALUES (3, NULL, 0)").await;
+            ok(&rel, "INSERT INTO t VALUES (4, NULL, 0)").await; // multiple NULLs ok
+        })
     }
 
     // 12. REFERENCES: present target ok; missing → 409; NULL link unchecked.
     //     (Cross-engine KVREF/JSONREF validation needs real target engines —
-    //     covered by the rel/012 tests in cross_engine.rs, not here.)
-    #[tokio::test]
-    async fn test_references() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO parent VALUES (1)").await;
-        ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
-        ok(&rel, "INSERT INTO child VALUES (1, 1)").await;
-        assert!(matches!(err(&rel, "INSERT INTO child VALUES (2, 999)", &[]).await, RelStoreError::LinkTargetMissing { .. }));
-        ok(&rel, "INSERT INTO child VALUES (3, NULL)").await; // NULL link unchecked
+    //     covered by the tests in cross_engine.rs, not here.)
+    #[test]
+    fn test_references() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO parent VALUES (1)").await;
+            ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
+            ok(&rel, "INSERT INTO child VALUES (1, 1)").await;
+            assert!(matches!(err(&rel, "INSERT INTO child VALUES (2, 999)", &[]).await, RelStoreError::LinkTargetMissing { .. }));
+            ok(&rel, "INSERT INTO child VALUES (3, NULL)").await; // NULL link unchecked
+        })
     }
 
     // 13. Size guards: TextTooLong, RowTooLarge, KeyTooLong (not an LSM-500).
-    #[tokio::test]
-    async fn test_size_guards() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_text_len: 10, ..config_in(dir.path()) }).await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
-        let long = "x".repeat(20);
-        assert!(matches!(err(&rel, &format!("INSERT INTO t VALUES (1, '{long}')"), &[]).await, RelStoreError::TextTooLong { .. }));
+    #[test]
+    fn test_size_guards() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
+            let long = json!("x".repeat(64 * 1024 + 1));
+            assert!(matches!(err(&rel, "INSERT INTO t VALUES (1, ?)", &[long]).await, RelStoreError::TextTooLong { max: 65_536, .. }));
 
-        let dir2 = tempfile::TempDir::new().unwrap();
-        let rel2 = boot(RelStoreConfig { max_row_size: 16, ..config_in(dir2.path()) }).await;
-        ok(&rel2, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
-        assert!(matches!(err(&rel2, "INSERT INTO t VALUES (1, 'hello')", &[]).await, RelStoreError::RowTooLarge { .. }));
+            let dir2 = tempfile::TempDir::new().unwrap();
+            let rel2 = boot(RelStoreConfig { max_row_size: 16, ..config_in(dir2.path()) }).await;
+            ok(&rel2, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
+            assert!(matches!(err(&rel2, "INSERT INTO t VALUES (1, 'hello')", &[]).await, RelStoreError::RowTooLarge { .. }));
 
-        let (rel3, _d3) = make().await;
-        ok(&rel3, "CREATE TABLE t (k TEXT PRIMARY KEY)").await;
-        let huge = "y".repeat(300); // ROW key > max_key_length (256)
-        assert!(matches!(err(&rel3, &format!("INSERT INTO t VALUES ('{huge}')"), &[]).await, RelStoreError::KeyTooLong { .. }));
+            let (rel3, _d3) = make().await;
+            ok(&rel3, "CREATE TABLE t (k TEXT PRIMARY KEY)").await;
+            let huge = "y".repeat(300); // ROW key > max_key_length (256)
+            assert!(matches!(err(&rel3, &format!("INSERT INTO t VALUES ('{huge}')"), &[]).await, RelStoreError::KeyTooLong { .. }));
+        })
+    }
+
+    // The storage value limit is the larger of
+    // 512 KiB and max_row_size, so rows above 512 KiB need only max_row_size
+    // and a tiny max_row_size leaves the catalog its room.
+    #[test]
+    fn test_value_limit_follows_max_row_size() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let rel = boot(RelStoreConfig { max_row_size: 1024 * 1024, ..config_in(dir.path()) }).await;
+            // 15 x 60 KiB = 900 KiB: each value stays under the fixed 64 KiB text
+            // limit, and parameters keep the statement under its fixed limit.
+            let columns: Vec<String> = (0..15).map(|i| format!("c{i} TEXT")).collect();
+            ok(&rel, &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, {})", columns.join(", "))).await;
+            let chunk = "x".repeat(60 * 1024);
+            let mut params = vec![json!(1)];
+            params.extend((0..15).map(|_| json!(chunk)));
+            let insert = format!("INSERT INTO t VALUES ({})", vec!["?"; 16].join(", "));
+            assert_eq!(dml(&rel, &insert, &params).await.affected, 1);
+            let s = sel(&rel, "SELECT c14 FROM t WHERE id = 1", &[]).await;
+            assert_eq!(s.rows[0][0], ScalarValue::Text(chunk));
+
+            let dir2 = tempfile::TempDir::new().unwrap();
+            let rel2 = boot(RelStoreConfig { max_row_size: 1024, ..config_in(dir2.path()) }).await;
+            // 40 columns with 48-character names: a catalog entry well over 1 KiB.
+            let columns: Vec<String> = (0..40).map(|i| format!("column_{i:02}_{} TEXT", "n".repeat(38))).collect();
+            ok(&rel2, &format!("CREATE TABLE wide (id INTEGER PRIMARY KEY, {})", columns.join(", "))).await;
+        })
     }
 
     // 14. UPDATE swaps the changed index entry; unchanged index survives.
-    #[tokio::test]
-    async fn test_update_index_swap() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_a ON t (a)").await;
-        ok(&rel, "CREATE INDEX idx_b ON t (b)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 10, 100)").await;
-        assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(10)).await, 1);
+    #[test]
+    fn test_update_index_swap() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_a ON t (a)").await;
+            ok(&rel, "CREATE INDEX idx_b ON t (b)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 10, 100)").await;
+            assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(10)).await, 1);
 
-        let r = dml(&rel, "UPDATE t SET a = 20 WHERE id = 1", &[]).await;
-        assert_eq!(r.affected, 1);
-        assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(10)).await, 0, "old gone");
-        assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(20)).await, 1, "new there");
-        assert_eq!(index_count(&rel, "t", "idx_b", ScalarValue::Integer(100)).await, 1, "unchanged survives");
+            let r = dml(&rel, "UPDATE t SET a = 20 WHERE id = 1", &[]).await;
+            assert_eq!(r.affected, 1);
+            assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(10)).await, 0, "old gone");
+            assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(20)).await, 1, "new there");
+            assert_eq!(index_count(&rel, "t", "idx_b", ScalarValue::Integer(100)).await, 1, "unchanged survives");
+        })
     }
 
     // 15. UPDATE on the PK column → PrimaryKeyImmutable.
-    #[tokio::test]
-    async fn test_pk_immutable() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 0)").await;
-        assert!(matches!(err(&rel, "UPDATE t SET id = 5 WHERE id = 1", &[]).await, RelStoreError::PrimaryKeyImmutable { .. }));
+    #[test]
+    fn test_pk_immutable() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 0)").await;
+            assert!(matches!(err(&rel, "UPDATE t SET id = 5 WHERE id = 1", &[]).await, RelStoreError::PrimaryKeyImmutable { .. }));
+        })
     }
 
     // 16. Full-scan UPDATE/DELETE: only matching rows; affected correct; no
-    //     match → 0.
-    #[tokio::test]
-    async fn test_full_scan_update_delete() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)").await;
+    //     match → 0 -- with the WAL local and on the storage hub.
+    #[test]
+    fn test_full_scan_update_delete() {
+        crate::core::engine_runtime::block_on(async {
+            for on_hub in [false, true] {
+                let (rel, _hub, _d) = make_on(on_hub).await;
+                ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)").await;
+                ok(&rel, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)").await;
 
-        assert_eq!(dml(&rel, "UPDATE t SET v = 0 WHERE grp = 1", &[]).await.affected, 2);
-        assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(0));
-        assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 3", &[]).await.rows[0][0], ScalarValue::Integer(30));
+                assert_eq!(dml(&rel, "UPDATE t SET v = 0 WHERE grp = 1", &[]).await.affected, 2);
+                assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(0));
+                assert_eq!(sel(&rel, "SELECT v FROM t WHERE id = 3", &[]).await.rows[0][0], ScalarValue::Integer(30));
 
-        assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 2", &[]).await.affected, 1);
-        assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 9", &[]).await.affected, 0);
-        assert_eq!(row_count(&rel, "t").await, 2);
+                assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 2", &[]).await.affected, 1);
+                assert_eq!(dml(&rel, "DELETE FROM t WHERE grp = 9", &[]).await.affected, 0);
+                assert_eq!(row_count(&rel, "t").await, 2);
+            }
+        })
     }
 
     // UPDATE -> UniqueViolation: a SET introduces a UNIQUE-column collision
-    // with another row (quality/007 prep work).
-    #[tokio::test]
-    async fn test_update_unique_violation() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 6)").await;
-        assert!(matches!(
-            err(&rel, "UPDATE t SET u = 5 WHERE id = 2", &[]).await,
-            RelStoreError::UniqueViolation { .. }
-        ));
+    // with another row.
+    #[test]
+    fn test_update_unique_violation() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 5), (2, 6)").await;
+            assert!(matches!(
+                err(&rel, "UPDATE t SET u = 5 WHERE id = 2", &[]).await,
+                RelStoreError::UniqueViolation { .. }
+            ));
+        })
     }
 
     // UPDATE -> LinkTargetMissing: the FK re-check runs over changed
-    // REFERENCES columns, not just at INSERT time (quality/007 prep work).
-    #[tokio::test]
-    async fn test_update_link_target_missing() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO parent VALUES (1)").await;
-        ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
-        ok(&rel, "INSERT INTO child VALUES (1, 1)").await;
-        assert!(matches!(
-            err(&rel, "UPDATE child SET pid = 999 WHERE id = 1", &[]).await,
-            RelStoreError::LinkTargetMissing { .. }
-        ));
+    // REFERENCES columns, not just at INSERT time.
+    #[test]
+    fn test_update_link_target_missing() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE parent (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO parent VALUES (1)").await;
+            ok(&rel, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent)").await;
+            ok(&rel, "INSERT INTO child VALUES (1, 1)").await;
+            assert!(matches!(
+                err(&rel, "UPDATE child SET pid = 999 WHERE id = 1", &[]).await,
+                RelStoreError::LinkTargetMissing { .. }
+            ));
+        })
     }
 
     // UPDATE -> TextTooLong / RowTooLarge: the same size guards as INSERT
-    // apply on the UPDATE path (quality/007 prep work).
-    #[tokio::test]
-    async fn test_update_size_guards() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_text_len: 10, ..config_in(dir.path()) }).await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
-        ok(&rel, "INSERT INTO t (id) VALUES (1)").await;
-        let long = "x".repeat(20);
-        assert!(matches!(
-            err(&rel, &format!("UPDATE t SET s = '{long}' WHERE id = 1"), &[]).await,
-            RelStoreError::TextTooLong { .. }
-        ));
+    // apply on the UPDATE path.
+    #[test]
+    fn test_update_size_guards() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
+            ok(&rel, "INSERT INTO t (id) VALUES (1)").await;
+            let long = json!("x".repeat(64 * 1024 + 1));
+            assert!(matches!(
+                err(&rel, "UPDATE t SET s = ? WHERE id = 1", &[long]).await,
+                RelStoreError::TextTooLong { max: 65_536, .. }
+            ));
 
-        // Row encoding is a fixed 32 bytes for this schema with `s` NULL, and
-        // 37 once `s` holds "hello" (rel/005 row.rs: 4B version+count + 2×2B
-        // col_dir + 1B bitmap padded to slots_start=16 + 2×8B slots, +5B var).
-        let dir2 = tempfile::TempDir::new().unwrap();
-        let rel2 = boot(RelStoreConfig { max_row_size: 34, ..config_in(dir2.path()) }).await;
-        ok(&rel2, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
-        ok(&rel2, "INSERT INTO t (id) VALUES (1)").await;
-        assert!(matches!(
-            err(&rel2, "UPDATE t SET s = 'hello' WHERE id = 1", &[]).await,
-            RelStoreError::RowTooLarge { .. }
-        ));
+            // Row encoding is a fixed 32 bytes for this schema with `s` NULL, and
+            // 37 once `s` holds "hello" (row.rs: 4B version+count + 2×2B
+            // col_dir + 1B bitmap padded to slots_start=16 + 2×8B slots, +5B var).
+            let dir2 = tempfile::TempDir::new().unwrap();
+            let rel2 = boot(RelStoreConfig { max_row_size: 34, ..config_in(dir2.path()) }).await;
+            ok(&rel2, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").await;
+            ok(&rel2, "INSERT INTO t (id) VALUES (1)").await;
+            assert!(matches!(
+                err(&rel2, "UPDATE t SET s = 'hello' WHERE id = 1", &[]).await,
+                RelStoreError::RowTooLarge { .. }
+            ));
+        })
     }
 
     // 17. DELETE removes the row and all its index entries.
-    #[tokio::test]
-    async fn test_delete_clears_indexes() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_a ON t (a)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 10)").await;
-        ok(&rel, "DELETE FROM t WHERE id = 1").await;
-        assert_eq!(row_count(&rel, "t").await, 0);
-        assert_eq!(all_index_entries(&rel).await, 0, "index entries gone too");
+    #[test]
+    fn test_delete_clears_indexes() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_a ON t (a)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 10)").await;
+            ok(&rel, "DELETE FROM t WHERE id = 1").await;
+            assert_eq!(row_count(&rel, "t").await, 0);
+            assert_eq!(all_index_entries(&rel).await, 0, "index entries gone too");
+        })
     }
 
     // 21. PK-point SELECT with projection: only chosen columns, in projection
     //     order; a missing row yields zero rows.
-    #[tokio::test]
-    async fn test_pk_select_projection() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 10, 'x')").await;
+    #[test]
+    fn test_pk_select_projection() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 10, 'x')").await;
 
-        let s = sel(&rel, "SELECT b, id FROM t WHERE id = 1", &[]).await;
-        assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["b", "id"]);
-        assert_eq!(s.rows[0], vec![ScalarValue::Text("x".into()), ScalarValue::Integer(1)]);
+            let s = sel(&rel, "SELECT b, id FROM t WHERE id = 1", &[]).await;
+            assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["b", "id"]);
+            assert_eq!(s.rows[0], vec![ScalarValue::Text("x".into()), ScalarValue::Integer(1)]);
 
-        assert!(sel(&rel, "SELECT * FROM t WHERE id = 2", &[]).await.rows.is_empty());
+            assert!(sel(&rel, "SELECT * FROM t WHERE id = 2", &[]).await.rows.is_empty());
+        })
     }
 
     // 23. CREATE INDEX backfills existing rows; a UNIQUE backfill over a
     //     duplicate → UniqueViolation and leaves no entry and no IndexMeta.
-    #[tokio::test]
-    async fn test_create_index_backfill() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10)").await;
-        ok(&rel, "CREATE INDEX idx_a ON t (a)").await;
-        assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(10)).await, 2);
-        assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(20)).await, 1);
-        assert_eq!(all_index_entries(&rel).await, 3);
+    #[test]
+    fn test_create_index_backfill() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10)").await;
+            ok(&rel, "CREATE INDEX idx_a ON t (a)").await;
+            assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(10)).await, 2);
+            assert_eq!(index_count(&rel, "t", "idx_a", ScalarValue::Integer(20)).await, 1);
+            assert_eq!(all_index_entries(&rel).await, 3);
 
-        let e = err(&rel, "CREATE UNIQUE INDEX uidx ON t (a)", &[]).await;
-        assert!(matches!(e, RelStoreError::UniqueViolation { .. }), "got: {e}");
-        assert_eq!(all_index_entries(&rel).await, 3, "no half index left behind");
-        let (_p, schema) = table_of(&rel, "t");
-        assert!(!schema.indexes.iter().any(|i| i.name == "uidx"), "IndexMeta not committed");
+            let e = err(&rel, "CREATE UNIQUE INDEX uidx ON t (a)", &[]).await;
+            assert!(matches!(e, RelStoreError::UniqueViolation { .. }), "got: {e}");
+            assert_eq!(all_index_entries(&rel).await, 3, "no half index left behind");
+            let (_p, schema) = table_of(&rel, "t");
+            assert!(!schema.indexes.iter().any(|i| i.name == "uidx"), "IndexMeta not committed");
+        })
     }
 
     // 24. DML target guards: missing table → 404; view → NotWritable (400);
     //     deleting domain → 410.
-    #[tokio::test]
-    async fn test_dml_target_guards() {
-        let (rel, _d) = make().await;
-        assert!(matches!(err(&rel, "INSERT INTO ghost VALUES (1)", &[]).await, RelStoreError::TableNotFound { .. }));
+    #[test]
+    fn test_dml_target_guards() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            assert!(matches!(err(&rel, "INSERT INTO ghost VALUES (1)", &[]).await, RelStoreError::TableNotFound { .. }));
 
-        rel.create_view("default", "v", "SELECT 1").await.unwrap();
-        assert!(matches!(err(&rel, "INSERT INTO v VALUES (1)", &[]).await, RelStoreError::NotWritable { .. }));
+            rel.create_view("default", "v", "SELECT 1").await.unwrap();
+            assert!(matches!(err(&rel, "INSERT INTO v VALUES (1)", &[]).await, RelStoreError::NotWritable { .. }));
 
-        rel.create_domain("d2").await.unwrap();
-        rel.execute("d2", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        rel.delete_domain("d2").await.unwrap();
-        let e = rel.execute("d2", "INSERT INTO t VALUES (1)", &[]).await.unwrap_err();
-        assert!(matches!(e, RelStoreError::DomainDeleting(_)), "got: {e}");
+            rel.create_domain("d2").await.unwrap();
+            rel.execute("d2", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            rel.delete_domain("d2").await.unwrap();
+            let e = rel.execute("d2", "INSERT INTO t VALUES (1)", &[]).await.unwrap_err();
+            assert!(matches!(e, RelStoreError::DomainDeleting(_)), "got: {e}");
+        })
     }
 
     // Three-valued WHERE end-to-end: a NULL column value drops the row.
-    #[tokio::test]
-    async fn test_where_unknown_drops_row() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
-        ok(&rel, "INSERT INTO t VALUES (1, NULL), (2, 5)").await;
-        // a = 5 is Unknown for row 1 (NULL), True for row 2.
-        assert_eq!(dml(&rel, "DELETE FROM t WHERE a = 5", &[]).await.affected, 1);
-        assert_eq!(row_count(&rel, "t").await, 1);
+    #[test]
+    fn test_where_unknown_drops_row() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").await;
+            ok(&rel, "INSERT INTO t VALUES (1, NULL), (2, 5)").await;
+            // a = 5 is Unknown for row 1 (NULL), True for row 2.
+            assert_eq!(dml(&rel, "DELETE FROM t WHERE a = 5", &[]).await.affected, 1);
+            assert_eq!(row_count(&rel, "t").await, 1);
+        })
     }
 
-    // 005-F1: a REAL literal/param/IN-element compared against an INTEGER
+    // A REAL literal/param/IN-element compared against an INTEGER
     // column keeps its own REAL type and widens at eval time instead of
-    // being lossily forced to INTEGER and rejected (spec §6: INTEGER<->REAL
+    // being lossily forced to INTEGER and rejected (INTEGER<->REAL
     // is the one implicit widening, and it applies to literals/params too,
     // not only column-vs-column comparisons).
-    #[tokio::test]
-    async fn test_where_real_literal_widens_against_integer_column() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER, hit INTEGER DEFAULT 0)").await;
-        ok(&rel, "INSERT INTO t (id, i) VALUES (1, 3)").await;
-        ok(&rel, "INSERT INTO t (id, i) VALUES (2, 4)").await;
+    #[test]
+    fn test_where_real_literal_widens_against_integer_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER, hit INTEGER DEFAULT 0)").await;
+            ok(&rel, "INSERT INTO t (id, i) VALUES (1, 3)").await;
+            ok(&rel, "INSERT INTO t (id, i) VALUES (2, 4)").await;
 
-        // Literal: only i=4 is > 3.5 (pre-fix: TypeMismatch/400 on the bind).
-        assert_eq!(dml(&rel, "UPDATE t SET hit = 1 WHERE i > 3.5", &[]).await.affected, 1);
-        assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(0));
-        assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 2", &[]).await.rows[0][0], ScalarValue::Integer(1));
+            // Literal: only i=4 is > 3.5 (pre-fix: TypeMismatch/400 on the bind).
+            assert_eq!(dml(&rel, "UPDATE t SET hit = 1 WHERE i > 3.5", &[]).await.affected, 1);
+            assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(0));
+            assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 2", &[]).await.rows[0][0], ScalarValue::Integer(1));
 
-        // A param arriving as a REAL number widens the same way.
-        ok(&rel, "UPDATE t SET hit = 0 WHERE id = 2").await;
-        assert_eq!(dml(&rel, "UPDATE t SET hit = 1 WHERE i > ?", &[json!(3.5)]).await.affected, 1);
-        assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 2", &[]).await.rows[0][0], ScalarValue::Integer(1));
+            // A param arriving as a REAL number widens the same way.
+            ok(&rel, "UPDATE t SET hit = 0 WHERE id = 2").await;
+            assert_eq!(dml(&rel, "UPDATE t SET hit = 1 WHERE i > ?", &[json!(3.5)]).await.affected, 1);
+            assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 2", &[]).await.rows[0][0], ScalarValue::Integer(1));
 
-        // IN-list with a REAL element against an INTEGER column: must bind
-        // (not 400), and the REAL element must widen-match an equal row.
-        assert_eq!(dml(&rel, "UPDATE t SET hit = 2 WHERE i IN (1, 2.5)", &[]).await.affected, 0);
-        assert_eq!(dml(&rel, "UPDATE t SET hit = 4 WHERE i IN (4.0, 99)", &[]).await.affected, 1);
-        assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 2", &[]).await.rows[0][0], ScalarValue::Integer(4));
+            // IN-list with a REAL element against an INTEGER column: must bind
+            // (not 400), and the REAL element must widen-match an equal row.
+            assert_eq!(dml(&rel, "UPDATE t SET hit = 2 WHERE i IN (1, 2.5)", &[]).await.affected, 0);
+            assert_eq!(dml(&rel, "UPDATE t SET hit = 4 WHERE i IN (4.0, 99)", &[]).await.affected, 1);
+            assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 2", &[]).await.rows[0][0], ScalarValue::Integer(4));
 
-        // `= 3.0` behaves sensibly: matches the Integer row i=3.
-        assert_eq!(dml(&rel, "UPDATE t SET hit = 3 WHERE i = 3.0", &[]).await.affected, 1);
-        assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(3));
+            // `= 3.0` behaves sensibly: matches the Integer row i=3.
+            assert_eq!(dml(&rel, "UPDATE t SET hit = 3 WHERE i = 3.0", &[]).await.affected, 1);
+            assert_eq!(sel(&rel, "SELECT hit FROM t WHERE id = 1", &[]).await.rows[0][0], ScalarValue::Integer(3));
 
-        // Genuine type errors on the same column stay 400.
-        assert!(matches!(err(&rel, "UPDATE t SET hit = 9 WHERE i > 'x'", &[]).await, RelStoreError::TypeMismatch { .. }));
+            // Genuine type errors on the same column stay 400.
+            assert!(matches!(err(&rel, "UPDATE t SET hit = 9 WHERE i > 'x'", &[]).await, RelStoreError::TypeMismatch { .. }));
+        })
     }
 
-    // ISO-8601 parser corner cases (spec §5).
+    // ISO-8601 parser corner cases.
     #[test]
     fn test_iso8601_parser() {
         assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00Z"), Some(0));
@@ -1772,7 +1913,7 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
     }
 
-    // 005-F2: an absurdly large ISO year must not overflow i64 (debug:
+    // An absurdly large ISO year must not overflow i64 (debug:
     // arithmetic-overflow panic ~ 500; release: wraps to a garbage
     // timestamp) — it must cleanly fail to parse instead. A normal date is
     // unaffected.
@@ -1782,13 +1923,15 @@ mod tests {
         assert!(parse_iso8601_millis("2026-07-15T00:00:00Z").is_some(), "a normal date still parses");
     }
 
-    #[tokio::test]
-    async fn test_insert_rejects_absurd_iso_year() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP)").await;
-        assert!(matches!(
-            err(&rel, "INSERT INTO t VALUES (1, '25000000000000001-01-01T00:00:00Z')", &[]).await,
-            RelStoreError::TypeMismatch { .. }
-        ));
+    #[test]
+    fn test_insert_rejects_absurd_iso_year() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP)").await;
+            assert!(matches!(
+                err(&rel, "INSERT INTO t VALUES (1, '25000000000000001-01-01T00:00:00Z')", &[]).await,
+                RelStoreError::TypeMismatch { .. }
+            ));
+        })
     }
 }

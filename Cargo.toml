@@ -1,6 +1,6 @@
 [package]
 name = "luradb"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Heiko Wein"]
 description = "LuraDB: A Linux-first, REST-native multi-model database"
@@ -11,55 +11,57 @@ readme = "README.md"
 exclude = ["/.github/**", "/docs/**"]
 
 [dependencies]
-# --- Core: Async Runtime & Web Interface ---
+# Core: async runtime & web interface
 # Axum is our "driver"
-axum = { version = "0.7", features = ["macros", "http2"] }
-# Direct access to the HTTP conn machinery for the UDS listener (perf/001);
+axum = { version = "0.8", features = ["macros", "http2"] }
+# Direct access to the HTTP conn machinery for the UDS listener;
 # both are already transitive dependencies of Axum.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
-# Native HTTPS listener (spec general/011); rustls itself comes as a re-export
+# Native HTTPS listener; rustls itself comes as a re-export
 # via tokio_rustls::rustls (default provider: aws-lc-rs).
 tokio-rustls = "0.26"
 # PEM cert/key loading; replaces the retired rustls-pemfile (RUSTSEC-2025-0134).
 rustls-pki-types = "1"
-utoipa = { version = "5", features = ["axum_extras"] }
-# 8.1.0 is the last utoipa-swagger-ui version before the axum-0.8 jump (9.x) — matches utoipa 5 + axum 0.7.
-utoipa-swagger-ui = { version = "8.1.0", features = ["axum"] }
+utoipa = { version = "6", features = ["axum_extras"] }
+# 10.0.2 is the first utoipa-swagger-ui version that builds with zip 9.
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 # Tokio as the base runtime (required by Axum)
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 # Middleware for tracing and CORS
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
 
-# --- The "Lura" Power: Linux I/O ---
-# The heart of it: asynchronous I/O via io_uring
-tokio-uring = "0.5"
-# Raw io_uring ring for the SQPOLL storage thread (perf/005).
+# Linux I/O
+# Raw io_uring ring for the SQPOLL storage thread.
 io-uring = "0.6"
+# Runtime of the engine thread; pinned, minor releases break.
+compio = { version = "=0.19.2", default-features = false, features = ["runtime", "io-uring", "time", "fs"] }
+# compio-driver's own io-uring version: the registered-buffer ops build its SQE type.
+io-uring-compio = { package = "io-uring", version = "0.7" }
 # For low-level flags like O_DIRECT and mmap (shared memory)
 libc = "0.2"
 # Efficient byte handling for zero-copy strategies
 bytes = "1.5"
 
-# --- Storage & Data Engines ---
+# Storage & data engines
 # Serde for everything (JSON engine & API responses)
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Memmap2 for shared-memory access
 memmap2 = "0.9"
 # rkyv for zero-copy deserialization. `little_endian` pins the archived byte
 # order across architectures; validation (bytecheck) is a default feature.
 rkyv = { version = "0.8.17", features = ["little_endian"] }
 
-# --- Concurrency & Safety ---
+# Concurrency & safety
 # DashMap for high-performance, lock-free maps in RAM
 dashmap = "5.5"
 crossbeam-skiplist = "0.1"
 crossbeam-utils = "0.8"
 parking_lot = "0.12"
 
-# --- Utils ---
+# Utils
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
@@ -73,21 +75,24 @@ futures = "0.3.31"
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
-# CSV/TSV parsing for the rel from-file import (spec rel/019).
+# CSV/TSV parsing for the rel from-file import.
 csv = "1"
+# Model Context Protocol server (Streamable HTTP) behind the MCP listener.
+rmcp = { version = "3.7", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]
 tempfile = "3.10"
-# Benchmark harness (perf/011).
-# "async" (not "async_tokio") so criterion doesn't pull its own separate tokio
-# dependency — we supply our own AsyncExecutor wrapping the project's runtime.
-criterion = { version = "0.5", features = ["html_reports", "async"] }
-# Client-side features for the IPC benchmark's hyper HTTP client (TCP + UDS).
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
+# h2c client for the per-connection ordering test.
+hyper = { version = "1", features = ["client", "http2"] }
 
-[[bench]]
-name = "ipc_bench"
-harness = false
+[lints.clippy]
+# House pattern: async trait methods are written as
+# `fn ... -> impl Future<Output = _> + Send` on purpose, without the async-trait crate.
+manual_async_fn = "allow"
+# Deliberately wide signatures (constructors, background-task wiring, staged
+# write paths) take their context as plain parameters; a parameter struct
+# would add churn without helping any call site.
+too_many_arguments = "allow"
 
 [package.metadata.deb]
 maintainer = "Heiko Wein <heiko.wein.hw@gmail.com>"
@@ -101,7 +106,7 @@ section = "database"
 priority = "optional"
 depends = "$auto, adduser"
 maintainer-scripts = "packaging/deb"
-systemd-units = { unit-scripts = "packaging", enable = true, start = true }
+systemd-units = { unit-scripts = "packaging", enable = true, start = false }
 assets = [
     ["target/release/luradb", "usr/bin/", "755"],
     ["packaging/luradb.toml", "etc/luradb/luradb.toml", "640"],

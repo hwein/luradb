@@ -8,7 +8,7 @@ pub mod key;
 pub mod memtable;
 pub mod engine;
 pub mod reader;
-pub mod levels;
+mod version;
 pub mod compaction;
 pub mod hlc;
 pub mod janitor;
@@ -20,11 +20,16 @@ pub mod ttl_sweeper;
 pub use block_cache::{BlockCache, BlockCacheKey, BlockCacheMetrics};
 pub use engine::LsmStorageEngine;
 pub use key::{InternalKey, Timestamp};
-pub use reader::{GetResult, LsmReader, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata, VersionedEntry};
-pub use levels::LevelManager;
+pub use reader::{
+    GetResult, LsmReader, RawEntry, RawScan, RawValue, RegistrySnapshot, Snapshot, SnapshotRegistry, ValueWithMetadata,
+    VersionedEntry,
+};
 pub use compaction::{CompactionConfig, CompactionJob};
 pub use janitor::{Janitor, JanitorConfig};
 pub use watcher::{OpType, WalEvent, WatchMessage, WATCH_TAG};
-pub use domain::{Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta, WatchStart};
+pub use domain::{
+    Domain, DomainPurger, DomainRegistry, DomainState, DomainStore, KeyMeta, KeyWrite, Precondition,
+    PreconditionFailed, PreconditionRequired, WatchStart,
+};
 pub use rate_limiter::{DomainQuota, RateLimiter, TokenBucket};
 pub use ttl_sweeper::TtlSweeper;

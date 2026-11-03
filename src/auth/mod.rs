@@ -3,9 +3,12 @@
 //! System keys layout:
 //!   __sys:auth:user:<name>          → serialised UserRecord (JSON)
 //!   __sys:auth:perm:<name>:<domain> → serialised DomainPermission (JSON)
+//!   __sys:oauth:client:<id>         → serialised OAuthClient (JSON), with a TTL until its first code
+//!   __sys:oauth:token:<hash>        → serialised TokenRecord (JSON), with a TTL
 
 pub mod handlers;
 pub mod middleware;
+pub mod oauth;
 
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::StorageEngine;
@@ -18,8 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-
-// ── Key helpers ───────────────────────────────────────────────────────────────
 
 pub(crate) const PREFIX_USER: &str = "__sys:auth:user:";
 pub(crate) const PREFIX_PERM: &str = "__sys:auth:perm:";
@@ -45,14 +46,12 @@ pub fn hash_api_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
-
-// ── Domain types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum UserRole {
@@ -60,8 +59,8 @@ pub enum UserRole {
     User,
 }
 
-/// Ordered Read < Write < Ddl (derive order = declaration order, spec
-/// rel/011 §3) — a higher grant covers the lower ones (`granted >= required`).
+/// Ordered Read < Write < Ddl (derive order = declaration order) — a
+/// higher grant covers the lower ones (`granted >= required`).
 /// Adding `Ddl` is wire-compatible: existing persisted `"Read"`/`"Write"`
 /// values deserialize unchanged, no migration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,30 +85,35 @@ pub struct DomainPermission {
     pub access: AccessLevel,
 }
 
-// ── AuthCache ─────────────────────────────────────────────────────────────────
-
 pub struct AuthCache {
     /// api_key_hash → UserRecord
     users: RwLock<HashMap<String, UserRecord>>,
     /// (username, domain_name) → AccessLevel
     permissions: RwLock<HashMap<(String, String), AccessLevel>>,
+    /// OAuth clients and tokens of the MCP listener.
+    oauth: RwLock<oauth::OAuthState>,
+    /// The resource access tokens must be for, with the MCP listener and
+    /// its OAuth on; without, the OAuth state is not even loaded.
+    oauth_resource: Option<String>,
     engine: Arc<LsmStorageEngine>,
 }
 
 impl AuthCache {
-    pub fn new(engine: Arc<LsmStorageEngine>) -> Self {
+    pub fn new(engine: Arc<LsmStorageEngine>, oauth_resource: Option<String>) -> Self {
         Self {
             users: RwLock::new(HashMap::new()),
             permissions: RwLock::new(HashMap::new()),
+            oauth: RwLock::new(oauth::OAuthState::default()),
+            oauth_resource,
             engine,
         }
     }
 
     /// Loads all auth data from the engine into the in-memory cache.
     ///
-    /// Rebuilds both maps rather than merging: a reload after a restore may
-    /// change a user's api_key_hash, and the superseded hash must stop
-    /// authenticating. Built off-lock, then swapped in — no empty-cache window.
+    /// Rebuilds both maps rather than merging, so a hash the store no longer
+    /// holds stops authenticating. Built off-lock, then swapped in — no
+    /// empty-cache window.
     pub async fn load_from_engine(&self) -> Result<()> {
         let user_keys = self
             .engine
@@ -139,8 +143,11 @@ impl AuthCache {
             }
         }
 
+        let new_oauth = if self.oauth_resource.is_some() { oauth::load(&self.engine).await? } else { oauth::OAuthState::default() };
+
         *self.users.write().await = new_users;
         *self.permissions.write().await = new_perms;
+        *self.oauth.write().await = new_oauth;
 
         Ok(())
     }
@@ -175,7 +182,7 @@ impl AuthCache {
             .map(|((u, d), a)| DomainPermission {
                 username: u.clone(),
                 domain: d.clone(),
-                access: a.clone(),
+                access: *a,
             })
             .collect()
     }
@@ -273,8 +280,6 @@ impl AuthCache {
     }
 }
 
-// ── Admin reconciliation ──────────────────────────────────────────────────────
-
 /// Reconciles the admin list from config with what is stored in the engine.
 ///
 /// 1. Upserts all admins from config (hash of key stored, plaintext discarded).
@@ -323,8 +328,6 @@ pub async fn reconcile_admins(
     Ok(())
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,8 +366,8 @@ mod tests {
             assert_eq!(serde_json::to_string(&level).unwrap(), wire);
             assert_eq!(serde_json::from_str::<AccessLevel>(wire).unwrap(), level);
         }
-        // Pre-rel/011 persisted entries only ever contain "Read"/"Write" —
-        // must deserialize unchanged (no migration, spec §3).
+        // Entries persisted before `Ddl` existed only contain "Read"/"Write" —
+        // must deserialize unchanged (no migration).
         assert_eq!(serde_json::from_str::<AccessLevel>("\"Write\"").unwrap(), AccessLevel::Write);
     }
 
@@ -384,74 +387,78 @@ mod tests {
             .await
             .unwrap(),
         );
-        (AuthCache::new(engine), dir)
+        (AuthCache::new(engine, None), dir)
     }
 
-    /// A restore overwrites a user record by name with a different
-    /// api_key_hash — reloading must drop the superseded hash, not keep it
-    /// alongside the new one.
-    #[tokio::test]
-    async fn load_from_engine_drops_superseded_key_hash() {
-        let (cache, _dir) = test_cache().await;
-        let hash_a = hash_api_key("lura_first");
-        let hash_b = hash_api_key("lura_second");
+    /// A user record overwritten by name with a different api_key_hash —
+    /// reloading must drop the superseded hash, not keep it alongside the
+    /// new one.
+    #[test]
+    fn load_from_engine_drops_superseded_key_hash() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            let hash_a = hash_api_key("lura_first");
+            let hash_b = hash_api_key("lura_second");
 
-        let mut record = UserRecord {
-            name: "alice".to_string(),
-            api_key_hash: hash_a.clone(),
-            role: UserRole::User,
-            created_at: 0,
-        };
-        let key = user_key(&record.name);
-        let value = serde_json::to_vec(&record).unwrap();
-        cache.engine.put(&key, &value).await.unwrap();
-        cache.load_from_engine().await.unwrap();
-        assert!(cache.get_user_by_key_hash(&hash_a).await.is_some());
+            let mut record = UserRecord {
+                name: "alice".to_string(),
+                api_key_hash: hash_a.clone(),
+                role: UserRole::User,
+                created_at: 0,
+            };
+            let key = user_key(&record.name);
+            let value = serde_json::to_vec(&record).unwrap();
+            cache.engine.put(&key, &value).await.unwrap();
+            cache.load_from_engine().await.unwrap();
+            assert!(cache.get_user_by_key_hash(&hash_a).await.is_some());
 
-        // Restore overwrites the same record by name with a new key hash.
-        record.api_key_hash = hash_b.clone();
-        let value = serde_json::to_vec(&record).unwrap();
-        cache.engine.put(&key, &value).await.unwrap();
-        cache.load_from_engine().await.unwrap();
+            // The same record, overwritten by name with a new key hash.
+            record.api_key_hash = hash_b.clone();
+            let value = serde_json::to_vec(&record).unwrap();
+            cache.engine.put(&key, &value).await.unwrap();
+            cache.load_from_engine().await.unwrap();
 
-        assert!(cache.get_user_by_key_hash(&hash_a).await.is_none());
-        assert!(cache.get_user_by_key_hash(&hash_b).await.is_some());
-        assert_eq!(cache.all_users().await.len(), 1);
+            assert!(cache.get_user_by_key_hash(&hash_a).await.is_none());
+            assert!(cache.get_user_by_key_hash(&hash_b).await.is_some());
+            assert_eq!(cache.all_users().await.len(), 1);
+        })
     }
 
     /// upsert_user must drop the previous hash for the same name, not add
     /// the new one alongside it.
-    #[tokio::test]
-    async fn upsert_user_replaces_previous_hash_for_same_name() {
-        let (cache, _dir) = test_cache().await;
-        let hash1 = hash_api_key("lura_first");
-        let hash2 = hash_api_key("lura_second");
+    #[test]
+    fn upsert_user_replaces_previous_hash_for_same_name() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            let hash1 = hash_api_key("lura_first");
+            let hash2 = hash_api_key("lura_second");
 
-        cache
-            .upsert_user(UserRecord {
-                name: "a".to_string(),
-                api_key_hash: hash1.clone(),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        cache
-            .upsert_user(UserRecord {
-                name: "a".to_string(),
-                api_key_hash: hash2.clone(),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
+            cache
+                .upsert_user(UserRecord {
+                    name: "a".to_string(),
+                    api_key_hash: hash1.clone(),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            cache
+                .upsert_user(UserRecord {
+                    name: "a".to_string(),
+                    api_key_hash: hash2.clone(),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
 
-        assert!(cache.get_user_by_key_hash(&hash1).await.is_none());
-        assert!(cache.get_user_by_key_hash(&hash2).await.is_some());
-        assert_eq!(
-            cache.get_user_by_name("a").await.unwrap().api_key_hash,
-            hash2
-        );
+            assert!(cache.get_user_by_key_hash(&hash1).await.is_none());
+            assert!(cache.get_user_by_key_hash(&hash2).await.is_some());
+            assert_eq!(
+                cache.get_user_by_name("a").await.unwrap().api_key_hash,
+                hash2
+            );
+        })
     }
 
     /// Rotation scenario: reconcile_admins is the documented way to rotate an
@@ -459,78 +466,82 @@ mod tests {
     /// leaves it (old hash from the persisted record), followed by
     /// reconcile_admins with a changed api_key for the same admin name, must
     /// invalidate the old hash — not leave both valid.
-    #[tokio::test]
-    async fn reconcile_admins_rotation_invalidates_old_hash() {
-        let (cache, _dir) = test_cache().await;
-        let old_key = "lura_old_admin_key";
-        let new_key = "lura_new_admin_key";
-        let old_hash = hash_api_key(old_key);
-        let new_hash = hash_api_key(new_key);
+    #[test]
+    fn reconcile_admins_rotation_invalidates_old_hash() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            let old_key = "lura_old_admin_key";
+            let new_key = "lura_new_admin_key";
+            let old_hash = hash_api_key(old_key);
+            let new_hash = hash_api_key(new_key);
 
-        let old_record = UserRecord {
-            name: "admin".to_string(),
-            api_key_hash: old_hash.clone(),
-            role: UserRole::Admin,
-            created_at: 0,
-        };
-        let key = user_key(&old_record.name);
-        let value = serde_json::to_vec(&old_record).unwrap();
-        cache.engine.put(&key, &value).await.unwrap();
-        cache.load_from_engine().await.unwrap();
-        assert!(cache.get_user_by_key_hash(&old_hash).await.is_some());
+            let old_record = UserRecord {
+                name: "admin".to_string(),
+                api_key_hash: old_hash.clone(),
+                role: UserRole::Admin,
+                created_at: 0,
+            };
+            let key = user_key(&old_record.name);
+            let value = serde_json::to_vec(&old_record).unwrap();
+            cache.engine.put(&key, &value).await.unwrap();
+            cache.load_from_engine().await.unwrap();
+            assert!(cache.get_user_by_key_hash(&old_hash).await.is_some());
 
-        let admins = vec![crate::config::AdminEntry {
-            name: "admin".to_string(),
-            api_key: new_key.to_string(),
-        }];
-        reconcile_admins(&cache, &admins, true).await.unwrap();
+            let admins = vec![crate::config::AdminEntry {
+                name: "admin".to_string(),
+                api_key: new_key.to_string(),
+            }];
+            reconcile_admins(&cache, &admins, true).await.unwrap();
 
-        assert!(cache.get_user_by_key_hash(&old_hash).await.is_none());
-        assert!(cache.get_user_by_key_hash(&new_hash).await.is_some());
-        assert_eq!(
-            cache.get_user_by_name("admin").await.unwrap().api_key_hash,
-            new_hash
-        );
+            assert!(cache.get_user_by_key_hash(&old_hash).await.is_none());
+            assert!(cache.get_user_by_key_hash(&new_hash).await.is_some());
+            assert_eq!(
+                cache.get_user_by_name("admin").await.unwrap().api_key_hash,
+                new_hash
+            );
+        })
     }
 
     /// Upserting one user must not disturb another user's cached hash.
-    #[tokio::test]
-    async fn upsert_user_leaves_other_users_untouched() {
-        let (cache, _dir) = test_cache().await;
-        let hash_a1 = hash_api_key("lura_a1");
-        let hash_a2 = hash_api_key("lura_a2");
-        let hash_b = hash_api_key("lura_b");
+    #[test]
+    fn upsert_user_leaves_other_users_untouched() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            let hash_a1 = hash_api_key("lura_a1");
+            let hash_a2 = hash_api_key("lura_a2");
+            let hash_b = hash_api_key("lura_b");
 
-        cache
-            .upsert_user(UserRecord {
-                name: "a".to_string(),
-                api_key_hash: hash_a1.clone(),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        cache
-            .upsert_user(UserRecord {
-                name: "b".to_string(),
-                api_key_hash: hash_b.clone(),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        cache
-            .upsert_user(UserRecord {
-                name: "a".to_string(),
-                api_key_hash: hash_a2.clone(),
-                role: UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
+            cache
+                .upsert_user(UserRecord {
+                    name: "a".to_string(),
+                    api_key_hash: hash_a1.clone(),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            cache
+                .upsert_user(UserRecord {
+                    name: "b".to_string(),
+                    api_key_hash: hash_b.clone(),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            cache
+                .upsert_user(UserRecord {
+                    name: "a".to_string(),
+                    api_key_hash: hash_a2.clone(),
+                    role: UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
 
-        assert!(cache.get_user_by_key_hash(&hash_a1).await.is_none());
-        assert!(cache.get_user_by_key_hash(&hash_a2).await.is_some());
-        assert!(cache.get_user_by_key_hash(&hash_b).await.is_some());
+            assert!(cache.get_user_by_key_hash(&hash_a1).await.is_none());
+            assert!(cache.get_user_by_key_hash(&hash_a2).await.is_some());
+            assert!(cache.get_user_by_key_hash(&hash_b).await.is_some());
+        })
     }
 }

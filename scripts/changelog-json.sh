@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Renders one keepachangelog section (spec dist/010) as machine-readable
+# Renders one keepachangelog section as machine-readable
 # JSON (schema v1) on stdout. Same argument convention as
 # changelog-extract.sh: a version, or the literal "unreleased".
 set -euo pipefail

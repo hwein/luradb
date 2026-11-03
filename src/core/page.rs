@@ -6,12 +6,8 @@
 
 use std::fmt;
 
-// --- Constants ---
-
 /// The size of a single page in bytes (e.g., 4KB).
 pub const PAGE_SIZE: usize = 4096;
-
-// --- PageId ---
 
 /// A unique identifier for a page in the database file.
 /// It corresponds to the page's offset in the file.
@@ -30,8 +26,6 @@ impl fmt::Display for PageId {
         write!(f, "PageId({})", self.0)
     }
 }
-
-// --- Page Header ---
 
 /// The header of a page, containing metadata.
 /// The `repr(C)` attribute is crucial to ensure a consistent memory layout,
@@ -53,8 +47,6 @@ impl PageHeader {
     /// The size of the `PageHeader` in bytes.
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
-
-// --- Page ---
 
 /// The size of the usable data area within a page.
 pub const PAGE_DATA_SIZE: usize = PAGE_SIZE - PageHeader::SIZE;

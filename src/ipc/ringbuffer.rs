@@ -1,4 +1,4 @@
-//! Double-mmap SPSC command ringbuffer (spec perf/008 §1–4, §6).
+//! Double-mmap SPSC command ringbuffer.
 //!
 //! The data segment is mapped twice, back-to-back, so a length-prefixed frame
 //! straddling the physical end wraps with no branch or modulo. Two monotonic
@@ -28,7 +28,7 @@ impl DoubleMmapRegion {
     /// open for the duration of this call.
     pub unsafe fn new(fd: RawFd, size: usize) -> Result<Self> {
         let page = page_size();
-        ensure!(size >= page && size % page == 0, "ring size {size} is not a multiple of page size {page}");
+        ensure!(size >= page && size.is_multiple_of(page), "ring size {size} is not a multiple of page size {page}");
         ensure!(size.is_power_of_two(), "ring size {size} is not a power of two");
 
         // Reserve 2*size of address space with no access — a placeholder we
@@ -140,7 +140,7 @@ pub enum RingSendError {
 }
 
 /// The framing written by an untrusted producer is inconsistent. The caller
-/// logs it and stops this ring (spec §6, orchestrator note 2).
+/// logs it and stops this ring.
 #[derive(Debug, Error, PartialEq)]
 #[error("ring corrupt: {0}")]
 pub struct RingCorrupt(&'static str);

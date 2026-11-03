@@ -6,8 +6,9 @@ use thiserror::Error;
 pub enum JsonStoreError {
     #[error("document '{key}' not found in domain '{domain}'")]
     DocumentNotFound { domain: String, key: String },
+    /// `etag` is the existing document's ETag value.
     #[error("document '{key}' already exists in domain '{domain}'")]
-    DocumentAlreadyExists { domain: String, key: String },
+    DocumentAlreadyExists { domain: String, key: String, etag: String },
     #[error("domain '{0}' not found")]
     DomainNotFound(String),
     #[error("domain '{0}' is being deleted")]
@@ -26,9 +27,12 @@ pub enum JsonStoreError {
     InvalidFilter(String),
     #[error("re-index already running for domain '{domain}' (task {task_id})")]
     ReindexInProgress { domain: String, task_id: String },
-    /// Both fields carry ETag values (`{generation:x}-{version}`, json/011).
-    #[error("version conflict: expected \"{expected}\", actual \"{actual}\"")]
-    VersionConflict { expected: String, actual: String },
+    /// Both fields carry ETag values (`{generation:x}-{version}`); `actual`
+    /// is `None` when the document does not exist.
+    #[error("version conflict: expected \"{expected}\", {}", describe_actual(.actual))]
+    VersionConflict { expected: String, actual: Option<String> },
+    #[error("428 Precondition Required: domain '{domain}' requires If-Match or If-None-Match: * on writes")]
+    PreconditionRequired { domain: String },
     #[error("invalid document key: {0}")]
     InvalidKey(String),
     #[error("field '{field}' is reserved (_key, _version, _content are store metadata)")]
@@ -39,4 +43,11 @@ pub enum JsonStoreError {
     SerializationError(#[from] serde_json::Error),
     #[error("storage error: {0}")]
     StorageError(#[from] anyhow::Error),
+}
+
+fn describe_actual(actual: &Option<String>) -> String {
+    match actual {
+        Some(etag) => format!("actual \"{etag}\""),
+        None => "document does not exist".to_string(),
+    }
 }

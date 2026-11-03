@@ -1,13 +1,13 @@
-//! DDL executor for table/index statements (spec rel/004 §8).
+//! DDL executor for table/index statements.
 //!
 //! A thin dispatch layer: each `DdlPlan` variant maps to exactly one
-//! `RelCatalog` primitive, which is the self-validating, atomic (`ddl_lock`
-//! + one `WriteBatch`) source of truth — see rel/003's `create_table` and
-//! the primitives this spec adds alongside it (`add_column`, `drop_column`,
+//! `RelCatalog` primitive, which is the self-validating, atomic
+//! (`ddl_lock` plus one `WriteBatch`) source of truth — see `create_table`
+//! and the primitives alongside it (`add_column`, `drop_column`,
 //! `rename_column`, `rename_table`, `create_index`, `drop_index`). `DROP
-//! TABLE` is the one exception: it reuses the existing generic
-//! `RelCatalog::get`/`drop_object` (rel/003) rather than a new primitive,
-//! remapping their generic `ObjectNotFound` to the more specific
+//! TABLE` is the one exception: it reuses the generic
+//! `RelCatalog::drop_object_checked` rather than a new primitive,
+//! remapping its generic `ObjectNotFound` to the more specific
 //! `TableNotFound` and rejecting a same-named view — `DROP TABLE` must not
 //! silently delete a view.
 
@@ -31,7 +31,7 @@ pub enum DdlOutcome {
     /// `renamed_from` is `Some(old_name)` only for `RENAME TABLE` (filled
     /// solely in the `DdlPlan::RenameTable` arm below) — the global event
     /// stream needs it to publish the vanished old name as its own
-    /// `table_dropped` event (spec general/018 §2.1); the three column-DDL
+    /// `table_dropped` event; the three column-DDL
     /// arms (`ADD`/`DROP`/`RENAME COLUMN`) leave it `None`.
     TableAltered { schema: TableSchema, renamed_from: Option<String> },
     TableDropped { name: String },
@@ -111,7 +111,7 @@ pub async fn execute(
         // dispatched directly by `RelEngine::execute` since it needs the LSM
         // engine and the per-table write lock, which this executor lacks.
         DdlPlan::CreateIndex { .. } => {
-            unreachable!("CREATE INDEX is dispatched to execute_create_index (spec rel/005 §13)")
+            unreachable!("CREATE INDEX is dispatched to execute_create_index")
         }
         DdlPlan::DropIndex { name } => {
             catalog.drop_index(domains, domain, &name).await?;
@@ -121,7 +121,7 @@ pub async fn execute(
     }
 }
 
-/// Executes `CREATE [UNIQUE] INDEX` with row backfill (spec rel/005 §13).
+/// Executes `CREATE [UNIQUE] INDEX` with row backfill.
 ///
 /// Order is load-bearing: (0) reserve the `index_id` and durably commit the id
 /// counter first; (1-3) under the table write lock + a snapshot, scan/decode
@@ -129,7 +129,6 @@ pub async fn execute(
 /// then write the `IDX:` entries in chunk batches; (4) make the `IndexMeta`
 /// catalog-visible **last**. A crash between 0 and 4 leaves only a burned id
 /// and orphan bytes (purger fodder), never a visible index missing entries.
-#[allow(clippy::too_many_arguments)]
 pub async fn execute_create_index(
     engine: &LsmStorageEngine,
     catalog: &RelCatalog,
@@ -150,7 +149,7 @@ pub async fn execute_create_index(
     let prefix = &dom.system_prefix;
     // Frees the reserved index id if the backfill below aborts (KeyTooLong /
     // UniqueViolation / scan error) so its orphaned IDX bytes get reaped by the
-    // rel/013 sweep; the success path disarms it after commit (rel/013 F1).
+    // orphan sweep; the success path disarms it after commit.
     let reservation = catalog.index_reservation_guard(prefix, meta.index_id);
     let col = schema
         .columns
@@ -161,7 +160,7 @@ pub async fn execute_create_index(
 
     let lock = locks.get(prefix, schema.table_id);
     let _guard = lock.lock().await;
-    let snapshot = engine.snapshot();
+    let snapshot = engine.snapshot().await;
     let snap = snapshot.snapshot();
 
     let mut idx_keys: Vec<Vec<u8>> = Vec::new();
@@ -203,7 +202,7 @@ pub async fn execute_create_index(
     Ok(DdlOutcome::IndexCreated(meta))
 }
 
-/// `DROP TABLE` on a missing name surfaces as `TableNotFound` (rel/003's
+/// `DROP TABLE` on a missing name surfaces as `TableNotFound` (the catalog's
 /// generic drop reports the neutral `ObjectNotFound`): from `DROP TABLE`'s
 /// point of view there is no table by that name. The "it's a view" case is
 /// caught atomically inside `drop_object_checked` (see the `DropTable` arm),
@@ -254,7 +253,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap());
+        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
         let metrics = MetricsStore::new(MetricsConfig::default());
         let limits = CatalogLimits {
             max_columns: 128,
@@ -266,131 +265,137 @@ mod tests {
     }
 
     // Dispatch smoke test: every DdlPlan variant reaches its catalog primitive.
-    #[tokio::test]
-    async fn test_dispatch_create_alter_index_drop() {
-        let (domains, catalog, metrics, _dir) = make_ctx().await;
+    #[test]
+    fn test_dispatch_create_alter_index_drop() {
+        crate::core::engine_runtime::block_on(async {
+            let (domains, catalog, metrics, _dir) = make_ctx().await;
 
-        let mut pk = ColumnInput::new("id", ColumnType::Integer);
-        pk.primary_key = true;
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DdlOutcome::TableCreated(_)));
+            let mut pk = ColumnInput::new("id", ColumnType::Integer);
+            pk.primary_key = true;
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, DdlOutcome::TableCreated(_)));
 
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::AddColumn {
-                table: "t".to_string(),
-                column: ColumnInput::new("age", ColumnType::Integer),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DdlOutcome::TableAltered { .. }));
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::AddColumn {
+                    table: "t".to_string(),
+                    column: ColumnInput::new("age", ColumnType::Integer),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, DdlOutcome::TableAltered { .. }));
 
-        // CREATE/DROP INDEX go through RelEngine::execute_create_index (backfill
-        // path) and RelEngine::execute; see mod.rs test 18 and dml.rs test 23.
+            // CREATE/DROP INDEX go through RelEngine::execute_create_index (backfill
+            // path) and RelEngine::execute; see mod.rs test 18 and dml.rs test 23.
 
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::DropTable { table: "t".to_string() },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DdlOutcome::TableDropped { .. }));
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::DropTable { table: "t".to_string() },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, DdlOutcome::TableDropped { .. }));
+        })
     }
 
     // DROP TABLE on a view name (or a missing name) -> TableNotFound, not a
     // silent view delete.
-    #[tokio::test]
-    async fn test_drop_table_rejects_view_and_missing() {
-        let (domains, catalog, metrics, _dir) = make_ctx().await;
-        catalog.create_view(&domains, "default", "v", "SELECT 1").await.unwrap();
+    #[test]
+    fn test_drop_table_rejects_view_and_missing() {
+        crate::core::engine_runtime::block_on(async {
+            let (domains, catalog, metrics, _dir) = make_ctx().await;
+            catalog.create_view(&domains, "default", "v", "SELECT 1").await.unwrap();
 
-        let err = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::DropTable { table: "v".to_string() },
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
-        // The view must still be there.
-        assert!(catalog.get(&domains, "default", "v").is_ok());
+            let err = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::DropTable { table: "v".to_string() },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            // The view must still be there.
+            assert!(catalog.get(&domains, "default", "v").is_ok());
 
-        let err = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::DropTable { table: "ghost".to_string() },
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+            let err = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::DropTable { table: "ghost".to_string() },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableNotFound { .. }), "got: {err}");
+        })
     }
 
-    // Spec general/018 §2.1: RENAME TABLE fills `renamed_from` with the old
+    // RENAME TABLE fills `renamed_from` with the old
     // name (needed to publish it as a `table_dropped` event); every other
     // ALTER TABLE variant leaves it `None`.
-    #[tokio::test]
-    async fn test_table_altered_renamed_from_only_set_by_rename_table() {
-        let (domains, catalog, metrics, _dir) = make_ctx().await;
-        let mut pk = ColumnInput::new("id", ColumnType::Integer);
-        pk.primary_key = true;
-        execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn test_table_altered_renamed_from_only_set_by_rename_table() {
+        crate::core::engine_runtime::block_on(async {
+            let (domains, catalog, metrics, _dir) = make_ctx().await;
+            let mut pk = ColumnInput::new("id", ColumnType::Integer);
+            pk.primary_key = true;
+            execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::CreateTable(TableInput { name: "t".to_string(), columns: vec![pk] }),
+            )
+            .await
+            .unwrap();
 
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::AddColumn { table: "t".to_string(), column: ColumnInput::new("age", ColumnType::Integer) },
-        )
-        .await
-        .unwrap();
-        match outcome {
-            DdlOutcome::TableAltered { renamed_from, .. } => assert_eq!(renamed_from, None, "ADD COLUMN must not set renamed_from"),
-            other => panic!("expected TableAltered, got {other:?}"),
-        }
-
-        let outcome = execute(
-            &catalog,
-            &domains,
-            &metrics,
-            "default",
-            DdlPlan::RenameTable { table: "t".to_string(), to: "t2".to_string() },
-        )
-        .await
-        .unwrap();
-        match outcome {
-            DdlOutcome::TableAltered { schema, renamed_from } => {
-                assert_eq!(renamed_from, Some("t".to_string()));
-                assert_eq!(schema.name, "t2");
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::AddColumn { table: "t".to_string(), column: ColumnInput::new("age", ColumnType::Integer) },
+            )
+            .await
+            .unwrap();
+            match outcome {
+                DdlOutcome::TableAltered { renamed_from, .. } => assert_eq!(renamed_from, None, "ADD COLUMN must not set renamed_from"),
+                other => panic!("expected TableAltered, got {other:?}"),
             }
-            other => panic!("expected TableAltered, got {other:?}"),
-        }
+
+            let outcome = execute(
+                &catalog,
+                &domains,
+                &metrics,
+                "default",
+                DdlPlan::RenameTable { table: "t".to_string(), to: "t2".to_string() },
+            )
+            .await
+            .unwrap();
+            match outcome {
+                DdlOutcome::TableAltered { schema, renamed_from } => {
+                    assert_eq!(renamed_from, Some("t".to_string()));
+                    assert_eq!(schema.name, "t2");
+                }
+                other => panic!("expected TableAltered, got {other:?}"),
+            }
+        })
     }
 }

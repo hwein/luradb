@@ -1,10 +1,12 @@
-//! Global lifecycle/DDL event stream (spec general/018).
+//! Global lifecycle/DDL event stream.
 //!
 //! GET /store-api/events → get_events (SSE stream, admin-only — see auth::middleware::extract_domain:
 //! a path with no `{domain}` segment is admin-only, no auth code needed here)
 
 use crate::api::AppState;
-use crate::core::events::{format_event_id, stream_epoch, GlobalEvent, ResetReason, Resume, EVENTS_TAG};
+use crate::core::events::{
+    format_event_id, stream_epoch, GlobalEvent, ResetReason, Resume, CONTROL_PLANE_SHARD, EVENTS_TAG,
+};
 use axum::{
     extract::{Query, State},
     http::HeaderMap,
@@ -13,23 +15,20 @@ use axum::{
 use futures::StreamExt;
 use serde::Deserialize;
 use std::convert::Infallible;
+use std::sync::Arc;
 use tokio::sync::broadcast;
-
-// ── Query param types ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct EventsParams {
     /// Fallback resume id for callers that cannot set headers (e.g. `curl`,
     /// or a `fetch`-based reader); the `Last-Event-ID` header wins when both
-    /// are present (spec general/018 §5, kv/024 §4.1).
+    /// are present.
     pub last_event_id: Option<String>,
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Resolves the effective `Last-Event-ID` (spec general/018 §5, kv/024
-/// §4.1): the header — what a native `EventSource`'s auto-reconnect sets —
-/// wins when both the header and `?last_event_id=` are present.
+/// Resolves the effective `Last-Event-ID`: the header — what a native
+/// `EventSource`'s auto-reconnect sets — wins when both the header and
+/// `?last_event_id=` are present.
 fn resolve_last_event_id(headers: &HeaderMap, params: &EventsParams) -> Option<String> {
     headers
         .get("last-event-id")
@@ -38,7 +37,7 @@ fn resolve_last_event_id(headers: &HeaderMap, params: &EventsParams) -> Option<S
         .or_else(|| params.last_event_id.clone())
 }
 
-/// A decided SSE item, before axum-specific rendering (kv/024 pattern: kept
+/// A decided SSE item, before axum-specific rendering (KV watch pattern: kept
 /// as plain data so the decision logic is unit-testable without depending on
 /// `Event`'s internal representation, which exposes no accessors of its own).
 struct SseItem {
@@ -56,7 +55,7 @@ fn global_event_item(event: &GlobalEvent, epoch: u64) -> SseItem {
     SseItem { id: format_event_id(EVENTS_TAG, epoch, event.seq), event: event.kind, data }
 }
 
-/// Builds `event: reset` (spec general/018 §5, kv/024 §5): `id:` carries the
+/// Builds `event: reset`: `id:` carries the
 /// current sequence head, so a reconnect right after a reset resumes
 /// gaplessly from there.
 fn reset_item(reason: ResetReason, epoch: u64, head: u64) -> SseItem {
@@ -71,12 +70,12 @@ enum EventStep {
     Stop,
 }
 
-/// Maps one raw bus receive to a live-stream outcome (spec general/018 §5,
-/// kv/024 §4.3/§6). Unlike kv/024's per-domain `watch_item`, there is no
-/// relay task and no domain/prefix filter here (§5: the handler subscribes to
-/// the bus directly) — so there is no `Gap` message, only the receiver's own
-/// `Lagged`, mapped straight to `reset(lagged)`, never a silent `continue`.
-/// Pure (no I/O), so every branch is unit-testable without real timing.
+/// Maps one raw bus receive to a live-stream outcome. Unlike the KV watch's
+/// per-domain `watch_item`, there is no relay task and no domain/prefix
+/// filter here (the handler subscribes to the bus directly) — so there is
+/// no `Gap` message, only the receiver's own `Lagged`, mapped straight to
+/// `reset(lagged)`, never a silent `continue`. Pure (no I/O), so every
+/// branch is unit-testable without real timing.
 fn global_live_item(
     msg: Result<GlobalEvent, broadcast::error::RecvError>,
     epoch: u64,
@@ -97,8 +96,6 @@ fn global_live_item(
     }
 }
 
-// ── Handler ───────────────────────────────────────────────────────────────────
-
 #[utoipa::path(
     get,
     path = "/store-api/events",
@@ -116,7 +113,7 @@ fn global_live_item(
 /// Opens a Server-Sent Events stream of global lifecycle/DDL events: domains created, deleted and
 /// purged across all three engines, plus relational table/view/index DDL and JSON index DDL.
 /// Admin-only — the path carries no domain segment, so the standard auth middleware rejects any
-/// non-admin caller (spec general/018 §3).
+/// non-admin caller.
 ///
 /// A `Last-Event-ID` (header or `?last_event_id=`, header wins) resumes gaplessly from an in-memory
 /// replay ring when possible; otherwise the server emits `event: reset` before continuing live. This
@@ -128,13 +125,14 @@ pub async fn get_events(
     headers: HeaderMap,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static> {
     let last_event_id = resolve_last_event_id(&headers, &params);
-    let epoch = stream_epoch();
+    let epoch = stream_epoch(CONTROL_PLANE_SHARD);
 
-    // subscribe() before the ring snapshot (spec §5, kv/024 §4.3): nothing
+    // subscribe() before the ring snapshot: nothing
     // published between them can be lost — only re-delivered, which the live
     // loop below discards via `suppress_upto`.
-    let rx = state.event_bus.subscribe();
-    let resume = state.event_bus.decide_resume(last_event_id.as_deref());
+    let bus = Arc::clone(state.control.event_bus());
+    let rx = bus.subscribe();
+    let resume = bus.decide_resume(last_event_id.as_deref());
 
     let (leading, suppress_upto): (Vec<Event>, Option<u64>) = match resume {
         Resume::Live => (Vec::new(), None),
@@ -146,7 +144,6 @@ pub async fn get_events(
     };
     let leading_stream = futures::stream::iter(leading.into_iter().map(Ok::<Event, Infallible>));
 
-    let bus = state.event_bus;
     let live_stream = futures::stream::unfold((rx, suppress_upto, bus), move |(mut rx, suppress_upto, bus)| async move {
         loop {
             let msg = rx.recv().await;
@@ -163,8 +160,6 @@ pub async fn get_events(
 
     Sse::new(leading_stream.chain(live_stream)).keep_alive(KeepAlive::default())
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -183,9 +178,9 @@ mod tests {
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
-    /// Full three-engine test app, admin key pre-provisioned, bus wired to
-    /// all three engines before the router is built (mirrors main.rs's
-    /// startup order, spec §1).
+    /// Full three-engine test app, admin key pre-provisioned, the control
+    /// plane attached to all three engines before the router is built
+    /// (mirrors the engine bootstrap's startup order in `server`).
     struct TestApp {
         app: axum::Router,
         admin_key: String,
@@ -244,11 +239,14 @@ mod tests {
         .unwrap();
 
         let bus = Arc::new(GlobalEventBus::new(channel_capacity, replay_buffer_size));
-        registry.attach_event_bus(Arc::clone(&bus)); // attach before anything runs, spec §1
-        json_engine.attach_event_bus(Arc::clone(&bus));
-        rel_engine.attach_event_bus(Arc::clone(&bus));
-
-        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
+        let (control, auth_cache) = crate::control::testing::start(
+            dir.path(),
+            Arc::clone(&registry),
+            Some(Arc::clone(&json_engine)),
+            Some(Arc::clone(&rel_engine)),
+            bus,
+        )
+        .await;
         let admin_key = "lura_test_events_admin".to_string();
         auth_cache
             .upsert_user(crate::auth::UserRecord {
@@ -270,12 +268,12 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: bus,
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,
         };
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         (TestApp { app, admin_key }, dir)
     }
 
@@ -306,7 +304,7 @@ mod tests {
         let mut buf = String::new();
         let mut fields = Vec::new();
         while fields.len() < min_fields {
-            let chunk = tokio::time::timeout(timeout, stream.next())
+            let chunk = compio::time::timeout(timeout, stream.next())
                 .await
                 .expect("timed out waiting for an SSE chunk")
                 .expect("stream ended before min_fields was reached")
@@ -324,315 +322,327 @@ mod tests {
     }
 
     // Test 6: no key -> 401; valid non-admin key -> 403; admin key -> 200
-    // with text/event-stream. Pins the path-shape admin-only property (§3).
-    #[tokio::test]
-    async fn test_auth_no_key_401_non_admin_403_admin_200() {
-        let (t, _dir) = make_app().await;
+    // with text/event-stream. Pins the path-shape admin-only property.
+    #[test]
+    fn test_auth_no_key_401_non_admin_403_admin_200() {
+        crate::core::engine_runtime::block_on(async {
+            let (t, _dir) = make_app().await;
 
-        let resp = t
-            .app
-            .clone()
-            .oneshot(Request::builder().method(Method::GET).uri("/store-api/events").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let resp = t
+                .app
+                .clone()
+                .oneshot(Request::builder().method(Method::GET).uri("/store-api/events").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // A non-admin key, created via the real API (no domain permission
-        // whatsoever — irrelevant here anyway, since this path has no domain
-        // segment for a permission to attach to).
-        let create_resp = t
-            .app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/store-api/auth/users")
-                    .header("authorization", format!("Bearer {}", t.admin_key))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"worker"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(create_resp.status(), StatusCode::CREATED);
-        let body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
-        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let worker_key = created["api_key"].as_str().unwrap().to_string();
+            // A non-admin key, created via the real API (no domain permission
+            // whatsoever — irrelevant here anyway, since this path has no domain
+            // segment for a permission to attach to).
+            let create_resp = t
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/store-api/auth/users")
+                        .header("authorization", format!("Bearer {}", t.admin_key))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"name":"worker"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(create_resp.status(), StatusCode::CREATED);
+            let body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+            let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let worker_key = created["api_key"].as_str().unwrap().to_string();
 
-        let resp = t
-            .app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/store-api/events")
-                    .header("authorization", format!("Bearer {worker_key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "non-admin, no domain segment -> 403");
+            let resp = t
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/store-api/events")
+                        .header("authorization", format!("Bearer {worker_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "non-admin, no domain segment -> 403");
 
-        let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
-            Some("text/event-stream")
-        );
+            let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("text/event-stream")
+            );
+        })
     }
 
     // Wire-format smoke test: a fresh connect gets no reset, and a real
     // lifecycle event carries id/event/data with the right shape.
-    #[tokio::test]
-    async fn test_sse_wire_format_has_id_and_no_reset_when_fresh() {
-        let (t, _dir) = make_app().await;
-        let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+    #[test]
+    fn test_sse_wire_format_has_id_and_no_reset_when_fresh() {
+        crate::core::engine_runtime::block_on(async {
+            let (t, _dir) = make_app().await;
+            let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        let create_resp = t
-            .app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/store-api/domains")
-                    .header("authorization", format!("Bearer {}", t.admin_key))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"sales"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(create_resp.status(), StatusCode::CREATED);
+            let create_resp = t
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/store-api/domains")
+                        .header("authorization", format!("Bearer {}", t.admin_key))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"name":"sales"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(create_resp.status(), StatusCode::CREATED);
 
-        let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
-        assert!(fields.iter().any(|(f, v)| f == "id" && v.starts_with("g-")), "got {fields:?}");
-        assert!(fields.contains(&("event".to_string(), "domain_created".to_string())), "got {fields:?}");
-        let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).expect("data field");
-        let json: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(json["engine"], "kv");
-        assert_eq!(json["type"], "domain_created");
-        assert_eq!(json["domain"], "sales");
-        assert!(json.get("object").is_none());
-        assert!(json["ts"].as_u64().unwrap() > 0);
-        assert!(
-            !fields.iter().any(|(f, v)| f == "event" && v == "reset"),
-            "a fresh connect must never reset, got {fields:?}"
-        );
+            let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
+            assert!(fields.iter().any(|(f, v)| f == "id" && v.starts_with("g-")), "got {fields:?}");
+            assert!(fields.contains(&("event".to_string(), "domain_created".to_string())), "got {fields:?}");
+            let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).expect("data field");
+            let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(json["engine"], "kv");
+            assert_eq!(json["type"], "domain_created");
+            assert_eq!(json["domain"], "sales");
+            assert!(json.get("object").is_none());
+            assert!(json["ts"].as_u64().unwrap() > 0);
+            assert!(
+                !fields.iter().any(|(f, v)| f == "event" && v == "reset"),
+                "a fresh connect must never reset, got {fields:?}"
+            );
+        })
     }
 
     // Test 7: disconnect after event 3, reconnect with its id -> exactly the
-    // following events, no reset. Connects (Resume::Live, spec §5) *before*
+    // following events, no reset. Connects (Resume::Live) *before*
     // the writes happen -- with no id presented, only events published after
     // the subscribe are ever seen, exactly as for a fresh domain watch.
-    #[tokio::test]
-    async fn test_resume_gapless_after_reconnect() {
-        let (t, _dir) = make_app().await;
-        let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
+    #[test]
+    fn test_resume_gapless_after_reconnect() {
+        crate::core::engine_runtime::block_on(async {
+            let (t, _dir) = make_app().await;
+            let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
 
-        for i in 0..5 {
-            let resp = t
+            for i in 0..5 {
+                let resp = t
+                    .app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/store-api/domains")
+                            .header("authorization", format!("Bearer {}", t.admin_key))
+                            .header("content-type", "application/json")
+                            .body(Body::from(format!(r#"{{"name":"d{i}"}}"#)))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+            }
+
+            let fields = read_sse_fields(resp.into_body(), 15, std::time::Duration::from_secs(5)).await; // 5 events x 3 fields
+            let third_id = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, (f, _))| f == "id")
+                .nth(2)
+                .map(|(_, (_, v))| v.clone())
+                .expect("third id");
+
+            let resumed = t
                 .app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method(Method::POST)
-                        .uri("/store-api/domains")
+                        .method(Method::GET)
+                        .uri(format!("/store-api/events?last_event_id={third_id}"))
                         .header("authorization", format!("Bearer {}", t.admin_key))
-                        .header("content-type", "application/json")
-                        .body(Body::from(format!(r#"{{"name":"d{i}"}}"#)))
+                        .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::CREATED);
-        }
-
-        let fields = read_sse_fields(resp.into_body(), 15, std::time::Duration::from_secs(5)).await; // 5 events x 3 fields
-        let third_id = fields
-            .iter()
-            .enumerate()
-            .filter(|(_, (f, _))| f == "id")
-            .nth(2)
-            .map(|(_, (_, v))| v.clone())
-            .expect("third id");
-
-        let resumed = t
-            .app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/store-api/events?last_event_id={third_id}"))
-                    .header("authorization", format!("Bearer {}", t.admin_key))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let resumed_fields = read_sse_fields(resumed.into_body(), 6, std::time::Duration::from_secs(5)).await; // events 4,5
-        let domains: Vec<String> = resumed_fields
-            .iter()
-            .filter(|(f, _)| f == "data")
-            .map(|(_, v)| serde_json::from_str::<serde_json::Value>(v).unwrap()["domain"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(domains, vec!["d3", "d4"], "expected exactly the events after the third, got {resumed_fields:?}");
-        assert!(
-            !resumed_fields.iter().any(|(f, v)| f == "event" && v == "reset"),
-            "a gapless resume must never reset, got {resumed_fields:?}"
-        );
+            let resumed_fields = read_sse_fields(resumed.into_body(), 6, std::time::Duration::from_secs(5)).await; // events 4,5
+            let domains: Vec<String> = resumed_fields
+                .iter()
+                .filter(|(f, _)| f == "data")
+                .map(|(_, v)| serde_json::from_str::<serde_json::Value>(v).unwrap()["domain"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(domains, vec!["d3", "d4"], "expected exactly the events after the third, got {resumed_fields:?}");
+            assert!(
+                !resumed_fields.iter().any(|(f, v)| f == "event" && v == "reset"),
+                "a gapless resume must never reset, got {resumed_fields:?}"
+            );
+        })
     }
 
     // Test 8: a tiny replay_buffer_size gets overrun -> reset(window_exceeded).
-    #[tokio::test]
-    async fn test_window_exceeded_resets() {
-        let (t, _dir) = make_app_with(256, 2).await;
-        for i in 0..5 {
+    #[test]
+    fn test_window_exceeded_resets() {
+        crate::core::engine_runtime::block_on(async {
+            let (t, _dir) = make_app_with(256, 2).await;
+            for i in 0..5 {
+                let resp = t
+                    .app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/store-api/domains")
+                            .header("authorization", format!("Bearer {}", t.admin_key))
+                            .header("content-type", "application/json")
+                            .body(Body::from(format!(r#"{{"name":"d{i}"}}"#)))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+            }
+
+            let epoch = stream_epoch(CONTROL_PLANE_SHARD);
+            let stale_id = format_event_id(EVENTS_TAG, epoch, 1);
             let resp = t
                 .app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method(Method::POST)
-                        .uri("/store-api/domains")
+                        .method(Method::GET)
+                        .uri(format!("/store-api/events?last_event_id={stale_id}"))
                         .header("authorization", format!("Bearer {}", t.admin_key))
-                        .header("content-type", "application/json")
-                        .body(Body::from(format!(r#"{{"name":"d{i}"}}"#)))
+                        .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::CREATED);
-        }
-
-        let epoch = stream_epoch();
-        let stale_id = format_event_id(EVENTS_TAG, epoch, 1);
-        let resp = t
-            .app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/store-api/events?last_event_id={stale_id}"))
-                    .header("authorization", format!("Bearer {}", t.admin_key))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
-        assert!(fields.contains(&("event".to_string(), "reset".to_string())), "got {fields:?}");
-        let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&data).unwrap()["reason"], "window_exceeded");
+            let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
+            assert!(fields.contains(&("event".to_string(), "reset".to_string())), "got {fields:?}");
+            let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&data).unwrap()["reason"], "window_exceeded");
+        })
     }
 
     // Test 9: a resume id from a different epoch -> reset(restart).
-    #[tokio::test]
-    async fn test_restart_epoch_mismatch_resets() {
-        let (t, _dir) = make_app().await;
-        let fake_epoch = stream_epoch().wrapping_add(1);
-        let id = format_event_id(EVENTS_TAG, fake_epoch, 1);
-        let resp = t
-            .app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/store-api/events?last_event_id={id}"))
-                    .header("authorization", format!("Bearer {}", t.admin_key))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
-        let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&data).unwrap()["reason"], "restart");
+    #[test]
+    fn test_restart_epoch_mismatch_resets() {
+        crate::core::engine_runtime::block_on(async {
+            let (t, _dir) = make_app().await;
+            let fake_epoch = stream_epoch(CONTROL_PLANE_SHARD).wrapping_add(1);
+            let id = format_event_id(EVENTS_TAG, fake_epoch, 1);
+            let resp = t
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/store-api/events?last_event_id={id}"))
+                        .header("authorization", format!("Bearer {}", t.admin_key))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
+            let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&data).unwrap()["reason"], "restart");
+        })
     }
 
     // Test 10: a tiny channel_capacity plus a burst makes a blocked consumer
     // lag -> reset(lagged), after which events flow again.
-    #[tokio::test]
-    async fn test_lagged_consumer_resets_then_events_flow_again() {
-        let (t, _dir) = make_app_with(2, 1024).await;
-        let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
-        let mut stream = resp.into_body().into_data_stream();
+    #[test]
+    fn test_lagged_consumer_resets_then_events_flow_again() {
+        crate::core::engine_runtime::block_on(async {
+            let (t, _dir) = make_app_with(2, 1024).await;
+            let resp = admin_req(&t.app, "/store-api/events", &t.admin_key).await;
+            let mut stream = resp.into_body().into_data_stream();
 
-        // Burst well past the tiny channel capacity without draining.
-        for i in 0..20 {
-            let r = t
+            // Burst well past the tiny channel capacity without draining.
+            for i in 0..20 {
+                let r = t
+                    .app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/store-api/domains")
+                            .header("authorization", format!("Bearer {}", t.admin_key))
+                            .header("content-type", "application/json")
+                            .body(Body::from(format!(r#"{{"name":"d{i}"}}"#)))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::CREATED);
+            }
+
+            let mut buf = String::new();
+            let mut fields = Vec::new();
+            let mut saw_reset = false;
+            let mut saw_event_after_reset = false;
+            while fields.len() < 200 {
+                let chunk = compio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("timed out waiting for an SSE chunk")
+                    .expect("stream ended early")
+                    .expect("chunk read error");
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                    buf = buf[pos + 1..].to_string();
+                    if let Some((field, value)) = parse_sse_field(&line) {
+                        if field == "event" && value == "reset" {
+                            saw_reset = true;
+                        } else if field == "event" && value != "reset" && saw_reset {
+                            saw_event_after_reset = true;
+                        }
+                        fields.push((field.to_string(), value.to_string()));
+                    }
+                }
+                if saw_event_after_reset {
+                    break;
+                }
+            }
+            assert!(saw_reset, "a burst past channel capacity must lag a non-draining consumer, got {fields:?}");
+            assert!(saw_event_after_reset, "events must keep flowing after a lagged reset, got {fields:?}");
+        })
+    }
+
+    // Test 11: a watch id (the KV watch's "w") at /store-api/events -> reset(unknown_id).
+    #[test]
+    fn test_foreign_watch_tag_is_unknown_id() {
+        crate::core::engine_runtime::block_on(async {
+            let (t, _dir) = make_app().await;
+            let id = format_event_id("w", stream_epoch(CONTROL_PLANE_SHARD), 1);
+            let resp = t
                 .app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method(Method::POST)
-                        .uri("/store-api/domains")
+                        .method(Method::GET)
+                        .uri(format!("/store-api/events?last_event_id={id}"))
                         .header("authorization", format!("Bearer {}", t.admin_key))
-                        .header("content-type", "application/json")
-                        .body(Body::from(format!(r#"{{"name":"d{i}"}}"#)))
+                        .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(r.status(), StatusCode::CREATED);
-        }
-
-        let mut buf = String::new();
-        let mut fields = Vec::new();
-        let mut saw_reset = false;
-        let mut saw_event_after_reset = false;
-        while fields.len() < 200 {
-            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
-                .await
-                .expect("timed out waiting for an SSE chunk")
-                .expect("stream ended early")
-                .expect("chunk read error");
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim_end_matches('\r').to_string();
-                buf = buf[pos + 1..].to_string();
-                if let Some((field, value)) = parse_sse_field(&line) {
-                    if field == "event" && value == "reset" {
-                        saw_reset = true;
-                    } else if field == "event" && value != "reset" && saw_reset {
-                        saw_event_after_reset = true;
-                    }
-                    fields.push((field.to_string(), value.to_string()));
-                }
-            }
-            if saw_event_after_reset {
-                break;
-            }
-        }
-        assert!(saw_reset, "a burst past channel capacity must lag a non-draining consumer, got {fields:?}");
-        assert!(saw_event_after_reset, "events must keep flowing after a lagged reset, got {fields:?}");
+            let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
+            let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&data).unwrap()["reason"], "unknown_id");
+        })
     }
-
-    // Test 11: a watch id (kv/024's "w") at /store-api/events -> reset(unknown_id).
-    #[tokio::test]
-    async fn test_foreign_watch_tag_is_unknown_id() {
-        let (t, _dir) = make_app().await;
-        let id = format_event_id("w", stream_epoch(), 1);
-        let resp = t
-            .app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/store-api/events?last_event_id={id}"))
-                    .header("authorization", format!("Bearer {}", t.admin_key))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let fields = read_sse_fields(resp.into_body(), 3, std::time::Duration::from_secs(5)).await;
-        let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&data).unwrap()["reason"], "unknown_id");
-    }
-
-    // ── Pure global_live_item branches (mirrors kv.rs's watch_item_tests) ────
 
     mod global_live_item_tests {
         use super::*;

@@ -4,6 +4,127 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-03
+
+### Added
+
+- New `[multicore].cpu_offload_threads` config key caps concurrent CPU offloads (`0` = auto).
+- The shipped luradb.toml documents every configuration key.
+- Startup rejects out-of-range values for the remaining configuration keys.
+- Startup warns about unknown configuration keys.
+- New `[multicore].frontend_workers` config key.
+- New `[multicore].reader_threads` and `[multicore].reader_queue_capacity` config keys.
+- **BREAKING** API: GET /store-api/metrics reports an `shm` block with snapshot publish, skip and kicked-client counters.
+- New `[shm].kick_blocking_client_after_secs` config key disconnects clients that keep the shared-memory snapshot from being updated (`0` = off).
+- **BREAKING** API: KV keys carry an `ETag`; PUT, DELETE and PATCH …/null accept `If-Match` (412 on mismatch or a missing key) and `If-None-Match: *` (create only, 412 if the key exists).
+- **BREAKING** API: domains created with `require_conditional_writes` reject unconditional single-key writes with 428.
+- New `[storage].system_dir` config key sets the directory of the system store, which holds users, API key hashes and permissions apart from domain data.
+- New `[storage].wal_queue_capacity` config key sets how many writes may wait for the storage thread.
+- New `[multicore].shard_queue_capacity` config key.
+- Multi-shard mode: `[multicore].shards` spreads domain writes over N engine threads; `0` keeps the count a data directory was written with, a new directory gets cores / 4 (at most 8).
+- `luradb --migrate-shards N` changes the shard count of a data directory offline.
+- The server refuses to start on a data directory that another LuraDB process uses.
+- **BREAKING** API: Backups include relational domains (schema, rows, AUTOINCREMENT state); scope accepts `rel` and `rel:<domain>`.
+- Built-in MCP server with OAuth sign-in (opt-in, `[mcp]` config section).
+- `storage.wal_max_size` caps the write-ahead log of each engine (default 256 MiB); the shards holding the oldest segment flush and the segment is dropped when the cap is reached, and a segment open for five minutes is closed the same way.
+- The server watches free disk space and its own memory use; below configurable thresholds it logs a warning, then refuses writes with 507 and `Retry-After` while reads continue, and resumes on its own; while memory is short it flushes its MemTables and returns free heap to the kernel. `GET /health` reports `degraded` with the states in a new `resources` field, and `GET /store-api/metrics` carries the numbers and paths in its `resources`.
+- `[resources]` settings `disk_free_warn`, `disk_free_block`, `disk_free_resume`, `memory_budget` take sizes and percentages.
+- `GET /health` reports `degraded` with a new `io` field (`failures`) while writes of a data file keep failing, and `GET /store-api/metrics` names the file in its `io` (`path`, `failures`).
+
+### Changed
+
+- **BREAKING** Format: the write-ahead log path is now a directory of segments; earlier versions cannot open a data directory written by this version.
+- The write-ahead log of each engine is kept in 64 MiB segment files under the configured path; full segments are deleted once their contents are in the data files, with no copying and no write pause.
+- **BREAKING** Format: the write-ahead log header now records the starting sequence number; data directories opened by this version cannot be opened by earlier versions.
+- Recovery after a crash replays only the write-ahead log entries that are not yet in the data files, streaming them with bounded memory.
+- Write-ahead log sequence numbers continue across restarts instead of starting at 1 after a clean shutdown.
+- `POST /oauth/register` on the MCP listener answers a missing or wrong Content-Type and malformed JSON with a JSON error (400, `invalid_client_metadata`).
+- With `mcp.public_url` under a path, the MCP listener also serves its OAuth metadata at the RFC 8414 and RFC 9728 well-known paths.
+- The MCP tool `kv_get` returns a value exactly as stored, as `{"value": …}` with `null` for a NULL key and base64url for non-UTF-8 values.
+- The MCP listener limits OAuth client registrations per client IP and to 10 redirect URIs of up to 2048 characters; registrations never used to sign in expire after a day.
+- The Debian package no longer starts the service on first install and prints where the config lives and how to start it; upgrades restart the service only if it is running.
+- Relational domains follow the `[rate_limit]` defaults instead of a fixed 1000 reads/500 writes per second.
+- Building the SHM snapshot of a domain larger than the data buffer no longer holds the whole domain in memory.
+- Long scans, queries and imports no longer block concurrent small requests; CPU-heavy parsing runs off the engine thread.
+- SHM snapshots are only rebuilt after data changes, cutting tail latency of small requests on idle servers.
+- The SHM command dispatcher wakes on a per-client doorbell passed with the registration reply instead of a 10 µs idle sleep loop.
+- Key listings, counts and queries no longer read unrelated recent writes.
+- Key listings, counts and queries no longer read unrelated on-disk entries.
+- The read path is thread-safe: readers see one consistent version of an engine's sources, and the block cache is striped.
+- HTTP and TLS termination run on a multi-threaded frontend runtime; the storage engines stay on a dedicated engine thread.
+- **BREAKING** API: requests on one connection are processed in order, HTTP/2 included — a connection serves one stream at a time, so clients need several connections for parallelism.
+- Short reads are served on the connection thread; long reads run on a multi-threaded reader pool and writes stay on the engine thread.
+- **BREAKING**: Requires Linux kernel 6.1 or newer; the server refuses to start on older kernels.
+- **BREAKING** API: a failed `If-Match` on a JSON document answers 412 instead of 409 (also for a missing document), every 412 carries the `ETag` of the current version, and `If-Match` may be combined with `If-None-Match: *` (If-Match is checked first).
+- Auth records move to the system store on first start (automatic, one-way; a downgrade needs a backup restore).
+- The storage thread always runs; all write-ahead logs (KV, JSON, relational, system) are written by it with shared group commit.
+- `io_engine.enabled` now only toggles registered buffers.
+- Write-ahead log format v2 (LSN-framed); existing logs are upgraded automatically on first start (one-way — a downgrade needs a backup restore).
+- The storage thread syncs the write-ahead logs of several engines in parallel instead of one after another.
+- **BREAKING** API: 503 Service Unavailable with Retry-After when the server is overloaded.
+- Data directory layout: engine files move into shard_0/ on first start (automatic, one-way).
+- **BREAKING** API: `GET /health` reports per-shard status and answers 503 with status `degraded` when a shard does not respond.
+- **BREAKING** API: `GET /store-api/metrics` answers 503 while a data shard is not running.
+- **BREAKING** API: Watch/event stream ids carry the shard in their epoch; existing cursors resync once after the upgrade.
+- `[io_engine].enabled` has no effect with more than one shard.
+- SHM snapshots are published from a consistent cut across all shards.
+- **BREAKING** API: Backup archives use manifest format v2 (shard count, LSN cut); v1 archives remain restorable.
+- The storage hub submits writes for other log files while a commit is still in flight.
+- **BREAKING** API: domain listings return the domains the API key has permissions on instead of 403 for non-admin keys; JSON and relational domain details are readable with a domain permission.
+- A failed fsync of the write-ahead log or value log stops the service with exit code 3 so the next start recovers from the write-ahead log; a start without room to recover exits with code 4, and the systemd unit does not restart after it.
+- **BREAKING** API: writes during a disk or memory shortage answer 507 Insufficient Storage instead of 500.
+- A start on a volume below the block threshold but with room for the recovery now starts with writes refused instead of exiting with code 4.
+- Compaction merges SSTables as a stream and writes one output file at a time; its memory no longer grows with the size of its inputs.
+- Compaction writes each data block as soon as it is complete; a compaction holds one block, the index and the Bloom filter of the file it is writing, not the whole output file.
+- A data write that fails with a read-only file system, or three times in a row with another I/O error (a full disk or quota does not count), stops the service with exit code 3 so the next start recovers from the write-ahead log; the flush retries once a second instead of ten times, logs its error once and then every 60th time, and leaves no temporary files behind; the start removes temporary files an earlier run left.
+- A failed sync of a newly written SSTable counts like a failed write: `/health` reports it as degraded, and the third in a row stops the service with exit code 3.
+
+### Removed
+
+- **BREAKING** API: GET /store-api/config no longer reports the removed configuration keys.
+- 72 undocumented tuning keys are no longer configurable; their former defaults are fixed.
+
+### Fixed
+
+- `luradb --migrate-shards` no longer warns about a missing old layout when the config names the data directory both absolutely and relatively.
+- Snapshot reads no longer miss an older version when the key is a prefix of another key or contains bytes above 0xFD.
+- Point reads no longer slow down with the size of newer SSTables that do not hold the key.
+- Reads no longer miss keys while a MemTable flush or a compaction installs its result.
+- Reads no longer fail or return stale values when vLog garbage collection overlaps a MemTable flush or a compaction.
+- `expand` no longer returns `null` for a reference whose target was compacted away during the query.
+- Disabling the JSON engine no longer permanently clears JSON references in relational tables.
+- Startup detects data paths that point to the same location through different spellings or symlinks.
+- `lsm.memtable_size_threshold` and the `memtable_size_bytes` metric now measure actual bytes instead of an entry-count estimate.
+- The TTL sweeper no longer discards a write that races with it on the same key.
+- A write that ties with a TTL sweeper tombstone is no longer lost once both are compacted.
+- Value log generations are no longer dropped while a memtable a failed flush handed back still points into them.
+- Shutdown saves the manifest before it truncates the WAL, so a flush whose manifest save failed is no longer lost.
+- Deleted or expired keys no longer reappear with an older value after compaction.
+- Small requests wait less behind concurrent key listings.
+- A failed write-ahead log append no longer leaves its partial bytes behind the log's end.
+- A write-ahead log whose cleanup after a failed append also failed is cut on the next start, before recovery reads it.
+- A write admitted just before its KV domain was deleted is refused with 410 instead of leaving an orphaned key.
+- Writes no longer stall for minutes while the SHM snapshot of a large domain is built.
+- A restore that replaces a KV or JSON domain no longer clears links to it from relational tables.
+- **BREAKING** API: `POST /store-api/domains` answers 400 instead of 500 for an invalid domain name.
+- **BREAKING** API: the schema of `default` in the table description now allows the scalar and null values the server returns.
+- `--migrate-shards` stops instead of skipping JSON or relational data it cannot find at the configured paths.
+- JSON search no longer returns documents that stopped matching the filter while the search ran; results and `total` come from one consistent state.
+- The value log, new data files and their directories are synced before the write-ahead log is cleared at start and stop and before compaction or value-log cleanup delete old files, so a power loss loses no confirmed write.
+- A flush syncs its directory before the manifest names the new data file, so a power loss right after a flush no longer prevents the next start.
+- Each write-ahead log is cut back once it reaches 64 MiB, so it no longer grows until the next restart.
+- Recovery reads the write-ahead log buffered and replays it many times faster.
+- Value log cleanup no longer counts values still in MemTables as dead, so it no longer copies the whole value log on pure inserts without freeing anything.
+
+### Security
+
+- Upgraded rustls to 0.23.45+, resolving RUSTSEC-2026-0285.
+- Upgraded rustls to 0.23.46+, resolving RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
+- Upgraded rustls-webpki to 0.103.16+, resolving RUSTSEC-2026-0382.
+- Upgraded tokio to 1.54.1, resolving RUSTSEC-2026-0386.
+- Reusing an OAuth authorization code on the MCP listener revokes the tokens issued from it; tokens issued for a previous `mcp.public_url` are no longer accepted.
+- The MCP sign-in page counts failed sign-ins per IPv6 /64 prefix instead of per address.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added
@@ -124,7 +245,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/hwein/luradb/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hwein/luradb/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hwein/luradb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hwein/luradb/compare/v0.2.1...v0.3.0

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "LuraDB API",
-    "description": "REST-native multi-model database — KeyValue and JSON engines. `version` is the API contract version (see API_VERSION), independent of the server version; the latter is in the `x-luradb-server-version` extension. Runtime check: GET /version.",
+    "description": "REST-native multi-model database — KeyValue and JSON engines. `version` is the API contract version (see API_VERSION), independent of the server version; the latter is in the `x-luradb-server-version` extension. Runtime check: GET /version. Under overload, any endpoint may answer 503 Service Unavailable (text/plain) with `Retry-After: 1`; the request was not processed and may be retried. While disk space or memory runs short, writes answer 507 Insufficient Storage (text/plain) with `Retry-After: 5` and are not applied; reads go on.",
     "contact": {
       "name": "Heiko Wein"
     },
@@ -10,8 +10,8 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.6.1",
-    "x-luradb-server-version": "0.4.0"
+    "version": "0.14.2",
+    "x-luradb-server-version": "0.5.0"
   },
   "paths": {
     "/health": {
@@ -20,11 +20,28 @@
           "Metrics"
         ],
         "summary": "`GET /health` — public heartbeat endpoint.",
-        "description": "Returns a JSON snapshot of system vitals. No authentication required.",
+        "description": "Returns a JSON snapshot of system vitals, summed over the data shards, in\n`shards` the status of each data shard: `ok` once it answered, `timeout`\nwhen it did not within 250 ms, in `resources` the state of disk space\n(the worst of all data volumes) and of the server's own memory, and in\n`io`, while writes of a data file fail, their failures in a row. It names\nno path and gives no size; `GET /store-api/metrics` does. No\nauthentication required.",
         "operationId": "health",
         "responses": {
           "200": {
-            "description": "System is healthy"
+            "description": "Every data shard answered. Status `ok`, or `degraded` while disk space or memory runs short: below a warn threshold (`warning`), or below a block threshold (`blocked`), while writes answer 507 and reads go on; `resources` gives the state of the disk space and of the memory, without volume, path or number. Also `degraded` while writes of a data file fail; `io` gives their failures in a row, without the file (the server stops at the third, or at the first on a read-only file system)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatMetrics"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A data shard did not answer within 250 ms; the full report with status `degraded`; its `shards` list names the shard with status `timeout`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatMetrics"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -38,7 +55,7 @@
           "Auth"
         ],
         "summary": "Returns all created users (admins and regular users) with their domain\npermission matrix. API keys are not included.",
-        "description": "For `role == \"Admin\"`, `permissions` is meaningless for access control:\nadmins have unconditional access regardless of its contents (kv/012). It\nis usually empty for an admin but not guaranteed to be — e.g. a user\npromoted to admin via `luradb.toml` keeps any permissions set before the\npromotion. Never read an empty array as \"no access\" or a non-empty one as\na restriction on an Admin row.\n\nThe list reflects the permission table as stored — it is not cross-checked\nagainst existing domains, so an entry for a since-deleted (or not-yet-created)\ndomain is shown unchanged.",
+        "description": "For `role == \"Admin\"`, `permissions` is meaningless for access control:\nadmins have unconditional access regardless of its contents. It\nis usually empty for an admin but not guaranteed to be — e.g. a user\npromoted to admin via `luradb.toml` keeps any permissions set before the\npromotion. Never read an empty array as \"no access\" or a non-empty one as\na restriction on an Admin row.\n\nThe list reflects the permission table as stored — it is not cross-checked\nagainst existing domains, so an entry for a since-deleted (or not-yet-created)\ndomain is shown unchanged.",
         "operationId": "list_users",
         "responses": {
           "200": {
@@ -306,7 +323,7 @@
           "Auth"
         ],
         "summary": "Returns the caller's own identity. Unlike every other endpoint under this\ntag, reachable by any authenticated caller — not admin-only (the\n`auth_layer` middleware whitelists this path, see `middleware.rs`).",
-        "description": "Checked in order: `auth.enabled = false` → `Disabled`; a `TrustedPeer`\n(UDS peer authenticated by the kernel, spec perf/001) → `TrustedPeer`;\notherwise the Bearer key is resolved to its `UserRecord` → `Admin`/`User`.\nA `401` past the `auth_layer` middleware (which already validates the key)\ncan only mean a middleware bug — fail-closed, analogous to `enforce_sql_level`.",
+        "description": "Checked in order: `auth.enabled = false` → `Disabled`; a `TrustedPeer`\n(UDS peer authenticated by the kernel) → `TrustedPeer`;\notherwise the Bearer key is resolved to its `UserRecord` → `Admin`/`User`.\nA `401` past the `auth_layer` middleware (which already validates the key)\ncan only mean a middleware bug — fail-closed, analogous to `enforce_sql_level`.",
         "operationId": "whoami",
         "responses": {
           "200": {
@@ -366,7 +383,7 @@
         "tags": [
           "Backup"
         ],
-        "summary": "Starts an on-demand backup job (spec general/006 scope syntax for `scope`).",
+        "summary": "Starts an on-demand backup job.",
         "operationId": "create_backup",
         "requestBody": {
           "content": {
@@ -420,7 +437,24 @@
             }
           },
           "503": {
-            "description": "Backup is disabled, or scope requires the JSON engine, which is disabled",
+            "description": "Backup is disabled, or scope requires the JSON or relational engine, which is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -473,6 +507,23 @@
           },
           "503": {
             "description": "Backup is disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -614,7 +665,8 @@
         "tags": [
           "Backup"
         ],
-        "summary": "Streams the archive (`ServeFile`/tower-http `fs`) with HTTP Range support\nfor resumable downloads (spec general/006).",
+        "summary": "Streams the archive with HTTP Range support for resumable downloads.",
+        "description": "The archive is NDJSON. Its first line is the manifest, format version 2:\n`format_version`, `id`, `created_at`, `luradb_version`, `scope`,\n`include_auth`, `encoding`, `schedule`, and\n- `shards`: data shards of the server that wrote it. Informational only:\n  a restore places every domain by the shard count of the server it runs\n  on, so an archive restores into any shard count.\n- `lsn_cut`: `{kv, json, rel}`, per engine a write-ahead-log position that\n  every write in the archive is at or below (a lower bound of the cut);\n  0 for an engine outside the scope. Positions keep growing across\n  restarts, so they compare across runs of the server.\n- `kv_snapshot_ts`, `json_snapshot_ts`, `rel_snapshot_ts`: per engine,\n  the newest read-snapshot stamp among the data shards; 0 for an engine\n  outside the scope.\n\nAll shards of one engine are read at one consistent cut: an archive that\nholds a write holds every write confirmed before it. The relational cut\nis taken before the KV and JSON cuts. Domain lines carry their domain's\nname; sections follow in the order KV, JSON, relational, auth; the last\nline is the checksum.\n\nA relational domain is a `rel-domain` line (`name`, `created_at`), then\nits tables by creation, its views, and per table its rows and\nAUTOINCREMENT state:\n- `rel-table`: `domain`, `name`, `columns` (each `name`, `type` as SQL\n  type name, `nullable`, `primary_key`, `autoincrement`, `unique`, an\n  optional `default` of `{\"kind\": \"null\"}`, `{\"kind\":\n  \"current_timestamp\"}` or `{\"kind\": \"literal\", \"value\": …}`, an optional\n  `references` naming the target table) and `indexes` (`name`, `column`,\n  `unique`; every index under its stored name).\n- `rel-view`: `domain`, `name`, `sql`, the stored SELECT text.\n- `rel-row`: `domain`, `table`, `row`, every column by name, NULL as\n  `null`, KVREF/JSONREF links as stored.\n- `rel-seq`: `domain`, `table`, `hw`: the next insert without a key gets\n  `hw + 1`.\n\nValues are JSON numbers (INTEGER, REAL), booleans, strings (TEXT, KVREF,\nJSONREF) and, for TIMESTAMP, integer milliseconds since the Unix epoch.\nArchives of format version 1, which lack `shards` and `lsn_cut`, and\narchives without relational lines remain restorable.",
         "operationId": "download_backup",
         "parameters": [
           {
@@ -761,6 +813,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -771,7 +840,7 @@
           "Metrics"
         ],
         "summary": "`GET /config` — effective configuration of the running process. Admin only.",
-        "description": "The path carries no `{domain}` segment, so `extract_domain` returns `None`\nand the auth layer's None-branch requires an admin role (spec\ngeneral/022). The admin API key never appears in the body — redaction\nhappens at the field level (`AdminEntry.api_key`'s `#[serde(skip_serializing)]`\nin config.rs), not in this handler.",
+        "description": "The path carries no `{domain}` segment, so `extract_domain` returns `None`\nand the auth layer's None-branch requires an admin role. The admin API\nkey never appears in the body — redaction happens at the field level\n(`AdminEntry.api_key`'s `#[serde(skip_serializing)]` in config.rs), not\nin this handler.",
         "operationId": "get_config",
         "responses": {
           "200": {
@@ -817,11 +886,11 @@
         "tags": [
           "Domains"
         ],
-        "summary": "Returns all active domains with their names and creation timestamps.",
+        "summary": "Returns the active domains with their names and creation timestamps.\nAdmin keys see all of them; any other key sees only the domains it has a\npermission on (an empty list without any).",
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "List of active domains",
+            "description": "List of the active domains the key may access",
             "content": {
               "application/json": {
                 "schema": {
@@ -839,7 +908,7 @@
         "tags": [
           "Domains"
         ],
-        "summary": "Creates a new logical domain (isolated KV namespace).\nDomain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.",
+        "summary": "Creates a new logical domain (isolated KV namespace).\nDomain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.\nWith `require_conditional_writes`, single-key writes over REST (PUT, DELETE, PATCH …/null) must\ncarry `If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.",
         "operationId": "create_domain",
         "requestBody": {
           "content": {
@@ -874,6 +943,23 @@
           },
           "409": {
             "description": "Domain already exists",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -956,6 +1042,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -965,7 +1068,7 @@
         "tags": [
           "Events"
         ],
-        "summary": "Opens a Server-Sent Events stream of global lifecycle/DDL events: domains created, deleted and\npurged across all three engines, plus relational table/view/index DDL and JSON index DDL.\nAdmin-only — the path carries no domain segment, so the standard auth middleware rejects any\nnon-admin caller (spec general/018 §3).",
+        "summary": "Opens a Server-Sent Events stream of global lifecycle/DDL events: domains created, deleted and\npurged across all three engines, plus relational table/view/index DDL and JSON index DDL.\nAdmin-only — the path carries no domain segment, so the standard auth middleware rejects any\nnon-admin caller.",
         "description": "A `Last-Event-ID` (header or `?last_event_id=`, header wins) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. This\nstream has its own tag (`g`) and sequence, entirely independent of `GET /store-api/kv/{domain}/watch`'s\n(`w`) — an id from one stream is `unknown_id` at the other.",
         "operationId": "get_events",
         "parameters": [
@@ -1026,11 +1129,11 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Returns all active JSON domains.",
+        "summary": "Returns the active JSON domains. Admin keys see all of them; any other key\nsees only the JSON domains it has a permission on (an empty list without any).",
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "List of active JSON domains",
+            "description": "List of the active JSON domains the key may access",
             "content": {
               "application/json": {
                 "schema": {
@@ -1058,7 +1161,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Creates a new JSON domain (isolated document namespace, separate from KV domains).",
+        "summary": "Creates a new JSON domain (isolated document namespace, separate from KV domains).\nWith `require_conditional_writes`, single-document writes over REST (PUT, DELETE) must carry\n`If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.",
         "operationId": "create_domain",
         "requestBody": {
           "content": {
@@ -1110,6 +1213,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1119,7 +1239,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Returns metadata for a single JSON domain, including its document count.\nDomains in `deleting` state answer with 410 Gone.",
+        "summary": "Returns metadata for a single JSON domain, including its document count.\nNeeds a permission on the domain (admin keys always pass). Domains in `deleting` state answer with 410 Gone.",
         "operationId": "get_domain",
         "parameters": [
           {
@@ -1139,6 +1259,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/JsonDomainResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — no permission on the domain (also when it does not exist)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1215,6 +1345,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1224,7 +1371,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Imports documents from an NDJSON body in atomic batches.",
+        "summary": "Imports documents from an NDJSON body in atomic batches; bulk writes take\nno preconditions and are not subject to `require_conditional_writes`.",
         "operationId": "bulk_load",
         "parameters": [
           {
@@ -1281,6 +1428,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1471,6 +1635,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -1542,7 +1723,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Reads a document; `_key`/`_version` are top-level fields and an opaque\n`ETag` is exposed for use with `If-Match` (json/011).",
+        "summary": "Reads a document; `_key`/`_version` are top-level fields and an opaque\n`ETag` is exposed for use with `If-Match`.",
         "operationId": "get_document",
         "parameters": [
           {
@@ -1619,7 +1800,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a\nconditional update that fails with 409 on a version mismatch. With\n`If-None-Match: *` the write is create-only and fails with 412 if the\ndocument already exists (json/014); the two headers are mutually\nexclusive (400).",
+        "summary": "Upserts a document. With an `If-Match: \"<etag>\"` header the write is a\nconditional update; with `If-None-Match: *` it is create-only. Both may\nbe combined and are evaluated in that order; a failed precondition\nanswers 412 with the current `ETag`.",
         "operationId": "put_document",
         "parameters": [
           {
@@ -1643,7 +1824,7 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "Opaque ETag from a prior read: conditional write, 409 on version mismatch",
+            "description": "Opaque ETag from a prior read: write only if it is still the document's current version, else 412",
             "required": false,
             "schema": {
               "type": [
@@ -1655,7 +1836,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "Only `*` is supported: create-only write, 412 if the document exists",
+            "description": "Only `*` is supported: create-only write, 412 if the document exists. Evaluated after If-Match",
             "required": false,
             "schema": {
               "type": [
@@ -1697,7 +1878,7 @@
             }
           },
           "400": {
-            "description": "Invalid key, reserved top-level field (_key, _version, _content), invalid If-Match or If-None-Match header, or both headers set together",
+            "description": "Invalid key, reserved top-level field (_key, _version, _content), or invalid If-Match or If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1707,17 +1888,7 @@
             }
           },
           "404": {
-            "description": "Domain not found, or If-Match on missing document",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Version conflict (If-Match mismatch)",
+            "description": "Domain not found",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1737,7 +1908,33 @@
             }
           },
           "412": {
-            "description": "Document already exists (If-None-Match: *)",
+            "description": "If-Match or If-None-Match does not hold (version mismatch, missing document, or document already exists); nothing was written",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the document's current version; absent when the document does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1755,6 +1952,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -1762,7 +1976,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Deletes a document and its index entries. Supports conditional delete via\n`If-Match: \"<etag>\"`.",
+        "summary": "Deletes a document and its index entries. Supports conditional delete via\n`If-Match: \"<etag>\"`; a failed precondition answers 412 with the current\n`ETag`.",
         "operationId": "delete_document",
         "parameters": [
           {
@@ -1786,7 +2000,19 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "Opaque ETag from a prior read: conditional write, 409 on version mismatch",
+            "description": "Opaque ETag from a prior read: delete only if it is still the document's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*` is supported: 412 if the document exists. Evaluated after If-Match",
             "required": false,
             "schema": {
               "type": [
@@ -1800,8 +2026,8 @@
           "204": {
             "description": "Document deleted"
           },
-          "404": {
-            "description": "Document or domain not found",
+          "400": {
+            "description": "Invalid key, or invalid If-Match or If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1810,8 +2036,8 @@
               }
             }
           },
-          "409": {
-            "description": "Version conflict (If-Match mismatch)",
+          "404": {
+            "description": "Document or domain not found",
             "content": {
               "text/plain": {
                 "schema": {
@@ -1830,8 +2056,61 @@
               }
             }
           },
+          "412": {
+            "description": "If-Match or If-None-Match does not hold (version mismatch, missing document, or document exists); nothing was deleted",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the document's current version; absent when the document does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1848,7 +2127,7 @@
         "tags": [
           "JSON Document Store"
         ],
-        "summary": "Streams all documents of a domain as NDJSON without full buffering. A\ndocument written before json/017 that still carries a top-level\n`_key`/`_version`/`_content` field exports lossy, same as before — no\nmigration reshapes existing data.",
+        "summary": "Streams all documents of a domain as NDJSON without full buffering. A\nlegacy document that still carries a top-level\n`_key`/`_version`/`_content` field exports lossy, same as before — no\nmigration reshapes existing data.",
         "operationId": "export_documents",
         "parameters": [
           {
@@ -2042,6 +2321,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2099,6 +2395,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2192,6 +2505,23 @@
           },
           "503": {
             "description": "JSON engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -2611,6 +2941,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2620,7 +2967,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.\nWhen the key has a TTL, the response carries an `X-Expires-At` header with the absolute Unix-seconds expiry.",
+        "summary": "Retrieves the raw byte value for a key. Returns 204 for a key in the null state and 404 if the key does not exist or has expired.\nWhen the key has a TTL, the response carries an `X-Expires-At` header with the absolute Unix-seconds expiry.\n200 and 204 carry an `ETag` identifying the version read, for a later conditional write.",
         "operationId": "get_key",
         "parameters": [
           {
@@ -2646,6 +2993,12 @@
           "200": {
             "description": "Value (raw bytes; an empty value yields an empty body). The `X-Expires-At` header (absolute Unix seconds) is present only when the key has a TTL.",
             "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong, opaque version tag for If-Match / If-None-Match"
+              },
               "X-Expires-At": {
                 "schema": {
                   "type": "integer",
@@ -2659,7 +3012,15 @@
             }
           },
           "204": {
-            "description": "Key exists in the explicit null state (set via PATCH …/null)"
+            "description": "Key exists in the explicit null state (set via PATCH …/null)",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong, opaque version tag for If-Match / If-None-Match"
+              }
+            }
           },
           "400": {
             "description": "Invalid key",
@@ -2716,7 +3077,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Inserts or updates a value for the given key (upsert semantics).\nThe optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.",
+        "summary": "Inserts or updates a value for the given key (upsert semantics).\nThe optional `ttl` query parameter sets an expiry in seconds; omitting it stores the key indefinitely.\n`If-Match` (an ETag from a prior read) or `If-None-Match: *` (create only) make the write conditional;\nwithout them the last writer wins.",
         "operationId": "put_key",
         "parameters": [
           {
@@ -2747,6 +3108,30 @@
               "format": "int64",
               "minimum": 0
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "ETag from a prior read: write only if it is still the key's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*`: write only if the key does not exist, else 412. Evaluated after If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -2764,7 +3149,7 @@
             "description": "Key upserted"
           },
           "400": {
-            "description": "Invalid key",
+            "description": "Invalid key, or invalid If-Match / If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -2793,6 +3178,42 @@
               }
             }
           },
+          "412": {
+            "description": "If-Match or If-None-Match does not hold; nothing was written",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the key's current version; absent when the key does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Rate limit exceeded",
             "headers": {
@@ -2811,6 +3232,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -2818,7 +3256,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Permanently removes a key from the domain. The operation is idempotent; deleting a non-existent key still returns 204.",
+        "summary": "Permanently removes a key from the domain. The operation is idempotent; deleting a non-existent key still returns 204.\n`If-Match` makes the delete conditional on the version read.",
         "operationId": "delete_key",
         "parameters": [
           {
@@ -2838,6 +3276,30 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "ETag from a prior read: delete only if it is still the key's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*`: delete only if the key does not exist, else 412. Evaluated after If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -2845,7 +3307,7 @@
             "description": "Key deleted"
           },
           "400": {
-            "description": "Invalid key",
+            "description": "Invalid key, or invalid If-Match / If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -2864,6 +3326,42 @@
               }
             }
           },
+          "412": {
+            "description": "If-Match or If-None-Match does not hold; nothing was deleted",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the key's current version; absent when the key does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Rate limit exceeded",
             "headers": {
@@ -2872,6 +3370,23 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
                 }
               }
             },
@@ -2981,7 +3496,7 @@
         "tags": [
           "Key-Value Store"
         ],
-        "summary": "Sets the key to an explicit null value (upsert): the key stays registered and appears in scans,\nbut carries no data — GET answers 204. A write like any other; it resets a previously set TTL.",
+        "summary": "Sets the key to an explicit null value (upsert): the key stays registered and appears in scans,\nbut carries no data — GET answers 204. A write like any other; it resets a previously set TTL,\nand takes the same `If-Match` / `If-None-Match: *` preconditions as PUT.",
         "operationId": "set_null",
         "parameters": [
           {
@@ -3001,6 +3516,30 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "ETag from a prior read: write only if it is still the key's current version, else 412",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Only `*`: write only if the key does not exist, else 412. Evaluated after If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -3008,7 +3547,7 @@
             "description": "Key set to the null value state"
           },
           "400": {
-            "description": "Invalid key",
+            "description": "Invalid key, or invalid If-Match / If-None-Match header",
             "content": {
               "text/plain": {
                 "schema": {
@@ -3019,6 +3558,42 @@
           },
           "410": {
             "description": "Domain is being deleted",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "If-Match or If-None-Match does not hold; nothing was written",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "ETag of the key's current version; absent when the key does not exist"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "The domain requires conditional writes and neither If-Match nor If-None-Match is set",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "no-store"
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -3045,6 +3620,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3055,7 +3647,7 @@
           "Key-Value Store"
         ],
         "summary": "Opens a Server-Sent Events stream that delivers real-time change events (`set` / `delete`) for keys matching the optional prefix.\nThe connection stays open until the client disconnects; a keep-alive ping is sent automatically.",
-        "description": "A `Last-Event-ID` (header or `?last_event_id=`, spec kv/024) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. A\nclient that ignores `id:`/`reset` behaves exactly as before this was added.",
+        "description": "A `Last-Event-ID` (header or `?last_event_id=`) resumes gaplessly from an in-memory\nreplay ring when possible; otherwise the server emits `event: reset` before continuing live. A\nclient that ignores `id:`/`reset` behaves exactly as before this was added.",
         "operationId": "watch",
         "parameters": [
           {
@@ -3123,7 +3715,7 @@
         "tags": [
           "Logs"
         ],
-        "summary": "Reads the last N lines of a log file (spec general/005).",
+        "summary": "Reads the last N lines of a log file.",
         "operationId": "get_logs",
         "parameters": [
           {
@@ -3214,7 +3806,7 @@
         "tags": [
           "Logs"
         ],
-        "summary": "Lists every `luradb.log*` file in the log directory (spec general/005).\n`files[0]` is exactly the file `GET /logs` reads without a `file` param.",
+        "summary": "Lists every `luradb.log*` file in the log directory.\n`files[0]` is exactly the file `GET /logs` reads without a `file` param.",
         "operationId": "list_files",
         "responses": {
           "200": {
@@ -3256,7 +3848,7 @@
           "Metrics"
         ],
         "summary": "`GET /metrics` — system + all domain metrics. Admin only.",
-        "description": "`engines` (spec general/019) is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.",
+        "description": "`engines` is an additive block, one entry per storage\nengine (`kv`/`json`/`rel`), each with the same nine fields: `read_ops`,\n`write_ops`, `read_latency_us_p50/p95/p99`, `write_latency_us_p50/p95/p99`,\n`window_secs`. Clients compute `read_ops / window_secs` for ops/s — the\nrate is a `window_secs`-wide average, not an instantaneous value, since\n`read_ops`/`write_ops` only count fully ticked seconds (the running\nsecond is excluded). A disabled engine still gets its block, all zero —\n`0` for a latency percentile means no op landed in the window, not an\nunmeasurably fast one.\n\n`shm` covers the shared-memory snapshot publisher, all zero while SHM is\noff: `snapshot_publishes_total`, `snapshot_publish_skips_total` (a client\nwas still reading the buffer due for overwriting),\n`snapshot_consecutive_skips` (the current run of skips; above 0 the snapshot\nis not being updated) and `clients_kicked_total` (clients disconnected after\n`shm.kick_blocking_client_after_secs`).\n\n`resources` is the full disk and memory report, of which `GET /health`\ngives the states only: per data volume `path`, `size_bytes`, `free_bytes`\nand `state`, and for the memory `rss_anon_bytes`, `budget_bytes` and\n`state`. `io` appears only while writes of a data file fail: the file\nwith the most failures in a row, `path` and `failures`.",
         "operationId": "get_metrics",
         "responses": {
           "200": {
@@ -3274,6 +3866,16 @@
           },
           "403": {
             "description": "Forbidden — Admin only",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A data shard is not running",
             "content": {
               "text/plain": {
                 "schema": {
@@ -3348,11 +3950,11 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Returns all active relational domains.",
+        "summary": "Returns the active relational domains. Admin keys see all of them; any\nother key sees only the relational domains it has a permission on (an empty\nlist without any).",
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "List of active relational domains",
+            "description": "List of the active relational domains the key may access",
             "content": {
               "application/json": {
                 "schema": {
@@ -3432,6 +4034,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -3441,7 +4060,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Returns metadata for a single relational domain. A domain in `deleting`\nstate answers 410 Gone (rel/013 finishes the physical purge).",
+        "summary": "Returns metadata for a single relational domain. Needs a permission on the\ndomain (admin keys always pass). A domain in `deleting` state answers 410\nGone (a background purge removes the data later).",
         "operationId": "get_domain",
         "parameters": [
           {
@@ -3461,6 +4080,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RelDomainResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — no permission on the domain (also when it does not exist)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -3501,7 +4130,7 @@
         "tags": [
           "Relational Domains"
         ],
-        "summary": "Marks a relational domain as deleting. Its tables/views become\ninaccessible immediately; physical cleanup follows in rel/013.",
+        "summary": "Marks a relational domain as deleting. Its tables/views become\ninaccessible immediately; physical cleanup follows in the background.",
         "operationId": "delete_domain",
         "parameters": [
           {
@@ -3516,7 +4145,7 @@
         ],
         "responses": {
           "202": {
-            "description": "Deletion accepted — background purge follows (rel/013)"
+            "description": "Deletion accepted — background purge follows"
           },
           "404": {
             "description": "Domain not found",
@@ -3540,6 +4169,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -3601,7 +4247,7 @@
             }
           },
           "403": {
-            "description": "Access level too low for this statement (rel/011)",
+            "description": "Access level too low for this statement",
             "content": {
               "text/plain": {
                 "schema": {
@@ -3662,6 +4308,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -3753,7 +4416,7 @@
         "tags": [
           "Relational Import"
         ],
-        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column (spec §5.1), then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues (spec §5.2). Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement (rel/011 pattern).",
+        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column, then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues. Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement.",
         "operationId": "create_table_from_file",
         "parameters": [
           {
@@ -3896,6 +4559,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -4202,7 +4882,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Inserts one row from a JSON object body (`{column: value, …}`). An omitted\nAUTOINCREMENT primary key is assigned the next sequence value (rel/005\n§9); this compiles onto the exact same bound INSERT plan `/sql` would use.",
+        "summary": "Inserts one row from a JSON object body (`{column: value, …}`). An omitted\nAUTOINCREMENT primary key is assigned the next sequence value; this\ncompiles onto the exact same bound INSERT plan `/sql` would use.",
         "operationId": "insert_row",
         "parameters": [
           {
@@ -4256,7 +4936,7 @@
             }
           },
           "403": {
-            "description": "Missing read access to a linked KV/JSON domain (rel/016)",
+            "description": "Missing read access to a linked KV/JSON domain",
             "content": {
               "text/plain": {
                 "schema": {
@@ -4307,6 +4987,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -4440,7 +5137,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Partially updates a row by primary key: only the columns named in the\nbody are set, everything else stays unchanged (spec §5). Not an upsert —\na PK the table doesn't have answers 404, never a create.",
+        "summary": "Partially updates a row by primary key: only the columns named in the\nbody are set, everything else stays unchanged. Not an upsert —\na PK the table doesn't have answers 404, never a create.",
         "operationId": "update_row",
         "parameters": [
           {
@@ -4503,7 +5200,7 @@
             }
           },
           "403": {
-            "description": "Missing read access to a linked KV/JSON domain (rel/016)",
+            "description": "Missing read access to a linked KV/JSON domain",
             "content": {
               "text/plain": {
                 "schema": {
@@ -4561,6 +5258,23 @@
                 }
               }
             }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -4568,7 +5282,7 @@
         "tags": [
           "Relational Rows"
         ],
-        "summary": "Deletes a row by primary key. Hanging REFERENCES from other tables are\nnot blocked by this (rel/005 §11) — they resolve to `null` afterwards.",
+        "summary": "Deletes a row by primary key. Hanging REFERENCES from other tables are\nnot blocked by this — they resolve to `null` afterwards.",
         "operationId": "delete_row",
         "parameters": [
           {
@@ -4652,6 +5366,23 @@
           },
           "503": {
             "description": "Relational engine disabled",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "Insufficient Storage — disk space or memory runs short; the write was not applied. Reads go on; retry after the seconds in Retry-After.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -4743,7 +5474,7 @@
         "tags": [
           "Backup"
         ],
-        "summary": "Live status of a restore job. Lives in RAM only (spec general/006) — gone\nafter a restart; the outcome is also in the log.",
+        "summary": "Live status of a restore job. Lives in RAM only — gone\nafter a restart; the outcome is also in the log.",
         "operationId": "get_restore_status",
         "parameters": [
           {
@@ -4846,7 +5577,7 @@
       },
       "BackupDetailResponse": {
         "type": "object",
-        "description": "Manifest fields + state + size (spec general/006 GET /backups/{id} and\nPOST /backups/upload). Everything but `id`/`state`/`scope` is optional:\nthe currently-running-job shape (`running`) only fills `started_at`; the\ncomplete/incomplete shape fills the rest instead.",
+        "description": "Manifest fields + state + size (GET /backups/{id} and\nPOST /backups/upload). Everything but `id`/`state`/`scope` is optional:\nthe currently-running-job shape (`running`) only fills `started_at`; the\ncomplete/incomplete shape fills the rest instead.",
         "required": [
           "id",
           "state",
@@ -4890,6 +5621,7 @@
               "null"
             ],
             "format": "int64",
+            "description": "The newest read-snapshot stamp of the JSON engine among the data shards.",
             "minimum": 0
           },
           "kv_snapshot_ts": {
@@ -4898,13 +5630,33 @@
               "null"
             ],
             "format": "int64",
+            "description": "The newest read-snapshot stamp of the KV engine among the data shards.",
             "minimum": 0
+          },
+          "lsn_cut": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LsnCutResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "luradb_version": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "rel_snapshot_ts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The newest read-snapshot stamp of the relational engine among the\ndata shards.",
+            "minimum": 0
           },
           "schedule": {
             "type": [
@@ -4914,6 +5666,15 @@
           },
           "scope": {
             "type": "string"
+          },
+          "shards": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Data shards of the server that wrote the archive; 0 for format\nversion 1. Informational: a restore places every domain by the shard\ncount of the server it runs on.",
+            "minimum": 0
           },
           "size_bytes": {
             "type": [
@@ -4951,10 +5712,10 @@
           "running": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RunningBackupInfo"
               },
               {
-                "$ref": "#/components/schemas/RunningBackupInfo"
+                "type": "null"
               }
             ]
           }
@@ -5071,9 +5832,7 @@
           "autoincrement": {
             "type": "boolean"
           },
-          "default": {
-            "type": "object"
-          },
+          "default": {},
           "name": {
             "type": "string"
           },
@@ -5099,7 +5858,7 @@
       },
       "CountResponse": {
         "type": "object",
-        "description": "Generic `{\"count\": N}` response, shared by JSON's `count_documents`, KV's\n`count_keys`, and rel's `count_rows` (spec general/017) — one schema\ninstead of three identical ones.",
+        "description": "Generic `{\"count\": N}` response, shared by JSON's `count_documents`, KV's\n`count_keys`, and rel's `count_rows` — one schema\ninstead of three identical ones.",
         "required": [
           "count"
         ],
@@ -5123,7 +5882,7 @@
           },
           "scope": {
             "type": "string",
-            "description": "`all` | `kv` | `json` | `kv:<domain>` | `json:<domain>` | `domain:<name>`.\nCovers the KV and JSON engines only — relational data is never included."
+            "description": "`all` | `kv` | `json` | `rel` | `kv:<domain>` | `json:<domain>` |\n`rel:<domain>` | `domain:<name>`. `all` covers every enabled engine;\n`domain:<name>` covers the domain of that name in each engine that has\nit. Relational domains go in with schema, rows and AUTOINCREMENT state."
           }
         }
       },
@@ -5136,6 +5895,10 @@
           "name": {
             "type": "string",
             "description": "User-visible domain name (max 50 chars, [a-zA-Z0-9_-])."
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "When true, PUT, DELETE and PATCH …/null on single keys need `If-Match` or\n`If-None-Match: *` and answer 428 without. Fixed at creation; default false."
           }
         }
       },
@@ -5244,6 +6007,10 @@
           "name": {
             "type": "string",
             "description": "User-visible domain name (max 50 chars, [a-zA-Z0-9_-])."
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "When true, PUT and DELETE on documents need `If-Match` or\n`If-None-Match: *` and answer 428 without. Fixed at creation; default false."
           }
         }
       },
@@ -5359,7 +6126,8 @@
         "type": "object",
         "required": [
           "name",
-          "created_at"
+          "created_at",
+          "require_conditional_writes"
         ],
         "properties": {
           "created_at": {
@@ -5371,6 +6139,78 @@
           "name": {
             "type": "string",
             "description": "User-visible domain name."
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "Whether single-key writes need `If-Match` or `If-None-Match: *` (else 428)."
+          }
+        }
+      },
+      "HeartbeatMetrics": {
+        "type": "object",
+        "required": [
+          "status",
+          "uptime_secs",
+          "version",
+          "domain_count",
+          "estimated_memtable_keys",
+          "vlog_size_bytes",
+          "l0_sstable_count",
+          "shards",
+          "resources"
+        ],
+        "properties": {
+          "domain_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "estimated_memtable_keys": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "io": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IoState",
+                "description": "Only while writes of a data file fail: the most failures in a row."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "l0_sstable_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "resources": {
+            "$ref": "#/components/schemas/ResourceState",
+            "description": "Whether disk space and the server's own memory are short."
+          },
+          "shards": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShardHealth"
+            },
+            "description": "Every data shard, by id."
+          },
+          "status": {
+            "type": "string",
+            "description": "`ok`, or `degraded` while a data shard does not answer, disk space\nor memory runs short (`resources`) or writes of a data file fail\n(`io`)."
+          },
+          "uptime_secs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string"
+          },
+          "vlog_size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -5414,12 +6254,28 @@
           }
         }
       },
+      "IoState": {
+        "type": "object",
+        "description": "`io` of `GET /health`: the failed writes in a row, without the file.",
+        "required": [
+          "failures"
+        ],
+        "properties": {
+          "failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Failed writes in a row of the data file with the most.",
+            "minimum": 0
+          }
+        }
+      },
       "JsonDomainResponse": {
         "type": "object",
         "required": [
           "name",
           "created_at",
-          "state"
+          "state",
+          "require_conditional_writes"
         ],
         "properties": {
           "created_at": {
@@ -5439,6 +6295,10 @@
           },
           "name": {
             "type": "string"
+          },
+          "require_conditional_writes": {
+            "type": "boolean",
+            "description": "Whether document PUT and DELETE need `If-Match` or `If-None-Match: *` (else 428)."
           },
           "state": {
             "type": "string",
@@ -5624,6 +6484,32 @@
           }
         }
       },
+      "LsnCutResponse": {
+        "type": "object",
+        "description": "Per engine, a write-ahead-log position that every write in the archive is\nat or below; 0 for an engine outside the scope and for format version 1.\nPositions keep growing across restarts, so they compare across runs of\nthe server.",
+        "required": [
+          "kv",
+          "json",
+          "rel"
+        ],
+        "properties": {
+          "json": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kv": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "rel": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "PermissionItem": {
         "type": "object",
         "description": "One entry of a user's domain permission matrix. `store_type`/`access` are\nlowercase and match the write-endpoint vocabulary exactly (`parse_store_type`,\n`access` parsing in `set_permission`) — usable as-is in a follow-up request.",
@@ -5688,7 +6574,30 @@
           },
           "state": {
             "type": "string",
-            "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running, rel/013).\nAlways present — so rel/013's later `list_domains` visibility change\n(surfacing `Deleting` domains too) needs no REST-contract change."
+            "description": "Lifecycle state: \"active\" or \"deleting\" (background purge running).\nAlways present — so a later `list_domains` visibility change\n(surfacing `Deleting` domains too) needs no REST-contract change."
+          }
+        }
+      },
+      "ResourceState": {
+        "type": "object",
+        "description": "`resources` of `GET /health`: the states of the report, without volumes,\npaths or numbers.",
+        "required": [
+          "state",
+          "disk_state",
+          "memory_state"
+        ],
+        "properties": {
+          "disk_state": {
+            "type": "string",
+            "description": "The worst state of the data volumes: `ok`, `warning` or `blocked`."
+          },
+          "memory_state": {
+            "type": "string",
+            "description": "`ok`, `warning` or `blocked`."
+          },
+          "state": {
+            "type": "string",
+            "description": "`ok`, `warning` (below a warn threshold) or `blocked` (writes refused)."
           }
         }
       },
@@ -5734,7 +6643,7 @@
               "string",
               "null"
             ],
-            "description": "Only legal when the archive contains exactly one domain name\n(`kv:*`/`json:*`/`domain:*` scopes)."
+            "description": "Only legal when the archive contains exactly one domain name\n(`kv:*`/`json:*`/`rel:*`/`domain:*` scopes). Links of relational\ntables (KVREF/JSONREF) then point to the KV and JSON domain of the new\nname."
           },
           "mode": {
             "type": [
@@ -5851,7 +6760,7 @@
             "items": {
               "type": "object"
             },
-            "description": "One JSON object per row (catalog column order in principle; `serde_json`'s\ndefault map is unordered/alphabetical here, see rel_browse.rs module docs),\nwith an optional `_expanded` block (spec §6)."
+            "description": "One JSON object per row (catalog column order in principle; `serde_json`'s\ndefault map is unordered/alphabetical here, see rel_browse.rs module docs),\nwith an optional `_expanded` block."
           }
         }
       },
@@ -5943,7 +6852,7 @@
         "properties": {
           "access": {
             "type": "string",
-            "description": "Access level: `\"read\"`, `\"write\"` or `\"ddl\"` (spec rel/011)."
+            "description": "Access level: `\"read\"`, `\"write\"` or `\"ddl\"`."
           },
           "domain": {
             "type": "string",
@@ -5954,7 +6863,25 @@
               "string",
               "null"
             ],
-            "description": "Store type of the domain: `\"kv\"` (default), `\"json\"` (spec json/012) or `\"rel\"` (spec rel/011)."
+            "description": "Store type of the domain: `\"kv\"` (default), `\"json\"` or `\"rel\"`."
+          }
+        }
+      },
+      "ShardHealth": {
+        "type": "object",
+        "description": "A data shard as `GET /health` reports it: `ok` once it answered its\nping, `timeout` otherwise.",
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string"
           }
         }
       },
@@ -5969,18 +6896,18 @@
             "items": {
               "type": "string"
             },
-            "description": "REFERENCES columns to resolve into embedded objects, or `[\"*\"]` for\nall of them (§5). Only valid for SELECT; non-empty on DML/DDL → 400."
+            "description": "REFERENCES columns to resolve into embedded objects, or `[\"*\"]` for\nall of them. Only valid for SELECT; non-empty on DML/DDL → 400."
           },
           "params": {
             "type": "array",
             "items": {
               "type": "object"
             },
-            "description": "Positional parameters (JSON array), bound to the `?` placeholders\n(rel/004/005). Omitted ⇒ empty array."
+            "description": "Positional parameters (JSON array), bound to the `?` placeholders.\nOmitted ⇒ empty array."
           },
           "sql": {
             "type": "string",
-            "description": "Exactly one LuraSQL statement (more → 400 `MultipleStatements`, rel/004)."
+            "description": "Exactly one LuraSQL statement (more → 400 `MultipleStatements`)."
           }
         }
       },
@@ -6131,7 +7058,7 @@
           },
           "role": {
             "type": "string",
-            "description": "`\"Admin\"`, `\"User\"`, or a pseudo-role: `\"TrustedPeer\"` (UDS peer\nauthenticated by the kernel, spec perf/001) or `\"Disabled\"`\n(`auth.enabled = false`)."
+            "description": "`\"Admin\"`, `\"User\"`, or a pseudo-role: `\"TrustedPeer\"` (UDS peer\nauthenticated by the kernel) or `\"Disabled\"`\n(`auth.enabled = false`)."
           }
         }
       }

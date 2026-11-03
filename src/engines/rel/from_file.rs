@@ -1,28 +1,32 @@
 //! CSV/TSV file import: CREATE TABLE + bulk INSERT with inferred column
-//! types (spec rel/019) -- the rel counterpart of the JSON bulk load
-//! (json/007). Two passes over the fully-buffered file (no sampling, no
-//! streaming, per spec §5): Pass 1 infers one LuraDB type per column; Pass 2
-//! creates the table through the existing catalog path (`RelEngine::create_table`)
-//! and inserts rows in batches through the existing per-row DML staging
-//! (`dml.rs`'s `stage_insert_row`) -- no SQL text is ever built from file data.
+//! types -- the rel counterpart of the JSON bulk load. Two passes over the
+//! fully-buffered file (no sampling, no streaming): Pass 1 infers one
+//! LuraDB type per column; Pass 2 creates the table through the existing catalog path
+//! (`RelEngine::create_table`) and inserts rows in batches through the existing per-row
+//! DML staging (`dml.rs`'s `stage_insert_row`) -- no SQL text is ever built from file data.
 
 use super::catalog::{ColumnInput, TableInput, MAX_IDENTIFIER_LEN};
 use super::cross_engine::LinkAuth;
-use super::dml::{coerce_json, RowPlan};
+use super::dml::{coerce_json, InsertChecks, RowPlan};
 use super::error::RelStoreError;
 use super::types::{ColumnType, ScalarValue};
 use super::RelEngine;
+use crate::core::coop::{self, YieldEvery};
 use crate::engines::lsm::engine::BatchOp;
 use crate::metrics::EngineKind;
+use bytes::Bytes;
 use csv::{ReaderBuilder, StringRecord};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-/// Rows staged per `write_batch` group (spec §5), mirroring the DDL backfill
+/// Rows staged per `write_batch` group, mirroring the DDL backfill
 /// chunk size (`ddl.rs`'s `BACKFILL_CHUNK`) rather than a new config knob.
 const IMPORT_BATCH_SIZE: usize = 500;
 
-/// Server-side file formats (spec §2 decision 2 -- no Excel/ODS/Sheets here).
+/// Rows staged between two cooperative yields.
+const IMPORT_ROW_YIELD_INTERVAL: u32 = 64;
+
+/// Server-side file formats (no Excel/ODS/Sheets here).
 #[derive(Debug, Clone, Copy)]
 pub enum FileFormat {
     Csv,
@@ -38,7 +42,7 @@ impl FileFormat {
     }
 }
 
-/// One column of the created table (spec §5 response summary).
+/// One column of the created table (response summary).
 #[derive(Debug)]
 pub struct ImportColumn {
     pub name: String,
@@ -49,7 +53,7 @@ pub struct ImportColumn {
     pub source_header: Option<String>,
 }
 
-/// One row-level import failure (spec §5).
+/// One row-level import failure.
 #[derive(Debug)]
 pub struct ImportRowError {
     pub row: u64,
@@ -81,9 +85,12 @@ struct PlannedColumn {
 }
 
 impl RelEngine {
-    /// Creates a table from an uploaded CSV/TSV file and imports its rows
-    /// (spec rel/019 §1-§5). `pk` is the caller's raw query value, if any;
-    /// matched against the normalized column names case-insensitively.
+    /// Creates a table from an uploaded CSV/TSV file and imports its rows.
+    /// `pk` is the caller's raw query value, if any; matched against the
+    /// normalized column names case-insensitively.
+    /// Parsing, header normalization and Pass-1 inference are pure CPU work
+    /// and run on the blocking pool, which is why the body
+    /// arrives owned; the insert pass below stays on the engine thread.
     pub async fn create_table_from_file(
         &self,
         domain: &str,
@@ -91,54 +98,17 @@ impl RelEngine {
         format: FileFormat,
         header: bool,
         pk: Option<&str>,
-        body: &[u8],
+        body: Bytes,
     ) -> Result<CreateFromFileResult, RelStoreError> {
-        let (raw_headers, data_records) = read_records(format, header, body)?;
-        let column_count = raw_headers.len();
-        // Cap first: normalization and inference below are per-column work, so
-        // a header far past the limit must be rejected before paying for it —
-        // `create_table` would reject the schema anyway (spec §1/§3).
         let max_columns = self.catalog.max_columns();
-        if column_count > max_columns {
-            return Err(RelStoreError::LimitExceeded {
-                which: "max_columns".to_string(),
-                max: max_columns,
-            });
-        }
-        let names = normalize_headers(&raw_headers);
         let pk = pk.map(|s| s.to_ascii_lowercase());
+        let owned_pk = pk.clone();
+        let ParsedFile { raw_headers, data_records, names, col_types } =
+            coop::offload(move || parse_file(format, header, &body, owned_pk.as_deref(), max_columns))
+                .await?;
+        let column_count = raw_headers.len();
 
-        // `_row` reservation (spec §3): only allowed as a file column when it
-        // is itself the chosen PK.
-        if let Some(pos) = names.iter().position(|n| n == "_row") {
-            if pk.as_deref() != Some("_row") {
-                return Err(RelStoreError::InvalidSchema(format!(
-                    "column '{}' normalizes to the reserved name '_row' \
-                     (use ?pk=_row to make it the primary key)",
-                    raw_headers[pos].as_deref().unwrap_or("_row")
-                )));
-            }
-        }
-        if let Some(pk_name) = &pk {
-            if !names.iter().any(|n| n == pk_name) {
-                return Err(RelStoreError::InvalidSchema(format!("pk column '{pk_name}' not found")));
-            }
-        }
-
-        // Pass 1 (spec §5.1): narrowest type per column over every non-empty
-        // value of the fully-buffered file.
-        let col_types: Vec<ColumnType> = (0..column_count)
-            .map(|i| {
-                let values = data_records
-                    .iter()
-                    .filter_map(|r| r.as_ref().ok())
-                    .filter_map(move |r| r.get(i))
-                    .filter(|v| !v.is_empty());
-                infer_column_type(values)
-            })
-            .collect();
-
-        // Column plan, in the table's final column order (spec §4): a
+        // Column plan, in the table's final column order: a
         // synthetic `_row` PK when none was requested, else the CSV columns
         // in their natural order with the requested one marked as PK.
         let mut planned: Vec<PlannedColumn> = Vec::with_capacity(column_count + 1);
@@ -153,7 +123,7 @@ impl RelEngine {
             planned.push(PlannedColumn { source: ColumnSource::Csv(i), input, header: raw_headers[i].clone() });
         }
 
-        // Pass 2, part 1 (spec §5.2): CREATE TABLE through the existing
+        // Pass 2, part 1: CREATE TABLE through the existing
         // catalog path -- nothing is persisted if this fails (400/404/409/410).
         let table_input =
             TableInput { name: table.to_string(), columns: planned.iter().map(|p| p.input.clone()).collect() };
@@ -173,7 +143,7 @@ impl RelEngine {
         // Pass 2, part 2: insert rows in `IMPORT_BATCH_SIZE` groups through
         // the same per-row staging (NOT NULL/PK-dup/size/UNIQUE/REFERENCES
         // checks, index entries) the SQL/REST write paths use -- a row that
-        // fails is logged and the import continues (spec §5).
+        // fails is logged and the import continues.
         let dom = self.domains.require_active(domain)?;
         let prefix = dom.system_prefix.clone();
         let lock = self.table_locks.get(&prefix, schema.table_id);
@@ -185,16 +155,18 @@ impl RelEngine {
         let mut seen_unique: HashSet<(u32, Vec<u8>)> = HashSet::new();
 
         let write_start = std::time::Instant::now();
+        let mut coop = YieldEvery::new(IMPORT_ROW_YIELD_INTERVAL);
         let mut start = 0usize;
         while start < data_records.len() {
             let end = (start + IMPORT_BATCH_SIZE).min(data_records.len());
             // A fresh snapshot per group: it must see the previous groups'
             // own commits for the PK-duplicate check inside `stage_insert_row`.
-            let snapshot = self.engine.snapshot();
+            let snapshot = self.engine.snapshot().await;
             let snap = snapshot.snapshot();
             let mut ops: Vec<BatchOp> = Vec::new();
 
             for (offset, record_result) in data_records[start..end].iter().enumerate() {
+                coop.tick().await;
                 let row_number = (start + offset + 1) as u64;
                 let record = match record_result {
                     Ok(r) => r,
@@ -239,6 +211,7 @@ impl RelEngine {
                         &mut seen_unique,
                         &mut ops,
                         LinkAuth::full(), // no KVREF/JSONREF column is ever inferred
+                        InsertChecks::All,
                     )
                     .await
                 {
@@ -262,18 +235,87 @@ impl RelEngine {
     }
 }
 
-/// Reads the file into `(raw_headers, data_records)` (spec §2/§3): with
+type DataRecords = Vec<Result<StringRecord, csv::Error>>;
+
+/// Everything [`RelEngine::create_table_from_file`] derives from the file
+/// alone — the result of the offloaded parse pass.
+struct ParsedFile {
+    raw_headers: Vec<Option<String>>,
+    data_records: DataRecords,
+    /// Normalized column names, one per file column.
+    names: Vec<String>,
+    /// Pass-1 inferred type, one per file column.
+    col_types: Vec<ColumnType>,
+}
+
+/// The whole file-derived half of the import: read, column
+/// cap, header normalization, `_row`/PK checks and Pass-1 inference. Pure —
+/// it touches no engine state, so it runs on the blocking pool.
+fn parse_file(
+    format: FileFormat,
+    header: bool,
+    body: &[u8],
+    pk: Option<&str>,
+    max_columns: usize,
+) -> Result<ParsedFile, RelStoreError> {
+    let (raw_headers, data_records) = read_records(format, header, body)?;
+    let column_count = raw_headers.len();
+    // Cap first: normalization and inference below are per-column work, so
+    // a header far past the limit must be rejected before paying for it —
+    // `create_table` would reject the schema anyway.
+    if column_count > max_columns {
+        return Err(RelStoreError::LimitExceeded {
+            which: "max_columns".to_string(),
+            max: max_columns,
+        });
+    }
+    let names = normalize_headers(&raw_headers);
+
+    // `_row` reservation: only allowed as a file column when it
+    // is itself the chosen PK.
+    if let Some(pos) = names.iter().position(|n| n == "_row") {
+        if pk != Some("_row") {
+            return Err(RelStoreError::InvalidSchema(format!(
+                "column '{}' normalizes to the reserved name '_row' \
+                 (use ?pk=_row to make it the primary key)",
+                raw_headers[pos].as_deref().unwrap_or("_row")
+            )));
+        }
+    }
+    if let Some(pk_name) = pk {
+        if !names.iter().any(|n| n == pk_name) {
+            return Err(RelStoreError::InvalidSchema(format!("pk column '{pk_name}' not found")));
+        }
+    }
+
+    // Pass 1: narrowest type per column over every non-empty
+    // value of the fully-buffered file.
+    let col_types: Vec<ColumnType> = (0..column_count)
+        .map(|i| {
+            let values = data_records
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .filter_map(move |r| r.get(i))
+                .filter(|v| !v.is_empty());
+            infer_column_type(values)
+        })
+        .collect();
+
+    Ok(ParsedFile { raw_headers, data_records, names, col_types })
+}
+
+/// Reads the file into `(raw_headers, data_records)`: with
 /// `header=true` the first record supplies `Some(text)` per column; with
 /// `header=false` every entry is `None` (the caller assigns `col_N`). Row
-/// numbering (§4) is 1-based over `data_records`, uniform for both modes.
-/// UTF-8 validation comes from the crate's `StringRecord` (spec §2) -- an
+/// numbering is 1-based over `data_records`, uniform for both modes.
+/// UTF-8 validation comes from the crate's `StringRecord` -- an
 /// invalid header record surfaces here; an invalid *data* record is left as
 /// its `Err` for the per-row loop to report and skip.
 fn read_records(
     format: FileFormat,
     header: bool,
     body: &[u8],
-) -> Result<(Vec<Option<String>>, Vec<Result<StringRecord, csv::Error>>), RelStoreError> {
+) -> Result<(Vec<Option<String>>, DataRecords), RelStoreError> {
     let reader =
         ReaderBuilder::new().delimiter(format.delimiter()).has_headers(false).flexible(false).from_reader(body);
     let mut records = reader.into_records();
@@ -300,7 +342,7 @@ fn read_records(
     }
 }
 
-/// Header normalization (spec §3): trim, lowercase, invalid chars -> `_`,
+/// Header normalization: trim, lowercase, invalid chars -> `_`,
 /// leading digit -> prefix `c`, empty -> `col_{i}`, over `MAX_IDENTIFIER_LEN`
 /// -> truncated, collisions (including ones truncation creates) -> `_2`,
 /// `_3`, … suffixed, still within the length cap.
@@ -367,11 +409,11 @@ fn dedupe_names(names: &mut [String]) {
     }
 }
 
-/// Pass-1 type inference (spec §5.1): the narrowest type that parses every
-/// given (already non-empty) value, in the mandated order INTEGER -> REAL ->
+/// Pass-1 type inference: the narrowest type that parses every
+/// given (already non-empty) value, in the fixed order INTEGER -> REAL ->
 /// BOOLEAN -> TIMESTAMP -> TEXT; TEXT always matches, so this never fails.
 /// A column with no values at all (empty iterator: either truly all-empty,
-/// or every value already excluded by the caller) is TEXT (spec §5.1).
+/// or every value already excluded by the caller) is TEXT.
 fn infer_column_type<'a>(values: impl Iterator<Item = &'a str> + Clone) -> ColumnType {
     const CANDIDATES: [ColumnType; 4] =
         [ColumnType::Integer, ColumnType::Real, ColumnType::Boolean, ColumnType::Timestamp];
@@ -394,7 +436,7 @@ fn infer_column_type<'a>(values: impl Iterator<Item = &'a str> + Clone) -> Colum
 
 /// Coerces one raw (non-empty) CSV field into `col_type`'s `ScalarValue`,
 /// reusing the exact `coerce_json` rules DML value binding uses everywhere
-/// else (rel/005) -- in particular its TIMESTAMP parser (millis or
+/// else -- in particular its TIMESTAMP parser (millis or
 /// ISO-8601) and its rejection of non-finite REAL values (`serde_json`'s
 /// `Number` cannot hold NaN/±Inf). A value Pass 1 accepted as REAL but that
 /// doesn't actually fit (e.g. "inf") surfaces here as a normal per-row
@@ -423,6 +465,120 @@ mod tests {
     use crate::metrics::{MetricsConfig, MetricsStore};
     use std::sync::Arc;
 
+    /// A CSV body with `rows` data rows over `id,label`.
+    fn wide_csv(rows: usize) -> Bytes {
+        let mut csv = String::from("id,label\n");
+        for i in 0..rows {
+            csv.push_str(&format!("{i},row{i}\n"));
+        }
+        Bytes::from(csv)
+    }
+
+    // Unindexed SELECT vs PK point: the scanning
+    // statement hands the thread back, so the point read spawned after it
+    // answers first.
+    #[test]
+    fn test_unindexed_select_interleaves_with_pk_point_select() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make_engine_with(RelStoreConfig::default()).await;
+            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, wide_csv(20_000))
+                .await
+                .unwrap();
+
+            let scanner = Arc::clone(&rel);
+            let reader = Arc::clone(&rel);
+            let order = crate::core::coop::completion_order(
+                async move {
+                    // Unindexed residual matching nothing: every one of the
+                    // 20 000 candidate rows is fetched and filtered out.
+                    let out = scanner.execute("default", "SELECT * FROM t WHERE label = 'none'", &[]).await;
+                    match out.unwrap() {
+                        ExecOutcome::Select(r) => assert!(r.rows.is_empty()),
+                        o => panic!("expected SELECT, got {o:?}"),
+                    }
+                },
+                async move {
+                    let out = reader.execute("default", "SELECT * FROM t WHERE _row = 5", &[]).await;
+                    match out.unwrap() {
+                        ExecOutcome::Select(r) => assert_eq!(r.rows.len(), 1),
+                        o => panic!("expected SELECT, got {o:?}"),
+                    }
+                },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
+    }
+
+    // Import vs SELECT on another table of the same domain: the import
+    // hands the thread back between its row batches.
+    #[test]
+    fn test_import_interleaves_with_select_on_another_table() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make_engine_with(RelStoreConfig::default()).await;
+            rel.execute("default", "CREATE TABLE other (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            rel.execute("default", "INSERT INTO other VALUES (1)", &[]).await.unwrap();
+
+            let importer = Arc::clone(&rel);
+            let reader = Arc::clone(&rel);
+            let order = crate::core::coop::completion_order(
+                async move {
+                    let result = importer
+                        .create_table_from_file("default", "t", FileFormat::Csv, true, None, wide_csv(10_000))
+                        .await
+                        .unwrap();
+                    assert_eq!(result.imported, 10_000);
+                    assert_eq!(result.failed, 0);
+                },
+                async move {
+                    let out = reader.execute("default", "SELECT * FROM other WHERE id = 1", &[]).await;
+                    match out.unwrap() {
+                        ExecOutcome::Select(r) => assert_eq!(r.rows.len(), 1),
+                        o => panic!("expected SELECT, got {o:?}"),
+                    }
+                },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
+    }
+
+    // Unindexed UPDATE vs PK point SELECT: the
+    // candidate scan hands the thread back. The UPDATE matches nothing, so
+    // it never reaches a commit that would suspend on its own.
+    #[test]
+    fn test_unindexed_update_interleaves_with_pk_point_select() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make_engine_with(RelStoreConfig::default()).await;
+            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, wide_csv(20_000))
+                .await
+                .unwrap();
+
+            let updater = Arc::clone(&rel);
+            let reader = Arc::clone(&rel);
+            let order = crate::core::coop::completion_order(
+                async move {
+                    let out = updater
+                        .execute("default", "UPDATE t SET label = 'x' WHERE label = 'none'", &[])
+                        .await;
+                    match out.unwrap() {
+                        ExecOutcome::Dml(r) => assert_eq!(r.affected, 0),
+                        o => panic!("expected DML, got {o:?}"),
+                    }
+                },
+                async move {
+                    let out = reader.execute("default", "SELECT * FROM t WHERE _row = 5", &[]).await;
+                    match out.unwrap() {
+                        ExecOutcome::Select(r) => assert_eq!(r.rows.len(), 1),
+                        o => panic!("expected SELECT, got {o:?}"),
+                    }
+                },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
+    }
+
     async fn make_engine_with(overrides: RelStoreConfig) -> (Arc<RelEngine>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let config = RelStoreConfig {
@@ -449,197 +605,215 @@ mod tests {
     }
 
     // 1. CSV with header, mixed types -> success; schema as inferred; `_row`
-    //    PK; every row readable via SELECT (spec §7 test 1).
-    #[tokio::test]
-    async fn test_csv_header_mixed_types_and_row_pk() {
-        let (rel, _dir) = make_engine().await;
-        let csv = "id,amount,active,Date,label\n\
+    //    PK; every row readable via SELECT.
+    #[test]
+    fn test_csv_header_mixed_types_and_row_pk() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let csv = "id,amount,active,Date,label\n\
                    1,42,true,2024-01-01T00:00:00Z,alpha\n\
                    2,7.5,false,2024-02-01T00:00:00Z,beta\n";
-        let result = rel
-            .create_table_from_file("default", "sales", FileFormat::Csv, true, None, csv.as_bytes())
-            .await
-            .unwrap();
-        assert_eq!(result.table, "sales");
-        assert_eq!(result.imported, 2);
-        assert_eq!(result.failed, 0);
-        assert!(result.errors.is_empty());
+            let result = rel
+                .create_table_from_file("default", "sales", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes()))
+                .await
+                .unwrap();
+            assert_eq!(result.table, "sales");
+            assert_eq!(result.imported, 2);
+            assert_eq!(result.failed, 0);
+            assert!(result.errors.is_empty());
 
-        let by_name = |n: &str| result.columns.iter().find(|c| c.name == n).unwrap();
-        let row_col = by_name("_row");
-        assert_eq!(row_col.col_type, ColumnType::Integer);
-        assert!(row_col.primary_key);
-        assert!(row_col.source_header.is_none());
-        assert_eq!(by_name("amount").col_type, ColumnType::Real, "1 int + 1 real value -> REAL");
-        assert_eq!(by_name("date").col_type, ColumnType::Timestamp);
-        assert_eq!(by_name("date").source_header.as_deref(), Some("Date"));
-        assert_eq!(by_name("label").col_type, ColumnType::Text);
+            let by_name = |n: &str| result.columns.iter().find(|c| c.name == n).unwrap();
+            let row_col = by_name("_row");
+            assert_eq!(row_col.col_type, ColumnType::Integer);
+            assert!(row_col.primary_key);
+            assert!(row_col.source_header.is_none());
+            assert_eq!(by_name("amount").col_type, ColumnType::Real, "1 int + 1 real value -> REAL");
+            assert_eq!(by_name("date").col_type, ColumnType::Timestamp);
+            assert_eq!(by_name("date").source_header.as_deref(), Some("Date"));
+            assert_eq!(by_name("label").col_type, ColumnType::Text);
 
-        let (cols, rows) = select_all(&rel, "SELECT _row, id, amount, active, label FROM sales ORDER BY _row").await;
-        assert_eq!(cols[0].1, ColumnType::Integer);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0],
-            vec![
-                ScalarValue::Integer(1),
-                ScalarValue::Integer(1),
-                ScalarValue::Real(42.0),
-                ScalarValue::Boolean(true),
-                ScalarValue::Text("alpha".to_string()),
-            ]
-        );
+            let (cols, rows) = select_all(&rel, "SELECT _row, id, amount, active, label FROM sales ORDER BY _row").await;
+            assert_eq!(cols[0].1, ColumnType::Integer);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0],
+                vec![
+                    ScalarValue::Integer(1),
+                    ScalarValue::Integer(1),
+                    ScalarValue::Real(42.0),
+                    ScalarValue::Boolean(true),
+                    ScalarValue::Text("alpha".to_string()),
+                ]
+            );
+        })
     }
 
-    // 2. TSV variant -> identical result, delimiter aside (spec §7 test 2).
-    #[tokio::test]
-    async fn test_tsv_variant_identical_result() {
-        let (rel, _dir) = make_engine().await;
-        let tsv = "id\tamount\n1\t10\n2\t20\n";
-        let result =
-            rel.create_table_from_file("default", "t", FileFormat::Tsv, true, None, tsv.as_bytes()).await.unwrap();
-        assert_eq!(result.imported, 2);
-        assert_eq!(result.columns.iter().find(|c| c.name == "amount").unwrap().col_type, ColumnType::Integer);
-        let (_, rows) = select_all(&rel, "SELECT id, amount FROM t ORDER BY id").await;
-        assert_eq!(rows[1], vec![ScalarValue::Integer(2), ScalarValue::Integer(20)]);
+    // 2. TSV variant -> identical result, delimiter aside.
+    #[test]
+    fn test_tsv_variant_identical_result() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let tsv = "id\tamount\n1\t10\n2\t20\n";
+            let result =
+                rel.create_table_from_file("default", "t", FileFormat::Tsv, true, None, Bytes::copy_from_slice(tsv.as_bytes())).await.unwrap();
+            assert_eq!(result.imported, 2);
+            assert_eq!(result.columns.iter().find(|c| c.name == "amount").unwrap().col_type, ColumnType::Integer);
+            let (_, rows) = select_all(&rel, "SELECT id, amount FROM t ORDER BY id").await;
+            assert_eq!(rows[1], vec![ScalarValue::Integer(2), ScalarValue::Integer(20)]);
+        })
     }
 
     // 3. header=false -> generated names col_1..col_n, no source_header
-    //    anywhere (spec §7 test 3).
-    #[tokio::test]
-    async fn test_header_false_generates_col_names() {
-        let (rel, _dir) = make_engine().await;
-        let csv = "1,alpha\n2,beta\n";
-        let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, false, None, csv.as_bytes()).await.unwrap();
-        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["_row", "col_1", "col_2"]);
-        assert!(result.columns.iter().all(|c| c.source_header.is_none()));
+    //    anywhere.
+    #[test]
+    fn test_header_false_generates_col_names() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let csv = "1,alpha\n2,beta\n";
+            let result =
+                rel.create_table_from_file("default", "t", FileFormat::Csv, false, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
+            let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, vec!["_row", "col_1", "col_2"]);
+            assert!(result.columns.iter().all(|c| c.source_header.is_none()));
+        })
     }
 
     // 4. Header normalization: punctuation -> `_`, source_header preserved,
     //    a collision suffixed, an overlong header truncated to the
-    //    identifier cap (spec §7 test 4).
-    #[tokio::test]
-    async fn test_header_normalization_and_collisions() {
-        let (rel, _dir) = make_engine().await;
-        let long = "a".repeat(60);
-        let csv = format!("Revenue (EUR),revenue (eur),{long}\n1,2,3\n");
-        let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
-        // columns[0] is the synthetic _row; the three CSV columns follow in order.
-        assert_eq!(result.columns[1].name, "revenue__eur_");
-        assert_eq!(result.columns[1].source_header.as_deref(), Some("Revenue (EUR)"));
-        assert_eq!(result.columns[2].name, "revenue__eur__2", "collision with column 1 after normalization");
-        assert_eq!(result.columns[3].name.len(), MAX_IDENTIFIER_LEN, "truncated to the identifier cap");
+    //    identifier cap.
+    #[test]
+    fn test_header_normalization_and_collisions() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let long = "a".repeat(60);
+            let csv = format!("Revenue (EUR),revenue (eur),{long}\n1,2,3\n");
+            let result =
+                rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
+            // columns[0] is the synthetic _row; the three CSV columns follow in order.
+            assert_eq!(result.columns[1].name, "revenue__eur_");
+            assert_eq!(result.columns[1].source_header.as_deref(), Some("Revenue (EUR)"));
+            assert_eq!(result.columns[2].name, "revenue__eur__2", "collision with column 1 after normalization");
+            assert_eq!(result.columns[3].name.len(), MAX_IDENTIFIER_LEN, "truncated to the identifier cap");
+        })
     }
 
     // 5. Type inference cascade: "1,2,x" -> TEXT; "1,2.5" -> REAL; an empty
-    //    field is nullable and reads back as NULL (spec §7 test 5).
-    #[tokio::test]
-    async fn test_type_inference_cascade_and_nullable() {
-        let (rel, _dir) = make_engine().await;
-        let csv = "mixed,real_col,gap\n1,1,x\n2,2.5,\nx,,\n";
-        let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
-        let ty = |name: &str| result.columns.iter().find(|c| c.name == name).unwrap().col_type;
-        assert_eq!(ty("mixed"), ColumnType::Text, "a non-numeric value forces TEXT");
-        assert_eq!(ty("real_col"), ColumnType::Real, "an int and a real value together -> REAL");
-        assert_eq!(ty("gap"), ColumnType::Text, "its only non-empty value is text");
+    //    field is nullable and reads back as NULL.
+    #[test]
+    fn test_type_inference_cascade_and_nullable() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let csv = "mixed,real_col,gap\n1,1,x\n2,2.5,\nx,,\n";
+            let result =
+                rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
+            let ty = |name: &str| result.columns.iter().find(|c| c.name == name).unwrap().col_type;
+            assert_eq!(ty("mixed"), ColumnType::Text, "a non-numeric value forces TEXT");
+            assert_eq!(ty("real_col"), ColumnType::Real, "an int and a real value together -> REAL");
+            assert_eq!(ty("gap"), ColumnType::Text, "its only non-empty value is text");
 
-        let (_, rows) = select_all(&rel, "SELECT gap FROM t WHERE _row = 2").await;
-        assert_eq!(rows[0][0], ScalarValue::Null, "an empty field reads back as NULL");
+            let (_, rows) = select_all(&rel, "SELECT gap FROM t WHERE _row = 2").await;
+            assert_eq!(rows[0][0], ScalarValue::Null, "an empty field reads back as NULL");
+        })
     }
 
     // 6. `?pk=id` with a unique column -> adopted as PK, no `_row`; a
-    //    duplicate value fails just that row, the rest still import
-    //    (spec §7 test 6).
-    #[tokio::test]
-    async fn test_pk_query_param_unique_and_duplicate() {
-        let (rel, _dir) = make_engine().await;
-        let csv = "id,name\n1,alpha\n2,beta\n2,gamma\n";
-        let result = rel
-            .create_table_from_file("default", "t", FileFormat::Csv, true, Some("id"), csv.as_bytes())
-            .await
-            .unwrap();
-        assert!(!result.columns.iter().any(|c| c.name == "_row"), "no synthetic _row when ?pk= is set");
-        assert!(result.columns.iter().find(|c| c.name == "id").unwrap().primary_key);
-        assert_eq!(result.imported, 2);
-        assert_eq!(result.failed, 1);
-        assert_eq!(result.errors[0].row, 3, "the third data row (duplicate id=2) fails");
+    //    duplicate value fails just that row, the rest still import.
+    #[test]
+    fn test_pk_query_param_unique_and_duplicate() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let csv = "id,name\n1,alpha\n2,beta\n2,gamma\n";
+            let result = rel
+                .create_table_from_file("default", "t", FileFormat::Csv, true, Some("id"), Bytes::copy_from_slice(csv.as_bytes()))
+                .await
+                .unwrap();
+            assert!(!result.columns.iter().any(|c| c.name == "_row"), "no synthetic _row when ?pk= is set");
+            assert!(result.columns.iter().find(|c| c.name == "id").unwrap().primary_key);
+            assert_eq!(result.imported, 2);
+            assert_eq!(result.failed, 1);
+            assert_eq!(result.errors[0].row, 3, "the third data row (duplicate id=2) fails");
 
-        let (_, rows) = select_all(&rel, "SELECT id FROM t ORDER BY id").await;
-        assert_eq!(rows, vec![vec![ScalarValue::Integer(1)], vec![ScalarValue::Integer(2)]]);
+            let (_, rows) = select_all(&rel, "SELECT id FROM t ORDER BY id").await;
+            assert_eq!(rows, vec![vec![ScalarValue::Integer(1)], vec![ScalarValue::Integer(2)]]);
+        })
     }
 
     // 7. Row errors: a mismatched column count and an overlong TEXT cell
-    //    each fail just that row (numbered), the import continues past them
-    //    (spec §7 test 7).
-    #[tokio::test]
-    async fn test_row_errors_continue_import() {
-        let (rel, _dir) = make_engine_with(RelStoreConfig { max_text_len: 4, ..RelStoreConfig::default() }).await;
-        let csv = "id,label\n1,ok\n2,a,extra\n3,toolong\n4,fine\n";
-        let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
-        assert_eq!(result.imported, 2, "rows 1 and 4 succeed");
-        assert_eq!(result.failed, 2);
-        let rows: Vec<u64> = result.errors.iter().map(|e| e.row).collect();
-        assert_eq!(rows, vec![2, 3]);
-        assert!(result.errors[0].error.to_lowercase().contains("field") || result.errors[0].error.contains('3'));
+    //    each fail just that row (numbered), the import continues past them.
+    #[test]
+    fn test_row_errors_continue_import() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let too_long = "x".repeat(64 * 1024 + 1);
+            let csv = format!("id,label\n1,ok\n2,a,extra\n3,{too_long}\n4,fine\n");
+            let result =
+                rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
+            assert_eq!(result.imported, 2, "rows 1 and 4 succeed");
+            assert_eq!(result.failed, 2);
+            let rows: Vec<u64> = result.errors.iter().map(|e| e.row).collect();
+            assert_eq!(rows, vec![2, 3]);
+            assert!(result.errors[0].error.to_lowercase().contains("field") || result.errors[0].error.contains('3'));
 
-        let (_, sel) = select_all(&rel, "SELECT id FROM t ORDER BY id").await;
-        assert_eq!(sel, vec![vec![ScalarValue::Integer(1)], vec![ScalarValue::Integer(4)]]);
+            let (_, sel) = select_all(&rel, "SELECT id FROM t ORDER BY id").await;
+            assert_eq!(sel, vec![vec![ScalarValue::Integer(1)], vec![ScalarValue::Integer(4)]]);
+        })
     }
 
     // 7b. Invalid UTF-8 in a data row fails just that row; the import
-    //     continues (spec §7 test 7).
-    #[tokio::test]
-    async fn test_invalid_utf8_row_fails_but_import_continues() {
-        let (rel, _dir) = make_engine().await;
-        let mut body = b"id,label\n1,ok\n2,".to_vec();
-        body.push(0xFF); // a lone byte that is not valid UTF-8 on its own
-        body.extend_from_slice(b"\n3,fine\n");
+    //     continues.
+    #[test]
+    fn test_invalid_utf8_row_fails_but_import_continues() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let mut body = b"id,label\n1,ok\n2,".to_vec();
+            body.push(0xFF); // a lone byte that is not valid UTF-8 on its own
+            body.extend_from_slice(b"\n3,fine\n");
 
-        let result = rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, &body).await.unwrap();
-        assert_eq!(result.imported, 2, "rows 1 and 3 succeed");
-        assert_eq!(result.failed, 1);
-        assert_eq!(result.errors[0].row, 2);
+            let result = rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::from(body)).await.unwrap();
+            assert_eq!(result.imported, 2, "rows 1 and 3 succeed");
+            assert_eq!(result.failed, 1);
+            assert_eq!(result.errors[0].row, 2);
+        })
     }
 
     // Valid multi-byte UTF-8 (as opposed to the invalid bytes above) is not a
     // row error: a TEXT value round-trips exactly (project convention: a
     // non-German multi-byte example, not literal invalid encoding).
-    #[tokio::test]
-    async fn test_multibyte_utf8_value_roundtrips() {
-        let (rel, _dir) = make_engine().await;
-        let csv = "id,label\n1,cl\u{e9}\n2,\u{1F600}\n";
-        let result =
-            rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, csv.as_bytes()).await.unwrap();
-        assert_eq!(result.imported, 2);
-        assert_eq!(result.columns.iter().find(|c| c.name == "label").unwrap().col_type, ColumnType::Text);
+    #[test]
+    fn test_multibyte_utf8_value_roundtrips() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let csv = "id,label\n1,cl\u{e9}\n2,\u{1F600}\n";
+            let result =
+                rel.create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes())).await.unwrap();
+            assert_eq!(result.imported, 2);
+            assert_eq!(result.columns.iter().find(|c| c.name == "label").unwrap().col_type, ColumnType::Text);
 
-        let (_, rows) = select_all(&rel, "SELECT label FROM t ORDER BY _row").await;
-        assert_eq!(rows[0][0], ScalarValue::Text("cl\u{e9}".to_string()));
-        assert_eq!(rows[1][0], ScalarValue::Text("\u{1F600}".to_string()));
+            let (_, rows) = select_all(&rel, "SELECT label FROM t ORDER BY _row").await;
+            assert_eq!(rows[0][0], ScalarValue::Text("cl\u{e9}".to_string()));
+            assert_eq!(rows[1][0], ScalarValue::Text("\u{1F600}".to_string()));
+        })
     }
 
     // The column cap is checked before any per-column work, so a header far
-    // past it costs nothing: with `max_columns = 2`, 5000 identical headers
-    // (which would otherwise be normalized and deduplicated first) are
-    // rejected, and no name normalization result can be observed.
-    #[tokio::test]
-    async fn test_oversized_header_rejected_before_normalization() {
-        let (rel, _dir) =
-            make_engine_with(RelStoreConfig { max_columns: 2, ..RelStoreConfig::default() }).await;
-        let header = vec!["a"; 5_000].join(",");
-        let row = vec!["1"; 5_000].join(",");
-        let csv = format!("{header}\n{row}\n");
+    // past it costs nothing: 5000 identical headers (which would otherwise be
+    // normalized and deduplicated first) are rejected against the 128-column
+    // cap, and no name normalization result can be observed.
+    #[test]
+    fn test_oversized_header_rejected_before_normalization() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let header = vec!["a"; 5_000].join(",");
+            let row = vec!["1"; 5_000].join(",");
+            let csv = format!("{header}\n{row}\n");
 
-        let err = rel
-            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, csv.as_bytes())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { ref which, .. } if which == "max_columns"), "got: {err}");
-        assert!(rel.get_object("default", "wide").is_err(), "no table created");
+            let err = rel
+                .create_table_from_file("default", "wide", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes()))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { ref which, .. } if which == "max_columns"), "got: {err}");
+            assert!(rel.get_object("default", "wide").is_err(), "no table created");
+        })
     }
 
     // Repeated headers keep their left-to-right suffixes even though the probe
@@ -658,59 +832,64 @@ mod tests {
         assert_eq!(mixed, vec!["col", "col_2", "col_3"]);
     }
 
-    // 8. Top-level failures (spec §1/§7 test 8): an existing table name, an
+    // 8. Top-level failures: an existing table name, an
     //    empty file, too many columns, and an unknown `?pk=` column each
     //    fail before any table is created.
-    #[tokio::test]
-    async fn test_top_level_failures_create_nothing() {
-        let (rel, _dir) = make_engine().await;
-        rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-        let err = rel
-            .create_table_from_file("default", "t", FileFormat::Csv, true, None, b"a,b\n1,2\n")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
+    #[test]
+    fn test_top_level_failures_create_nothing() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            rel.execute("default", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            let err = rel
+                .create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::from_static(b"a,b\n1,2\n"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::TableAlreadyExists { .. }), "got: {err}");
 
-        let err = rel.create_table_from_file("default", "empty", FileFormat::Csv, true, None, b"").await.unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
-        assert!(rel.get_object("default", "empty").is_err(), "no table created");
+            let err = rel.create_table_from_file("default", "empty", FileFormat::Csv, true, None, Bytes::from_static(b"")).await.unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            assert!(rel.get_object("default", "empty").is_err(), "no table created");
 
-        let (rel2, _dir2) = make_engine_with(RelStoreConfig { max_columns: 2, ..RelStoreConfig::default() }).await;
-        let err = rel2
-            .create_table_from_file("default", "wide", FileFormat::Csv, true, None, b"a,b,c\n1,2,3\n")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "got: {err}");
-        assert!(rel2.get_object("default", "wide").is_err(), "no table created");
+            let header: Vec<String> = (0..129).map(|i| format!("c{i}")).collect();
+            let csv = format!("{}\n{}\n", header.join(","), vec!["1"; 129].join(","));
+            let err = rel
+                .create_table_from_file("default", "wide", FileFormat::Csv, true, None, Bytes::copy_from_slice(csv.as_bytes()))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::LimitExceeded { .. }), "got: {err}");
+            assert!(rel.get_object("default", "wide").is_err(), "no table created");
 
-        let err = rel
-            .create_table_from_file("default", "u", FileFormat::Csv, true, Some("ghost"), b"a,b\n1,2\n")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
-        assert!(rel.get_object("default", "u").is_err(), "no table created");
+            let err = rel
+                .create_table_from_file("default", "u", FileFormat::Csv, true, Some("ghost"), Bytes::from_static(b"a,b\n1,2\n"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            assert!(rel.get_object("default", "u").is_err(), "no table created");
+        })
     }
 
     // 10. A header column literally named `_row` without `?pk=_row` -> 400
     //     (InvalidSchema); with `?pk=_row` it is accepted and used as-is,
-    //     not replaced by a generated row number (spec §7 test 10).
-    #[tokio::test]
-    async fn test_row_header_conflict_without_pk_row() {
-        let (rel, _dir) = make_engine().await;
-        let err = rel
-            .create_table_from_file("default", "t", FileFormat::Csv, true, None, b"_row,name\n1,a\n")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
-        assert!(rel.get_object("default", "t").is_err());
+    //     not replaced by a generated row number.
+    #[test]
+    fn test_row_header_conflict_without_pk_row() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let err = rel
+                .create_table_from_file("default", "t", FileFormat::Csv, true, None, Bytes::from_static(b"_row,name\n1,a\n"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RelStoreError::InvalidSchema(_)), "got: {err}");
+            assert!(rel.get_object("default", "t").is_err());
 
-        let result = rel
-            .create_table_from_file("default", "t2", FileFormat::Csv, true, Some("_row"), b"_row,name\n5,a\n")
-            .await
-            .unwrap();
-        assert_eq!(result.columns.len(), 2);
-        assert!(result.columns.iter().find(|c| c.name == "_row").unwrap().primary_key);
-        let (_, rows) = select_all(&rel, "SELECT _row FROM t2").await;
-        assert_eq!(rows[0][0], ScalarValue::Integer(5), "uses the file's own value, not a generated row number");
+            let result = rel
+                .create_table_from_file("default", "t2", FileFormat::Csv, true, Some("_row"), Bytes::from_static(b"_row,name\n5,a\n"))
+                .await
+                .unwrap();
+            assert_eq!(result.columns.len(), 2);
+            assert!(result.columns.iter().find(|c| c.name == "_row").unwrap().primary_key);
+            let (_, rows) = select_all(&rel, "SELECT _row FROM t2").await;
+            assert_eq!(rows[0][0], ScalarValue::Integer(5), "uses the file's own value, not a generated row number");
+        })
     }
 }

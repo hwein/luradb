@@ -1,4 +1,4 @@
-//! 5-field cron subset (spec general/006 configuration schema): minute,
+//! 5-field cron subset for backup schedules: minute,
 //! hour, day-of-month, month, weekday. Supports `*`, single values, lists
 //! (`a,b,c`), ranges (`a-b`) and steps (`*/n`, `a-b/n`). No names (`MON`,
 //! `JAN`), no special characters (`@daily`, `L`, `#`).
@@ -64,6 +64,28 @@ impl CronSchedule {
             (false, false) => self.day_of_month.contains(&day_of_month) || self.weekday.contains(&weekday),
         }
     }
+
+    /// Whether the schedule fires after `now` (Unix seconds, UTC) and within
+    /// `days` days. Minute and hour always hold at least one value, so only
+    /// the date fields can keep a schedule silent: one check per day suffices.
+    pub fn fires_within_days(&self, now: u64, days: u64) -> bool {
+        let start = civil_from_unix(now);
+        // Like the scheduler, the start minute itself never fires.
+        let later_today = self
+            .hour
+            .iter()
+            .flat_map(|&hour| self.minute.iter().map(move |&minute| (hour, minute)))
+            .find(|&time| time > (start.hour, start.minute));
+        if let Some((hour, minute)) = later_today {
+            if self.matches(minute, hour, start.day, start.month, start.weekday) {
+                return true;
+            }
+        }
+        (1..=days).any(|day| {
+            let t = civil_from_unix(now + day * 86400);
+            self.matches(self.minute[0], self.hour[0], t.day, t.month, t.weekday)
+        })
+    }
 }
 
 /// Parses one field, returning its expanded, sorted, deduped value set and
@@ -128,10 +150,8 @@ fn parse_bound(part: &str, min: u32, max: u32, name: &str) -> Result<u32> {
     Ok(v)
 }
 
-// ── Civil calendar time ──────────────────────────────────────────────────
-//
-// Shared by backup/restore ID timestamps (spec general/006) and, in the
-// scheduler follow-up, the cron minute-match against "now". This project has
+// `CivilTime` and `civil_from_unix` are shared by backup/restore ID timestamps
+// and the scheduler's cron minute-match against "now". This project has
 // no chrono/time dependency, so date math is done by hand: proleptic
 // Gregorian civil-from-days (Howard Hinnant's algorithm,
 // http://howardhinnant.github.io/date_algorithms.html).
@@ -175,7 +195,7 @@ pub fn civil_from_unix(unix_secs: u64) -> CivilTime {
     CivilTime { year, month, day, hour, minute, second, weekday }
 }
 
-/// Formats a Unix timestamp as `YYYYMMDDTHHMMSSZ` (spec general/006 backup/restore IDs).
+/// Formats a Unix timestamp as `YYYYMMDDTHHMMSSZ` (backup/restore IDs).
 pub fn format_utc_timestamp(unix_secs: u64) -> String {
     let t = civil_from_unix(unix_secs);
     format!(
@@ -206,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_nightly_example_from_spec() {
-        // "0 3 * * *" from the spec's [[backup.schedule]] example.
+        // "0 3 * * *": the nightly [[backup.schedule]] example.
         let sched = CronSchedule::parse("0 3 * * *").unwrap();
         assert!(sched.matches(0, 3, 1, 1, 0));
         assert!(sched.matches(0, 3, 15, 7, 4));
@@ -278,7 +298,7 @@ mod tests {
     #[test]
     fn test_dom_step_counts_as_restricted_for_the_or_rule() {
         // `*/3` is not literally `*`, so day-of-month and weekday are
-        // OR-combined (spec general/006) -- Vixie cron would AND them here.
+        // OR-combined -- Vixie cron would AND them here.
         let sched = CronSchedule::parse("30 2 */3 * 1").unwrap();
         assert!(sched.matches(30, 2, 4, 6, 5)); // day 4 is in */3, any weekday
         assert!(sched.matches(30, 2, 5, 6, 1)); // Monday, day not in */3
@@ -351,8 +371,6 @@ mod tests {
     fn test_reject_empty_list_items() {
         assert!(CronSchedule::parse("1,,2 * * * *").is_err());
     }
-
-    // ── civil_from_unix / format_utc_timestamp ───────────────────────────
 
     #[test]
     fn test_civil_from_unix_epoch() {

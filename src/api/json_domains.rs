@@ -1,27 +1,32 @@
-//! JSON-domain REST handlers (spec json/009).
+//! JSON-domain REST handlers.
 //!
 //! POST   /store-api/json/domains          → create_domain  (201 | 409 | 400)
 //! GET    /store-api/json/domains          → list_domains   (200)
-//! GET    /store-api/json/domains/{name}   → get_domain     (200 | 404)
+//! GET    /store-api/json/domains/{name}   → get_domain     (200 | 403 | 404 | 410)
 //! DELETE /store-api/json/domains/{name}   → delete_domain  (202 | 404)
 
+use crate::api::domains::DomainFilter;
 use crate::api::json::json_engine;
 use crate::api::{middleware::ApiError, AppState};
+use crate::auth::middleware::{AuthOutcome, AuthUser, StoreType};
+use crate::control::{DomainEntry, Engine};
 use crate::engines::json::{JsonDomain, JsonDomainState};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::Json,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-// ── DTOs ─────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize, ToSchema)]
 pub struct CreateJsonDomainRequest {
     /// User-visible domain name (max 50 chars, [a-zA-Z0-9_-]).
     pub name: String,
+    /// When true, PUT and DELETE on documents need `If-Match` or
+    /// `If-None-Match: *` and answer 428 without. Fixed at creation; default false.
+    #[serde(default)]
+    pub require_conditional_writes: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -31,6 +36,8 @@ pub struct JsonDomainResponse {
     pub created_at: u64,
     /// Lifecycle state: "active" or "deleting" (background purge running).
     pub state: String,
+    /// Whether document PUT and DELETE need `If-Match` or `If-None-Match: *` (else 428).
+    pub require_conditional_writes: bool,
     /// Number of documents — only set on the detail endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_count: Option<u64>,
@@ -46,12 +53,23 @@ impl From<JsonDomain> for JsonDomainResponse {
             name: d.name,
             created_at: d.created_at,
             state: state.to_string(),
+            require_conditional_writes: d.require_conditional_writes,
             document_count: None,
         }
     }
 }
 
-// ── Handlers ─────────────────────────────────────────────────────────────────
+impl From<&DomainEntry> for JsonDomainResponse {
+    fn from(d: &DomainEntry) -> Self {
+        JsonDomainResponse {
+            name: d.name.clone(),
+            created_at: d.created_at,
+            state: d.state.as_str().to_string(),
+            require_conditional_writes: d.require_conditional_writes,
+            document_count: None,
+        }
+    }
+}
 
 #[utoipa::path(
     post,
@@ -66,30 +84,38 @@ impl From<JsonDomain> for JsonDomainResponse {
     tag = "JSON Document Store"
 )]
 /// Creates a new JSON domain (isolated document namespace, separate from KV domains).
+/// With `require_conditional_writes`, single-document writes over REST (PUT, DELETE) must carry
+/// `If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.
 pub async fn create_domain(
     State(state): State<AppState>,
     Json(body): Json<CreateJsonDomainRequest>,
 ) -> Result<(StatusCode, Json<JsonDomainResponse>), ApiError> {
-    let engine = json_engine(&state)?;
-    let domain = engine.create_domain(&body.name).await?;
-    Ok((StatusCode::CREATED, Json(domain.into())))
+    json_engine(&state)?;
+    let domain = state.control.create_domain(Engine::Json, &body.name, body.require_conditional_writes).await?;
+    Ok((StatusCode::CREATED, Json((&domain).into())))
 }
 
 #[utoipa::path(
     get,
     path = "/store-api/json/domains",
     responses(
-        (status = 200, description = "List of active JSON domains", body = Vec<JsonDomainResponse>),
+        (status = 200, description = "List of the active JSON domains the key may access", body = Vec<JsonDomainResponse>),
         (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "JSON Document Store"
 )]
-/// Returns all active JSON domains.
+/// Returns the active JSON domains. Admin keys see all of them; any other key
+/// sees only the JSON domains it has a permission on (an empty list without any).
 pub async fn list_domains(
     State(state): State<AppState>,
+    outcome: Option<Extension<AuthOutcome>>,
+    user: Option<Extension<AuthUser>>,
 ) -> Result<Json<Vec<JsonDomainResponse>>, ApiError> {
-    let engine = json_engine(&state)?;
-    Ok(Json(engine.list_domains().into_iter().map(Into::into).collect()))
+    json_engine(&state)?;
+    let filter = DomainFilter::for_caller(&state, outcome, user, StoreType::Json).await?;
+    let directory = state.control.directory();
+    let visible = directory.domains(Engine::Json).filter(|d| filter.allows(&d.name));
+    Ok(Json(visible.map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -98,6 +124,7 @@ pub async fn list_domains(
     params(("name" = String, Path, description = "JSON domain name")),
     responses(
         (status = 200, description = "Domain found", body = JsonDomainResponse),
+        (status = 403, description = "Forbidden — no permission on the domain (also when it does not exist)", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted (background purge running)", body = String, content_type = "text/plain"),
         (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
@@ -105,7 +132,7 @@ pub async fn list_domains(
     tag = "JSON Document Store"
 )]
 /// Returns metadata for a single JSON domain, including its document count.
-/// Domains in `deleting` state answer with 410 Gone.
+/// Needs a permission on the domain (admin keys always pass). Domains in `deleting` state answer with 410 Gone.
 pub async fn get_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -141,7 +168,7 @@ pub async fn delete_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let engine = json_engine(&state)?;
-    engine.delete_domain(&name).await?;
+    json_engine(&state)?;
+    state.control.delete_domain(Engine::Json, &name).await?;
     Ok(StatusCode::ACCEPTED)
 }

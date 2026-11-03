@@ -1,4 +1,4 @@
-//! Two-process reader-liveness test for spec perf/012 (test strategy 9).
+//! Two-process reader-liveness test.
 //!
 //! The parent runs the server side: `ShmManager`, the registration listener,
 //! the command dispatcher and the publisher's `SnapshotWriter`. The child is a
@@ -12,7 +12,13 @@
 //! publish onto that buffer goes through again, (c) the bytes the child read
 //! match the published snapshot exactly.
 
+mod common;
+
+use luradb::auth::AuthCache;
 use luradb::config::ShmConfig;
+use luradb::control::{serve_shard, system, ControlPlane, Owners, Shard, ShardOwners};
+use luradb::core::events::GlobalEventBus;
+use luradb::core::storage_thread::{StorageThread, WalTarget};
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::domain::{DomainConfig, DomainRegistry};
 use luradb::engines::lsm::engine::LsmEngineOptions;
@@ -49,107 +55,113 @@ const SNAPSHOT_PINNED: &[u8] = b"snapshot-1: the child pins this one";
 const SNAPSHOT_FREE: &[u8] = b"snapshot-2: lands on the free buffer";
 const SNAPSHOT_BLOCKED: &[u8] = b"snapshot-3: wants the pinned buffer";
 
-// ── Parent ────────────────────────────────────────────────────────────────────
+#[test]
+fn shm_reader_liveness_across_processes() {
+    luradb::core::engine_runtime::block_on(async {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("reg.sock");
+        let ready = dir.path().join("child-ready");
+        let instance_id = format!("shm012-{}", std::process::id());
 
-#[tokio::test]
-async fn shm_reader_liveness_across_processes() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let sock = dir.path().join("reg.sock");
-    let ready = dir.path().join("child-ready");
-    let instance_id = format!("shm012-{}", std::process::id());
+        let manager = ShmManager::new(shm_config(&instance_id, &sock)).expect("shm manager");
+        let state = manager.get_segment("state").expect("state segment");
+        let data_a = manager.get_segment("data_a").expect("data_a segment");
+        let data_b = manager.get_segment("data_b").expect("data_b segment");
+        // Safe: the segments outlive `manager`'s use here and are only touched
+        // through `StateHeader` / the writer's raw pointers.
+        let header = unsafe { StateHeader::from_ptr(state.as_ptr(), state.len()) };
+        header.init();
 
-    let manager = ShmManager::new(shm_config(&instance_id, &sock)).expect("shm manager");
-    let state = manager.get_segment("state").expect("state segment");
-    let data_a = manager.get_segment("data_a").expect("data_a segment");
-    let data_b = manager.get_segment("data_b").expect("data_b segment");
-    // Safe: the segments outlive `manager`'s use here and are only touched
-    // through `StateHeader` / the writer's raw pointers.
-    let header = unsafe { StateHeader::from_ptr(state.as_ptr(), state.len()) };
-    header.init();
+        let readers = Arc::new(ReaderRegistry::new());
+        let buf_len = data_a.len();
+        // Safe: this test is the single writer; the two data buffers are distinct
+        // mappings of `buf_len` bytes.
+        let writer = unsafe {
+            SnapshotWriter::new(
+                header,
+                data_a.as_ptr() as *mut u8,
+                data_b.as_ptr() as *mut u8,
+                buf_len,
+                PUBLISH_WAIT_TIMEOUT_US,
+                Arc::clone(&readers),
+            )
+        };
 
-    let readers = Arc::new(ReaderRegistry::new());
-    let buf_len = data_a.len();
-    // Safe: this test is the single writer; the two data buffers are distinct
-    // mappings of `buf_len` bytes.
-    let writer = unsafe {
-        SnapshotWriter::new(
-            header,
-            data_a.as_ptr() as *mut u8,
-            data_b.as_ptr() as *mut u8,
-            buf_len,
-            PUBLISH_WAIT_TIMEOUT_US,
-            Arc::clone(&readers),
-        )
-    };
+        let (control, _hub, _db_dir) = make_control().await;
+        let listener = prepare_registration_socket(&sock.to_string_lossy()).expect("registration socket");
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let dispatcher = compio::runtime::spawn(ShmDispatcher::new(control).run(events_rx, shutdown_rx.clone()));
+        let registration = compio::runtime::spawn(serve_registration(
+            listener,
+            RegistrationConfig {
+                instance_id: instance_id.clone(),
+                ring_size: 4096,
+                segment_mode: 0o600,
+                auth_enabled: false,
+                trusted_uids: Arc::new(Vec::new()),
+                readers: Arc::clone(&readers),
+            },
+            events_tx,
+            shutdown_rx,
+        ));
 
-    let (registry, _db_dir) = make_registry().await;
-    let listener = prepare_registration_socket(&sock.to_string_lossy()).expect("registration socket");
-    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let dispatcher = tokio::spawn(ShmDispatcher::new(registry).run(events_rx, shutdown_rx.clone()));
-    let registration = tokio::spawn(serve_registration(
-        listener,
-        RegistrationConfig {
-            instance_id: instance_id.clone(),
-            ring_size: 4096,
-            segment_mode: 0o600,
-            auth_enabled: false,
-            trusted_uids: Arc::new(Vec::new()),
-            readers: Arc::clone(&readers),
-        },
-        events_tx,
-        shutdown_rx,
-    ));
+        // Buffer A is active after init, so this lands in buffer B — the one the
+        // child will pin.
+        assert_eq!(writer.publish(SNAPSHOT_PINNED).unwrap(), PublishOutcome::Published);
 
-    // Buffer A is active after init, so this lands in buffer B — the one the
-    // child will pin.
-    assert_eq!(writer.publish(SNAPSHOT_PINNED).unwrap(), PublishOutcome::Published);
+        let mut child = ChildGuard(spawn_child(&sock, &instance_id, &ready));
 
-    let mut child = ChildGuard(spawn_child(&sock, &instance_id, &ready));
+        // (c) The child read the published snapshot byte for byte.
+        let seen = wait_for_ready(&ready).await.expect("child never reported a pinned snapshot");
+        assert_eq!(seen, SNAPSHOT_PINNED, "child read different bytes than were published");
 
-    // (c) The child read the published snapshot byte for byte.
-    let seen = wait_for_ready(&ready).await.expect("child never reported a pinned snapshot");
-    assert_eq!(seen, SNAPSHOT_PINNED, "child read different bytes than were published");
+        // (a) The free buffer still takes a publish; the pinned one is skipped.
+        assert_eq!(writer.publish(SNAPSHOT_FREE).unwrap(), PublishOutcome::Published);
+        assert_eq!(
+            writer.publish(SNAPSHOT_BLOCKED).unwrap(),
+            PublishOutcome::SkippedBusy { buffer: 1 },
+            "a buffer pinned by a foreign process must never be overwritten"
+        );
+        assert_eq!(readers.blockers(1), vec![(1, 1)], "the child is the single blocker");
 
-    // (a) The free buffer still takes a publish; the pinned one is skipped.
-    assert_eq!(writer.publish(SNAPSHOT_FREE).unwrap(), PublishOutcome::Published);
-    assert_eq!(
-        writer.publish(SNAPSHOT_BLOCKED).unwrap(),
-        PublishOutcome::SkippedBusy { buffer: 1 },
-        "a buffer pinned by a foreign process must never be overwritten"
-    );
-    assert_eq!(readers.blockers(1), vec![(1, 1)], "the child is the single blocker");
+        // (b) SIGKILL: the EOF path deregisters the slot and publishing resumes.
+        child.kill_and_reap();
+        assert!(
+            publish_until_published(&writer, SNAPSHOT_BLOCKED).await,
+            "reader slot was never reclaimed after the client process was killed"
+        );
 
-    // (b) SIGKILL: the EOF path deregisters the slot and publishing resumes.
-    child.kill_and_reap();
-    assert!(
-        publish_until_published(&writer, SNAPSHOT_BLOCKED).await,
-        "reader slot was never reclaimed after the client process was killed"
-    );
-
-    let _ = shutdown_tx.send(true);
-    let _ = registration.await;
-    let _ = dispatcher.await;
-    manager.shutdown();
+        let _ = shutdown_tx.send(true);
+        let _ = registration.await;
+        let _ = dispatcher.await;
+        manager.shutdown();
+    })
 }
 
 fn shm_config(instance_id: &str, sock: &Path) -> ShmConfig {
     ShmConfig {
         enabled: true,
         instance_id: instance_id.to_string(),
-        state_size: 4096,
         data_buffer_size: 8192,
-        command_buffer_size: 4096,
-        segment_mode: 0o600,
         registration_socket_path: sock.to_string_lossy().to_string(),
         snapshot_interval_ms: 100,
+        kick_blocking_client_after_secs: 0,
     }
 }
 
-async fn make_registry() -> (Arc<DomainRegistry>, tempfile::TempDir) {
+/// A control plane over one data shard with a key-value registry on a fresh
+/// store, with the storage hub that writes its and the system store's WALs.
+async fn make_control() -> (Arc<ControlPlane>, StorageThread, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let wal_path = dir.path().join("wal.log");
-    let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
+    let system_dir = dir.path().join("sys");
+    std::fs::create_dir_all(&system_dir).expect("system dir");
+    let (hub, handle) =
+        common::start_hub(&[(WalTarget::Kv, &wal_path), (WalTarget::Sys, &system_dir.join(system::WAL_FILE))]);
+    let system_wal = WriteAheadLog::with_storage_handle(handle.clone(), WalTarget::Sys);
+    let system = system::open_with_wal(&system_dir, system_wal).await.expect("system store");
+    let wal = Arc::new(WriteAheadLog::with_storage_handle(handle, WalTarget::Kv));
     let vlog_path = dir.path().join("vlog.log");
     let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
     let file_manager = Arc::new(FileManager::new(dir.path()).await.unwrap());
@@ -170,7 +182,14 @@ async fn make_registry() -> (Arc<DomainRegistry>, tempfile::TempDir) {
     let metrics = MetricsStore::new(MetricsConfig::default());
     let registry =
         Arc::new(DomainRegistry::recover(engine, DomainConfig::default(), metrics).await.unwrap());
-    (registry, dir)
+    let owners = ShardOwners { kv: registry, json: None, rel: None };
+    let (commands, inbox) = tokio::sync::mpsc::unbounded_channel();
+    compio::runtime::spawn(serve_shard(owners.clone(), inbox)).detach();
+    let auth = Arc::new(AuthCache::new(Arc::clone(&system), None));
+    let bus = Arc::new(GlobalEventBus::new(64, 64));
+    let owners = Owners { shards: vec![Shard { owners, commands }], auth };
+    let control = ControlPlane::start(owners, system, bus, Default::default()).await.expect("control plane");
+    (control, hub, dir)
 }
 
 /// Kills the child on drop, so a failing assertion cannot leak the process.
@@ -216,7 +235,7 @@ async fn wait_for_ready(ready: &Path) -> Option<Vec<u8>> {
         if Instant::now() >= deadline {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        compio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -232,11 +251,9 @@ async fn publish_until_published(writer: &SnapshotWriter<'_>, data: &[u8]) -> bo
         if Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        compio::time::sleep(Duration::from_millis(20)).await;
     }
 }
-
-// ── Child role ────────────────────────────────────────────────────────────────
 
 /// The client process of the test above. `#[ignore]`d and gated on `ROLE_ENV`:
 /// a plain `cargo test -- --ignored` runs it as a no-op.
@@ -262,7 +279,7 @@ fn shm_reader_liveness_child() {
     let parts: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(parts.first().copied(), Some("OK"), "registration failed: {line:?}");
 
-    // Mandatory mapping modes (spec perf/012 §10): state and both data buffers
+    // Mandatory mapping modes: state and both data buffers
     // read-only, our own cmd_hdr — which carries the reader slot — read/write.
     let cmd_hdr = ShmSegment::open(parts[3]).expect("open cmd_hdr read/write");
     let seg = |purpose: &str| {

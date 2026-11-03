@@ -1,4 +1,4 @@
-//! AST for LuraSQL (spec rel/004, concept 004 ch. 4).
+//! AST for LuraSQL.
 //!
 //! The parser (`parser.rs`) builds these types via recursive descent; the
 //! binder (`binder.rs`) translates the DDL subset into catalog inputs
@@ -7,19 +7,15 @@
 
 use super::types::ColumnType;
 
-// ── Statement classification (concept 4.2; rel/011 auth) ───────────────────────
-
-/// Coarse statement class for the two-stage auth enforcement rel/011 adds.
+/// Coarse statement class for the two-stage auth enforcement.
 /// `Ddl` covers table/index/view DDL alike; every DDL statement parses, binds,
-/// and executes downstream (view DDL included, since rel/008).
+/// and executes downstream (view DDL included).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementClass {
     Read,
     Write,
     Ddl,
 }
-
-// ── Top-level statement ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -54,8 +50,6 @@ impl Statement {
     }
 }
 
-// ── DDL: tables & indexes ────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTable {
     pub name: String,
@@ -63,7 +57,7 @@ pub struct CreateTable {
 }
 
 /// One column in a `CREATE TABLE`/`ADD COLUMN`. Not `ColumnDef` — that name is
-/// the catalog's own struct (rel/003); the binder translates this into a
+/// the catalog's own struct; the binder translates this into a
 /// `catalog::ColumnInput`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstColumnDef {
@@ -119,14 +113,12 @@ pub struct DropIndex {
     pub name: String,
 }
 
-// ── DDL: views (parse + bind only in this spec; execution → rel/008) ───────────
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateView {
     pub name: String,
     pub select: Box<Select>,
     /// Byte offset in the original SQL text where the `SELECT` body begins
-    /// (right after `AS`) — rel/008 slices the raw, unparsed view text from
+    /// (right after `AS`) — view DDL slices the raw, unparsed view text from
     /// here to end-of-statement instead of re-serializing the AST.
     pub select_offset: usize,
 }
@@ -135,8 +127,6 @@ pub struct CreateView {
 pub struct DropView {
     pub name: String,
 }
-
-// ── DML (parse + front-end checks only in this spec; execution → rel/005) ──────
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insert {
@@ -166,8 +156,6 @@ pub struct Delete {
     pub where_clause: Option<Expr>,
 }
 
-// ── SELECT (parse + front-end checks only in this spec; execution → rel/006-007) ─
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub items: Vec<SelectItem>,
@@ -179,7 +167,7 @@ pub struct Select {
 }
 
 /// A `select_list` is exclusively `*`, `COUNT(*)`, or a non-empty list of
-/// `Column` items (grammar §4) — enforced by the parser, not by this type.
+/// `Column` items — enforced by the parser, not by this type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Star,
@@ -219,8 +207,6 @@ pub struct Limit {
     pub limit: i64,
     pub offset: Option<i64>,
 }
-
-// ── Expressions (WHERE) ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {

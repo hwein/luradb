@@ -13,13 +13,20 @@ use axum::{
 use std::sync::Arc;
 
 /// Marker set by the UDS accept loop for connections whose kernel-verified
-/// peer UID is in `auth.trusted_uids` (spec perf/001). Grants admin access.
+/// peer UID is in `auth.trusted_uids`. Grants admin access.
 /// Clients cannot forge request extensions, so its presence is trustworthy.
 #[derive(Clone, Copy, Debug)]
 pub struct TrustedPeer;
 
+/// Marker the MCP listener sets on the internal requests it builds for its
+/// tools, resources and OAuth endpoints; no network request carries it. Only
+/// such requests may use an OAuth access token or reach the internal OAuth
+/// routes.
+#[derive(Clone, Copy, Debug)]
+pub struct McpInternal;
+
 /// Store type of a domain-scoped request — KV, JSON and rel domains are
-/// separate permission namespaces (spec json/012, rel/011).
+/// separate permission namespaces.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum StoreType {
     Kv,
@@ -32,18 +39,26 @@ pub(crate) enum StoreType {
 ///   /store-api/json/{domain}/…           → (Json, domain, false)
 ///   /store-api/rel/{domain}/…            → (Rel, domain, false)
 ///   /store-api/domains/{domain}[/…]      → (Kv, domain, true)   KV domain management
+///   /store-api/json/domains/{domain}     → (Json, domain, true) JSON domain management
+///   /store-api/rel/domains/{domain}      → (Rel, domain, true)  rel domain management
 ///   /store-api/metrics/domains/{domain}  → (Kv, domain, false)  domain metrics
-/// `/store-api/json/domains/…`, `/store-api/rel/domains/…` and everything
-/// else → None (admin-only).
-fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
+/// The domain listings (`/store-api/{,json/,rel/}domains`) and everything
+/// else → None.
+pub(crate) fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
         ["store-api", "kv", domain, ..] if !domain.is_empty() => {
             Some((StoreType::Kv, domain, false))
         }
+        ["store-api", "json", "domains", domain] if !domain.is_empty() => {
+            Some((StoreType::Json, domain, true))
+        }
         ["store-api", "json", "domains", ..] => None,
         ["store-api", "json", domain, ..] if !domain.is_empty() => {
             Some((StoreType::Json, domain, false))
+        }
+        ["store-api", "rel", "domains", domain] if !domain.is_empty() => {
+            Some((StoreType::Rel, domain, true))
         }
         ["store-api", "rel", "domains", ..] => None,
         ["store-api", "rel", domain, ..] if !domain.is_empty() => {
@@ -59,8 +74,12 @@ fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
     }
 }
 
+fn is_domain_listing(path: &str) -> bool {
+    matches!(path, "/store-api/domains" | "/store-api/json/domains" | "/store-api/rel/domains")
+}
+
 /// POST counts as a write except for the read-only `/search` endpoint and
-/// `/sql` (rel/011 §4): its required level depends on the statement, so the
+/// `/sql`: its required level depends on the statement, so the
 /// handler enforces it after parsing — the middleware only demands `Read`.
 fn is_write_request(method: &Method, path: &str) -> bool {
     match *method {
@@ -103,7 +122,7 @@ fn forbidden() -> Response {
 }
 
 /// Result of the middleware auth check for a domain-scoped request, handed to
-/// handlers that need a finer check than the path allows (rel/009 `/sql`).
+/// handlers that need a finer check than the path allows (`/sql`).
 /// Set by `auth_layer` into the request extensions.
 #[derive(Clone, Copy, Debug)]
 pub enum AuthOutcome {
@@ -113,15 +132,16 @@ pub enum AuthOutcome {
     Scoped(AccessLevel),
 }
 
-/// Username of a Scoped user, set into the request extensions alongside
-/// `AuthOutcome::Scoped` (spec rel/016). Additive — `AuthOutcome` itself is
-/// unchanged (`backup.rs` depends on its exact shape). Lets handlers that
-/// need a per-engine permission lookup (cross-engine link authorization)
-/// resolve the caller's username without re-deriving it from the request.
+/// Username of a regular user, set into the request extensions alongside
+/// `AuthOutcome::Scoped`, or alone on the domain listings. Additive —
+/// `AuthOutcome` itself is unchanged (`backup.rs` depends on its exact shape).
+/// Lets handlers that need a per-engine permission lookup (cross-engine link
+/// authorization, domain listings) resolve the caller's username without
+/// re-deriving it from the request.
 #[derive(Clone, Debug)]
 pub struct AuthUser(pub String);
 
-/// Enforces the statement-exact level in the `/sql` handler (rel/011 §4).
+/// Enforces the statement-exact level in the `/sql` handler.
 /// `required` is mapped by the caller from `StatementClass`. `auth_enabled`
 /// comes from `AppState`: a missing outcome may only pass when auth is
 /// globally off — otherwise fail-closed (403), since a missing outcome while
@@ -130,13 +150,13 @@ pub fn enforce_sql_level(
     auth_enabled: bool,
     outcome: Option<AuthOutcome>,
     required: AccessLevel,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     match outcome {
         Some(AuthOutcome::Full) => Ok(()),
         Some(AuthOutcome::Scoped(level)) if level >= required => Ok(()),
-        Some(AuthOutcome::Scoped(_)) => Err(forbidden()),
+        Some(AuthOutcome::Scoped(_)) => Err(Box::new(forbidden())),
         None if !auth_enabled => Ok(()), // auth globally off: nothing is checked anywhere
-        None => Err(forbidden()),        // auth on, outcome missing: fail-closed
+        None => Err(Box::new(forbidden())), // auth on, outcome missing: fail-closed
     }
 }
 
@@ -154,23 +174,26 @@ pub async fn auth_layer(
         return next.run(request).await;
     }
 
-    // UDS peers with a trusted UID are authenticated by the kernel (perf/001).
+    // The MCP listener's OAuth state: its client registrations and code
+    // exchanges carry no user key, and for every other caller the routes
+    // do not exist.
+    let mcp_internal = request.extensions().get::<McpInternal>().is_some();
+    if path.starts_with("/store-api/auth/oauth/") {
+        return if mcp_internal { next.run(request).await } else { StatusCode::NOT_FOUND.into_response() };
+    }
+
+    // UDS peers with a trusted UID are authenticated by the kernel.
     if request.extensions().get::<TrustedPeer>().is_some() {
         request.extensions_mut().insert(AuthOutcome::Full);
         return next.run(request).await;
     }
 
-    let hash = match extract_bearer(request.headers()) {
-        Some(h) => h,
-        None => return unauthorized(),
-    };
-
-    let user = match cache.get_user_by_key_hash(&hash).await {
+    let user = match cache.resolve_bearer(request.headers(), mcp_internal, crate::auth::now_secs()).await {
         Some(u) => u,
         None => return unauthorized(),
     };
 
-    // Whitelist (spec 004 §7 for /version, general/016 for whoami): any valid
+    // Whitelist (/version handshake, whoami): any valid
     // key passes for these paths, no domain permission or admin role
     // required. Must come after user resolution (so an invalid key still
     // 401s) but before the admin/domain logic below — extract_domain(…) is
@@ -185,17 +208,24 @@ pub async fn auth_layer(
         return next.run(request).await;
     }
 
+    // Domain listings are open to every user; the handler filters them by the
+    // user's permissions. Creating a domain (POST) stays admin-only.
+    if is_domain_listing(&path) && matches!(*request.method(), Method::GET | Method::HEAD) {
+        request.extensions_mut().insert(AuthUser(user.name.clone()));
+        return next.run(request).await;
+    }
+
     // Regular user: check domain permission
     let (store_type, domain, management) = match extract_domain(&path) {
         Some(x) => x,
         None => {
-            // Path doesn't include a domain (e.g. /auth/* or /json/domains/*
-            // management routes). Only admins can reach those.
+            // Path doesn't include a domain (e.g. /auth/*, /metrics, /config).
+            // Only admins can reach those.
             return forbidden();
         }
     };
 
-    // Domain lifecycle (create/delete) is admin-only (spec kv/012); GET on
+    // Domain lifecycle (create/delete) is admin-only; GET on
     // management paths stays open to users with a permission on the domain.
     if management
         && matches!(
@@ -208,9 +238,9 @@ pub async fn auth_layer(
 
     let perm_domain = permission_domain(store_type, domain);
     let perm = cache.get_permission(&user.name, &perm_domain).await;
-    // Ddl > Write > Read (spec rel/011 §3): a higher grant covers path-based
+    // Ddl > Write > Read: a higher grant covers path-based
     // writes too. `/sql` never requires more than Read here — the exact
-    // statement level is the handler's job (`enforce_sql_level`, §4).
+    // statement level is the handler's job (`enforce_sql_level`).
     let required_min = if is_write_request(request.method(), &path) {
         AccessLevel::Write
     } else {
@@ -226,9 +256,9 @@ pub async fn auth_layer(
     }
 }
 
-/// Axum middleware for the OpenAPI/Swagger docs routes (spec general/014).
+/// Axum middleware for the OpenAPI/Swagger docs routes.
 /// Applied only to the Swagger sub-router in `build_router` — never merged
-/// into `create_router`'s route surface, which would trip the general/009
+/// into `create_router`'s route surface, which would trip the
 /// router-contract coverage gate. Same "any valid key, no domain permission"
 /// rule as the `/version` handshake in `auth_layer` above, since docs routes
 /// aren't domain-scoped either.
@@ -251,16 +281,14 @@ pub async fn docs_auth_layer(
 }
 
 pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?;
-    let s = value.to_str().ok()?;
-    let token = s.strip_prefix("Bearer ")?;
-    if token.is_empty() {
-        return None;
-    }
-    Some(crate::auth::hash_api_key(token))
+    bearer_token(headers).map(crate::auth::hash_api_key)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+/// The Bearer credential of `headers`, if any.
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
+    (!token.is_empty()).then_some(token)
+}
 
 #[cfg(test)]
 mod tests {
@@ -281,7 +309,12 @@ mod tests {
             Some((StoreType::Json, "users", false))
         );
         assert_eq!(extract_domain("/store-api/json/domains"), None);
-        assert_eq!(extract_domain("/store-api/json/domains/users"), None);
+        assert_eq!(
+            extract_domain("/store-api/json/domains/users"),
+            Some((StoreType::Json, "users", true))
+        );
+        assert_eq!(extract_domain("/store-api/json/domains/users/extra"), None);
+        assert_eq!(extract_domain("/store-api/json/domains/"), None);
         assert_eq!(
             extract_domain("/store-api/rel/sales/sql"),
             Some((StoreType::Rel, "sales", false))
@@ -295,7 +328,12 @@ mod tests {
             Some((StoreType::Rel, "sales", false))
         );
         assert_eq!(extract_domain("/store-api/rel/domains"), None);
-        assert_eq!(extract_domain("/store-api/rel/domains/sales"), None);
+        assert_eq!(
+            extract_domain("/store-api/rel/domains/sales"),
+            Some((StoreType::Rel, "sales", true))
+        );
+        assert_eq!(extract_domain("/store-api/rel/domains/sales/extra"), None);
+        assert_eq!(extract_domain("/store-api/rel/domains/"), None);
         assert_eq!(
             extract_domain("/store-api/domains/analytics"),
             Some((StoreType::Kv, "analytics", true))
@@ -373,15 +411,13 @@ mod tests {
         assert!(enforce_sql_level(true, None, Ddl).is_err());
     }
 
-    // ── HTTP-level: /version handshake + /health regression (spec 004 §7) ──
-
     use axum::body::Body;
     use axum::http::Request;
     use tower::util::ServiceExt;
     use utoipa::OpenApi;
 
     /// Shared engine/state bootstrap for `make_app_with_auth` and
-    /// `make_docs_app` below (spec general/014).
+    /// `make_docs_app` below.
     async fn make_test_state(auth_enabled: bool) -> (crate::api::AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
@@ -398,7 +434,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             crate::engines::lsm::DomainRegistry::recover(
@@ -409,6 +444,8 @@ mod tests {
             .await
             .unwrap(),
         );
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(256, 1024));
+        let (control, auth_cache) = crate::control::testing::start(dir.path(), Arc::clone(&registry), None, None, bus).await;
         let state = crate::api::AppState {
             registry,
             auth_cache,
@@ -419,7 +456,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access: None,
-            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,
@@ -432,15 +469,13 @@ mod tests {
     async fn make_app_with_auth() -> (axum::Router, Arc<crate::auth::AuthCache>, tempfile::TempDir) {
         let (state, dir) = make_test_state(true).await;
         let auth_cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+        let app = crate::api::router_inline(state, Arc::new(vec![]));
         (app, auth_cache, dir)
     }
 
     /// Builds the Swagger/docs sub-router + `docs_auth_layer`, merged with the
-    /// regular API router — mirrors `build_router` in `main.rs` (spec
-    /// general/014). Can't call `build_router` itself: it's private to the
-    /// binary crate, and this test module also compiles under the library
-    /// crate (`src/lib.rs` declares the same `pub mod` tree).
+    /// regular API router — the docs part of the frontend router
+    /// (`server::build_router`), without the engine bridge.
     async fn make_docs_app(auth_enabled: bool) -> (axum::Router, Arc<crate::auth::AuthCache>, tempfile::TempDir) {
         let (state, dir) = make_test_state(auth_enabled).await;
         let auth_cache = Arc::clone(&state.auth_cache);
@@ -454,223 +489,231 @@ mod tests {
                 docs_auth_layer,
             ));
         }
-        let app = docs_router.merge(crate::api::create_router(state, Arc::new(vec![])));
+        let app = docs_router.merge(crate::api::router_inline(state, Arc::new(vec![])));
         (app, auth_cache, dir)
     }
 
-    #[tokio::test]
-    async fn version_requires_valid_key_any_role() {
-        let (app, auth_cache, _dir) = make_app_with_auth().await;
+    #[test]
+    fn version_requires_valid_key_any_role() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app_with_auth().await;
 
-        // No token -> 401.
-        let resp = app
-            .clone()
-            .oneshot(Request::builder().uri("/version").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // Non-admin key, no domain permission at all -> still passes /version.
-        let key = "lura_test_version_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/version")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // Regression: /health stays reachable without a token.
-        let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ── /store-api/config admin-only (spec general/022) ──────────────────────
-
-    // Regression-critical: /store-api/config carries no `{domain}` segment, so
-    // its admin-only protection is entirely implicit -- it falls out of
-    // extract_domain's None branch above, same as /metrics, /events,
-    // /backups*. A future path refactor that accidentally gave it a domain
-    // segment would silently open it to any user holding some permission.
-    #[tokio::test]
-    async fn config_endpoint_is_admin_only() {
-        let (app, auth_cache, _dir) = make_app_with_auth().await;
-
-        // Non-admin key, even with a domain permission -> 403 (no {domain}
-        // segment in this path for that permission to apply to).
-        let key = "lura_test_config_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        auth_cache
-            .set_permission(crate::auth::DomainPermission {
-                username: "worker".to_string(),
-                domain: "shop".to_string(),
-                access: AccessLevel::Ddl,
-            })
-            .await
-            .unwrap();
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/config")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-        // Admin key -> 200.
-        let admin_key = "lura_test_config_admin_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "admin".to_string(),
-                api_key_hash: crate::auth::hash_api_key(admin_key),
-                role: crate::auth::UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/store-api/config")
-                    .header("authorization", format!("Bearer {admin_key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ── Docs routes behind auth (spec general/014) ──────────────────────────
-
-    #[tokio::test]
-    async fn docs_routes_require_key_when_auth_enabled() {
-        let (app, _auth_cache, _dir) = make_docs_app(true).await;
-
-        // openapi.json, the bare swagger_url (redirects to .../), and an
-        // asset sub-path under it (spec general/014: asset sub-paths under
-        // swagger_url) — the `*rest` wildcard SwaggerUi registers for its own
-        // static assets is part of the same sub-router, so it's covered by
-        // the same layer too, no path list needed.
-        for uri in ["/api-docs/openapi.json", "/test-ui", "/test-ui/does-not-exist.js"] {
+            // No token -> 401.
             let resp = app
                 .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .oneshot(Request::builder().uri("/version").body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
-        }
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // /health is untouched by this change.
-        let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn docs_routes_accept_any_valid_key_no_domain_permission() {
-        let (app, auth_cache, _dir) = make_docs_app(true).await;
-
-        // Non-admin key with no domain permission at all -> still 200, same
-        // "any valid key" rule as /version (not 403 from the extract_domain
-        // fallback that `auth_layer` would otherwise apply).
-        let key = "lura_test_docs_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-
-        for uri in ["/api-docs/openapi.json", "/test-ui/"] {
+            // Non-admin key, no domain permission at all -> still passes /version.
+            let key = "lura_test_version_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
             let resp = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(uri)
+                        .uri("/version")
                         .header("authorization", format!("Bearer {key}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        }
-    }
+            assert_eq!(resp.status(), StatusCode::OK);
 
-    #[tokio::test]
-    async fn docs_routes_accept_admin_key() {
-        let (app, auth_cache, _dir) = make_docs_app(true).await;
-
-        let key = "lura_test_docs_admin_key";
-        auth_cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "admin".to_string(),
-                api_key_hash: crate::auth::hash_api_key(key),
-                role: crate::auth::UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api-docs/openapi.json")
-                    .header("authorization", format!("Bearer {key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn docs_routes_open_without_key_when_auth_disabled() {
-        let (app, _auth_cache, _dir) = make_docs_app(false).await;
-
-        for uri in ["/api-docs/openapi.json", "/test-ui/"] {
+            // Regression: /health stays reachable without a token.
             let resp = app
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        }
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    // Regression-critical: /store-api/config carries no `{domain}` segment, so
+    // its admin-only protection is entirely implicit -- it falls out of
+    // extract_domain's None branch above, same as /metrics, /events,
+    // /backups*. A future path refactor that accidentally gave it a domain
+    // segment would silently open it to any user holding some permission.
+    #[test]
+    fn config_endpoint_is_admin_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_app_with_auth().await;
+
+            // Non-admin key, even with a domain permission -> 403 (no {domain}
+            // segment in this path for that permission to apply to).
+            let key = "lura_test_config_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            auth_cache
+                .set_permission(crate::auth::DomainPermission {
+                    username: "worker".to_string(),
+                    domain: "shop".to_string(),
+                    access: AccessLevel::Ddl,
+                })
+                .await
+                .unwrap();
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/config")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+            // Admin key -> 200.
+            let admin_key = "lura_test_config_admin_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "admin".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(admin_key),
+                    role: crate::auth::UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/store-api/config")
+                        .header("authorization", format!("Bearer {admin_key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    #[test]
+    fn docs_routes_require_key_when_auth_enabled() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_docs_app(true).await;
+
+            // openapi.json, the bare swagger_url (redirects to .../), and an
+            // asset sub-path under it — the `{*rest}` wildcard SwaggerUi
+            // registers for its own static assets is part of the same
+            // sub-router, so it's covered by the same layer too, no path list
+            // needed.
+            for uri in ["/api-docs/openapi.json", "/test-ui", "/test-ui/does-not-exist.js"] {
+                let resp = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            }
+
+            // /health is untouched by this change.
+            let resp = app
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    #[test]
+    fn docs_routes_accept_any_valid_key_no_domain_permission() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_docs_app(true).await;
+
+            // Non-admin key with no domain permission at all -> still 200, same
+            // "any valid key" rule as /version (not 403 from the extract_domain
+            // fallback that `auth_layer` would otherwise apply).
+            let key = "lura_test_docs_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+
+            for uri in ["/api-docs/openapi.json", "/test-ui/"] {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("authorization", format!("Bearer {key}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+        })
+    }
+
+    #[test]
+    fn docs_routes_accept_admin_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, auth_cache, _dir) = make_docs_app(true).await;
+
+            let key = "lura_test_docs_admin_key";
+            auth_cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "admin".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(key),
+                    role: crate::auth::UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api-docs/openapi.json")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    #[test]
+    fn docs_routes_open_without_key_when_auth_disabled() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _auth_cache, _dir) = make_docs_app(false).await;
+
+            for uri in ["/api-docs/openapi.json", "/test-ui/"] {
+                let resp = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+        })
     }
 }

@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, PoisonError,
 };
 use std::time::{Duration, SystemTime};
 use tracing_appender::{
@@ -13,7 +13,17 @@ use tracing_appender::{
 };
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-pub fn init_logging(cfg: &LogConfig) -> Result<Option<WorkerGuard>> {
+/// The file logger's writer guard, held here so a stop from any thread can
+/// write out what the logger still buffers ([`flush`]).
+static FILE_LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
+
+/// Writes out the lines the file logger still buffers; the last call before
+/// the process ends, from any thread. Later lines go nowhere.
+pub fn flush() {
+    drop(FILE_LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner).take());
+}
+
+pub fn init_logging(cfg: &LogConfig) -> Result<()> {
     let filter = build_env_filter(cfg);
 
     if cfg.path.is_empty() {
@@ -31,7 +41,7 @@ pub fn init_logging(cfg: &LogConfig) -> Result<Option<WorkerGuard>> {
                     .init();
             }
         }
-        return Ok(None);
+        return Ok(());
     }
 
     let appender = match cfg.rotation.as_str() {
@@ -56,7 +66,8 @@ pub fn init_logging(cfg: &LogConfig) -> Result<Option<WorkerGuard>> {
         }
     }
 
-    Ok(Some(guard))
+    *FILE_LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
+    Ok(())
 }
 
 fn build_env_filter(cfg: &LogConfig) -> EnvFilter {
@@ -73,11 +84,10 @@ pub(crate) fn directive_string(cfg: &LogConfig) -> String {
 pub(crate) fn build_filter_string(cfg: &LogConfig) -> String {
     let global = level_to_str(&cfg.level);
     let mut directives = format!("luradb={global}");
-    let modules: [(&str, &Option<LogLevel>); 5] = [
+    let modules: [(&str, &Option<LogLevel>); 4] = [
         ("luradb::auth", &cfg.modules.auth),
         ("luradb::api", &cfg.modules.api),
         ("luradb::engines", &cfg.modules.engine),
-        ("luradb::engines::lsm::domain", &cfg.modules.domains),
         ("luradb::storage", &cfg.modules.storage),
     ];
     for (target, level_opt) in &modules {
@@ -95,8 +105,6 @@ pub(crate) fn level_to_str(level: &LogLevel) -> &'static str {
         LogLevel::Prod => "warn",
     }
 }
-
-// ── LogJanitor ────────────────────────────────────────────────────────────────
 
 pub struct LogJanitor {
     log_path: PathBuf,
@@ -117,7 +125,7 @@ impl LogJanitor {
         let mut elapsed = Duration::ZERO;
 
         loop {
-            tokio::time::sleep(check_interval).await;
+            compio::time::sleep(check_interval).await;
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -134,17 +142,17 @@ impl LogJanitor {
             .checked_sub(Duration::from_secs(self.retention_days * 86_400))
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
-        let mut entries = match tokio::fs::read_dir(&self.log_path).await {
+        let entries = match std::fs::read_dir(&self.log_path) {
             Ok(e) => e,
             Err(_) => return,
         };
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        for entry in entries.map_while(Result::ok) {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
             if !name.starts_with("luradb.log") {
                 continue;
             }
-            let metadata = match entry.metadata().await {
+            let metadata = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -153,7 +161,8 @@ impl LogJanitor {
                 Err(_) => continue,
             };
             if mtime < cutoff {
-                let _ = tokio::fs::remove_file(entry.path()).await;
+                let path = entry.path();
+                let _ = crate::core::engine_runtime::spawn_io(async move { compio::fs::remove_file(path).await }).await;
             }
         }
     }
@@ -221,41 +230,45 @@ mod tests {
         unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
     }
 
-    #[tokio::test]
-    async fn test_janitor_cleanup_old_files() {
-        let dir = tempdir().unwrap();
+    #[test]
+    fn test_janitor_cleanup_old_files() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempdir().unwrap();
 
-        let old = dir.path().join("luradb.log.2025-01-01");
-        fs::write(&old, b"old log").unwrap();
-        set_mtime_days_ago(&old, 35);
+            let old = dir.path().join("luradb.log.2025-01-01");
+            fs::write(&old, b"old log").unwrap();
+            set_mtime_days_ago(&old, 35);
 
-        let recent = dir.path().join("luradb.log.2026-02-19");
-        fs::write(&recent, b"recent log").unwrap();
-        // mtime stays at "now" — within retention window
+            let recent = dir.path().join("luradb.log.2026-02-19");
+            fs::write(&recent, b"recent log").unwrap();
+            // mtime stays at "now" — within retention window
 
-        let janitor = LogJanitor::new(dir.path(), 30);
-        janitor.cleanup().await;
+            let janitor = LogJanitor::new(dir.path(), 30);
+            janitor.cleanup().await;
 
-        assert!(!old.exists(), "Old file should have been deleted");
-        assert!(recent.exists(), "Recent file should survive");
+            assert!(!old.exists(), "Old file should have been deleted");
+            assert!(recent.exists(), "Recent file should survive");
+        })
     }
 
-    #[tokio::test]
-    async fn test_janitor_guard_luradb_only() {
-        let dir = tempdir().unwrap();
+    #[test]
+    fn test_janitor_guard_luradb_only() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempdir().unwrap();
 
-        let lura_log = dir.path().join("luradb.log.old");
-        fs::write(&lura_log, b"log").unwrap();
-        set_mtime_days_ago(&lura_log, 40);
+            let lura_log = dir.path().join("luradb.log.old");
+            fs::write(&lura_log, b"log").unwrap();
+            set_mtime_days_ago(&lura_log, 40);
 
-        let other = dir.path().join("important.txt");
-        fs::write(&other, b"keep me").unwrap();
-        set_mtime_days_ago(&other, 40);
+            let other = dir.path().join("important.txt");
+            fs::write(&other, b"keep me").unwrap();
+            set_mtime_days_ago(&other, 40);
 
-        let janitor = LogJanitor::new(dir.path(), 30);
-        janitor.cleanup().await;
+            let janitor = LogJanitor::new(dir.path(), 30);
+            janitor.cleanup().await;
 
-        assert!(!lura_log.exists(), "luradb.log.old should be deleted");
-        assert!(other.exists(), "important.txt must not be touched");
+            assert!(!lura_log.exists(), "luradb.log.old should be deleted");
+            assert!(other.exists(), "important.txt must not be touched");
+        })
     }
 }

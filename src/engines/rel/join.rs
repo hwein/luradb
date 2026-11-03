@@ -1,7 +1,7 @@
-//! LEFT JOIN execution (spec rel/007): `IndexNestedLoopJoin` operator, ON
+//! LEFT JOIN execution: `IndexNestedLoopJoin` operator, ON
 //! resolution + probe-strategy selection, multi-binding column resolution,
 //! left-deep join-chain planning. Reuses `RowScan`/`Filter`/`Sort`/
-//! `OffsetLimitOp`/`RowSource` (select.rs), the rel/005 evaluator (eval.rs)
+//! `OffsetLimitOp`/`RowSource` (select.rs), the WHERE evaluator (eval.rs)
 //! and key builders (keys.rs) unchanged — this module only adds the join
 //! layer between the base scan and the residual filter.
 
@@ -15,10 +15,11 @@ use super::plan;
 use super::row::decode_row;
 use super::select::{
     self, flatten, Filter, OffsetLimitOp, PlanRow, ProjectedColumn, RowScan, RowSource, Sort,
-    SourceBinding,
+    SourceBinding, ROW_YIELD_INTERVAL,
 };
 use super::types::{encode_sortable, ColumnType, ScalarValue};
 use super::{ExecOutcome, RelEngine};
+use crate::core::coop::YieldEvery;
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::reader::Snapshot;
 use crate::metrics::MetricsStore;
@@ -29,13 +30,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-// ── Dynamic RowSource boxing (spec §2 Rust note) ──────────────────────────
-//
-// `RowSource::next` is RPITIT (rel/006 §2 pattern), which is not `dyn`-safe.
+// `RowSource::next` is RPITIT, which is not `dyn`-safe.
 // A join chain has dynamic depth (`max_join_depth` stages), so the left input
 // of an `IndexNestedLoopJoin` cannot be a single fixed generic type the way
 // v1's finitely-many pipeline shapes are (`RowPipeline` enum). This trait is
-// the one sanctioned boxing seam (rel/006 §2 comment): it boxes exactly the
+// the one sanctioned boxing seam (see `RowSource`): it boxes exactly the
 // recursive edge (the left input's `next()` future), not the whole operator
 // tree — Filter/Sort/OffsetLimit above the join still compose statically via
 // generics over `IndexNestedLoopJoin`, unchanged from v1's mechanism.
@@ -53,8 +52,6 @@ impl<T: RowSource + Send> DynRowSource for T {
     }
 }
 
-// ── Probe strategy & JoinProbe (spec §3) ─────────────────────────────────────
-
 #[derive(Clone, Copy)]
 enum ProbeStrategy {
     PkPoint,
@@ -62,10 +59,10 @@ enum ProbeStrategy {
     ScanFallback,
 }
 
-/// The right-hand sonde of one join stage: how to turn a left ON-value into
-/// 0..n right `SourceBinding`s (spec §2/§3). `pub(super)`: named (though never
+/// The right-hand probe of one join stage: how to turn a left ON-value into
+/// 0..n right `SourceBinding`s. `pub(super)`: named (though never
 /// constructed or inspected) in `build_join_probe`'s `pub(super)` return type,
-/// used by rel/008 `view.rs`'s CREATE-time bind-and-discard.
+/// used by `view.rs`'s CREATE-time bind-and-discard.
 pub(super) struct JoinProbe {
     engine: Arc<LsmStorageEngine>,
     snapshot: Snapshot,
@@ -79,21 +76,21 @@ pub(super) struct JoinProbe {
     value_source: (usize, usize),
     strategy: ProbeStrategy,
     /// The left value's declared type is INTEGER while the right column is
-    /// REAL — the one implicit widening (spec §3); the probe value must be
+    /// REAL — the one implicit widening; the probe value must be
     /// converted before `encode_sortable`.
     widen_int_to_real: bool,
     /// Statement-wide cumulative `ScanFallback` row-visit counter, shared
-    /// across every fallback-using join stage (spec §3).
+    /// across every fallback-using join stage.
     fallback_budget: Arc<AtomicU64>,
     max_fallback_scan: usize,
-    /// Read masking (spec rel/012 §3): the right side shares the query's rel
+    /// Read masking of link cells: the right side shares the query's rel
     /// domain, so its link cells mask by the same flags as the left.
     mask: LinkMask,
 }
 
 impl JoinProbe {
     /// The LEFT-preserved binding: all-NULL, used for "no match" and "NULL ON
-    /// value" alike (spec §4).
+    /// value" alike.
     fn null_binding(&self) -> SourceBinding {
         SourceBinding {
             table_id: self.right_table.table_id,
@@ -102,7 +99,7 @@ impl JoinProbe {
         }
     }
 
-    /// A matched right-hand row. Masking (spec rel/012 §3) is applied to the
+    /// A matched right-hand row. Link masking is applied to the
     /// materialized output only — the physical join match (by key/eval)
     /// already happened, so a hanging link still joins but reads as `NULL`.
     fn row_binding(&self, mut values: Vec<ScalarValue>) -> SourceBinding {
@@ -110,19 +107,19 @@ impl JoinProbe {
         SourceBinding { table_id: self.right_table.table_id, alias: self.right_alias.clone(), values }
     }
 
-    /// Executes one probe for a non-NULL left value `v` (spec §3/§9): returns
+    /// Executes one probe for a non-NULL left value `v`: returns
     /// the right-hand hits (0..n `SourceBinding`s); the caller turns an empty
-    /// result into the LEFT-preserved all-NULL binding (spec §4).
+    /// result into the LEFT-preserved all-NULL binding.
     async fn probe(&self, v: &ScalarValue) -> Result<Vec<SourceBinding>, RelStoreError> {
         self.metrics.record_rel_join_probes(1);
-        // spec rel/012: a masked right ON-column reads NULL for every row;
+        // A masked right ON-column reads NULL for every row;
         // NULL never matches under 3-valued ON equality, so skip storage.
         if self.mask.masks(self.right_table.columns[self.right_col_pos].col_type) {
             return Ok(Vec::new());
         }
         let v = self.widened(v);
-        // NULL is already excluded by the caller (spec §2); every other
-        // ScalarValue encodes to `Some` (rel/003).
+        // NULL is already excluded by the caller; every other
+        // ScalarValue encodes to `Some`.
         let Some(val_enc) = encode_sortable(&v) else { return Ok(Vec::new()) };
 
         match self.strategy {
@@ -132,7 +129,7 @@ impl JoinProbe {
         }
     }
 
-    /// The one implicit widening (spec §3): an INTEGER left value probing a
+    /// The one implicit widening: an INTEGER left value probing a
     /// REAL right column.
     fn widened(&self, v: &ScalarValue) -> ScalarValue {
         if self.widen_int_to_real {
@@ -150,7 +147,7 @@ impl JoinProbe {
         self.metrics.record_rel_select_scanned_keys(1);
         match self.engine.get_with_snapshot(&key, &self.snapshot).await?.into_option() {
             Some(bytes) => Ok(vec![self.row_binding(decode_row(&bytes, &self.right_table))]),
-            None => Ok(Vec::new()), // ghost or never existed — not a hit (spec §2 Snapshot & Ghosts)
+            None => Ok(Vec::new()), // ghost or never existed — not a hit
         }
     }
 
@@ -159,27 +156,30 @@ impl JoinProbe {
         let hits = self.engine.scan_keys_with_snapshot(&scan_prefix, &self.snapshot).await?;
         self.metrics.record_rel_select_scanned_keys(hits.len() as u64);
         let mut out = Vec::with_capacity(hits.len());
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for h in &hits {
+            coop.tick().await;
             let pk_enc = &h[scan_prefix.len()..];
             let row_key = keys::row_key(&self.right_prefix, self.right_table.table_id, pk_enc);
             self.metrics.record_rel_select_scanned_keys(1);
             if let Some(bytes) = self.engine.get_with_snapshot(&row_key, &self.snapshot).await?.into_option() {
                 out.push(self.row_binding(decode_row(&bytes, &self.right_table)));
-            } // ghost: skip, not a hit (spec §2)
+            } // ghost: skip, not a hit
         }
         Ok(out)
     }
 
     async fn probe_scan_fallback(&self, v: &ScalarValue) -> Result<Vec<SourceBinding>, RelStoreError> {
         let row_prefix = keys::row_table_prefix(&self.right_prefix, self.right_table.table_id);
-        // Cap the scan itself (spec rel/007 F1): scan only the remaining
+        // Cap the scan itself: scan only the remaining
         // budget + 1, so a right table bigger than the cap is never fully
-        // materialized before the cap check below ever runs.
+        // materialized before the cap check below ever runs. Saturating, so a
+        // budget of usize::MAX does not overflow.
         let consumed = self.fallback_budget.load(Ordering::Relaxed);
         let remaining = (self.max_fallback_scan as u64).saturating_sub(consumed);
         let scan_keys = self
             .engine
-            .scan_keys_limited_with_snapshot(&row_prefix, remaining as usize + 1, &self.snapshot)
+            .scan_keys_limited_with_snapshot(&row_prefix, (remaining as usize).saturating_add(1), &self.snapshot)
             .await?;
         let n = scan_keys.len() as u64;
         self.metrics.record_rel_select_scanned_keys(n);
@@ -196,7 +196,9 @@ impl JoinProbe {
             rhs: PredOperand::Value(v.clone()),
         };
         let mut out = Vec::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         for k in &scan_keys {
+            coop.tick().await;
             if let Some(bytes) = self.engine.get_with_snapshot(k, &self.snapshot).await?.into_option() {
                 let values = decode_row(&bytes, &self.right_table);
                 if matches!(eval(&pred, &values)?, Bool3::True) {
@@ -208,11 +210,9 @@ impl JoinProbe {
     }
 }
 
-// ── IndexNestedLoopJoin (spec §2) ────────────────────────────────────────────
-
 /// Sits above its left source (a base scan or a shallower join). Streaming:
 /// buffers only the current left row's right-hand hits, never the whole
-/// input (spec §2).
+/// input.
 struct IndexNestedLoopJoin {
     left: Box<dyn DynRowSource>,
     probe: JoinProbe,
@@ -236,7 +236,7 @@ impl RowSource for IndexNestedLoopJoin {
             };
             let (bi, vi) = self.probe.value_source;
             let v = lrow.bindings[bi].values[vi].clone();
-            // Three-valued ON (spec §4/concept 3.7): NULL never probes.
+            // Three-valued ON: NULL never probes.
             let right_bindings = if matches!(v, ScalarValue::Null) {
                 vec![self.probe.null_binding()]
             } else {
@@ -262,8 +262,8 @@ impl RowSource for IndexNestedLoopJoin {
     }
 }
 
-/// The finitely many SELECT pipeline shapes over a join chain (spec §6 step
-/// 5), mirroring v1's `RowPipeline` (select.rs) but based on
+/// The finitely many SELECT pipeline shapes over a join chain,
+/// mirroring v1's `RowPipeline` (select.rs) but based on
 /// `IndexNestedLoopJoin` instead of `RowScan` — same Filter/Sort/OffsetLimit,
 /// no new mechanism.
 enum JoinRowPipeline {
@@ -293,12 +293,10 @@ impl JoinRowPipeline {
     }
 }
 
-// ── Multi-binding column resolution (spec §5) ────────────────────────────────
-
 /// One FROM-/JOIN-chain source: its binding key (`AS` alias, else table name)
-/// and schema, in statement order (base first, spec §5).
+/// and schema, in statement order (base first).
 /// `pub(super)`: reused by the view CREATE-time/dependency structural bind
-/// (rel/008 `view.rs`), which builds these directly from base tables once
+/// (`view.rs`), which builds these directly from base tables once
 /// the inliner has fully flattened a (possibly view-touching) SELECT.
 pub(super) struct BindingInfo {
     pub(super) alias: String,
@@ -307,7 +305,7 @@ pub(super) struct BindingInfo {
 
 /// Flat position of each binding's first column — the position space WHERE
 /// residual/ORDER BY/projection resolve into once bindings are concatenated
-/// via `select::flatten` (spec §5/§7.1). `pub(super)`: reused by rel/008 `view.rs`.
+/// via `select::flatten`. `pub(super)`: reused by `view.rs`.
 pub(super) fn flat_offsets(bindings: &[BindingInfo]) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(bindings.len());
     let mut acc = 0usize;
@@ -318,7 +316,7 @@ pub(super) fn flat_offsets(bindings: &[BindingInfo]) -> Vec<usize> {
     offsets
 }
 
-/// `pub(super)`: reused by rel/008 `view.rs` (structural bind over a fully
+/// `pub(super)`: reused by `view.rs` (structural bind over a fully
 /// flattened statement).
 pub(super) fn check_unique_aliases(bindings: &[BindingInfo]) -> Result<(), RelStoreError> {
     let mut seen = HashSet::new();
@@ -367,9 +365,9 @@ fn try_resolve_in_many(
     Ok(hit)
 }
 
-/// General column resolution (spec §5: WHERE residual/ORDER BY/projection)
+/// General column resolution (WHERE residual/ORDER BY/projection)
 /// against the *full* binding list — qualified/unqualified, ambiguous, or
-/// not-found all become hard errors here. `pub(super)`: reused by rel/008 `view.rs`.
+/// not-found all become hard errors here. `pub(super)`: reused by `view.rs`.
 pub(super) fn resolve_multi(cref: &ColumnRef, bindings: &[BindingInfo]) -> Result<(usize, usize), RelStoreError> {
     match try_resolve_in_many(cref, bindings)? {
         Some(hit) => Ok(hit),
@@ -384,7 +382,7 @@ pub(super) fn resolve_multi(cref: &ColumnRef, bindings: &[BindingInfo]) -> Resul
     }
 }
 
-/// Which side of the binding split an ON operand resolved into (spec §3).
+/// Which side of the binding split an ON operand resolved into.
 enum OnSide {
     Known(usize, usize),
     New(usize),
@@ -392,7 +390,7 @@ enum OnSide {
 
 /// Resolves one ON operand against the two disjoint sets a join stage sees:
 /// the already-established bindings and the newly-joined table. Exactly one
-/// must hit (spec §3's "violations" list; ambiguity/no-match are hard errors).
+/// must hit (ambiguity/no-match are hard errors).
 fn resolve_on_side(
     cref: &ColumnRef,
     known: &[BindingInfo],
@@ -410,8 +408,6 @@ fn resolve_on_side(
         }),
     }
 }
-
-// ── WHERE split: base-driving vs. residual-over-the-chain (spec §6 step 2/4) ─
 
 /// True iff every column referenced anywhere in `expr` resolves — unambiguously
 /// — to the base binding (`bindings[0]`) alone. Such a conjunct is the only
@@ -461,18 +457,16 @@ fn fold_and_exprs(conjuncts: Vec<&Expr>) -> Option<Expr> {
     Some(it.fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e.clone()))))
 }
 
-// ── Flat multi-binding WHERE binder (spec §5) ────────────────────────────────
-//
-// Mirrors `dml::bind_predicate`/`bind_compare`/`bind_pred_operand` exactly,
+// `bind_flat_predicate` mirrors `dml::bind_predicate`/`bind_compare`/`bind_pred_operand` exactly,
 // but resolves columns via `resolve_multi` (multi-binding) instead of
 // `dml::resolve_column` (single-table), and binds `PredOperand::Column` to a
-// *flat* position (spec rel/007 orchestrator note: flattening the `PlanRow`
+// *flat* position (flattening the `PlanRow`
 // into one values list and binding to flat positions is the option that
-// leaves `eval.rs` and rel/006's single-table `Pred`/`PredOperand` completely
+// leaves `eval.rs` and the single-table `Pred`/`PredOperand` completely
 // untouched — the alternative, lifting `PredOperand::Column` to a
 // `(binding_idx, value_idx)` pair, would instead have to change `eval.rs`'s
 // public types and every existing call site).
-/// `pub(super)`: reused by rel/008 `view.rs` (structural bind over a fully
+/// `pub(super)`: reused by `view.rs` (structural bind over a fully
 /// flattened statement).
 pub(super) fn bind_flat_predicate(
     expr: &Expr,
@@ -579,12 +573,10 @@ fn bind_flat_operand(
     }
 }
 
-// ── Projection & ORDER BY over multiple bindings (spec §5/§7) ───────────────
-
-/// `*` → all columns of all bindings in binding order (spec §5/§7.1,
-/// duplicate names allowed); an explicit list resolves each column via
+/// `*` → all columns of all bindings in binding order (duplicate names
+/// allowed); an explicit list resolves each column via
 /// `resolve_multi` to a flat position.
-/// `pub(super)`: reused by rel/008 `view.rs` (structural bind over a fully
+/// `pub(super)`: reused by `view.rs` (structural bind over a fully
 /// flattened statement, and the `*`-expansion inside the inliner itself).
 pub(super) fn bind_join_projection(
     items: &[SelectItem],
@@ -619,7 +611,7 @@ pub(super) fn bind_join_projection(
                 });
             }
             SelectItem::Star | SelectItem::CountStar => {
-                unreachable!("grammar: Star/CountStar are only ever alone (rel/004)")
+                unreachable!("grammar: Star/CountStar are only ever alone")
             }
         }
     }
@@ -637,10 +629,10 @@ fn bind_join_order_by(
         .collect()
 }
 
-/// Depth guard (spec §8): `already_used` lets a future caller (rel/009 expand
-/// columns, which count against the same limit) feed in an already-consumed
-/// starting depth — this spec always passes 0 (signature prep only, no logic).
-/// `pub(super)`: reused by rel/008 `view.rs`'s CREATE-time full bind.
+/// Depth guard: `already_used` lets the expand path (whose columns count
+/// against the same limit) feed in an already-consumed starting depth; the
+/// SELECT path passes 0.
+/// `pub(super)`: reused by `view.rs`'s CREATE-time full bind.
 pub(super) fn check_join_depth(joins_len: usize, already_used: usize, max_join_depth: usize) -> Result<(), RelStoreError> {
     let depth = joins_len + already_used;
     if depth > max_join_depth {
@@ -649,13 +641,13 @@ pub(super) fn check_join_depth(joins_len: usize, already_used: usize, max_join_d
     Ok(())
 }
 
-/// ON resolution + type check for one join stage (spec §3) — the *structural*
+/// ON resolution + type check for one join stage — the *structural*
 /// half of `RelEngine::build_join_probe`, deliberately engine-free (no
 /// index-requirement/probe-strategy decision): exactly one ON operand must
 /// bind into `new_binding`, the other into an earlier binding (`known`,
 /// arbitrarily deep). Returns `(value_source, right_col_pos, widen_int_to_real)`.
-/// `pub(super)`: reused by rel/008 `view.rs`'s dependency re-bind (spec §7,
-/// which explicitly excludes the index requirement — a dropped index alone
+/// `pub(super)`: reused by `view.rs`'s dependency re-bind (which
+/// explicitly excludes the index requirement — a dropped index alone
 /// must not block unrelated DDL) *and* by `build_join_probe` below (which
 /// layers the probe-strategy selection on top for CREATE-time/execution binding).
 pub(super) fn resolve_join_on(
@@ -696,7 +688,7 @@ pub(super) fn resolve_join_on(
             actual: format!("{rt:?}"),
         });
     }
-    // The only implicit widening is INTEGER -> REAL (spec §3); the reverse
+    // The only implicit widening is INTEGER -> REAL; the reverse
     // (a REAL probe value against an INTEGER column) is a forbidden narrowing.
     if lt == ColumnType::Real && rt == ColumnType::Integer {
         return Err(RelStoreError::TypeMismatch {
@@ -712,8 +704,6 @@ pub(super) fn resolve_join_on(
     Ok((value_source, right_col_pos, widen_int_to_real))
 }
 
-// ── Probe-build environment (spec §7 too_many_arguments finding) ────────────
-
 /// The four statement-wide constants every join stage's `build_join_probe`
 /// call needs, bundled to stay under Clippy's argument-count threshold. Pure
 /// data bundling of what `JoinProbe` already carries as fields — no new
@@ -725,9 +715,7 @@ pub(super) struct ProbeEnv<'a> {
     pub(super) mask: LinkMask,
 }
 
-// ── exec_select_joined helpers (spec §6) ─────────────────────────────────────
-
-/// WHERE split (step 2/4): base-only top-level conjuncts (may drive the base
+/// WHERE split: base-only top-level conjuncts (may drive the base
 /// scan) vs. everything else (residual over the chain).
 fn split_where<'a>(where_clause: &'a Option<Expr>, bindings: &[BindingInfo]) -> (Vec<&'a Expr>, Vec<&'a Expr>) {
     let mut base_conjuncts: Vec<&Expr> = Vec::new();
@@ -747,7 +735,7 @@ fn split_where<'a>(where_clause: &'a Option<Expr>, bindings: &[BindingInfo]) -> 
 }
 
 /// ANDs the base access path's own residual together with every join-touching
-/// WHERE conjunct, bound at flat positions (step 4).
+/// WHERE conjunct, bound at flat positions.
 fn fold_residual(
     base_residual: Option<Pred>,
     other: Vec<&Expr>,
@@ -766,7 +754,7 @@ fn fold_residual(
     Ok(residual)
 }
 
-/// ORDER BY free-order special case (spec §7): only a single ORDER BY item on
+/// ORDER BY free-order special case: only a single ORDER BY item on
 /// a *base* column can possibly ride the base access path's key order for
 /// free; anything else (including COUNT, which has no output order) forces
 /// the Sort path regardless.
@@ -781,21 +769,24 @@ fn base_order_hint(sel: &Select, bindings: &[BindingInfo], is_count: bool) -> Ve
     }
 }
 
-/// No key-count shortcut over a join (spec §7): fan-out and LEFT preservation
+/// No key-count shortcut over a join: fan-out and LEFT preservation
 /// change the count vs. the raw key set, so this always iterates the
 /// pipeline (residual-filtered, if any).
 async fn count_join_rows(chain: IndexNestedLoopJoin, residual: Option<Pred>) -> Result<i64, RelStoreError> {
     let mut count: i64 = 0;
+    let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
     match residual {
         None => {
             let mut c = chain;
             while c.next().await?.is_some() {
+                coop.tick().await;
                 count += 1;
             }
         }
         Some(pred) => {
-            let mut f = Filter { input: chain, pred };
+            let mut f = Filter::new(chain, pred);
             while f.next().await?.is_some() {
+                coop.tick().await;
                 count += 1;
             }
         }
@@ -803,11 +794,9 @@ async fn count_join_rows(chain: IndexNestedLoopJoin, residual: Option<Pred>) -> 
     Ok(count)
 }
 
-// ── Planner & executor entry point (spec §1/§6) ──────────────────────────────
-
 impl RelEngine {
     /// Resolves one FROM-/JOIN-chain table reference. `select::exec_select`'s
-    /// `view::inline_views` pre-pass (rel/008 §1) runs before this ever does,
+    /// `view::inline_views` pre-pass runs before this ever does,
     /// so a view can no longer reach here; missing → `TableNotFound`.
     fn require_table_for_join(&self, domain: &str, name: &str) -> Result<TableSchema, RelStoreError> {
         match self.catalog.get(&self.domains, domain, name) {
@@ -823,10 +812,10 @@ impl RelEngine {
         }
     }
 
-    /// ON resolution + probe-strategy selection for one join stage (spec §3):
+    /// ON resolution + probe-strategy selection for one join stage:
     /// exactly one ON operand must bind into `new_binding`, the other into an
     /// earlier binding (`known`, arbitrarily deep — not just the previous stage).
-    /// `pub(super)`: reused by rel/008 `view.rs`'s CREATE-time full bind (which
+    /// `pub(super)`: reused by `view.rs`'s CREATE-time full bind (which
     /// needs the index requirement too, unlike the DDL dependency check —
     /// see `resolve_join_on`).
     pub(super) fn build_join_probe(
@@ -876,12 +865,12 @@ impl RelEngine {
         })
     }
 
-    /// Runs a `LEFT JOIN` SELECT/COUNT end to end (spec §1/§6): depth guard →
-    /// resolve every table ref (a view can no longer appear here — rel/008's
+    /// Runs a `LEFT JOIN` SELECT/COUNT end to end: depth guard →
+    /// resolve every table ref (a view can no longer appear here — the
     /// `view::inline_views` pre-pass already replaced it) → split WHERE into
     /// base-driving vs. residual-over-the-chain → plan the base access path
-    /// (rel/006 §3, unchanged) → build one `JoinProbe` per stage (§3) → stack
-    /// `IndexNestedLoopJoin`s left-deep (§6) → `Filter`? → `Sort`? →
+    /// (single-table planner, unchanged) → build one `JoinProbe` per stage → stack
+    /// `IndexNestedLoopJoin`s left-deep → `Filter`? → `Sort`? →
     /// `OffsetLimit` → project (or count).
     pub(super) async fn exec_select_joined(
         &self,
@@ -906,27 +895,28 @@ impl RelEngine {
         check_unique_aliases(&bindings)?;
         let offsets = flat_offsets(&bindings);
 
-        // One masking lookup for the whole query (spec rel/012 §3): every
+        // One masking lookup for the whole query: every
         // binding shares this rel domain, so one KV/JSON status pair covers all.
         let schemas: Vec<&TableSchema> = bindings.iter().map(|b| b.schema.as_ref()).collect();
         let mask = self.compute_link_mask(domain, &schemas, auth).await?;
 
         self.metrics.record_rel_select_statement();
 
-        // One snapshot for the whole statement — base *and* every join fetch
-        // (spec §2 Snapshot & Ghosts). Kept alive for the whole function so
-        // compaction cannot advance past it mid-pipeline.
-        let snapshot_guard = self.engine.snapshot();
+        // One snapshot for the whole statement — base *and* every join fetch.
+        // Kept alive so compaction cannot advance
+        // past it mid-pipeline; moves into the result so `expand` is covered
+        // too.
+        let snapshot_guard = self.engine.snapshot().await;
         let snap = snapshot_guard.snapshot().clone();
 
         let is_count = sel.items.len() == 1 && matches!(sel.items[0], SelectItem::CountStar);
 
-        // WHERE split (spec §6 step 2/4): only base-only top-level conjuncts
+        // WHERE split: only base-only top-level conjuncts
         // may drive the base scan; everything else is residual over the chain.
         let (base_conjuncts, other_conjuncts) = split_where(&sel.where_clause, &bindings);
         let base_where = fold_and_exprs(base_conjuncts);
 
-        // ORDER BY free-order special case (spec §7): only a single ORDER BY
+        // ORDER BY free-order special case: only a single ORDER BY
         // item on a *base* column can possibly ride the base access path's key
         // order for free; anything else forces the Sort path regardless.
         let base_order_local = base_order_hint(&sel, &bindings, is_count);
@@ -957,9 +947,10 @@ impl RelEngine {
             alias: bindings[0].alias.clone(),
             keys: row_keys.into_iter(),
             mask,
+            coop: YieldEvery::new(ROW_YIELD_INTERVAL),
         };
 
-        // One JoinProbe per stage, in statement order (left-deep, spec §6).
+        // One JoinProbe per stage, in statement order (left-deep).
         let fallback_budget = Arc::new(AtomicU64::new(0));
         let env = ProbeEnv { prefix: &prefix, snap: &snap, fallback_budget: &fallback_budget, mask };
         let mut probes = Vec::with_capacity(sel.joins.len());
@@ -1002,7 +993,7 @@ impl RelEngine {
         let mut pipeline = match (residual, needs_sort) {
             (None, false) => JoinRowPipeline::Plain(OffsetLimitOp::new(chain, offset, limit)),
             (Some(pred), false) => {
-                JoinRowPipeline::Filtered(OffsetLimitOp::new(Filter { input: chain, pred }, offset, limit))
+                JoinRowPipeline::Filtered(OffsetLimitOp::new(Filter::new(chain, pred), offset, limit))
             }
             (None, true) => JoinRowPipeline::Sorted(OffsetLimitOp::new(
                 Sort::new(chain, order_items_flat.clone(), self.max_sort_rows),
@@ -1010,14 +1001,16 @@ impl RelEngine {
                 limit,
             )),
             (Some(pred), true) => JoinRowPipeline::FilteredSorted(OffsetLimitOp::new(
-                Sort::new(Filter { input: chain, pred }, order_items_flat.clone(), self.max_sort_rows),
+                Sort::new(Filter::new(chain, pred), order_items_flat.clone(), self.max_sort_rows),
                 offset,
                 limit,
             )),
         };
 
         let mut rows = Vec::new();
+        let mut coop = YieldEvery::new(ROW_YIELD_INTERVAL);
         while let Some(row) = pipeline.next().await? {
+            coop.tick().await;
             let values = flatten(&row.bindings);
             rows.push(proj.iter().map(|p| values[p.pos].clone()).collect());
         }
@@ -1033,10 +1026,7 @@ impl RelEngine {
             limit_applied,
             column_refs,
             joins_used: sel.joins.len(),
-            // `snap` was only ever cloned/borrowed above (`base_scan`,
-            // `build_join_probe`), so it's still ours to hand to `expand`
-            // (rel/009 §5) — the same snapshot the join itself read at.
-            snapshot: Some(snap),
+            snapshot: Some(snapshot_guard),
         }))
     }
 }
@@ -1114,505 +1104,583 @@ mod tests {
 
     // 1. PK-probe (link resolution): matched rows widen; unmatched rows get
     // the all-NULL binding.
-    #[tokio::test]
-    async fn test_pk_probe_link_resolution() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'x'), (2, 'y')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2), (12, NULL), (13, 99)").await;
+    #[test]
+    fn test_pk_probe_link_resolution() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'x'), (2, 'y')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2), (12, NULL), (13, 99)").await;
 
-        let s = sel(&rel, "SELECT a.id, b.id, b.note FROM a LEFT JOIN b ON a.b_id = b.id ORDER BY a.id").await;
-        assert_eq!(s.rows.len(), 4);
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1), ScalarValue::Text("x".into())]);
-        assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Integer(2), ScalarValue::Text("y".into())]);
-        assert_eq!(s.rows[2], vec![ScalarValue::Integer(12), ScalarValue::Null, ScalarValue::Null]);
-        assert_eq!(s.rows[3], vec![ScalarValue::Integer(13), ScalarValue::Null, ScalarValue::Null]);
+            let s = sel(&rel, "SELECT a.id, b.id, b.note FROM a LEFT JOIN b ON a.b_id = b.id ORDER BY a.id").await;
+            assert_eq!(s.rows.len(), 4);
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1), ScalarValue::Text("x".into())]);
+            assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Integer(2), ScalarValue::Text("y".into())]);
+            assert_eq!(s.rows[2], vec![ScalarValue::Integer(12), ScalarValue::Null, ScalarValue::Null]);
+            assert_eq!(s.rows[3], vec![ScalarValue::Integer(13), ScalarValue::Null, ScalarValue::Null]);
+        })
     }
 
     // 2. INNER-emulation: WHERE b.id IS NOT NULL drops the unmatched rows,
-    // through the unchanged rel/005 evaluator.
-    #[tokio::test]
-    async fn test_inner_emulation_via_is_not_null() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1), (11, NULL), (12, 99)").await;
+    // through the unchanged WHERE evaluator.
+    #[test]
+    fn test_inner_emulation_via_is_not_null() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1), (11, NULL), (12, 99)").await;
 
-        let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id WHERE b.id IS NOT NULL").await;
-        assert_eq!(ints(&s.rows, 0), vec![10]);
+            let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id WHERE b.id IS NOT NULL").await;
+            assert_eq!(ints(&s.rows, 0), vec![10]);
+        })
     }
 
     // 3. Non-unique index probe -> one output row per right-hand hit (fan-out).
-    #[tokio::test]
-    async fn test_nonunique_index_probe_fan_out() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, grp INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_grp ON b (grp)").await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 5), (3, 9)").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 5)").await;
+    #[test]
+    fn test_nonunique_index_probe_fan_out() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, grp INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_grp ON b (grp)").await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 5), (3, 9)").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 5)").await;
 
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.g = b.grp ORDER BY b.id").await;
-        assert_eq!(s.rows.len(), 2);
-        assert_eq!(ints(&s.rows, 1), vec![1, 2]);
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.g = b.grp ORDER BY b.id").await;
+            assert_eq!(s.rows.len(), 2);
+            assert_eq!(ints(&s.rows, 1), vec![1, 2]);
+        })
     }
 
     // 4. Unique-index probe: 0 or 1 right-hand row.
-    #[tokio::test]
-    async fn test_unique_index_probe() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, code TEXT UNIQUE)").await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, code TEXT)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 'x'), (11, 'ghost')").await;
+    #[test]
+    fn test_unique_index_probe() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, code TEXT UNIQUE)").await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, code TEXT)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 'x'), (11, 'ghost')").await;
 
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.code = b.code ORDER BY a.id").await;
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]);
-        assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Null]);
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.code = b.code ORDER BY a.id").await;
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]);
+            assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Null]);
+        })
     }
 
     // 5. NULL left ON value: no probe at all, all-NULL binding; the probes
     // metric must not move.
-    #[tokio::test]
-    async fn test_null_on_value_no_probe() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, NULL)").await;
+    #[test]
+    fn test_null_on_value_no_probe() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, NULL)").await;
 
-        let before = join_probes(&rel);
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.b_id = b.id").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(10), ScalarValue::Null]]);
-        assert_eq!(join_probes(&rel), before, "a NULL ON value must not count as a probe");
+            let before = join_probes(&rel);
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.b_id = b.id").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(10), ScalarValue::Null]]);
+            assert_eq!(join_probes(&rel), before, "a NULL ON value must not count as a probe");
+        })
     }
 
     // 6. Dangling link: the referenced row is gone -> all-NULL binding
-    // (tolerant, concept 3.4), not an error.
-    #[tokio::test]
-    async fn test_dangling_link_tolerant() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO a VALUES (10, 999)").await; // b(999) never existed
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.b_id = b.id").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(10), ScalarValue::Null]]);
+    // (tolerant), not an error.
+    #[test]
+    fn test_dangling_link_tolerant() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO a VALUES (10, 999)").await; // b(999) never existed
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.b_id = b.id").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(10), ScalarValue::Null]]);
+        })
     }
 
     // 7. Join chain (3 tables), left-deep: bindings append in statement order;
     // the third stage probes with a value from the *first* table, not the
     // immediately preceding one.
-    #[tokio::test]
-    async fn test_join_chain_left_deep() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_c_a ON c (a_id)").await;
-        ok(&rel, "INSERT INTO b VALUES (1)").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1)").await;
-        ok(&rel, "INSERT INTO c VALUES (100, 10), (101, 10)").await;
+    #[test]
+    fn test_join_chain_left_deep() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_c_a ON c (a_id)").await;
+            ok(&rel, "INSERT INTO b VALUES (1)").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1)").await;
+            ok(&rel, "INSERT INTO c VALUES (100, 10), (101, 10)").await;
 
-        let s = sel(
-            &rel,
-            "SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.b_id = b.id LEFT JOIN c ON a.id = c.a_id ORDER BY c.id",
-        )
-        .await;
-        assert_eq!(s.rows.len(), 2);
-        assert_eq!(ints(&s.rows, 2), vec![100, 101]);
-        assert_eq!(ints(&s.rows, 0), vec![10, 10]);
-        assert_eq!(ints(&s.rows, 1), vec![1, 1]);
+            let s = sel(
+                &rel,
+                "SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.b_id = b.id LEFT JOIN c ON a.id = c.a_id ORDER BY c.id",
+            )
+            .await;
+            assert_eq!(s.rows.len(), 2);
+            assert_eq!(ints(&s.rows, 2), vec![100, 101]);
+            assert_eq!(ints(&s.rows, 0), vec![10, 10]);
+            assert_eq!(ints(&s.rows, 1), vec![1, 1]);
+        })
     }
 
     // 8. Self-join with aliases disambiguates; the same query without aliases
     // (duplicate binding key) -> InvalidSchema.
-    #[tokio::test]
-    async fn test_self_join_aliases_and_duplicate_key() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr_id INTEGER)").await;
-        ok(&rel, "INSERT INTO emp VALUES (1, NULL), (2, 1)").await;
+    #[test]
+    fn test_self_join_aliases_and_duplicate_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr_id INTEGER)").await;
+            ok(&rel, "INSERT INTO emp VALUES (1, NULL), (2, 1)").await;
 
-        let s = sel(&rel, "SELECT e.id, m.id FROM emp e LEFT JOIN emp m ON e.mgr_id = m.id ORDER BY e.id").await;
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(1), ScalarValue::Null]);
-        assert_eq!(s.rows[1], vec![ScalarValue::Integer(2), ScalarValue::Integer(1)]);
+            let s = sel(&rel, "SELECT e.id, m.id FROM emp e LEFT JOIN emp m ON e.mgr_id = m.id ORDER BY e.id").await;
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(1), ScalarValue::Null]);
+            assert_eq!(s.rows[1], vec![ScalarValue::Integer(2), ScalarValue::Integer(1)]);
 
-        let e = err(&rel, "SELECT * FROM emp LEFT JOIN emp ON emp.mgr_id = emp.id").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+            let e = err(&rel, "SELECT * FROM emp LEFT JOIN emp ON emp.mgr_id = emp.id").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+        })
     }
 
     // 9. Index requirement: an unindexed right ON-column with allow_unindexed_joins
     // = false -> UnindexedJoin with a CREATE INDEX hint.
-    #[tokio::test]
-    async fn test_unindexed_join_rejected_by_default() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 5)").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 5)").await;
+    #[test]
+    fn test_unindexed_join_rejected_by_default() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 5)").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 5)").await;
 
-        let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.tag = b.tag").await;
-        match &e {
-            RelStoreError::UnindexedJoin { table, column, hint } => {
-                assert_eq!(table, "b");
-                assert_eq!(column, "tag");
-                assert!(hint.contains("CREATE INDEX"), "hint: {hint}");
+            let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.tag = b.tag").await;
+            match &e {
+                RelStoreError::UnindexedJoin { table, column, hint } => {
+                    assert_eq!(table, "b");
+                    assert_eq!(column, "tag");
+                    assert!(hint.contains("CREATE INDEX"), "hint: {hint}");
+                }
+                _ => panic!("got: {e}"),
             }
-            _ => panic!("got: {e}"),
-        }
+        })
     }
 
     // 10. Fallback scan: allow_unindexed_joins = true produces a correct
     // result; cumulative scanned rows over max_sort_rows -> UnindexedJoinScanExceeded.
-    #[tokio::test]
-    async fn test_unindexed_join_fallback_and_cap() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { allow_unindexed_joins: true, ..config_in(dir.path()) }).await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 9)").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
+    #[test]
+    fn test_unindexed_join_fallback_and_cap() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let rel = boot(RelStoreConfig { allow_unindexed_joins: true, ..config_in(dir.path()) }).await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 9)").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
 
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag ORDER BY a.id").await;
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]);
-        assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Integer(2)]);
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag ORDER BY a.id").await;
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]);
+            assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Integer(2)]);
 
-        let dir2 = tempfile::TempDir::new().unwrap();
-        let rel2 =
-            boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: 3, ..config_in(dir2.path()) }).await;
-        ok(&rel2, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel2, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel2, "INSERT INTO b VALUES (1, 5), (2, 9), (3, 1), (4, 2)").await; // 4 rows scanned per probe
-        ok(&rel2, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
+            let dir2 = tempfile::TempDir::new().unwrap();
+            let rel2 =
+                boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: 3, ..config_in(dir2.path()) }).await;
+            ok(&rel2, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel2, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel2, "INSERT INTO b VALUES (1, 5), (2, 9), (3, 1), (4, 2)").await; // 4 rows scanned per probe
+            ok(&rel2, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
 
-        let e = err(&rel2, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag").await;
-        assert!(matches!(e, RelStoreError::UnindexedJoinScanExceeded { .. }), "got: {e}");
+            let e = err(&rel2, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag").await;
+            assert!(matches!(e, RelStoreError::UnindexedJoinScanExceeded { .. }), "got: {e}");
+        })
+    }
+
+    // The fallback's scan budget derived from
+    // max_sort_rows saturates, so usize::MAX (not reachable via TOML) still
+    // finds the matches.
+    #[test]
+    fn test_unindexed_join_fallback_with_max_sort_rows_at_usize_max() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let rel = boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: usize::MAX, ..config_in(dir.path()) })
+                .await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 9)").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
+
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag ORDER BY a.id").await;
+            assert_eq!(
+                s.rows,
+                vec![
+                    vec![ScalarValue::Integer(10), ScalarValue::Integer(1)],
+                    vec![ScalarValue::Integer(11), ScalarValue::Integer(2)],
+                ]
+            );
+        })
     }
 
     // 11. max_join_depth: a chain longer than the limit -> JoinDepthExceeded,
     // before any execution.
-    #[tokio::test]
-    async fn test_max_join_depth_exceeded() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { max_join_depth: 1, ..config_in(dir.path()) }).await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY)").await;
+    #[test]
+    fn test_max_join_depth_exceeded() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut rel = boot(config_in(dir.path())).await;
+            Arc::get_mut(&mut rel).unwrap().set_max_join_depth(1);
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE c (id INTEGER PRIMARY KEY)").await;
 
-        let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON a.id = c.id").await;
-        assert!(matches!(e, RelStoreError::JoinDepthExceeded { depth: 2, max: 1 }), "got: {e}");
+            let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON a.id = c.id").await;
+            assert!(matches!(e, RelStoreError::JoinDepthExceeded { depth: 2, max: 1 }), "got: {e}");
+        })
     }
 
     // 12. Column resolution: a qualified reference resolves; the same name
     // unqualified across two bindings -> AmbiguousColumn; unqualified but
     // unique -> ok.
-    #[tokio::test]
-    async fn test_column_resolution_qualified_ambiguous_unique() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
-        ok(&rel, "INSERT INTO a VALUES (1, 'x')").await;
-        ok(&rel, "INSERT INTO b VALUES (100, 1)").await;
+    #[test]
+    fn test_column_resolution_qualified_ambiguous_unique() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
+            ok(&rel, "INSERT INTO a VALUES (1, 'x')").await;
+            ok(&rel, "INSERT INTO b VALUES (100, 1)").await;
 
-        let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1").await;
-        assert_eq!(ints(&s.rows, 0), vec![1]);
+            let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1").await;
+            assert_eq!(ints(&s.rows, 0), vec![1]);
 
-        let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE id = 1").await;
-        assert!(matches!(e, RelStoreError::AmbiguousColumn { .. }), "got: {e}");
+            let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE id = 1").await;
+            assert!(matches!(e, RelStoreError::AmbiguousColumn { .. }), "got: {e}");
 
-        let s = sel(&rel, "SELECT name FROM a LEFT JOIN b ON a.id = b.a_id").await;
-        assert_eq!(s.rows[0][0], ScalarValue::Text("x".into()));
+            let s = sel(&rel, "SELECT name FROM a LEFT JOIN b ON a.id = b.a_id").await;
+            assert_eq!(s.rows[0][0], ScalarValue::Text("x".into()));
+        })
     }
 
     // 13. Projection *: all columns of all bindings in binding order;
     // colliding names (id/id) allowed since rows are arrays.
-    #[tokio::test]
-    async fn test_star_projection_binding_order_and_duplicates() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
-        ok(&rel, "INSERT INTO a VALUES (1, 100)").await;
-        ok(&rel, "INSERT INTO b VALUES (5, 1)").await;
+    #[test]
+    fn test_star_projection_binding_order_and_duplicates() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
+            ok(&rel, "INSERT INTO a VALUES (1, 100)").await;
+            ok(&rel, "INSERT INTO b VALUES (5, 1)").await;
 
-        let s = sel(&rel, "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id").await;
-        assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["id", "v", "id", "a_id"]);
-        assert_eq!(
-            s.rows[0],
-            vec![ScalarValue::Integer(1), ScalarValue::Integer(100), ScalarValue::Integer(5), ScalarValue::Integer(1)]
-        );
+            let s = sel(&rel, "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id").await;
+            assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["id", "v", "id", "a_id"]);
+            assert_eq!(
+                s.rows[0],
+                vec![ScalarValue::Integer(1), ScalarValue::Integer(100), ScalarValue::Integer(5), ScalarValue::Integer(1)]
+            );
+        })
     }
 
     // 14. Explicit projection `a.id, b.id`: two `id` columns; AS disambiguates
     // the wire names.
-    #[tokio::test]
-    async fn test_explicit_projection_as_disambiguates() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
-        ok(&rel, "INSERT INTO a VALUES (1)").await;
-        ok(&rel, "INSERT INTO b VALUES (5, 1)").await;
+    #[test]
+    fn test_explicit_projection_as_disambiguates() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
+            ok(&rel, "INSERT INTO a VALUES (1)").await;
+            ok(&rel, "INSERT INTO b VALUES (5, 1)").await;
 
-        let s = sel(&rel, "SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.id = b.a_id").await;
-        assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["aid", "bid"]);
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(1), ScalarValue::Integer(5)]);
+            let s = sel(&rel, "SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.id = b.a_id").await;
+            assert_eq!(s.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), vec!["aid", "bid"]);
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(1), ScalarValue::Integer(5)]);
+        })
     }
 
     // 15. ON assignment is not positional: `ON b.id = a.b_id` behaves exactly
     // like `ON a.b_id = b.id`.
-    #[tokio::test]
-    async fn test_on_side_order_not_positional() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1)").await;
+    #[test]
+    fn test_on_side_order_not_positional() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1)").await;
 
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON b.id = a.b_id").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]]);
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON b.id = a.b_id").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]]);
+        })
     }
 
     // 16. ON shape errors: both operands the same/no new table -> InvalidSchema;
     // INTEGER -> REAL widening works; REAL -> INTEGER narrowing is rejected.
-    #[tokio::test]
-    async fn test_on_form_errors_and_widening() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)").await;
-        ok(&rel, "INSERT INTO a VALUES (1, 5)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 5)").await;
+    #[test]
+    fn test_on_form_errors_and_widening() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)").await;
+            ok(&rel, "INSERT INTO a VALUES (1, 5)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 5)").await;
 
-        let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.x = a.id").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
-        let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON b.y = b.id").await;
-        assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+            let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON a.x = a.id").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
+            let e = err(&rel, "SELECT * FROM a LEFT JOIN b ON b.y = b.id").await;
+            assert!(matches!(e, RelStoreError::InvalidSchema(_)), "got: {e}");
 
-        ok(&rel, "CREATE TABLE s (id INTEGER PRIMARY KEY, code REAL)").await;
-        ok(&rel, "CREATE INDEX idx_code ON s (code)").await;
-        ok(&rel, "INSERT INTO s VALUES (7, 5.0)").await;
-        let s2 = sel(&rel, "SELECT a.id, s.id FROM a LEFT JOIN s ON a.x = s.code").await;
-        assert_eq!(s2.rows, vec![vec![ScalarValue::Integer(1), ScalarValue::Integer(7)]]);
+            ok(&rel, "CREATE TABLE s (id INTEGER PRIMARY KEY, code REAL)").await;
+            ok(&rel, "CREATE INDEX idx_code ON s (code)").await;
+            ok(&rel, "INSERT INTO s VALUES (7, 5.0)").await;
+            let s2 = sel(&rel, "SELECT a.id, s.id FROM a LEFT JOIN s ON a.x = s.code").await;
+            assert_eq!(s2.rows, vec![vec![ScalarValue::Integer(1), ScalarValue::Integer(7)]]);
 
-        ok(&rel, "CREATE TABLE r (id INTEGER PRIMARY KEY, v REAL)").await;
-        ok(&rel, "INSERT INTO r VALUES (1, 5.0)").await;
-        ok(&rel, "CREATE TABLE t2 (id INTEGER PRIMARY KEY, k INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_t2_k ON t2 (k)").await;
-        let e = err(&rel, "SELECT * FROM r LEFT JOIN t2 ON r.v = t2.k").await;
-        assert!(matches!(e, RelStoreError::TypeMismatch { .. }), "got: {e}");
+            ok(&rel, "CREATE TABLE r (id INTEGER PRIMARY KEY, v REAL)").await;
+            ok(&rel, "INSERT INTO r VALUES (1, 5.0)").await;
+            ok(&rel, "CREATE TABLE t2 (id INTEGER PRIMARY KEY, k INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_t2_k ON t2 (k)").await;
+            let e = err(&rel, "SELECT * FROM r LEFT JOIN t2 ON r.v = t2.k").await;
+            assert!(matches!(e, RelStoreError::TypeMismatch { .. }), "got: {e}");
+        })
     }
 
     // 17. ORDER BY on the base PK: free ordering (no Sort) even with fan-out,
     // since fan-out rows share their base row's key.
-    #[tokio::test]
-    async fn test_order_by_base_pk_free_despite_fanout() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, grp INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_grp ON b (grp)").await;
-        ok(&rel, "INSERT INTO a VALUES (3), (1), (2)").await;
-        ok(&rel, "INSERT INTO b VALUES (10, 1), (11, 1), (12, 2)").await;
+    #[test]
+    fn test_order_by_base_pk_free_despite_fanout() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, grp INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_grp ON b (grp)").await;
+            ok(&rel, "INSERT INTO a VALUES (3), (1), (2)").await;
+            ok(&rel, "INSERT INTO b VALUES (10, 1), (11, 1), (12, 2)").await;
 
-        let before = sort_fallback_total(&rel);
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.grp ORDER BY a.id").await;
-        assert_eq!(ints(&s.rows, 0), vec![1, 1, 2, 3]);
-        assert_eq!(sort_fallback_total(&rel), before, "base PK order must be free even with fan-out");
+            let before = sort_fallback_total(&rel);
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.grp ORDER BY a.id").await;
+            assert_eq!(ints(&s.rows, 0), vec![1, 1, 2, 3]);
+            assert_eq!(sort_fallback_total(&rel), before, "base PK order must be free even with fan-out");
+        })
     }
 
     // 18. ORDER BY on a join-table column: Sort path.
-    #[tokio::test]
-    async fn test_order_by_join_column_uses_sort() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'z'), (2, 'a')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2)").await;
+    #[test]
+    fn test_order_by_join_column_uses_sort() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'z'), (2, 'a')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2)").await;
 
-        let before = sort_fallback_total(&rel);
-        let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id ORDER BY b.note").await;
-        assert_eq!(ints(&s.rows, 0), vec![11, 10]);
-        assert_eq!(sort_fallback_total(&rel), before + 1);
+            let before = sort_fallback_total(&rel);
+            let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id ORDER BY b.note").await;
+            assert_eq!(ints(&s.rows, 0), vec![11, 10]);
+            assert_eq!(sort_fallback_total(&rel), before + 1);
+        })
     }
 
     // 19. WHERE split: a base-only conjunct drives the base scan (PK-point,
     // not a full scan); a conjunct on the right table filters over the join.
-    #[tokio::test]
-    async fn test_where_split_base_drives_right_filters_over_join() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, note TEXT)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'keep'), (2, 'drop')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2)").await;
+    #[test]
+    fn test_where_split_base_drives_right_filters_over_join() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, note TEXT)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'keep'), (2, 'drop')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2)").await;
 
-        let before = scanned_keys(&rel);
-        let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id WHERE a.id = 10 AND b.note = 'keep'").await;
-        let after = scanned_keys(&rel);
-        assert_eq!(ints(&s.rows, 0), vec![10]);
-        // 1 base PK-point key + 1 right-hand PK-point probe key — not a full
-        // scan of either table.
-        assert_eq!(after - before, 2, "PK-point base access + PK-point probe, no full scan");
+            let before = scanned_keys(&rel);
+            let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id WHERE a.id = 10 AND b.note = 'keep'").await;
+            let after = scanned_keys(&rel);
+            assert_eq!(ints(&s.rows, 0), vec![10]);
+            // 1 base PK-point key + 1 right-hand PK-point probe key — not a full
+            // scan of either table.
+            assert_eq!(after - before, 2, "PK-point base access + PK-point probe, no full scan");
+        })
     }
 
     // 20. LIMIT/OFFSET over a join, including fan-out; limit_applied semantics.
-    #[tokio::test]
-    async fn test_limit_offset_over_join_with_fanout() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, grp INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_grp ON b (grp)").await;
-        ok(&rel, "INSERT INTO a VALUES (1), (2)").await;
-        ok(&rel, "INSERT INTO b VALUES (10, 1), (11, 1), (12, 2)").await;
+    #[test]
+    fn test_limit_offset_over_join_with_fanout() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, grp INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_grp ON b (grp)").await;
+            ok(&rel, "INSERT INTO a VALUES (1), (2)").await;
+            ok(&rel, "INSERT INTO b VALUES (10, 1), (11, 1), (12, 2)").await;
 
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.grp ORDER BY a.id, b.id LIMIT 2").await;
-        assert_eq!(s.rows.len(), 2);
-        assert_eq!(ints(&s.rows, 1), vec![10, 11]);
-        assert!(s.limit_applied, "more output rows exist past LIMIT 2");
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.grp ORDER BY a.id, b.id LIMIT 2").await;
+            assert_eq!(s.rows.len(), 2);
+            assert_eq!(ints(&s.rows, 1), vec![10, 11]);
+            assert!(s.limit_applied, "more output rows exist past LIMIT 2");
 
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.grp ORDER BY a.id, b.id LIMIT 10").await;
-        assert_eq!(s.rows.len(), 3);
-        assert!(!s.limit_applied);
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.grp ORDER BY a.id, b.id LIMIT 10").await;
+            assert_eq!(s.rows.len(), 3);
+            assert!(!s.limit_applied);
+        })
     }
 
     // 21. COUNT(*) over a join: counts output rows including LEFT-preserved
     // ones, post-residual; ORDER BY is ignored.
-    #[tokio::test]
-    async fn test_count_star_over_join() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1), (11, NULL), (12, 99)").await;
+    #[test]
+    fn test_count_star_over_join() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'x')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1), (11, NULL), (12, 99)").await;
 
-        let s = sel(&rel, "SELECT COUNT(*) FROM a LEFT JOIN b ON a.b_id = b.id ORDER BY a.id").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(3)]]);
-        assert!(!s.limit_applied);
+            let s = sel(&rel, "SELECT COUNT(*) FROM a LEFT JOIN b ON a.b_id = b.id ORDER BY a.id").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(3)]]);
+            assert!(!s.limit_applied);
+        })
     }
 
-    // 22 (superseded by rel/008): a view touching the join (base or join
+    // 22: a view touching the join (base or join
     // side) is inlined to its base table before the join planner ever runs
     // — see view.rs for the dedicated view-in-join test coverage.
-    #[tokio::test]
-    async fn test_view_touching_join_now_inlines() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO a VALUES (1)").await;
-        ok(&rel, "INSERT INTO b VALUES (1)").await;
-        rel.create_view("default", "va", "SELECT * FROM a").await.unwrap();
+    #[test]
+    fn test_view_touching_join_now_inlines() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO a VALUES (1)").await;
+            ok(&rel, "INSERT INTO b VALUES (1)").await;
+            rel.create_view("default", "va", "SELECT * FROM a").await.unwrap();
 
-        let s = sel(&rel, "SELECT * FROM va LEFT JOIN b ON va.id = b.id").await;
-        assert_eq!(s.rows.len(), 1, "view in FROM position joins fine");
+            let s = sel(&rel, "SELECT * FROM va LEFT JOIN b ON va.id = b.id").await;
+            assert_eq!(s.rows.len(), 1, "view in FROM position joins fine");
 
-        let s = sel(&rel, "SELECT * FROM a LEFT JOIN va ON a.id = va.id").await;
-        assert_eq!(s.rows.len(), 1, "view in JOIN position (no WHERE) joins fine");
+            let s = sel(&rel, "SELECT * FROM a LEFT JOIN va ON a.id = va.id").await;
+            assert_eq!(s.rows.len(), 1, "view in JOIN position (no WHERE) joins fine");
+        })
     }
 
     // 23. MVCC/Ghost on the right side: a key live at scan time but gone at
     // the (older) snapshot is skipped, not surfaced as a hit. Driving this
     // through the SQL surface would need an externally-injected snapshot,
-    // which `execute()` does not expose (same reasoning as rel/006's own
+    // which `execute()` does not expose (same reasoning as select.rs's own
     // ghost test) — exercised white-box on `JoinProbe` directly instead.
-    #[tokio::test]
-    async fn test_right_side_ghost_skipped_white_box() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1)").await;
+    #[test]
+    fn test_right_side_ghost_skipped_white_box() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1)").await;
 
-        let snapshot_guard = rel.engine().snapshot();
-        let snap = snapshot_guard.snapshot().clone();
-        ok(&rel, "INSERT INTO b VALUES (1)").await; // live now, but not in `snap`
+            let snapshot_guard = rel.engine().snapshot().await;
+            let snap = snapshot_guard.snapshot().clone();
+            ok(&rel, "INSERT INTO b VALUES (1)").await; // live now, but not in `snap`
 
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let b_schema = match rel.get_object("default", "b").unwrap() {
-            CatalogEntry::Table(t) => Arc::new(t),
-            _ => unreachable!(),
-        };
-        let probe = JoinProbe {
-            engine: Arc::clone(rel.engine()),
-            snapshot: snap,
-            metrics: Arc::clone(&rel.metrics),
-            right_prefix: prefix,
-            right_table: Arc::clone(&b_schema),
-            right_alias: "b".to_string(),
-            right_col_pos: 0,
-            value_source: (0, 1),
-            strategy: ProbeStrategy::PkPoint,
-            widen_int_to_real: false,
-            fallback_budget: Arc::new(AtomicU64::new(0)),
-            max_fallback_scan: 100_000,
-            mask: LinkMask::default(),
-        };
-        let hits = probe.probe(&ScalarValue::Integer(1)).await.unwrap();
-        assert!(hits.is_empty(), "a ghost key must be skipped, not surfaced as a hit");
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let b_schema = match rel.get_object("default", "b").unwrap() {
+                CatalogEntry::Table(t) => Arc::new(t),
+                _ => unreachable!(),
+            };
+            let probe = JoinProbe {
+                engine: Arc::clone(rel.engine()),
+                snapshot: snap,
+                metrics: Arc::clone(&rel.metrics),
+                right_prefix: prefix,
+                right_table: Arc::clone(&b_schema),
+                right_alias: "b".to_string(),
+                right_col_pos: 0,
+                value_source: (0, 1),
+                strategy: ProbeStrategy::PkPoint,
+                widen_int_to_real: false,
+                fallback_budget: Arc::new(AtomicU64::new(0)),
+                max_fallback_scan: 100_000,
+                mask: LinkMask::default(),
+            };
+            let hits = probe.probe(&ScalarValue::Integer(1)).await.unwrap();
+            assert!(hits.is_empty(), "a ghost key must be skipped, not surfaced as a hit");
+        })
     }
 
     // 24. Metrics: rel_join_probes_total +1 per executed probe (NULL ON values
     // excluded); visited probe keys increase rel_select_scanned_keys_total.
-    #[tokio::test]
-    async fn test_join_metrics() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'x'), (2, 'y')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2), (12, NULL)").await;
+    #[test]
+    fn test_join_metrics() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'x'), (2, 'y')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2), (12, NULL)").await;
 
-        let probes_before = join_probes(&rel);
-        let keys_before = scanned_keys(&rel);
-        sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id").await;
-        assert_eq!(join_probes(&rel) - probes_before, 2, "only the 2 non-NULL ON values probe");
-        assert!(scanned_keys(&rel) > keys_before, "probe key visits must be counted");
+            let probes_before = join_probes(&rel);
+            let keys_before = scanned_keys(&rel);
+            sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.b_id = b.id").await;
+            assert_eq!(join_probes(&rel) - probes_before, 2, "only the 2 non-NULL ON values probe");
+            assert!(scanned_keys(&rel) > keys_before, "probe key visits must be counted");
+        })
     }
 
     // 25. COUNT(*) over a join with a WHERE residual (a join-table conjunct,
     // so `other_conjuncts` is non-empty): the `Some(pred)` arm in the COUNT
-    // branch (quality/007 prep work).
-    #[tokio::test]
-    async fn test_count_star_over_join_with_residual() {
-        let (rel, _d) = make().await;
-        setup_a_b(&rel).await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'keep'), (2, 'drop')").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2), (12, NULL)").await;
+    // branch.
+    #[test]
+    fn test_count_star_over_join_with_residual() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            setup_a_b(&rel).await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'keep'), (2, 'drop')").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 1), (11, 2), (12, NULL)").await;
 
-        let s = sel(&rel, "SELECT COUNT(*) FROM a LEFT JOIN b ON a.b_id = b.id WHERE b.note = 'keep'").await;
-        assert_eq!(s.rows, vec![vec![ScalarValue::Integer(1)]]);
+            let s = sel(&rel, "SELECT COUNT(*) FROM a LEFT JOIN b ON a.b_id = b.id WHERE b.note = 'keep'").await;
+            assert_eq!(s.rows, vec![vec![ScalarValue::Integer(1)]]);
+        })
     }
 
-    // 26 (007-F1 regression): the scan-fallback cap must bound the storage
+    // 26 (regression): the scan-fallback cap must bound the storage
     // scan itself, not just the reported cumulative total. (a) a right table
     // within the cap still yields the same join result as before; (b) a
     // right table over the cap reports `scanned` bounded by `max + 1` — the
     // pre-fix code instead reports b's actual (much larger) row count, since
     // it always materialized the full table before ever checking the cap.
-    #[tokio::test]
-    async fn test_scan_fallback_caps_the_scan_before_materializing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let rel = boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: 50, ..config_in(dir.path()) }).await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 9), (3, 1)").await;
-        ok(&rel, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
-        let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag ORDER BY a.id").await;
-        assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]);
-        assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Integer(2)]);
+    #[test]
+    fn test_scan_fallback_caps_the_scan_before_materializing() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let rel = boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: 50, ..config_in(dir.path()) }).await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 5), (2, 9), (3, 1)").await;
+            ok(&rel, "INSERT INTO a VALUES (10, 5), (11, 9)").await;
+            let s = sel(&rel, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag ORDER BY a.id").await;
+            assert_eq!(s.rows[0], vec![ScalarValue::Integer(10), ScalarValue::Integer(1)]);
+            assert_eq!(s.rows[1], vec![ScalarValue::Integer(11), ScalarValue::Integer(2)]);
 
-        let dir2 = tempfile::TempDir::new().unwrap();
-        let rel2 =
-            boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: 3, ..config_in(dir2.path()) }).await;
-        ok(&rel2, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel2, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        ok(&rel2, "INSERT INTO b VALUES (1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9),(10,10)").await;
-        ok(&rel2, "INSERT INTO a VALUES (100, 1)").await;
+            let dir2 = tempfile::TempDir::new().unwrap();
+            let rel2 =
+                boot(RelStoreConfig { allow_unindexed_joins: true, max_sort_rows: 3, ..config_in(dir2.path()) }).await;
+            ok(&rel2, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel2, "CREATE TABLE a (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            ok(&rel2, "INSERT INTO b VALUES (1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9),(10,10)").await;
+            ok(&rel2, "INSERT INTO a VALUES (100, 1)").await;
 
-        // `scanned` comes straight from the same `n` the scanned-keys metric
-        // is recorded with (spec rel/007 F1) — asserting it is capped at
-        // max+1 proves both the scan and the metric reflect the capped read,
-        // not b's full (10-row) table.
-        let e = err(&rel2, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag").await;
-        match e {
-            RelStoreError::UnindexedJoinScanExceeded { scanned, max } => {
-                assert_eq!(max, 3);
-                assert_eq!(scanned, 4, "scan must be capped at max+1 (4), not b's full row count (10)");
+            // `scanned` comes straight from the same `n` the scanned-keys metric
+            // is recorded with — asserting it is capped at
+            // max+1 proves both the scan and the metric reflect the capped read,
+            // not b's full (10-row) table.
+            let e = err(&rel2, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.tag = b.tag").await;
+            match e {
+                RelStoreError::UnindexedJoinScanExceeded { scanned, max } => {
+                    assert_eq!(max, 3);
+                    assert_eq!(scanned, 4, "scan must be capped at max+1 (4), not b's full row count (10)");
+                }
+                other => panic!("got: {other}"),
             }
-            other => panic!("got: {other}"),
-        }
+        })
     }
 
-    // 27 (012-F1 regression): a masked right ON-column (its link target
+    // 27 (regression): a masked right ON-column (its link target
     // domain gone) must probe empty — under 3-valued ON equality NULL never
     // matches, and a masked column reads NULL on every row — without ever
     // touching storage. DDL can't declare a real KVREF/JSONREF column here
@@ -1624,68 +1692,72 @@ mod tests {
     // encode identically to Text (both collapse to `ColumnType::Text`, see
     // `physical_type`), so the relabeling changes only what the mask sees,
     // not what is actually stored.
-    #[tokio::test]
-    async fn test_masked_right_on_column_probes_empty() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, link TEXT)").await;
-        ok(&rel, "INSERT INTO b VALUES (1, 'k')").await; // a row a physical probe *would* find
+    #[test]
+    fn test_masked_right_on_column_probes_empty() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, link TEXT)").await;
+            ok(&rel, "INSERT INTO b VALUES (1, 'k')").await; // a row a physical probe *would* find
 
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let mut b_schema = match rel.get_object("default", "b").unwrap() {
-            CatalogEntry::Table(t) => t,
-            _ => unreachable!(),
-        };
-        b_schema.columns[1].col_type = ColumnType::KvRef; // relabel `link` for the mask check only
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let mut b_schema = match rel.get_object("default", "b").unwrap() {
+                CatalogEntry::Table(t) => t,
+                _ => unreachable!(),
+            };
+            b_schema.columns[1].col_type = ColumnType::KvRef; // relabel `link` for the mask check only
 
-        let snapshot_guard = rel.engine().snapshot();
-        let snap = snapshot_guard.snapshot().clone();
-        let probe = JoinProbe {
-            engine: Arc::clone(rel.engine()),
-            snapshot: snap,
-            metrics: Arc::clone(&rel.metrics),
-            right_prefix: prefix,
-            right_table: Arc::new(b_schema),
-            right_alias: "b".to_string(),
-            right_col_pos: 1, // `link`, the (now-masked) ON column
-            value_source: (0, 1),
-            strategy: ProbeStrategy::ScanFallback,
-            widen_int_to_real: false,
-            fallback_budget: Arc::new(AtomicU64::new(0)),
-            max_fallback_scan: 100_000,
-            mask: LinkMask { kvref: true, jsonref: false },
-        };
-        let hits = probe.probe(&ScalarValue::Text("k".into())).await.unwrap();
-        assert!(hits.is_empty(), "a masked ON column must never match, even though the physical row exists");
+            let snapshot_guard = rel.engine().snapshot().await;
+            let snap = snapshot_guard.snapshot().clone();
+            let probe = JoinProbe {
+                engine: Arc::clone(rel.engine()),
+                snapshot: snap,
+                metrics: Arc::clone(&rel.metrics),
+                right_prefix: prefix,
+                right_table: Arc::new(b_schema),
+                right_alias: "b".to_string(),
+                right_col_pos: 1, // `link`, the (now-masked) ON column
+                value_source: (0, 1),
+                strategy: ProbeStrategy::ScanFallback,
+                widen_int_to_real: false,
+                fallback_budget: Arc::new(AtomicU64::new(0)),
+                max_fallback_scan: 100_000,
+                mask: LinkMask { kvref: true, jsonref: false },
+            };
+            let hits = probe.probe(&ScalarValue::Text("k".into())).await.unwrap();
+            assert!(hits.is_empty(), "a masked ON column must never match, even though the physical row exists");
+        })
     }
 
-    // 27. WHERE over a join (finding 005-F1): a REAL literal / param / IN element
-    // compared against an INTEGER column widens per spec §6 instead of 400. The
+    // 27. WHERE over a join: a REAL literal / param / IN element
+    // compared against an INTEGER column widens instead of a 400. The
     // predicate sits on the right (joined) table, so it is bound by the flat
     // join binder (`bind_flat_operand`/`bind_flat_predicate`), not the base-scan
     // path — exercising the join-side mirror of the fix.
-    #[tokio::test]
-    async fn test_join_residual_real_literal_widens_against_integer_column() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
-        ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
-        ok(&rel, "INSERT INTO a VALUES (1), (2)").await;
-        ok(&rel, "INSERT INTO b VALUES (100, 1), (200, 2)").await;
+    #[test]
+    fn test_join_residual_real_literal_widens_against_integer_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE a (id INTEGER PRIMARY KEY)").await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").await;
+            ok(&rel, "CREATE INDEX idx_b_a_id ON b (a_id)").await;
+            ok(&rel, "INSERT INTO a VALUES (1), (2)").await;
+            ok(&rel, "INSERT INTO b VALUES (100, 1), (200, 2)").await;
 
-        // b.a_id > 1.5 is a right-table residual → flat binder; widening keeps a.id = 2.
-        let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.a_id > 1.5").await;
-        assert_eq!(ints(&s.rows, 0), vec![2]);
+            // b.a_id > 1.5 is a right-table residual → flat binder; widening keeps a.id = 2.
+            let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.a_id > 1.5").await;
+            assert_eq!(ints(&s.rows, 0), vec![2]);
 
-        // IN list with a REAL element widens likewise.
-        let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.a_id IN (2.0, 99)").await;
-        assert_eq!(ints(&s.rows, 0), vec![2]);
+            // IN list with a REAL element widens likewise.
+            let s = sel(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.a_id IN (2.0, 99)").await;
+            assert_eq!(ints(&s.rows, 0), vec![2]);
 
-        // A genuine type error is still rejected.
-        let e = err(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.a_id > 'x'").await;
-        assert!(matches!(e, RelStoreError::TypeMismatch { .. }), "got: {e}");
+            // A genuine type error is still rejected.
+            let e = err(&rel, "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.a_id > 'x'").await;
+            assert!(matches!(e, RelStoreError::TypeMismatch { .. }), "got: {e}");
+        })
     }
 
-    // 28. Spec rel/018 §Test 3 (join fallback cap, exact): a right table
+    // 28. Join fallback cap, exact: a right table
     // with exactly `max_fallback_scan` snapshot-visible rows plus ghosts
     // inserted after the snapshot must not trip `UnindexedJoinScanExceeded`
     // -- pre-fix, the live (unsnapshotted) fallback scan counted the ghosts
@@ -1693,43 +1765,45 @@ mod tests {
     // cap-exactness check, now snapshot-scoped). White-box on `JoinProbe`
     // directly (pattern: tests 23/27) so the snapshot boundary is exact,
     // not timing-dependent.
-    #[tokio::test]
-    async fn test_scan_fallback_cap_excludes_ghosts_from_budget() {
-        let (rel, _d) = make().await;
-        ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
-        for i in 0..5 {
-            ok(&rel, &format!("INSERT INTO b VALUES ({i}, 42)")).await;
-        }
+    #[test]
+    fn test_scan_fallback_cap_excludes_ghosts_from_budget() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _d) = make().await;
+            ok(&rel, "CREATE TABLE b (id INTEGER PRIMARY KEY, tag INTEGER)").await;
+            for i in 0..5 {
+                ok(&rel, &format!("INSERT INTO b VALUES ({i}, 42)")).await;
+            }
 
-        let snapshot_guard = rel.engine().snapshot();
-        let snap = snapshot_guard.snapshot().clone();
-        // Ghosts: live at probe time, but after the snapshot -- must not
-        // count toward the fallback budget nor appear in the result.
-        for i in 5..8 {
-            ok(&rel, &format!("INSERT INTO b VALUES ({i}, 42)")).await;
-        }
+            let snapshot_guard = rel.engine().snapshot().await;
+            let snap = snapshot_guard.snapshot().clone();
+            // Ghosts: live at probe time, but after the snapshot -- must not
+            // count toward the fallback budget nor appear in the result.
+            for i in 5..8 {
+                ok(&rel, &format!("INSERT INTO b VALUES ({i}, 42)")).await;
+            }
 
-        let prefix = rel.get_domain("default").unwrap().system_prefix;
-        let b_schema = match rel.get_object("default", "b").unwrap() {
-            CatalogEntry::Table(t) => Arc::new(t),
-            _ => unreachable!(),
-        };
-        let probe = JoinProbe {
-            engine: Arc::clone(rel.engine()),
-            snapshot: snap,
-            metrics: Arc::clone(&rel.metrics),
-            right_prefix: prefix,
-            right_table: Arc::clone(&b_schema),
-            right_alias: "b".to_string(),
-            right_col_pos: 1,
-            value_source: (0, 1),
-            strategy: ProbeStrategy::ScanFallback,
-            widen_int_to_real: false,
-            fallback_budget: Arc::new(AtomicU64::new(0)),
-            max_fallback_scan: 5,
-            mask: LinkMask::default(),
-        };
-        let hits = probe.probe(&ScalarValue::Integer(42)).await.unwrap();
-        assert_eq!(hits.len(), 5, "all 5 snapshot-visible rows must match; ghosts excluded from the scan itself");
+            let prefix = rel.get_domain("default").unwrap().system_prefix;
+            let b_schema = match rel.get_object("default", "b").unwrap() {
+                CatalogEntry::Table(t) => Arc::new(t),
+                _ => unreachable!(),
+            };
+            let probe = JoinProbe {
+                engine: Arc::clone(rel.engine()),
+                snapshot: snap,
+                metrics: Arc::clone(&rel.metrics),
+                right_prefix: prefix,
+                right_table: Arc::clone(&b_schema),
+                right_alias: "b".to_string(),
+                right_col_pos: 1,
+                value_source: (0, 1),
+                strategy: ProbeStrategy::ScanFallback,
+                widen_int_to_real: false,
+                fallback_budget: Arc::new(AtomicU64::new(0)),
+                max_fallback_scan: 5,
+                mask: LinkMask::default(),
+            };
+            let hits = probe.probe(&ScalarValue::Integer(42)).await.unwrap();
+            assert_eq!(hits.len(), 5, "all 5 snapshot-visible rows must match; ghosts excluded from the scan itself");
+        })
     }
 }

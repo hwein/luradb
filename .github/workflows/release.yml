@@ -201,6 +201,11 @@ jobs:
           sudo apt-get update
           sudo apt install -y ./luradb_*.deb
 
+      # A first install enables the service but does not start it.
+      - name: Start service
+        run: |
+          sudo systemctl start luradb
+
       - name: Wait for service to come up
         run: |
           set -euo pipefail

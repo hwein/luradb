@@ -1,18 +1,21 @@
-//! Amplifier stress harness for spec kv/026 (restart data-loss analysis),
-//! §1 A1+A2. `#[ignore]`d -- run explicitly:
+//! Amplifier stress harness for restart data-loss analysis.
+//! `#[ignore]`d -- run explicitly:
 //! `cargo test --test restart_stress -- --ignored`.
 //!
 //! N independent engine instances each run M shutdown-restart cycles and M
 //! drop-restart cycles while background engines keep flush/compaction/GC
-//! busy, hunting for the still (non-panicking) data loss the spec
-//! describes. Calibrate via env: LURADB_STRESS_N, LURADB_STRESS_M,
+//! busy, hunting for silent (non-panicking) data loss across restarts.
+//! Calibrate via env: LURADB_STRESS_N, LURADB_STRESS_M,
 //! LURADB_STRESS_KEYS, LURADB_STRESS_BG_WRITERS, LURADB_STRESS_ARTIFACT_DIR.
 //!
-//! TempDir trap (spec kv/026 A2): no assert!/unwrap between a restart and
+//! TempDir trap: no assert!/unwrap between a restart and
 //! evidence conservation anywhere below -- every failure becomes a String
 //! finding, snapshots (S1 before reopen, S2 after verify) are conserved
 //! first, and the single panic! happens only at the very end.
 
+mod common;
+
+use luradb::core::storage_thread::{StorageHandle, WalTarget};
 use luradb::core::wal::WriteAheadLog;
 use luradb::engines::lsm::LsmStorageEngine;
 use luradb::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions};
@@ -44,11 +47,12 @@ fn stress_engine_config() -> LsmEngineConfig {
 }
 
 /// One (re)open on `dir` -- fresh WAL/VLog/FileManager/ManifestManager
-/// handles each time, exactly what a real restart does (mirrors
-/// `engine.rs::tests::engine_on`).
-async fn open_engine(dir: &Path, config: LsmEngineConfig) -> anyhow::Result<LsmStorageEngine> {
+/// handles each time (mirrors `engine.rs::tests::engine_on`). Unlike a real
+/// restart, the storage hub behind `hub` lives on: it keeps the WAL open,
+/// its cursor at the end of the file.
+async fn open_engine(dir: &Path, hub: &StorageHandle, config: LsmEngineConfig) -> anyhow::Result<LsmStorageEngine> {
     let wal_path = dir.join("wal.log");
-    let wal = Arc::new(WriteAheadLog::new(&wal_path).await?);
+    let wal = Arc::new(WriteAheadLog::with_storage_handle(hub.clone(), WalTarget::Kv));
     let vlog_path = dir.join("vlog.log");
     let vlog = Arc::new(VLog::new(&vlog_path).await?);
     let file_manager = Arc::new(FileManager::new(dir).await?);
@@ -58,10 +62,10 @@ async fn open_engine(dir: &Path, config: LsmEngineConfig) -> anyhow::Result<LsmS
 }
 
 /// Like [`open_engine`], but a slow/failed open becomes a labeled finding
-/// instead of a hang or an unwrap (spec kv/026 A2: engine errors from
-/// `new()` get the same no-panic treatment as a verify mismatch).
-async fn open_engine_or_finding(dir: &Path, label: &str) -> Result<LsmStorageEngine, String> {
-    match tokio::time::timeout(OP_TIMEOUT, open_engine(dir, stress_engine_config())).await {
+/// instead of a hang or an unwrap: engine errors from `new()` get the same
+/// no-panic treatment as a verify mismatch.
+async fn open_engine_or_finding(dir: &Path, hub: &StorageHandle, label: &str) -> Result<LsmStorageEngine, String> {
+    match compio::time::timeout(OP_TIMEOUT,open_engine(dir, hub, stress_engine_config())).await {
         Ok(Ok(engine)) => Ok(engine),
         Ok(Err(e)) => Err(format!("{label}: reopen failed: {e}")),
         Err(_) => Err(format!("{label}: reopen did not complete within {OP_TIMEOUT:?}")),
@@ -70,7 +74,7 @@ async fn open_engine_or_finding(dir: &Path, label: &str) -> Result<LsmStorageEng
 
 /// Like [`open_engine_or_finding`], for `shutdown()` -- never unwraps.
 async fn shutdown_or_finding(engine: &LsmStorageEngine, label: &str) -> Option<String> {
-    match tokio::time::timeout(OP_TIMEOUT, engine.shutdown()).await {
+    match compio::time::timeout(OP_TIMEOUT,engine.shutdown()).await {
         Ok(()) => None,
         Err(_) => Some(format!("{label}: shutdown() did not complete within {OP_TIMEOUT:?}")),
     }
@@ -91,8 +95,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 /// Copies `dir`'s complete engine directory into `artifact_root/label`
-/// (spec kv/026 A2 -- the S1/S2 pair is the only surviving evidence once
-/// `new()` has unconditionally truncated the WAL, Fact 3).
+/// (the S1/S2 pair is the only surviving evidence once
+/// `new()` has unconditionally truncated the WAL).
 fn snapshot(dir: &Path, artifact_root: &Path, label: &str) -> Result<PathBuf, String> {
     let dest = artifact_root.join(label);
     copy_dir_recursive(dir, &dest).map(|_| dest).map_err(|e| format!("{label}: snapshot failed: {e}"))
@@ -100,7 +104,7 @@ fn snapshot(dir: &Path, artifact_root: &Path, label: &str) -> Result<PathBuf, St
 
 /// Checks every `expected` (key, value) pair via `get()`. Returns one
 /// human-readable line per mismatch; empty means everything verified.
-/// Assert/unwrap-free by design (spec kv/026 A2 TempDir trap, §Tests 3).
+/// Assert/unwrap-free by design (TempDir trap).
 async fn verify_keys(engine: &LsmStorageEngine, expected: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {
     let mut findings = Vec::new();
     for (key, value) in expected {
@@ -152,9 +156,8 @@ async fn write_cycle_keys(
 
 /// Shared tail of both restart families: verify against the reopened
 /// engine, take S2, then either delete both snapshots immediately (no
-/// finding) or leave them on disk (spec kv/026 A2: "nur im Fehlerfall
-/// behalten"). Called directly by the §Tests 3 self-test below with a
-/// deliberately wrong expectation.
+/// finding) or leave them on disk (kept only on a failure). Called
+/// directly by the self-test below with a deliberately wrong expectation.
 async fn finish_cycle(
     new_engine: &LsmStorageEngine,
     dir: &Path,
@@ -183,13 +186,14 @@ async fn finish_cycle(
     findings
 }
 
-/// Family (a) -- spec kv/026 A1: `write -> shutdown().await -> S1 -> Re-Open
+/// Family (a): `write -> shutdown().await -> S1 -> Re-Open
 /// -> verify -> S2`, background tasks running like every real bootstrap
 /// path. Returns the reopened engine for the next cycle (`None` if reopen
 /// itself failed) plus this cycle's findings.
 async fn run_shutdown_cycle(
     engine: Arc<LsmStorageEngine>,
     dir: &Path,
+    hub: &StorageHandle,
     artifact_root: &Path,
     instance: usize,
     cycle: usize,
@@ -209,7 +213,7 @@ async fn run_shutdown_cycle(
         Err(e) => { findings.push(e); None }
     };
 
-    let new_engine = match open_engine_or_finding(dir, &label_base).await {
+    let new_engine = match open_engine_or_finding(dir, hub, &label_base).await {
         Ok(e) => Arc::new(e),
         Err(f) => {
             findings.push(f);
@@ -223,11 +227,12 @@ async fn run_shutdown_cycle(
     (Some(new_engine), findings)
 }
 
-/// Family (b) -- spec kv/026 A1: `write -> drop -> S1 -> Re-Open -> verify
+/// Family (b): `write -> drop -> S1 -> Re-Open -> verify
 /// -> S2`, no background tasks (mirrors `engine_on` -- the raw-crash path).
 async fn run_drop_cycle(
     engine: LsmStorageEngine,
     dir: &Path,
+    hub: &StorageHandle,
     artifact_root: &Path,
     instance: usize,
     cycle: usize,
@@ -237,14 +242,14 @@ async fn run_drop_cycle(
     let (expected, mut findings) =
         write_cycle_keys(&engine, instance, "drop", cycle, key_count, &label_base).await;
 
-    drop(engine); // no shutdown() -- family (b) is the raw-crash path (spec kv/026 A1)
+    drop(engine); // no shutdown() -- family (b) is the raw-crash path
 
     let s1 = match snapshot(dir, artifact_root, &format!("{label_base}-S1")) {
         Ok(p) => Some(p),
         Err(e) => { findings.push(e); None }
     };
 
-    let new_engine = match open_engine_or_finding(dir, &label_base).await {
+    let new_engine = match open_engine_or_finding(dir, hub, &label_base).await {
         Ok(e) => e,
         Err(f) => {
             findings.push(f);
@@ -266,9 +271,10 @@ struct InstanceOutcome {
 /// then M drop-family cycles, all on the same TempDir.
 async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_count: usize) -> InstanceOutcome {
     let dir = TempDir::new().expect("tempdir for stress instance");
+    let (_hub, hub) = common::start_hub(&[(WalTarget::Kv, &dir.path().join("wal.log"))]);
     let mut findings = Vec::new();
 
-    match open_engine_or_finding(dir.path(), &format!("instance {instance} shutdown-init")).await {
+    match open_engine_or_finding(dir.path(), &hub, &format!("instance {instance} shutdown-init")).await {
         Ok(engine) => {
             let engine = Arc::new(engine);
             engine.start_background_tasks();
@@ -276,7 +282,7 @@ async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_cou
             for cycle in 0..m {
                 let Some(engine) = current.take() else { break };
                 let (next, cycle_findings) =
-                    run_shutdown_cycle(engine, dir.path(), &artifact_root, instance, cycle, key_count).await;
+                    run_shutdown_cycle(engine, dir.path(), &hub, &artifact_root, instance, cycle, key_count).await;
                 findings.extend(cycle_findings);
                 current = next;
             }
@@ -290,13 +296,13 @@ async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_cou
         Err(f) => findings.push(f),
     }
 
-    match open_engine_or_finding(dir.path(), &format!("instance {instance} drop-init")).await {
+    match open_engine_or_finding(dir.path(), &hub, &format!("instance {instance} drop-init")).await {
         Ok(engine) => {
             let mut current = Some(engine);
             for cycle in 0..m {
                 let Some(engine) = current.take() else { break };
                 let (next, cycle_findings) =
-                    run_drop_cycle(engine, dir.path(), &artifact_root, instance, cycle, key_count).await;
+                    run_drop_cycle(engine, dir.path(), &hub, &artifact_root, instance, cycle, key_count).await;
                 findings.extend(cycle_findings);
                 current = next;
             }
@@ -309,7 +315,7 @@ async fn run_instance(instance: usize, artifact_root: PathBuf, m: usize, key_cou
     InstanceOutcome { findings, dir }
 }
 
-/// Pure load generator (spec kv/026 A1: restarts happen while the same
+/// Pure load generator (restarts happen while the same
 /// process keeps producing write/flush load) -- keeps flush/compaction/GC busy on its
 /// own throwaway store while the main instances restart. Its own
 /// correctness is out of scope; errors are swallowed on purpose.
@@ -323,7 +329,8 @@ async fn run_background_loader(id: usize, stop: Arc<AtomicBool>) {
         compaction_check_interval_ms: 5,
         ..Default::default()
     };
-    let Ok(engine) = open_engine(dir.path(), config).await else { return };
+    let (_hub, hub) = common::start_hub(&[(WalTarget::Kv, &dir.path().join("wal.log"))]);
+    let Ok(engine) = open_engine(dir.path(), &hub, config).await else { return };
     let engine = Arc::new(engine);
     engine.start_background_tasks();
 
@@ -331,124 +338,129 @@ async fn run_background_loader(id: usize, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         let key = format!("bg{id}-{i}").into_bytes();
         let _ = engine.put(&key, &[b'x'; 256]).await;
-        if i % 4 == 0 {
+        if i.is_multiple_of(4) {
             let _ = engine.flush_memtable().await;
         }
         i += 1;
         tokio::task::yield_now().await;
     }
 
-    let _ = tokio::time::timeout(OP_TIMEOUT, engine.shutdown()).await;
+    let _ = compio::time::timeout(OP_TIMEOUT,engine.shutdown()).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[test]
 #[ignore]
-async fn restart_stress_amplifier() {
-    let n = env_usize("LURADB_STRESS_N", 4);
-    let m = env_usize("LURADB_STRESS_M", 5);
-    let key_count = env_usize("LURADB_STRESS_KEYS", 10);
-    let bg_writers = env_usize("LURADB_STRESS_BG_WRITERS", 2);
+fn restart_stress_amplifier() {
+    luradb::core::engine_runtime::block_on(async {
+        let n = env_usize("LURADB_STRESS_N", 4);
+        let m = env_usize("LURADB_STRESS_M", 5);
+        let key_count = env_usize("LURADB_STRESS_KEYS", 10);
+        let bg_writers = env_usize("LURADB_STRESS_BG_WRITERS", 2);
 
-    let (artifact_root, owned_artifact_dir): (PathBuf, Option<TempDir>) =
-        match std::env::var("LURADB_STRESS_ARTIFACT_DIR") {
-            Ok(dir) => {
-                let path = PathBuf::from(dir);
-                std::fs::create_dir_all(&path).expect("create LURADB_STRESS_ARTIFACT_DIR");
-                (path, None)
-            }
-            Err(_) => {
-                let td = TempDir::new().expect("tempdir for stress artifacts");
-                (td.path().to_path_buf(), Some(td))
-            }
-        };
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let bg_handles: Vec<_> = (0..bg_writers)
-        .map(|id| tokio::spawn(run_background_loader(id, Arc::clone(&stop))))
-        .collect();
-
-    let start = Instant::now();
-    let instance_handles: Vec<_> = (0..n)
-        .map(|instance| tokio::spawn(run_instance(instance, artifact_root.clone(), m, key_count)))
-        .collect();
-
-    let mut all_findings = Vec::new();
-    let mut kept_dirs = Vec::new();
-    for handle in instance_handles {
-        match handle.await {
-            Ok(outcome) => {
-                if !outcome.findings.is_empty() {
-                    all_findings.extend(outcome.findings);
-                    kept_dirs.push(outcome.dir);
+        let (artifact_root, owned_artifact_dir): (PathBuf, Option<TempDir>) =
+            match std::env::var("LURADB_STRESS_ARTIFACT_DIR") {
+                Ok(dir) => {
+                    let path = PathBuf::from(dir);
+                    std::fs::create_dir_all(&path).expect("create LURADB_STRESS_ARTIFACT_DIR");
+                    (path, None)
                 }
+                Err(_) => {
+                    let td = TempDir::new().expect("tempdir for stress artifacts");
+                    (td.path().to_path_buf(), Some(td))
+                }
+            };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let bg_handles: Vec<_> = (0..bg_writers)
+            .map(|id| compio::runtime::spawn(run_background_loader(id, Arc::clone(&stop))))
+            .collect();
+
+        let start = Instant::now();
+        let instance_handles: Vec<_> = (0..n)
+            .map(|instance| compio::runtime::spawn(run_instance(instance, artifact_root.clone(), m, key_count)))
+            .collect();
+
+        let mut all_findings = Vec::new();
+        let mut kept_dirs = Vec::new();
+        for handle in instance_handles {
+            match handle.await {
+                Ok(outcome) => {
+                    if !outcome.findings.is_empty() {
+                        all_findings.extend(outcome.findings);
+                        kept_dirs.push(outcome.dir);
+                    }
+                }
+                Err(e) => all_findings.push(format!("instance task panicked/joined with error: {e}")),
             }
-            Err(e) => all_findings.push(format!("instance task panicked/joined with error: {e}")),
         }
-    }
-    let elapsed = start.elapsed();
+        let elapsed = start.elapsed();
 
-    stop.store(true, Ordering::Relaxed);
-    for handle in bg_handles {
-        let _ = handle.await;
-    }
+        stop.store(true, Ordering::Relaxed);
+        for handle in bg_handles {
+            let _ = handle.await;
+        }
 
-    let total_cycles = n * m * 2;
-    println!(
-        "restart_stress_amplifier: N={n} M={m} keys/cycle={key_count} bg_writers={bg_writers} \
+        let total_cycles = n * m * 2;
+        println!(
+            "restart_stress_amplifier: N={n} M={m} keys/cycle={key_count} bg_writers={bg_writers} \
 total_cycles={total_cycles} elapsed={elapsed:?}"
-    );
+        );
 
-    if all_findings.is_empty() {
-        return;
-    }
+        if all_findings.is_empty() {
+            return;
+        }
 
-    let mut kept_paths: Vec<PathBuf> = kept_dirs.into_iter().map(TempDir::keep).collect();
-    match owned_artifact_dir {
-        Some(td) => kept_paths.push(td.keep()),
-        None => kept_paths.push(artifact_root),
-    }
+        let mut kept_paths: Vec<PathBuf> = kept_dirs.into_iter().map(TempDir::keep).collect();
+        match owned_artifact_dir {
+            Some(td) => kept_paths.push(td.keep()),
+            None => kept_paths.push(artifact_root),
+        }
 
-    let report = format!(
-        "restart_stress_amplifier: {} finding(s) after {total_cycles} cycles ({elapsed:?}):\n{}\n\nKept evidence directories:\n{}",
-        all_findings.len(),
-        all_findings.join("\n"),
-        kept_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
-    );
-    panic!("{report}");
+        let report = format!(
+            "restart_stress_amplifier: {} finding(s) after {total_cycles} cycles ({elapsed:?}):\n{}\n\nKept evidence directories:\n{}",
+            all_findings.len(),
+            all_findings.join("\n"),
+            kept_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
+        );
+        panic!("{report}");
+    })
 }
 
-/// Spec kv/026 §Tests 3: plays through the conservation mechanism with an
+/// Plays through the conservation mechanism with an
 /// artificially provoked verify failure (a deliberately wrong expected
 /// value, not a real corruption) and checks the snapshot directories exist
 /// -- and that `finish_cycle` never panics on its way there.
-#[tokio::test]
-async fn self_test_conserves_evidence_on_verify_mismatch() {
-    let dir = TempDir::new().unwrap();
-    let artifact_dir = TempDir::new().unwrap();
+#[test]
+fn self_test_conserves_evidence_on_verify_mismatch() {
+    luradb::core::engine_runtime::block_on(async {
+        let dir = TempDir::new().unwrap();
+        let artifact_dir = TempDir::new().unwrap();
 
-    let engine = open_engine(dir.path(), stress_engine_config()).await.unwrap();
-    let key = b"self-test-key".to_vec();
-    let value = b"self-test-value".to_vec();
-    engine.put(&key, &value).await.unwrap();
-    engine.shutdown().await;
-    drop(engine);
+        let (_hub, hub) = common::start_hub(&[(WalTarget::Kv, &dir.path().join("wal.log"))]);
+        let engine = open_engine(dir.path(), &hub, stress_engine_config()).await.unwrap();
+        let key = b"self-test-key".to_vec();
+        let value = b"self-test-value".to_vec();
+        engine.put(&key, &value).await.unwrap();
+        engine.shutdown().await;
+        drop(engine);
 
-    let s1 = snapshot(dir.path(), artifact_dir.path(), "self-test-S1").expect("S1 snapshot must succeed");
+        let s1 = snapshot(dir.path(), artifact_dir.path(), "self-test-S1").expect("S1 snapshot must succeed");
 
-    let new_engine = open_engine(dir.path(), stress_engine_config()).await.unwrap();
+        let new_engine = open_engine(dir.path(), &hub, stress_engine_config()).await.unwrap();
 
-    // Deliberately wrong expected value (spec kv/026 §Tests 3) -- forces a
-    // mismatch without corrupting real engine state. Must not panic: both
-    // verify_keys and finish_cycle only ever collect findings.
-    let wrong_expected = vec![(key.clone(), b"WRONG-VALUE-INJECTED".to_vec())];
-    let findings = finish_cycle(
-        &new_engine, dir.path(), artifact_dir.path(), "self-test",
-        &wrong_expected, Some(s1.clone()), Vec::new(),
-    ).await;
+        // Deliberately wrong expected value -- forces a
+        // mismatch without corrupting real engine state. Must not panic: both
+        // verify_keys and finish_cycle only ever collect findings.
+        let wrong_expected = vec![(key.clone(), b"WRONG-VALUE-INJECTED".to_vec())];
+        let findings = finish_cycle(
+            &new_engine, dir.path(), artifact_dir.path(), "self-test",
+            &wrong_expected, Some(s1.clone()), Vec::new(),
+        ).await;
 
-    assert!(!findings.is_empty(), "the injected wrong value must be reported, not silently accepted");
-    assert!(s1.exists(), "S1 must be conserved (not deleted) when a finding is present");
-    let s2 = artifact_dir.path().join("self-test-S2");
-    assert!(s2.exists(), "S2 must be conserved (not deleted) when a finding is present");
-    assert!(s1.join("wal.log").exists(), "S1 must contain the copied WAL file");
+        assert!(!findings.is_empty(), "the injected wrong value must be reported, not silently accepted");
+        assert!(s1.exists(), "S1 must be conserved (not deleted) when a finding is present");
+        let s2 = artifact_dir.path().join("self-test-S2");
+        assert!(s2.exists(), "S2 must be conserved (not deleted) when a finding is present");
+        assert!(s1.join("wal.log").exists(), "S1 must contain the copied WAL");
+    })
 }

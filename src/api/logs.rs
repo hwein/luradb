@@ -1,11 +1,11 @@
-//! Log Access REST handlers (spec general/005): read-only tail + file
+//! Log Access REST handlers: read-only tail + file
 //! listing over the log directory. Admin-only — `extract_domain`
 //! (`src/auth/middleware.rs`) has no match arm for `/store-api/logs*`, so
 //! non-admins get 403 from the existing auth middleware automatically.
 //!
 //! Opt-in: `AppState.log_access` is `None` unless `log.http_access = true`,
-//! in which case both handlers answer 503 (spec general/005 decision 1: a
-//! disabled feature is 503 project-wide, same as the JSON/rel/backup
+//! in which case both handlers answer 503 (a disabled feature is 503
+//! project-wide, same as the JSON/rel/backup
 //! guards). Routes are always registered so "disabled" (503) stays
 //! distinguishable from "wrong URL / old server" (404).
 
@@ -33,8 +33,6 @@ pub struct LogAccessState {
 
 const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const CHUNK_SIZE: usize = 64 * 1024;
-
-// ── DTOs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, ToSchema)]
 pub struct LogQuery {
@@ -77,8 +75,8 @@ fn format_str(format: &LogFormat) -> &'static str {
     }
 }
 
-/// Resolves the log-access state or fails with 503 (spec general/005
-/// decision 1: "feature disabled" answers 503 project-wide) when
+/// Resolves the log-access state or fails with 503 ("feature disabled"
+/// answers 503 project-wide) when
 /// `log.http_access = false`.
 fn log_access_state(state: &AppState) -> Result<&LogAccessState, ApiError> {
     state.log_access.as_ref().ok_or_else(|| {
@@ -88,8 +86,6 @@ fn log_access_state(state: &AppState) -> Result<&LogAccessState, ApiError> {
         )
     })
 }
-
-// ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
     get,
@@ -108,7 +104,7 @@ fn log_access_state(state: &AppState) -> Result<&LogAccessState, ApiError> {
     ),
     tag = "Logs"
 )]
-/// Reads the last N lines of a log file (spec general/005).
+/// Reads the last N lines of a log file.
 pub async fn get_logs(
     State(state): State<AppState>,
     Query(query): Query<LogQuery>,
@@ -174,7 +170,7 @@ pub async fn get_logs(
     ),
     tag = "Logs"
 )]
-/// Lists every `luradb.log*` file in the log directory (spec general/005).
+/// Lists every `luradb.log*` file in the log directory.
 /// `files[0]` is exactly the file `GET /logs` reads without a `file` param.
 pub async fn list_files(State(state): State<AppState>) -> Result<Json<LogFilesResponse>, ApiError> {
     let access = log_access_state(&state)?;
@@ -184,11 +180,9 @@ pub async fn list_files(State(state): State<AppState>) -> Result<Json<LogFilesRe
     Ok(Json(LogFilesResponse { files }))
 }
 
-// ── File listing & selection ────────────────────────────────────────────────
-
 /// Whitelist for the `file` query param: must start with `luradb.log` and
-/// stay a single path segment -- structurally excludes traversal (spec
-/// general/005 "Sicherheit"). Same prefix rule as `LogJanitor`.
+/// stay a single path segment -- structurally excludes traversal. Same
+/// prefix rule as `LogJanitor`.
 fn is_valid_file_name(name: &str) -> bool {
     name.starts_with("luradb.log") && !name.contains('/') && !name.contains('\\')
 }
@@ -220,8 +214,6 @@ async fn list_log_files(dir: &Path) -> io::Result<Vec<LogFileInfo>> {
     Ok(files)
 }
 
-// ── Backward tail ────────────────────────────────────────────────────────────
-
 struct TailResult {
     lines: Vec<String>,
     truncated: bool,
@@ -230,7 +222,7 @@ struct TailResult {
 /// Reads `path` backwards in `CHUNK_SIZE` chunks, collecting up to `lines`
 /// lines (optionally only `q` substring matches), stopping at `lines`
 /// matches, the start of the file, or `MAX_SCAN_BYTES` scanned -- whichever
-/// comes first (spec general/005 "Sicherheit": resource caps). Returns
+/// comes first (resource caps). Returns
 /// lines in chronological (oldest-first) order, like `tail`.
 async fn tail_lines(path: &Path, lines: usize, q: Option<&str>) -> io::Result<TailResult> {
     // Same rule as `list_log_files`: regular files only, no symlink traversal
@@ -242,8 +234,8 @@ async fn tail_lines(path: &Path, lines: usize, q: Option<&str>) -> io::Result<Ta
     let mut file = tokio::fs::File::open(path).await?;
     let file_len = file.metadata().await?.len() as usize;
 
-    // A single trailing '\n' at EOF must not produce an empty-line artifact
-    // (spec): scan as if the file ended right before it.
+    // A single trailing '\n' at EOF must not produce an empty-line artifact:
+    // scan as if the file ended right before it.
     let mut pos = file_len;
     if pos > 0 {
         let mut last = [0u8; 1];
@@ -326,7 +318,7 @@ async fn tail_lines(path: &Path, lines: usize, q: Option<&str>) -> io::Result<Ta
 }
 
 /// Byte-buffer-to-line UTF-8 conversion happens per assembled line, never
-/// per chunk (spec: chunk boundaries must not split multi-byte sequences).
+/// per chunk (chunk boundaries must not split multi-byte sequences).
 fn push_if_match(bytes: &[u8], q: Option<&str>, out: &mut Vec<String>) {
     let line = String::from_utf8_lossy(bytes).into_owned();
     let matches = match q {
@@ -337,8 +329,6 @@ fn push_if_match(bytes: &[u8], q: Option<&str>, out: &mut Vec<String>) {
         out.push(line);
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -364,7 +354,6 @@ mod tests {
             .await
             .unwrap(),
         );
-        let auth_cache = Arc::new(crate::auth::AuthCache::new(Arc::clone(&engine)));
         let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
         let registry = Arc::new(
             crate::engines::lsm::DomainRegistry::recover(
@@ -375,6 +364,8 @@ mod tests {
             .await
             .unwrap(),
         );
+        let bus = Arc::new(crate::core::events::GlobalEventBus::new(256, 1024));
+        let (control, auth_cache) = crate::control::testing::start(dir.path(), Arc::clone(&registry), None, None, bus).await;
         let state = AppState {
             registry,
             auth_cache,
@@ -385,7 +376,7 @@ mod tests {
             shm_manager: None,
             backup_manager: None,
             log_access,
-            event_bus: Arc::new(crate::core::events::GlobalEventBus::new(256, 1024)),
+            control,
             config: Arc::new(crate::config::LuraConfig::default()),
             config_path: "test.toml".to_string(),
             config_file_loaded: false,
@@ -395,7 +386,7 @@ mod tests {
 
     async fn make_app(log_access: Option<LogAccessState>) -> (axum::Router, tempfile::TempDir) {
         let (state, dir) = make_state(log_access, false).await;
-        (crate::api::create_router(state, Arc::new(vec![])), dir)
+        (crate::api::router_inline(state, Arc::new(vec![])), dir)
     }
 
     fn text_access(dir: &Path) -> LogAccessState {
@@ -428,273 +419,299 @@ mod tests {
     }
 
     // 1. http_access = false -> both routes 503.
-    #[tokio::test]
-    async fn test_log_access_disabled_returns_503_on_both_routes() {
-        let (app, _dir) = make_app(None).await;
-        for uri in ["/store-api/logs", "/store-api/logs/files"] {
-            let (status, body) = request(&app, uri, None).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
-            assert!(body.contains("log access is disabled"), "{uri}: {body}");
-        }
+    #[test]
+    fn test_log_access_disabled_returns_503_on_both_routes() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app(None).await;
+            for uri in ["/store-api/logs", "/store-api/logs/files"] {
+                let (status, body) = request(&app, uri, None).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+                assert!(body.contains("log access is disabled"), "{uri}: {body}");
+            }
+        })
     }
 
     // 3. Mandatory test: non-admin -> 403 on both routes, admin -> 200.
-    #[tokio::test]
-    async fn test_both_routes_require_admin() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(log_dir.path().join("luradb.log"), "a line\n").unwrap();
-        let (state, _dir) = make_state(Some(text_access(log_dir.path())), true).await;
-        let cache = Arc::clone(&state.auth_cache);
-        let app = crate::api::create_router(state, Arc::new(vec![]));
+    #[test]
+    fn test_both_routes_require_admin() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(log_dir.path().join("luradb.log"), "a line\n").unwrap();
+            let (state, _dir) = make_state(Some(text_access(log_dir.path())), true).await;
+            let cache = Arc::clone(&state.auth_cache);
+            let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-        let worker_key = "lura_test_logs_worker_key";
-        cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "worker".to_string(),
-                api_key_hash: crate::auth::hash_api_key(worker_key),
-                role: crate::auth::UserRole::User,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        for uri in ["/store-api/logs", "/store-api/logs/files"] {
-            let (status, body) = request(&app, uri, Some(worker_key)).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
-        }
+            let worker_key = "lura_test_logs_worker_key";
+            cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "worker".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(worker_key),
+                    role: crate::auth::UserRole::User,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            for uri in ["/store-api/logs", "/store-api/logs/files"] {
+                let (status, body) = request(&app, uri, Some(worker_key)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            }
 
-        let admin_key = "lura_test_logs_admin_key";
-        cache
-            .upsert_user(crate::auth::UserRecord {
-                name: "boss".to_string(),
-                api_key_hash: crate::auth::hash_api_key(admin_key),
-                role: crate::auth::UserRole::Admin,
-                created_at: 0,
-            })
-            .await
-            .unwrap();
-        for uri in ["/store-api/logs", "/store-api/logs/files"] {
-            let (status, body) = request(&app, uri, Some(admin_key)).await;
-            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
-        }
+            let admin_key = "lura_test_logs_admin_key";
+            cache
+                .upsert_user(crate::auth::UserRecord {
+                    name: "boss".to_string(),
+                    api_key_hash: crate::auth::hash_api_key(admin_key),
+                    role: crate::auth::UserRole::Admin,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+            for uri in ["/store-api/logs", "/store-api/logs/files"] {
+                let (status, body) = request(&app, uri, Some(admin_key)).await;
+                assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            }
+        })
     }
 
     // 4. Tail correctness: last N lines, chronologically ascending.
-    #[tokio::test]
-    async fn test_tail_returns_last_n_lines_chronological() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        let content = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n") + "\n";
-        std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_tail_returns_last_n_lines_chronological() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            let content = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n") + "\n";
+            std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?lines=3", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["lines"], serde_json::json!(["line8", "line9", "line10"]));
-        assert_eq!(value["truncated"], serde_json::json!(false));
-        assert_eq!(value["file"], serde_json::json!("luradb.log"));
-        assert_eq!(value["format"], serde_json::json!("text"));
+            let (status, body) = request(&app, "/store-api/logs?lines=3", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["lines"], serde_json::json!(["line8", "line9", "line10"]));
+            assert_eq!(value["truncated"], serde_json::json!(false));
+            assert_eq!(value["file"], serde_json::json!("luradb.log"));
+            assert_eq!(value["format"], serde_json::json!("text"));
+        })
     }
 
     // 5. Chunk boundaries: a line far longer than CHUNK_SIZE necessarily
     // spans multiple 64-KiB reads and must reassemble intact.
-    #[tokio::test]
-    async fn test_line_spanning_chunk_boundary_reassembled_intact() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        let huge = "X".repeat(150_000);
-        let content = format!("before\n{huge}\nafter\n");
-        std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_line_spanning_chunk_boundary_reassembled_intact() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            let huge = "X".repeat(150_000);
+            let content = format!("before\n{huge}\nafter\n");
+            std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?lines=10", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["lines"], serde_json::json!(["before", huge, "after"]));
-        assert_eq!(value["truncated"], serde_json::json!(false));
+            let (status, body) = request(&app, "/store-api/logs?lines=10", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["lines"], serde_json::json!(["before", huge, "after"]));
+            assert_eq!(value["truncated"], serde_json::json!(false));
+        })
     }
 
     // 6. q filter: only matches, counted toward `lines`.
-    #[tokio::test]
-    async fn test_q_filter_only_matching_lines() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        let content = "INFO one\nWARN two\nINFO three\nWARN four\nINFO five\n";
-        std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_q_filter_only_matching_lines() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            let content = "INFO one\nWARN two\nINFO three\nWARN four\nINFO five\n";
+            std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?lines=10&q=WARN", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["lines"], serde_json::json!(["WARN two", "WARN four"]));
+            let (status, body) = request(&app, "/store-api/logs?lines=10&q=WARN", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["lines"], serde_json::json!(["WARN two", "WARN four"]));
+        })
     }
 
     // 7. Without `file`, the newest file by mtime is read (LogJanitor-style utimes).
-    #[tokio::test]
-    async fn test_tail_without_file_param_reads_newest_by_mtime() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        let old = log_dir.path().join("luradb.log.2026-08-11");
-        std::fs::write(&old, "old\n").unwrap();
-        set_mtime_secs_ago(&old, 200);
-        let new = log_dir.path().join("luradb.log.2026-08-12");
-        std::fs::write(&new, "new\n").unwrap();
-        set_mtime_secs_ago(&new, 10);
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_tail_without_file_param_reads_newest_by_mtime() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            let old = log_dir.path().join("luradb.log.2026-08-11");
+            std::fs::write(&old, "old\n").unwrap();
+            set_mtime_secs_ago(&old, 200);
+            let new = log_dir.path().join("luradb.log.2026-08-12");
+            std::fs::write(&new, "new\n").unwrap();
+            set_mtime_secs_ago(&new, 10);
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["file"], serde_json::json!("luradb.log.2026-08-12"));
-        assert_eq!(value["lines"], serde_json::json!(["new"]));
+            let (status, body) = request(&app, "/store-api/logs", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["file"], serde_json::json!("luradb.log.2026-08-12"));
+            assert_eq!(value["lines"], serde_json::json!(["new"]));
+        })
     }
 
     // 8. Files listing: sorted newest first, files[0] matches the tail
     // default; empty directory -> 200 {"files": []}.
-    #[tokio::test]
-    async fn test_list_files_sorted_newest_first_and_empty_dir() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_list_files_sorted_newest_first_and_empty_dir() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs/files", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({"files": []})
-        );
+            let (status, body) = request(&app, "/store-api/logs/files", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"files": []})
+            );
 
-        let a = log_dir.path().join("luradb.log.a");
-        std::fs::write(&a, "1234").unwrap();
-        set_mtime_secs_ago(&a, 100);
-        let b = log_dir.path().join("luradb.log.b");
-        std::fs::write(&b, "12345678").unwrap();
-        set_mtime_secs_ago(&b, 10);
+            let a = log_dir.path().join("luradb.log.a");
+            std::fs::write(&a, "1234").unwrap();
+            set_mtime_secs_ago(&a, 100);
+            let b = log_dir.path().join("luradb.log.b");
+            std::fs::write(&b, "12345678").unwrap();
+            set_mtime_secs_ago(&b, 10);
 
-        let (status, body) = request(&app, "/store-api/logs/files", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let files = value["files"].as_array().unwrap();
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0]["file"], serde_json::json!("luradb.log.b"));
-        assert_eq!(files[0]["size"], serde_json::json!(8));
-        assert_eq!(files[1]["file"], serde_json::json!("luradb.log.a"));
+            let (status, body) = request(&app, "/store-api/logs/files", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let files = value["files"].as_array().unwrap();
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0]["file"], serde_json::json!("luradb.log.b"));
+            assert_eq!(files[0]["size"], serde_json::json!(8));
+            assert_eq!(files[1]["file"], serde_json::json!("luradb.log.a"));
 
-        let (status, body) = request(&app, "/store-api/logs", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let tail: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(tail["file"], files[0]["file"]);
+            let (status, body) = request(&app, "/store-api/logs", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let tail: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(tail["file"], files[0]["file"]);
+        })
     }
 
     // 9. file param: selects a listed archive file; invalid names -> 400;
     // validated-but-missing -> 404.
-    #[tokio::test]
-    async fn test_file_param_selects_listed_file_and_validates() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(log_dir.path().join("luradb.log"), "current\n").unwrap();
-        std::fs::write(log_dir.path().join("luradb.log.old"), "archived\n").unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_file_param_selects_listed_file_and_validates() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(log_dir.path().join("luradb.log"), "current\n").unwrap();
+            std::fs::write(log_dir.path().join("luradb.log.old"), "archived\n").unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?file=luradb.log.old", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["file"], serde_json::json!("luradb.log.old"));
-        assert_eq!(value["lines"], serde_json::json!(["archived"]));
+            let (status, body) = request(&app, "/store-api/logs?file=luradb.log.old", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["file"], serde_json::json!("luradb.log.old"));
+            assert_eq!(value["lines"], serde_json::json!(["archived"]));
 
-        for bad in ["evil.txt", "luradb.log%2F..%2Fx", "..%2Fluradb.log"] {
-            let (status, body) = request(&app, &format!("/store-api/logs?file={bad}"), None).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
-            assert!(body.contains("invalid file name"), "{bad}: {body}");
-        }
+            for bad in ["evil.txt", "luradb.log%2F..%2Fx", "..%2Fluradb.log"] {
+                let (status, body) = request(&app, &format!("/store-api/logs?file={bad}"), None).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+                assert!(body.contains("invalid file name"), "{bad}: {body}");
+            }
 
-        let (status, body) = request(&app, "/store-api/logs?file=luradb.log.missing", None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-        assert!(body.contains("log file not found"), "{body}");
+            let (status, body) = request(&app, "/store-api/logs?file=luradb.log.missing", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains("log file not found"), "{body}");
+        })
     }
 
     // 9b. Listing and `file=` apply the same regular-file rule: a symlink or
     // directory named `luradb.log*` is neither listed nor readable.
-    #[tokio::test]
-    async fn test_symlink_and_directory_are_neither_listed_nor_readable() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
-        let target = outside.path().join("secret.txt");
-        std::fs::write(&target, "secret\n").unwrap();
-        std::os::unix::fs::symlink(&target, log_dir.path().join("luradb.log.link")).unwrap();
-        std::fs::create_dir(log_dir.path().join("luradb.log.dir")).unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_symlink_and_directory_are_neither_listed_nor_readable() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            let outside = tempfile::TempDir::new().unwrap();
+            let target = outside.path().join("secret.txt");
+            std::fs::write(&target, "secret\n").unwrap();
+            std::os::unix::fs::symlink(&target, log_dir.path().join("luradb.log.link")).unwrap();
+            std::fs::create_dir(log_dir.path().join("luradb.log.dir")).unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs/files", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({"files": []})
-        );
+            let (status, body) = request(&app, "/store-api/logs/files", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"files": []})
+            );
 
-        for name in ["luradb.log.link", "luradb.log.dir"] {
-            let (status, body) = request(&app, &format!("/store-api/logs?file={name}"), None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{name}: {body}");
-            assert!(body.contains("log file not found"), "{name}: {body}");
-        }
+            for name in ["luradb.log.link", "luradb.log.dir"] {
+                let (status, body) = request(&app, &format!("/store-api/logs?file={name}"), None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{name}: {body}");
+                assert!(body.contains("log file not found"), "{name}: {body}");
+            }
+        })
     }
 
     // 10a. Caps: lines=5000 is capped to 1000.
-    #[tokio::test]
-    async fn test_lines_param_capped_at_1000() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        let content = (1..=1200).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n") + "\n";
-        std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_lines_param_capped_at_1000() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            let content = (1..=1200).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n") + "\n";
+            std::fs::write(log_dir.path().join("luradb.log"), content).unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?lines=5000", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let lines = value["lines"].as_array().unwrap();
-        assert_eq!(lines.len(), 1000);
-        assert_eq!(lines[0], serde_json::json!("l201"));
-        assert_eq!(lines[999], serde_json::json!("l1200"));
+            let (status, body) = request(&app, "/store-api/logs?lines=5000", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let lines = value["lines"].as_array().unwrap();
+            assert_eq!(lines.len(), 1000);
+            assert_eq!(lines[0], serde_json::json!("l201"));
+            assert_eq!(lines[999], serde_json::json!("l1200"));
+        })
     }
 
     // 10b. Budget stop -> truncated = true, fewer than the capped count returned.
-    #[tokio::test]
-    async fn test_scan_budget_exhausted_sets_truncated() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        // ~4.5 KB/line * 2000 lines ~= 9 MB, well over the 4 MiB scan budget;
-        // 1000 matches would need ~4.5 MB, past the budget too.
-        let line = "x".repeat(4500);
-        let mut content = String::new();
-        for _ in 0..2000 {
-            content.push_str(&line);
-            content.push('\n');
-        }
-        std::fs::write(log_dir.path().join("luradb.log"), &content).unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_scan_budget_exhausted_sets_truncated() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            // ~4.5 KB/line * 2000 lines ~= 9 MB, well over the 4 MiB scan budget;
+            // 1000 matches would need ~4.5 MB, past the budget too.
+            let line = "x".repeat(4500);
+            let mut content = String::new();
+            for _ in 0..2000 {
+                content.push_str(&line);
+                content.push('\n');
+            }
+            std::fs::write(log_dir.path().join("luradb.log"), &content).unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?lines=5000", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["truncated"], serde_json::json!(true));
-        assert!(value["lines"].as_array().unwrap().len() < 1000);
+            let (status, body) = request(&app, "/store-api/logs?lines=5000", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["truncated"], serde_json::json!(true));
+            assert!(value["lines"].as_array().unwrap().len() < 1000);
+        })
     }
 
     // 11. Fewer lines than requested -> all lines, truncated = false.
-    #[tokio::test]
-    async fn test_fewer_lines_than_requested_returns_all_not_truncated() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(log_dir.path().join("luradb.log"), "only one line\n").unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_fewer_lines_than_requested_returns_all_not_truncated() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(log_dir.path().join("luradb.log"), "only one line\n").unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?lines=50", None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["lines"], serde_json::json!(["only one line"]));
-        assert_eq!(value["truncated"], serde_json::json!(false));
+            let (status, body) = request(&app, "/store-api/logs?lines=50", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["lines"], serde_json::json!(["only one line"]));
+            assert_eq!(value["truncated"], serde_json::json!(false));
+        })
     }
 
     // lines = 0 -> 400.
-    #[tokio::test]
-    async fn test_lines_zero_rejected() {
-        let log_dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(log_dir.path().join("luradb.log"), "x\n").unwrap();
-        let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
+    #[test]
+    fn test_lines_zero_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let log_dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(log_dir.path().join("luradb.log"), "x\n").unwrap();
+            let (app, _dir) = make_app(Some(text_access(log_dir.path()))).await;
 
-        let (status, body) = request(&app, "/store-api/logs?lines=0", None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("lines must be"), "{body}");
+            let (status, body) = request(&app, "/store-api/logs?lines=0", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("lines must be"), "{body}");
+        })
     }
 }

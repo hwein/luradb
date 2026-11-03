@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reads sections from CHANGELOG.md (keepachangelog 1.1.0). Used by
-# release.sh and (later) CI as a consistency gate (spec dist/003 §4/§6).
+# release.sh and (later) CI as a consistency gate.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -32,8 +32,8 @@ extract_section() {
             first = 1; last = n
             # The oldest section has no trailing "## [" line to bound the
             # body - the reference-link block at the end of the file
-            # (spec §2) must therefore be cut off explicitly, or it ends up
-            # in the extracted body.
+            # must therefore be cut off explicitly, or it ends up in the
+            # extracted body.
             while (last >= first && body[last] ~ /^\[[^]]+\]:/) last--
             while (first <= last && body[first] ~ /^[ \t]*$/) first++
             while (last >= first && body[last] ~ /^[ \t]*$/) last--

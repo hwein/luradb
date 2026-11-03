@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release automation (spec dist/003 §3). Modes: final (default), rc, --hotfix.
+# Release automation. Modes: final (default), rc, --hotfix.
 # Principle: all checks first, then mutations; --dry-run shows the plan
 # without changing anything (checks incl. cargo/git-fetch still run for real).
 set -euo pipefail
@@ -13,6 +13,7 @@ CHANGELOG_JSON="$SCRIPT_DIR/changelog-json.sh"
 
 DRY_RUN=0
 MODE="final"
+REPORT=""
 
 TMP_DIRS=()
 cleanup() {
@@ -29,14 +30,16 @@ trap cleanup EXIT
 usage() {
     local exit_code="${1:-1}"
     cat <<'EOF'
-Usage: scripts/release.sh [rc|--hotfix] [--dry-run]
+Usage: scripts/release.sh [rc|--hotfix] [--report <file>] [--dry-run]
 
   (no argument)    final mode: next -> main, tag vX.Y.Z, next to X.Y.(Z+1)-dev
   rc               rc mode: prerelease tag vX.Y.Z-rc.N on next
   --hotfix         hotfix mode: on hotfix/vX.Y.Z, merge into main, tag vX.Y.Z
+  --report <file>  final mode only
   --dry-run        shows the full plan without changing anything
 
-Details: concepts/specs/dist/003_versioning_changelog_release.md
+final releases require --report: the JSON report of the release test run against
+the rc tag that points at HEAD (fields: tag, commit, verdict)
 EOF
     exit "$exit_code"
 }
@@ -44,8 +47,6 @@ EOF
 log()  { printf '%s\n' "$*"; }
 step() { printf -- '-- %s\n' "$*"; }
 die()  { printf 'release.sh: %s\n' "$*" >&2; exit 1; }
-
-# --- Git/Cargo helpers -------------------------------------------------
 
 current_branch() { git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD; }
 
@@ -90,7 +91,51 @@ version_gt() {
     return 1
 }
 
-# --- Preflight checks (§3.1) ----------------------------------------------
+check_tools() {
+    command -v jq >/dev/null 2>&1 || die "jq is required (apt install jq)"
+    command -v curl >/dev/null 2>&1 || die "curl is required (apt install curl)"
+}
+
+github_api_url() {
+    local repo_url
+    repo_url=$(resolve_repo_url)
+    printf 'https://api.github.com/repos/%s' "${repo_url#https://github.com/}"
+}
+
+# The pushed tag only triggers the Release workflow; the GitHub release with
+# its assets exists once that workflow has passed. Waits for it (unauthenticated
+# API, polled once a minute) and fails loudly when the workflow is red.
+wait_for_release_workflow() {
+    local tag="$1" api status conclusion html_url assets deadline line
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] wait for the Release workflow of %s and check the GitHub release\n' "$tag"
+        return
+    fi
+    api=$(github_api_url)
+    step "waiting for the Release workflow of $tag (up to 45 min)"
+    deadline=$(( $(date +%s) + 45 * 60 ))
+    status=""
+    while :; do
+        line=$(curl -fsS "$api/actions/workflows/release.yml/runs?event=push&branch=$tag&per_page=1" \
+            | jq -r '.workflow_runs[0] | select(. != null) | [.status, (.conclusion // "-"), .html_url] | @tsv' \
+            2>/dev/null || true)
+        if [ -n "$line" ]; then
+            IFS=$'\t' read -r status conclusion html_url <<<"$line"
+            [ "$status" = "completed" ] && break
+            log "   workflow $status ..."
+        else
+            log "   workflow not started yet ..."
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] || die "the Release workflow of $tag did not finish in time — check ${html_url:-the Actions page}"
+        sleep 60
+    done
+    if [ "$conclusion" != "success" ]; then
+        die "the Release workflow of $tag ended with '$conclusion' — no GitHub release was published. Fix the cause on next and cut the next rc. Details: $html_url"
+    fi
+    assets=$(curl -fsS "$api/releases/tags/$tag" | jq -r '.assets | length' 2>/dev/null || echo 0)
+    [ "$assets" -gt 0 ] || die "the Release workflow passed but no GitHub release with assets exists for $tag: $html_url"
+    log "Release $tag published with $assets assets: $(resolve_repo_url)/releases/tag/$tag"
+}
 
 check_branch() {
     local branch="$1" current
@@ -127,6 +172,26 @@ check_clean_and_synced() {
     fi
 }
 
+# The report must be a passing run against an annotated rc tag on exactly HEAD.
+check_release_report() {
+    [ -n "$REPORT" ] || die "final releases require --report <file> (the release test report)"
+    [ -r "$REPORT" ] || die "report not readable: $REPORT"
+    local verdict commit tag head
+    verdict=$(jq -r '.verdict // empty' "$REPORT") || die "report is not valid JSON: $REPORT"
+    commit=$(jq -r '.commit // empty' "$REPORT")
+    tag=$(jq -r '.tag // empty' "$REPORT")
+    [ "$verdict" = "pass" ] || die "report verdict is not pass: '${verdict}'"
+    head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+    [ "$commit" = "$head" ] || die "report commit '${commit}' is not HEAD ($head)"
+    [ -n "$tag" ] || die "report has no tag"
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]] \
+        || die "report tag '${tag}' is not an rc tag (vX.Y.Z-rc.N)"
+    [ "$(git -C "$REPO_ROOT" cat-file -t "refs/tags/$tag" 2>/dev/null)" = "tag" ] \
+        || die "report tag '${tag}' is not an annotated tag"
+    [ "$(git -C "$REPO_ROOT" rev-parse "refs/tags/$tag^{commit}")" = "$commit" ] \
+        || die "report tag '${tag}' does not point at the report commit"
+}
+
 check_tests() {
     step "cargo check --tests"
     ( cd "$REPO_ROOT" && cargo check --tests )
@@ -139,7 +204,7 @@ check_unreleased_nonempty() {
 }
 
 # Runs unconditionally, even under --dry-run: changelog-json.sh only reads
-# CHANGELOG.md, it mutates nothing (spec dist/010 §Umsetzung).
+# CHANGELOG.md, it mutates nothing.
 check_changelog_json() {
     "$CHANGELOG_JSON" unreleased | jq empty || die "changelog-json.sh unreleased did not produce valid JSON"
 }
@@ -149,8 +214,6 @@ check_tag_free() {
     git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "tag $tag already exists"
     return 0
 }
-
-# --- Version proposal (§1) --------------------------------------------
 
 # Categories in the [Unreleased] section -> bump kind (0.x vs. 1.0+ rules).
 bump_kind() {
@@ -201,8 +264,6 @@ confirm_version() {
     printf '%s' "$final"
 }
 
-# --- CHANGELOG.md / Cargo.toml mutations -------------------------------
-
 # Removes category blocks ("### Name" + content) that have no bullet content.
 filter_empty_categories() {
     awk '
@@ -214,7 +275,7 @@ filter_empty_categories() {
 }
 
 # Rebuilds CHANGELOG.md: [Unreleased] -> [$1] - today, fresh empty
-# [Unreleased], reference block regenerated from scratch (§2).
+# [Unreleased], reference block regenerated from scratch.
 _rewrite_changelog_for_release() {
     local version="$1" date body repo_url tmp
     date=$(date +%F)
@@ -343,10 +404,8 @@ push_atomic() {
     fi
 }
 
-# --- final mode (§3.2) --------------------------------------------------
-
 # Detects: commit/merge/tag/dev-bump already ran, only the push is still
-# missing (§3.5). Prints the affected tag on a match.
+# missing. Prints the affected tag on a match.
 detect_pending_push_final() {
     [ "$(current_branch)" = "next" ] || return 1
     local parent tag main_tip
@@ -370,6 +429,7 @@ run_final() {
     fi
 
     check_clean_and_synced
+    check_release_report
     check_tests
     check_unreleased_nonempty
     check_changelog_json
@@ -412,8 +472,6 @@ run_final() {
     push_atomic main next "$tag"
 }
 
-# --- rc mode (§3.3) ------------------------------------------------------
-
 detect_pending_push_rc() {
     [ "$(current_branch)" = "next" ] || return 1
     local head tag
@@ -431,6 +489,7 @@ run_rc() {
     if resume_tag=$(detect_pending_push_rc); then
         log "Detected a half-finished rc state (tag $resume_tag local, push pending) — catching up the push only."
         push_atomic next "$resume_tag"
+        wait_for_release_workflow "$resume_tag"
         return
     fi
 
@@ -451,15 +510,14 @@ run_rc() {
     tag="v$version-rc.$n"
     check_tag_free "$tag"
 
-    # Mutations start here. Changelog stays unfinalized (§3.3.2).
+    # Mutations start here. Changelog stays unfinalized.
     set_cargo_version "$version-rc.$n"
     regenerate_openapi
     commit_paths "chore(release): $tag" Cargo.toml Cargo.lock api/openapi.json
     create_tag "$tag" "LuraDB $tag"
     push_atomic next "$tag"
+    wait_for_release_workflow "$tag"
 }
-
-# --- --hotfix mode (§3.4) ------------------------------------------------
 
 detect_pending_push_hotfix() {
     local version="$1"
@@ -524,17 +582,28 @@ run_hotfix() {
     log "Then delete $branch: git branch -d $branch"
 }
 
-# --- Arguments & dispatch --------------------------------------------------
-
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         rc) MODE="rc" ;;
         --hotfix) MODE="hotfix" ;;
         --dry-run) DRY_RUN=1 ;;
+        --report)
+            [ $# -ge 2 ] || { printf -- '--report needs a file\n\n' >&2; usage 1; }
+            REPORT="$2"
+            shift
+            ;;
         -h|--help) usage 0 ;;
-        *) printf 'Unknown argument: %s\n\n' "$arg" >&2; usage 1 ;;
+        *) printf 'Unknown argument: %s\n\n' "$1" >&2; usage 1 ;;
     esac
+    shift
 done
+
+if [ -n "$REPORT" ] && [ "$MODE" != "final" ]; then
+    printf -- '--report applies to final releases only\n\n' >&2
+    usage 1
+fi
+
+check_tools
 
 case "$MODE" in
     final)  run_final ;;

@@ -1,22 +1,23 @@
-//! rel-domain REST handlers (spec rel/009 §2, pattern `json_domains.rs`).
+//! rel-domain REST handlers (pattern `json_domains.rs`).
 //!
 //! POST   /store-api/rel/domains          → create_domain  (201 | 409 | 400)
 //! GET    /store-api/rel/domains          → list_domains   (200)
-//! GET    /store-api/rel/domains/{name}   → get_domain     (200 | 404 | 410)
+//! GET    /store-api/rel/domains/{name}   → get_domain     (200 | 403 | 404 | 410)
 //! DELETE /store-api/rel/domains/{name}   → delete_domain  (202 | 404 | 410)
 
+use crate::api::domains::DomainFilter;
 use crate::api::rel::rel_engine;
 use crate::api::{middleware::ApiError, AppState};
+use crate::auth::middleware::{AuthOutcome, AuthUser, StoreType};
+use crate::control::{DomainEntry, Engine};
 use crate::engines::rel::{RelDomain, RelDomainState};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::Json,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-
-// ── DTOs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateRelDomainRequest {
@@ -29,8 +30,8 @@ pub struct RelDomainResponse {
     pub name: String,
     /// Creation timestamp (Unix seconds).
     pub created_at: u64,
-    /// Lifecycle state: "active" or "deleting" (background purge running, rel/013).
-    /// Always present — so rel/013's later `list_domains` visibility change
+    /// Lifecycle state: "active" or "deleting" (background purge running).
+    /// Always present — so a later `list_domains` visibility change
     /// (surfacing `Deleting` domains too) needs no REST-contract change.
     pub state: String,
 }
@@ -45,7 +46,11 @@ impl From<RelDomain> for RelDomainResponse {
     }
 }
 
-// ── Handlers ─────────────────────────────────────────────────────────────────
+impl From<&DomainEntry> for RelDomainResponse {
+    fn from(d: &DomainEntry) -> Self {
+        RelDomainResponse { name: d.name.clone(), created_at: d.created_at, state: d.state.as_str().to_string() }
+    }
+}
 
 #[utoipa::path(
     post,
@@ -65,24 +70,33 @@ pub async fn create_domain(
     State(state): State<AppState>,
     Json(body): Json<CreateRelDomainRequest>,
 ) -> Result<(StatusCode, Json<RelDomainResponse>), ApiError> {
-    let engine = rel_engine(&state)?;
-    let domain = engine.create_domain(&body.name).await?;
-    Ok((StatusCode::CREATED, Json(domain.into())))
+    rel_engine(&state)?;
+    let domain = state.control.create_domain(Engine::Rel, &body.name, false).await?;
+    Ok((StatusCode::CREATED, Json((&domain).into())))
 }
 
 #[utoipa::path(
     get,
     path = "/store-api/rel/domains",
     responses(
-        (status = 200, description = "List of active relational domains", body = Vec<RelDomainResponse>),
+        (status = 200, description = "List of the active relational domains the key may access", body = Vec<RelDomainResponse>),
         (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]
-/// Returns all active relational domains.
-pub async fn list_domains(State(state): State<AppState>) -> Result<Json<Vec<RelDomainResponse>>, ApiError> {
-    let engine = rel_engine(&state)?;
-    Ok(Json(engine.list_domains().into_iter().map(Into::into).collect()))
+/// Returns the active relational domains. Admin keys see all of them; any
+/// other key sees only the relational domains it has a permission on (an empty
+/// list without any).
+pub async fn list_domains(
+    State(state): State<AppState>,
+    outcome: Option<Extension<AuthOutcome>>,
+    user: Option<Extension<AuthUser>>,
+) -> Result<Json<Vec<RelDomainResponse>>, ApiError> {
+    rel_engine(&state)?;
+    let filter = DomainFilter::for_caller(&state, outcome, user, StoreType::Rel).await?;
+    let directory = state.control.directory();
+    let visible = directory.domains(Engine::Rel).filter(|d| filter.allows(&d.name));
+    Ok(Json(visible.map(Into::into).collect()))
 }
 
 #[utoipa::path(
@@ -91,14 +105,16 @@ pub async fn list_domains(State(state): State<AppState>) -> Result<Json<Vec<RelD
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
         (status = 200, description = "Domain found", body = RelDomainResponse),
+        (status = 403, description = "Forbidden — no permission on the domain (also when it does not exist)", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is being deleted (background purge running)", body = String, content_type = "text/plain"),
         (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
     ),
     tag = "Relational Domains"
 )]
-/// Returns metadata for a single relational domain. A domain in `deleting`
-/// state answers 410 Gone (rel/013 finishes the physical purge).
+/// Returns metadata for a single relational domain. Needs a permission on the
+/// domain (admin keys always pass). A domain in `deleting` state answers 410
+/// Gone (a background purge removes the data later).
 pub async fn get_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -121,7 +137,7 @@ pub async fn get_domain(
     path = "/store-api/rel/domains/{name}",
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
-        (status = 202, description = "Deletion accepted — background purge follows (rel/013)"),
+        (status = 202, description = "Deletion accepted — background purge follows"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 410, description = "Domain is already being deleted", body = String, content_type = "text/plain"),
         (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
@@ -129,12 +145,12 @@ pub async fn get_domain(
     tag = "Relational Domains"
 )]
 /// Marks a relational domain as deleting. Its tables/views become
-/// inaccessible immediately; physical cleanup follows in rel/013.
+/// inaccessible immediately; physical cleanup follows in the background.
 pub async fn delete_domain(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let engine = rel_engine(&state)?;
-    engine.delete_domain(&name).await?;
+    rel_engine(&state)?;
+    state.control.delete_domain(Engine::Rel, &name).await?;
     Ok(StatusCode::ACCEPTED)
 }

@@ -1,7 +1,7 @@
 //! `ttl_sweeper` module
 //!
 //! Background task that removes TTL-expired keys proactively instead of
-//! waiting for a compaction to happen over them (spec kv/025). Each removed
+//! waiting for a compaction to happen over them. Each removed
 //! key gets a real tombstone plus the `delete` event of the ordinary write
 //! path — the KV instance only, since JSON and rel never write an `expire_at`.
 
@@ -10,55 +10,34 @@ use crate::engines::lsm::key::Timestamp;
 use crate::storage::format::VersionState;
 use anyhow::Result;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
 
 /// Periodic TTL sweeper over one KV engine.
 pub struct TtlSweeper {
     engine: Arc<LsmStorageEngine>,
-    /// Candidates *checked* per tick — discarded ones count too (spec §6).
+    /// Candidates *checked* per tick — discarded ones count too.
     batch_size: usize,
-    interval: Duration,
-    shutdown: Arc<AtomicBool>,
-    /// Scan cursor kept across ticks, not persisted (spec kv/025 §3): the
-    /// largest key checked last tick. It is what guarantees progress — a chunk
+    /// Scan cursor kept across ticks, not persisted: the
+    /// largest key settled last tick. It is what guarantees progress — a chunk
     /// consisting purely of false positives still moves it forward instead of
     /// blocking the lid for good. Empty means "start from the beginning".
     cursor: Mutex<Vec<u8>>,
 }
 
 impl TtlSweeper {
-    pub fn new(
-        engine: Arc<LsmStorageEngine>,
-        shutdown: Arc<AtomicBool>,
-        batch_size: usize,
-        interval_secs: u64,
-    ) -> Self {
-        Self {
-            engine,
-            batch_size,
-            interval: Duration::from_secs(interval_secs),
-            shutdown,
-            cursor: Mutex::new(Vec::new()),
-        }
+    pub fn new(engine: Arc<LsmStorageEngine>, batch_size: usize) -> Self {
+        Self { engine, batch_size, cursor: Mutex::new(Vec::new()) }
     }
 
-    /// Runs the sweep loop until `shutdown` is set.
-    pub async fn run(self: Arc<Self>) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Err(e) = self.sweep_tick().await {
-                eprintln!("[TtlSweeper] Error: {e}");
-            }
-            sleep(self.interval).await;
-        }
-    }
-
-    /// One sweep cycle (spec kv/025 §3).
+    /// One sweep cycle; none while writes are refused for want of disk space
+    /// or memory, where a tombstone would only take space.
     pub async fn sweep_tick(&self) -> Result<()> {
+        if self.engine.writes_refused() {
+            return Ok(());
+        }
         // 1./2. One freeze check, then pin — after this the tick never causes
         // a freeze itself, so no tombstone can land in a newer source than a
-        // concurrent write to the same key (§4.2).
+        // concurrent write to the same key.
         self.engine.maybe_freeze_memtable().await?;
         let memtable = self.engine.pin_memtable();
 
@@ -67,23 +46,33 @@ impl TtlSweeper {
         let candidates = self.engine.scan_expired(&after, self.batch_size).await?;
 
         // A short chunk means the end of the round was reached — wrap around.
-        let next_cursor = if candidates.len() < self.batch_size {
+        let mut next_cursor = if candidates.len() < self.batch_size {
             Vec::new()
         } else {
             candidates.last().cloned().unwrap_or_default()
         };
 
         let mut written = 0usize;
-        for key in &candidates {
+        for (i, key) in candidates.iter().enumerate() {
             // 4. Authoritative re-check: `Live`, `Tombstone` and "absent"
-            // discard the candidate without write and without event (§5).
+            // discard the candidate without write and without event.
             if let Some((ts, VersionState::Expired)) = self.engine.newest_version(key).await? {
+                #[cfg(test)]
+                if let Some(hook) = &self.engine.hooks.after_sweep_recheck {
+                    hook.pause().await;
+                }
                 // 5. Dated on the *re-check* stamp, never the scan's: the
                 // smallest value above the version it displaces, so every
-                // other write of this key beats it (§4.1). `Timestamp: Ord` is
+                // other write of this key beats it. `Timestamp: Ord` is
                 // inverted — arithmetic goes through `as_u64` only.
                 let tombstone_ts = Timestamp::new(ts.as_u64() + 1);
-                self.engine.write_tombstone_at(&memtable, key, tombstone_ts).await?;
+                if !self.engine.write_tombstone_at(&memtable, key, tombstone_ts).await? {
+                    // The pinned MemTable was rotated out: end the tick so
+                    // the next one pins the active one and checks this key
+                    // again.
+                    next_cursor = if i == 0 { after } else { candidates[i - 1].clone() };
+                    break;
+                }
                 written += 1;
             }
         }
@@ -99,14 +88,15 @@ impl TtlSweeper {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::storage_thread::{TestHub, WalTarget};
     use crate::core::wal::WriteAheadLog;
-    use crate::engines::lsm::engine::LsmEngineOptions;
-    use crate::engines::lsm::reader::GetResult;
+    use crate::engines::lsm::engine::{LsmEngineOptions, TestHook, TestHooks};
+    use crate::engines::lsm::hlc::HLCTimestamp;
+    use crate::engines::lsm::memtable::Value;
+    use crate::engines::lsm::reader::{GetResult, Snapshot};
     use crate::engines::lsm::watcher::{OpType, WalEvent};
     use crate::engines::StorageEngine;
     use crate::storage::file_manager::FileManager;
@@ -132,12 +122,7 @@ mod tests {
     }
 
     fn sweeper(engine: &Arc<LsmStorageEngine>, batch_size: usize) -> TtlSweeper {
-        TtlSweeper::new(
-            Arc::clone(engine),
-            Arc::new(AtomicBool::new(false)),
-            batch_size,
-            60,
-        )
+        TtlSweeper::new(Arc::clone(engine), batch_size)
     }
 
     /// Drains the delete events currently queued on `rx` (the sweeper writes
@@ -162,236 +147,640 @@ mod tests {
     }
 
     // 1. Expiry -> delete event + a real tombstone (not just lazily filtered).
-    #[tokio::test]
-    async fn test_expired_key_yields_event_and_tombstone() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_expired_key_yields_event_and_tombstone() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"v").await.unwrap();
+            let mut rx = engine.watch_subscribe();
 
-        sweeper(&engine, 500).sweep_tick().await.unwrap();
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
 
-        assert_eq!(drained_deletes(&mut rx), vec![b"k".to_vec()]);
-        assert_eq!(engine.get(b"k").await.unwrap(), None);
-        assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+            assert_eq!(drained_deletes(&mut rx), vec![b"k".to_vec()]);
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
     }
 
-    // 2. Mechanism A without the sweeper: a tombstone dated on the expired
+    // Test 6: while writes are refused, a tick writes no tombstone; the
+    // first tick after the block does.
+    #[test]
+    fn test_no_tick_while_writes_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"v").await.unwrap();
+            let lsn = engine.last_applied_lsn();
+            engine.resources().block_for_test(false, false);
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), lsn, "no tombstone during the block");
+
+            engine.resources().unblock_for_test();
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
+    }
+
+    // 2. Without the sweeper: a tombstone dated on the expired
     // version loses against a newer write, in the MemTable ...
-    #[tokio::test]
-    async fn test_dated_tombstone_loses_against_newer_write() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
-        let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+    #[test]
+    fn test_dated_tombstone_loses_against_newer_write() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
 
-        engine.put(b"k", b"fresh").await.unwrap();
-        let memtable = engine.pin_memtable();
-        engine
-            .write_tombstone_at(&memtable, b"k", Timestamp::new(observed.as_u64() + 1))
-            .await
-            .unwrap();
+            engine.put(b"k", b"fresh").await.unwrap();
+            let memtable = engine.pin_memtable();
+            engine
+                .write_tombstone_at(&memtable, b"k", Timestamp::new(observed.as_u64() + 1))
+                .await
+                .unwrap();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+        })
     }
 
     // ... and across a flush plus compaction of the same sequence.
-    #[tokio::test]
-    async fn test_dated_tombstone_loses_against_newer_write_after_compaction() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
-        let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+    #[test]
+    fn test_dated_tombstone_loses_against_newer_write_after_compaction() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
 
-        engine.put(b"k", b"fresh").await.unwrap();
-        let memtable = engine.pin_memtable();
-        engine
-            .write_tombstone_at(&memtable, b"k", Timestamp::new(observed.as_u64() + 1))
-            .await
-            .unwrap();
+            engine.put(b"k", b"fresh").await.unwrap();
+            let memtable = engine.pin_memtable();
+            engine
+                .write_tombstone_at(&memtable, b"k", Timestamp::new(observed.as_u64() + 1))
+                .await
+                .unwrap();
 
-        engine.freeze_active_memtable();
-        engine.flush_memtable().await.unwrap();
-        engine.compact().await.unwrap();
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap();
+            engine.compact().await.unwrap();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+        })
     }
 
-    // 3. Mechanism B: the tombstone goes into the pinned (now immutable)
-    // MemTable while the client value lands in the new active one — the freeze
-    // inversion the pin rules out.
-    #[tokio::test]
-    async fn test_tombstone_in_pinned_memtable_loses_against_newer_source() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
-        let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+    // 3. The pinned MemTable is frozen by the time of the write while the
+    // client value lands in the new active one: the tombstone is not
+    // written, the client value stays.
+    #[test]
+    fn test_no_tombstone_goes_into_a_pinned_memtable_frozen_since() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let (observed, _) = engine.newest_version(b"k").await.unwrap().unwrap();
 
-        let memtable = engine.pin_memtable();
-        engine.freeze_active_memtable();
-        engine.put(b"k", b"client").await.unwrap();
-        engine
-            .write_tombstone_at(&memtable, b"k", Timestamp::new(observed.as_u64() + 1))
-            .await
-            .unwrap();
+            let memtable = engine.pin_memtable();
+            engine.freeze_active_memtable();
+            engine.put(b"k", b"client").await.unwrap();
+            let written = engine
+                .write_tombstone_at(&memtable, b"k", Timestamp::new(observed.as_u64() + 1))
+                .await
+                .unwrap();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+            assert!(!written);
+            assert_eq!(memtable.len(), 1, "the expired value alone");
+            assert_eq!(engine.last_applied_lsn(), 2, "no record for the tombstone");
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+        })
     }
 
     // 4. A candidate revived with a live value between scan and re-check gets
     // neither a tombstone nor an event — the scan still lists it (its expired
     // old version is physically there), the re-check drops it.
-    #[tokio::test]
-    async fn test_recheck_suppresses_write_and_event() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"old", 0).await.unwrap();
-        engine.put(b"k", b"alive").await.unwrap();
-        assert_eq!(engine.scan_expired(b"", 500).await.unwrap(), vec![b"k".to_vec()]);
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_recheck_suppresses_write_and_event() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            engine.put(b"k", b"alive").await.unwrap();
+            assert_eq!(engine.scan_expired(b"", 500).await.unwrap(), vec![b"k".to_vec()]);
+            let mut rx = engine.watch_subscribe();
 
-        sweeper(&engine, 500).sweep_tick().await.unwrap();
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
 
-        assert!(drained_deletes(&mut rx).is_empty());
-        assert_eq!(engine.get(b"k").await.unwrap(), Some(b"alive".to_vec()));
-        assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Live));
+            assert!(drained_deletes(&mut rx).is_empty());
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"alive".to_vec()));
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Live));
+        })
     }
 
     // 5. Replaced by an equally expired version: the tombstone is dated on the
     // re-check stamp, so it takes effect in this tick — no second one needed.
-    #[tokio::test]
-    async fn test_tombstone_dates_on_the_recheck_version() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"first", 0).await.unwrap();
-        engine.put_with_ttl(b"k", b"second", 0).await.unwrap();
+    #[test]
+    fn test_tombstone_dates_on_the_recheck_version() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"first").await.unwrap();
+            engine.put_expired_for_test(b"k", b"second").await.unwrap();
 
-        sweeper(&engine, 500).sweep_tick().await.unwrap();
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), None);
-        assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
     }
 
     // 6. Idempotent without a flush of the pinned MemTable in between: the
     // second tick still sees the candidate but writes nothing and stays silent.
-    #[tokio::test]
-    async fn test_second_tick_writes_nothing_and_stays_silent() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
-        let sweeper = sweeper(&engine, 500);
-        sweeper.sweep_tick().await.unwrap();
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_second_tick_writes_nothing_and_stays_silent() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"v").await.unwrap();
+            let sweeper = sweeper(&engine, 500);
+            sweeper.sweep_tick().await.unwrap();
+            let mut rx = engine.watch_subscribe();
 
-        sweeper.sweep_tick().await.unwrap();
+            sweeper.sweep_tick().await.unwrap();
 
-        assert!(drained_deletes(&mut rx).is_empty());
-        assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+            assert!(drained_deletes(&mut rx).is_empty());
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
     }
 
     // 7. Disabled sweeper = today's behavior: `main.rs` starts no task, so the
     // key stays physically present and is invisible through the lazy filter only.
-    #[tokio::test]
-    async fn test_without_a_tick_the_expired_key_stays_physically_present() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
+    #[test]
+    fn test_without_a_tick_the_expired_key_stays_physically_present() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"v").await.unwrap();
 
-        assert_eq!(engine.get(b"k").await.unwrap(), None);
-        assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));
-        assert!(crate::config::TtlSweeperCfg::default().enabled);
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));
+            assert!(crate::config::TtlSweeperCfg::default().enabled);
+        })
     }
 
-    // 8. Keys without a TTL, NULL keys (kv/018) and already tombstoned ones
+    // 8. Keys without a TTL, NULL keys and already tombstoned ones
     // are never candidates.
-    #[tokio::test]
-    async fn test_no_candidates_without_expiry() {
-        let (engine, _dir) = make_engine().await;
-        engine.put(b"plain", b"v").await.unwrap();
-        engine.set_null(b"null").await.unwrap();
-        engine.put(b"gone", b"v").await.unwrap();
-        engine.delete(b"gone").await.unwrap();
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_no_candidates_without_expiry() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"plain", b"v").await.unwrap();
+            engine.set_null(b"null").await.unwrap();
+            engine.put(b"gone", b"v").await.unwrap();
+            engine.delete(b"gone").await.unwrap();
+            let mut rx = engine.watch_subscribe();
 
-        assert!(engine.scan_expired(b"", 500).await.unwrap().is_empty());
-        sweeper(&engine, 500).sweep_tick().await.unwrap();
+            assert!(engine.scan_expired(b"", 500).await.unwrap().is_empty());
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
 
-        assert!(drained_deletes(&mut rx).is_empty());
-        assert_eq!(engine.get(b"plain").await.unwrap(), Some(b"v".to_vec()));
-        assert_eq!(state_of(&engine, b"null").await, Some(VersionState::Live));
+            assert!(drained_deletes(&mut rx).is_empty());
+            assert_eq!(engine.get(b"plain").await.unwrap(), Some(b"v".to_vec()));
+            assert_eq!(state_of(&engine, b"null").await, Some(VersionState::Live));
+        })
     }
 
     // 9. Chunk boundary: the first tick clears exactly `batch_size` keys, the
     // second one the rest.
-    #[tokio::test]
-    async fn test_chunk_boundary_splits_over_two_ticks() {
-        let (engine, _dir) = make_engine().await;
-        for i in 0..7u32 {
-            engine.put_with_ttl(format!("k{i}").as_bytes(), b"v", 0).await.unwrap();
-        }
-        let sweeper = sweeper(&engine, 5);
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_chunk_boundary_splits_over_two_ticks() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            for i in 0..7u32 {
+                engine.put_expired_for_test(format!("k{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let sweeper = sweeper(&engine, 5);
+            let mut rx = engine.watch_subscribe();
 
-        sweeper.sweep_tick().await.unwrap();
-        assert_eq!(drained_deletes(&mut rx).len(), 5);
+            sweeper.sweep_tick().await.unwrap();
+            assert_eq!(drained_deletes(&mut rx).len(), 5);
 
-        sweeper.sweep_tick().await.unwrap();
-        assert_eq!(drained_deletes(&mut rx).len(), 2);
-        for i in 0..7u32 {
-            let key = format!("k{i}");
-            assert_eq!(state_of(&engine, key.as_bytes()).await, Some(VersionState::Tombstone));
-        }
+            sweeper.sweep_tick().await.unwrap();
+            assert_eq!(drained_deletes(&mut rx).len(), 2);
+            for i in 0..7u32 {
+                let key = format!("k{i}");
+                assert_eq!(state_of(&engine, key.as_bytes()).await, Some(VersionState::Tombstone));
+            }
+        })
     }
 
     // 10. Cursor progress (blocker regression): more false positives than
     // `batch_size` sort ahead of the one genuinely expired key. Without the
     // cursor that key would stay behind forever.
-    #[tokio::test]
-    async fn test_cursor_advances_past_false_positives() {
-        let (engine, _dir) = make_engine().await;
-        for i in 0..6u32 {
-            let key = format!("a{i}");
-            engine.put_with_ttl(key.as_bytes(), b"old", 0).await.unwrap();
-            engine.put(key.as_bytes(), b"alive").await.unwrap();
-        }
-        engine.put_with_ttl(b"z", b"v", 0).await.unwrap();
-        let sweeper = sweeper(&engine, 5);
-        let mut rx = engine.watch_subscribe();
+    #[test]
+    fn test_cursor_advances_past_false_positives() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            for i in 0..6u32 {
+                let key = format!("a{i}");
+                engine.put_expired_for_test(key.as_bytes(), b"old").await.unwrap();
+                engine.put(key.as_bytes(), b"alive").await.unwrap();
+            }
+            engine.put_expired_for_test(b"z", b"v").await.unwrap();
+            let sweeper = sweeper(&engine, 5);
+            let mut rx = engine.watch_subscribe();
 
-        sweeper.sweep_tick().await.unwrap();
-        assert!(drained_deletes(&mut rx).is_empty(), "all five candidates are false positives");
-        assert_eq!(*sweeper.cursor.lock(), b"a4".to_vec());
+            sweeper.sweep_tick().await.unwrap();
+            assert!(drained_deletes(&mut rx).is_empty(), "all five candidates are false positives");
+            assert_eq!(*sweeper.cursor.lock(), b"a4".to_vec());
 
-        sweeper.sweep_tick().await.unwrap();
-        assert_eq!(drained_deletes(&mut rx), vec![b"z".to_vec()]);
-        assert_eq!(state_of(&engine, b"z").await, Some(VersionState::Tombstone));
-        assert!(sweeper.cursor.lock().is_empty(), "a short chunk wraps the cursor around");
+            sweeper.sweep_tick().await.unwrap();
+            assert_eq!(drained_deletes(&mut rx), vec![b"z".to_vec()]);
+            assert_eq!(state_of(&engine, b"z").await, Some(VersionState::Tombstone));
+            assert!(sweeper.cursor.lock().is_empty(), "a short chunk wraps the cursor around");
+        })
     }
 
     // The candidate scan sees expired versions in SSTables too, not just in
     // MemTables — otherwise a flushed key would never be swept.
-    #[tokio::test]
-    async fn test_sweeps_expired_key_from_sstable() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
-        engine.freeze_active_memtable();
-        engine.flush_memtable().await.unwrap();
+    #[test]
+    fn test_sweeps_expired_key_from_sstable() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"v").await.unwrap();
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap();
 
-        sweeper(&engine, 500).sweep_tick().await.unwrap();
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
 
-        assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
     }
 
     // The re-check reports state, not just presence: expired and absent are
-    // distinguishable, which `get_with_metadata` cannot do (spec kv/025 §3.1).
-    #[tokio::test]
-    async fn test_newest_version_distinguishes_expired_from_absent() {
-        let (engine, _dir) = make_engine().await;
-        engine.put_with_ttl(b"k", b"v", 0).await.unwrap();
-        let snapshot = engine.snapshot();
+    // distinguishable, which `get_with_metadata` cannot do.
+    #[test]
+    fn test_newest_version_distinguishes_expired_from_absent() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put_expired_for_test(b"k", b"v").await.unwrap();
+            let snapshot = engine.snapshot().await;
 
-        assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));
-        assert_eq!(state_of(&engine, b"missing").await, None);
-        assert_eq!(engine.get_with_metadata(b"k", snapshot.snapshot()).await.unwrap(), None);
-        assert_eq!(
-            engine.get_with_metadata(b"missing", snapshot.snapshot()).await.unwrap(),
-            None
-        );
-        assert_eq!(
-            engine.get_with_snapshot(b"k", snapshot.snapshot()).await.unwrap(),
-            GetResult::Absent
-        );
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));
+            assert_eq!(state_of(&engine, b"missing").await, None);
+            assert_eq!(engine.get_with_metadata(b"k", snapshot.snapshot()).await.unwrap(), None);
+            assert_eq!(
+                engine.get_with_metadata(b"missing", snapshot.snapshot()).await.unwrap(),
+                None
+            );
+            assert_eq!(
+                engine.get_with_snapshot(b"k", snapshot.snapshot()).await.unwrap(),
+                GetResult::Absent
+            );
+        })
+    }
+
+    // A client write that drew the tombstone's stamp
+    // (`ts + 1`) and landed first keeps its entry; tombstone and event drop.
+    #[test]
+    fn test_tombstone_on_identical_internal_key_keeps_client_value() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"client").await.unwrap();
+            let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+            let memtable = engine.pin_memtable();
+            let mut rx = engine.watch_subscribe();
+
+            engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
+
+            assert!(drained_deletes(&mut rx).is_empty());
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+        })
+    }
+
+    // Regression: the tombstone landed first, the client
+    // write with the same stamp replaces it.
+    #[test]
+    fn test_client_write_replaces_tombstone_on_identical_internal_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            // Far ahead of the wall clock: the next stamp is exactly `seed + 1`.
+            let seed = HLCTimestamp::from_components(1 << 47, 0).as_u64();
+            engine.hlc().seed(seed);
+            let tie = Timestamp::new(seed + 1);
+            let memtable = engine.pin_memtable();
+
+            engine.write_tombstone_at(&memtable, b"k", tie).await.unwrap();
+            engine.put(b"k", b"client").await.unwrap();
+
+            let (newest_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+            assert_eq!(newest_ts.as_u64(), tie.as_u64(), "the client write must tie with the tombstone");
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+        })
+    }
+
+    // The same tie across sources: a tombstone in an older MemTable, the
+    // client write in the newer one. Reads take the newer source, and a
+    // compaction of both flushed tables must decide the same.
+    #[test]
+    fn test_tie_across_sources_keeps_the_client_value_through_compaction() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            // Far ahead of the wall clock: the next stamp is exactly `seed + 1`.
+            let seed = HLCTimestamp::from_components(1 << 47, 0).as_u64();
+            engine.hlc().seed(seed);
+            let tie = Timestamp::new(seed + 1);
+            let pinned = engine.pin_memtable();
+            engine.freeze_active_memtable();
+
+            engine.put(b"k", b"client").await.unwrap();
+            pinned.set_if_absent(b"k".to_vec(), tie, Value::Tombstone);
+            let (newest_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+            assert_eq!(newest_ts.as_u64(), tie.as_u64(), "the client write must tie with the tombstone");
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap();
+            engine.flush_memtable().await.unwrap();
+            engine.compact().await.unwrap();
+
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"client".to_vec()));
+        })
+    }
+
+    // The same tie above the low watermark: a snapshot registered below it
+    // keeps every version the tie holds, yet the compaction writes each
+    // internal key once -- the newer source's entry, the one reads see. A
+    // second entry could open the next data block, where a read at the tie
+    // would find the tombstone.
+    #[test]
+    fn test_tie_above_the_watermark_leaves_one_entry_after_compaction() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            let below = engine.snapshot().await;
+            // Far ahead of the wall clock: the next stamp is exactly `seed + 1`.
+            let seed = HLCTimestamp::from_components(1 << 47, 0).as_u64();
+            engine.hlc().seed(seed);
+            let tie = Timestamp::new(seed + 1);
+            assert!(below.snapshot().timestamp().as_u64() < tie.as_u64());
+            let pinned = engine.pin_memtable();
+            engine.freeze_active_memtable();
+
+            engine.put(b"k", b"client").await.unwrap();
+            pinned.set_if_absent(b"k".to_vec(), tie, Value::Tombstone);
+            engine.freeze_active_memtable();
+            engine.flush_memtable().await.unwrap();
+            engine.flush_memtable().await.unwrap();
+            engine.compact().await.unwrap();
+
+            let entries: usize = engine.version().level(1).iter().map(|t| t.iter().count()).sum();
+            assert_eq!(entries, 1, "one entry per internal key");
+            assert_eq!(
+                engine.get_with_snapshot(b"k", &Snapshot::new(tie)).await.unwrap(),
+                GetResult::Present(b"client".to_vec())
+            );
+            drop(below);
+        })
+    }
+
+    // The dropped tombstone adds no bytes to the MemTable size.
+    #[test]
+    fn test_dropped_tombstone_adds_no_bytes() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _dir) = make_engine().await;
+            engine.put(b"k", b"client").await.unwrap();
+            let (client_ts, _) = engine.newest_version(b"k").await.unwrap().unwrap();
+            let memtable = engine.pin_memtable();
+
+            engine.write_tombstone_at(&memtable, b"k", client_ts).await.unwrap();
+
+            // The client entry only: 1-byte user key + 8-byte stamp + 6 value bytes.
+            assert_eq!(memtable.size_bytes(), 1 + 8 + 6);
+        })
+    }
+
+    /// A key-value engine with `hooks` on the log `<dir>/wal` of `hub`; it
+    /// replays the log when it opens.
+    async fn engine_on_hub(
+        dir: &std::path::Path,
+        hub: &TestHub,
+        hooks: TestHooks,
+        options: LsmEngineOptions,
+    ) -> Arc<LsmStorageEngine> {
+        let (wal_path, vlog_path) = (dir.join("wal"), dir.join("vlog.log"));
+        let wal = Arc::new(hub.wal(WalTarget::Kv));
+        let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
+        let file_manager = Arc::new(FileManager::new(dir).await.unwrap());
+        let manifest_manager = Arc::new(ManifestManager::new(dir));
+        let mut engine =
+            LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options).await.unwrap();
+        engine.hooks = hooks;
+        Arc::new(engine)
+    }
+
+    /// An engine on a hub of its own over `<dir>/wal`, with `hooks`.
+    async fn start(dir: &std::path::Path, hooks: TestHooks) -> (Arc<LsmStorageEngine>, TestHub) {
+        let hub = TestHub::start(&[(WalTarget::Kv, &dir.join("wal"))]);
+        (engine_on_hub(dir, &hub, hooks, LsmEngineOptions::default()).await, hub)
+    }
+
+    /// Drops `engine` and its hub without a flush or a cut, as a crash does,
+    /// and opens the engine again on the files left behind.
+    async fn crash(dir: &std::path::Path, engine: Arc<LsmStorageEngine>, hub: TestHub) -> (Arc<LsmStorageEngine>, TestHub) {
+        drop(engine);
+        drop(hub);
+        start(dir, TestHooks::default()).await
+    }
+
+    /// [`crash`], with a MemTable threshold of one byte: the replay flushes
+    /// before every record that follows another one.
+    async fn crash_flushing_every_record(
+        dir: &std::path::Path,
+        engine: Arc<LsmStorageEngine>,
+        hub: TestHub,
+    ) -> (Arc<LsmStorageEngine>, TestHub) {
+        drop(engine);
+        drop(hub);
+        let hub = TestHub::start(&[(WalTarget::Kv, &dir.join("wal"))]);
+        let options = LsmEngineOptions {
+            engine: crate::engines::lsm::engine::LsmEngineConfig { memtable_size_threshold: 1, ..Default::default() },
+            ..Default::default()
+        };
+        (engine_on_hub(dir, &hub, TestHooks::default(), options).await, hub)
+    }
+
+    /// An engine whose sweeps park at `hook` after a re-check found a key expired.
+    async fn parking_sweeps(dir: &std::path::Path, hook: &Arc<TestHook>) -> (Arc<LsmStorageEngine>, TestHub) {
+        start(dir, TestHooks { after_sweep_recheck: Some(Arc::clone(hook)), ..TestHooks::default() }).await
+    }
+
+    fn spawn_sweep(engine: &Arc<LsmStorageEngine>) -> compio::runtime::JoinHandle<Result<()>> {
+        spawn_tick(&Arc::new(sweeper(engine, 500)))
+    }
+
+    fn spawn_tick(sweeper: &Arc<TtlSweeper>) -> compio::runtime::JoinHandle<Result<()>> {
+        let sweeper = Arc::clone(sweeper);
+        compio::runtime::spawn(async move { sweeper.sweep_tick().await })
+    }
+
+    /// The bytes of the segments of the log at `<dir>/wal`, in order.
+    fn log_in(dir: &std::path::Path) -> Vec<u8> {
+        let segments = crate::core::wal::segments_in(&dir.join("wal")).unwrap();
+        segments.into_iter().flat_map(|(_, path)| std::fs::read(path).unwrap()).collect()
+    }
+
+    // A sweep whose re-check saw the expired value before a newer write and
+    // a rotation with its flush writes no tombstone after them: no record,
+    // no event, and after a crash the newer value is there. The next tick
+    // checks the key again and finds it fresh.
+    #[test]
+    fn test_a_tombstone_checked_before_a_rotation_and_its_flush_is_not_written() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hook = Arc::new(TestHook::default());
+            let (engine, hub) = parking_sweeps(dir.path(), &hook).await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let mut rx = engine.watch_subscribe();
+            let sweeper = Arc::new(sweeper(&engine, 1));
+            let sweep = spawn_tick(&sweeper);
+            hook.reached.notified().await;
+
+            engine.put(b"k", b"fresh").await.unwrap();
+            engine.flush_all_memtables().await.unwrap();
+            let log = log_in(dir.path());
+            hook.release.notify_one();
+            sweep.await.unwrap().unwrap();
+            assert_eq!(log_in(dir.path()), log, "the sweep wrote a record");
+            assert!(drained_deletes(&mut rx).is_empty());
+            assert!(sweeper.cursor.lock().is_empty(), "the next tick starts before the key");
+
+            sweeper.sweep_tick().await.unwrap();
+            assert_eq!(log_in(dir.path()), log, "the next tick wrote a record");
+            assert!(drained_deletes(&mut rx).is_empty());
+
+            let (engine, _hub) = crash(dir.path(), engine, hub).await;
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+        })
+    }
+
+    // A rotation without a flush between the re-check and the write drops
+    // the tombstone as well.
+    #[test]
+    fn test_a_tombstone_checked_before_a_rotation_is_not_written() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hook = Arc::new(TestHook::default());
+            let (engine, _hub) = parking_sweeps(dir.path(), &hook).await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let mut rx = engine.watch_subscribe();
+            let sweep = spawn_sweep(&engine);
+            hook.reached.notified().await;
+
+            engine.freeze_active_memtable();
+            let log = log_in(dir.path());
+            hook.release.notify_one();
+            sweep.await.unwrap().unwrap();
+            assert_eq!(log_in(dir.path()), log, "the sweep wrote a record");
+            assert!(drained_deletes(&mut rx).is_empty());
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Expired));
+        })
+    }
+
+    // A tick whose tombstone was dropped ends there; the next tick starts at
+    // the key again and writes exactly one tombstone, even with a chunk that
+    // would have moved past it.
+    #[test]
+    fn test_the_tick_after_a_dropped_tombstone_writes_it() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hook = Arc::new(TestHook::default());
+            let (engine, _hub) = parking_sweeps(dir.path(), &hook).await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let mut rx = engine.watch_subscribe();
+            let sweeper = Arc::new(sweeper(&engine, 1));
+            let sweep = spawn_tick(&sweeper);
+            hook.reached.notified().await;
+            engine.freeze_active_memtable();
+            hook.release.notify_one();
+            sweep.await.unwrap().unwrap();
+            assert!(drained_deletes(&mut rx).is_empty());
+            assert!(sweeper.cursor.lock().is_empty(), "the next tick starts before the key");
+
+            let sweep = spawn_tick(&sweeper);
+            hook.reached.notified().await;
+            hook.release.notify_one();
+            sweep.await.unwrap().unwrap();
+
+            assert_eq!(drained_deletes(&mut rx), [b"k".to_vec()]);
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
+    }
+
+    // A tombstone and a newer write of the same key in the one active
+    // MemTable, the tombstone with the higher LSN and the older stamp: the
+    // newer write wins, before and after a crash.
+    #[test]
+    fn test_a_tombstone_behind_a_newer_write_in_the_same_memtable_keeps_the_newer_write() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hook = Arc::new(TestHook::default());
+            let (engine, hub) = parking_sweeps(dir.path(), &hook).await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let sweep = spawn_sweep(&engine);
+            hook.reached.notified().await;
+            engine.put(b"k", b"fresh").await.unwrap();
+            hook.release.notify_one();
+            sweep.await.unwrap().unwrap();
+            assert_eq!(engine.last_applied_lsn(), 3, "the tombstone went into the log after the write");
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+
+            let (engine, _hub) = crash(dir.path(), engine, hub).await;
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+        })
+    }
+
+    // A tombstone written into the active MemTable and flushed with it keeps
+    // the key removed after a crash.
+    #[test]
+    fn test_a_flushed_tombstone_survives_a_crash() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (engine, hub) = start(dir.path(), TestHooks::default()).await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            sweeper(&engine, 500).sweep_tick().await.unwrap();
+            engine.flush_all_memtables().await.unwrap();
+            assert_eq!(engine.flushed_lsn(), 2);
+
+            let (engine, _hub) = crash(dir.path(), engine, hub).await;
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
+    }
+
+    // The same tombstone behind the newer write, replayed with a flush
+    // between the two records: the newer write in an SSTable still wins over
+    // the tombstone after it in the log.
+    #[test]
+    fn test_a_replay_that_flushes_between_a_newer_write_and_a_tombstone_keeps_the_newer_write() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hook = Arc::new(TestHook::default());
+            let (engine, hub) = parking_sweeps(dir.path(), &hook).await;
+            engine.put_expired_for_test(b"k", b"old").await.unwrap();
+            let sweep = spawn_sweep(&engine);
+            hook.reached.notified().await;
+            engine.put(b"k", b"fresh").await.unwrap();
+            hook.release.notify_one();
+            sweep.await.unwrap().unwrap();
+            assert_eq!(engine.last_applied_lsn(), 3);
+
+            let (engine, _hub) = crash_flushing_every_record(dir.path(), engine, hub).await;
+            assert_eq!(*engine.replay_watermarks.lock(), [1, 2], "a flush before each record after the first");
+            assert_eq!(engine.get(b"k").await.unwrap(), Some(b"fresh".to_vec()));
+        })
+    }
+
+    // A client delete behind a write of the same key, replayed with a flush
+    // between the two: the delete is newer and removes the key.
+    #[test]
+    fn test_a_replay_that_flushes_between_a_write_and_its_delete_removes_the_key() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (engine, hub) = start(dir.path(), TestHooks::default()).await;
+            engine.put(b"k", b"v").await.unwrap();
+            engine.delete(b"k").await.unwrap();
+
+            let (engine, _hub) = crash_flushing_every_record(dir.path(), engine, hub).await;
+            assert_eq!(*engine.replay_watermarks.lock(), [1]);
+            assert_eq!(engine.get(b"k").await.unwrap(), None);
+            assert_eq!(state_of(&engine, b"k").await, Some(VersionState::Tombstone));
+        })
     }
 }

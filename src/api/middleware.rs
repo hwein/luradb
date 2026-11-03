@@ -3,32 +3,51 @@
 //! Errors from the domain/engine layer embed an HTTP status code as a numeric
 //! prefix in the message string (e.g. "404 Not Found: …"). `ApiError` reads
 //! that prefix and produces the appropriate HTTP response, including a
-//! `Retry-After: 1` header for 429 responses.
+//! `Retry-After: 1` header for 429, `Retry-After: 5` for 507 and
+//! `Cache-Control: no-store` for 428 responses.
 
+use crate::control::resources::{WriteBlocked, RETRY_AFTER_SECS};
+use crate::control::DomainError;
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-// ── ApiError ──────────────────────────────────────────────────────────────────
-
 /// Unified API error that maps anyhow errors to HTTP responses.
-pub struct ApiError(StatusCode, String);
+/// Extra headers are boxed so the error stays small on every `Result` path.
+pub struct ApiError(StatusCode, String, Option<Box<HeaderMap>>);
 
 impl ApiError {
     pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        ApiError(status, message.into())
+        ApiError(status, message.into(), None)
+    }
+
+    /// Adds a header to the error response; the plain-text body stays as is.
+    pub(crate) fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.2.get_or_insert_with(Default::default).insert(name, value);
+        self
+    }
+}
+
+impl From<WriteBlocked> for ApiError {
+    fn from(e: WriteBlocked) -> Self {
+        ApiError::new(StatusCode::INSUFFICIENT_STORAGE, e.to_string())
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if let Some(blocked) = WriteBlocked::in_chain(&e) {
+            return blocked.into();
+        }
         let msg = e.to_string();
-        let status = if msg.starts_with("429") {
+        let status = if msg.starts_with("507") {
+            StatusCode::INSUFFICIENT_STORAGE
+        } else if msg.starts_with("429") {
             StatusCode::TOO_MANY_REQUESTS
         } else if msg.starts_with("410") {
             StatusCode::GONE
@@ -43,22 +62,48 @@ impl From<anyhow::Error> for ApiError {
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
-        ApiError(status, msg)
+        ApiError::new(status, msg)
+    }
+}
+
+impl From<DomainError> for ApiError {
+    fn from(e: DomainError) -> Self {
+        match e {
+            DomainError::Kv(e) => e.into(),
+            DomainError::Json(e) => e.into(),
+            DomainError::Rel(e) => e.into(),
+            DomainError::Disabled(engine) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("503 Service Unavailable: the {} engine is disabled", engine.as_str()),
+            ),
+            DomainError::Stopped => {
+                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable: the control plane is not running")
+            }
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut resp = (self.0, self.1).into_response();
+        if let Some(headers) = self.2 {
+            resp.headers_mut().extend(*headers);
+        }
         if self.0 == StatusCode::TOO_MANY_REQUESTS {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, "1".parse().unwrap());
         }
+        if self.0 == StatusCode::INSUFFICIENT_STORAGE {
+            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
+        }
+        // RFC 6585 section 3: a 428 must not be stored by a cache.
+        if self.0 == StatusCode::PRECONDITION_REQUIRED {
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
         resp
     }
 }
-
-// ── Trusted Proxy Middleware ──────────────────────────────────────────────────
 
 /// The resolved real client IP address, set by [`proxy_fn`] on every request.
 /// Downstream handlers and loggers can read this from request extensions.
@@ -171,11 +216,12 @@ fn real_ip_from_headers(headers: &axum::http::HeaderMap, fallback: IpAddr) -> Ip
 /// - Sets [`ClientIp`] in request extensions for downstream use.
 pub async fn proxy_fn(
     State(cidrs): State<Arc<Vec<ParsedCidr>>>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let peer_ip = connect_info
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
         .unwrap_or_else(|| IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
@@ -189,8 +235,6 @@ pub async fn proxy_fn(
     request.extensions_mut().insert(ClientIp(client_ip));
     next.run(request).await
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -208,8 +252,6 @@ mod tests {
         h.insert("x-real-ip", HeaderValue::from_str(ip).unwrap());
         h
     }
-
-    // ── CIDR matching ──────────────────────────────────────────────────────
 
     #[test]
     fn cidr_v4_exact() {
@@ -232,12 +274,10 @@ mod tests {
         assert!(!c.contains("::2".parse().unwrap()));
     }
 
-    // ── Spec test 1: trusted proxy → client_ip from X-Forwarded-For ───────
-
     #[test]
     fn trusted_proxy_xff_gives_real_ip() {
         let peer: IpAddr = "127.0.0.1".parse().unwrap();
-        let cidrs = vec![ParsedCidr::parse("127.0.0.1").unwrap()];
+        let cidrs = [ParsedCidr::parse("127.0.0.1").unwrap()];
         let headers = make_xff("1.2.3.4");
 
         let client_ip = if !cidrs.is_empty() && cidrs.iter().any(|c| c.contains(peer)) {
@@ -252,7 +292,7 @@ mod tests {
     #[test]
     fn trusted_proxy_xri_gives_real_ip() {
         let peer: IpAddr = "127.0.0.1".parse().unwrap();
-        let cidrs = vec![ParsedCidr::parse("127.0.0.1").unwrap()];
+        let cidrs = [ParsedCidr::parse("127.0.0.1").unwrap()];
         let headers = make_xri("5.6.7.8");
 
         let client_ip = if !cidrs.is_empty() && cidrs.iter().any(|c| c.contains(peer)) {
@@ -264,12 +304,10 @@ mod tests {
         assert_eq!(client_ip, "5.6.7.8".parse::<IpAddr>().unwrap());
     }
 
-    // ── Spec test 2: non-trusted peer → headers ignored ───────────────────
-
     #[test]
     fn non_trusted_proxy_xff_ignored() {
         let peer: IpAddr = "5.6.7.8".parse().unwrap();
-        let cidrs = vec![ParsedCidr::parse("127.0.0.1").unwrap()];
+        let cidrs = [ParsedCidr::parse("127.0.0.1").unwrap()];
         let headers = make_xff("1.2.3.4");
 
         let client_ip = if !cidrs.is_empty() && cidrs.iter().any(|c| c.contains(peer)) {
@@ -280,8 +318,6 @@ mod tests {
 
         assert_eq!(client_ip, peer);
     }
-
-    // ── Spec test 3: empty trusted_proxies → headers never evaluated ───────
 
     #[test]
     fn empty_trusted_proxies_uses_peer_ip() {
@@ -298,11 +334,30 @@ mod tests {
         assert_eq!(client_ip, peer);
     }
 
-    // ── Spec general/007 test 4: error-mapping ──────────────────────────────
-
     #[test]
     fn api_error_maps_400_prefix_to_bad_request() {
         let err = ApiError::from(anyhow::anyhow!("400 Bad Request: key must be valid UTF-8"));
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    // A write refused for want of disk space answers 507 with Retry-After: 5
+    // and the refusal's text, behind added context too.
+    #[tokio::test]
+    async fn a_refused_write_maps_to_507_with_retry_after() {
+        let resources = crate::control::resources::Resources::default();
+        resources.block_for_test(false, false);
+        let refused = anyhow::Error::from(resources.check_write().unwrap_err()).context("writing the batch");
+        let resp = ApiError::from(refused).into_response();
+        assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "5");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, "507 Insufficient Storage: write blocked: disk space below threshold, retry in 5 s");
+    }
+
+    #[test]
+    fn a_stopped_control_plane_maps_to_service_unavailable() {
+        let err = ApiError::from(DomainError::Stopped);
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1, "503 Service Unavailable: the control plane is not running");
     }
 }

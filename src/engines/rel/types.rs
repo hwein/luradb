@@ -1,16 +1,14 @@
-//! Type system and order-preserving memcomparable encoding (spec rel/003).
+//! Type system and order-preserving memcomparable encoding.
 //!
 //! Five canonical value types plus the `KvRef`/`JsonRef` tags, the SQL alias
-//! resolver, and `encode_sortable` — the encoder later specs build `ROW:`/
-//! `IDX:` keys from (rel/005). Decoding is out of scope (not needed in v1).
+//! resolver, and `encode_sortable` — the encoder the `ROW:`/`IDX:` keys
+//! are built from. Decoding is out of scope (not needed in v1).
 
 use serde::{Deserialize, Serialize};
 
-// ── ColumnType ─────────────────────────────────────────────────────────────────
-
 /// The five canonical value types plus the two reference tags. `KvRef`/`JsonRef`
-/// are physically TEXT; they are only registered as type tags here — validation
-/// and resolution land in rel/012.
+/// are physically TEXT; they are only type tags here — validation and
+/// resolution live in `cross_engine.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnType {
     Integer,
@@ -47,9 +45,20 @@ impl ColumnType {
             _ => None,
         }
     }
-}
 
-// ── ScalarValue ────────────────────────────────────────────────────────────────
+    /// The canonical SQL type name, which [`Self::from_sql_name`] reads back.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            ColumnType::Integer => "INTEGER",
+            ColumnType::Real => "REAL",
+            ColumnType::Text => "TEXT",
+            ColumnType::Boolean => "BOOLEAN",
+            ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::KvRef => "KVREF",
+            ColumnType::JsonRef => "JSONREF",
+        }
+    }
+}
 
 /// A canonical scalar value — the shared basis for defaults and encoding.
 /// `KvRef`/`JsonRef` values live as `Text`; the tag stays in `ColumnType`.
@@ -77,8 +86,6 @@ impl ScalarValue {
         ) || matches!(self, ScalarValue::Null)
     }
 }
-
-// ── Memcomparable encoding ─────────────────────────────────────────────────────
 
 /// Order-preserving, self-terminating encoding of a scalar value. `Null` yields
 /// `None` (not indexed). The byte order of the result matches the natural order
@@ -133,19 +140,17 @@ fn encode_text(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-// ── Wire serialization (spec rel/009 §4) ────────────────────────────────────
-//
-// Placed here (not `src/api/rel.rs`, where the spec's own snippet puts it):
-// `RelEngine::execute_sql`'s `ExpandedBlock` (rel/009 §5) already builds its
+// `scalar_to_json` lives here, not in `src/api/rel.rs`:
+// `RelEngine::execute_sql`'s `ExpandedBlock` already builds its
 // `serde_json::Value` objects at the engine layer, before the REST handler
 // ever sees the result — so the engine needs this conversion too. Making the
 // engine depend on `src/api/` would invert the crate's layering; keeping the
 // one function here and having `src/api/rel.rs` reuse it (for `rows`/`last_pk`)
 // keeps a single conversion, just colocated with `ScalarValue` instead.
 
-/// `ScalarValue` → JSON (spec §4): the single conversion used for `rows`,
+/// `ScalarValue` → JSON: the single conversion used for `rows`,
 /// `last_pk`, and expand objects alike. KVREF/JSONREF values are physically
-/// `Text` and serialize as a plain string — no resolution here (rel/012).
+/// `Text` and serialize as a plain string — no resolution here.
 pub fn scalar_to_json(v: &ScalarValue) -> serde_json::Value {
     match v {
         ScalarValue::Integer(i) => serde_json::Value::from(*i),
@@ -157,7 +162,7 @@ pub fn scalar_to_json(v: &ScalarValue) -> serde_json::Value {
     }
 }
 
-/// `i64` millis-UTC → `YYYY-MM-DDThh:mm:ss[.fff]Z` (spec §4), the inverse of
+/// `i64` millis-UTC → `YYYY-MM-DDThh:mm:ss[.fff]Z`, the inverse of
 /// `dml.rs`'s hand-written ISO-8601 parser (`days_from_civil`). Always UTC
 /// (`Z` suffix); the `.fff` fraction is only emitted when non-zero, so a
 /// value with no millis roundtrips through the parser unchanged. Correct
@@ -290,8 +295,6 @@ mod tests {
     fn test_encode_null_is_none() {
         assert_eq!(encode_sortable(&ScalarValue::Null), None);
     }
-
-    // ── scalar_to_json / ISO-8601 formatter (spec rel/009 §4) ───────────────
 
     #[test]
     fn test_scalar_to_json_all_variants() {

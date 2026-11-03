@@ -1,30 +1,32 @@
-//! Domain management for the JSON store (spec json/003).
+//! Domain management for the JSON store.
 //!
 //! Self-hosting pattern like the KV `DomainRegistry`: metadata lives in the
 //! JSON LSM instance under `__sys:json_domain:{name}`, separate from document
-//! data. Deletion only marks the domain `Deleting`; physical cleanup follows
-//! in spec json/013.
+//! data. Deletion only marks the domain `Deleting`; the background purger
+//! does the physical cleanup.
 
 use super::error::JsonStoreError;
-use crate::core::events::GlobalEventBus;
 use crate::engines::lsm::domain::{fnv64, now_secs};
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::StorageEngine;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
 const SYS_JSON_DOMAIN_PREFIX: &[u8] = b"__sys:json_domain:";
 pub(crate) const DEFAULT_DOMAIN: &str = "default";
-const MAX_DOMAIN_NAME_LEN: usize = 50;
+pub(super) const MAX_DOMAIN_NAME_LEN: usize = 50;
 
 fn sys_key(name: &str) -> Vec<u8> {
     let mut k = SYS_JSON_DOMAIN_PREFIX.to_vec();
     k.extend_from_slice(name.as_bytes());
     k
 }
+
+/// Lower bound of `json.lsm.max_key_length`: the longest
+/// management key, `__sys:json_domain:{name}` at a maximal name, plus 1 byte.
+pub(crate) const MIN_LSM_KEY_LENGTH: usize = SYS_JSON_DOMAIN_PREFIX.len() + MAX_DOMAIN_NAME_LEN + 1;
 
 fn validate_domain_name(name: &str) -> Result<(), JsonStoreError> {
     if name.is_empty() {
@@ -48,7 +50,7 @@ fn validate_domain_name(name: &str) -> Result<(), JsonStoreError> {
             name
         )));
     }
-    // Shadowed by the static /json/domains admin routes: data endpoints of
+    // Shadowed by the static /json/domains routes: data endpoints of
     // such a domain would answer 404/405 (matchit prefers static segments).
     if name == "domains" {
         return Err(JsonStoreError::InvalidDomainName(
@@ -57,8 +59,6 @@ fn validate_domain_name(name: &str) -> Result<(), JsonStoreError> {
     }
     Ok(())
 }
-
-// ── JsonDomain ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum JsonDomainState {
@@ -76,37 +76,35 @@ pub struct JsonDomain {
     pub created_at: u64,
     #[serde(default)]
     pub state: JsonDomainState,
+    /// Document writes over REST must carry `If-Match` or
+    /// `If-None-Match: *`; fixed at creation.
+    #[serde(default)]
+    pub require_conditional_writes: bool,
 }
 
 impl JsonDomain {
-    fn new(name: &str) -> Self {
+    fn new(name: &str, require_conditional_writes: bool) -> Self {
         Self {
             name: name.to_string(),
             system_prefix: format!("{:016x}", fnv64(name.as_bytes())).into_bytes(),
             created_at: now_secs(),
             state: JsonDomainState::Active,
+            require_conditional_writes,
         }
     }
 }
 
-// ── JsonDomainRegistry ────────────────────────────────────────────────────────
-
-/// Manages JSON domain lifecycle: creation, lookup, listing, deletion, recovery.
+/// Holds the JSON domains: lookup, listing, recovery. Creates and deletes
+/// run through the control plane, one at a time.
 pub struct JsonDomainRegistry {
     domains: RwLock<HashMap<String, JsonDomain>>,
     engine: Arc<LsmStorageEngine>,
-    /// Serializes `create_domain` end-to-end (check-then-act spans an await,
-    /// see spec general/003).
-    create_lock: Mutex<()>,
-    /// Global lifecycle/DDL event bus (spec general/018 §1) — unset in unit
-    /// tests and a standalone-built registry, which then publishes nothing.
-    event_bus: OnceLock<Arc<GlobalEventBus>>,
 }
 
 impl JsonDomainRegistry {
-    /// Loads all persisted domains, then creates the default domain if it is
-    /// missing in any state.
-    pub async fn recover(engine: Arc<LsmStorageEngine>) -> anyhow::Result<Self> {
+    /// Loads all persisted domains, then, with `owns_default`, creates the
+    /// default domain if it is missing in any state.
+    pub async fn recover(engine: Arc<LsmStorageEngine>, owns_default: bool) -> anyhow::Result<Self> {
         let keys = engine.scan_keys(SYS_JSON_DOMAIN_PREFIX).await?;
         let mut loaded = HashMap::new();
         for key in keys {
@@ -122,16 +120,12 @@ impl JsonDomainRegistry {
                 }
             }
         }
-        let registry = Self {
-            domains: RwLock::new(loaded),
-            engine,
-            create_lock: Mutex::new(()),
-            event_bus: OnceLock::new(),
-        };
+        let registry = Self { domains: RwLock::new(loaded), engine };
         // Any state counts: creating over a Deleting default would fail with
         // DomainAlreadyExists and abort every boot. The purger finalizes it;
         // the next recover() then recreates it.
         match registry.get_domain_any(DEFAULT_DOMAIN) {
+            None if !owns_default => {}
             None => {
                 registry.create_domain(DEFAULT_DOMAIN).await?;
             }
@@ -144,31 +138,27 @@ impl JsonDomainRegistry {
         Ok(registry)
     }
 
-    /// Wires the global event bus (spec general/018 §1); a no-op call site
-    /// (`event_bus.get()` returning `None`) means it was never attached.
-    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
-        let _ = self.event_bus.set(bus);
-    }
-
-    /// `domain_created` / `domain_deleted` / `domain_purged` (spec §2).
-    fn publish_lifecycle_event(&self, kind: &'static str, domain: &str) {
-        if let Some(bus) = self.event_bus.get() {
-            bus.publish("json", kind, domain, None);
-        }
-    }
-
     /// Creates a new domain. Fails if the name already exists (incl. deleting).
-    pub async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
+    pub(crate) async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
+        self.create_domain_with(name, false).await
+    }
+
+    /// [`Self::create_domain`] with the domain's
+    /// [`JsonDomain::require_conditional_writes`] setting. The check and the
+    /// insert span an await: callers must not run two lifecycle changes at once.
+    pub(crate) async fn create_domain_with(
+        &self,
+        name: &str,
+        require_conditional_writes: bool,
+    ) -> Result<JsonDomain, JsonStoreError> {
         validate_domain_name(name)?;
-        let _guard = self.create_lock.lock().await;
         if self.domains.read().contains_key(name) {
             return Err(JsonStoreError::DomainAlreadyExists(name.to_string()));
         }
-        let domain = JsonDomain::new(name);
+        let domain = JsonDomain::new(name, require_conditional_writes);
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain.clone());
-        self.publish_lifecycle_event("domain_created", name);
         Ok(domain)
     }
 
@@ -187,7 +177,7 @@ impl JsonDomainRegistry {
     }
 
     /// Lists all domains including `Deleting` ones (state is part of the
-    /// returned model, spec json/013).
+    /// returned model).
     pub fn list_domains(&self) -> Vec<JsonDomain> {
         self.domains.read().values().cloned().collect()
     }
@@ -203,8 +193,8 @@ impl JsonDomainRegistry {
     }
 
     /// Marks the domain `Deleting` and persists the change. Documents and
-    /// indexes stay on disk until the purger (spec json/013) cleans them up.
-    pub async fn delete_domain(&self, name: &str) -> Result<(), JsonStoreError> {
+    /// indexes stay on disk until the purger cleans them up.
+    pub(crate) async fn delete_domain(&self, name: &str) -> Result<(), JsonStoreError> {
         let mut domain = match self.get_domain_any(name) {
             None => return Err(JsonStoreError::DomainNotFound(name.to_string())),
             Some(d) if d.state == JsonDomainState::Deleting => {
@@ -216,16 +206,14 @@ impl JsonDomainRegistry {
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.domains.write().insert(name.to_string(), domain);
-        self.publish_lifecycle_event("domain_deleted", name);
         Ok(())
     }
 
-    /// Removes the domain metadata for good — called by the purger after all
-    /// documents and index entries are gone.
+    /// Removes the domain metadata for good — once the purger removed all
+    /// documents and index entries.
     pub(crate) async fn finalize_deletion(&self, name: &str) -> Result<(), JsonStoreError> {
         self.engine.delete(&sys_key(name)).await?;
         self.domains.write().remove(name);
-        self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
 
@@ -239,5 +227,18 @@ impl JsonDomainRegistry {
             }
             Some(d) => Ok(d),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The domain key at a maximal name stays below the
+    // startup lower bound of json.lsm.max_key_length.
+    #[test]
+    fn test_sys_key_at_max_name_fits_key_limit_lower_bound() {
+        let key = sys_key(&"d".repeat(MAX_DOMAIN_NAME_LEN));
+        assert!(key.len() < MIN_LSM_KEY_LENGTH, "{}", key.len());
     }
 }

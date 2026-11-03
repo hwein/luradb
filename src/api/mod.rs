@@ -18,7 +18,7 @@ pub mod rel_import;
 use crate::auth::{handlers::AuthState, middleware::auth_layer, AuthCache};
 use crate::backup::BackupManager;
 use crate::config::LuraConfig;
-use crate::core::events::GlobalEventBus;
+use crate::control::ControlPlane;
 use crate::engines::json::JsonEngine;
 use crate::engines::lsm::DomainRegistry;
 use crate::engines::rel::RelEngine;
@@ -34,8 +34,6 @@ use middleware::{proxy_fn, ParsedCidr};
 use serde::Serialize;
 use std::sync::Arc;
 use utoipa::{openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme}, Modify, OpenApi, ToSchema};
-
-// ── Security scheme (Modify hook) ─────────────────────────────────────────────
 
 struct BearerAuth;
 
@@ -56,12 +54,45 @@ impl Modify for BearerAuth {
     }
 }
 
-// ── API contract version (Modify hook) ────────────────────────────────────────
+/// Declares 507 on every operation a shortage of disk space or memory
+/// refuses: the writes the bridge answers itself, and the SQL route, whose
+/// writes the engine refuses.
+struct WriteBlockedResponses;
+
+impl Modify for WriteBlockedResponses {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use axum::http::Method;
+        use crate::bridge::{passes_write_block, route_class, RouteClass};
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            let operations =
+                [(Method::POST, &mut item.post), (Method::PUT, &mut item.put), (Method::PATCH, &mut item.patch), (Method::DELETE, &mut item.delete)];
+            for (method, operation) in operations {
+                let Some(operation) = operation else { continue };
+                let refused = route_class(&method, path) == RouteClass::Write || path.ends_with("/sql");
+                if refused && !passes_write_block(&method, path) {
+                    operation.responses.responses.insert("507".to_string(), write_blocked_response().into());
+                }
+            }
+        }
+    }
+}
+
+fn write_blocked_response() -> utoipa::openapi::Response {
+    use utoipa::openapi::{schema::{ObjectBuilder, Type}, ContentBuilder, HeaderBuilder, ResponseBuilder};
+    ResponseBuilder::new()
+        .description(
+            "Insufficient Storage — disk space or memory runs short; the write was not applied. \
+             Reads go on; retry after the seconds in Retry-After.",
+        )
+        .header("Retry-After", HeaderBuilder::new().schema(Some(ObjectBuilder::new().schema_type(Type::Integer))).build())
+        .content("text/plain", ContentBuilder::new().schema(Some(ObjectBuilder::new().schema_type(Type::String))).build())
+        .build()
+}
 
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
-/// Bump rules: COMPATIBILITY.md in the private concepts repo. Single source of
+/// Breaking bumps the middle digit, anything else the last. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.6.1";
+pub const API_VERSION: &str = "0.14.2";
 
 struct VersionInfo;
 
@@ -79,8 +110,6 @@ impl Modify for VersionInfo {
     }
 }
 
-// ── AppState ──────────────────────────────────────────────────────────────────
-
 /// Shared application state injected into every Axum handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -92,20 +121,19 @@ pub struct AppState {
     pub json_engine: Option<Arc<JsonEngine>>,
     /// `None` when the relational engine is disabled via `rel.enabled = false`.
     pub rel_engine: Option<Arc<RelEngine>>,
-    /// `None` when `shm.enabled = false` (spec perf/006).
+    /// `None` when `shm.enabled = false`.
     pub shm_manager: Option<Arc<ShmManager>>,
-    /// `None` when `backup.enabled = false` (spec general/006) — routes stay
+    /// `None` when `backup.enabled = false` — routes stay
     /// registered either way; handlers answer 503 (plaintext `ApiError`).
     pub backup_manager: Option<Arc<BackupManager>>,
-    /// `None` when `log.http_access = false` (spec general/005) — routes stay
+    /// `None` when `log.http_access = false` — routes stay
     /// registered either way; handlers answer 503 (plaintext `ApiError`).
     pub log_access: Option<logs::LogAccessState>,
-    /// Global lifecycle/DDL event bus backing `GET /store-api/events` (spec
-    /// general/018) — always present; whether anything was ever attached to
-    /// the KV/JSON/rel engines is a startup-wiring concern, not an `Option` here.
-    pub event_bus: Arc<GlobalEventBus>,
+    /// Runs domain creates and deletes and auth changes, lists the domains,
+    /// and carries the global event stream behind `GET /store-api/events`.
+    pub control: Arc<ControlPlane>,
     /// Effective configuration of the running process, backing
-    /// `GET /store-api/config` (spec general/022) — always present.
+    /// `GET /store-api/config` — always present.
     pub config: Arc<LuraConfig>,
     /// Resolved config path (`resolve_config_path`) — always set, even when
     /// `config_file_loaded` is `false`.
@@ -114,73 +142,71 @@ pub struct AppState {
     pub config_file_loaded: bool,
 }
 
-// ── Shared DTOs ───────────────────────────────────────────────────────────────
-
 /// Generic `{"count": N}` response, shared by JSON's `count_documents`, KV's
-/// `count_keys`, and rel's `count_rows` (spec general/017) — one schema
+/// `count_keys`, and rel's `count_rows` — one schema
 /// instead of three identical ones.
 #[derive(Serialize, ToSchema)]
 pub struct CountResponse {
     pub count: u64,
 }
 
-// ── Router ────────────────────────────────────────────────────────────────────
-
-/// Builds the full domain + KV + auth router with the given app state.
-pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Router {
+/// Builds the full domain + KV + auth router with the given app state — the
+/// routes only; the per-request layers come from [`frontend_layers`].
+#[allow(clippy::let_and_return, reason = "the router coverage test finds the root routes by the `let router` binding")]
+pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState {
         cache: Arc::clone(&state.auth_cache),
-        registry: Arc::clone(&state.registry),
+        control: Arc::clone(&state.control),
         auth_enabled: state.auth_enabled,
         json_engine: state.json_engine.clone(),
         rel_engine: state.rel_engine.clone(),
     };
 
     let mut store_router = Router::new()
-        // Effective configuration (spec general/022). No `{domain}` segment —
+        // Effective configuration. No `{domain}` segment —
         // admin-only via the same extract_domain None-branch as /metrics.
         .route("/config", get(metrics::get_config))
         // Metrics (admin / domain user)
         .route("/metrics", get(metrics::get_metrics))
-        .route("/metrics/domains/:name", get(metrics::get_domain_metrics))
+        .route("/metrics/domains/{name}", get(metrics::get_domain_metrics))
         // Domain management
         .route("/domains", post(domains::create_domain).get(domains::list_domains))
-        .route("/domains/:name", get(domains::get_domain).delete(domains::delete_domain))
+        .route("/domains/{name}", get(domains::get_domain).delete(domains::delete_domain))
         // KV operations (engine → domain → resource)
         .route(
-            "/kv/:domain/keys/:key",
+            "/kv/{domain}/keys/{key}",
             put(kv::put_key).get(kv::get_key).delete(kv::delete_key),
         )
-        .route("/kv/:domain/keys/:key/null", patch(kv::set_null))
-        .route("/kv/:domain/keys/:key/meta", get(kv::get_key_meta))
-        .route("/kv/:domain/keys", get(kv::scan_keys).delete(kv::delete_keys_by_prefix))
-        .route("/kv/:domain/count", get(kv::count_keys))
-        .route("/kv/:domain/watch", get(kv::watch))
+        .route("/kv/{domain}/keys/{key}/null", patch(kv::set_null))
+        .route("/kv/{domain}/keys/{key}/meta", get(kv::get_key_meta))
+        .route("/kv/{domain}/keys", get(kv::scan_keys).delete(kv::delete_keys_by_prefix))
+        .route("/kv/{domain}/count", get(kv::count_keys))
+        .route("/kv/{domain}/watch", get(kv::watch))
         // JSON document store (handlers answer 503 when the engine is disabled)
         .route(
             "/json/domains",
             post(json_domains::create_domain).get(json_domains::list_domains),
         )
         .route(
-            "/json/domains/:name",
+            "/json/domains/{name}",
             get(json_domains::get_domain).delete(json_domains::delete_domain),
         )
         .route(
-            "/json/:domain/documents",
+            "/json/{domain}/documents",
             post(json::create_document).get(json::list_documents),
         )
-        .route("/json/:domain/documents/count", get(json::count_documents))
+        .route("/json/{domain}/documents/count", get(json::count_documents))
         .route(
-            "/json/:domain/documents/:key",
+            "/json/{domain}/documents/{key}",
             put(json::put_document).get(json::get_document).delete(json::delete_document),
         )
-        .route("/json/:domain/indexes", post(json::create_index).get(json::list_indexes))
-        .route("/json/:domain/indexes/:field", delete(json::delete_index))
-        .route("/json/:domain/search", post(json::search_documents))
+        .route("/json/{domain}/indexes", post(json::create_index).get(json::list_indexes))
+        .route("/json/{domain}/indexes/{field}", delete(json::delete_index))
+        .route("/json/{domain}/search", post(json::search_documents))
         // Bulk imports exceed axum's 2 MB default body limit; when the JSON
         // engine is disabled the safe default stays (route answers 503).
         .route(
-            "/json/:domain/bulk",
+            "/json/{domain}/bulk",
             post(json::bulk_load).layer(DefaultBodyLimit::max(
                 state
                     .json_engine
@@ -188,32 +214,32 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
                     .map_or(2 * 1024 * 1024, |e| e.bulk_body_limit_bytes()),
             )),
         )
-        .route("/json/:domain/export", get(json::export_documents))
-        .route("/json/:domain/reindex", post(json::trigger_reindex))
-        .route("/json/:domain/reindex/:task_id", get(json::reindex_status))
-        // Backup & Restore (spec general/006). Always registered — like the
+        .route("/json/{domain}/export", get(json::export_documents))
+        .route("/json/{domain}/reindex", post(json::trigger_reindex))
+        .route("/json/{domain}/reindex/{task_id}", get(json::reindex_status))
+        // Backup & Restore. Always registered — like the
         // JSON engine (and unlike rel), `backup.enabled = false` is a
         // handler-level 503, not a router-level absence, so on/off never
         // changes the contract's route surface.
         .route("/backups", post(backup::create_backup).get(backup::list_backups))
         .route("/backups/upload", post(backup::upload_backup))
-        .route("/backups/:id", get(backup::get_backup).delete(backup::delete_backup))
-        .route("/backups/:id/download", get(backup::download_backup))
-        .route("/backups/:id/restore", post(backup::restore_backup))
-        .route("/restores/:id", get(backup::get_restore_status))
-        // Log Access (spec general/005). Always registered — like backup and
+        .route("/backups/{id}", get(backup::get_backup).delete(backup::delete_backup))
+        .route("/backups/{id}/download", get(backup::download_backup))
+        .route("/backups/{id}/restore", post(backup::restore_backup))
+        .route("/restores/{id}", get(backup::get_restore_status))
+        // Log Access. Always registered — like backup and
         // the JSON engine — so `log.http_access = false` stays a handler-level
         // 503, keeping 404 free for "wrong URL / old server".
         .route("/logs", get(logs::get_logs))
         .route("/logs/files", get(logs::list_files))
-        // Global lifecycle/DDL event stream (spec general/018). No `{domain}`
+        // Global lifecycle/DDL event stream. No `{domain}`
         // segment — admin-only via the same path-shape rule as `/metrics`,
         // `/backups*` etc. (auth::middleware::extract_domain returns `None`).
         .route("/events", get(events::get_events))
         .with_state(state.clone());
 
-    // Relational store (spec rel/009 §1): registered *only* when the engine
-    // is enabled — unlike json/009, a disabled rel engine means the whole
+    // Relational store: registered *only* when the engine
+    // is enabled — unlike JSON, a disabled rel engine means the whole
     // rel REST surface is absent (axum default 404), not a 503 per handler.
     // A disabled engine means no rel data can exist at all, so conditional
     // registration is the KISS choice: it keeps the router free of routes
@@ -225,35 +251,35 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
                 post(rel_domains::create_domain).get(rel_domains::list_domains),
             )
             .route(
-                "/rel/domains/:name",
+                "/rel/domains/{name}",
                 get(rel_domains::get_domain).delete(rel_domains::delete_domain),
             )
-            .route("/rel/:domain/sql", post(rel::execute_sql))
-            // CSV/TSV file import (spec rel/019): a body-size cap analogous
+            .route("/rel/{domain}/sql", post(rel::execute_sql))
+            // CSV/TSV file import: a body-size cap analogous
             // to the JSON bulk route below, sized from the engine config.
             .route(
-                "/rel/:domain/tables/from-file",
+                "/rel/{domain}/tables/from-file",
                 post(rel_import::create_table_from_file).layer(DefaultBodyLimit::max(
                     state.rel_engine.as_ref().map_or(64 * 1024 * 1024, |e| e.import_body_limit_bytes()),
                 )),
             )
-            // Browse/Row REST surface (spec rel/010): registered in this
+            // Browse/Row REST surface: registered in this
             // same conditional sub-router, not a second merge point.
-            .route("/rel/:domain/tables", get(rel_browse::list_tables))
-            .route("/rel/:domain/tables/:table", get(rel_browse::get_table))
-            .route("/rel/:domain/views", get(rel_browse::list_views))
+            .route("/rel/{domain}/tables", get(rel_browse::list_tables))
+            .route("/rel/{domain}/tables/{table}", get(rel_browse::get_table))
+            .route("/rel/{domain}/views", get(rel_browse::list_views))
             .route(
-                "/rel/:domain/tables/:table/rows",
+                "/rel/{domain}/tables/{table}/rows",
                 get(rel_browse::browse_rows).post(rel_browse::insert_row),
             )
             .route(
-                "/rel/:domain/tables/:table/rows/:pk",
+                "/rel/{domain}/tables/{table}/rows/{pk}",
                 get(rel_browse::get_row).put(rel_browse::update_row).delete(rel_browse::delete_row),
             )
-            // Object counter (spec general/017): a level above the `rows`
+            // Object counter: a level above the `rows`
             // collection, not a static child of it — `/tables/count` still
-            // matches `:table`, so a table literally named `count` stays reachable.
-            .route("/rel/:domain/tables/:table/count", get(rel_browse::count_rows))
+            // matches `{table}`, so a table literally named `count` stays reachable.
+            .route("/rel/{domain}/tables/{table}/count", get(rel_browse::count_rows))
             .with_state(state.clone());
         store_router = store_router.merge(rel_routes);
     }
@@ -264,43 +290,60 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             "/auth/users",
             post(crate::auth::handlers::create_user).get(crate::auth::handlers::list_users),
         )
-        .route("/auth/users/:name", delete(crate::auth::handlers::delete_user))
+        .route("/auth/users/{name}", delete(crate::auth::handlers::delete_user))
         .route(
-            "/auth/users/:name/permissions",
+            "/auth/users/{name}/permissions",
             post(crate::auth::handlers::set_permission),
         )
         .route(
-            "/auth/users/:name/permissions/:domain",
+            "/auth/users/{name}/permissions/{domain}",
             delete(crate::auth::handlers::remove_permission),
         )
         .route(
-            "/auth/users/:name/rotate-key",
+            "/auth/users/{name}/rotate-key",
             post(crate::auth::handlers::rotate_key),
         )
+        // OAuth state of the MCP listener, for its requests only.
+        .route("/auth/oauth/clients", post(crate::auth::oauth::register_client))
+        .route("/auth/oauth/clients/{id}", get(crate::auth::oauth::get_client))
+        .route("/auth/oauth/codes", post(crate::auth::oauth::issue_code))
+        .route("/auth/oauth/tokens", post(crate::auth::oauth::issue_token))
+        .route("/auth/oauth/revoke", post(crate::auth::oauth::revoke))
         .with_state(auth_state);
 
-    let mut router = Router::new()
+    let router = Router::new()
         // Heartbeat at root (infra convention for load balancers / k8s probes)
         .route("/health", get(metrics::health).with_state(state.clone()))
-        // Version handshake at root, next to /health (spec 004 §7) — reads
+        // Version handshake at root, next to /health — reads
         // only constants, no engine access, so no state needed.
         .route("/version", get(metrics::version))
         .nest("/store-api", store_router.merge(auth_router));
 
-    if state.auth_enabled {
-        router = router.layer(from_fn_with_state(
-            Arc::clone(&state.auth_cache),
-            auth_layer,
-        ));
-    }
-
-    // Proxy layer is outermost: runs first, sets ClientIp on every request.
-    router = router.layer(from_fn_with_state(trusted_cidrs, proxy_fn));
-
     router
 }
 
-// ── OpenAPI / Swagger ─────────────────────────────────────────────────────────
+/// Wraps `router` in the per-request layers that run on the frontend, ahead
+/// of the engine bridge: trusted-proxy resolution and,
+/// when `auth_cache` is set (auth enabled), auth. Neither calls an engine.
+pub fn frontend_layers(
+    router: Router,
+    auth_cache: Option<Arc<AuthCache>>,
+    trusted_cidrs: Arc<Vec<ParsedCidr>>,
+) -> Router {
+    let mut router = router;
+    if let Some(cache) = auth_cache {
+        router = router.layer(from_fn_with_state(cache, auth_layer));
+    }
+    // Proxy layer is outermost: runs first, sets ClientIp on every request.
+    router.layer(from_fn_with_state(trusted_cidrs, proxy_fn))
+}
+
+/// [`create_router`] inside [`frontend_layers`] as one router, without the
+/// bridge between them — the request path for router-level tests.
+pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Router {
+    let auth_cache = state.auth_enabled.then(|| Arc::clone(&state.auth_cache));
+    frontend_layers(create_router(state), auth_cache, trusted_cidrs)
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -390,10 +433,12 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         // Global event stream
         events::get_events,
     ),
-    modifiers(&BearerAuth, &VersionInfo),
+    modifiers(&BearerAuth, &VersionInfo, &WriteBlockedResponses),
     components(
         schemas(
             metrics::VersionResponse,
+            crate::metrics::HeartbeatMetrics,
+            crate::metrics::ShardHealth,
             domains::CreateDomainRequest,
             domains::DomainResponse,
             kv::KeyMetaResponse,
@@ -439,6 +484,7 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             backup::RunningBackupInfo,
             backup::BackupListResponse,
             backup::BackupDetailResponse,
+            backup::LsnCutResponse,
             backup::RestoreRequest,
             backup::RestoreAcceptedResponse,
             backup::RestoreErrorEntry,
@@ -471,12 +517,14 @@ pub fn create_router(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         description = "REST-native multi-model database — KeyValue and JSON engines. \
             `version` is the API contract version (see API_VERSION), independent of the \
             server version; the latter is in the `x-luradb-server-version` extension. \
-            Runtime check: GET /version."
+            Runtime check: GET /version. \
+            Under overload, any endpoint may answer 503 Service Unavailable (text/plain) \
+            with `Retry-After: 1`; the request was not processed and may be retried. \
+            While disk space or memory runs short, writes answer 507 Insufficient Storage \
+            (text/plain) with `Retry-After: 5` and are not applied; reads go on."
     )
 )]
 pub struct ApiDoc;
-
-// ── Contract drift gate (spec 004 §5) ──────────────────────────────────────────
 
 #[cfg(test)]
 mod contract_tests {
@@ -494,8 +542,7 @@ mod contract_tests {
             generated, committed,
             "api/openapi.json is stale. Regenerate: \
              cargo run -- --dump-openapi > api/openapi.json — and check whether info.version \
-             needs a bump and whether COMPATIBILITY.md in the concepts repo \
-             needs a new line."
+             needs a bump."
         );
     }
 
@@ -536,7 +583,7 @@ mod contract_tests {
         );
     }
 
-    // DocumentResponse schema shape (spec json/015 §1): _key/_version are
+    // DocumentResponse schema shape: _key/_version are
     // fixed required properties, everything else is an open additionalProperties map.
     #[test]
     fn document_response_schema_is_well_formed() {
@@ -554,7 +601,7 @@ mod contract_tests {
         assert_ne!(additional, &serde_json::json!(false), "additionalProperties must not be false: {schema}");
     }
 
-    // DocumentResponse wiring (spec json/015 §3): the four document-CRUD
+    // DocumentResponse wiring: the four document-CRUD
     // responses that carry a body reference the new schema.
     #[test]
     fn document_response_wired_to_all_four_responses() {
@@ -576,10 +623,10 @@ mod contract_tests {
         }
     }
 
-    // 410 coverage (spec json/016 §A, test 1): every document-side JSON
+    // 410 coverage: every document-side JSON
     // endpoint whose engine call reaches `require_active` documents a 410
     // response. Domain-management routes in json_domains.rs document their
-    // own 410 separately (json/013) and reindex_status (task-map lookup
+    // own 410 separately and reindex_status (task-map lookup
     // only, no domain-state check) is deliberately excluded.
     #[test]
     fn json_document_endpoints_document_410_gone() {
@@ -608,9 +655,9 @@ mod contract_tests {
         assert!(status_responses["410"].is_null(), "reindex_status must not document 410");
     }
 
-    // Header parameters (spec json/016 §B, test 2): PUT and DELETE of the
+    // Header parameters: PUT and DELETE of the
     // document route carry If-Match; PUT additionally keeps the
-    // If-None-Match parameter from json/014.
+    // existing If-None-Match parameter.
     #[test]
     fn document_route_carries_if_match_header_parameter() {
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
@@ -627,7 +674,7 @@ mod contract_tests {
         assert!(has_header(doc_path, "delete", "If-Match"), "DELETE must carry If-Match");
     }
 
-    // List/search typing (spec json/016 §C, test 3): both `documents` fields
+    // List/search typing: both `documents` fields
     // reference DocumentResponse instead of the former Vec<Object> placeholder.
     #[test]
     fn document_list_and_search_responses_reference_document_response_items() {
@@ -643,7 +690,37 @@ mod contract_tests {
         }
     }
 
-    // ETag response header (spec json/016 §D1, test 4): GET …/documents/{key}'s
+    // Test 4 (contract): the writes a shortage of disk space or memory
+    // refuses declare 507 with Retry-After, the SQL route included; reads,
+    // the searches, sign-in and keys, and backup deletion do not.
+    #[test]
+    fn refused_writes_declare_507_and_the_rest_do_not() {
+        let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let response = |path: &str, method: &str| json["paths"][path][method]["responses"]["507"].clone();
+        for (path, method) in [
+            ("/store-api/kv/{domain}/keys/{key}", "put"),
+            ("/store-api/kv/{domain}/keys/{key}", "delete"),
+            ("/store-api/domains", "post"),
+            ("/store-api/rel/{domain}/sql", "post"),
+            ("/store-api/backups", "post"),
+            ("/store-api/backups/{id}/restore", "post"),
+        ] {
+            let declared = response(path, method);
+            assert!(declared["headers"]["Retry-After"].is_object(), "{method} {path}: {declared}");
+            assert_eq!(declared["content"]["text/plain"]["schema"]["type"], "string", "{method} {path}");
+        }
+        for (path, method) in [
+            ("/store-api/kv/{domain}/keys/{key}", "get"),
+            ("/store-api/json/{domain}/search", "post"),
+            ("/store-api/auth/users", "post"),
+            ("/store-api/backups/{id}", "delete"),
+            ("/health", "get"),
+        ] {
+            assert!(response(path, method).is_null(), "{method} {path}");
+        }
+    }
+
+    // ETag response header: GET …/documents/{key}'s
     // 200 declares the header used for a subsequent If-Match / If-None-Match.
     #[test]
     fn get_document_200_declares_etag_header() {
@@ -653,7 +730,7 @@ mod contract_tests {
         assert!(!header.is_null(), "GET …/documents/{{key}} 200 must declare an ETag header: {header}");
     }
 
-    // Error-body typing sample (spec json/016 §D2, test 5 schema half): a 4xx
+    // Error-body typing sample (schema half): a 4xx
     // response of json.rs declares its body as a plain string. The matching
     // reality check (an actual roundtrip) lives in json::tests.
     #[test]
@@ -664,26 +741,27 @@ mod contract_tests {
         assert_eq!(schema["type"], serde_json::json!("string"), "{schema}");
     }
 
-    // ── Error-body typing gate (spec general/026) ────────────────────────────
-
     /// Every documented response with status >= 400, anywhere in the API,
     /// must declare a `text/plain` string body — otherwise a codegen client
-    /// sees `content?: never` on that error, the contract lie general/004 set
-    /// out to end. No exception list as a starting state (spec §Gate); the
-    /// one exception below is justified, not a loophole, and covers json.rs
-    /// too (json/016 §D2's narrower guarantee, now subsumed).
+    /// sees `content?: never` on that error, a contract lie. No exception
+    /// list as a starting state; the one exception below is justified, not
+    /// a loophole. Covers json.rs too.
     #[test]
     fn every_4xx_5xx_response_declares_text_plain_string_body() {
         const HTTP_METHODS: [&str; 8] =
             ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
         // metrics::get_domain_metrics returns a bare `Result<_, StatusCode>`
         // (see the handler in metrics.rs), not `ApiError` — its 404 is a
-        // real empty body, not a plaintext one. Reality over schema (spec
-        // general/026): documented without a body instead of faking one. The
+        // real empty body, not a plaintext one. Reality over schema:
+        // documented without a body instead of faking one. The
         // only entry here; a new one needs the same proof (a handler path
         // that provably never carries a body).
         const NO_BODY_EXCEPTIONS: &[(&str, &str, &str)] =
             &[("/store-api/metrics/domains/{name}", "get", "404")];
+        // GET /health answers 503 with its full JSON report when a data shard
+        // stays silent, so a probe still reads which one; it declares that
+        // body instead.
+        const JSON_BODY_EXCEPTIONS: &[(&str, &str, &str)] = &[("/health", "get", "503")];
 
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = json["paths"].as_object().expect("contract without paths");
@@ -699,7 +777,15 @@ mod contract_tests {
                     if code < 400 {
                         continue;
                     }
-                    if NO_BODY_EXCEPTIONS.contains(&(path.as_str(), method.as_str(), status.as_str())) {
+                    let route = (path.as_str(), method.as_str(), status.as_str());
+                    if NO_BODY_EXCEPTIONS.contains(&route) {
+                        continue;
+                    }
+                    if JSON_BODY_EXCEPTIONS.contains(&route) {
+                        assert!(
+                            response["content"]["application/json"].is_object(),
+                            "{method} {path} -> {status}: missing JSON body: {response}"
+                        );
                         continue;
                     }
                     let schema_type = &response["content"]["text/plain"]["schema"]["type"];
@@ -713,8 +799,6 @@ mod contract_tests {
         }
     }
 }
-
-// ── Router↔Contract coverage gate (spec general/009) ──────────────────────────
 
 #[cfg(test)]
 mod router_coverage_tests {
@@ -820,17 +904,6 @@ mod router_coverage_tests {
         found
     }
 
-    /// axum `:param` → OpenAPI `{param}`.
-    fn normalize_path(path: &str) -> String {
-        path.split('/')
-            .map(|seg| match seg.strip_prefix(':') {
-                Some(name) => format!("{{{name}}}"),
-                None => seg.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("/")
-    }
-
     /// All `.route("<path>", …)` registrations of a source-text section,
     /// as (method, prefix+path) pairs.
     fn route_pairs(section: &str, prefix: &str) -> BTreeSet<(String, String)> {
@@ -841,7 +914,7 @@ mod router_coverage_tests {
             let args = &rest[..paren_end(rest)];
             let path_start = args.find('"').expect(".route without a path literal") + 1;
             let path_end = path_start + args[path_start..].find('"').expect("path literal not terminated");
-            let path = format!("{prefix}{}", normalize_path(&args[path_start..path_end]));
+            let path = format!("{prefix}{}", &args[path_start..path_end]);
             let methods = http_methods(args);
             assert!(!methods.is_empty(), "no HTTP method detected in .route({path:?}, …)");
             for method in methods {
@@ -868,13 +941,9 @@ mod router_coverage_tests {
         pairs
     }
 
-    /// The drift gate only guarantees definition == file; a route registered in
-    /// `create_router` without a `paths(...)` entry would be silently missing on
-    /// both sides. Axum offers no router introspection, hence the source-text parse.
-    /// Swagger's runtime routes and the hello route (main.rs) are deliberately not
-    /// part of the contract and live outside `create_router`.
-    #[test]
-    fn every_registered_route_matches_contract_exactly() {
+    /// (method, path) pairs registered in `create_router`, parsed from its
+    /// source text: axum offers no router introspection.
+    fn registered_routes() -> BTreeSet<(String, String)> {
         let body = create_router_source();
 
         // Guard the structural assumptions: fail loudly on a create_router
@@ -895,13 +964,36 @@ mod router_coverage_tests {
         }
 
         let root_at = body
-            .find("let mut router = Router::new()")
+            .find("let router = Router::new()")
             .expect("root router marker not found — adjust the parser");
         let (nested, root) = body.split_at(root_at);
         let mut registered = route_pairs(nested, "/store-api");
         registered.extend(route_pairs(root, ""));
         assert!(!registered.is_empty(), "parser found no .route registrations");
+        registered
+    }
 
+    /// Routes only the MCP listener reaches (404 for everyone else); they
+    /// are no part of the REST contract.
+    const INTERNAL_ROUTES: &[(&str, &str)] = &[
+        ("post", "/store-api/auth/oauth/clients"),
+        ("get", "/store-api/auth/oauth/clients/{id}"),
+        ("post", "/store-api/auth/oauth/codes"),
+        ("post", "/store-api/auth/oauth/tokens"),
+        ("post", "/store-api/auth/oauth/revoke"),
+    ];
+
+    /// The drift gate only guarantees definition == file; a route registered in
+    /// `create_router` without a `paths(...)` entry would be silently missing on
+    /// both sides. Swagger's runtime routes and the hello route
+    /// (`server::build_router`) are deliberately not part of the contract and
+    /// live outside `create_router`.
+    #[test]
+    fn every_registered_route_matches_contract_exactly() {
+        let mut registered = registered_routes();
+        for (method, path) in INTERNAL_ROUTES {
+            assert!(registered.remove(&(method.to_string(), path.to_string())), "{method} {path} is not registered");
+        }
         let contract = contract_pairs();
         let not_in_contract: Vec<_> = registered.difference(&contract).collect();
         let not_registered: Vec<_> = contract.difference(&registered).collect();
@@ -911,5 +1003,145 @@ mod router_coverage_tests {
              Registered but missing from the contract — add a #[utoipa::path] + paths(...) entry: {not_in_contract:?}\n\
              In the contract but not registered — stale paths(...) entry or missing .route(): {not_registered:?}"
         );
+    }
+
+    /// Point reads served on the frontend thread that holds the connection.
+    /// Each handler answers without a scan; a route that scans or streams
+    /// belongs in `READ_ROUTES`.
+    const INLINE_ROUTES: &[(&str, &str)] = &[
+        ("get", "/health"),
+        ("get", "/version"),
+        ("get", "/store-api/kv/{domain}/keys/{key}"),
+        ("get", "/store-api/json/{domain}/documents/{key}"),
+        ("get", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
+    ];
+
+    /// Routes served by the reader pool. Each handler was
+    /// checked for engine writes; one that writes belongs in `WRITE_ROUTES`.
+    const READ_ROUTES: &[(&str, &str)] = &[
+        ("get", "/store-api/config"),
+        ("get", "/store-api/metrics"),
+        ("get", "/store-api/metrics/domains/{name}"),
+        ("get", "/store-api/domains"),
+        ("get", "/store-api/domains/{name}"),
+        ("get", "/store-api/kv/{domain}/keys/{key}/meta"),
+        ("get", "/store-api/kv/{domain}/keys"),
+        ("get", "/store-api/kv/{domain}/count"),
+        ("get", "/store-api/kv/{domain}/watch"),
+        ("get", "/store-api/json/domains"),
+        ("get", "/store-api/json/domains/{name}"),
+        ("get", "/store-api/json/{domain}/documents"),
+        ("get", "/store-api/json/{domain}/documents/count"),
+        ("get", "/store-api/json/{domain}/indexes"),
+        ("post", "/store-api/json/{domain}/search"),
+        ("get", "/store-api/json/{domain}/export"),
+        ("get", "/store-api/json/{domain}/reindex/{task_id}"),
+        ("get", "/store-api/backups"),
+        ("get", "/store-api/backups/{id}"),
+        ("get", "/store-api/backups/{id}/download"),
+        ("get", "/store-api/restores/{id}"),
+        ("get", "/store-api/logs"),
+        ("get", "/store-api/logs/files"),
+        ("get", "/store-api/events"),
+        ("get", "/store-api/rel/domains"),
+        ("get", "/store-api/rel/domains/{name}"),
+        ("post", "/store-api/rel/{domain}/sql"),
+        ("get", "/store-api/rel/{domain}/tables"),
+        ("get", "/store-api/rel/{domain}/tables/{table}"),
+        ("get", "/store-api/rel/{domain}/views"),
+        ("get", "/store-api/rel/{domain}/tables/{table}/rows"),
+        ("get", "/store-api/rel/{domain}/tables/{table}/count"),
+        ("get", "/store-api/auth/whoami"),
+        ("get", "/store-api/auth/users"),
+        ("get", "/store-api/auth/oauth/clients/{id}"),
+    ];
+
+    /// Routes served by the engine thread.
+    const WRITE_ROUTES: &[(&str, &str)] = &[
+        ("post", "/store-api/domains"),
+        ("delete", "/store-api/domains/{name}"),
+        ("put", "/store-api/kv/{domain}/keys/{key}"),
+        ("delete", "/store-api/kv/{domain}/keys/{key}"),
+        ("patch", "/store-api/kv/{domain}/keys/{key}/null"),
+        ("delete", "/store-api/kv/{domain}/keys"),
+        ("post", "/store-api/json/domains"),
+        ("delete", "/store-api/json/domains/{name}"),
+        ("post", "/store-api/json/{domain}/documents"),
+        ("put", "/store-api/json/{domain}/documents/{key}"),
+        ("delete", "/store-api/json/{domain}/documents/{key}"),
+        ("post", "/store-api/json/{domain}/indexes"),
+        ("delete", "/store-api/json/{domain}/indexes/{field}"),
+        ("post", "/store-api/json/{domain}/bulk"),
+        ("post", "/store-api/json/{domain}/reindex"),
+        ("post", "/store-api/backups"),
+        ("post", "/store-api/backups/upload"),
+        ("delete", "/store-api/backups/{id}"),
+        ("post", "/store-api/backups/{id}/restore"),
+        ("post", "/store-api/rel/domains"),
+        ("delete", "/store-api/rel/domains/{name}"),
+        ("post", "/store-api/rel/{domain}/tables/from-file"),
+        ("post", "/store-api/rel/{domain}/tables/{table}/rows"),
+        ("put", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
+        ("delete", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),
+        ("post", "/store-api/auth/users"),
+        ("delete", "/store-api/auth/users/{name}"),
+        ("post", "/store-api/auth/users/{name}/permissions"),
+        ("delete", "/store-api/auth/users/{name}/permissions/{domain}"),
+        ("post", "/store-api/auth/users/{name}/rotate-key"),
+        ("post", "/store-api/auth/oauth/clients"),
+        ("post", "/store-api/auth/oauth/codes"),
+        ("post", "/store-api/auth/oauth/tokens"),
+        ("post", "/store-api/auth/oauth/revoke"),
+    ];
+
+    // Every registered route sits in exactly one of the three lists above, and
+    // `route_class` sends it where its list says — a new route without a
+    // reviewed class fails here.
+    #[test]
+    fn every_registered_route_has_a_reviewed_class() {
+        use crate::bridge::{route_class, RouteClass};
+
+        let listed = |list: &[(&str, &str)]| -> BTreeSet<(String, String)> {
+            list.iter().map(|(method, path)| (method.to_string(), path.to_string())).collect()
+        };
+        let (inline, reads, writes) = (listed(INLINE_ROUTES), listed(READ_ROUTES), listed(WRITE_ROUTES));
+        let pairs = [
+            ("inline and read", &inline, &reads),
+            ("inline and write", &inline, &writes),
+            ("read and write", &reads, &writes),
+        ];
+        for (lists, a, b) in pairs {
+            assert!(a.is_disjoint(b), "listed as {lists}: {:?}", a.intersection(b));
+        }
+
+        let registered = registered_routes();
+        let all: BTreeSet<_> = inline.iter().chain(&reads).chain(&writes).cloned().collect();
+        let unlisted: Vec<_> = registered.difference(&all).collect();
+        let stale: Vec<_> = all.difference(&registered).collect();
+        assert!(
+            unlisted.is_empty() && stale.is_empty(),
+            "Route classes and router diverge.\n\
+             Registered but in no list — check the handler for engine writes, then list it: {unlisted:?}\n\
+             Listed but not registered: {stale:?}"
+        );
+
+        for (method, path) in &registered {
+            let route = (method.clone(), path.clone());
+            let expected = if inline.contains(&route) {
+                RouteClass::ReadInline
+            } else if reads.contains(&route) {
+                RouteClass::Read
+            } else {
+                RouteClass::Write
+            };
+            // A concrete request path: every `{param}` segment gets a sample value.
+            let concrete = path
+                .split('/')
+                .map(|seg| if seg.starts_with('{') { "x" } else { seg })
+                .collect::<Vec<_>>()
+                .join("/");
+            let method = axum::http::Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
+            assert_eq!(route_class(&method, &concrete), expected, "{method} {path}");
+        }
     }
 }

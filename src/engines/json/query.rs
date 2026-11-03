@@ -1,9 +1,9 @@
-//! Search & query engine for the JSON store (spec json/006).
+//! Search & query engine for the JSON store.
 //!
 //! Filters run exclusively over index entries (no full table scans): an
 //! `Eq` filter is a prefix scan on `IDX:{prefix}:{field}:{value}:`, range
 //! filters scan the field's entries and compare encoded bytes — the sortable
-//! encoding from spec 004 makes byte order equal value order.
+//! index value encoding makes byte order equal value order.
 
 use super::document::{doc_scan_prefix, parse_doc_key, Document};
 use super::domain::JsonDomain;
@@ -12,12 +12,20 @@ use super::index::{
     self, encode_index_value, index_field_prefix, index_scan_prefix, IndexDefinition,
 };
 use super::JsonEngine;
+use crate::core::coop::YieldEvery;
+use crate::engines::lsm::reader::Snapshot;
 use crate::metrics::EngineKind;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 1000;
+
+/// Documents read between two yields.
+const DOC_YIELD_INTERVAL: u32 = 256;
+
+/// Keys post-processed between two yields.
+const KEY_YIELD_INTERVAL: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub enum FilterCondition {
@@ -54,8 +62,6 @@ pub struct SearchResult {
     pub offset: u32,
     pub limit: u32,
 }
-
-// ── Unfiltered listing (spec json/010) ────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ListOptions {
@@ -95,11 +101,16 @@ impl JsonEngine {
         let dom = self.domains.require_active(domain)?;
         if query.filters.is_empty() {
             return Err(JsonStoreError::InvalidFilter(
-                "at least one filter is required (unfiltered listing: spec json/010)".to_string(),
+                "at least one filter is required".to_string(),
             ));
         }
         let limit = query.limit.min(MAX_LIMIT);
         let defs = self.indexes.get_indexes(&dom.name);
+        // Every index scan and document read of this search runs against one
+        // snapshot: hits, their content and `total` share one state, and
+        // writes after it stay invisible to this search.
+        let snapshot_guard = self.engine.snapshot().await;
+        let snapshot = snapshot_guard.snapshot();
 
         // Intersect per-filter matches; BTreeSet keeps pagination deterministic.
         let mut matched: Option<BTreeSet<String>> = None;
@@ -110,7 +121,7 @@ impl JsonEngine {
                     field: field.clone(),
                 }
             })?;
-            let keys = self.eval_filter(&dom, def, condition).await?;
+            let keys = self.eval_filter(&dom, def, condition, snapshot).await?;
             matched = Some(match matched {
                 None => keys,
                 Some(previous) => previous.intersection(&keys).cloned().collect(),
@@ -121,11 +132,20 @@ impl JsonEngine {
         }
         let matched = matched.unwrap_or_default();
         let total = matched.len() as u64;
+        #[cfg(test)]
+        {
+            let hook = self.search_parked.lock().take();
+            if let Some(hook) = hook {
+                hook.pause().await;
+            }
+        }
 
         // Only the requested page is actually fetched.
         let mut documents = Vec::new();
+        let mut coop = YieldEvery::new(DOC_YIELD_INTERVAL);
         for key in matched.iter().skip(query.offset as usize).take(limit as usize) {
-            if let Some(stored) = self.read_stored(&dom, key).await? {
+            coop.tick().await;
+            if let Some(stored) = self.read_stored_with_snapshot(&dom, key, snapshot).await? {
                 documents.push(Document {
                     key: key.clone(),
                     domain: dom.name.clone(),
@@ -159,10 +179,14 @@ impl JsonEngine {
             .engine
             .scan_keys(&doc_scan_prefix(&dom.system_prefix))
             .await?;
-        let all_keys: Vec<String> = lsm_keys
-            .iter()
-            .filter_map(|k| parse_doc_key(k).map(|(_, doc_key)| doc_key))
-            .collect();
+        let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
+        let mut all_keys: Vec<String> = Vec::with_capacity(lsm_keys.len());
+        for lsm_key in &lsm_keys {
+            coop.tick().await;
+            if let Some((_, doc_key)) = parse_doc_key(lsm_key) {
+                all_keys.push(doc_key);
+            }
+        }
         let total = all_keys.len() as u64;
         let keys: Vec<String> = all_keys
             .into_iter()
@@ -171,7 +195,9 @@ impl JsonEngine {
             .collect();
         let mut documents = Vec::new();
         if !options.keys_only {
+            let mut coop = YieldEvery::new(DOC_YIELD_INTERVAL);
             for key in &keys {
+                coop.tick().await;
                 if let Some(stored) = self.read_stored(&dom, key).await? {
                     documents.push(Document {
                         key: key.clone(),
@@ -207,6 +233,7 @@ impl JsonEngine {
         dom: &JsonDomain,
         def: &IndexDefinition,
         condition: &FilterCondition,
+        snapshot: &Snapshot,
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let encode = |value: &Value| {
             encode_index_value(value, def.field_type).ok_or_else(|| {
@@ -219,14 +246,14 @@ impl JsonEngine {
         match condition {
             FilterCondition::Eq(value) => {
                 let encoded = encode(value)?;
-                self.eval_eq(dom, def, &encoded).await
+                self.eval_eq(dom, def, &encoded, snapshot).await
             }
             FilterCondition::Gt(value)
             | FilterCondition::Gte(value)
             | FilterCondition::Lt(value)
             | FilterCondition::Lte(value) => {
                 let bound = encode(value)?;
-                self.eval_range(dom, def, condition, &bound).await
+                self.eval_range(dom, def, condition, &bound, snapshot).await
             }
         }
     }
@@ -236,10 +263,13 @@ impl JsonEngine {
         dom: &JsonDomain,
         def: &IndexDefinition,
         encoded: &[u8],
+        snapshot: &Snapshot,
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let mut matches = BTreeSet::new();
         let prefix = index_scan_prefix(&dom.system_prefix, &def.field, encoded);
-        for lsm_key in self.engine.scan_keys(&prefix).await? {
+        let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
+        for lsm_key in self.engine.scan_keys_with_snapshot(&prefix, snapshot).await? {
+            coop.tick().await;
             let Some((_, _, value_bytes, doc_key)) = index::parse_index_key(&lsm_key) else {
                 continue;
             };
@@ -258,10 +288,13 @@ impl JsonEngine {
         def: &IndexDefinition,
         condition: &FilterCondition,
         bound: &[u8],
+        snapshot: &Snapshot,
     ) -> Result<BTreeSet<String>, JsonStoreError> {
         let mut matches = BTreeSet::new();
         let prefix = index_field_prefix(&dom.system_prefix, &def.field);
-        for lsm_key in self.engine.scan_keys(&prefix).await? {
+        let mut coop = YieldEvery::new(KEY_YIELD_INTERVAL);
+        for lsm_key in self.engine.scan_keys_with_snapshot(&prefix, snapshot).await? {
+            coop.tick().await;
             let Some((_, _, value_bytes, doc_key)) = index::parse_index_key(&lsm_key) else {
                 continue;
             };
@@ -304,6 +337,32 @@ mod tests {
         (engine, dir)
     }
 
+    // A 5 000-document `list_documents`
+    // hands the thread back, so a `get_document` spawned after it answers
+    // first.
+    #[test]
+    fn test_list_documents_interleaves_with_get_document() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let docs = (0..5_000).map(|i| (Some(format!("d{i:05}")), json!({"n": i}))).collect();
+            assert_eq!(json.bulk_load("default", docs).await.unwrap().imported, 5_000);
+
+            let lister = Arc::clone(&json);
+            let reader = Arc::clone(&json);
+            let order = crate::core::coop::completion_order(
+                async move {
+                    let listed = lister.list_documents("default", ListOptions::default()).await.unwrap();
+                    assert_eq!(listed.total, 5_000);
+                },
+                async move {
+                    assert!(reader.get_document("default", "d00001").await.unwrap().is_some());
+                },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
+    }
+
     fn eq_query(pairs: &[(&str, Value)]) -> SearchQuery {
         SearchQuery {
             filters: pairs
@@ -315,141 +374,240 @@ mod tests {
     }
 
     // 1. Eq filter finds all matching documents.
-    #[tokio::test]
-    async fn test_eq_filter_finds_matches() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", super::super::IndexFieldType::String).await.unwrap();
-        json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
-        json.put_document("default", "b", json!({"city": "Berlin"})).await.unwrap();
-        json.put_document("default", "c", json!({"city": "Essen"})).await.unwrap();
-        let result = json.search_documents("default", eq_query(&[("city", json!("Essen"))])).await.unwrap();
-        assert_eq!(result.total, 2);
-        let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
-        assert_eq!(keys, vec!["a", "c"]);
-        assert!(result.documents.iter().all(|d| d.content["city"] == json!("Essen")));
+    #[test]
+    fn test_eq_filter_finds_matches() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", super::super::IndexFieldType::String).await.unwrap();
+            json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
+            json.put_document("default", "b", json!({"city": "Berlin"})).await.unwrap();
+            json.put_document("default", "c", json!({"city": "Essen"})).await.unwrap();
+            let result = json.search_documents("default", eq_query(&[("city", json!("Essen"))])).await.unwrap();
+            assert_eq!(result.total, 2);
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!(keys, vec!["a", "c"]);
+            assert!(result.documents.iter().all(|d| d.content["city"] == json!("Essen")));
+        })
     }
 
     // 2. Eq filter with no matches → empty result.
-    #[tokio::test]
-    async fn test_eq_filter_no_matches() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", super::super::IndexFieldType::String).await.unwrap();
-        json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
-        let result = json.search_documents("default", eq_query(&[("city", json!("Hamburg"))])).await.unwrap();
-        assert_eq!(result.total, 0);
-        assert!(result.documents.is_empty());
+    #[test]
+    fn test_eq_filter_no_matches() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", super::super::IndexFieldType::String).await.unwrap();
+            json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
+            let result = json.search_documents("default", eq_query(&[("city", json!("Hamburg"))])).await.unwrap();
+            assert_eq!(result.total, 0);
+            assert!(result.documents.is_empty());
+        })
     }
 
     // 3. Multiple filters are AND-combined (intersection).
-    #[tokio::test]
-    async fn test_and_intersection() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "city", super::super::IndexFieldType::String).await.unwrap();
-        json.create_index("default", "role", super::super::IndexFieldType::String).await.unwrap();
-        json.put_document("default", "a", json!({"city": "Essen", "role": "admin"})).await.unwrap();
-        json.put_document("default", "b", json!({"city": "Essen", "role": "user"})).await.unwrap();
-        json.put_document("default", "c", json!({"city": "Berlin", "role": "admin"})).await.unwrap();
-        let result = json
-            .search_documents("default", eq_query(&[("city", json!("Essen")), ("role", json!("admin"))]))
-            .await
-            .unwrap();
-        assert_eq!(result.total, 1);
-        assert_eq!(result.documents[0].key, "a");
+    #[test]
+    fn test_and_intersection() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "city", super::super::IndexFieldType::String).await.unwrap();
+            json.create_index("default", "role", super::super::IndexFieldType::String).await.unwrap();
+            json.put_document("default", "a", json!({"city": "Essen", "role": "admin"})).await.unwrap();
+            json.put_document("default", "b", json!({"city": "Essen", "role": "user"})).await.unwrap();
+            json.put_document("default", "c", json!({"city": "Berlin", "role": "admin"})).await.unwrap();
+            let result = json
+                .search_documents("default", eq_query(&[("city", json!("Essen")), ("role", json!("admin"))]))
+                .await
+                .unwrap();
+            assert_eq!(result.total, 1);
+            assert_eq!(result.documents[0].key, "a");
+        })
     }
 
     // 4./7. Pagination slices the fetch and reports the full total.
-    #[tokio::test]
-    async fn test_pagination_with_total() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "kind", super::super::IndexFieldType::String).await.unwrap();
-        for i in 0..10 {
-            json.put_document("default", &format!("u{i}"), json!({"kind": "x", "n": i})).await.unwrap();
-        }
-        let query = SearchQuery {
-            filters: HashMap::from([("kind".to_string(), FilterCondition::Eq(json!("x")))]),
-            limit: 3,
-            offset: 2,
-        };
-        let result = json.search_documents("default", query).await.unwrap();
-        assert_eq!(result.total, 10);
-        assert_eq!(result.limit, 3);
-        assert_eq!(result.offset, 2);
-        let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
-        assert_eq!(keys, vec!["u2", "u3", "u4"]);
+    #[test]
+    fn test_pagination_with_total() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "kind", super::super::IndexFieldType::String).await.unwrap();
+            for i in 0..10 {
+                json.put_document("default", &format!("u{i}"), json!({"kind": "x", "n": i})).await.unwrap();
+            }
+            let query = SearchQuery {
+                filters: HashMap::from([("kind".to_string(), FilterCondition::Eq(json!("x")))]),
+                limit: 3,
+                offset: 2,
+            };
+            let result = json.search_documents("default", query).await.unwrap();
+            assert_eq!(result.total, 10);
+            assert_eq!(result.limit, 3);
+            assert_eq!(result.offset, 2);
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!(keys, vec!["u2", "u3", "u4"]);
+        })
     }
 
     // 5. Filter on a non-indexed field → IndexNotFound.
-    #[tokio::test]
-    async fn test_unindexed_field_rejected() {
-        let (json, _dir) = make_engine().await;
-        json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
-        let err = json
-            .search_documents("default", eq_query(&[("city", json!("Essen"))]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::IndexNotFound { .. }), "got: {err}");
+    #[test]
+    fn test_unindexed_field_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.put_document("default", "a", json!({"city": "Essen"})).await.unwrap();
+            let err = json
+                .search_documents("default", eq_query(&[("city", json!("Essen"))]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::IndexNotFound { .. }), "got: {err}");
+        })
     }
 
     // 6. Empty domain → empty result, no error.
-    #[tokio::test]
-    async fn test_empty_domain_empty_result() {
-        let (json, _dir) = make_engine().await;
-        json.create_domain("empty").await.unwrap();
-        json.create_index("empty", "city", super::super::IndexFieldType::String).await.unwrap();
-        let result = json.search_documents("empty", eq_query(&[("city", json!("Essen"))])).await.unwrap();
-        assert_eq!(result.total, 0);
-        assert!(result.documents.is_empty());
+    #[test]
+    fn test_empty_domain_empty_result() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_domain("empty").await.unwrap();
+            json.create_index("empty", "city", super::super::IndexFieldType::String).await.unwrap();
+            let result = json.search_documents("empty", eq_query(&[("city", json!("Essen"))])).await.unwrap();
+            assert_eq!(result.total, 0);
+            assert!(result.documents.is_empty());
+        })
     }
 
     // 8. Filter value not matching the index type → InvalidFilter.
-    #[tokio::test]
-    async fn test_type_mismatch_rejected() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "age", super::super::IndexFieldType::Number).await.unwrap();
-        let err = json
-            .search_documents("default", eq_query(&[("age", json!("not-a-number"))]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::InvalidFilter(_)), "got: {err}");
+    #[test]
+    fn test_type_mismatch_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "age", super::super::IndexFieldType::Number).await.unwrap();
+            let err = json
+                .search_documents("default", eq_query(&[("age", json!("not-a-number"))]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::InvalidFilter(_)), "got: {err}");
+        })
     }
 
     // 9. Range filters on a Number index (sortable encoding).
-    #[tokio::test]
-    async fn test_range_filters() {
-        let (json, _dir) = make_engine().await;
-        json.create_index("default", "age", super::super::IndexFieldType::Number).await.unwrap();
-        for (key, age) in [("a", -5), ("b", 0), ("c", 30), ("d", 42), ("e", 100)] {
-            json.put_document("default", key, json!({"age": age})).await.unwrap();
-        }
-        let gt = SearchQuery {
-            filters: HashMap::from([("age".to_string(), FilterCondition::Gt(json!(30)))]),
-            ..Default::default()
-        };
-        let result = json.search_documents("default", gt).await.unwrap();
-        let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
-        assert_eq!(keys, vec!["d", "e"]);
+    #[test]
+    fn test_range_filters() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_index("default", "age", super::super::IndexFieldType::Number).await.unwrap();
+            for (key, age) in [("a", -5), ("b", 0), ("c", 30), ("d", 42), ("e", 100)] {
+                json.put_document("default", key, json!({"age": age})).await.unwrap();
+            }
+            let gt = SearchQuery {
+                filters: HashMap::from([("age".to_string(), FilterCondition::Gt(json!(30)))]),
+                ..Default::default()
+            };
+            let result = json.search_documents("default", gt).await.unwrap();
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!(keys, vec!["d", "e"]);
 
-        let lte = SearchQuery {
-            filters: HashMap::from([("age".to_string(), FilterCondition::Lte(json!(0)))]),
-            ..Default::default()
-        };
-        let result = json.search_documents("default", lte).await.unwrap();
-        let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
-        assert_eq!(keys, vec!["a", "b"]);
+            let lte = SearchQuery {
+                filters: HashMap::from([("age".to_string(), FilterCondition::Lte(json!(0)))]),
+                ..Default::default()
+            };
+            let result = json.search_documents("default", lte).await.unwrap();
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!(keys, vec!["a", "b"]);
+        })
     }
 
-    // 10. Empty filter map → InvalidFilter (unfiltered listing is spec 010).
-    #[tokio::test]
-    async fn test_empty_filters_rejected() {
-        let (json, _dir) = make_engine().await;
-        let err = json
-            .search_documents("default", SearchQuery::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, JsonStoreError::InvalidFilter(_)), "got: {err}");
+    // 10. Empty filter map → InvalidFilter (unfiltered listing is `list_documents`).
+    #[test]
+    fn test_empty_filters_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            let err = json
+                .search_documents("default", SearchQuery::default())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JsonStoreError::InvalidFilter(_)), "got: {err}");
+        })
     }
 
-    // ── Listing & counting (spec json/010) ───────────────────────────────────
+    /// `d` with `grp = a` under an index on `grp`.
+    async fn engine_with_d() -> (Arc<JsonEngine>, tempfile::TempDir, Document) {
+        let (json, dir) = make_engine().await;
+        json.create_index("default", "grp", super::super::IndexFieldType::String).await.unwrap();
+        let d = json.put_document("default", "d", json!({"grp": "a"})).await.unwrap();
+        (json, dir, d)
+    }
+
+    /// Runs the search `grp = a`, parks it after its index scans, runs
+    /// `write` meanwhile, then lets the search finish. The search holds
+    /// exactly one snapshot while parked and none afterwards.
+    async fn search_around(json: &Arc<JsonEngine>, write: impl std::future::Future<Output = ()>) -> SearchResult {
+        let hook = Arc::new(crate::engines::lsm::engine::TestHook::default());
+        *json.search_parked.lock() = Some(Arc::clone(&hook));
+        let search = compio::runtime::spawn({
+            let json = Arc::clone(json);
+            async move { json.search_documents("default", eq_query(&[("grp", json!("a"))])).await }
+        });
+        hook.reached.notified().await;
+        let registry = json.engine().snapshot_registry();
+        assert_eq!(registry.active_count(), 1, "the parked search holds its snapshot");
+        write.await;
+        hook.release.notify_one();
+        let result = search.await.unwrap().unwrap();
+        assert_eq!(registry.active_count(), 0, "the search released its snapshot");
+        result
+    }
+
+    // 14. An update during the search: the hit comes with the content and
+    //     version it matched with.
+    #[test]
+    fn test_search_returns_the_matching_state_of_a_document_updated_meanwhile() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir, d) = engine_with_d().await;
+            let result = search_around(&json, async {
+                json.put_document("default", "d", json!({"grp": "b"})).await.unwrap();
+            })
+            .await;
+            assert_eq!(result.total, 1);
+            assert_eq!(result.documents.len(), 1);
+            assert_eq!(result.documents[0].content, json!({"grp": "a"}));
+            assert_eq!(result.documents[0].version, d.version);
+            let now = json.get_document("default", "d").await.unwrap().unwrap();
+            assert_ne!(now.version, d.version, "the update went through");
+        })
+    }
+
+    // 15. A delete during the search: the hit is still delivered, the page
+    //     is as long as `total` says.
+    #[test]
+    fn test_search_delivers_a_document_deleted_meanwhile() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir, d) = engine_with_d().await;
+            let result = search_around(&json, async {
+                assert!(json.delete_document("default", "d").await.unwrap());
+            })
+            .await;
+            assert_eq!(result.total, 1);
+            assert_eq!(result.documents.len(), 1);
+            assert_eq!((result.documents[0].key.as_str(), result.documents[0].version), ("d", d.version));
+            assert!(json.get_document("default", "d").await.unwrap().is_none(), "the delete went through");
+        })
+    }
+
+    // 16. A matching document created during the search stays invisible to
+    //     it; the next search finds it.
+    #[test]
+    fn test_search_hides_a_document_created_meanwhile_until_the_next_search() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir, _) = engine_with_d().await;
+            let result = search_around(&json, async {
+                json.put_document("default", "e", json!({"grp": "a"})).await.unwrap();
+            })
+            .await;
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!((result.total, keys), (1, vec!["d"]));
+
+            let result = json.search_documents("default", eq_query(&[("grp", json!("a"))])).await.unwrap();
+            let keys: Vec<&str> = result.documents.iter().map(|d| d.key.as_str()).collect();
+            assert_eq!((result.total, keys), (2, vec!["d", "e"]));
+        })
+    }
 
     async fn seed(json: &Arc<JsonEngine>, n: usize) {
         for i in 0..n {
@@ -458,53 +616,59 @@ mod tests {
     }
 
     // 11. Listing paginates and reports the total.
-    #[tokio::test]
-    async fn test_list_documents_paginated() {
-        let (json, _dir) = make_engine().await;
-        seed(&json, 10).await;
-        let result = json
-            .list_documents("default", ListOptions { limit: 5, ..Default::default() })
-            .await
-            .unwrap();
-        assert_eq!(result.total, 10);
-        assert_eq!(result.documents.len(), 5);
-        assert_eq!(result.keys.len(), 5);
+    #[test]
+    fn test_list_documents_paginated() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            seed(&json, 10).await;
+            let result = json
+                .list_documents("default", ListOptions { limit: 5, ..Default::default() })
+                .await
+                .unwrap();
+            assert_eq!(result.total, 10);
+            assert_eq!(result.documents.len(), 5);
+            assert_eq!(result.keys.len(), 5);
 
-        let result = json
-            .list_documents("default", ListOptions { limit: 5, offset: 8, ..Default::default() })
-            .await
-            .unwrap();
-        assert_eq!(result.total, 10);
-        assert_eq!(result.keys, vec!["l08", "l09"]);
-        assert_eq!(result.documents.len(), 2);
+            let result = json
+                .list_documents("default", ListOptions { limit: 5, offset: 8, ..Default::default() })
+                .await
+                .unwrap();
+            assert_eq!(result.total, 10);
+            assert_eq!(result.keys, vec!["l08", "l09"]);
+            assert_eq!(result.documents.len(), 2);
+        })
     }
 
     // 12. keys_only returns keys without loading documents.
-    #[tokio::test]
-    async fn test_list_documents_keys_only() {
-        let (json, _dir) = make_engine().await;
-        seed(&json, 4).await;
-        let result = json
-            .list_documents("default", ListOptions { keys_only: true, ..Default::default() })
-            .await
-            .unwrap();
-        assert_eq!(result.keys.len(), 4);
-        assert!(result.documents.is_empty());
+    #[test]
+    fn test_list_documents_keys_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            seed(&json, 4).await;
+            let result = json
+                .list_documents("default", ListOptions { keys_only: true, ..Default::default() })
+                .await
+                .unwrap();
+            assert_eq!(result.keys.len(), 4);
+            assert!(result.documents.is_empty());
+        })
     }
 
     // 13. count_documents tracks inserts and deletes; empty domain → 0.
-    #[tokio::test]
-    async fn test_count_documents() {
-        let (json, _dir) = make_engine().await;
-        json.create_domain("void").await.unwrap();
-        assert_eq!(json.count_documents("void").await.unwrap(), 0);
-        let empty = json.list_documents("void", ListOptions::default()).await.unwrap();
-        assert_eq!(empty.total, 0);
-        assert!(empty.keys.is_empty());
+    #[test]
+    fn test_count_documents() {
+        crate::core::engine_runtime::block_on(async {
+            let (json, _dir) = make_engine().await;
+            json.create_domain("void").await.unwrap();
+            assert_eq!(json.count_documents("void").await.unwrap(), 0);
+            let empty = json.list_documents("void", ListOptions::default()).await.unwrap();
+            assert_eq!(empty.total, 0);
+            assert!(empty.keys.is_empty());
 
-        seed(&json, 3).await;
-        assert_eq!(json.count_documents("default").await.unwrap(), 3);
-        json.delete_document("default", "l01").await.unwrap();
-        assert_eq!(json.count_documents("default").await.unwrap(), 2);
+            seed(&json, 3).await;
+            assert_eq!(json.count_documents("default").await.unwrap(), 3);
+            json.delete_document("default", "l01").await.unwrap();
+            assert_eq!(json.count_documents("default").await.unwrap(), 2);
+        })
     }
 }

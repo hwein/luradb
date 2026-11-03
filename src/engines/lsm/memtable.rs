@@ -4,9 +4,15 @@
 //! recent writes in a sorted, lock-free data structure with MVCC support.
 
 use crate::engines::lsm::key::{InternalKey, Timestamp};
-use crate::storage::format::{is_expired, VersionState};
+use crate::storage::format::{is_expired, ValuePointer, VersionState};
 use crossbeam_skiplist::SkipMap;
+use std::cell::Cell;
+use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Counted size of a vLog-offloaded value: its on-disk vLog pointer.
+const POINTER_SIZE: usize = std::mem::size_of::<ValuePointer>();
 
 /// Represents a value stored in the MemTable.
 /// It can either be the full value (for small values) or a pointer
@@ -18,16 +24,16 @@ use std::sync::Arc;
 pub enum Value {
     Inline(Vec<u8>, Option<u64>), // data, expire_at
     /// vLog pointer + TTL. `file_id` is the vLog generation the value was
-    /// appended to (spec kv/017).
+    /// appended to.
     Pointer { file_id: u32, offset: u64, len: usize, expire_at: Option<u64> },
-    /// Key explicitly set to NULL (kv/018): present, no bytes, no TTL — an
+    /// Key explicitly set to NULL: present, no bytes, no TTL — an
     /// update, not a delete.
     Null,
     Tombstone,
 }
 
 impl Value {
-    /// Classifies this version's liveness at `now` (spec kv/025 §2): mirrors
+    /// Classifies this version's liveness at `now`: mirrors
     /// `DataBlockValue`/`CachedValue` in `storage::format` for the
     /// MemTable's own value representation.
     pub fn version_state(&self, now: u64) -> VersionState {
@@ -44,6 +50,16 @@ impl Value {
             }
         }
     }
+
+    /// Counted value bytes: inline data without its TTL,
+    /// an offloaded value as its vLog pointer.
+    fn stored_size(&self) -> usize {
+        match self {
+            Value::Inline(data, _) => data.len(),
+            Value::Pointer { .. } => POINTER_SIZE,
+            Value::Null | Value::Tombstone => 0,
+        }
+    }
 }
 
 /// The MemTable is a sorted, in-memory data structure that holds recent
@@ -55,6 +71,11 @@ impl Value {
 pub struct MemTable {
     /// SkipMap with encoded InternalKey as the key
     map: Arc<SkipMap<Vec<u8>, Value>>,
+    /// Encoded internal keys plus counted value bytes of all entries.
+    size_bytes: AtomicUsize,
+    /// The LSN up to which the instance had applied all of its records when
+    /// this MemTable was rotated out; 0 before.
+    lsn_watermark: AtomicU64,
 }
 
 impl MemTable {
@@ -62,7 +83,18 @@ impl MemTable {
     pub fn new() -> Self {
         Self {
             map: Arc::new(SkipMap::new()),
+            size_bytes: AtomicUsize::new(0),
+            lsn_watermark: AtomicU64::new(0),
         }
+    }
+
+    /// Set by the rotation that freezes this MemTable.
+    pub fn set_lsn_watermark(&self, lsn: u64) {
+        self.lsn_watermark.store(lsn, Ordering::Release);
+    }
+
+    pub fn lsn_watermark(&self) -> u64 {
+        self.lsn_watermark.load(Ordering::Acquire)
     }
 
     /// Inserts a key-value pair with a timestamp (MVCC).
@@ -74,7 +106,40 @@ impl MemTable {
     pub fn set(&self, user_key: Vec<u8>, timestamp: Timestamp, value: Value) {
         let internal_key = InternalKey::new(user_key, timestamp);
         let encoded_key = internal_key.encode();
-        self.map.insert(encoded_key, value);
+        let key_len = encoded_key.len();
+        self.size_bytes.fetch_add(key_len + value.stored_size(), Ordering::Relaxed);
+
+        // An identical internal key (a batch shares one stamp) replaces the
+        // entry, so its bytes leave the count. compare_insert may call the
+        // closure more than once: overwrite, never add.
+        let replaced = Cell::new(0);
+        self.map.compare_insert(encoded_key, value, |old| {
+            replaced.set(key_len + old.stored_size());
+            true
+        });
+        self.size_bytes.fetch_sub(replaced.get(), Ordering::Relaxed);
+    }
+
+    /// Like [`Self::set`], but keeps an existing entry with the identical
+    /// internal key. Returns whether `value` was inserted.
+    pub fn set_if_absent(&self, user_key: Vec<u8>, timestamp: Timestamp, value: Value) -> bool {
+        let encoded_key = InternalKey::new(user_key, timestamp).encode();
+        let size = encoded_key.len() + value.stored_size();
+        // Counted up front like `set`, so a racing replace of this entry
+        // never subtracts bytes that were not added yet.
+        self.size_bytes.fetch_add(size, Ordering::Relaxed);
+
+        // compare_insert calls the closure only for an existing identical key
+        // (possibly more than once); `false` keeps that entry.
+        let existed = Cell::new(false);
+        self.map.compare_insert(encoded_key, value, |_| {
+            existed.set(true);
+            false
+        });
+        if existed.get() {
+            self.size_bytes.fetch_sub(size, Ordering::Relaxed);
+        }
+        !existed.get()
     }
 
     /// Retrieves the latest version of a key visible to the given snapshot.
@@ -83,7 +148,7 @@ impl MemTable {
     }
 
     /// Like [`Self::get`], but also returns the version's write timestamp
-    /// (spec kv/022 `last_modified_at`) — decoded straight from the encoded
+    /// (`last_modified_at`) — decoded straight from the encoded
     /// key, so already un-inverted.
     ///
     /// # Arguments
@@ -158,14 +223,27 @@ impl MemTable {
         })
     }
 
-    /// Returns the approximate size of the MemTable in bytes.
-    ///
-    /// This is used to determine when to freeze and flush the MemTable.
-    #[allow(dead_code)]
-    pub fn approximate_size(&self) -> usize {
-        // Rough estimate: count entries and assume average size
-        // A more accurate implementation would track actual memory usage
-        self.map.len() * 256 // Rough estimate
+    /// Like [`Self::iter`], but starting at the first encoded key `>= start`.
+    pub fn iter_from<'a>(&'a self, start: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, Value)> + 'a {
+        self.map
+            .range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+    }
+
+    /// Payload bytes of all entries.
+    pub fn size_bytes(&self) -> usize {
+        self.size_bytes.load(Ordering::Relaxed)
+    }
+
+    /// vLog bytes the offloaded values of all entries take.
+    pub fn pointer_bytes(&self) -> u64 {
+        self.map
+            .iter()
+            .map(|entry| match entry.value() {
+                Value::Pointer { len, .. } => *len as u64,
+                _ => 0,
+            })
+            .sum()
     }
 
     /// Returns true if the MemTable is empty.
@@ -174,7 +252,6 @@ impl MemTable {
     }
 
     /// Returns the number of entries in the MemTable.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -236,5 +313,32 @@ mod tests {
 
         let versions = memtable.get_all_versions(b"key1");
         assert_eq!(versions.len(), 3);
+    }
+
+    // Re-inserting an identical internal key replaces the
+    // entry, so its old contribution is subtracted.
+    #[test]
+    fn test_memtable_set_on_identical_internal_key_replaces_its_bytes() {
+        let memtable = MemTable::new();
+
+        memtable.set(b"key".to_vec(), Timestamp::new(100), Value::Inline(b"old-value".to_vec(), None));
+        memtable.set(b"key".to_vec(), Timestamp::new(100), Value::Inline(b"new".to_vec(), None));
+
+        assert_eq!(memtable.size_bytes(), 3 + 8 + 3);
+    }
+
+    // Only offloaded values have bytes in the vLog; their `len` is what counts.
+    #[test]
+    fn test_memtable_pointer_bytes_counts_only_pointers() {
+        let memtable = MemTable::new();
+        assert_eq!(memtable.pointer_bytes(), 0);
+
+        memtable.set(b"a".to_vec(), Timestamp::new(100), Value::Pointer { file_id: 1, offset: 0, len: 700, expire_at: None });
+        memtable.set(b"a".to_vec(), Timestamp::new(200), Value::Pointer { file_id: 1, offset: 700, len: 300, expire_at: Some(9) });
+        memtable.set(b"b".to_vec(), Timestamp::new(100), Value::Inline(vec![b'I'; 50], None));
+        memtable.set(b"c".to_vec(), Timestamp::new(100), Value::Null);
+        memtable.set(b"d".to_vec(), Timestamp::new(100), Value::Tombstone);
+
+        assert_eq!(memtable.pointer_bytes(), 1000);
     }
 }

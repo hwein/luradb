@@ -1,21 +1,21 @@
-//! Unix Domain Socket transport (spec perf/001).
+//! Unix Domain Socket transport.
 //!
 //! Serves the same Axum router as the TCP listener. Local processes skip the
 //! kernel TCP/IP stack entirely; peers whose UID is in `auth.trusted_uids`
 //! are authenticated via kernel-verified peer credentials (no API key).
 
 use crate::auth::middleware::TrustedPeer;
+use crate::server::serve_connection;
 use axum::extract::connect_info::ConnectInfo;
+use axum::http::Extensions;
 use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{unix::UCred, UnixListener};
 use tokio::sync::watch;
-use tower::ServiceExt;
 
 /// Connection info attached to every UDS request (kernel-verified peer creds).
 #[derive(Clone, Debug)]
@@ -24,9 +24,12 @@ pub struct UdsConnectInfo {
     pub peer_addr: Arc<tokio::net::unix::SocketAddr>,
 }
 
+/// Filesystem mode of every socket file.
+const SOCKET_MODE: u32 = 0o660;
+
 /// Validates the path, removes a stale socket file from a previous run,
-/// binds the listener, and applies the configured filesystem mode.
-pub fn prepare_uds_socket(path: &str, mode: Option<u32>) -> anyhow::Result<UnixListener> {
+/// binds the listener, and applies `SOCKET_MODE`.
+pub fn prepare_uds_socket(path: &str) -> anyhow::Result<UnixListener> {
     let p = Path::new(path);
     anyhow::ensure!(p.is_absolute(), "unix_socket_path must be absolute: {path}");
     let parent = p
@@ -47,7 +50,7 @@ pub fn prepare_uds_socket(path: &str, mode: Option<u32>) -> anyhow::Result<UnixL
         std::fs::remove_file(p)?;
     }
     let listener = UnixListener::bind(p)?;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode.unwrap_or(0o660)))?;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(SOCKET_MODE))?;
     Ok(listener)
 }
 
@@ -65,6 +68,7 @@ pub fn remove_socket_file(path: &str) {
 /// Trusted-UID detection happens here (not in the auth middleware): the
 /// kernel-provided `UCred` is only available at accept time, and a request
 /// extension cannot be forged by clients.
+#[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 pub async fn serve_uds(
     listener: UnixListener,
     router: Router,
@@ -73,6 +77,7 @@ pub async fn serve_uds(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut connections = tokio::task::JoinSet::new();
+    let connection_shutdown = shutdown.clone();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -95,24 +100,18 @@ pub async fn serve_uds(
                     peer_cred,
                     peer_addr: Arc::new(peer_addr),
                 };
-                let router = router.clone();
-                connections.spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let service =
-                        hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-                            req.extensions_mut().insert(ConnectInfo(connect_info.clone()));
-                            if trusted {
-                                req.extensions_mut().insert(TrustedPeer);
-                            }
-                            router.clone().oneshot(req)
-                        });
-                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                    {
-                        tracing::debug!("[uds] connection error: {e}");
-                    }
-                });
+                connections.spawn(serve_connection(
+                    TokioIo::new(stream),
+                    router.clone(),
+                    move |ext: &mut Extensions| {
+                        ext.insert(ConnectInfo(connect_info.clone()));
+                        if trusted {
+                            ext.insert(TrustedPeer);
+                        }
+                    },
+                    connection_shutdown.clone(),
+                    "uds",
+                ));
             }
         }
     }
@@ -125,6 +124,7 @@ pub async fn serve_uds(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "the listener runs on a tokio runtime, like the frontend")]
 mod tests {
     use super::*;
     use axum::routing::get;
@@ -141,9 +141,9 @@ mod tests {
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
         assert!(sock.exists());
 
-        let listener = prepare_uds_socket(&path, Some(0o600)).unwrap();
+        let listener = prepare_uds_socket(&path).unwrap();
         let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(mode & 0o777, 0o660);
 
         let router = Router::new().route("/ping", get(|| async { "pong" }));
         let (tx, rx) = watch::channel(false);
@@ -168,13 +168,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_rejects_relative_and_missing_parent() {
-        assert!(prepare_uds_socket("relative.sock", None).is_err());
-        assert!(prepare_uds_socket("/nonexistent-dir-xyz/luradb.sock", None).is_err());
+        assert!(prepare_uds_socket("relative.sock").is_err());
+        assert!(prepare_uds_socket("/nonexistent-dir-xyz/luradb.sock").is_err());
         // A regular file at the path must be rejected, not deleted.
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("regular.txt");
         std::fs::write(&file, b"keep me").unwrap();
-        assert!(prepare_uds_socket(&file.to_string_lossy(), None).is_err());
+        assert!(prepare_uds_socket(&file.to_string_lossy()).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
     }
 
@@ -183,7 +183,7 @@ mod tests {
     async fn test_uds_shutdown_drains_inflight_connection() {
         let dir = tempfile::TempDir::new().unwrap();
         let sock = dir.path().join("drain.sock");
-        let listener = prepare_uds_socket(&sock.to_string_lossy(), None).unwrap();
+        let listener = prepare_uds_socket(&sock.to_string_lossy()).unwrap();
 
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -1,4 +1,4 @@
-//! On-disk/wire format break rkyv 0.7 → 0.8 (spec general-010 §5).
+//! On-disk/wire format break rkyv 0.7 → 0.8.
 //!
 //! The fixtures under `tests/fixtures/rkyv07/` were serialized with rkyv 0.7
 //! and are frozen. They pin down empirically which of our archived types
@@ -90,16 +90,14 @@ fn rkyv07_shm_command_decodes_to_a_different_value() {
         value: b"fixture-value".to_vec(),
         ttl_secs: 60,
     };
-    match ShmCommand::decode(bytes.as_slice()) {
-        Ok(decoded) => {
-            assert_ne!(decoded, original, "0.7 payload must not be wire-compatible");
-            match decoded {
-                ShmCommand::Put { domain, .. } => {
-                    assert_eq!(domain, "fixture\u{7}", "inline string picks up the length byte")
-                }
-                other => panic!("expected Put, got {other:?}"),
+    // A decode error (a future 0.8.x tightening the check) is equally acceptable.
+    if let Ok(decoded) = ShmCommand::decode(bytes.as_slice()) {
+        assert_ne!(decoded, original, "0.7 payload must not be wire-compatible");
+        match decoded {
+            ShmCommand::Put { domain, .. } => {
+                assert_eq!(domain, "fixture\u{7}", "inline string picks up the length byte")
             }
+            other => panic!("expected Put, got {other:?}"),
         }
-        Err(_) => {} // A future 0.8.x tightening the check is equally acceptable.
     }
 }

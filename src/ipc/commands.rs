@@ -1,9 +1,8 @@
-//! rkyv command/response types carried in the SHM rings (spec perf/008 §5–7).
+//! rkyv command/response types carried in the SHM rings.
 //!
 //! A length-prefixed frame holds an rkyv payload. The server validates
 //! untrusted command bytes with `rkyv::access` before deserializing to an
-//! owned value (spec §6 option a: copy into an `AlignedVec`, correctness over
-//! zero-copy).
+//! owned value (copy into an `AlignedVec`: correctness over zero-copy).
 
 use rkyv::util::AlignedVec;
 use rkyv::{rancor, Archive, Archived, Deserialize, Serialize};
@@ -20,7 +19,7 @@ pub enum ShmCommand {
     Ping { request_id: u64 },
 }
 
-/// Three-valued GET payload (spec kv/018): mirrors the engine's `GetResult`
+/// Three-valued GET payload: mirrors the engine's `GetResult`
 /// on the wire — a key can be absent, explicitly NULL, or carry bytes.
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 pub enum ShmGetValue {

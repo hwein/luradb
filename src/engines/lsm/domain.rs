@@ -4,18 +4,21 @@
 //! deterministic system prefix derived from its name via FNV-64a; all KV operations
 //! are transparently prefixed so keys from different domains never collide.
 //!
-//! Spec 009 additions:
+//! Lifecycle and runtime state:
 //! - `DomainState`: active vs. deleting (lazy background purge).
 //! - `DomainRuntime`: non-serializable per-domain state (rate limiter).
 //! - `DomainPurger`: background task that tombstones keys of deleting domains.
 //!
-//! Spec 013: `DomainCacheStats` replaced by `MetricsStore` integration.
+//! Per-domain statistics are recorded in the `MetricsStore`.
 
-use crate::core::events::{GlobalEventBus, Resume};
+use crate::control::{ControlPlane, Engine};
+use crate::core::coop::{on_give_up, YieldEvery};
+use crate::core::events::Resume;
 use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::engines::lsm::watcher::{WalEvent, WatchMessage};
+use crate::metrics::window::MetricsWindow;
 use crate::metrics::MetricsStore;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -25,14 +28,66 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, OnceLock,
 };
-use tokio::sync::{broadcast, Mutex};
-use tokio::time::{sleep, Duration};
-
-// ── Constants ────────────────────────────────────────────────────────────────
+use tokio::sync::broadcast;
 
 const SYS_DOMAIN_PREFIX: &[u8] = b"__sys:domain:";
 
-// ── DomainConfig ──────────────────────────────────────────────────────────────
+/// Keys the post-scan loops of one method process between two yields; they
+/// share one counter.
+const KEY_LOOP_YIELD_INTERVAL: u32 = 4096;
+
+/// Single-key write lock shards per domain. Not configurable — the number
+/// only caps how often a conditional write waits on writes to other keys.
+const KEY_WRITE_SHARDS: usize = 64;
+
+/// Strips the domain's system prefix off every scanned key.
+async fn strip_domain_prefix(raw_keys: Vec<Vec<u8>>, prefix_len: usize, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(raw_keys.len());
+    for key in raw_keys {
+        coop.tick().await;
+        out.push(key[prefix_len..].to_vec());
+    }
+    out
+}
+
+/// Keeps the user-keys containing `needle` (case-sensitive). A non-UTF-8 key
+/// would be an invariant break (key validation guarantees UTF-8 keys) — skip
+/// it rather than fail the request.
+async fn filter_contains(keys: Vec<Vec<u8>>, needle: &str, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for key in keys {
+        coop.tick().await;
+        if std::str::from_utf8(&key).is_ok_and(|s| s.contains(needle)) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// Takes the page `offset..offset + limit` of `keys`; every key it skips or
+/// leaves over ticks `coop`, so dropping them yields too.
+async fn take_page(keys: Vec<Vec<u8>>, offset: usize, limit: usize, coop: &mut YieldEvery) -> Vec<Vec<u8>> {
+    let mut page = Vec::with_capacity(keys.len().saturating_sub(offset).min(limit));
+    for (i, key) in keys.into_iter().enumerate() {
+        if i >= offset && page.len() < limit {
+            page.push(key);
+        } else {
+            coop.tick().await;
+        }
+    }
+    page
+}
+
+/// Counts `keys`, releasing them one by one; every key ticks `coop`, so
+/// dropping the list yields too.
+async fn count_and_release(keys: Vec<Vec<u8>>, coop: &mut YieldEvery) -> u64 {
+    let mut count = 0;
+    for _ in keys {
+        coop.tick().await;
+        count += 1;
+    }
+    count
+}
 
 /// Configuration for the domain management layer.
 pub struct DomainConfig {
@@ -63,8 +118,6 @@ impl Default for DomainConfig {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -72,10 +125,16 @@ pub(crate) fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Absolute expiry stamp for a TTL in seconds. The extra second compensates the
-/// sub-second remainder `now_secs()` drops, which would expire the entry early.
+/// [`expire_at_from`] at the current wall-clock second.
 pub(crate) fn expire_at_from_ttl(ttl_secs: u64) -> u64 {
-    if ttl_secs == 0 { now_secs() } else { now_secs() + ttl_secs + 1 }
+    expire_at_from(now_secs(), ttl_secs)
+}
+
+/// Absolute expiry stamp for a TTL in seconds, `now` in whole seconds. The
+/// extra second compensates the sub-second remainder the truncation drops,
+/// which would expire the entry early.
+pub(crate) fn expire_at_from(now: u64, ttl_secs: u64) -> u64 {
+    if ttl_secs == 0 { now } else { now + ttl_secs + 1 }
 }
 
 pub(crate) fn fnv64(data: &[u8]) -> u64 {
@@ -94,16 +153,16 @@ fn generate_prefix(name: &str) -> Vec<u8> {
 }
 
 fn validate_domain_name(name: &str, max_len: usize) -> Result<()> {
-    anyhow::ensure!(!name.is_empty(), "Domain name must not be empty");
+    anyhow::ensure!(!name.is_empty(), "400 Bad Request: Domain name must not be empty");
     anyhow::ensure!(
         name.len() <= max_len,
-        "Domain name '{}' exceeds maximum of {} characters",
+        "400 Bad Request: Domain name '{}' exceeds maximum of {} characters",
         name,
         max_len
     );
     anyhow::ensure!(
         name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-        "Domain name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
+        "400 Bad Request: Domain name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
         name
     );
     Ok(())
@@ -115,7 +174,9 @@ fn sys_key(name: &str) -> Vec<u8> {
     k
 }
 
-// ── DomainState ───────────────────────────────────────────────────────────────
+fn deleting_error(name: &str) -> anyhow::Error {
+    anyhow!("410 Gone: Domain '{}' is being deleted", name)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum DomainState {
@@ -123,8 +184,6 @@ pub enum DomainState {
     Active,
     Deleting,
 }
-
-// ── Domain ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Domain {
@@ -134,52 +193,71 @@ pub struct Domain {
     /// Lifecycle state — `Active` or `Deleting` (lazy background purge).
     #[serde(default)]
     pub state: DomainState,
+    /// Single-key writes over REST must carry `If-Match` or
+    /// `If-None-Match: *`; fixed at creation.
+    #[serde(default)]
+    pub require_conditional_writes: bool,
 }
 
 impl Domain {
-    fn new(name: &str) -> Self {
+    fn new(name: &str, require_conditional_writes: bool) -> Self {
         Domain {
             name: name.to_string(),
             system_prefix: generate_prefix(name),
             created_at: now_secs(),
             state: DomainState::Active,
+            require_conditional_writes,
         }
     }
 }
 
-// ── DomainRuntime ─────────────────────────────────────────────────────────────
-
 /// Non-serializable, per-domain in-memory state.
 struct DomainRuntime {
     rate_limiter: RateLimiter,
+    /// The domain's metrics window, fetched on its first read and kept, so
+    /// reads record without a lookup.
+    metrics_window: OnceLock<Arc<MetricsWindow>>,
+    /// Single-key write locks, sharded by key. A conditional write holds its
+    /// shard exclusively from the precondition check through the write, so
+    /// no other write of that key falls in between; unconditional writes
+    /// hold it shared and keep running side by side.
+    key_write_locks: [tokio::sync::RwLock<()>; KEY_WRITE_SHARDS],
+    /// Set once the domain turns `Deleting`, never cleared: a domain created
+    /// again under the same name gets a runtime of its own.
+    deleting: AtomicBool,
 }
 
 impl DomainRuntime {
     fn new(quota: DomainQuota) -> Arc<Self> {
         Arc::new(Self {
             rate_limiter: RateLimiter::new(quota),
+            metrics_window: OnceLock::new(),
+            key_write_locks: std::array::from_fn(|_| tokio::sync::RwLock::new(())),
+            deleting: AtomicBool::new(false),
         })
+    }
+
+    fn mark_deleting(&self) {
+        self.deleting.store(true, Ordering::Release);
+    }
+
+    fn key_write_lock(&self, user_key: &[u8]) -> &tokio::sync::RwLock<()> {
+        &self.key_write_locks[(fnv64(user_key) % KEY_WRITE_SHARDS as u64) as usize]
     }
 }
 
-// ── DomainRegistry ────────────────────────────────────────────────────────────
-
-/// Manages domain lifecycle: creation, lookup, listing, deletion, and recovery.
+/// Holds the domains: lookup, listing and recovery. Creates and deletes run
+/// through the control plane, one at a time.
 pub struct DomainRegistry {
     /// Persistent domain metadata (name → Domain), cached in memory.
     domains: RwLock<HashMap<String, Domain>>,
     /// Non-serializable runtime state (rate limiter).
     runtimes: RwLock<HashMap<String, Arc<DomainRuntime>>>,
-    /// Serializes `create_domain` end-to-end: the check-then-act spans an
-    /// `.await`, so a `parking_lot` guard cannot cover it (spec general/003).
-    create_lock: Mutex<()>,
     engine: Arc<LsmStorageEngine>,
     config: DomainConfig,
     metrics: Arc<MetricsStore>,
-    /// Global lifecycle/DDL event bus (spec general/018 §1) — unset in unit
-    /// tests and standalone-built registries, which then simply publish
-    /// nothing (`publish_lifecycle_event`'s `if let Some(bus) = ...`).
-    event_bus: OnceLock<Arc<GlobalEventBus>>,
+    /// Unset for a standalone registry, whose purger then finalizes directly.
+    control: OnceLock<Arc<ControlPlane>>,
 }
 
 impl DomainRegistry {
@@ -190,15 +268,25 @@ impl DomainRegistry {
         config: DomainConfig,
         metrics: Arc<MetricsStore>,
     ) -> Result<Self> {
+        Self::recover_on_shard(engine, config, metrics, true).await
+    }
+
+    /// [`Self::recover`] on a data shard: only the shard that `owns_default`
+    /// creates the default domain.
+    pub async fn recover_on_shard(
+        engine: Arc<LsmStorageEngine>,
+        config: DomainConfig,
+        metrics: Arc<MetricsStore>,
+        owns_default: bool,
+    ) -> Result<Self> {
         let default_domain = config.default_domain.clone();
         let registry = Self {
             domains: RwLock::new(HashMap::new()),
             runtimes: RwLock::new(HashMap::new()),
-            create_lock: Mutex::new(()),
             engine,
             config,
             metrics,
-            event_bus: OnceLock::new(),
+            control: OnceLock::new(),
         };
         registry.load_from_engine().await?;
         // Check in any state: creating over a Deleting default would 409 and
@@ -206,6 +294,7 @@ impl DomainRegistry {
         // recreates it.
         let default_state = registry.domains.read().get(&default_domain).map(|d| d.state.clone());
         match default_state {
+            None if !owns_default => {}
             None => {
                 registry.create_domain(&default_domain).await?;
             }
@@ -223,19 +312,21 @@ impl DomainRegistry {
         &self.engine
     }
 
-    /// Wires the global event bus (spec general/018 §1). Must run before the
-    /// purgers are spawned and before the listener accepts requests — set
-    /// only once, during startup; every read afterward goes through
-    /// `publish_lifecycle_event`'s `OnceLock::get`.
-    pub fn attach_event_bus(&self, bus: Arc<GlobalEventBus>) {
-        let _ = self.event_bus.set(bus);
+    /// The metrics store the domains record into.
+    pub fn metrics(&self) -> &Arc<MetricsStore> {
+        &self.metrics
     }
 
-    /// `domain_created` / `domain_deleted` / `domain_purged` (spec §2) — a
-    /// no-op when no bus is attached.
-    fn publish_lifecycle_event(&self, kind: &'static str, domain: &str) {
-        if let Some(bus) = self.event_bus.get() {
-            bus.publish("kv", kind, domain, None);
+    /// Set once at startup, before the purger runs.
+    pub(crate) fn attach_control_plane(&self, control: Arc<ControlPlane>) {
+        let _ = self.control.set(control);
+    }
+
+    /// Removes a purged domain — through the control plane once attached.
+    async fn finish_purge(&self, name: &str) -> Result<()> {
+        match self.control.get() {
+            Some(control) => control.finalize_deletion(Engine::Kv, name).await,
+            None => self.finalize_domain_deletion(name).await,
         }
     }
 
@@ -249,40 +340,52 @@ impl DomainRegistry {
 
     async fn load_from_engine(&self) -> Result<()> {
         let sys_keys = self.engine.scan_keys(SYS_DOMAIN_PREFIX).await?;
-        let mut cache = self.domains.write();
-        let mut runtimes = self.runtimes.write();
+        let mut loaded = Vec::new();
         for key in sys_keys {
-            let snap = self.engine.snapshot();
-            match self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
-                Some(value) => match serde_json::from_slice::<Domain>(&value) {
-                    Ok(domain) => {
-                        runtimes.insert(domain.name.clone(), self.make_runtime());
-                        cache.insert(domain.name.clone(), domain);
-                    }
+            let snap = self.engine.snapshot().await;
+            if let Some(value) = self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
+                match serde_json::from_slice::<Domain>(&value) {
+                    Ok(domain) => loaded.push(domain),
                     Err(e) => eprintln!(
                         "[DomainRegistry] Cannot deserialize domain at key {:?}: {e}",
                         key
                     ),
-                },
-                None => {}
+                }
             }
+        }
+        let mut cache = self.domains.write();
+        let mut runtimes = self.runtimes.write();
+        for domain in loaded {
+            let runtime = self.make_runtime();
+            if domain.state == DomainState::Deleting {
+                runtime.mark_deleting();
+            }
+            runtimes.insert(domain.name.clone(), runtime);
+            cache.insert(domain.name.clone(), domain);
         }
         Ok(())
     }
 
     /// Creates a new domain. Returns `Err` (409-style) if the name already exists.
-    pub async fn create_domain(&self, name: &str) -> Result<Domain> {
+    pub(crate) async fn create_domain(&self, name: &str) -> Result<Domain> {
+        self.create_domain_with(name, false).await
+    }
+
+    /// [`Self::create_domain`] with the domain's
+    /// [`Domain::require_conditional_writes`] setting. The check and the
+    /// insert span an await: callers must not run two lifecycle changes at once.
+    pub(crate) async fn create_domain_with(&self, name: &str, require_conditional_writes: bool) -> Result<Domain> {
         validate_domain_name(name, self.config.max_name_length)?;
-        let _guard = self.create_lock.lock().await;
         if self.domains.read().contains_key(name) {
             return Err(anyhow!("409 Conflict: Domain '{}' already exists", name));
         }
-        let domain = Domain::new(name);
+        let domain = Domain::new(name, require_conditional_writes);
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
         self.runtimes.write().insert(name.to_string(), self.make_runtime());
         self.domains.write().insert(name.to_string(), domain.clone());
-        self.publish_lifecycle_event("domain_created", name);
+        // The engine write above raised the epoch before `list_domains` changed.
+        self.engine.raise_change_epoch();
         Ok(domain)
     }
 
@@ -299,7 +402,7 @@ impl DomainRegistry {
         }
         // Engine fallback (e.g. after a cold start that didn't hit load_from_engine).
         let key = sys_key(name);
-        let snap = self.engine.snapshot();
+        let snap = self.engine.snapshot().await;
         if let Some(value) = self.engine.get_with_snapshot(&key, snap.snapshot()).await?.into_option() {
             let domain: Domain = serde_json::from_slice(&value)?;
             if domain.state == DomainState::Deleting {
@@ -327,11 +430,12 @@ impl DomainRegistry {
             .collect())
     }
 
-    /// Transitions the domain to `Deleting` state and persists the change.
+    /// Transitions the domain to `Deleting` state and persists the change;
+    /// stores taken before refuse every write from then on.
     ///
     /// Returns `Err` if the domain doesn't exist. Physical key cleanup is
     /// handled asynchronously by `DomainPurger`.
-    pub async fn delete_domain(&self, name: &str) -> Result<()> {
+    pub(crate) async fn delete_domain(&self, name: &str) -> Result<()> {
         let mut domain = {
             let cache = self.domains.read();
             cache
@@ -342,8 +446,12 @@ impl DomainRegistry {
         domain.state = DomainState::Deleting;
         let data = serde_json::to_vec(&domain)?;
         self.engine.put(&sys_key(name), &data).await?;
+        if let Some(runtime) = self.runtimes.read().get(name) {
+            runtime.mark_deleting();
+        }
         self.domains.write().insert(name.to_string(), domain);
-        self.publish_lifecycle_event("domain_deleted", name);
+        // The engine write above raised the epoch before `list_domains` changed.
+        self.engine.raise_change_epoch();
         Ok(())
     }
 
@@ -358,14 +466,14 @@ impl DomainRegistry {
     }
 
     /// Finalises a purged domain: removes metadata from engine and cache.
-    pub async fn finalize_domain_deletion(&self, name: &str) -> Result<()> {
+    pub(crate) async fn finalize_domain_deletion(&self, name: &str) -> Result<()> {
         self.engine.write_tombstone(&sys_key(name)).await?;
-        // runtimes before domains: a create_domain that passed the domains
-        // check can then never lose its freshly inserted runtime.
+        // Metrics window, then runtime, then domain: a create_domain that
+        // passed the domains check can then neither lose its freshly
+        // inserted runtime nor cache the window removed after it.
+        self.metrics.remove_domain(name);
         self.runtimes.write().remove(name);
         self.domains.write().remove(name);
-        self.metrics.remove_domain(name);
-        self.publish_lifecycle_event("domain_purged", name);
         Ok(())
     }
 
@@ -378,9 +486,7 @@ impl DomainRegistry {
             let cache = self.domains.read();
             match cache.get(name) {
                 None => return Err(anyhow!("404 Not Found: Domain '{}' not found", name)),
-                Some(d) if d.state == DomainState::Deleting => {
-                    return Err(anyhow!("410 Gone: Domain '{}' is being deleted", name));
-                }
+                Some(d) if d.state == DomainState::Deleting => return Err(deleting_error(name)),
                 Some(d) => {
                     let rt = self
                         .runtimes
@@ -408,8 +514,6 @@ impl DomainRegistry {
     }
 }
 
-// ── DomainStore ───────────────────────────────────────────────────────────────
-
 /// Domain-scoped facade over `LsmStorageEngine`.
 ///
 /// All operations transparently prepend `domain.system_prefix` to every key
@@ -423,7 +527,7 @@ pub struct DomainStore {
     metrics: Arc<MetricsStore>,
 }
 
-/// Key metadata without the value bytes (spec kv/022): TTL expiry and the
+/// Key metadata without the value bytes: TTL expiry and the
 /// write time of the newest visible version. Backs `GET …/{key}/meta`;
 /// never dereferences a VLog pointer.
 #[derive(Debug, Clone, PartialEq)]
@@ -434,11 +538,61 @@ pub struct KeyMeta {
     pub last_modified_ms: u64,
 }
 
-/// Result of starting (or resuming) a KV watch (spec kv/024 §4.3):
-/// `resume` is already domain-filtered/stripped, `rx` is the live stream.
+/// Result of starting (or resuming) a KV watch: `resume` is already
+/// domain-filtered/stripped, `rx` is the live stream, `epoch` the epoch of
+/// its event ids.
 pub struct WatchStart {
     pub resume: Resume<WalEvent>,
     pub rx: broadcast::Receiver<WatchMessage>,
+    pub epoch: u64,
+}
+
+/// The change a single-key write makes.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyWrite<'a> {
+    /// Upserts `value`; with `ttl_secs` it expires that many seconds from now.
+    Put { value: &'a [u8], ttl_secs: Option<u64> },
+    /// Sets the NULL state.
+    Null,
+    /// Tombstones the key.
+    Delete,
+}
+
+/// A precondition of a single-key write, checked against the write stamp of
+/// the key's visible version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precondition {
+    /// The key exists with exactly this version stamp (`If-Match`).
+    IfMatch(u64),
+    /// The key does not exist (`If-None-Match: *`).
+    MustNotExist,
+}
+
+impl Precondition {
+    /// Whether it holds for `current`, the visible version's stamp (`None` =
+    /// the key does not exist).
+    fn holds(self, current: Option<u64>) -> bool {
+        match self {
+            Precondition::IfMatch(stamp) => current == Some(stamp),
+            Precondition::MustNotExist => current.is_none(),
+        }
+    }
+}
+
+/// A single-key write whose precondition did not hold; nothing was written.
+#[derive(Debug, thiserror::Error)]
+#[error("412 Precondition Failed: the key's current version does not satisfy the write precondition")]
+pub struct PreconditionFailed {
+    /// Version stamp of the key's visible version; `None` if it does not exist.
+    pub current: Option<u64>,
+}
+
+/// A single-key write without preconditions to a domain that requires
+/// them; nothing was written.
+#[derive(Debug, thiserror::Error)]
+#[error("428 Precondition Required: domain '{domain}' requires If-Match or If-None-Match: * on writes")]
+pub struct PreconditionRequired {
+    pub domain: String,
 }
 
 impl DomainStore {
@@ -446,6 +600,22 @@ impl DomainStore {
         let mut k = self.domain.system_prefix.clone();
         k.extend_from_slice(user_key);
         k
+    }
+
+    /// The domain's metrics window, looked up once per runtime.
+    fn metrics_window(&self) -> &MetricsWindow {
+        self.runtime.metrics_window.get_or_init(|| self.metrics.domain_window(&self.domain.name))
+    }
+
+    /// Takes a read token; an inline read that gives up gets it back, so
+    /// that its run on the reader pool takes the only one.
+    fn check_read(&self) -> bool {
+        if !self.runtime.rate_limiter.check_read() {
+            return false;
+        }
+        let runtime = Arc::clone(&self.runtime);
+        on_give_up(move || runtime.rate_limiter.refund_read());
+        true
     }
 
     fn validate_user_key(&self, key: &[u8]) -> Result<()> {
@@ -469,126 +639,162 @@ impl DomainStore {
 
     /// Upserts a key-value pair in this domain.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_write() {
-            self.metrics.record_rate_limit_rejection(&self.domain.name);
-            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
-        }
-        let start = std::time::Instant::now();
-        self.engine.write_kv_pair(&self.prefixed_key(key), value, None).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(())
+        self.write_with(key, KeyWrite::Put { value, ttl_secs: None }, &[], false).await
     }
 
     /// Upserts a key-value pair with a TTL (seconds from now).
     pub async fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl_secs: u64) -> Result<()> {
+        self.write_with(key, KeyWrite::Put { value, ttl_secs: Some(ttl_secs) }, &[], false).await
+    }
+
+    /// Executes a single-key write if every precondition holds for the key's
+    /// visible version; otherwise fails with [`PreconditionFailed`] and
+    /// writes nothing. A domain that requires conditional writes rejects one
+    /// without preconditions with [`PreconditionRequired`], after key
+    /// validation and the rate limit; the shorthands such as [`Self::put`]
+    /// never do. Check and write run under the key's write lock, so no
+    /// other single-key write of the domain falls in between —
+    /// [`Self::delete_by_prefix`] takes no key lock.
+    pub async fn write(&self, key: &[u8], op: KeyWrite<'_>, preconditions: &[Precondition]) -> Result<()> {
+        self.write_with(key, op, preconditions, self.domain.require_conditional_writes).await
+    }
+
+    async fn write_with(
+        &self,
+        key: &[u8],
+        op: KeyWrite<'_>,
+        preconditions: &[Precondition],
+        require_preconditions: bool,
+    ) -> Result<()> {
         self.validate_user_key(key)?;
         if !self.runtime.rate_limiter.check_write() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
         }
-        let expire_at = expire_at_from_ttl(ttl_secs);
-        let start = std::time::Instant::now();
-        self.engine.write_kv_pair(&self.prefixed_key(key), value, Some(expire_at)).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
+        if require_preconditions && preconditions.is_empty() {
+            return Err(PreconditionRequired { domain: self.domain.name.clone() }.into());
+        }
+        let lock = self.runtime.key_write_lock(key);
+        let key = self.prefixed_key(key);
+        let elapsed_us = if preconditions.is_empty() {
+            let _shared = lock.read().await;
+            self.apply(&key, op).await?
+        } else {
+            let _exclusive = lock.write().await;
+            let current = self.engine.get_latest_with_metadata(&key).await?.map(|m| m.stamp);
+            if !preconditions.iter().all(|p| p.holds(current)) {
+                return Err(PreconditionFailed { current }.into());
+            }
+            self.apply(&key, op).await?
+        };
+        self.metrics.record_write(&self.domain.name, elapsed_us);
         Ok(())
     }
 
-    /// Reads a value by user key — three-valued (spec kv/018): `Present`,
+    /// Refuses a write once the domain is deleting. The engine runs it under
+    /// the write's in-flight guard, so a delete's drain waits for every
+    /// write it let through.
+    fn admit(&self) -> Result<()> {
+        if self.runtime.deleting.load(Ordering::Acquire) {
+            return Err(deleting_error(&self.domain.name));
+        }
+        Ok(())
+    }
+
+    /// Runs `op` on the domain-prefixed `key`; returns the engine write's
+    /// latency in microseconds.
+    async fn apply(&self, key: &[u8], op: KeyWrite<'_>) -> Result<u64> {
+        let start = std::time::Instant::now();
+        let admit = || self.admit();
+        match op {
+            KeyWrite::Put { value, ttl_secs } => {
+                self.engine.write_kv_pair_admitted(key, value, ttl_secs.map(expire_at_from_ttl), admit).await?
+            }
+            KeyWrite::Null => self.engine.write_null_admitted(key, admit).await?,
+            KeyWrite::Delete => self.engine.write_tombstone_admitted(key, admit).await?,
+        }
+        Ok(start.elapsed().as_micros() as u64)
+    }
+
+    /// Test-only: see `LsmStorageEngine::put_expired_for_test`.
+    #[cfg(test)]
+    pub(crate) async fn put_expired_for_test(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.validate_user_key(key)?;
+        self.engine.write_kv_pair_admitted(&self.prefixed_key(key), value, Some(1), || self.admit()).await
+    }
+
+    /// Reads a value by user key — three-valued: `Present`,
     /// `Null` (key exists in the NULL state), or `Absent`. Records latency
     /// and hit/miss in MetricsStore (a `Null` read counts as a hit).
     pub async fn get(&self, key: &[u8]) -> Result<GetResult> {
-        Ok(self.get_with_expiry(key).await?.0)
+        Ok(self.get_with_stamp(key).await?.0)
     }
 
     /// Like [`Self::get`], but also returns `expire_at` (absolute Unix
-    /// seconds, 0 = no TTL) — spec kv/022, backs the `X-Expires-At` response
-    /// header. Same validation, rate-limiting and hit/miss accounting as
-    /// `get`; unlike [`Self::get_with_snapshot`] this acquires its own
-    /// snapshot and goes through the read rate limiter.
-    pub async fn get_with_expiry(&self, key: &[u8]) -> Result<(GetResult, u64)> {
+    /// seconds, 0 = no TTL), which backs the `X-Expires-At` response header,
+    /// and the write stamp of the version read (0 = absent), which backs the
+    /// `ETag`. Same validation, rate-limiting and hit/miss accounting as
+    /// `get`; unlike [`Self::get_with_snapshot`] this reads the current state
+    /// without registering a snapshot and goes through the read rate limiter.
+    pub async fn get_with_stamp(&self, key: &[u8]) -> Result<(GetResult, u64, u64)> {
         self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let start = std::time::Instant::now();
-        let snap = self.engine.snapshot();
-        let result = self
-            .engine
-            .get_with_expiry(&self.prefixed_key(key), snap.snapshot())
-            .await?;
+        let result = self.engine.get_latest_with_stamp(&self.prefixed_key(key)).await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.metrics.record_read(&self.domain.name, elapsed_us, !matches!(result.0, GetResult::Absent));
+        self.metrics.record_read(self.metrics_window(), elapsed_us, !matches!(result.0, GetResult::Absent));
         Ok(result)
     }
 
     /// Reads a key's TTL expiry and last-modified time without its value
-    /// bytes (spec kv/022) — backs `GET …/{key}/meta`; never dereferences a
+    /// bytes — backs `GET …/{key}/meta`; never dereferences a
     /// VLog pointer. Same validation and rate-limiting as `get`, including
     /// the same hit/miss rule (a `Null` key is a hit, only an absent key is
     /// a miss) — the read still spends a rate-limit token on the domain path.
     pub async fn get_meta(&self, key: &[u8]) -> Result<Option<KeyMeta>> {
         self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let start = std::time::Instant::now();
-        let snap = self.engine.snapshot();
-        let result = self
-            .engine
-            .get_with_metadata(&self.prefixed_key(key), snap.snapshot())
-            .await?;
+        let result = self.engine.get_latest_with_metadata(&self.prefixed_key(key)).await?;
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.metrics.record_read(&self.domain.name, elapsed_us, result.is_some());
+        self.metrics.record_read(self.metrics_window(), elapsed_us, result.is_some());
         Ok(result.map(|m| KeyMeta { expire_at: m.expire_at, last_modified_ms: m.last_modified_ms }))
     }
 
     /// Tombstones a key (hard delete).
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
-        self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_write() {
-            self.metrics.record_rate_limit_rejection(&self.domain.name);
-            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
-        }
-        let start = std::time::Instant::now();
-        self.engine.write_tombstone(&self.prefixed_key(key)).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(())
+        self.write_with(key, KeyWrite::Delete, &[], false).await
     }
 
-    /// Sets a key to the technical NULL state (spec kv/018): an update, not a
-    /// delete — the key stays visible with no value and appears in scans. A
-    /// non-existent key is upserted into the NULL state.
+    /// Sets a key to the technical NULL state: an update, not a delete — the
+    /// key stays visible with no value and appears in scans. A non-existent
+    /// key is upserted into the NULL state.
     pub async fn set_null(&self, key: &[u8]) -> Result<()> {
-        self.validate_user_key(key)?;
-        if !self.runtime.rate_limiter.check_write() {
-            self.metrics.record_rate_limit_rejection(&self.domain.name);
-            return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
-        }
-        let start = std::time::Instant::now();
-        self.engine.write_null(&self.prefixed_key(key)).await?;
-        self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(())
+        self.write_with(key, KeyWrite::Null, &[], false).await
     }
 
     /// Returns all live user-keys whose raw form starts with `prefix`.
     pub async fn scan_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys(&full_prefix).await?;
-        let prefix_len = self.domain.system_prefix.len();
-        Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len(), &mut coop).await)
     }
 
     /// Returns one page of live user-keys whose raw form starts with
     /// `prefix`, optionally narrowed by a case-sensitive `contains`
     /// substring filter on the user key — same filter semantics as
     /// `delete_by_prefix` (a non-UTF-8 key is skipped, not an error). One
-    /// read token per call (spec kv/028): the scan itself stays unbounded,
+    /// read token per call: the scan itself stays unbounded,
     /// same server cost as `scan_keys`/`count_keys` — only the wire response
     /// is capped. `total` counts the filtered set before `offset`/`limit`
     /// are applied; returns `(page, total)`.
@@ -599,42 +805,38 @@ impl DomainStore {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<Vec<u8>>, u64)> {
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys(&full_prefix).await?;
-        let prefix_len = self.domain.system_prefix.len();
-        let matched: Vec<Vec<u8>> = raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect();
-        let matched: Vec<Vec<u8>> = match contains {
-            // A non-UTF-8 key would be an invariant break (general/007
-            // guarantees UTF-8 keys) — skip it rather than fail the request
-            // (same rule as delete_by_prefix).
-            Some(needle) => matched
-                .into_iter()
-                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
-                .collect(),
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        let matched = strip_domain_prefix(raw_keys, self.domain.system_prefix.len(), &mut coop).await;
+        let matched = match contains {
+            Some(needle) => filter_contains(matched, needle, &mut coop).await,
             None => matched,
         };
         let total = matched.len() as u64;
-        let page: Vec<Vec<u8>> = matched.into_iter().skip(offset).take(limit).collect();
+        let page = take_page(matched, offset, limit, &mut coop).await;
         Ok((page, total))
     }
 
     /// Counts live user-keys whose raw form starts with `prefix` — same scan
-    /// as `scan_keys` (spec general/017), without materializing the stripped
-    /// key strings.
+    /// as `scan_keys`, without materializing the stripped key strings; the
+    /// scanned list is released key by key with yield points.
     pub async fn count_keys(&self, prefix: &[u8]) -> Result<u64> {
-        if !self.runtime.rate_limiter.check_read() {
+        if !self.check_read() {
             return Err(anyhow!("429 Too Many Requests: read rate limit exceeded"));
         }
         let full_prefix = self.prefixed_key(prefix);
-        Ok(self.engine.scan_keys(&full_prefix).await?.len() as u64)
+        let keys = self.engine.scan_keys(&full_prefix).await?;
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        Ok(count_and_release(keys, &mut coop).await)
     }
 
     /// Deletes every live user-key matching `prefix`, optionally narrowed by
-    /// a case-sensitive `contains` substring filter on the user key (spec
-    /// kv/023). Order is binding (spec §3): the write token is checked
+    /// a case-sensitive `contains` substring filter on the user key. Order
+    /// is binding: the write token is checked
     /// before the scan runs, so a request that will fail the write limit
     /// never pays for scan work; the scan itself pulls its own read token
     /// (`scan_keys`). Atomic — one `write_batch` call for the whole
@@ -648,14 +850,9 @@ impl DomainStore {
         }
 
         let matched = self.scan_keys(prefix).await?;
-        let matched: Vec<Vec<u8>> = match contains {
-            // A non-UTF-8 key would be an invariant break (general/007
-            // guarantees UTF-8 keys) — skip it from the filtered match set
-            // rather than fail the whole request.
-            Some(needle) => matched
-                .into_iter()
-                .filter(|k| std::str::from_utf8(k).is_ok_and(|s| s.contains(needle)))
-                .collect(),
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        let matched = match contains {
+            Some(needle) => filter_contains(matched, needle, &mut coop).await,
             None => matched,
         };
 
@@ -666,42 +863,52 @@ impl DomainStore {
             self.max_bulk_delete_keys
         );
 
-        let ops: Vec<BatchOp> =
-            matched.iter().map(|k| BatchOp::Delete { key: self.prefixed_key(k) }).collect();
+        let count = matched.len();
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(count);
+        for k in matched {
+            coop.tick().await;
+            ops.push(BatchOp::Delete { key: self.prefixed_key(&k) });
+        }
         let start = std::time::Instant::now();
-        self.engine.write_batch(ops).await?;
+        self.engine.write_batch_admitted(ops, || self.admit()).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
-        Ok(matched.len())
+        Ok(count)
     }
 
     /// Test-only: drains and locks this domain's read bucket so the next
     /// read deterministically answers 429 — no refill race no matter how
-    /// slow the test runs (flaky-test fix, spec general/008 pattern).
+    /// slow the test runs (avoids flaky tests).
     #[cfg(test)]
     pub fn drain_read_budget_for_test(&self) {
         self.runtime.rate_limiter.read_bucket.drain_for_test();
     }
 
+    /// Test-only: locks out the refill of this domain's read bucket and keeps
+    /// its tokens, so only reads and refunds change them.
+    #[cfg(test)]
+    pub fn lock_read_refill_for_test(&self) {
+        self.runtime.rate_limiter.read_bucket.lock_refill_for_test();
+    }
+
     /// Test-only: write-bucket counterpart of
     /// [`Self::drain_read_budget_for_test`] — used to prove the write-token
-    /// check in [`Self::delete_by_prefix`] runs before the scan (spec kv/023
-    /// §3.2): draining only the write bucket leaves the read bucket
+    /// check in [`Self::delete_by_prefix`] runs before the scan: draining
+    /// only the write bucket leaves the read bucket
     /// untouched, so a following read still succeeds.
     #[cfg(test)]
     pub fn drain_write_budget_for_test(&self) {
         self.runtime.rate_limiter.write_bucket.drain_for_test();
     }
 
-    /// Restore-path upsert (spec general/006): same key validation as
+    /// Restore-path upsert: same key validation as
     /// [`Self::put`]/[`Self::put_with_ttl`] but takes the absolute
     /// `expire_at` directly (no now-relative round trip) and bypasses the
-    /// rate limiter (admin maintenance operation, per spec general/006's
-    /// authorization section — the restore throttle is `scan_batch_size`/
-    /// `scan_pause_ms`).
+    /// rate limiter (admin-only maintenance operation — the restore throttle
+    /// is `scan_batch_size`/`scan_pause_ms`).
     pub(crate) async fn put_unthrottled(&self, key: &[u8], value: &[u8], expire_at: Option<u64>) -> Result<()> {
         self.validate_user_key(key)?;
         let start = std::time::Instant::now();
-        self.engine.write_kv_pair(&self.prefixed_key(key), value, expire_at).await?;
+        self.engine.write_kv_pair_admitted(&self.prefixed_key(key), value, expire_at, || self.admit()).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
         Ok(())
     }
@@ -711,42 +918,42 @@ impl DomainStore {
     pub(crate) async fn set_null_unthrottled(&self, key: &[u8]) -> Result<()> {
         self.validate_user_key(key)?;
         let start = std::time::Instant::now();
-        self.engine.write_null(&self.prefixed_key(key)).await?;
+        self.engine.write_null_admitted(&self.prefixed_key(key), || self.admit()).await?;
         self.metrics.record_write(&self.domain.name, start.elapsed().as_micros() as u64);
         Ok(())
     }
 
     /// Reads a value against an externally held snapshot, with `expire_at`
-    /// (spec general/006 backup export) instead of acquiring a snapshot
-    /// internally like [`Self::get`] — lets the backup writer pin every read
+    /// (backup export) instead of reading the current state
+    /// like [`Self::get`] — lets the backup writer pin every read
     /// of a domain export to the same point in time. Bypasses the rate
-    /// limiter (admin maintenance operation, per spec general/006's
-    /// authorization section).
+    /// limiter (admin-only maintenance operation).
     pub async fn get_with_snapshot(&self, key: &[u8], snapshot: &Snapshot) -> Result<(GetResult, u64)> {
         self.validate_user_key(key)?;
         self.engine.get_with_expiry(&self.prefixed_key(key), snapshot).await
     }
 
     /// Returns all user-keys (raw form) visible under `snapshot` and
-    /// starting with `prefix` (spec general/006 backup export) — the
+    /// starting with `prefix` (backup export) — the
     /// snapshot-pinned counterpart of [`Self::scan_keys`]. Bypasses the rate
     /// limiter (admin maintenance operation).
     pub async fn scan_keys_with_snapshot(&self, prefix: &[u8], snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
         let full_prefix = self.prefixed_key(prefix);
         let raw_keys = self.engine.scan_keys_with_snapshot(&full_prefix, snapshot).await?;
-        let prefix_len = self.domain.system_prefix.len();
-        Ok(raw_keys.into_iter().map(|k| k[prefix_len..].to_vec()).collect())
+        let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+        Ok(strip_domain_prefix(raw_keys, self.domain.system_prefix.len(), &mut coop).await)
     }
 
     /// Subscribes to write events for this domain (domain prefix already
-    /// stripped), optionally resuming from `last_event_id` (spec kv/024 §4).
+    /// stripped), optionally resuming from `last_event_id`.
     ///
-    /// Step order is binding (spec kv/024 §4.3): subscribing to the raw
+    /// Step order is binding: subscribing to the raw
     /// engine broadcast happens *before* the ring snapshot, so nothing can
     /// be lost between the snapshot and the relay task picking up live
     /// traffic — only overlap, which the caller suppresses using the
     /// returned `Resume`'s `head` (a live event with `seq <= head` is a
     /// re-delivery of what was just replayed).
+    #[allow(clippy::disallowed_methods, reason = "the watch route runs on the reader pool")]
     pub fn watch_from(&self, last_event_id: Option<&str>) -> WatchStart {
         let mut raw_rx = self.engine.watch_subscribe(); // step 1: subscribe first
         let resume = self.strip_domain_prefix(self.engine.watch_decide_resume(last_event_id)); // step 2
@@ -772,8 +979,7 @@ impl DomainStore {
                     }
                     // A silent `continue` would hide the gap forever — the
                     // domain-filtered stream isn't sequence-contiguous by
-                    // construction, so the client can't infer it either
-                    // (spec kv/024 §6).
+                    // construction, so the client can't infer it either.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if tx.send(WatchMessage::Gap).is_err() {
                             break;
@@ -784,10 +990,10 @@ impl DomainStore {
             }
         });
 
-        WatchStart { resume, rx } // step 4
+        WatchStart { resume, rx, epoch: self.engine.watch_epoch() } // step 4
     }
 
-    /// Current head of the engine's watch-stream sequence (spec kv/024 §5)
+    /// Current head of the engine's watch-stream sequence
     /// — stamps a `reset` triggered by a live lag, as opposed to one from
     /// the initial resume decision, which already carries its own `head`.
     pub fn watch_head(&self) -> u64 {
@@ -796,7 +1002,7 @@ impl DomainStore {
 
     /// Filters a resume's replay list to this domain's keys and strips the
     /// domain prefix — the ring holds raw (prefixed) keys across every
-    /// domain (spec kv/024 §2.1); `head` and non-`Replay` variants pass
+    /// domain; `head` and non-`Replay` variants pass
     /// through unchanged.
     fn strip_domain_prefix(&self, resume: Resume<WalEvent>) -> Resume<WalEvent> {
         match resume {
@@ -815,8 +1021,6 @@ impl DomainStore {
     }
 }
 
-// ── DomainPurger ──────────────────────────────────────────────────────────────
-
 /// Background task that tombstones all keys belonging to `Deleting` domains.
 ///
 /// Operates in batches to avoid starving normal I/O. After all keys of a
@@ -825,44 +1029,33 @@ pub struct DomainPurger {
     engine: Arc<LsmStorageEngine>,
     registry: Arc<DomainRegistry>,
     pub batch_size: usize,
-    pub interval: Duration,
-    shutdown: Arc<AtomicBool>,
 }
 
 impl DomainPurger {
-    pub fn new(
-        engine: Arc<LsmStorageEngine>,
-        registry: Arc<DomainRegistry>,
-        shutdown: Arc<AtomicBool>,
-        batch_size: usize,
-        interval_secs: u64,
-    ) -> Self {
-        Self {
-            engine,
-            registry,
-            batch_size,
-            interval: Duration::from_secs(interval_secs),
-            shutdown,
-        }
+    pub fn new(engine: Arc<LsmStorageEngine>, registry: Arc<DomainRegistry>, batch_size: usize) -> Self {
+        Self { engine, registry, batch_size }
     }
 
-    /// Runs the purge loop until `shutdown` is set.
-    pub async fn run(self: Arc<Self>) {
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Err(e) = self.purge_tick().await {
-                eprintln!("[DomainPurger] Error: {e}");
-            }
-            sleep(self.interval).await;
-        }
-    }
-
-    /// Performs one purge cycle: finds deleting domains and tombstones their keys.
+    /// Performs one purge cycle: finds deleting domains and tombstones their
+    /// keys; none while writes are refused for want of disk space or memory.
     pub async fn purge_tick(&self) -> Result<()> {
+        if self.engine.writes_refused() {
+            return Ok(());
+        }
         for domain in self.registry.list_deleting_domains() {
             let prefix = domain.system_prefix.clone();
             let all_keys = self.engine.scan_keys(&prefix).await?;
             if all_keys.is_empty() {
-                self.registry.finalize_domain_deletion(&domain.name).await?;
+                // Rescanned under a drain: a write that held its guard during
+                // the scan above may not have applied its key yet. The finalize
+                // writes too, so it runs after the drain.
+                let empty = {
+                    let _drain = self.engine.drain_writes().await;
+                    self.engine.scan_keys_limited(&prefix, 1).await?.is_empty()
+                };
+                if empty {
+                    self.registry.finish_purge(&domain.name).await?;
+                }
                 continue;
             }
             for key in all_keys.iter().take(self.batch_size) {
@@ -873,14 +1066,12 @@ impl DomainPurger {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::events::{format_event_id, stream_epoch, ResetReason};
     use crate::core::wal::WriteAheadLog;
-    use crate::engines::lsm::engine::LsmEngineConfig;
+    use crate::engines::lsm::engine::{LsmEngineConfig, TestHook, TestHooks};
     use crate::engines::lsm::watcher::WATCH_TAG;
     use crate::metrics::{MetricsConfig, MetricsStore};
     use crate::storage::vlog::VLog;
@@ -891,11 +1082,18 @@ mod tests {
         make_setup_with_engine_config(LsmEngineConfig::default()).await
     }
 
-    // Spec kv/024 tests 3/5/11 need a non-default `watch_replay_buffer_size`
+    // Some watch tests need a non-default `watch_replay_buffer_size`
     // or `wal_event_channel_capacity` — every other test keeps using the
     // default-config `make_setup` above.
     async fn make_setup_with_engine_config(
         engine_config: LsmEngineConfig,
+    ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
+        make_setup_with_hooks(engine_config, TestHooks::default()).await
+    }
+
+    async fn make_setup_with_hooks(
+        engine_config: LsmEngineConfig,
+        hooks: TestHooks,
     ) -> (Arc<LsmStorageEngine>, Arc<DomainRegistry>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
@@ -904,17 +1102,17 @@ mod tests {
         let vlog = Arc::new(VLog::new(&vlog_path).await.unwrap());
         let fm = Arc::new(FileManager::new(dir.path()).await.unwrap());
         let mm = Arc::new(ManifestManager::new(dir.path()));
-        let engine = Arc::new(
-            LsmStorageEngine::new(
-                wal, wal_path, vlog, vlog_path, fm, mm,
-                crate::engines::lsm::engine::LsmEngineOptions {
-                    engine: engine_config,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap(),
-        );
+        let mut engine = LsmStorageEngine::new(
+            wal, wal_path, vlog, vlog_path, fm, mm,
+            crate::engines::lsm::engine::LsmEngineOptions {
+                engine: engine_config,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.hooks = hooks;
+        let engine = Arc::new(engine);
         let metrics = MetricsStore::new(MetricsConfig::default());
         let registry = Arc::new(DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap());
         (engine, registry, dir)
@@ -926,396 +1124,536 @@ mod tests {
     }
 
     // 1. Create domain → get_domain returns it.
-    #[tokio::test]
-    async fn test_create_and_get_domain() {
-        let (registry, _dir) = make_registry().await;
-        let domain = registry.create_domain("alpha").await.unwrap();
-        assert_eq!(domain.name, "alpha");
-        let fetched = registry.get_domain("alpha").await.unwrap();
-        assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().name, "alpha");
+    #[test]
+    fn test_create_and_get_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let domain = registry.create_domain("alpha").await.unwrap();
+            assert_eq!(domain.name, "alpha");
+            let fetched = registry.get_domain("alpha").await.unwrap();
+            assert!(fetched.is_some());
+            assert_eq!(fetched.unwrap().name, "alpha");
+        })
     }
 
     // 2. Duplicate domain → 409-style error.
-    #[tokio::test]
-    async fn test_duplicate_domain_rejected() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("beta").await.unwrap();
-        let err = registry.create_domain("beta").await;
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("409"));
+    #[test]
+    fn test_duplicate_domain_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("beta").await.unwrap();
+            let err = registry.create_domain("beta").await;
+            assert!(err.is_err());
+            assert!(err.unwrap_err().to_string().contains("409"));
+        })
+    }
+
+    // KV point reads (value and meta) register no snapshot.
+    #[test]
+    fn test_point_reads_register_no_snapshot() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"k", b"v").await.unwrap();
+            let acquired = engine.snapshot_registry().acquire_count();
+
+            assert_eq!(store.get(b"k").await.unwrap(), GetResult::Present(b"v".to_vec()));
+            assert_eq!(store.get_with_stamp(b"k").await.unwrap().0, GetResult::Present(b"v".to_vec()));
+            assert!(store.get_meta(b"k").await.unwrap().is_some());
+            assert_eq!(engine.snapshot_registry().acquire_count(), acquired);
+        })
+    }
+
+    // After a domain's first read the read path looks up
+    // no map -- the window hangs off the domain's runtime -- and the numbers
+    // `/metrics` reports stay what they were.
+    #[test]
+    fn test_reads_record_metrics_without_a_map_lookup() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, _, _dir) = make_setup().await;
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let registry = DomainRegistry::recover(engine, DomainConfig::default(), Arc::clone(&metrics)).await.unwrap();
+            let store = registry.default_store().await.unwrap();
+            store.put(b"k", b"v").await.unwrap();
+            store.get(b"k").await.unwrap();
+            let lookups = metrics.domain_map_reads();
+
+            for _ in 0..100 {
+                assert_eq!(store.get(b"k").await.unwrap(), GetResult::Present(b"v".to_vec()));
+                assert!(store.get_meta(b"k").await.unwrap().is_some());
+            }
+            registry.default_store().await.unwrap().get(b"k").await.unwrap();
+            assert_eq!(metrics.domain_map_reads(), lookups, "the read path must not look up the domain map");
+
+            metrics.tick_all();
+            let window = metrics.get_domain_metrics("default").unwrap();
+            assert_eq!((window.read_ops, window.write_ops), (202, 1));
+            assert_eq!(window.cache_hit_rate, 1.0);
+            assert_eq!(metrics.system.total_reads.load(Ordering::Relaxed), 202);
+            assert_eq!(metrics.engine_metrics()[0].read_ops, 202);
+        })
     }
 
     // 3. put in domain A, get in domain B → None (isolation).
-    #[tokio::test]
-    async fn test_domain_isolation() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("tenant-a").await.unwrap();
-        registry.create_domain("tenant-b").await.unwrap();
-        let store_a = registry.store("tenant-a").await.unwrap();
-        let store_b = registry.store("tenant-b").await.unwrap();
-        store_a.put(b"secret", b"value-a").await.unwrap();
-        let result = store_b.get(b"secret").await.unwrap();
-        assert_eq!(result, GetResult::Absent, "Domain B must not see Domain A's keys");
+    #[test]
+    fn test_domain_isolation() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("tenant-a").await.unwrap();
+            registry.create_domain("tenant-b").await.unwrap();
+            let store_a = registry.store("tenant-a").await.unwrap();
+            let store_b = registry.store("tenant-b").await.unwrap();
+            store_a.put(b"secret", b"value-a").await.unwrap();
+            let result = store_b.get(b"secret").await.unwrap();
+            assert_eq!(result, GetResult::Absent, "Domain B must not see Domain A's keys");
+        })
     }
 
     // 4. scan_keys in domain A sees only its own keys.
-    #[tokio::test]
-    async fn test_scan_keys_isolation() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("scan-a").await.unwrap();
-        registry.create_domain("scan-b").await.unwrap();
-        let store_a = registry.store("scan-a").await.unwrap();
-        let store_b = registry.store("scan-b").await.unwrap();
-        store_a.put(b"key:1", b"v1").await.unwrap();
-        store_a.put(b"key:2", b"v2").await.unwrap();
-        store_b.put(b"key:1", b"vb").await.unwrap();
-        let keys_a = store_a.scan_keys(b"key:").await.unwrap();
-        assert_eq!(keys_a.len(), 2);
-        assert!(keys_a.contains(&b"key:1".to_vec()));
-        assert!(keys_a.contains(&b"key:2".to_vec()));
-        let keys_b = store_b.scan_keys(b"key:").await.unwrap();
-        assert_eq!(keys_b.len(), 1);
-        assert!(keys_b.contains(&b"key:1".to_vec()));
+    #[test]
+    fn test_scan_keys_isolation() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("scan-a").await.unwrap();
+            registry.create_domain("scan-b").await.unwrap();
+            let store_a = registry.store("scan-a").await.unwrap();
+            let store_b = registry.store("scan-b").await.unwrap();
+            store_a.put(b"key:1", b"v1").await.unwrap();
+            store_a.put(b"key:2", b"v2").await.unwrap();
+            store_b.put(b"key:1", b"vb").await.unwrap();
+            let keys_a = store_a.scan_keys(b"key:").await.unwrap();
+            assert_eq!(keys_a.len(), 2);
+            assert!(keys_a.contains(&b"key:1".to_vec()));
+            assert!(keys_a.contains(&b"key:2".to_vec()));
+            let keys_b = store_b.scan_keys(b"key:").await.unwrap();
+            assert_eq!(keys_b.len(), 1);
+            assert!(keys_b.contains(&b"key:1".to_vec()));
+        })
     }
 
-    // 5. Invalid domain names → error.
-    #[tokio::test]
-    async fn test_invalid_domain_name_rejected() {
-        let (registry, _dir) = make_registry().await;
-        assert!(registry.create_domain("").await.is_err());
-        let long = "a".repeat(51);
-        assert!(registry.create_domain(&long).await.is_err());
-        assert!(registry.create_domain("bad name!").await.is_err());
-        assert!(registry.create_domain("bad/slash").await.is_err());
+    // 5. Invalid domain names → 400-prefixed error, no domain created.
+    #[test]
+    fn test_invalid_domain_name_rejected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let before = registry.list_domains().await.unwrap().len();
+            let long = "a".repeat(DomainConfig::default().max_name_length + 1);
+            for bad in ["", long.as_str(), "bad name!", "bad/slash"] {
+                let err = registry.create_domain(bad).await.unwrap_err().to_string();
+                assert!(err.starts_with("400 Bad Request: Domain name"), "{bad:?}: {err}");
+                assert!(registry.get_domain(bad).await.unwrap().is_none(), "{bad:?}");
+            }
+            assert_eq!(registry.list_domains().await.unwrap().len(), before);
+        })
     }
 
     // 6. Default domain exists after recovery.
-    #[tokio::test]
-    async fn test_default_domain_exists_after_recovery() {
-        let (registry, _dir) = make_registry().await;
-        let default_name = DomainConfig::default().default_domain;
-        let default = registry.get_domain(&default_name).await.unwrap();
-        assert!(default.is_some());
-        assert_eq!(default.unwrap().name, default_name);
+    #[test]
+    fn test_default_domain_exists_after_recovery() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            let default_name = DomainConfig::default().default_domain;
+            let default = registry.get_domain(&default_name).await.unwrap();
+            assert!(default.is_some());
+            assert_eq!(default.unwrap().name, default_name);
+        })
     }
 
     // 7. delete_domain → domain no longer visible via get_domain.
-    #[tokio::test]
-    async fn test_delete_domain() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("to-delete").await.unwrap();
-        registry.delete_domain("to-delete").await.unwrap();
-        let result = registry.get_domain("to-delete").await.unwrap();
-        assert!(result.is_none());
+    #[test]
+    fn test_delete_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("to-delete").await.unwrap();
+            registry.delete_domain("to-delete").await.unwrap();
+            let result = registry.get_domain("to-delete").await.unwrap();
+            assert!(result.is_none());
+        })
     }
 
     // 8. Prefix is deterministic.
-    #[tokio::test]
-    async fn test_prefix_is_deterministic() {
-        let p1 = generate_prefix("myapp");
-        let p2 = generate_prefix("myapp");
-        assert_eq!(p1, p2);
-        assert_ne!(generate_prefix("myapp"), generate_prefix("myapp2"));
-    }
-
-    // 9. Concurrent create of the same name → exactly one succeeds (spec general/003).
-    #[tokio::test]
-    async fn test_concurrent_create_domain_single_winner() {
-        let (registry, _dir) = make_registry().await;
-        let tasks: Vec<_> = (0..8)
-            .map(|_| {
-                let reg = Arc::clone(&registry);
-                tokio::spawn(async move { reg.create_domain("contested").await })
-            })
-            .collect();
-        let mut ok = 0;
-        for t in tasks {
-            if t.await.unwrap().is_ok() {
-                ok += 1;
-            }
-        }
-        assert_eq!(ok, 1, "exactly one concurrent create_domain must succeed");
+    #[test]
+    fn test_prefix_is_deterministic() {
+        crate::core::engine_runtime::block_on(async {
+            let p1 = generate_prefix("myapp");
+            let p2 = generate_prefix("myapp");
+            assert_eq!(p1, p2);
+            assert_ne!(generate_prefix("myapp"), generate_prefix("myapp2"));
+        })
     }
 
     // Test: Domain in Deleting state → store() returns 410.
-    #[tokio::test]
-    async fn test_deleting_domain_returns_410() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("gone-soon").await.unwrap();
-        registry.delete_domain("gone-soon").await.unwrap();
-        let err = registry.store("gone-soon").await;
-        assert!(err.is_err());
-        let msg = format!("{}", err.err().unwrap());
-        assert!(msg.contains("410"), "expected 410 in error: {msg}");
+    #[test]
+    fn test_deleting_domain_returns_410() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("gone-soon").await.unwrap();
+            registry.delete_domain("gone-soon").await.unwrap();
+            let err = registry.store("gone-soon").await;
+            assert!(err.is_err());
+            let msg = format!("{}", err.err().unwrap());
+            assert!(msg.contains("410"), "expected 410 in error: {msg}");
+        })
+    }
+
+    // A store taken before the delete keeps its domain; every write it still
+    // tries is refused under the in-flight guard and reaches neither the WAL
+    // nor the MemTable.
+    #[test]
+    fn test_writes_through_a_store_of_a_deleting_domain_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, dir) = make_setup().await;
+            registry.create_domain("doomed").await.unwrap();
+            let store = registry.store("doomed").await.unwrap();
+            store.put(b"p:1", b"v").await.unwrap();
+            registry.delete_domain("doomed").await.unwrap();
+            let wal = dir.path().join("wal.log");
+            let wal_len = std::fs::metadata(&wal).unwrap().len();
+
+            let refusals = [
+                store.put(b"k", b"v").await,
+                store.put_with_ttl(b"k", b"v", 60).await,
+                store.delete(b"p:1").await,
+                store.set_null(b"k").await,
+                store.write(b"k", KeyWrite::Null, &[Precondition::MustNotExist]).await,
+                store.put_unthrottled(b"k", b"v", None).await,
+                store.set_null_unthrottled(b"k").await,
+                store.delete_by_prefix(b"p:", None).await.map(|_| ()),
+            ];
+            for refused in refusals {
+                assert_eq!(refused.unwrap_err().to_string(), "410 Gone: Domain 'doomed' is being deleted");
+            }
+            assert_eq!(std::fs::metadata(&wal).unwrap().len(), wal_len, "nothing may reach the WAL");
+            let prefix = store.domain().system_prefix.clone();
+            assert_eq!(engine.scan_keys(&prefix).await.unwrap(), [[prefix.as_slice(), b"p:1"].concat()]);
+        })
     }
 
     // Test: Domain-Purge removes all keys → scan_keys returns empty.
-    #[tokio::test]
-    async fn test_domain_purge_removes_keys() {
-        let (engine, registry, _dir) = make_setup().await;
-        registry.create_domain("purge-test").await.unwrap();
-        let store = registry.store("purge-test").await.unwrap();
-        store.put(b"key1", b"val1").await.unwrap();
-        store.put(b"key2", b"val2").await.unwrap();
-        let prefix = store.domain().system_prefix.clone();
+    #[test]
+    fn test_domain_purge_removes_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.create_domain("purge-test").await.unwrap();
+            let store = registry.store("purge-test").await.unwrap();
+            store.put(b"key1", b"val1").await.unwrap();
+            store.put(b"key2", b"val2").await.unwrap();
+            let prefix = store.domain().system_prefix.clone();
 
-        registry.delete_domain("purge-test").await.unwrap();
+            registry.delete_domain("purge-test").await.unwrap();
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let cfg = DomainConfig::default();
-        let purger = DomainPurger::new(
-            Arc::clone(&engine),
-            Arc::clone(&registry),
-            Arc::clone(&shutdown),
-            cfg.purger_batch_size,
-            cfg.purger_interval_secs,
-        );
-        // Run two ticks: first removes keys, second finalises metadata.
-        purger.purge_tick().await.unwrap();
-        purger.purge_tick().await.unwrap();
+            let cfg = DomainConfig::default();
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), cfg.purger_batch_size);
+            // Run two ticks: first removes keys, second finalises metadata.
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
 
-        let remaining = engine.scan_keys(&prefix).await.unwrap();
-        assert!(remaining.is_empty(), "All domain keys must be removed after purge");
-        assert!(registry.get_domain("purge-test").await.unwrap().is_none());
+            let remaining = engine.scan_keys(&prefix).await.unwrap();
+            assert!(remaining.is_empty(), "All domain keys must be removed after purge");
+            assert!(registry.get_domain("purge-test").await.unwrap().is_none());
+        })
+    }
+
+    // Test 6: while writes are refused, a purge tick writes nothing; after
+    // the block the purge goes on.
+    #[test]
+    fn test_no_purge_while_writes_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.create_domain("purge-test").await.unwrap();
+            registry.store("purge-test").await.unwrap().put(b"key1", b"val1").await.unwrap();
+            registry.delete_domain("purge-test").await.unwrap();
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), 100);
+
+            engine.resources().block_for_test(false, false);
+            let lsn = engine.last_applied_lsn();
+            purger.purge_tick().await.unwrap();
+            assert_eq!(engine.last_applied_lsn(), lsn, "no tombstone during the block");
+
+            engine.resources().unblock_for_test();
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
+            assert!(registry.get_domain("purge-test").await.unwrap().is_none());
+        })
+    }
+
+    // A write that holds its in-flight guard with a key not yet applied keeps
+    // the purger's final empty scan waiting; once the key is in, the scan
+    // finds it and the domain is not finalized.
+    #[test]
+    fn test_purger_rescans_under_a_drain_before_it_finalizes() {
+        crate::core::engine_runtime::block_on(async {
+            let key = [generate_prefix("doomed").as_slice(), b"late"].concat();
+            let hook = Arc::new(TestHook::default());
+            let hooks = TestHooks { before_kv_pair_apply: Some((key.clone(), Arc::clone(&hook))), ..Default::default() };
+            let (engine, registry, _dir) = make_setup_with_hooks(LsmEngineConfig::default(), hooks).await;
+            registry.create_domain("doomed").await.unwrap();
+            registry.delete_domain("doomed").await.unwrap();
+
+            let writer = compio::runtime::spawn({
+                let (engine, key) = (Arc::clone(&engine), key.clone());
+                async move { engine.write_kv_pair(&key, b"v", None).await }
+            });
+            hook.reached.notified().await;
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), 100);
+            let tick = compio::runtime::spawn(async move { purger.purge_tick().await });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!tick.is_finished(), "the final scan must wait for the write in flight");
+
+            hook.release.notify_one();
+            writer.await.unwrap().unwrap();
+            tick.await.unwrap().unwrap();
+            assert_eq!(engine.scan_keys(&key).await.unwrap(), [key]);
+            assert!(registry.list_deleting_domains().iter().any(|d| d.name == "doomed"), "must not be finalized");
+        })
     }
 
     // Regression: recover() must not 409 (boot loop) when the default domain
     // is still in Deleting state at startup (pendant of the JSON registry fix).
-    #[tokio::test]
-    async fn test_recover_survives_deleting_default_domain() {
-        let (engine, registry, _dir) = make_setup().await;
-        registry.delete_domain("default").await.unwrap();
+    #[test]
+    fn test_recover_survives_deleting_default_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.delete_domain("default").await.unwrap();
 
-        // Simulated restart before the purge finished: recover must succeed
-        // and keep the default domain invisible (still Deleting).
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let registry2 = Arc::new(
-            DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics)
+            // Simulated restart before the purge finished: recover must succeed
+            // and keep the default domain invisible (still Deleting).
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let registry2 = Arc::new(
+                DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics)
+                    .await
+                    .expect("recover must survive a Deleting default domain"),
+            );
+            assert!(registry2.get_domain("default").await.unwrap().is_none());
+
+            // After the purger finalized it, the next recover recreates it as Active.
+            let cfg = DomainConfig::default();
+            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry2), cfg.purger_batch_size);
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
+
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let registry3 = DomainRegistry::recover(engine, DomainConfig::default(), metrics)
                 .await
-                .expect("recover must survive a Deleting default domain"),
-        );
-        assert!(registry2.get_domain("default").await.unwrap().is_none());
-
-        // After the purger finalized it, the next recover recreates it as Active.
-        let cfg = DomainConfig::default();
-        let purger = DomainPurger::new(
-            Arc::clone(&engine),
-            Arc::clone(&registry2),
-            Arc::new(AtomicBool::new(false)),
-            cfg.purger_batch_size,
-            cfg.purger_interval_secs,
-        );
-        purger.purge_tick().await.unwrap();
-        purger.purge_tick().await.unwrap();
-
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let registry3 = DomainRegistry::recover(engine, DomainConfig::default(), metrics)
-            .await
-            .unwrap();
-        assert!(registry3.get_domain("default").await.unwrap().is_some());
+                .unwrap();
+            assert!(registry3.get_domain("default").await.unwrap().is_some());
+        })
     }
-
-    // ── Spec general/007: UTF-8 key invariant ───────────────────────────────
 
     // Test 1a: all five DomainStore operations reject a non-UTF-8 key with a
     // "400 "-prefixed error.
-    #[tokio::test]
-    async fn test_invalid_utf8_key_rejected_on_all_five_ops() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("utf8-test").await.unwrap();
-        let store = registry.store("utf8-test").await.unwrap();
-        let bad_key: &[u8] = &[0xFF, 0xFE];
+    #[test]
+    fn test_invalid_utf8_key_rejected_on_all_five_ops() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("utf8-test").await.unwrap();
+            let store = registry.store("utf8-test").await.unwrap();
+            let bad_key: &[u8] = &[0xFF, 0xFE];
 
-        let err = store.put(bad_key, b"v").await.unwrap_err();
-        assert!(err.to_string().starts_with("400"), "put: {err}");
+            let err = store.put(bad_key, b"v").await.unwrap_err();
+            assert!(err.to_string().starts_with("400"), "put: {err}");
 
-        let err = store.put_with_ttl(bad_key, b"v", 60).await.unwrap_err();
-        assert!(err.to_string().starts_with("400"), "put_with_ttl: {err}");
+            let err = store.put_with_ttl(bad_key, b"v", 60).await.unwrap_err();
+            assert!(err.to_string().starts_with("400"), "put_with_ttl: {err}");
 
-        let err = store.get(bad_key).await.unwrap_err();
-        assert!(err.to_string().starts_with("400"), "get: {err}");
+            let err = store.get(bad_key).await.unwrap_err();
+            assert!(err.to_string().starts_with("400"), "get: {err}");
 
-        let err = store.delete(bad_key).await.unwrap_err();
-        assert!(err.to_string().starts_with("400"), "delete: {err}");
+            let err = store.delete(bad_key).await.unwrap_err();
+            assert!(err.to_string().starts_with("400"), "delete: {err}");
 
-        let err = store.set_null(bad_key).await.unwrap_err();
-        assert!(err.to_string().starts_with("400"), "set_null: {err}");
+            let err = store.set_null(bad_key).await.unwrap_err();
+            assert!(err.to_string().starts_with("400"), "set_null: {err}");
+        })
     }
 
-    // Test 1b: valid UTF-8 keys (umlaut, 4-byte emoji codepoint) are unaffected.
-    #[tokio::test]
-    async fn test_valid_utf8_keys_unaffected() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("utf8-ok").await.unwrap();
-        let store = registry.store("utf8-ok").await.unwrap();
+    // Test 1b: valid UTF-8 keys (accent, 4-byte emoji codepoint) are unaffected.
+    #[test]
+    fn test_valid_utf8_keys_unaffected() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("utf8-ok").await.unwrap();
+            let store = registry.store("utf8-ok").await.unwrap();
 
-        store.put("clé".as_bytes(), b"v1").await.unwrap();
-        assert_eq!(store.get("clé".as_bytes()).await.unwrap(), GetResult::Present(b"v1".to_vec()));
+            store.put("clé".as_bytes(), b"v1").await.unwrap();
+            assert_eq!(store.get("clé".as_bytes()).await.unwrap(), GetResult::Present(b"v1".to_vec()));
 
-        store.put("🎉".as_bytes(), b"v2").await.unwrap();
-        assert_eq!(store.get("🎉".as_bytes()).await.unwrap(), GetResult::Present(b"v2".to_vec()));
+            store.put("🎉".as_bytes(), b"v2").await.unwrap();
+            assert_eq!(store.get("🎉".as_bytes()).await.unwrap(), GetResult::Present(b"v2".to_vec()));
 
-        store.set_null("clé".as_bytes()).await.unwrap();
-        store.delete("🎉".as_bytes()).await.unwrap();
+            store.set_null("clé".as_bytes()).await.unwrap();
+            store.delete("🎉".as_bytes()).await.unwrap();
+        })
     }
 
     // Test 5: the length limit counts bytes, not chars — 100 four-byte emoji
     // codepoints (400 bytes) exceed the default 256-byte max_user_key_length.
-    #[tokio::test]
-    async fn test_key_length_limit_counts_bytes_not_chars() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("utf8-len").await.unwrap();
-        let store = registry.store("utf8-len").await.unwrap();
-        let long_key = "🎉".repeat(100);
-        assert_eq!(long_key.len(), 400, "sanity: emoji key must be 400 bytes");
-        let err = store.put(long_key.as_bytes(), b"v").await.unwrap_err();
-        assert!(err.to_string().starts_with("400"), "expected 400 prefix, got: {err}");
+    #[test]
+    fn test_key_length_limit_counts_bytes_not_chars() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("utf8-len").await.unwrap();
+            let store = registry.store("utf8-len").await.unwrap();
+            let long_key = "🎉".repeat(100);
+            assert_eq!(long_key.len(), 400, "sanity: emoji key must be 400 bytes");
+            let err = store.put(long_key.as_bytes(), b"v").await.unwrap_err();
+            assert!(err.to_string().starts_with("400"), "expected 400 prefix, got: {err}");
+        })
     }
 
     // Test 2 (ScanKeys half): a partial-codepoint byte prefix (0xC3, the lead
     // byte of the whole Latin-1 "ä/ö/ü…" block) is a legitimate raw-byte scan
     // query and still finds every key in that block.
-    #[tokio::test]
-    async fn test_scan_keys_partial_codepoint_prefix() {
-        let (registry, _dir) = make_registry().await;
-        registry.create_domain("utf8-scan").await.unwrap();
-        let store = registry.store("utf8-scan").await.unwrap();
-        store.put("älg".as_bytes(), b"v1").await.unwrap();
-        store.put("äpple".as_bytes(), b"v2").await.unwrap();
-        store.put("zebra".as_bytes(), b"v3").await.unwrap();
+    #[test]
+    fn test_scan_keys_partial_codepoint_prefix() {
+        crate::core::engine_runtime::block_on(async {
+            let (registry, _dir) = make_registry().await;
+            registry.create_domain("utf8-scan").await.unwrap();
+            let store = registry.store("utf8-scan").await.unwrap();
+            store.put("älg".as_bytes(), b"v1").await.unwrap();
+            store.put("äpple".as_bytes(), b"v2").await.unwrap();
+            store.put("zebra".as_bytes(), b"v3").await.unwrap();
 
-        let found = store.scan_keys(&[0xC3]).await.unwrap();
-        assert_eq!(found.len(), 2, "expected both ä-prefixed keys, got {found:?}");
+            let found = store.scan_keys(&[0xC3]).await.unwrap();
+            assert_eq!(found.len(), 2, "expected both ä-prefixed keys, got {found:?}");
+        })
     }
-
-    // ── Spec general/006: snapshot-pinned reads/scans (backup export) ───────
 
     // get_with_snapshot/scan_keys_with_snapshot must strip the domain prefix
     // like their unpinned counterparts and stay isolated between domains.
-    #[tokio::test]
-    async fn test_get_and_scan_keys_with_snapshot_strip_domain_prefix() {
-        let (engine, registry, _dir) = make_setup().await;
-        registry.create_domain("backup-a").await.unwrap();
-        registry.create_domain("backup-b").await.unwrap();
-        let store_a = registry.store("backup-a").await.unwrap();
-        let store_b = registry.store("backup-b").await.unwrap();
+    #[test]
+    fn test_get_and_scan_keys_with_snapshot_strip_domain_prefix() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.create_domain("backup-a").await.unwrap();
+            registry.create_domain("backup-b").await.unwrap();
+            let store_a = registry.store("backup-a").await.unwrap();
+            let store_b = registry.store("backup-b").await.unwrap();
 
-        store_a.put(b"key:1", b"va").await.unwrap();
-        store_b.put(b"key:1", b"vb").await.unwrap();
-        let snap = engine.snapshot();
+            store_a.put(b"key:1", b"va").await.unwrap();
+            store_b.put(b"key:1", b"vb").await.unwrap();
+            let snap = engine.snapshot().await;
 
-        let (result_a, _) = store_a.get_with_snapshot(b"key:1", snap.snapshot()).await.unwrap();
-        assert_eq!(result_a, GetResult::Present(b"va".to_vec()));
-        let (result_b, _) = store_b.get_with_snapshot(b"key:1", snap.snapshot()).await.unwrap();
-        assert_eq!(result_b, GetResult::Present(b"vb".to_vec()));
+            let (result_a, _) = store_a.get_with_snapshot(b"key:1", snap.snapshot()).await.unwrap();
+            assert_eq!(result_a, GetResult::Present(b"va".to_vec()));
+            let (result_b, _) = store_b.get_with_snapshot(b"key:1", snap.snapshot()).await.unwrap();
+            assert_eq!(result_b, GetResult::Present(b"vb".to_vec()));
 
-        let keys_a = store_a.scan_keys_with_snapshot(b"key:", snap.snapshot()).await.unwrap();
-        assert_eq!(keys_a, vec![b"key:1".to_vec()], "must be domain-a's raw user key, not prefixed");
+            let keys_a = store_a.scan_keys_with_snapshot(b"key:", snap.snapshot()).await.unwrap();
+            assert_eq!(keys_a, vec![b"key:1".to_vec()], "must be domain-a's raw user key, not prefixed");
+        })
     }
 
     // Writes after the snapshot are invisible to the pinned domain read/scan,
-    // while the domain's live view has moved on (spec general/006, consistency section).
-    #[tokio::test]
-    async fn test_domain_snapshot_consistency() {
-        let (engine, registry, _dir) = make_setup().await;
-        registry.create_domain("snap-dom").await.unwrap();
-        let store = registry.store("snap-dom").await.unwrap();
-        store.put(b"k1", b"old").await.unwrap();
-        let snap = engine.snapshot();
-        store.put(b"k1", b"new").await.unwrap();
-        store.put(b"k2", b"created-after").await.unwrap();
+    // while the domain's live view has moved on.
+    #[test]
+    fn test_domain_snapshot_consistency() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            registry.create_domain("snap-dom").await.unwrap();
+            let store = registry.store("snap-dom").await.unwrap();
+            store.put(b"k1", b"old").await.unwrap();
+            let snap = engine.snapshot().await;
+            store.put(b"k1", b"new").await.unwrap();
+            store.put(b"k2", b"created-after").await.unwrap();
 
-        let (result, _) = store.get_with_snapshot(b"k1", snap.snapshot()).await.unwrap();
-        assert_eq!(result, GetResult::Present(b"old".to_vec()));
+            let (result, _) = store.get_with_snapshot(b"k1", snap.snapshot()).await.unwrap();
+            assert_eq!(result, GetResult::Present(b"old".to_vec()));
 
-        let keys = store.scan_keys_with_snapshot(b"k", snap.snapshot()).await.unwrap();
-        assert_eq!(keys, vec![b"k1".to_vec()]);
+            let keys = store.scan_keys_with_snapshot(b"k", snap.snapshot()).await.unwrap();
+            assert_eq!(keys, vec![b"k1".to_vec()]);
 
-        assert_eq!(store.get(b"k1").await.unwrap(), GetResult::Present(b"new".to_vec()));
+            assert_eq!(store.get(b"k1").await.unwrap(), GetResult::Present(b"new".to_vec()));
+        })
     }
-
-    // ── Spec kv/024: watch event ids, resume & gap signal ───────────────────
 
     // Test 1: 10 writes, disconnect after event 3, reconnect with its id ->
     // exactly events 4..=10, in order, as a gapless Replay (no reset).
-    #[tokio::test]
-    async fn test_watch_resume_gapless_after_reconnect() {
-        let (_engine, registry, _dir) = make_setup().await;
-        registry.create_domain("w1").await.unwrap();
-        let store = registry.store("w1").await.unwrap();
+    #[test]
+    fn test_watch_resume_gapless_after_reconnect() {
+        crate::core::engine_runtime::block_on(async {
+            let (_engine, registry, _dir) = make_setup().await;
+            registry.create_domain("w1").await.unwrap();
+            let store = registry.store("w1").await.unwrap();
 
-        let started = store.watch_from(None);
-        assert!(matches!(started.resume, Resume::Live));
-        let mut rx = started.rx;
+            let started = store.watch_from(None);
+            assert!(matches!(started.resume, Resume::Live));
+            let mut rx = started.rx;
 
-        for i in 0..10 {
-            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
-        }
-
-        let mut last_id = String::new();
-        for _ in 0..3 {
-            match rx.recv().await.unwrap() {
-                WatchMessage::Event(e) => last_id = format_event_id(WATCH_TAG, stream_epoch(), e.seq),
-                WatchMessage::Gap => panic!("unexpected gap"),
+            for i in 0..10 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
             }
-        }
 
-        let resumed = store.watch_from(Some(&last_id));
-        match resumed.resume {
-            Resume::Replay { events, .. } => {
-                assert_eq!(events.len(), 7, "expected events 4..=10, got {events:?}");
-                for (i, e) in events.iter().enumerate() {
-                    assert_eq!(e.key, format!("k{}", i + 3).into_bytes());
+            let mut last_id = String::new();
+            for _ in 0..3 {
+                match rx.recv().await.unwrap() {
+                    WatchMessage::Event(e) => last_id = format_event_id(WATCH_TAG, stream_epoch(0), e.seq),
+                    WatchMessage::Gap => panic!("unexpected gap"),
                 }
             }
-            _ => panic!("expected a gapless replay"),
-        }
+
+            let resumed = store.watch_from(Some(&last_id));
+            match resumed.resume {
+                Resume::Replay { events, .. } => {
+                    assert_eq!(events.len(), 7, "expected events 4..=10, got {events:?}");
+                    for (i, e) in events.iter().enumerate() {
+                        assert_eq!(e.key, format!("k{}", i + 3).into_bytes());
+                    }
+                }
+                _ => panic!("expected a gapless replay"),
+            }
+        })
     }
 
     // Test 3: watch_replay_buffer_size = 4, 10 writes, resume from event 1 ->
     // reset(window_exceeded); the stream still continues live afterward.
-    #[tokio::test]
-    async fn test_watch_window_exceeded_resets_then_live_continues() {
-        let engine_config = LsmEngineConfig { watch_replay_buffer_size: 4, ..LsmEngineConfig::default() };
-        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
-        registry.create_domain("w3").await.unwrap();
-        let store = registry.store("w3").await.unwrap();
+    #[test]
+    fn test_watch_window_exceeded_resets_then_live_continues() {
+        crate::core::engine_runtime::block_on(async {
+            let engine_config = LsmEngineConfig { watch_replay_buffer_size: 4, ..LsmEngineConfig::default() };
+            let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+            registry.create_domain("w3").await.unwrap();
+            let store = registry.store("w3").await.unwrap();
 
-        for i in 0..10 {
-            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
-        }
-        let id = format_event_id(WATCH_TAG, stream_epoch(), 1);
-        let mut resumed = store.watch_from(Some(&id));
-        match resumed.resume {
-            Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
-            _ => panic!("expected window_exceeded"),
-        }
+            for i in 0..10 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+            }
+            let id = format_event_id(WATCH_TAG, stream_epoch(0), 1);
+            let mut resumed = store.watch_from(Some(&id));
+            match resumed.resume {
+                Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
+                _ => panic!("expected window_exceeded"),
+            }
 
-        store.put(b"after", b"v").await.unwrap();
-        match resumed.rx.recv().await.unwrap() {
-            WatchMessage::Event(e) => assert_eq!(e.key, b"after"),
-            WatchMessage::Gap => panic!("unexpected gap"),
-        }
+            store.put(b"after", b"v").await.unwrap();
+            match resumed.rx.recv().await.unwrap() {
+                WatchMessage::Event(e) => assert_eq!(e.key, b"after"),
+                WatchMessage::Gap => panic!("unexpected gap"),
+            }
+        })
     }
 
     // Test 4: a resume id from a different epoch -> reset(restart). The
     // fabricated epoch stands in for "a different process" — see
     // core::events::tests for the fully parameterized version of this row.
-    #[tokio::test]
-    async fn test_watch_resume_wrong_epoch_is_restart() {
-        let (_engine, registry, _dir) = make_setup().await;
-        registry.create_domain("w4").await.unwrap();
-        let store = registry.store("w4").await.unwrap();
-        store.put(b"k", b"v").await.unwrap();
+    #[test]
+    fn test_watch_resume_wrong_epoch_is_restart() {
+        crate::core::engine_runtime::block_on(async {
+            let (_engine, registry, _dir) = make_setup().await;
+            registry.create_domain("w4").await.unwrap();
+            let store = registry.store("w4").await.unwrap();
+            store.put(b"k", b"v").await.unwrap();
 
-        let fake_epoch = stream_epoch().wrapping_add(1);
-        let id = format_event_id(WATCH_TAG, fake_epoch, 1);
-        let started = store.watch_from(Some(&id));
-        match started.resume {
-            Resume::Reset { reason: ResetReason::Restart, .. } => {}
-            _ => panic!("expected restart on epoch mismatch"),
-        }
+            let fake_epoch = stream_epoch(0).wrapping_add(1);
+            let id = format_event_id(WATCH_TAG, fake_epoch, 1);
+            let started = store.watch_from(Some(&id));
+            match started.resume {
+                Resume::Reset { reason: ResetReason::Restart, .. } => {}
+                _ => panic!("expected restart on epoch mismatch"),
+            }
+        })
     }
 
     // Test 5: a tiny wal_event_channel_capacity plus a non-draining
@@ -1324,241 +1662,151 @@ mod tests {
     // rather than a hardcoded value. The Lagged-to-reset(lagged) mapping
     // itself is unit-tested at the kv.rs handler level (pure function, no
     // timing dependency).
-    #[tokio::test]
-    async fn test_watch_slow_client_channel_lags_when_capacity_exceeded() {
-        let engine_config = LsmEngineConfig { wal_event_channel_capacity: 2, ..LsmEngineConfig::default() };
-        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
-        registry.create_domain("w5").await.unwrap();
-        let store = registry.store("w5").await.unwrap();
+    #[test]
+    fn test_watch_slow_client_channel_lags_when_capacity_exceeded() {
+        crate::core::engine_runtime::block_on(async {
+            let engine_config = LsmEngineConfig { wal_event_channel_capacity: 2, ..LsmEngineConfig::default() };
+            let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+            registry.create_domain("w5").await.unwrap();
+            let store = registry.store("w5").await.unwrap();
 
-        let started = store.watch_from(None);
-        let mut rx = started.rx;
+            let started = store.watch_from(None);
+            let mut rx = started.rx;
 
-        for i in 0..10 {
-            store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
-        }
-
-        let mut saw_lag = false;
-        for _ in 0..10 {
-            match rx.recv().await {
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    saw_lag = true;
-                    break;
-                }
-                Ok(_) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            for i in 0..10 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
             }
-        }
-        assert!(saw_lag, "a burst past channel capacity must eventually lag a non-draining receiver");
+
+            let mut saw_lag = false;
+            for _ in 0..10 {
+                match rx.recv().await {
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        saw_lag = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            assert!(saw_lag, "a burst past channel capacity must eventually lag a non-draining receiver");
+        })
     }
 
     // Test 6: no Last-Event-ID -> Live (no replay, no reset), plus every
     // live event still carries a real seq (id: is additive).
-    #[tokio::test]
-    async fn test_watch_no_last_event_id_is_additive_live_only() {
-        let (_engine, registry, _dir) = make_setup().await;
-        registry.create_domain("w6").await.unwrap();
-        let store = registry.store("w6").await.unwrap();
+    #[test]
+    fn test_watch_no_last_event_id_is_additive_live_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (_engine, registry, _dir) = make_setup().await;
+            registry.create_domain("w6").await.unwrap();
+            let store = registry.store("w6").await.unwrap();
 
-        let started = store.watch_from(None);
-        assert!(matches!(started.resume, Resume::Live));
-        let mut rx = started.rx;
+            let started = store.watch_from(None);
+            assert!(matches!(started.resume, Resume::Live));
+            let mut rx = started.rx;
 
-        store.put(b"only", b"v").await.unwrap();
-        match rx.recv().await.unwrap() {
-            WatchMessage::Event(e) => {
-                assert_eq!(e.key, b"only");
-                assert!(e.seq > 0, "seq must be assigned even without a resume attempt");
+            store.put(b"only", b"v").await.unwrap();
+            match rx.recv().await.unwrap() {
+                WatchMessage::Event(e) => {
+                    assert_eq!(e.key, b"only");
+                    assert!(e.seq > 0, "seq must be assigned even without a resume attempt");
+                }
+                WatchMessage::Gap => panic!("unexpected gap"),
             }
-            WatchMessage::Gap => panic!("unexpected gap"),
-        }
+        })
     }
 
     // Test 11: watch_replay_buffer_size = 0 -> id: still assigned, and even
-    // an immediate reconnect with the just-received id resets (spec §4.2:
-    // the cap == 0 row is checked before the window-arithmetic rows).
-    #[tokio::test]
-    async fn test_watch_cap_zero_ids_present_but_every_resume_is_window_exceeded() {
-        let engine_config = LsmEngineConfig { watch_replay_buffer_size: 0, ..LsmEngineConfig::default() };
-        let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
-        registry.create_domain("w11").await.unwrap();
-        let store = registry.store("w11").await.unwrap();
+    // an immediate reconnect with the just-received id resets (cap == 0 is
+    // checked before the window arithmetic).
+    #[test]
+    fn test_watch_cap_zero_ids_present_but_every_resume_is_window_exceeded() {
+        crate::core::engine_runtime::block_on(async {
+            let engine_config = LsmEngineConfig { watch_replay_buffer_size: 0, ..LsmEngineConfig::default() };
+            let (_engine, registry, _dir) = make_setup_with_engine_config(engine_config).await;
+            registry.create_domain("w11").await.unwrap();
+            let store = registry.store("w11").await.unwrap();
 
-        let started = store.watch_from(None);
-        let mut rx = started.rx;
-        store.put(b"k", b"v").await.unwrap();
-        let last_id = match rx.recv().await.unwrap() {
-            WatchMessage::Event(e) => {
-                assert!(e.seq > 0, "id must be assigned even with the ring disabled");
-                format_event_id(WATCH_TAG, stream_epoch(), e.seq)
+            let started = store.watch_from(None);
+            let mut rx = started.rx;
+            store.put(b"k", b"v").await.unwrap();
+            let last_id = match rx.recv().await.unwrap() {
+                WatchMessage::Event(e) => {
+                    assert!(e.seq > 0, "id must be assigned even with the ring disabled");
+                    format_event_id(WATCH_TAG, stream_epoch(0), e.seq)
+                }
+                WatchMessage::Gap => panic!("unexpected gap"),
+            };
+
+            let resumed = store.watch_from(Some(&last_id));
+            match resumed.resume {
+                Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
+                _ => panic!("cap == 0 must always reset, even for the just-received id"),
             }
-            WatchMessage::Gap => panic!("unexpected gap"),
-        };
-
-        let resumed = store.watch_from(Some(&last_id));
-        match resumed.resume {
-            Resume::Reset { reason: ResetReason::WindowExceeded, .. } => {}
-            _ => panic!("cap == 0 must always reset, even for the just-received id"),
-        }
+        })
     }
 
-    // Test 12: an id tagged for a different stream (general/018's "g") must
-    // reset as unknown_id, never silently succeed.
-    #[tokio::test]
-    async fn test_watch_foreign_tag_is_unknown_id() {
-        let (_engine, registry, _dir) = make_setup().await;
-        registry.create_domain("w12").await.unwrap();
-        let store = registry.store("w12").await.unwrap();
-        store.put(b"k", b"v").await.unwrap();
+    // Test 12: an id tagged for a different stream (the events stream's
+    // "g") must reset as unknown_id, never silently succeed.
+    #[test]
+    fn test_watch_foreign_tag_is_unknown_id() {
+        crate::core::engine_runtime::block_on(async {
+            let (_engine, registry, _dir) = make_setup().await;
+            registry.create_domain("w12").await.unwrap();
+            let store = registry.store("w12").await.unwrap();
+            store.put(b"k", b"v").await.unwrap();
 
-        let id = format_event_id("g", stream_epoch(), 1);
-        let started = store.watch_from(Some(&id));
-        match started.resume {
-            Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
-            _ => panic!("a foreign tag must reset as unknown_id, not silently succeed"),
-        }
+            let id = format_event_id("g", stream_epoch(0), 1);
+            let started = store.watch_from(Some(&id));
+            match started.resume {
+                Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
+                _ => panic!("a foreign tag must reset as unknown_id, not silently succeed"),
+            }
+        })
     }
 
     // Replay is filtered to this domain's keys and prefix-stripped, exactly
-    // like the live relay (spec kv/024 §2.1/§4.3) -- a foreign domain's
+    // like the live relay -- a foreign domain's
     // events in the same engine-wide ring must never surface here.
-    #[tokio::test]
-    async fn test_watch_replay_is_isolated_and_stripped_per_domain() {
-        let (_engine, registry, _dir) = make_setup().await;
-        registry.create_domain("wa").await.unwrap();
-        registry.create_domain("wb").await.unwrap();
-        let store_a = registry.store("wa").await.unwrap();
-        let store_b = registry.store("wb").await.unwrap();
+    #[test]
+    fn test_watch_replay_is_isolated_and_stripped_per_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (_engine, registry, _dir) = make_setup().await;
+            registry.create_domain("wa").await.unwrap();
+            registry.create_domain("wb").await.unwrap();
+            let store_a = registry.store("wa").await.unwrap();
+            let store_b = registry.store("wb").await.unwrap();
 
-        let started = store_a.watch_from(None);
-        let mut rx = started.rx;
+            let started = store_a.watch_from(None);
+            let mut rx = started.rx;
 
-        store_b.put(b"other-domain-key", b"v").await.unwrap();
-        store_a.put(b"mine", b"v").await.unwrap();
-        match rx.recv().await.unwrap() {
-            WatchMessage::Event(e) => {
-                assert_eq!(e.key, b"mine", "domain B's key must never reach domain A's live stream");
+            store_b.put(b"other-domain-key", b"v").await.unwrap();
+            store_a.put(b"mine", b"v").await.unwrap();
+            match rx.recv().await.unwrap() {
+                WatchMessage::Event(e) => {
+                    assert_eq!(e.key, b"mine", "domain B's key must never reach domain A's live stream");
+                }
+                WatchMessage::Gap => panic!("unexpected gap"),
             }
-            WatchMessage::Gap => panic!("unexpected gap"),
-        }
 
-        // Resuming from before either write: replay must contain only A's
-        // key, raw-prefix-stripped, even though the ring holds both.
-        let before_id = format_event_id(WATCH_TAG, stream_epoch(), 0);
-        let resumed = store_a.watch_from(Some(&before_id));
-        match resumed.resume {
-            Resume::Replay { events, .. } => {
-                assert_eq!(events.len(), 1, "expected exactly A's own write, got {events:?}");
-                assert_eq!(events[0].key, b"mine");
+            // Resuming from before either write: replay must contain only A's
+            // key, raw-prefix-stripped, even though the ring holds both.
+            let before_id = format_event_id(WATCH_TAG, stream_epoch(0), 0);
+            let resumed = store_a.watch_from(Some(&before_id));
+            match resumed.resume {
+                Resume::Replay { events, .. } => {
+                    assert_eq!(events.len(), 1, "expected exactly A's own write, got {events:?}");
+                    assert_eq!(events[0].key, b"mine");
+                }
+                _ => panic!("expected a gapless replay"),
             }
-            _ => panic!("expected a gapless replay"),
-        }
+        })
     }
-
-    // ── Spec general/018: global lifecycle event bus ────────────────────────
-
-    // Test 1 (kv slice): create_domain/delete_domain publish domain_created/
-    // domain_deleted with the right engine, domain and a real ts.
-    #[tokio::test]
-    async fn test_domain_lifecycle_events_published_with_engine_domain_and_ts() {
-        let (_engine, registry, _dir) = make_setup().await;
-        let bus = Arc::new(GlobalEventBus::new(16, 16));
-        registry.attach_event_bus(Arc::clone(&bus));
-        let mut rx = bus.subscribe();
-
-        registry.create_domain("evdom").await.unwrap();
-        registry.delete_domain("evdom").await.unwrap();
-
-        let created = rx.try_recv().unwrap();
-        assert_eq!(created.engine, "kv");
-        assert_eq!(created.kind, "domain_created");
-        assert_eq!(created.domain, "evdom");
-        assert_eq!(created.object, None);
-        assert!(created.ts > 0);
-
-        let deleted = rx.try_recv().unwrap();
-        assert_eq!(deleted.kind, "domain_deleted");
-        assert_eq!(deleted.domain, "evdom");
-    }
-
-    // Test 2: after a purge run, domain_purged appears, and after domain_deleted.
-    #[tokio::test]
-    async fn test_domain_purge_event_published_after_domain_deleted() {
-        let (engine, registry, _dir) = make_setup().await;
-        let bus = Arc::new(GlobalEventBus::new(16, 16));
-        registry.attach_event_bus(Arc::clone(&bus));
-        let mut rx = bus.subscribe();
-
-        registry.create_domain("purge-ev").await.unwrap();
-        rx.try_recv().unwrap(); // domain_created, not under test here
-
-        registry.delete_domain("purge-ev").await.unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let cfg = DomainConfig::default();
-        let purger = DomainPurger::new(
-            Arc::clone(&engine),
-            Arc::clone(&registry),
-            Arc::clone(&shutdown),
-            cfg.purger_batch_size,
-            cfg.purger_interval_secs,
-        );
-        purger.purge_tick().await.unwrap(); // empty domain: finalizes immediately
-
-        let deleted = rx.try_recv().unwrap();
-        assert_eq!(deleted.kind, "domain_deleted");
-        let purged = rx.try_recv().unwrap();
-        assert_eq!(purged.kind, "domain_purged");
-        assert_eq!(purged.domain, "purge-ev");
-    }
-
-    // Test 12 (kv slice): no bus attached -> lifecycle ops succeed unchanged,
-    // no panic, and nothing is published anywhere.
-    #[tokio::test]
-    async fn test_lifecycle_ops_without_event_bus_attached_publish_nothing() {
-        let (_engine, registry, _dir) = make_setup().await;
-        let bus = GlobalEventBus::new(16, 16); // never attached
-        let mut rx = bus.subscribe();
-
-        registry.create_domain("no-bus").await.unwrap();
-        registry.delete_domain("no-bus").await.unwrap();
-
-        assert!(rx.try_recv().is_err(), "no bus attached must mean no event, anywhere");
-    }
-
-    // Test 13: attach_event_bus, THEN spawn the purger (main.rs's startup
-    // order, spec §1) -- a purge run afterward still delivers domain_purged.
-    #[tokio::test]
-    async fn test_attach_before_purger_spawn_still_delivers_domain_purged() {
-        let (engine, registry, _dir) = make_setup().await;
-        let bus = Arc::new(GlobalEventBus::new(16, 16));
-        registry.attach_event_bus(Arc::clone(&bus)); // attach first
-        let mut rx = bus.subscribe();
-
-        registry.create_domain("late-purge").await.unwrap();
-        registry.delete_domain("late-purge").await.unwrap();
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let purger = Arc::new(DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry), Arc::clone(&shutdown), 1, 1));
-        tokio::spawn(purger.run()); // spawned after attach, mirroring main.rs's startup order
-
-        // Drain domain_created/domain_deleted, then wait for domain_purged.
-        rx.recv().await.unwrap();
-        rx.recv().await.unwrap();
-        let purged = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timed out waiting for domain_purged")
-            .unwrap();
-        assert_eq!(purged.kind, "domain_purged");
-        assert_eq!(purged.domain, "late-purge");
-        shutdown.store(true, Ordering::Relaxed);
-    }
-
-    // ── Spec kv/023: prefix bulk-delete ──────────────────────────────────────
 
     /// Reopens an `LsmStorageEngine` on `dir`'s existing WAL/VLog/SSTable
     /// files (same file names as `make_setup`) — mirrors `engine.rs`'s own
     /// `engine_on` test helper; needed here to prove `delete_by_prefix`'s
-    /// batch survives a real restart (spec kv/023 §8 test 11).
+    /// batch survives a real restart.
     async fn reopen_engine(dir: &tempfile::TempDir) -> Arc<LsmStorageEngine> {
         let wal_path = dir.path().join("wal.log");
         let wal = Arc::new(WriteAheadLog::new(&wal_path).await.unwrap());
@@ -1578,34 +1826,206 @@ mod tests {
 
     // Test 11: delete_by_prefix's write_batch is atomic across a restart —
     // every key of the deleted selection stays gone after WAL recovery, the
-    // same property the existing engine-level write_batch tests prove
-    // (json/005), exercised here through the domain-scoped bulk-delete path.
-    #[tokio::test]
-    async fn test_delete_by_prefix_atomic_and_recovered() {
-        let (engine, registry, dir) = make_setup().await;
-        registry.create_domain("bulk-recover").await.unwrap();
-        let store = registry.store("bulk-recover").await.unwrap();
-        store.put(b"p:1", b"v1").await.unwrap();
-        store.put(b"p:2", b"v2").await.unwrap();
-        store.put(b"p:3", b"v3").await.unwrap();
-        store.put(b"other", b"vx").await.unwrap();
+    // same property the existing engine-level write_batch tests prove,
+    // exercised here through the domain-scoped bulk-delete path.
+    #[test]
+    fn test_delete_by_prefix_atomic_and_recovered() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, dir) = make_setup().await;
+            registry.create_domain("bulk-recover").await.unwrap();
+            let store = registry.store("bulk-recover").await.unwrap();
+            store.put(b"p:1", b"v1").await.unwrap();
+            store.put(b"p:2", b"v2").await.unwrap();
+            store.put(b"p:3", b"v3").await.unwrap();
+            store.put(b"other", b"vx").await.unwrap();
 
-        let deleted = store.delete_by_prefix(b"p:", None).await.unwrap();
-        assert_eq!(deleted, 3);
+            let deleted = store.delete_by_prefix(b"p:", None).await.unwrap();
+            assert_eq!(deleted, 3);
 
-        drop(store);
-        drop(registry);
-        drop(engine);
+            drop(store);
+            drop(registry);
+            drop(engine);
 
-        let engine2 = reopen_engine(&dir).await;
-        let metrics = MetricsStore::new(MetricsConfig::default());
-        let registry2 = DomainRegistry::recover(Arc::clone(&engine2), DomainConfig::default(), metrics)
-            .await
-            .unwrap();
-        let store2 = registry2.store("bulk-recover").await.unwrap();
-        assert_eq!(store2.get(b"p:1").await.unwrap(), GetResult::Absent);
-        assert_eq!(store2.get(b"p:2").await.unwrap(), GetResult::Absent);
-        assert_eq!(store2.get(b"p:3").await.unwrap(), GetResult::Absent);
-        assert_eq!(store2.get(b"other").await.unwrap(), GetResult::Present(b"vx".to_vec()));
+            let engine2 = reopen_engine(&dir).await;
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let registry2 = DomainRegistry::recover(Arc::clone(&engine2), DomainConfig::default(), metrics)
+                .await
+                .unwrap();
+            let store2 = registry2.store("bulk-recover").await.unwrap();
+            assert_eq!(store2.get(b"p:1").await.unwrap(), GetResult::Absent);
+            assert_eq!(store2.get(b"p:2").await.unwrap(), GetResult::Absent);
+            assert_eq!(store2.get(b"p:3").await.unwrap(), GetResult::Absent);
+            assert_eq!(store2.get(b"other").await.unwrap(), GetResult::Present(b"vx".to_vec()));
+        })
+    }
+
+    // A 20 000-key `scan_keys_page` with a `contains`
+    // filter hands the thread back, so a point `get` spawned after it
+    // answers first.
+    #[test]
+    fn test_scan_keys_page_interleaves_with_get() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, _dir) = make_setup().await;
+            let domain = registry.create_domain("paged").await.unwrap();
+            let ops: Vec<BatchOp> = (0..20_000u32)
+                .map(|i| BatchOp::Put {
+                    key: [domain.system_prefix.as_slice(), format!("k:{i:05}").as_bytes()].concat(),
+                    value: b"v".to_vec(),
+                })
+                .collect();
+            engine.write_batch(ops).await.unwrap();
+
+            let scanner = registry.store("paged").await.unwrap();
+            let reader = registry.store("paged").await.unwrap();
+            let order = crate::core::coop::completion_order(
+                async move {
+                    let (page, total) = scanner.scan_keys_page(b"k:", Some("1"), 0, 10).await.unwrap();
+                    assert_eq!(page.len(), 10);
+                    // 20 000 minus the 9^4 five-digit numbers below 20 000 that
+                    // use no '1' at all.
+                    assert_eq!(total, 13_439);
+                },
+                async move {
+                    assert_eq!(reader.get(b"k:00001").await.unwrap(), GetResult::Present(b"v".to_vec()));
+                },
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
+    }
+
+    // Dropping the keys a page skips or leaves over hands the
+    // thread back — one key above a yield interval leaves exactly one
+    // interval of keys to drop for `limit = 1`.
+    #[test]
+    fn test_take_page_yields_while_dropping_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let keys: Vec<Vec<u8>> = (0..=KEY_LOOP_YIELD_INTERVAL).map(|i| i.to_be_bytes().to_vec()).collect();
+            let order = crate::core::coop::completion_order(
+                async move {
+                    let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+                    assert_eq!(take_page(keys, 0, 1, &mut coop).await.len(), 1);
+                },
+                async {},
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
+    }
+
+    #[test]
+    fn test_take_page_applies_offset_and_limit() {
+        crate::core::engine_runtime::block_on(async {
+            let keys: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i]).collect();
+            let cases: [(usize, usize, &[u8]); 7] = [
+                (0, usize::MAX, &[0, 1, 2, 3, 4]),
+                (1, 2, &[1, 2]),
+                (3, 10, &[3, 4]),
+                (2, usize::MAX, &[2, 3, 4]),
+                (5, 1, &[]),
+                (9, 1, &[]),
+                (0, 0, &[]),
+            ];
+            let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+            for (offset, limit, expected) in cases {
+                let expected: Vec<Vec<u8>> = expected.iter().map(|&i| vec![i]).collect();
+                let page = take_page(keys.clone(), offset, limit, &mut coop).await;
+                assert_eq!(page, expected, "offset={offset} limit={limit}");
+            }
+        })
+    }
+
+    // Releasing the counted keys hands the thread back — one
+    // key above a yield interval gives exactly one yield.
+    #[test]
+    fn test_count_and_release_yields_while_dropping_keys() {
+        crate::core::engine_runtime::block_on(async {
+            let keys: Vec<Vec<u8>> = (0..=KEY_LOOP_YIELD_INTERVAL).map(|i| i.to_be_bytes().to_vec()).collect();
+            let order = crate::core::coop::completion_order(
+                async move {
+                    let mut coop = YieldEvery::new(KEY_LOOP_YIELD_INTERVAL);
+                    assert_eq!(count_and_release(keys, &mut coop).await, KEY_LOOP_YIELD_INTERVAL as u64 + 1);
+                },
+                async {},
+            )
+            .await;
+            assert_eq!(order, ["small", "long"]);
+        })
+    }
+
+    // Two conditional writes race with the same ETag, each through its own
+    // `DomainStore` like two requests: exactly one wins, the other fails and
+    // names the winner's version as current.
+    #[test]
+    fn test_parallel_conditional_writes_single_winner() {
+        crate::core::engine_runtime::block_on(async {
+            let (_, registry, _dir) = make_setup().await;
+            let store = registry.default_store().await.unwrap();
+            store.put(b"k", b"v0").await.unwrap();
+            let read = store.get_with_stamp(b"k").await.unwrap().2;
+
+            let tasks: Vec<_> = (0..2)
+                .map(|i| {
+                    let registry = Arc::clone(&registry);
+                    compio::runtime::spawn(async move {
+                        let store = registry.default_store().await.unwrap();
+                        let value = format!("v{}", i + 1);
+                        let op = KeyWrite::Put { value: value.as_bytes(), ttl_secs: None };
+                        store.write(b"k", op, &[Precondition::IfMatch(read)]).await
+                    })
+                })
+                .collect();
+            let mut won = 0;
+            let mut lost = Vec::new();
+            for task in tasks {
+                match task.await.unwrap() {
+                    Ok(()) => won += 1,
+                    Err(e) => lost.push(e.downcast::<PreconditionFailed>().expect("a precondition failure")),
+                }
+            }
+            assert_eq!((won, lost.len()), (1, 1));
+            let winner = store.get_with_stamp(b"k").await.unwrap().2;
+            assert_eq!(lost[0].current, Some(winner));
+        })
+    }
+
+    // A domain that requires conditional writes rejects `write` without
+    // preconditions; the unconditional shorthands (the non-REST write
+    // paths) are not affected.
+    #[test]
+    fn test_required_preconditions_bind_only_write() {
+        crate::core::engine_runtime::block_on(async {
+            let (_, registry, _dir) = make_setup().await;
+            registry.create_domain_with("strict", true).await.unwrap();
+            let store = registry.store("strict").await.unwrap();
+
+            let err = store.write(b"k", KeyWrite::Null, &[]).await.unwrap_err();
+            let required = err.downcast::<PreconditionRequired>().expect("a missing precondition");
+            assert_eq!(required.domain, "strict");
+            assert_eq!(store.get(b"k").await.unwrap(), GetResult::Absent, "nothing was written");
+
+            store.put(b"k", b"v").await.unwrap();
+            store.set_null(b"k").await.unwrap();
+            store.delete(b"k").await.unwrap();
+        })
+    }
+
+    // require_conditional_writes is persisted with the domain and survives a
+    // restart; a domain created without it keeps it off.
+    #[test]
+    fn test_conditional_writes_setting_survives_recover() {
+        crate::core::engine_runtime::block_on(async {
+            let (engine, registry, dir) = make_setup().await;
+            registry.create_domain_with("strict", true).await.unwrap();
+            registry.create_domain("plain").await.unwrap();
+            drop(registry);
+            drop(engine);
+
+            let engine2 = reopen_engine(&dir).await;
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let registry2 = DomainRegistry::recover(engine2, DomainConfig::default(), metrics).await.unwrap();
+            assert!(registry2.get_domain("strict").await.unwrap().unwrap().require_conditional_writes);
+            assert!(!registry2.get_domain("plain").await.unwrap().unwrap().require_conditional_writes);
+        })
     }
 }

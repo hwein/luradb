@@ -1,14 +1,15 @@
-//! Native TLS listener (spec general/011).
+//! Native TLS listener.
 //!
 //! Serves the same Axum router as the plain TCP listener, over TLS on a
 //! separate port. Accept-loop pattern mirrors `src/uds.rs`: `TcpListener::
 //! accept` -> `TlsAcceptor::accept` (handshake timeout) -> `TokioIo` ->
 //! `auto::Builder::serve_connection_with_upgrades`.
 
+use crate::server::serve_connection;
 use axum::extract::connect_info::ConnectInfo;
+use axum::http::Extensions;
 use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use rustls_pki_types::pem::{self, PemObject};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
@@ -17,7 +18,6 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tower::ServiceExt;
 
 /// TLS handshake must complete within this long or the connection is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -62,6 +62,7 @@ pub fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsA
 /// Accept loop serving the router over TLS until `shutdown` flips, then
 /// drains in-flight connections (5s cap) before returning — mirrors
 /// `uds::serve_uds`.
+#[allow(clippy::disallowed_methods, reason = "runs on the frontend runtime")]
 pub async fn serve_tls(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -69,6 +70,7 @@ pub async fn serve_tls(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut connections = tokio::task::JoinSet::new();
+    let connection_shutdown = shutdown.clone();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -84,8 +86,12 @@ pub async fn serve_tls(
                         continue;
                     }
                 };
+                // Same reason as in `server::serve_http`: a streamed body can
+                // leave in a write of its own, after the response head.
+                let _ = stream.set_nodelay(true);
                 let acceptor = acceptor.clone();
                 let router = router.clone();
+                let shutdown = connection_shutdown.clone();
                 connections.spawn(async move {
                     let tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                         Ok(Ok(s)) => s,
@@ -98,21 +104,19 @@ pub async fn serve_tls(
                             return;
                         }
                     };
-                    let io = TokioIo::new(tls_stream);
-                    // ConnectInfo<SocketAddr> — same type the plain HTTP listener
-                    // injects — so rate-limiter/trusted-proxy middleware see the
-                    // real peer IP over HTTPS too.
-                    let service =
-                        hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-                            req.extensions_mut().insert(ConnectInfo(peer_addr));
-                            router.clone().oneshot(req)
-                        });
-                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                    {
-                        tracing::debug!("[tls] connection error: {e}");
-                    }
+                    serve_connection(
+                        TokioIo::new(tls_stream),
+                        router,
+                        // ConnectInfo<SocketAddr> — same type the plain HTTP
+                        // listener injects — so rate-limiter/trusted-proxy
+                        // middleware see the real peer IP over HTTPS too.
+                        move |ext: &mut Extensions| {
+                            ext.insert(ConnectInfo(peer_addr));
+                        },
+                        shutdown,
+                        "tls",
+                    )
+                    .await;
                 });
             }
         }
@@ -126,6 +130,7 @@ pub async fn serve_tls(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "the listener runs on a tokio runtime, like the frontend")]
 mod tests {
     use super::*;
     use axum::routing::get;
@@ -222,7 +227,7 @@ mod tests {
 
     // Full accept-loop roundtrip (HTTP/1.1 request/response over TLS), plus
     // proof that ALPN can negotiate both protocol strings the listener
-    // offers (spec general/011 Tests: "ALPN-Verhandlung h2 und http/1.1").
+    // offers (h2 and http/1.1).
     #[tokio::test]
     async fn test_tls_e2e_roundtrip_and_alpn() {
         let acceptor = load_tls_acceptor(&fixture_cert_path(), &fixture_key_path()).unwrap();
@@ -264,7 +269,7 @@ mod tests {
     }
 
     // HTTP and HTTPS must serve the same router at the same time, each on
-    // its own port (spec general/011 Tests: "Parallelbetrieb").
+    // its own port.
     #[tokio::test]
     async fn test_tls_and_plain_http_serve_concurrently() {
         let acceptor = load_tls_acceptor(&fixture_cert_path(), &fixture_key_path()).unwrap();

@@ -1,8 +1,8 @@
-//! Shared infrastructure for resumable SSE streams (spec kv/024): a
-//! per-process stream epoch and a sequenced replay ring. Generic over the
-//! event type `T` so a second stream source (spec general/018) can reuse it
-//! with its own tag and its own `SeqRing` instance — sequences are per
-//! stream source, never shared across two `SeqRing`s.
+//! Shared infrastructure for resumable SSE streams: a stream epoch per data
+//! shard and a sequenced replay ring. Generic over the event type `T` so
+//! every stream source can reuse it with its own tag and its own `SeqRing`
+//! instance — sequences are per stream source, never shared across two
+//! `SeqRing`s.
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -10,15 +10,22 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tokio::sync::broadcast;
 
-/// Per-process stream epoch. Random, not clock-based: a restart within the
-/// same second (or a clock that went backwards) must never reuse an epoch.
-pub fn stream_epoch() -> u64 {
-    static EPOCH: OnceLock<u64> = OnceLock::new();
-    *EPOCH.get_or_init(rand::random::<u64>)
+/// The shard ID in the epoch of the control plane's streams.
+pub const CONTROL_PLANE_SHARD: u16 = 0xFFFF;
+
+/// Stream epoch of the streams of data shard `shard`, or of the control
+/// plane's with [`CONTROL_PLANE_SHARD`]: the process's boot epoch in the
+/// upper 48 bits, `shard` in the lower 16, so a cursor of one shard never
+/// passes on another. The boot epoch is random, not clock-based: a restart
+/// within the same second (or a clock that went backwards) must never reuse
+/// an epoch.
+pub fn stream_epoch(shard: u16) -> u64 {
+    static BOOT: OnceLock<u64> = OnceLock::new();
+    (*BOOT.get_or_init(rand::random::<u64>) & !0xFFFF) | u64::from(shard)
 }
 
 /// Parses `<tag>-<epoch:016x>-<seq>`, verifying `tag` matches `expected_tag`
-/// (spec kv/024 §1: without the tag check, an id meant for a different
+/// (without the tag check, an id meant for a different
 /// stream could pass the epoch check and produce a false "gapless"). Returns
 /// `None` for any structurally invalid or wrong-tag id.
 pub fn parse_event_id(raw: &str, expected_tag: &str) -> Option<(u64, u64)> {
@@ -37,7 +44,7 @@ pub fn format_event_id(tag: &str, epoch: u64, seq: u64) -> String {
 }
 
 /// Why a stream could not (or would not) guarantee a gapless resume —
-/// carried as `{"reason": ...}` in an `event: reset` body (spec kv/024 §5).
+/// carried as `{"reason": ...}` in an `event: reset` body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResetReason {
@@ -54,13 +61,13 @@ pub enum ResetReason {
     UnknownId,
 }
 
-/// Outcome of a resume decision (spec kv/024 §4.2/§4.3).
+/// Outcome of a resume decision.
 pub enum Resume<T> {
     /// No id was presented — behave exactly like a fresh, non-resuming watch.
     Live,
     /// Gaplessness cannot be guaranteed; the caller must emit `event: reset`
     /// before continuing live. `head` is the current sequence head, used as
-    /// the reset event's own `id:` (spec kv/024 §5).
+    /// the reset event's own `id:`.
     Reset { reason: ResetReason, head: u64 },
     /// Gapless replay of these events (in ascending seq order), then live.
     /// `head` is the sequence at the moment of the snapshot — events
@@ -82,7 +89,7 @@ struct Inner<T> {
 /// replay ring. `publish`/`publish_many` push into the ring and send on the
 /// broadcast channel inside the same lock section, so broadcast delivery
 /// order is always sequence order — required for `snapshot_since`'s
-/// replay-then-live handoff to be gapless (spec kv/024 §2).
+/// replay-then-live handoff to be gapless.
 pub struct SeqRing<T> {
     inner: Mutex<Inner<T>>,
 }
@@ -110,7 +117,7 @@ impl<T: Clone> SeqRing<T> {
     /// Same as [`Self::publish`], but assigns `n` consecutive sequences in
     /// one lock section — no other writer's event can land between them, so
     /// an atomic multi-op write (e.g. `write_batch`) stays contiguous in the
-    /// stream too (spec kv/024 §2).
+    /// stream too.
     pub fn publish_many(&self, tx: &broadcast::Sender<T>, n: usize, mut make: impl FnMut(u64) -> T) {
         if n == 0 {
             return;
@@ -136,14 +143,14 @@ impl<T: Clone> SeqRing<T> {
     }
 
     /// Current sequence head (`next_seq - 1`; `0` on a never-published
-    /// ring) — the `id:` a `reset` event carries (spec kv/024 §5).
+    /// ring) — the `id:` a `reset` event carries.
     pub fn head(&self) -> u64 {
         self.inner.lock().next_seq - 1
     }
 
-    /// Resume decision for a client-supplied `last` sequence (spec kv/024
-    /// §4.2). The row order below is binding: `cap == 0` is checked *before*
-    /// the window rows — with a disabled ring, `lo == next_seq == hi + 1`,
+    /// Resume decision for a client-supplied `last` sequence. The check
+    /// order below is binding: `cap == 0` is checked *before* the window
+    /// checks — with a disabled ring, `lo == next_seq == hi + 1`,
     /// so `last == hi` would satisfy neither `last > hi` nor `last + 1 <
     /// lo`, and without this early return `snapshot_since` would silently
     /// return an empty-but-gapless replay a disabled ring cannot back up.
@@ -164,11 +171,10 @@ impl<T: Clone> SeqRing<T> {
         Resume::Replay { events, head: hi }
     }
 
-    /// Full resume decision from a raw client-supplied id (spec kv/024
-    /// §4.2, rows "kein Header" through "epoch !="): parses `raw_id` against
-    /// `tag`, checks it against `current_epoch`, then defers to
-    /// [`Self::snapshot_since`]. `current_epoch` is an explicit parameter
-    /// (rather than reading [`stream_epoch`] internally) so the restart row
+    /// Full resume decision from a raw client-supplied id (or none): parses
+    /// `raw_id` against `tag`, checks it against `current_epoch`, then
+    /// defers to [`Self::snapshot_since`]. `current_epoch` is an explicit parameter
+    /// (rather than reading [`stream_epoch`] internally) so the restart case
     /// is unit-testable without an actual process restart.
     pub fn decide_resume(&self, raw_id: Option<&str>, tag: &str, current_epoch: u64) -> Resume<T> {
         let Some(raw) = raw_id else { return Resume::Live };
@@ -182,11 +188,9 @@ impl<T: Clone> SeqRing<T> {
     }
 }
 
-// ── Global lifecycle/DDL event stream (spec general/018) ────────────────────
-
 /// Tag for `GET /store-api/events` ids — distinguishes them from `WATCH_TAG`
-/// (`w`, spec kv/024), which shares the same epoch/sequence format but is a
-/// separate stream with its own sequence (spec general/018 §5).
+/// (`w`), which shares the same epoch/sequence format but is a
+/// separate stream with its own sequence.
 pub const EVENTS_TAG: &str = "g";
 
 fn now_secs() -> u64 {
@@ -196,10 +200,10 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// One lifecycle/DDL event (spec general/018 §1/§2): a domain created/
+/// One lifecycle/DDL event: a domain created/
 /// deleted/purged, or (rel/json) table/view/index DDL. `seq` is excluded from
 /// the wire JSON (`#[serde(skip)]`) — it only backs the SSE `id:` field and
-/// the live-stream replay-overlap check (spec §5), never the payload itself.
+/// the live-stream replay-overlap check, never the payload itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalEvent {
     #[serde(skip)]
@@ -214,7 +218,7 @@ pub struct GlobalEvent {
 }
 
 /// AppState-wide broadcast of lifecycle/DDL events across the KV, JSON and
-/// relational engines (spec general/018 §1) — a `SeqRing` of its own, tagged
+/// relational engines — a `SeqRing` of its own, tagged
 /// `g`, entirely independent of any per-domain KV watch (`WATCH_TAG`, `w`).
 pub struct GlobalEventBus {
     tx: broadcast::Sender<GlobalEvent>,
@@ -228,30 +232,30 @@ impl GlobalEventBus {
     }
 
     /// Subscribes to the live channel. Callers must subscribe *before*
-    /// taking a replay snapshot (spec §5, kv/024 §4.3) so nothing published
+    /// taking a replay snapshot so nothing published
     /// in between is lost — only re-delivered, which the caller discards via
     /// the replay's own `head`.
     pub fn subscribe(&self) -> broadcast::Receiver<GlobalEvent> {
         self.tx.subscribe()
     }
 
-    /// Current sequence head — the `id:` a live-triggered `reset` carries
-    /// (spec §5), as opposed to one from the initial resume decision, which
+    /// Current sequence head — the `id:` a live-triggered `reset` carries,
+    /// as opposed to one from the initial resume decision, which
     /// already carries its own `head`.
     pub fn head(&self) -> u64 {
         self.log.head()
     }
 
-    /// Full resume decision for `GET /store-api/events` (spec §5): parses
-    /// and validates against `EVENTS_TAG`/the process epoch, then defers to
-    /// the replay ring.
+    /// Full resume decision for `GET /store-api/events`: parses and
+    /// validates against `EVENTS_TAG`/the control plane's epoch, then defers
+    /// to the replay ring.
     pub fn decide_resume(&self, raw_id: Option<&str>) -> Resume<GlobalEvent> {
-        self.log.decide_resume(raw_id, EVENTS_TAG, stream_epoch())
+        self.log.decide_resume(raw_id, EVENTS_TAG, stream_epoch(CONTROL_PLANE_SHARD))
     }
 
     /// Publishes one event, filling `seq`/`ts` and delegating to
     /// `SeqRing::publish` — same mutex-coupled sequence/broadcast ordering as
-    /// kv/024 (spec §1).
+    /// the KV watch.
     pub fn publish(&self, engine: &'static str, kind: &'static str, domain: &str, object: Option<String>) {
         let domain = domain.to_string();
         self.log.publish(&self.tx, |seq| GlobalEvent {
@@ -264,8 +268,8 @@ impl GlobalEventBus {
         });
     }
 
-    /// Publishes `events.len()` consecutive events sharing one `ts` (spec
-    /// §1: `RENAME TABLE` needs two events, `table_dropped` then
+    /// Publishes `events.len()` consecutive events sharing one `ts`
+    /// (`RENAME TABLE` needs two events, `table_dropped` then
     /// `table_created`, that land adjacent in the stream with no foreign
     /// event between them — `engine`/`domain` are shared since one
     /// `publish_many` call always comes from one DDL statement on one domain).
@@ -274,7 +278,7 @@ impl GlobalEventBus {
         let mut items = events.iter();
         self.log.publish_many(&self.tx, events.len(), |seq| {
             let (kind, object) = items.next().expect("publish_many: make is called exactly events.len() times");
-            GlobalEvent { seq, engine, kind: *kind, domain: domain.to_string(), object: object.clone(), ts }
+            GlobalEvent { seq, engine, kind, domain: domain.to_string(), object: object.clone(), ts }
         });
     }
 }
@@ -290,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_stream_epoch_is_stable_within_process() {
-        assert_eq!(stream_epoch(), stream_epoch());
+        assert_eq!(stream_epoch(0), stream_epoch(0));
     }
 
     #[test]
@@ -355,7 +359,7 @@ mod tests {
     }
 
     // cap == 0 still assigns sequences (id: fields always exist) but never
-    // stores anything, and every snapshot is window_exceeded (spec §2, §4.2).
+    // stores anything, and every snapshot is window_exceeded.
     #[test]
     fn test_cap_zero_sequences_but_never_replays() {
         let (ring, tx) = ring_of(0);
@@ -369,7 +373,7 @@ mod tests {
     }
 
     // An empty-but-active ring resumes gaplessly at its own head — the same
-    // arithmetic as a populated one, no special case (spec §4.2).
+    // arithmetic as a populated one, no special case.
     #[test]
     fn test_fresh_ring_last_equals_head_is_gapless_empty_replay() {
         let ring: SeqRing<u32> = SeqRing::new(10);
@@ -395,7 +399,7 @@ mod tests {
 
     // decide_resume: no id -> Live; epoch mismatch -> Restart, with the
     // epoch supplied as an explicit parameter (testable without a real
-    // process restart, spec kv/024 Tests #4).
+    // process restart).
     #[test]
     fn test_decide_resume_no_id_is_live() {
         let ring: SeqRing<u32> = SeqRing::new(10);
@@ -422,15 +426,15 @@ mod tests {
     fn test_decide_resume_wrong_tag_is_unknown_id() {
         let (ring, tx) = ring_of(10);
         ring.publish(&tx, |seq| seq as u32);
-        let id = format_event_id("g", stream_epoch(), 1);
-        match ring.decide_resume(Some(&id), "w", stream_epoch()) {
+        let id = format_event_id("g", stream_epoch(0), 1);
+        match ring.decide_resume(Some(&id), "w", stream_epoch(0)) {
             Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
             _ => panic!("expected unknown_id for a foreign tag"),
         }
     }
 
     // Broadcast delivery order matches sequence order even under concurrent
-    // publishers (spec kv/024 §2: publish couples ring-push and send under
+    // publishers (publish couples ring-push and send under
     // one lock, so no writer can be reordered between them).
     #[test]
     fn test_broadcast_order_matches_sequence_order() {
@@ -457,8 +461,6 @@ mod tests {
         assert_eq!(received, sorted, "broadcast order must equal sequence order: {received:?}");
     }
 
-    // ── GlobalEventBus (spec general/018) ───────────────────────────────────
-
     #[test]
     fn test_global_event_bus_publish_populates_fields_and_advances_head() {
         let bus = GlobalEventBus::new(16, 16);
@@ -475,7 +477,7 @@ mod tests {
     }
 
     // publish_many assigns consecutive sequences and one shared ts across
-    // the whole call (spec §1: RENAME TABLE's two events).
+    // the whole call (RENAME TABLE's two events).
     #[test]
     fn test_global_event_bus_publish_many_consecutive_seq_and_shared_ts() {
         let bus = GlobalEventBus::new(16, 16);
@@ -505,12 +507,12 @@ mod tests {
     }
 
     // A watch id (WATCH_TAG "w") must never validate against the global
-    // stream's own tag (spec §5) — mirrors kv/024's tag-isolation guarantee.
+    // stream's own tag — mirrors the KV watch's tag-isolation guarantee.
     #[test]
     fn test_global_event_bus_decide_resume_rejects_foreign_tag() {
         let bus = GlobalEventBus::new(16, 16);
         bus.publish("kv", "domain_created", "sales", None);
-        let foreign = format_event_id("w", stream_epoch(), 1);
+        let foreign = format_event_id("w", stream_epoch(CONTROL_PLANE_SHARD), 1);
         match bus.decide_resume(Some(&foreign)) {
             Resume::Reset { reason: ResetReason::UnknownId, .. } => {}
             _ => panic!("expected unknown_id for a foreign tag"),

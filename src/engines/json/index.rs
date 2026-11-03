@@ -1,7 +1,7 @@
-//! Index definitions and management for the JSON store (spec json/004).
+//! Index definitions and management for the JSON store.
 //!
 //! An index definition declares *which* field of a domain gets indexed;
-//! writing the actual `IDX:` entries happens on the write path (spec 005).
+//! writing the actual `IDX:` entries happens on the write path.
 
 use super::domain::JsonDomainRegistry;
 use super::error::JsonStoreError;
@@ -59,8 +59,6 @@ fn validate_field_path(field: &str) -> Result<(), JsonStoreError> {
     Ok(())
 }
 
-// ── IndexDefinition ───────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexFieldType {
@@ -76,8 +74,6 @@ pub struct IndexDefinition {
     pub domain: String,
     pub created_at: u64,
 }
-
-// ── Field extraction & value encoding ─────────────────────────────────────────
 
 /// Resolves `path` (dot notation) against `doc`. `None` if any segment is
 /// missing or an intermediate value is not an object.
@@ -115,8 +111,6 @@ pub fn encode_index_value(value: &Value, field_type: IndexFieldType) -> Option<V
         _ => None,
     }
 }
-
-// ── Index LSM keys (spec json/005) ────────────────────────────────────────────
 
 pub(crate) const IDX_PREFIX: &[u8] = b"IDX:";
 
@@ -181,15 +175,13 @@ pub fn parse_index_key(lsm_key: &[u8]) -> Option<(String, String, Vec<u8>, Strin
     ))
 }
 
-// ── IndexRegistry ─────────────────────────────────────────────────────────────
-
 /// Manages index definitions per domain (in-memory cache + LSM persistence).
 pub struct IndexRegistry {
-    /// Domain name → definitions. Read on every document write (spec 005).
+    /// Domain name → definitions. Read on every document write.
     indexes: RwLock<HashMap<String, Vec<IndexDefinition>>>,
     engine: Arc<LsmStorageEngine>,
     /// Serializes index DDL (create/delete/purge) — check-then-act spans an
-    /// await (general/003).
+    /// await.
     ddl_lock: Mutex<()>,
 }
 
@@ -261,7 +253,7 @@ impl IndexRegistry {
     }
 
     /// Removes ALL index definitions of a domain — persistence and cache.
-    /// Used by the domain purger (spec json/013).
+    /// Used by the domain purger.
     pub(crate) async fn purge_domain_definitions(&self, domain: &str) -> Result<(), JsonStoreError> {
         let _guard = self.ddl_lock.lock().await;
         let mut prefix = SYS_INDEX_PREFIX.to_vec();
@@ -319,6 +311,15 @@ impl IndexRegistry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // An index-definition key at a maximal domain name and
+    // a 1-byte field fits the startup lower bound of json.lsm.max_key_length.
+    #[test]
+    fn test_sys_index_key_at_max_domain_fits_key_limit_lower_bound() {
+        use crate::engines::json::domain::{MAX_DOMAIN_NAME_LEN, MIN_LSM_KEY_LENGTH};
+        let key = sys_index_key(&"d".repeat(MAX_DOMAIN_NAME_LEN), "f");
+        assert!(key.len() <= MIN_LSM_KEY_LENGTH, "{}", key.len());
+    }
 
     // 1. extract_field with a top-level field.
     #[test]

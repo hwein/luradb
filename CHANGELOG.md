@@ -4,6 +4,8 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-03
+
 ### Added
 
 - New `[multicore].cpu_offload_threads` config key caps concurrent CPU offloads (`0` = auto).
@@ -243,7 +245,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/hwein/luradb/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hwein/luradb/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hwein/luradb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hwein/luradb/compare/v0.2.1...v0.3.0

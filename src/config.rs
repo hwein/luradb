@@ -1404,7 +1404,7 @@ pub struct MulticoreConfig {
     pub frontend_workers: usize,
     /// Data shards, each a thread with its own engine instances. `0` = auto
     /// = the count the data directory was written with; for a new one a
-    /// quarter of the cores, 1 to 8, and 1 while shared memory is enabled.
+    /// quarter of the cores, 1 to 8.
     pub shards: u16,
     /// Requests a data shard takes at once, running or waiting; beyond that
     /// it answers 503 with `Retry-After`.

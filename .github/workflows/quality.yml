@@ -1,0 +1,129 @@
+name: Quality
+
+# Separate from CI on purpose: coverage and mutation runs take far longer
+# than the test suite and must never delay the gate for the next change.
+# Results are reviewed after the push instead of blocking it.
+on:
+  push:
+    branches: [next]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Coverage
+    # GitHub-hosted: io_uring needs a VM, and the persistent CI runner
+    # executes one job at a time, so hours-long jobs there would stall CI.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+
+      - name: Toolchain (from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show
+          rustup component add llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2  # v2.90.0
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      - name: Run tests with coverage
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Coverage summary
+        run: |
+          {
+            echo '### Line coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 30
+
+  mutants:
+    name: Mutants in diff
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+        with:
+          fetch-depth: 0
+
+      # Only the lines changed by the push are mutated: a full run over the
+      # whole code base would take days, and new work has to bring its tests.
+      # A manual run or a new branch has no usable previous commit, so it
+      # falls back to the last commit.
+      - name: Diff of the push
+        id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          range="HEAD~1..HEAD"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            range="$BEFORE..$GITHUB_SHA"
+          fi
+          git diff "$range" -- . > "$RUNNER_TEMP/mutants.diff"
+          if [ -n "$(git diff --name-only "$range" -- src)" ]; then
+            echo "mutate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mutate=false" >> "$GITHUB_OUTPUT"
+            echo "no mutants in diff" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Toolchain (from rust-toolchain.toml)
+        if: steps.diff.outputs.mutate == 'true'
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        if: steps.diff.outputs.mutate == 'true'
+
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2  # v2.90.0
+        if: steps.diff.outputs.mutate == 'true'
+        with:
+          tool: cargo-mutants@27.1.0
+
+      # One mutant at a time: the tests use fixed ports, shared-memory names
+      # and directories, so two test suites running in parallel can collide.
+      # Exit code: 0 all caught, 2 missed, 3 timeout, 4 baseline failed.
+      - name: Run mutants
+        if: steps.diff.outputs.mutate == 'true'
+        run: cargo mutants --in-diff "$RUNNER_TEMP/mutants.diff" --jobs 1 --output target
+
+      - name: Missed mutants summary
+        if: always() && steps.diff.outputs.mutate == 'true'
+        run: |
+          {
+            echo '### Missed mutants'
+            echo '```'
+            if [ -s target/mutants.out/missed.txt ]; then
+              cat target/mutants.out/missed.txt
+            else
+              echo none
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        if: always() && steps.diff.outputs.mutate == 'true'
+        with:
+          name: mutants
+          path: |
+            target/mutants.out/missed.txt
+            target/mutants.out/timeout.txt
+            target/mutants.out/caught.txt
+            target/mutants.out/unviable.txt
+          if-no-files-found: warn
+          retention-days: 30

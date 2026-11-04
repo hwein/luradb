@@ -150,6 +150,10 @@ pub struct CountResponse {
     pub count: u64,
 }
 
+/// First path segments of the top-level routes below. Every new top-level
+/// route must be added here so `server.swagger_url` cannot shadow it.
+pub const RESERVED_TOP_LEVEL_SEGMENTS: [&str; 3] = ["store-api", "health", "version"];
+
 /// Builds the full domain + KV + auth router with the given app state — the
 /// routes only; the per-request layers come from [`frontend_layers`].
 #[allow(clippy::let_and_return, reason = "the router coverage test finds the root routes by the `let router` binding")]

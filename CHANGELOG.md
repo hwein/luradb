@@ -17,6 +17,7 @@ All notable changes to LuraDB are documented in this file.
 - A backup schedule runs at most once per cron minute, also when the timer wakes early.
 - **BREAKING** API: `lsm.max_value_size` now applies to single-key KV writes (413); deleting by prefix no longer fails with 500 for keys near the length limit.
 - LuraSQL rejects `DISTINCT`, `GROUP BY`, `HAVING`, `UNION`, `EXCEPT`, `INTERSECT` and join types other than `LEFT JOIN` with a clear 400 instead of a misleading error; these words are now reserved.
+- Startup rejects a `server.swagger_url` that would shadow the API or crash the router (/, /store-api, /health, /version, /api-docs/openapi.json, path placeholders) instead of starting a server that answers 404 to every request.
 
 ### Removed
 

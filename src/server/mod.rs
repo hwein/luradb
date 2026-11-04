@@ -922,6 +922,43 @@ mod tests {
         })
     }
 
+    #[test]
+    fn accepted_swagger_urls_keep_the_api_and_auth_reachable() {
+        crate::core::engine_runtime::block_on(async {
+            for (swagger_url, page) in [
+                ("/docs", "/docs/"),
+                ("/test-ui/", "/test-ui/"),
+                ("/ops/swagger", "/ops/swagger/"),
+                ("/api-docs", "/api-docs/"),
+            ] {
+                let mut cfg = LuraConfig::default();
+                cfg.server.swagger_enabled = true;
+                cfg.server.swagger_url = swagger_url.to_string();
+                cfg.auth.enabled = true;
+                cfg.server.validate().unwrap();
+
+                let (state, _dir) = make_test_state(true).await;
+                let auth_cache = Arc::clone(&state.auth_cache);
+                let ship = ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]);
+                let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
+
+                for (uri, expected) in [
+                    ("/health", StatusCode::OK),
+                    ("/version", StatusCode::UNAUTHORIZED),
+                    (page, StatusCode::OK),
+                    ("/api-docs/openapi.json", StatusCode::OK),
+                ] {
+                    let resp = app
+                        .clone()
+                        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), expected, "{swagger_url} {uri}");
+                }
+            }
+        })
+    }
+
     // Auth runs on the frontend, in front of the bridge — the engine
     // router behind it carries no auth layer of its own, so a 401 here can
     // only come from the frontend router.

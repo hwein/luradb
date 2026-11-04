@@ -314,9 +314,28 @@ impl ServerConfig {
                 "invalid config: server.swagger_url ({}) must start with /",
                 self.swagger_url
             );
+            let path = self.swagger_url.strip_suffix('/').unwrap_or(&self.swagger_url);
             anyhow::ensure!(
-                self.swagger_url != "/" || !self.hello_enabled,
-                "invalid config: server.swagger_url (/) collides with the root route; set server.hello_enabled = false or use another path"
+                path.len() > 1,
+                "invalid config: server.swagger_url ({}) would shadow every API route; use a sub-path such as /test-ui",
+                self.swagger_url
+            );
+            anyhow::ensure!(
+                !path.contains(['{', '}']) && !path.split('/').any(|s| s.starts_with(['*', ':'])),
+                "invalid config: server.swagger_url ({}) contains a path placeholder ({{ or }}) or a segment starting with * or :; use a plain sub-path such as /test-ui",
+                self.swagger_url
+            );
+            let first_segment = path[1..].split('/').next().unwrap_or_default();
+            anyhow::ensure!(
+                !crate::api::RESERVED_TOP_LEVEL_SEGMENTS.contains(&first_segment),
+                "invalid config: server.swagger_url ({}) would shadow the API route /{}; use a sub-path such as /test-ui",
+                self.swagger_url,
+                first_segment
+            );
+            anyhow::ensure!(
+                path != "/api-docs/openapi.json",
+                "invalid config: server.swagger_url ({}) would shadow the API route /api-docs/openapi.json; use a sub-path such as /test-ui",
+                self.swagger_url
             );
         }
         Ok(())
@@ -2634,12 +2653,38 @@ mod tests {
     }
 
     #[test]
-    fn test_server_validate_swagger_url_root_collides_with_the_hello_route() {
-        let toml_str = |hello: bool| format!("[server]\nswagger_enabled = true\nswagger_url = \"/\"\nhello_enabled = {hello}\n");
-        let config: LuraConfig = toml::from_str(&toml_str(true)).unwrap();
-        assert_invalid(config.server.validate(), "server.swagger_url (/)", "server.hello_enabled");
-        let config: LuraConfig = toml::from_str(&toml_str(false)).unwrap();
-        assert!(config.server.validate().is_ok());
+    fn test_server_validate_swagger_url_rejects_values_that_shadow_the_api_or_crash_the_router() {
+        let server = |url: &str, hello: bool| {
+            let toml_str = format!("[server]\nswagger_enabled = true\nswagger_url = '{url}'\nhello_enabled = {hello}\n");
+            toml::from_str::<LuraConfig>(&toml_str).unwrap().server
+        };
+        let rejected = [
+            ("/", "would shadow every API route"),
+            ("//", "would shadow every API route"),
+            ("/store-api", "would shadow the API route /store-api"),
+            ("/store-api/", "would shadow the API route /store-api"),
+            ("/store-api/kv", "would shadow the API route /store-api"),
+            ("/health", "would shadow the API route /health"),
+            ("/version", "would shadow the API route /version"),
+            ("/api-docs/openapi.json", "would shadow the API route /api-docs/openapi.json"),
+            ("/api-docs/openapi.json/", "would shadow the API route /api-docs/openapi.json"),
+            ("/{x}", "path placeholder"),
+            ("/{*x}", "path placeholder"),
+            ("/a{b}", "path placeholder"),
+            ("/:x", "path placeholder"),
+            ("/*x", "path placeholder"),
+            ("/a/:x", "path placeholder"),
+        ];
+        for (url, expected) in rejected {
+            for hello in [true, false] {
+                assert_invalid(server(url, hello).validate(), &format!("server.swagger_url ({url})"), expected);
+            }
+        }
+        for url in ["/docs", "/test-ui", "/test-ui/", "/ops/swagger", "/api-docs", "/api-docs/ui", "///", "/a*b"] {
+            for hello in [true, false] {
+                assert!(server(url, hello).validate().is_ok(), "{url} hello={hello}");
+            }
+        }
     }
 
     #[test]

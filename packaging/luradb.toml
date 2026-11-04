@@ -2,7 +2,8 @@
 # Serves the Swagger UI and /api-docs/openapi.json without a key, also with auth on;
 # the API calls made from the UI still need one.
 swagger_enabled = false
-# URL path of the Swagger UI; must start with /, and not be / while hello_enabled is true.
+# URL path of the Swagger UI; a sub-path starting with /. Not /, /store-api, /health, /version
+# or /api-docs/openapi.json (they would shadow the API), and no placeholders ({}, *, :).
 swagger_url = "/test-ui"
 # Address of the HTTP and HTTPS listeners; with auth off, only loopback is allowed.
 bind_address = "127.0.0.1"

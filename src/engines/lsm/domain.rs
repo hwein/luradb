@@ -14,7 +14,7 @@
 use crate::control::{ControlPlane, Engine};
 use crate::core::coop::{on_give_up, YieldEvery};
 use crate::core::events::Resume;
-use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
+use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::engines::lsm::watcher::{WalEvent, WatchMessage};
@@ -93,6 +93,7 @@ async fn count_and_release(keys: Vec<Vec<u8>>, coop: &mut YieldEvery) -> u64 {
 pub struct DomainConfig {
     pub max_name_length: usize,
     pub max_user_key_length: usize,
+    pub max_value_size: usize,
     pub default_domain: String,
     pub default_read_iops: u32,
     pub default_write_iops: u32,
@@ -106,6 +107,7 @@ impl Default for DomainConfig {
         Self {
             max_name_length: 50,
             max_user_key_length: 256,
+            max_value_size: LsmEngineConfig::default().max_value_size,
             default_domain: "default".to_string(),
             default_read_iops: 1000,
             default_write_iops: 500,
@@ -144,6 +146,15 @@ pub(crate) fn fnv64(data: &[u8]) -> u64 {
         h = h.wrapping_mul(PRIME);
     }
     h
+}
+
+/// Length of the internal key prefix `d:<16 hex>:` every domain key carries.
+pub const DOMAIN_KEY_PREFIX_LEN: usize = 19;
+
+/// Longest user key the domain layer accepts: the prefixed key must fit
+/// `lsm.max_key_length`, otherwise accepted keys fail in the engine (500).
+pub(crate) fn effective_user_key_limit(max_user_key_length: usize, lsm_max_key_length: usize) -> usize {
+    max_user_key_length.min(lsm_max_key_length.saturating_sub(DOMAIN_KEY_PREFIX_LEN))
 }
 
 fn generate_prefix(name: &str) -> Vec<u8> {
@@ -500,6 +511,7 @@ impl DomainRegistry {
             engine: Arc::clone(&self.engine),
             runtime,
             max_user_key_len: self.config.max_user_key_length,
+            max_value_size: self.config.max_value_size,
             max_bulk_delete_keys: self.config.max_bulk_delete_keys,
             metrics: Arc::clone(&self.metrics),
         })
@@ -520,6 +532,7 @@ pub struct DomainStore {
     engine: Arc<LsmStorageEngine>,
     runtime: Arc<DomainRuntime>,
     max_user_key_len: usize,
+    max_value_size: usize,
     max_bulk_delete_keys: usize,
     metrics: Arc<MetricsStore>,
 }
@@ -648,8 +661,9 @@ impl DomainStore {
     /// visible version; otherwise fails with [`PreconditionFailed`] and
     /// writes nothing. A domain that requires conditional writes rejects one
     /// without preconditions with [`PreconditionRequired`], after key
-    /// validation and the rate limit; the shorthands such as [`Self::put`]
-    /// never do. Check and write run under the key's write lock, so no
+    /// validation, the value size check (puts only) and the rate limit; the
+    /// shorthands such as [`Self::put`] never do. Check and write run under
+    /// the key's write lock, so no
     /// other single-key write of the domain falls in between —
     /// [`Self::delete_by_prefix`] takes no key lock.
     pub async fn write(&self, key: &[u8], op: KeyWrite<'_>, preconditions: &[Precondition]) -> Result<()> {
@@ -664,6 +678,14 @@ impl DomainStore {
         require_preconditions: bool,
     ) -> Result<()> {
         self.validate_user_key(key)?;
+        if let KeyWrite::Put { value, .. } = &op {
+            anyhow::ensure!(
+                value.len() <= self.max_value_size,
+                "413 Payload Too Large: value of {} bytes exceeds lsm.max_value_size ({} bytes)",
+                value.len(),
+                self.max_value_size
+            );
+        }
         if !self.runtime.rate_limiter.check_write() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
@@ -1277,6 +1299,18 @@ mod tests {
             assert_eq!(p1, p2);
             assert_ne!(generate_prefix("myapp"), generate_prefix("myapp2"));
         })
+    }
+
+    #[test]
+    fn test_domain_key_prefix_len_matches_generated_prefix() {
+        assert_eq!(generate_prefix("any-name").len(), DOMAIN_KEY_PREFIX_LEN);
+    }
+
+    #[test]
+    fn test_effective_user_key_limit_leaves_room_for_the_prefix() {
+        assert_eq!(effective_user_key_limit(256, 256), 237);
+        assert_eq!(effective_user_key_limit(256, 512), 256);
+        assert_eq!(effective_user_key_limit(100, 512), 100);
     }
 
     // Test: Domain in Deleting state → store() returns 410.

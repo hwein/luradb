@@ -32,7 +32,7 @@ use crate::{
     engines::json::JsonEngine,
     engines::lsm::{
         compaction::CompactionConfig,
-        domain::DomainConfig,
+        domain::{effective_user_key_limit, DomainConfig, DOMAIN_KEY_PREFIX_LEN},
         engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine},
         janitor::JanitorConfig,
         TtlSweeper,
@@ -555,9 +555,20 @@ async fn prepare_control(
 
 /// Settings of the key-value engine's domain layer.
 pub(super) fn domain_config(cfg: &LuraConfig) -> DomainConfig {
+    let max_user_key_length = effective_user_key_limit(cfg.domains.max_user_key_length, cfg.lsm.max_key_length);
+    if max_user_key_length < cfg.domains.max_user_key_length {
+        tracing::warn!(
+            "domains.max_user_key_length ({}) is capped to {} by lsm.max_key_length ({}) minus the {}-byte internal domain prefix; raise lsm.max_key_length to use the full length",
+            cfg.domains.max_user_key_length,
+            max_user_key_length,
+            cfg.lsm.max_key_length,
+            DOMAIN_KEY_PREFIX_LEN
+        );
+    }
     DomainConfig {
         max_name_length: cfg.domains.max_name_length,
-        max_user_key_length: cfg.domains.max_user_key_length,
+        max_user_key_length,
+        max_value_size: cfg.lsm.max_value_size,
         default_domain: cfg.domains.default_domain.clone(),
         default_read_iops: cfg.rate_limit.default_read_iops,
         default_write_iops: cfg.rate_limit.default_write_iops,

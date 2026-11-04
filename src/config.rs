@@ -1,6 +1,7 @@
 use crate::control::system;
 use crate::core::wal::WAL_MAX_FIELD_LEN;
 use crate::engines::json::domain as json_domain;
+use crate::engines::lsm::domain::DOMAIN_KEY_PREFIX_LEN;
 use crate::engines::rel::{catalog as rel_catalog, row::ROW_HEADER_LEN};
 use serde::de::{self, value::StrDeserializer, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -581,7 +582,7 @@ impl Default for LsmConfig {
         Self {
             vlog_inline_threshold: 1024,
             memtable_size_threshold: 4 * 1024 * 1024,
-            max_key_length: 256,
+            max_key_length: 512,
             max_value_size: 512 * 1024,
             flush_check_interval_ms: 100,
             compaction_check_interval_ms: 1000,
@@ -597,6 +598,7 @@ impl LsmConfig {
         check_min("lsm.compaction_check_interval_ms", self.compaction_check_interval_ms, 1)?;
         check_min("lsm.wal_event_channel_capacity", self.wal_event_channel_capacity, 1)?;
         check_wal_field("lsm.max_value_size", self.max_value_size)?;
+        check_min("lsm.max_key_length", self.max_key_length, DOMAIN_KEY_PREFIX_LEN + 1)?;
         check_wal_field("lsm.max_key_length", self.max_key_length)
     }
 }
@@ -2900,6 +2902,13 @@ mod tests {
         let lsm = LsmConfig { max_key_length: WAL_MAX_FIELD_LEN + 1, ..Default::default() };
         let err = lsm.validate().unwrap_err().to_string();
         assert!(err.contains("lsm.max_key_length"), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_max_key_length_must_exceed_domain_prefix() {
+        let at = |max_key_length| LsmConfig { max_key_length, ..Default::default() };
+        assert_invalid(at(19).validate(), "lsm.max_key_length (19)", "at least 20");
+        assert!(at(20).validate().is_ok());
     }
 
     #[test]

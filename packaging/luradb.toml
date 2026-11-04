@@ -135,8 +135,9 @@ reader_queue_capacity = 4096
 vlog_inline_threshold = 1024
 # MemTable size in bytes (keys plus stored values) at which it is written to disk.
 memtable_size_threshold = 4194304
-# Longest stored key in bytes, including the internal domain prefix.
-max_key_length = 256
+# Longest stored key in bytes, including the internal domain prefix. Must leave
+# room for domains.max_user_key_length plus the 19-byte prefix.
+max_key_length = 512
 # Largest value in bytes; larger writes are rejected.
 max_value_size = 524288
 # How often, in milliseconds, the flush loop checks for a full MemTable. At least 1.

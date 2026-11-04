@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch, Notify};
 
 // Default limits — kept as constants so tests can reference them directly.
-const MAX_KEY_LENGTH: usize = 256;
+const MAX_KEY_LENGTH: usize = 512;
 const MAX_VALUE_SIZE_LIMIT: usize = 512 * 1024;
 
 /// Per-instance tuning parameters for the LSM storage engine.

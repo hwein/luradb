@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.14.3",
+    "version": "0.14.4",
     "x-luradb-server-version": "0.5.2-dev"
   },
   "paths": {
@@ -3188,6 +3188,16 @@
                 "description": "ETag of the key's current version; absent when the key does not exist"
               }
             },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The value exceeds lsm.max_value_size; nothing was written",
             "content": {
               "text/plain": {
                 "schema": {

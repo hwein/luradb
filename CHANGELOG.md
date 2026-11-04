@@ -8,12 +8,14 @@ All notable changes to LuraDB are documented in this file.
 
 - **BREAKING** API: with `server.swagger_enabled = true`, the Swagger UI, its assets and `/api-docs/openapi.json` are served without an API key also when `auth.enabled = true`; the API calls made from the UI still need one.
 - **BREAKING** API: operation ids of the domain endpoints are unique per engine (`kv_`, `json_`, `rel_` prefix).
+- Default of `lsm.max_key_length` raised from 256 to 512; a `domains.max_user_key_length` that does not fit into `lsm.max_key_length` minus the 19-byte internal domain prefix is capped with a startup warning (256/256 → 237-byte keys).
 
 ### Fixed
 
 - Startup rejects zero intervals, zero channel capacities, an invalid `server.swagger_url`, an unknown `log.rotation` and an unusable `log.path` instead of hanging or panicking.
 - **BREAKING** API: with `rel.enabled = false` the relational endpoints answer 503 as documented instead of 404.
 - A backup schedule runs at most once per cron minute, also when the timer wakes early.
+- **BREAKING** API: `lsm.max_value_size` now applies to single-key KV writes (413); deleting by prefix no longer fails with 500 for keys near the length limit.
 
 ### Removed
 

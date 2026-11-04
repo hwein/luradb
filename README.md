@@ -5,7 +5,7 @@
 
 #
 
-**Handbook:** <https://hwein.github.io/luradb-docs> — install, operate and use LuraDB, with the configuration reference and the REST API.
+**Handbook:** <https://docs.luradb.org> — install, operate and use LuraDB, with the configuration reference and the REST API.
 
 LuraDB is a Linux-first, REST-native multi-model database built on io_uring.
 One small, fast process covers the three shapes of data a typical backend

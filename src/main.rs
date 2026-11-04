@@ -96,6 +96,10 @@ fn run() -> anyhow::Result<()> {
     config.auth.validate(&config.server)?;
     config.cors.validate()?;
     config.lsm.validate()?;
+    config.janitor.validate()?;
+    config.ttl_sweeper.validate()?;
+    config.domains.validate()?;
+    config.events.validate()?;
     config.json.validate()?;
     config.rel.validate()?;
     config.shm.validate_registration_socket(&config.server)?;

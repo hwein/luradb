@@ -1,4 +1,4 @@
-use crate::config::{LogConfig, LogFormat, LogLevel};
+use crate::config::{LogConfig, LogFormat, LogLevel, LogRotation};
 use anyhow::Result;
 use std::fmt::Write;
 use std::path::PathBuf;
@@ -44,12 +44,7 @@ pub fn init_logging(cfg: &LogConfig) -> Result<()> {
         return Ok(());
     }
 
-    let appender = match cfg.rotation.as_str() {
-        "hourly" => RollingFileAppender::new(Rotation::HOURLY, &cfg.path, "luradb.log"),
-        "daily" => RollingFileAppender::new(Rotation::DAILY, &cfg.path, "luradb.log"),
-        _ => RollingFileAppender::new(Rotation::NEVER, &cfg.path, "luradb.log"),
-    };
-    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(build_appender(cfg)?);
 
     match cfg.format {
         LogFormat::Json => {
@@ -68,6 +63,19 @@ pub fn init_logging(cfg: &LogConfig) -> Result<()> {
 
     *FILE_LOG_GUARD.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
     Ok(())
+}
+
+fn build_appender(cfg: &LogConfig) -> Result<RollingFileAppender> {
+    let rotation = match cfg.rotation {
+        LogRotation::None => Rotation::NEVER,
+        LogRotation::Daily => Rotation::DAILY,
+        LogRotation::Hourly => Rotation::HOURLY,
+    };
+    RollingFileAppender::builder()
+        .rotation(rotation)
+        .filename_prefix("luradb.log")
+        .build(&cfg.path)
+        .map_err(|e| anyhow::anyhow!("invalid config: log.path ({}) cannot be used: {e}", cfg.path))
 }
 
 fn build_env_filter(cfg: &LogConfig) -> EnvFilter {
@@ -211,6 +219,28 @@ mod tests {
         assert_eq!(directive_string(&cfg), "luradb=trace,tower_http=debug");
 
         std::env::remove_var("RUST_LOG");
+    }
+
+    #[test]
+    fn test_build_appender_rejects_a_path_below_a_regular_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("not_a_dir");
+        fs::write(&file, b"x").unwrap();
+        let path = file.join("logs");
+        let cfg = LogConfig { path: path.to_string_lossy().into_owned(), ..Default::default() };
+
+        let err = build_appender(&cfg).expect_err("an unusable log path must fail").to_string();
+        assert!(err.starts_with(&format!("invalid config: log.path ({})", path.display())), "{err}");
+    }
+
+    #[test]
+    fn test_build_appender_creates_the_log_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("logs");
+        let cfg = LogConfig { path: path.to_string_lossy().into_owned(), ..Default::default() };
+
+        build_appender(&cfg).unwrap();
+        assert!(path.is_dir());
     }
 
     fn set_mtime_days_ago(path: &std::path::Path, days: u64) {

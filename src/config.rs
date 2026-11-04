@@ -291,10 +291,11 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Startup validation: at least one TCP listener must
-    /// be enabled, and HTTP/HTTPS cannot share the same port. Cert/key
-    /// readability and parsability are checked when the TLS listener is
-    /// actually built (`tls::load_tls_acceptor`), not here.
+    /// Startup validation: at least one TCP listener must be enabled,
+    /// HTTP/HTTPS cannot share the same port, and an enabled Swagger UI
+    /// needs a usable path. Cert/key readability and parsability are
+    /// checked when the TLS listener is actually built
+    /// (`tls::load_tls_acceptor`), not here.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.http_enabled || self.tls_enabled,
@@ -306,6 +307,17 @@ impl ServerConfig {
             self.tls_port,
             self.port
         );
+        if self.swagger_enabled {
+            anyhow::ensure!(
+                self.swagger_url.starts_with('/'),
+                "invalid config: server.swagger_url ({}) must start with /",
+                self.swagger_url
+            );
+            anyhow::ensure!(
+                self.swagger_url != "/" || !self.hello_enabled,
+                "invalid config: server.swagger_url (/) collides with the root route; set server.hello_enabled = false or use another path"
+            );
+        }
         Ok(())
     }
 }
@@ -581,6 +593,9 @@ impl Default for LsmConfig {
 
 impl LsmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("lsm.flush_check_interval_ms", self.flush_check_interval_ms, 1)?;
+        check_min("lsm.compaction_check_interval_ms", self.compaction_check_interval_ms, 1)?;
+        check_min("lsm.wal_event_channel_capacity", self.wal_event_channel_capacity, 1)?;
         check_wal_field("lsm.max_value_size", self.max_value_size)?;
         check_wal_field("lsm.max_key_length", self.max_key_length)
     }
@@ -598,7 +613,7 @@ fn check_wal_field(key: &str, value: usize) -> anyhow::Result<()> {
 }
 
 /// Startup validation: rejects `value` below `min`.
-fn check_min(key: &str, value: usize, min: usize) -> anyhow::Result<()> {
+fn check_min<T: PartialOrd + std::fmt::Display>(key: &str, value: T, min: T) -> anyhow::Result<()> {
     anyhow::ensure!(value >= min, "invalid config: {key} ({value}) must be at least {min}");
     Ok(())
 }
@@ -692,6 +707,12 @@ impl Default for JanitorCfg {
     }
 }
 
+impl JanitorCfg {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("janitor.check_interval_secs", self.check_interval_secs, 1)
+    }
+}
+
 /// Background task that tombstones TTL-expired keys and emits their delete
 /// events. Only the KV instance runs one.
 #[derive(Debug, Deserialize, Serialize)]
@@ -711,6 +732,12 @@ impl Default for TtlSweeperCfg {
             interval_secs: 60,
             batch_size: 500,
         }
+    }
+}
+
+impl TtlSweeperCfg {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("ttl_sweeper.interval_secs", self.interval_secs, 1)
     }
 }
 
@@ -739,6 +766,12 @@ impl Default for DomainsConfig {
             purger_interval_secs: 5,
             max_bulk_delete_keys: 10_000,
         }
+    }
+}
+
+impl DomainsConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("domains.purger_interval_secs", self.purger_interval_secs, 1)
     }
 }
 
@@ -818,6 +851,15 @@ pub enum LogFormat {
     Json,
 }
 
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogRotation {
+    None,
+    #[default]
+    Daily,
+    Hourly,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct LogConfig {
@@ -825,8 +867,8 @@ pub struct LogConfig {
     pub format: LogFormat,
     /// Empty = stdout only; the directory is created if missing.
     pub path: String,
-    /// "none" | "daily" | "hourly" — ignored when path is empty.
-    pub rotation: String,
+    /// Ignored when path is empty.
+    pub rotation: LogRotation,
     /// 0 = never delete.
     pub retention_days: u64,
     pub modules: LogModulesConfig,
@@ -841,7 +883,7 @@ impl Default for LogConfig {
             level: LogLevel::Info,
             format: LogFormat::Text,
             path: String::new(),
-            rotation: "daily".to_string(),
+            rotation: LogRotation::Daily,
             retention_days: 30,
             modules: LogModulesConfig::default(),
             http_access: false,
@@ -1180,6 +1222,12 @@ impl Default for EventsConfig {
             channel_capacity: 256,
             replay_buffer_size: 1024,
         }
+    }
+}
+
+impl EventsConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("events.channel_capacity", self.channel_capacity, 1)
     }
 }
 
@@ -2510,6 +2558,97 @@ mod tests {
     }
 
     #[test]
+    fn test_log_rotation_parses_the_three_values_and_defaults_to_daily() {
+        assert_eq!(LogConfig::default().rotation, LogRotation::Daily);
+        for (text, expected) in [
+            ("none", LogRotation::None),
+            ("daily", LogRotation::Daily),
+            ("hourly", LogRotation::Hourly),
+        ] {
+            let config: LuraConfig = toml::from_str(&format!("[log]\nrotation = \"{text}\"\n")).unwrap();
+            assert_eq!(config.log.rotation, expected);
+        }
+    }
+
+    #[test]
+    fn test_log_rotation_rejects_other_text_when_parsing() {
+        let err = toml::from_str::<LuraConfig>("[log]\nrotation = \"weekly\"\n").unwrap_err().to_string();
+        assert!(err.contains("weekly") && err.contains("hourly"), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_rejects_zero_intervals_and_capacity() {
+        for key in ["flush_check_interval_ms", "compaction_check_interval_ms", "wal_event_channel_capacity"] {
+            let config: LuraConfig = toml::from_str(&format!("[lsm]\n{key} = 0\n")).unwrap();
+            assert_invalid(config.lsm.validate(), &format!("lsm.{key} (0)"), "at least 1");
+        }
+        let config: LuraConfig = toml::from_str(
+            "[lsm]\nflush_check_interval_ms = 1\ncompaction_check_interval_ms = 1\nwal_event_channel_capacity = 1\n",
+        )
+        .unwrap();
+        assert!(config.lsm.validate().is_ok());
+    }
+
+    #[test]
+    fn test_janitor_validate_rejects_zero_interval() {
+        let config: LuraConfig = toml::from_str("[janitor]\ncheck_interval_secs = 0\n").unwrap();
+        assert_invalid(config.janitor.validate(), "janitor.check_interval_secs (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[janitor]\ncheck_interval_secs = 1\n").unwrap();
+        assert!(config.janitor.validate().is_ok());
+    }
+
+    #[test]
+    fn test_ttl_sweeper_validate_rejects_zero_interval() {
+        let config: LuraConfig = toml::from_str("[ttl_sweeper]\ninterval_secs = 0\n").unwrap();
+        assert_invalid(config.ttl_sweeper.validate(), "ttl_sweeper.interval_secs (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[ttl_sweeper]\ninterval_secs = 1\n").unwrap();
+        assert!(config.ttl_sweeper.validate().is_ok());
+    }
+
+    #[test]
+    fn test_domains_validate_rejects_zero_purger_interval() {
+        let config: LuraConfig = toml::from_str("[domains]\npurger_interval_secs = 0\n").unwrap();
+        assert_invalid(config.domains.validate(), "domains.purger_interval_secs (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[domains]\npurger_interval_secs = 1\n").unwrap();
+        assert!(config.domains.validate().is_ok());
+    }
+
+    #[test]
+    fn test_events_validate_rejects_zero_channel_capacity() {
+        let config: LuraConfig = toml::from_str("[events]\nchannel_capacity = 0\n").unwrap();
+        assert_invalid(config.events.validate(), "events.channel_capacity (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[events]\nchannel_capacity = 1\nreplay_buffer_size = 0\n").unwrap();
+        assert!(config.events.validate().is_ok());
+    }
+
+    #[test]
+    fn test_server_validate_swagger_url_needs_a_leading_slash_when_swagger_is_on() {
+        let config: LuraConfig = toml::from_str("[server]\nswagger_enabled = true\nswagger_url = \"docs\"\n").unwrap();
+        assert_invalid(config.server.validate(), "server.swagger_url (docs)", "start with /");
+        let config: LuraConfig = toml::from_str("[server]\nswagger_enabled = true\nswagger_url = \"\"\n").unwrap();
+        assert_invalid(config.server.validate(), "server.swagger_url ()", "start with /");
+        let config: LuraConfig = toml::from_str("[server]\nswagger_enabled = true\nswagger_url = \"/docs\"\n").unwrap();
+        assert!(config.server.validate().is_ok());
+    }
+
+    #[test]
+    fn test_server_validate_swagger_url_root_collides_with_the_hello_route() {
+        let toml_str = |hello: bool| format!("[server]\nswagger_enabled = true\nswagger_url = \"/\"\nhello_enabled = {hello}\n");
+        let config: LuraConfig = toml::from_str(&toml_str(true)).unwrap();
+        assert_invalid(config.server.validate(), "server.swagger_url (/)", "server.hello_enabled");
+        let config: LuraConfig = toml::from_str(&toml_str(false)).unwrap();
+        assert!(config.server.validate().is_ok());
+    }
+
+    #[test]
+    fn test_server_validate_ignores_swagger_url_while_swagger_is_off() {
+        let config: LuraConfig = toml::from_str("[server]\nswagger_url = \"docs\"\n").unwrap();
+        assert!(config.server.validate().is_ok());
+        let config: LuraConfig = toml::from_str("[server]\nswagger_url = \"/\"\n").unwrap();
+        assert!(config.server.validate().is_ok());
+    }
+
+    #[test]
     fn test_server_default_bind_address_is_loopback() {
         assert_eq!(ServerConfig::default().bind_address, "127.0.0.1");
     }
@@ -3251,6 +3390,10 @@ flag = true
             config.auth.validate(&config.server).unwrap();
             config.cors.validate().unwrap();
             config.lsm.validate().unwrap();
+            config.janitor.validate().unwrap();
+            config.ttl_sweeper.validate().unwrap();
+            config.domains.validate().unwrap();
+            config.events.validate().unwrap();
             config.json.validate().unwrap();
             config.rel.validate().unwrap();
             config.shm.validate().unwrap();

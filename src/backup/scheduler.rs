@@ -10,7 +10,7 @@ use super::cron::CronSchedule;
 use super::{cron, BackupError, BackupManager, BackupScope, BackupState};
 use crate::config::BackupScheduleConfig;
 use crate::engines::lsm::domain::now_secs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +24,8 @@ struct SchedulerEntry {
     scope: BackupScope,
     include_auth: bool,
     keep_last: usize,
+    /// Last cron minute (`unix / 60`) this schedule matched; 0 = never.
+    last_minute: AtomicU64,
 }
 
 impl SchedulerEntry {
@@ -34,6 +36,7 @@ impl SchedulerEntry {
             scope: BackupScope::parse(&cfg.scope)?,
             include_auth: cfg.include_auth,
             keep_last: cfg.keep_last,
+            last_minute: AtomicU64::new(0),
         })
     }
 }
@@ -59,10 +62,10 @@ impl BackupScheduler {
     pub async fn run(self: Arc<Self>) {
         while !self.shutdown.load(Ordering::Relaxed) {
             // Sleep to the next minute boundary before ticking, like classic
-            // cron: ticks only ever land on a boundary, so a start inside an
-            // already-matching minute does not re-fire that slot (no
-            // catch-up). Sleeping to the boundary instead of a flat 60s also
-            // avoids drifting by the tick's own duration each round.
+            // cron, so a start inside an already-matching minute does not
+            // fire that slot (no catch-up). Sleeping to the boundary instead
+            // of a flat 60s also avoids drifting by the tick's own duration
+            // each round. A timer that wakes early is caught by `tick`.
             let sleep_secs = 60 - (now_secs() % 60);
             compio::time::sleep(Duration::from_secs(sleep_secs)).await;
             if self.shutdown.load(Ordering::Relaxed) {
@@ -74,14 +77,20 @@ impl BackupScheduler {
 
     /// One minute tick: evaluates every schedule's cron against `now`'s UTC
     /// calendar fields (match against the current minute, not next-fire
-    /// computation; no catch-up of missed ticks). Pure/callable so tests can
-    /// drive it directly without a real 60s sleep loop.
+    /// computation; no catch-up of missed ticks). A schedule is attempted at
+    /// most once per cron minute, whether or not the job starts. Callable
+    /// directly so tests can drive it without a real 60s sleep loop.
     pub async fn tick(&self, now: u64) {
         let t = cron::civil_from_unix(now);
+        let minute = now / 60;
         for entry in &self.entries {
             if !entry.cron.matches(t.minute, t.hour, t.day, t.month, t.weekday) {
                 continue;
             }
+            if minute <= entry.last_minute.load(Ordering::Relaxed) {
+                continue;
+            }
+            entry.last_minute.store(minute, Ordering::Relaxed);
             if !self.manager.backup_allowed() {
                 tracing::warn!(
                     "[Backup Scheduler] skipping this tick for schedule '{}': writes are refused for want of \
@@ -240,11 +249,12 @@ mod tests {
                 BackupScheduler::new(Arc::clone(&manager), &[always_matching_schedule("nightly")], Arc::new(AtomicBool::new(false)))
                     .unwrap();
             manager.control.resources().block_for_test(false, false);
-            scheduler.tick(now_secs()).await;
+            let now = now_secs();
+            scheduler.tick(now).await;
             assert!(manager.running_job().is_none(), "no backup during the block");
 
             manager.control.resources().block_for_test(false, true);
-            scheduler.tick(now_secs()).await;
+            scheduler.tick(now + 60).await;
             assert!(manager.running_job().is_some(), "a backup onto a volume with room");
         })
     }
@@ -306,6 +316,59 @@ mod tests {
             let job = manager.running_job().expect("the first schedule must have started a job");
             // ID suffix carries the schedule name.
             assert!(job.id.ends_with("_first"), "the first schedule must have won the slot, got id '{}'", job.id);
+        })
+    }
+
+    async fn tick_and_finish(scheduler: &BackupScheduler, now: u64) {
+        scheduler.tick(now).await;
+        while scheduler.manager.running_job().is_some() {
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn scheduler_with_one_schedule(manager: &Arc<BackupManager>) -> BackupScheduler {
+        BackupScheduler::new(Arc::clone(manager), &[always_matching_schedule("nightly")], Arc::new(AtomicBool::new(false)))
+            .unwrap()
+    }
+
+    // A schedule runs at most once per cron minute, even when ticks land
+    // twice inside that minute (early timer wake-up).
+    #[test]
+    fn test_tick_runs_a_schedule_once_per_cron_minute() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let scheduler = scheduler_with_one_schedule(&manager);
+
+            tick_and_finish(&scheduler, 60).await;
+            tick_and_finish(&scheduler, 119).await;
+
+            assert_eq!(manager.list_backups().unwrap().len(), 1, "the second tick in minute 1 must not run again");
+        })
+    }
+
+    #[test]
+    fn test_tick_runs_a_schedule_again_in_the_next_minute() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let scheduler = scheduler_with_one_schedule(&manager);
+
+            tick_and_finish(&scheduler, 60).await;
+            tick_and_finish(&scheduler, 120).await;
+
+            assert_eq!(manager.list_backups().unwrap().len(), 2);
+        })
+    }
+
+    #[test]
+    fn test_tick_does_not_rerun_after_the_clock_jumps_back() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let scheduler = scheduler_with_one_schedule(&manager);
+
+            tick_and_finish(&scheduler, 120).await;
+            tick_and_finish(&scheduler, 60).await;
+
+            assert_eq!(manager.list_backups().unwrap().len(), 1, "an already served minute must not run again");
         })
     }
 

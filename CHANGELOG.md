@@ -13,6 +13,7 @@ All notable changes to LuraDB are documented in this file.
 
 - Startup rejects zero intervals, zero channel capacities, an invalid `server.swagger_url`, an unknown `log.rotation` and an unusable `log.path` instead of hanging or panicking.
 - **BREAKING** API: with `rel.enabled = false` the relational endpoints answer 503 as documented instead of 404.
+- A backup schedule runs at most once per cron minute, also when the timer wakes early.
 
 ### Removed
 

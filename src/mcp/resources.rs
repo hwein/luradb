@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn the_domain_list_is_the_merged_listing() {
         let read = read(DOMAINS_URI).unwrap();
-        let replies = [reply(200, r#"[{"name":"a"}]"#), reply(503, "off"), reply(404, "")];
+        let replies = [reply(200, r#"[{"name":"a"}]"#), reply(503, "off"), reply(503, "")];
         let result = read.result(DOMAINS_URI, &replies).unwrap();
         assert_eq!(text(&result), json!({"domains": [{"name": "a", "engine": "kv"}], "unavailable_engines": ["json", "rel"]}));
     }

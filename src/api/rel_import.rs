@@ -393,14 +393,13 @@ mod tests {
         })
     }
 
-    // Disabled engine: the route is not registered at all (404, axum's
-    // default for an unmatched route) -- same contract as every other rel route.
+    // Disabled engine: 503, same contract as every other rel route.
     #[test]
-    fn test_disabled_engine_route_absent() {
+    fn test_disabled_engine_returns_503() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(None).await;
             let (status, _) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         })
     }
 }

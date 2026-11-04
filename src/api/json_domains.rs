@@ -74,6 +74,7 @@ impl From<&DomainEntry> for JsonDomainResponse {
 #[utoipa::path(
     post,
     path = "/store-api/json/domains",
+    operation_id = "json_create_domain",
     request_body = CreateJsonDomainRequest,
     responses(
         (status = 201, description = "JSON domain created", body = JsonDomainResponse),
@@ -98,6 +99,7 @@ pub async fn create_domain(
 #[utoipa::path(
     get,
     path = "/store-api/json/domains",
+    operation_id = "json_list_domains",
     responses(
         (status = 200, description = "List of the active JSON domains the key may access", body = Vec<JsonDomainResponse>),
         (status = 503, description = "JSON engine disabled", body = String, content_type = "text/plain"),
@@ -121,6 +123,7 @@ pub async fn list_domains(
 #[utoipa::path(
     get,
     path = "/store-api/json/domains/{name}",
+    operation_id = "json_get_domain",
     params(("name" = String, Path, description = "JSON domain name")),
     responses(
         (status = 200, description = "Domain found", body = JsonDomainResponse),
@@ -155,6 +158,7 @@ pub async fn get_domain(
 #[utoipa::path(
     delete,
     path = "/store-api/json/domains/{name}",
+    operation_id = "json_delete_domain",
     params(("name" = String, Path, description = "JSON domain name")),
     responses(
         (status = 202, description = "Deletion accepted — background purge follows"),

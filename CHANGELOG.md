@@ -7,10 +7,12 @@ All notable changes to LuraDB are documented in this file.
 ### Changed
 
 - **BREAKING** API: with `server.swagger_enabled = true`, the Swagger UI, its assets and `/api-docs/openapi.json` are served without an API key also when `auth.enabled = true`; the API calls made from the UI still need one.
+- **BREAKING** API: operation ids of the domain endpoints are unique per engine (`kv_`, `json_`, `rel_` prefix).
 
 ### Fixed
 
 - Startup rejects zero intervals, zero channel capacities, an invalid `server.swagger_url`, an unknown `log.rotation` and an unusable `log.path` instead of hanging or panicking.
+- **BREAKING** API: with `rel.enabled = false` the relational endpoints answer 503 as documented instead of 404.
 
 ### Removed
 

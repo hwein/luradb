@@ -1403,17 +1403,17 @@ mod tests {
         })
     }
 
-    // 15. Disabled engine: rel Browse/Row paths are not registered at all (404).
+    // 15. Disabled engine: rel Browse/Row paths answer 503.
     #[test]
-    fn test_disabled_engine_routes_absent() {
+    fn test_disabled_engine_returns_503() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(None).await;
             let (status, _) = request(&app, Method::GET, "/store-api/rel/default/tables", None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             let (status, _) = request(&app, Method::GET, "/store-api/rel/default/tables/t/rows", None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             let (status, _) = request(&app, Method::POST, "/store-api/rel/default/tables/t/rows", Some("{}")).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         })
     }
 
@@ -1490,7 +1490,7 @@ mod tests {
     // Test 7: unknown table -> 404; a view -> 404, not 400 (proof that
     // count_rows resolves the schema via browse_table, the read-side
     // resolver, not the write path's require_table); unknown/deleting domain
-    // -> 404/410; disabled engine -> the route doesn't exist at all.
+    // -> 404/410; disabled engine -> 503.
     #[test]
     fn test_count_rows_not_found_view_and_domain_errors() {
         crate::core::engine_runtime::block_on(async {
@@ -1515,7 +1515,7 @@ mod tests {
             let (app_disabled, _dir2) = make_app(None).await;
             let (status, _) =
                 request(&app_disabled, Method::GET, "/store-api/rel/default/tables/t/count", None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "rel engine disabled -> route absent");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "rel engine disabled");
         })
     }
 

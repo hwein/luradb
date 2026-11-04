@@ -55,6 +55,7 @@ impl From<&DomainEntry> for RelDomainResponse {
 #[utoipa::path(
     post,
     path = "/store-api/rel/domains",
+    operation_id = "rel_create_domain",
     request_body = CreateRelDomainRequest,
     responses(
         (status = 201, description = "Relational domain created", body = RelDomainResponse),
@@ -78,6 +79,7 @@ pub async fn create_domain(
 #[utoipa::path(
     get,
     path = "/store-api/rel/domains",
+    operation_id = "rel_list_domains",
     responses(
         (status = 200, description = "List of the active relational domains the key may access", body = Vec<RelDomainResponse>),
         (status = 503, description = "Relational engine disabled", body = String, content_type = "text/plain"),
@@ -102,6 +104,7 @@ pub async fn list_domains(
 #[utoipa::path(
     get,
     path = "/store-api/rel/domains/{name}",
+    operation_id = "rel_get_domain",
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
         (status = 200, description = "Domain found", body = RelDomainResponse),
@@ -135,6 +138,7 @@ pub async fn get_domain(
 #[utoipa::path(
     delete,
     path = "/store-api/rel/domains/{name}",
+    operation_id = "rel_delete_domain",
     params(("name" = String, Path, description = "Relational domain name")),
     responses(
         (status = 202, description = "Deletion accepted — background purge follows"),

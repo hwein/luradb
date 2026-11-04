@@ -97,6 +97,7 @@ impl From<&DomainEntry> for DomainResponse {
 #[utoipa::path(
     post,
     path = "/store-api/domains",
+    operation_id = "kv_create_domain",
     request_body = CreateDomainRequest,
     responses(
         (status = 201, description = "Domain created", body = DomainResponse),
@@ -120,6 +121,7 @@ pub async fn create_domain(
 #[utoipa::path(
     get,
     path = "/store-api/domains",
+    operation_id = "kv_list_domains",
     responses(
         (status = 200, description = "List of the active domains the key may access", body = Vec<DomainResponse>),
     ),
@@ -144,6 +146,7 @@ pub async fn list_domains(
 #[utoipa::path(
     get,
     path = "/store-api/domains/{name}",
+    operation_id = "kv_get_domain",
     params(("name" = String, Path, description = "Domain name")),
     responses(
         (status = 200, description = "Domain found", body = DomainResponse),
@@ -168,6 +171,7 @@ pub async fn get_domain(
 #[utoipa::path(
     delete,
     path = "/store-api/domains/{name}",
+    operation_id = "kv_delete_domain",
     params(("name" = String, Path, description = "Domain name")),
     responses(
         (status = 202, description = "Deletion accepted — background purge started"),

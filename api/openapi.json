@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.14.2",
+    "version": "0.14.3",
     "x-luradb-server-version": "0.5.2-dev"
   },
   "paths": {
@@ -887,7 +887,7 @@
           "Domains"
         ],
         "summary": "Returns the active domains with their names and creation timestamps.\nAdmin keys see all of them; any other key sees only the domains it has a\npermission on (an empty list without any).",
-        "operationId": "list_domains",
+        "operationId": "kv_list_domains",
         "responses": {
           "200": {
             "description": "List of the active domains the key may access",
@@ -909,7 +909,7 @@
           "Domains"
         ],
         "summary": "Creates a new logical domain (isolated KV namespace).\nDomain names must be unique, max 50 chars, and match `[a-zA-Z0-9_-]`.\nWith `require_conditional_writes`, single-key writes over REST (PUT, DELETE, PATCH …/null) must\ncarry `If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.",
-        "operationId": "create_domain",
+        "operationId": "kv_create_domain",
         "requestBody": {
           "content": {
             "application/json": {
@@ -977,7 +977,7 @@
           "Domains"
         ],
         "summary": "Returns metadata for a single domain by name. Returns 404 if it does not exist.",
-        "operationId": "get_domain",
+        "operationId": "kv_get_domain",
         "parameters": [
           {
             "name": "name",
@@ -1017,7 +1017,7 @@
           "Domains"
         ],
         "summary": "Schedules a domain and all its data for deletion.\nThe domain becomes immediately inaccessible; the actual purge runs in the background.",
-        "operationId": "delete_domain",
+        "operationId": "kv_delete_domain",
         "parameters": [
           {
             "name": "name",
@@ -1130,7 +1130,7 @@
           "JSON Document Store"
         ],
         "summary": "Returns the active JSON domains. Admin keys see all of them; any other key\nsees only the JSON domains it has a permission on (an empty list without any).",
-        "operationId": "list_domains",
+        "operationId": "json_list_domains",
         "responses": {
           "200": {
             "description": "List of the active JSON domains the key may access",
@@ -1162,7 +1162,7 @@
           "JSON Document Store"
         ],
         "summary": "Creates a new JSON domain (isolated document namespace, separate from KV domains).\nWith `require_conditional_writes`, single-document writes over REST (PUT, DELETE) must carry\n`If-Match` or `If-None-Match: *`; bulk operations and other write paths are not affected.",
-        "operationId": "create_domain",
+        "operationId": "json_create_domain",
         "requestBody": {
           "content": {
             "application/json": {
@@ -1240,7 +1240,7 @@
           "JSON Document Store"
         ],
         "summary": "Returns metadata for a single JSON domain, including its document count.\nNeeds a permission on the domain (admin keys always pass). Domains in `deleting` state answer with 410 Gone.",
-        "operationId": "get_domain",
+        "operationId": "json_get_domain",
         "parameters": [
           {
             "name": "name",
@@ -1310,7 +1310,7 @@
           "JSON Document Store"
         ],
         "summary": "Marks a JSON domain as deleting. Documents become inaccessible immediately.",
-        "operationId": "delete_domain",
+        "operationId": "json_delete_domain",
         "parameters": [
           {
             "name": "name",
@@ -3951,7 +3951,7 @@
           "Relational Domains"
         ],
         "summary": "Returns the active relational domains. Admin keys see all of them; any\nother key sees only the relational domains it has a permission on (an empty\nlist without any).",
-        "operationId": "list_domains",
+        "operationId": "rel_list_domains",
         "responses": {
           "200": {
             "description": "List of the active relational domains the key may access",
@@ -3983,7 +3983,7 @@
           "Relational Domains"
         ],
         "summary": "Creates a new relational domain (isolated table/view namespace, separate\nfrom KV and JSON domains).",
-        "operationId": "create_domain",
+        "operationId": "rel_create_domain",
         "requestBody": {
           "content": {
             "application/json": {
@@ -4061,7 +4061,7 @@
           "Relational Domains"
         ],
         "summary": "Returns metadata for a single relational domain. Needs a permission on the\ndomain (admin keys always pass). A domain in `deleting` state answers 410\nGone (a background purge removes the data later).",
-        "operationId": "get_domain",
+        "operationId": "rel_get_domain",
         "parameters": [
           {
             "name": "name",
@@ -4131,7 +4131,7 @@
           "Relational Domains"
         ],
         "summary": "Marks a relational domain as deleting. Its tables/views become\ninaccessible immediately; physical cleanup follows in the background.",
-        "operationId": "delete_domain",
+        "operationId": "rel_delete_domain",
         "parameters": [
           {
             "name": "name",

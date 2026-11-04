@@ -92,7 +92,7 @@ fn write_blocked_response() -> utoipa::openapi::Response {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Breaking bumps the middle digit, anything else the last. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.14.2";
+pub const API_VERSION: &str = "0.14.3";
 
 struct VersionInfo;
 
@@ -162,7 +162,7 @@ pub fn create_router(state: AppState) -> Router {
         rel_engine: state.rel_engine.clone(),
     };
 
-    let mut store_router = Router::new()
+    let store_router = Router::new()
         // Effective configuration. No `{domain}` segment —
         // admin-only via the same extract_domain None-branch as /metrics.
         .route("/config", get(metrics::get_config))
@@ -218,7 +218,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/json/{domain}/reindex", post(json::trigger_reindex))
         .route("/json/{domain}/reindex/{task_id}", get(json::reindex_status))
         // Backup & Restore. Always registered — like the
-        // JSON engine (and unlike rel), `backup.enabled = false` is a
+        // JSON and relational engines, `backup.enabled = false` is a
         // handler-level 503, not a router-level absence, so on/off never
         // changes the contract's route surface.
         .route("/backups", post(backup::create_backup).get(backup::list_backups))
@@ -236,53 +236,42 @@ pub fn create_router(state: AppState) -> Router {
         // segment — admin-only via the same path-shape rule as `/metrics`,
         // `/backups*` etc. (auth::middleware::extract_domain returns `None`).
         .route("/events", get(events::get_events))
+        // Relational store (handlers answer 503 when the engine is disabled)
+        .route(
+            "/rel/domains",
+            post(rel_domains::create_domain).get(rel_domains::list_domains),
+        )
+        .route(
+            "/rel/domains/{name}",
+            get(rel_domains::get_domain).delete(rel_domains::delete_domain),
+        )
+        .route("/rel/{domain}/sql", post(rel::execute_sql))
+        // CSV/TSV file import: a body-size cap analogous
+        // to the JSON bulk route above, sized from the engine config; when
+        // the engine is disabled the default stays (route answers 503).
+        .route(
+            "/rel/{domain}/tables/from-file",
+            post(rel_import::create_table_from_file).layer(DefaultBodyLimit::max(
+                state.rel_engine.as_ref().map_or(64 * 1024 * 1024, |e| e.import_body_limit_bytes()),
+            )),
+        )
+        // Browse/Row REST surface
+        .route("/rel/{domain}/tables", get(rel_browse::list_tables))
+        .route("/rel/{domain}/tables/{table}", get(rel_browse::get_table))
+        .route("/rel/{domain}/views", get(rel_browse::list_views))
+        .route(
+            "/rel/{domain}/tables/{table}/rows",
+            get(rel_browse::browse_rows).post(rel_browse::insert_row),
+        )
+        .route(
+            "/rel/{domain}/tables/{table}/rows/{pk}",
+            get(rel_browse::get_row).put(rel_browse::update_row).delete(rel_browse::delete_row),
+        )
+        // Object counter: a level above the `rows`
+        // collection, not a static child of it — `/tables/count` still
+        // matches `{table}`, so a table literally named `count` stays reachable.
+        .route("/rel/{domain}/tables/{table}/count", get(rel_browse::count_rows))
         .with_state(state.clone());
-
-    // Relational store: registered *only* when the engine
-    // is enabled — unlike JSON, a disabled rel engine means the whole
-    // rel REST surface is absent (axum default 404), not a 503 per handler.
-    // A disabled engine means no rel data can exist at all, so conditional
-    // registration is the KISS choice: it keeps the router free of routes
-    // that could never do anything but reject.
-    if state.rel_engine.is_some() {
-        let rel_routes = Router::new()
-            .route(
-                "/rel/domains",
-                post(rel_domains::create_domain).get(rel_domains::list_domains),
-            )
-            .route(
-                "/rel/domains/{name}",
-                get(rel_domains::get_domain).delete(rel_domains::delete_domain),
-            )
-            .route("/rel/{domain}/sql", post(rel::execute_sql))
-            // CSV/TSV file import: a body-size cap analogous
-            // to the JSON bulk route below, sized from the engine config.
-            .route(
-                "/rel/{domain}/tables/from-file",
-                post(rel_import::create_table_from_file).layer(DefaultBodyLimit::max(
-                    state.rel_engine.as_ref().map_or(64 * 1024 * 1024, |e| e.import_body_limit_bytes()),
-                )),
-            )
-            // Browse/Row REST surface: registered in this
-            // same conditional sub-router, not a second merge point.
-            .route("/rel/{domain}/tables", get(rel_browse::list_tables))
-            .route("/rel/{domain}/tables/{table}", get(rel_browse::get_table))
-            .route("/rel/{domain}/views", get(rel_browse::list_views))
-            .route(
-                "/rel/{domain}/tables/{table}/rows",
-                get(rel_browse::browse_rows).post(rel_browse::insert_row),
-            )
-            .route(
-                "/rel/{domain}/tables/{table}/rows/{pk}",
-                get(rel_browse::get_row).put(rel_browse::update_row).delete(rel_browse::delete_row),
-            )
-            // Object counter: a level above the `rows`
-            // collection, not a static child of it — `/tables/count` still
-            // matches `{table}`, so a table literally named `count` stays reachable.
-            .route("/rel/{domain}/tables/{table}/count", get(rel_browse::count_rows))
-            .with_state(state.clone());
-        store_router = store_router.merge(rel_routes);
-    }
 
     let auth_router = Router::new()
         .route("/auth/whoami", get(crate::auth::handlers::whoami))
@@ -544,6 +533,22 @@ mod contract_tests {
              cargo run -- --dump-openapi > api/openapi.json — and check whether info.version \
              needs a bump."
         );
+    }
+
+    #[test]
+    fn operation_ids_are_unique() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let mut seen = std::collections::BTreeMap::new();
+        let mut duplicates = Vec::new();
+        for (path, item) in doc["paths"].as_object().expect("contract without paths") {
+            for (method, operation) in item.as_object().expect("path item is not an object") {
+                let Some(id) = operation["operationId"].as_str() else { continue };
+                if let Some(first) = seen.insert(id.to_string(), format!("{method} {path}")) {
+                    duplicates.push(format!("{id}: {first} and {method} {path}"));
+                }
+            }
+        }
+        assert!(duplicates.is_empty(), "duplicate operationIds: {duplicates:#?}");
     }
 
     #[test]

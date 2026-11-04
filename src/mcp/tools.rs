@@ -348,8 +348,7 @@ fn merge_domains(engines: &[&'static str], replies: &[Reply]) -> CallToolResult 
         if reply.body.is_none() {
             return too_large();
         }
-        // A disabled relational engine has no routes at all.
-        if matches!(reply.status, StatusCode::SERVICE_UNAVAILABLE | StatusCode::NOT_FOUND) {
+        if reply.status == StatusCode::SERVICE_UNAVAILABLE {
             unavailable.push(json!(engine));
             continue;
         }
@@ -710,7 +709,7 @@ mod tests {
                 "unavailable_engines": ["json"],
             }))
         );
-        let replies = [reply(200, "[]"), reply(200, "[]"), reply(404, "")];
+        let replies = [reply(200, "[]"), reply(200, "[]"), reply(503, "")];
         let result = plan.result(&replies);
         assert_eq!(result.structured_content, Some(json!({"domains": [], "unavailable_engines": ["rel"]})));
         let replies = [reply(200, "[]"), reply(500, "boom"), reply(200, "[]")];

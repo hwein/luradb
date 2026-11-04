@@ -93,11 +93,7 @@ impl From<RelStoreError> for ApiError {
     }
 }
 
-/// Resolves the rel engine or fails with 503 when `rel.enabled = false`. With
-/// conditional router registration (`create_router`) the rel routes
-/// don't even exist in that case, so this never actually fires in normal
-/// operation — kept as a defensive guard (parity with `json_engine`) in case
-/// a path is ever reachable while `rel_engine` is `None`.
+/// Resolves the rel engine or fails with 503 when `rel.enabled = false`.
 pub(crate) fn rel_engine(state: &AppState) -> Result<&Arc<RelEngine>, ApiError> {
     state.rel_engine.as_ref().ok_or_else(|| {
         ApiError::new(
@@ -322,7 +318,6 @@ mod tests {
     use axum::body::to_bytes;
     use axum::body::Body;
     use axum::http::{Method, Request};
-    use axum::response::IntoResponse;
     use tower::util::ServiceExt;
 
     /// `rel_config = None` ⇒ `rel.enabled = false`; `Some(cfg)` ⇒ enabled
@@ -965,23 +960,16 @@ mod tests {
         })
     }
 
-    // 17. Disabled engine: rel paths are not registered at all (404, axum
-    //     default for an unmatched route); the `rel_engine` guard itself
-    //     answers 503 when called directly (defensive path).
+    // 17. Disabled engine: the rel routes stay registered and answer 503.
     #[test]
-    fn test_disabled_engine_routes_absent_and_guard_503() {
+    fn test_disabled_engine_returns_503() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(None).await;
-            let (status, _) = request(&app, Method::GET, "/store-api/rel/domains", None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "route must not exist when rel.enabled = false");
+            let (status, body) = request(&app, Method::GET, "/store-api/rel/domains", None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(body.contains("relational engine is disabled (rel.enabled = false)"), "{body}");
             let (status, _) = sql(&app, "default", r#"{"sql": "SELECT 1"}"#).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
-
-            let (state, _dir2) = make_state(None, false).await;
-            match rel_engine(&state) {
-                Ok(_) => panic!("rel_engine guard must fail when rel_engine is None"),
-                Err(err) => assert_eq!(err.into_response().status(), StatusCode::SERVICE_UNAVAILABLE),
-            }
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         })
     }
 

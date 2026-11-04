@@ -4,6 +4,11 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- Config keys `storage.db_path`, `buffer_pool.pool_size` and `rate_limit.default_max_storage_bytes`; the server no longer creates the empty `luradb.db` page file. A `luradb.toml` that still sets them starts with a warning per key.
+- **BREAKING** API: GET /store-api/config no longer reports these three keys.
+
 ## [0.5.1] - 2026-11-03
 
 ### Added

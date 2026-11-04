@@ -20,8 +20,6 @@ pub struct DomainQuota {
     pub read_iops: u32,
     /// Max write operations per second.
     pub write_iops: u32,
-    /// Max storage bytes (0 = unlimited).
-    pub max_storage_bytes: u64,
 }
 
 impl Default for DomainQuota {
@@ -29,7 +27,6 @@ impl Default for DomainQuota {
         Self {
             read_iops: 1000,
             write_iops: 500,
-            max_storage_bytes: 0,
         }
     }
 }

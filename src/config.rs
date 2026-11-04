@@ -17,7 +17,6 @@ pub struct LuraConfig {
     pub storage: StorageConfig,
     pub resources: ResourcesConfig,
     pub io_engine: IoEngineConfig,
-    pub buffer_pool: BufferPoolConfig,
     pub lsm: LsmConfig,
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
@@ -68,7 +67,6 @@ impl LuraConfig {
         let [system_wal, system_vlog, system_sstables] = [system::WAL_FILE, system::VLOG_FILE, system::SSTABLE_DIR]
             .map(|name| Path::new(&self.storage.system_dir).join(name).to_string_lossy().into_owned());
         let mut entries: Vec<(&str, &str, bool)> = vec![
-            ("storage.db_path", self.storage.db_path.as_str(), false),
             ("storage.wal_path", self.storage.wal_path.as_str(), false),
             ("storage.vlog_path", self.storage.vlog_path.as_str(), true),
             ("storage.sstable_dir", self.storage.sstable_dir.as_str(), false),
@@ -317,7 +315,6 @@ impl ServerConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    pub db_path: String,
     pub wal_path: String,
     pub vlog_path: String,
     pub sstable_dir: String,
@@ -335,7 +332,6 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            db_path: "luradb.db".to_string(),
             wal_path: "luradb.wal".to_string(),
             vlog_path: "luradb.vlog".to_string(),
             sstable_dir: "luradb_sstables".to_string(),
@@ -530,18 +526,6 @@ pub struct IoEngineConfig {
     /// Enables the IoEngine's registered buffers (default: false). The storage
     /// thread runs either way.
     pub enabled: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct BufferPoolConfig {
-    pub pool_size: usize,
-}
-
-impl Default for BufferPoolConfig {
-    fn default() -> Self {
-        Self { pool_size: 1024 }
-    }
 }
 
 /// Block-cache sizing of one LSM instance. A parameter type, not a config
@@ -765,8 +749,6 @@ impl Default for DomainsConfig {
 pub struct RateLimitConfig {
     pub default_read_iops: u32,
     pub default_write_iops: u32,
-    /// `0` means no limit.
-    pub default_max_storage_bytes: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -774,7 +756,6 @@ impl Default for RateLimitConfig {
         Self {
             default_read_iops: 1000,
             default_write_iops: 500,
-            default_max_storage_bytes: 0,
         }
     }
 }
@@ -938,8 +919,7 @@ impl JsonStoreConfig {
 }
 
 /// Config for the relational engine's dedicated LSM instance (own paths &
-/// limits). No `db_path` — like the JSON engine, this LSM instance has no
-/// buffer-pool/DiskManager stack, so there is no database file to point at.
+/// limits).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RelStoreConfig {
@@ -1705,6 +1685,9 @@ pub(crate) const REMOVED_KEYS: &[&str] = &[
     "rel.block_cache.small_ratio",
     "rel.block_cache.ghost_capacity",
     "multicore.engine_queue_capacity",
+    "storage.db_path",
+    "buffer_pool.pool_size",
+    "rate_limit.default_max_storage_bytes",
 ];
 
 #[cfg(test)]
@@ -1715,7 +1698,7 @@ mod tests {
     // values have no effect.
     #[test]
     fn test_removed_keys_load_without_effect() {
-        assert_eq!(REMOVED_KEYS.len(), 73);
+        assert_eq!(REMOVED_KEYS.len(), 76);
         let toml_str: String = REMOVED_KEYS.iter().map(|key| format!("{key} = 1\n")).collect();
         let config: LuraConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(
@@ -1990,11 +1973,9 @@ mod tests {
         let config: LuraConfig = toml::from_str("").unwrap();
         assert_eq!(config.rate_limit.default_read_iops, 1000);
         assert_eq!(config.rate_limit.default_write_iops, 500);
-        assert_eq!(config.rate_limit.default_max_storage_bytes, 0);
         let quota = crate::engines::lsm::rate_limiter::DomainQuota::default();
         assert_eq!(quota.read_iops, config.rate_limit.default_read_iops);
         assert_eq!(quota.write_iops, config.rate_limit.default_write_iops);
-        assert_eq!(quota.max_storage_bytes, config.rate_limit.default_max_storage_bytes);
     }
 
     #[test]

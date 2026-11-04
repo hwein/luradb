@@ -934,7 +934,6 @@ mod tests {
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let mut cfg = LuraConfig::default();
         cfg.server.port = 0;
-        cfg.storage.db_path = path("luradb.db");
         cfg.storage.wal_path = path("luradb.wal");
         cfg.storage.vlog_path = path("luradb.vlog");
         cfg.storage.sstable_dir = path("sstables");
@@ -1261,8 +1260,13 @@ mod tests {
         (crate::control::system::open_with_wal(dir, hub.wal(WalTarget::Sys)).await.unwrap(), hub)
     }
 
+    /// The empty page file that older versions left in the data directory.
+    fn leftover_page_file(cfg: &LuraConfig) -> PathBuf {
+        PathBuf::from(&cfg.storage.vlog_path).with_file_name("luradb.db")
+    }
+
     /// A data directory from before the shard layout, its default domain
-    /// holding `key` in an SSTable.
+    /// holding `key` in an SSTable, with a leftover page file beside it.
     fn legacy_data_directory(cfg: &LuraConfig, key: &[u8]) {
         engine_runtime::block_on(async {
             let (kv, _hub) = open_kv_engine(cfg, None).await;
@@ -1277,7 +1281,7 @@ mod tests {
             registry.store("default").await.unwrap().put(key, "clé".as_bytes()).await.unwrap();
             kv.shutdown().await;
         });
-        std::fs::write(&cfg.storage.db_path, b"").unwrap();
+        std::fs::write(leftover_page_file(cfg), b"").unwrap();
     }
 
     // The first start moves the files of an older data directory into
@@ -1289,11 +1293,8 @@ mod tests {
         let mut cfg = test_config(dir.path());
         cfg.multicore.shards = 1;
         legacy_data_directory(&cfg, b"moved");
-        let (vlog, sstables, db) = (
-            PathBuf::from(&cfg.storage.vlog_path),
-            PathBuf::from(&cfg.storage.sstable_dir),
-            PathBuf::from(&cfg.storage.db_path),
-        );
+        let (vlog, sstables, db) =
+            (PathBuf::from(&cfg.storage.vlog_path), PathBuf::from(&cfg.storage.sstable_dir), leftover_page_file(&cfg));
         let legacy_tables: Vec<_> = std::fs::read_dir(&sstables).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert!(legacy_tables.iter().any(|name| name == "MANIFEST"), "{legacy_tables:?}");
 
@@ -1306,8 +1307,8 @@ mod tests {
             server.shutdown().unwrap();
             assert_eq!((status, value.as_slice()), (200, "clé".as_bytes()), "{start} start");
 
-            assert!(!vlog.exists() && !db.exists(), "{start} start");
-            assert!(layout::shard_file(&vlog, 0).is_file() && layout::shard_file(&db, 0).is_file(), "{start} start");
+            assert!(!vlog.exists() && layout::shard_file(&vlog, 0).is_file(), "{start} start");
+            assert!(db.is_file() && !layout::shard_file(&db, 0).exists(), "{start} start: the page file stays");
             for table in &legacy_tables {
                 assert!(!sstables.join(table).exists(), "{start} start: {table:?}");
             }
@@ -1638,6 +1639,16 @@ mod tests {
         }
     }
 
+    // A start creates no page file, in the data directory or in a shard's.
+    #[test]
+    fn a_start_creates_no_page_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let page_file = leftover_page_file(&cfg);
+        Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap().shutdown().unwrap();
+        assert!(!page_file.exists() && !layout::shard_file(&page_file, 0).exists());
+    }
+
     // A shard capacity the channel cannot take down must fail the
     // in-process start before the engines, SHM and background tasks are up.
     #[test]
@@ -1645,9 +1656,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cfg = test_config(dir.path());
         cfg.multicore.shard_queue_capacity = 0;
-        let db_path = PathBuf::from(cfg.storage.db_path.clone());
+        let system_dir = PathBuf::from(cfg.storage.system_dir.clone());
         assert!(Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).is_err());
-        assert!(!db_path.exists(), "the engine booted before the bridge channel existed");
+        assert!(!system_dir.exists(), "the engine booted before the bridge channel existed");
     }
 
     // A live keep-alive connection learns about the shutdown: hyper closes it

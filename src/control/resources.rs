@@ -931,7 +931,6 @@ pub fn fixed_memory(config: &LuraConfig, shards: u16) -> Vec<(&'static str, u64)
     let mut items = vec![
         ("memtables", memtables),
         ("block caches", (engines + 1) * block_cache),
-        ("buffer pool", (config.buffer_pool.pool_size * crate::core::page::PAGE_SIZE) as u64),
     ];
     if config.shm.enabled {
         items.push(("shared memory", 3 * config.shm.data_buffer_size as u64));
@@ -949,7 +948,7 @@ pub fn fixed_memory(config: &LuraConfig, shards: u16) -> Vec<(&'static str, u64)
 fn create_data_dirs(config: &LuraConfig, base: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let storage = &config.storage;
     let mut dirs = vec![&storage.sstable_dir, &storage.system_dir];
-    let mut files = vec![&storage.db_path, &storage.wal_path, &storage.vlog_path];
+    let mut files = vec![&storage.wal_path, &storage.vlog_path];
     for (enabled, wal, vlog, sstables) in [
         (config.json.enabled, &config.json.wal_path, &config.json.vlog_path, &config.json.sstable_dir),
         (config.rel.enabled, &config.rel.wal_path, &config.rel.vlog_path, &config.rel.sstable_dir),
@@ -1174,7 +1173,6 @@ pub(crate) mod tests {
     pub(crate) fn config_in(dir: &Path) -> LuraConfig {
         let mut config = LuraConfig::default();
         let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
-        config.storage.db_path = at("db/luradb.db");
         config.storage.wal_path = at("wal/luradb.wal");
         config.storage.vlog_path = at("data/luradb.vlog");
         config.storage.sstable_dir = at("data/sstables");
@@ -1647,7 +1645,7 @@ pub(crate) mod tests {
         let refused = err.downcast_ref::<NoRoomToRecover>().expect("NoRoomToRecover");
         assert_eq!(refused.needed, 3000);
         assert!(err.to_string().starts_with("not enough free disk space to recover"), "{err}");
-        for name in ["db", "data/sstables", "data/sys", "wal"] {
+        for name in ["data/sstables", "data/sys", "wal"] {
             assert!(dir.path().join(name).is_dir(), "{name}");
         }
         assert!(!probe.asked.lock().is_empty() && probe.asked.lock().iter().all(|(_, existed)| *existed));

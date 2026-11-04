@@ -76,7 +76,7 @@ The `[multicore]` keys size each part; `0` is automatic:
 
 On 12 cores with a new data directory that is 2 frontend workers, 3 data shards and 5 reader threads; the start log (`journalctl -u luradb`) reports the split and the memory of each shard.
 
-Memory: the block cache of each engine (64 MiB) and the buffer pool (`buffer_pool.pool_size`) are split evenly across the shards; the MemTable threshold (`lsm.memtable_size_threshold`) applies per engine and shard, so MemTable memory grows to engines × shards × threshold (plus MemTables being flushed).
+Memory: the block cache of each engine (64 MiB) is split evenly across the shards; the MemTable threshold (`lsm.memtable_size_threshold`) applies per engine and shard, so MemTable memory grows to engines × shards × threshold (plus MemTables being flushed).
 
 The shard count belongs to the data directory: with `shards = 0` the service keeps the count the data was written with, also after an upgrade or a move to a host with another core count; a different count set explicitly refuses the start. Only the migration tool changes it.
 

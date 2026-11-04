@@ -137,7 +137,7 @@ async fn run(config: &LuraConfig, sys: &LsmStorageEngine, hub: &StorageHandle, s
     let from = system::stored_shard_count(sys).await?.context(NOT_SHARDED)?;
     let engines: Vec<(Engine, EngineFiles)> =
         engine_files(config).into_iter().filter(|(_, files)| holds_data(files, from)).collect();
-    let roots = roots(config, engines.iter().map(|(_, files)| files));
+    let roots = roots(engines.iter().map(|(_, files)| files));
     for root in &roots {
         remove_stale_staging(root)?;
     }
@@ -186,12 +186,12 @@ fn parent(path: &Path) -> PathBuf {
     }
 }
 
-/// The directories holding `shard_<k>/` directories: the page files', and
-/// the value logs' and SSTables' of the engines on `files`. One entry per
-/// directory, however the config spells it (absolute and relative to the
-/// working directory name the same one).
-fn roots<'a>(config: &LuraConfig, files: impl Iterator<Item = &'a EngineFiles>) -> Vec<PathBuf> {
-    let mut roots = vec![parent(Path::new(&config.storage.db_path))];
+/// The directories holding `shard_<k>/` directories: the value logs' and
+/// SSTables' of the engines on `files`. One entry per directory, however the
+/// config spells it (absolute and relative to the working directory name the
+/// same one).
+fn roots<'a>(files: impl Iterator<Item = &'a EngineFiles>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     for files in files {
         roots.push(parent(&files.vlog));
         roots.push(files.sstables.clone());
@@ -281,7 +281,7 @@ async fn build(
             std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
     }
-    let memory = MemorySplit::of(config, marker.shards);
+    let memory = MemorySplit::of(marker.shards);
     for (engine, files) in engines {
         let wal = Arc::new(WriteAheadLog::with_storage_handle(hub.clone(), (*engine).into()));
         copy(files, from, marker, &wal, || options(config, *engine, &memory))
@@ -503,8 +503,8 @@ mod tests {
             std::fs::create_dir_all(dir.join(root)).unwrap();
             dir.join(root).join(name).to_string_lossy().into_owned()
         };
-        (cfg.storage.db_path, cfg.storage.wal_path) = (at("kv", "luradb.db"), at("kv", "luradb.wal"));
-        (cfg.storage.vlog_path, cfg.storage.sstable_dir) = (at("kv", "luradb.vlog"), at("kv", "sstables"));
+        (cfg.storage.wal_path, cfg.storage.vlog_path) = (at("kv", "luradb.wal"), at("kv", "luradb.vlog"));
+        cfg.storage.sstable_dir = at("kv", "sstables");
         (cfg.json.wal_path, cfg.json.vlog_path, cfg.json.sstable_dir) =
             (at("json", "json.wal"), at("json", "json.vlog"), at("json", "sstables"));
         (cfg.rel.wal_path, cfg.rel.vlog_path, cfg.rel.sstable_dir) =
@@ -655,8 +655,6 @@ mod tests {
         let data = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(data.join("sstables")).unwrap();
         std::fs::create_dir_all(data.join("luradb_json_sstables")).unwrap();
-        let mut cfg = config(dir.path(), 2);
-        cfg.storage.db_path = data.join("luradb.db").to_string_lossy().into_owned();
         let files = [
             EngineFiles {
                 wal: data.join("luradb.wal"),
@@ -670,7 +668,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            roots(&cfg, files.iter()),
+            roots(files.iter()),
             vec![data.clone(), data.join("luradb_json_sstables"), data.join("sstables")]
         );
     }

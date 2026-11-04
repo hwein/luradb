@@ -17,13 +17,9 @@ name = "admin"
 api_key = "lura_changeme_in_production"
 
 [storage]
-db_path = "luradb.db"
 wal_path = "luradb.wal"
 vlog_path = "luradb.vlog"
 sstable_dir = "luradb_sstables"
-
-[buffer_pool]
-pool_size = 1024
 
 [lsm]
 vlog_inline_threshold = 1024
@@ -68,7 +64,6 @@ max_bulk_delete_keys = 10000
 [rate_limit]
 default_read_iops = 1000
 default_write_iops = 500
-default_max_storage_bytes = 0
 
 [rel]
 # Body-size cap for POST .../tables/from-file.

@@ -10,8 +10,6 @@ use crate::{
     config::LuraConfig,
     control::{self, slots, Engine, ShardCommand, ShardOwners},
     core::{
-        buffer_pool::BufferPoolManager,
-        disk_manager::DiskManager,
         engine_runtime,
         io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID},
     },
@@ -40,7 +38,6 @@ pub(super) struct ShardBoot {
     pub(super) kv: Arc<LsmStorageEngine>,
     pub(super) json: Option<Arc<LsmStorageEngine>>,
     pub(super) rel: Option<Arc<LsmStorageEngine>>,
-    pub(super) buffer_pool_pages: usize,
     pub(super) jobs: mpsc::Receiver<Job>,
     pub(super) commands: mpsc::UnboundedReceiver<ShardCommand>,
     /// The shard's engines once they are up.
@@ -77,7 +74,6 @@ pub(super) fn spawn(boot: ShardBoot, frontend: tokio::runtime::Handle) -> anyhow
 /// The shard's engine instances and the storage stack beside them.
 struct Storage {
     instances: Vec<(Engine, Arc<LsmStorageEngine>)>,
-    buffer_pool: Option<Arc<BufferPoolManager>>,
     /// Registered buffers and files stay alive for the whole run; dropping
     /// this closes their descriptors (a blocking `close(2)` each).
     io_engine: Option<IoEngine>,
@@ -90,7 +86,7 @@ async fn run(boot: ShardBoot) {
     for (_, instance) in &instances {
         instance.start_background_tasks();
     }
-    let mut storage = Storage { instances, buffer_pool: None, io_engine: None };
+    let mut storage = Storage { instances, io_engine: None };
     let opened = open(&mut storage, &boot).await;
     let ShardBoot { config, jobs, commands, ready, start, .. } = boot;
     #[cfg(test)]
@@ -147,18 +143,15 @@ async fn run(boot: ShardBoot) {
     drop(storage.io_engine);
 }
 
-/// Puts the page store, the registered buffers (shard 0 of a single one
-/// only) and the domain layers, with a metrics store of their own, on the
-/// shard's instances. Only the shard that owns the default domain creates it.
+/// Puts the registered buffers (shard 0 of a single one only) and the domain
+/// layers, with a metrics store of their own, on the shard's instances. Only
+/// the shard that owns the default domain creates it.
 async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOwners> {
-    let ShardBoot { shard, shards, config, kv, json, rel, buffer_pool_pages, .. } = boot;
+    let ShardBoot { shard, shards, config, kv, json, rel, .. } = boot;
     let (shard, shards) = (*shard, *shards);
     let metrics = MetricsStore::new(MetricsConfig::default());
     let owns = |name: &str| usize::from(slots::shard_of_domain(name, shards)) == shard;
 
-    let db_path = layout::shard_file(Path::new(&config.storage.db_path), shard);
-    let disk_manager = DiskManager::new(&db_path).await?;
-    storage.buffer_pool = Some(Arc::new(BufferPoolManager::new(*buffer_pool_pages, disk_manager)));
     if shard == 0 && shards == 1 {
         let vlog_path = layout::shard_file(Path::new(&config.storage.vlog_path), 0);
         storage.io_engine = init_io_engine(config, &vlog_path).await;
@@ -190,7 +183,6 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
             let quota = DomainQuota {
                 read_iops: config.rate_limit.default_read_iops,
                 write_iops: config.rate_limit.default_write_iops,
-                max_storage_bytes: config.rate_limit.default_max_storage_bytes,
             };
             let owns_default = owns(rel_domain::DEFAULT_DOMAIN);
             Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(&metrics), resolver, owns_default).await?)
@@ -201,18 +193,12 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
 }
 
 /// Stops the instances' background tasks and flushes each instance once its
-/// writes in flight have applied, then the page store; the result of each
-/// instance's flush.
+/// writes in flight have applied; the result of each instance's flush.
 async fn close(storage: &Storage) -> Vec<(Engine, anyhow::Result<()>)> {
     let mut flushed = Vec::with_capacity(storage.instances.len());
     for (engine, instance) in &storage.instances {
         instance.quiesce_writes().await;
         flushed.push((*engine, instance.shutdown_flush().await));
-    }
-    if let Some(buffer_pool) = &storage.buffer_pool {
-        if let Err(e) = buffer_pool.flush_all_pages().await {
-            tracing::error!("Failed to flush pages: {}", e);
-        }
     }
     flushed
 }
@@ -414,7 +400,7 @@ mod tests {
             });
             hook.reached.notified().await;
 
-            let storage = Storage { instances: vec![(Engine::Kv, Arc::clone(&kv))], buffer_pool: None, io_engine: None };
+            let storage = Storage { instances: vec![(Engine::Kv, Arc::clone(&kv))], io_engine: None };
             let shutdown = compio::runtime::spawn(async move {
                 loops.stop().await;
                 close(&storage).await

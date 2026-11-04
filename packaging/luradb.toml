@@ -48,8 +48,6 @@ api_key = "@GENERATED_ON_INSTALL@"
 # Files of the key-value engine and the system store. Relative paths resolve
 # against the working directory; no two data paths may resolve to the same location.
 [storage]
-# Page file of the buffer pool. Default: luradb.db
-db_path = "/var/lib/luradb/luradb.db"
 # Write-ahead log: a directory of segment files of about 64 MiB each, which the server
 # creates, writes and deletes; never change anything in it by hand. The path may be a
 # symlink, the segments then lie at its target. A log file of an earlier LuraDB version
@@ -130,10 +128,6 @@ reader_threads = 0
 # count. At least 1.
 reader_queue_capacity = 4096
 
-[buffer_pool]
-# Pages (4 KiB each) the buffer pool keeps in memory.
-pool_size = 1024
-
 # LSM storage of the key-value engine.
 [lsm]
 # Values of at least this many bytes go to the value log instead of the SSTables.
@@ -205,8 +199,6 @@ max_bulk_delete_keys = 10000
 default_read_iops = 1000
 # Writes per second per domain.
 default_write_iops = 500
-# Stored bytes per domain; 0 means no limit.
-default_max_storage_bytes = 0
 
 # JSON document engine with its own LSM storage.
 [json]

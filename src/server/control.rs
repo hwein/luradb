@@ -208,17 +208,11 @@ impl Cluster {
 pub(super) struct MemorySplit {
     /// Block cache of each engine instance; an engine's budget splits evenly.
     block_cache_bytes: usize,
-    /// Pages of each shard's buffer pool.
-    buffer_pool_pages: usize,
 }
 
 impl MemorySplit {
-    pub(super) fn of(config: &LuraConfig, shards: u16) -> Self {
-        let shards = usize::from(shards);
-        Self {
-            block_cache_bytes: BlockCacheConfig::default().capacity_bytes / shards,
-            buffer_pool_pages: (config.buffer_pool.pool_size / shards).max(1),
-        }
+    pub(super) fn of(shards: u16) -> Self {
+        Self { block_cache_bytes: BlockCacheConfig::default().capacity_bytes / usize::from(shards) }
     }
 
     pub(super) fn block_cache(&self) -> BlockCacheConfig {
@@ -232,10 +226,9 @@ impl MemorySplit {
             .map(|shard| {
                 format!(
                     "Shard {shard}: block cache {} KiB per engine; MemTable threshold {} bytes per engine; \
-                     buffer pool {} pages; registered I/O buffers {}.",
+                     registered I/O buffers {}.",
                     self.block_cache_bytes / 1024,
                     config.lsm.memtable_size_threshold,
-                    self.buffer_pool_pages,
                     if io_engine && shard == 0 { "on" } else { "off" }
                 )
             })
@@ -303,7 +296,7 @@ async fn bootstrap(
 
     // Every log is recovered once, onto the instances of all shards, and cut
     // back only once every engine has flushed what it recovered.
-    let memory = MemorySplit::of(config, shards);
+    let memory = MemorySplit::of(shards);
     for line in memory.report(config, shards) {
         tracing::info!("{line}");
     }
@@ -367,7 +360,6 @@ async fn bootstrap(
             kv: Arc::clone(&kv[k]),
             json: json.as_ref().map(|json| Arc::clone(&json[k])),
             rel: rel.as_ref().map(|rel| Arc::clone(&rel[k])),
-            buffer_pool_pages: memory.buffer_pool_pages,
             jobs,
             commands: commands_rx,
             ready,
@@ -569,7 +561,6 @@ pub(super) fn domain_config(cfg: &LuraConfig) -> DomainConfig {
         default_domain: cfg.domains.default_domain.clone(),
         default_read_iops: cfg.rate_limit.default_read_iops,
         default_write_iops: cfg.rate_limit.default_write_iops,
-        default_max_storage_bytes: cfg.rate_limit.default_max_storage_bytes,
         purger_batch_size: cfg.domains.purger_batch_size,
         purger_interval_secs: cfg.domains.purger_interval_secs,
         max_bulk_delete_keys: cfg.domains.max_bulk_delete_keys,
@@ -780,21 +771,16 @@ fn start_shm(cfg: &LuraConfig, manager: &Arc<ShmManager>, state: &AppState) -> a
 mod tests {
     use super::*;
 
-    // The block cache of each engine and the buffer pool split evenly
-    // across the shards; the MemTable threshold stays per instance.
+    // The block cache of each engine splits evenly across the shards; the
+    // MemTable threshold stays per instance.
     #[test]
     fn the_memory_budgets_split_across_the_shards() {
-        let mut config = LuraConfig::default();
-        config.buffer_pool.pool_size = 1024;
-        let one = MemorySplit::of(&config, 1);
-        assert_eq!((one.block_cache_bytes, one.buffer_pool_pages), (64 * 1024 * 1024, 1024));
-        let four = MemorySplit::of(&config, 4);
-        assert_eq!((four.block_cache_bytes, four.buffer_pool_pages), (16 * 1024 * 1024, 256));
+        let config = LuraConfig::default();
+        assert_eq!(MemorySplit::of(1).block_cache_bytes, 64 * 1024 * 1024);
+        let four = MemorySplit::of(4);
+        assert_eq!(four.block_cache_bytes, 16 * 1024 * 1024);
         assert_eq!(four.block_cache().capacity_bytes, 16 * 1024 * 1024);
         assert_eq!(kv_options(&config, &four).engine.memtable_size_threshold, config.lsm.memtable_size_threshold);
-
-        config.buffer_pool.pool_size = 3;
-        assert_eq!(MemorySplit::of(&config, 4).buffer_pool_pages, 1, "every shard keeps a page");
     }
 
     // The start log reports each shard's share; registered I/O buffers stay
@@ -802,23 +788,22 @@ mod tests {
     #[test]
     fn the_start_log_reports_the_split_of_every_shard() {
         let mut config = LuraConfig::default();
-        config.buffer_pool.pool_size = 1024;
         config.lsm.memtable_size_threshold = 4_194_304;
         config.io_engine.enabled = true;
         assert_eq!(
-            MemorySplit::of(&config, 2).report(&config, 2),
+            MemorySplit::of(2).report(&config, 2),
             [
                 "Shard 0: block cache 32768 KiB per engine; MemTable threshold 4194304 bytes per engine; \
-                 buffer pool 512 pages; registered I/O buffers off.",
+                 registered I/O buffers off.",
                 "Shard 1: block cache 32768 KiB per engine; MemTable threshold 4194304 bytes per engine; \
-                 buffer pool 512 pages; registered I/O buffers off.",
+                 registered I/O buffers off.",
                 "io_engine.enabled has no effect with more than one data shard.",
             ]
         );
         assert_eq!(
-            MemorySplit::of(&config, 1).report(&config, 1),
+            MemorySplit::of(1).report(&config, 1),
             ["Shard 0: block cache 65536 KiB per engine; MemTable threshold 4194304 bytes per engine; \
-              buffer pool 1024 pages; registered I/O buffers on."]
+              registered I/O buffers on."]
         );
     }
 }

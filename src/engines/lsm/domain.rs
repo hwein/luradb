@@ -96,7 +96,6 @@ pub struct DomainConfig {
     pub default_domain: String,
     pub default_read_iops: u32,
     pub default_write_iops: u32,
-    pub default_max_storage_bytes: u64,
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
     pub max_bulk_delete_keys: usize,
@@ -110,7 +109,6 @@ impl Default for DomainConfig {
             default_domain: "default".to_string(),
             default_read_iops: 1000,
             default_write_iops: 500,
-            default_max_storage_bytes: 0,
             purger_batch_size: 100,
             purger_interval_secs: 5,
             max_bulk_delete_keys: 10_000,
@@ -334,7 +332,6 @@ impl DomainRegistry {
         DomainRuntime::new(DomainQuota {
             read_iops: self.config.default_read_iops,
             write_iops: self.config.default_write_iops,
-            max_storage_bytes: self.config.default_max_storage_bytes,
         })
     }
 

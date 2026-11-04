@@ -992,6 +992,22 @@ mod tests {
         })
     }
 
+    #[test]
+    fn test_unsupported_select_constructs_return_400_with_reason() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            for (stmt, reason) in [
+                ("SELECT DISTINCT id FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT * FROM t INNER JOIN u ON t.id = u.id", "only LEFT JOIN is supported; INNER JOIN is not"),
+            ] {
+                let (status, body) = sql(&app, "default", &json!({ "sql": stmt }).to_string()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{stmt}");
+                let text = body["_raw"].as_str().unwrap_or_default();
+                assert!(text.contains(reason), "{stmt}: {text}");
+            }
+        })
+    }
+
     // Middleware auth over real rel routes. A Read grant
     // passes a SELECT via /sql (the middleware's /sql exception only demands
     // Read) but the handler's enforce_sql_level still blocks DDL — that's the

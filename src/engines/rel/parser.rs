@@ -24,19 +24,34 @@ const MAX_EXPR_DEPTH: usize = 100;
 
 /// Parses one full statement (with an optional single trailing `;`) from
 /// already-lexed `(Token, byte_pos)` pairs. Empty input → `EmptyStatement`;
-/// leftover tokens after the statement (and its optional `;`) →
-/// `MultipleStatements`.
+/// a second statement (tokens after a `;`, or a statement keyword right after
+/// the first) → `MultipleStatements`; any other leftover token → `Syntax`.
 pub fn parse(tokens: &[(Token, usize)]) -> Result<Statement, RelStoreError> {
     if tokens.is_empty() {
         return Err(RelStoreError::EmptyStatement);
     }
     let mut p = Parser { tokens, pos: 0, depth: 0 };
     let stmt = p.parse_statement()?;
-    p.eat_punct(&Token::Semicolon);
-    if !p.at_eof() {
+    let had_semicolon = p.eat_punct(&Token::Semicolon);
+    if p.at_eof() {
+        return Ok(stmt);
+    }
+    let starts_statement = matches!(
+        p.peek(),
+        Some(Token::Keyword(
+            Keyword::Create
+                | Keyword::Alter
+                | Keyword::Drop
+                | Keyword::Insert
+                | Keyword::Update
+                | Keyword::Delete
+                | Keyword::Select
+        ))
+    );
+    if had_semicolon || starts_statement {
         return Err(RelStoreError::MultipleStatements);
     }
-    Ok(stmt)
+    Err(p.err(format!("unexpected {} after the end of the statement", p.describe_current())))
 }
 
 struct Parser<'a> {
@@ -436,6 +451,9 @@ impl<'a> Parser<'a> {
 
     fn parse_select(&mut self) -> Result<Select, RelStoreError> {
         self.expect_kw(Keyword::Select)?;
+        if self.peek() == Some(&Token::Keyword(Keyword::Distinct)) {
+            return Err(self.err("DISTINCT is not supported by LuraSQL"));
+        }
         let items = self.parse_select_list()?;
         self.expect_kw(Keyword::From)?;
         let from = self.parse_table_ref()?;
@@ -450,9 +468,32 @@ impl<'a> Parser<'a> {
             let right = self.parse_column_ref()?;
             joins.push(Join { table, left, right });
         }
+        let other_join = match self.peek() {
+            Some(Token::Keyword(Keyword::Join)) => Some("JOIN without LEFT".to_string()),
+            Some(Token::Keyword(kw @ (Keyword::Inner | Keyword::Right | Keyword::Full | Keyword::Cross))) => {
+                Some(format!("{} JOIN", kw.as_str()))
+            }
+            _ => None,
+        };
+        if let Some(what) = other_join {
+            return Err(self.err(format!(
+                "only LEFT JOIN is supported; {what} is not (use LEFT JOIN and a WHERE on the joined column)"
+            )));
+        }
         let where_clause = self.try_parse_where()?;
         let order_by = self.try_parse_order_by()?;
         let limit = self.try_parse_limit()?;
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Group)) => {
+                return Err(self.err(
+                    "GROUP BY is not supported by LuraSQL; COUNT(*) without GROUP BY is the only aggregate",
+                ));
+            }
+            Some(Token::Keyword(
+                kw @ (Keyword::Having | Keyword::Union | Keyword::Except | Keyword::Intersect),
+            )) => return Err(self.err(format!("{} is not supported by LuraSQL", kw.as_str()))),
+            _ => {}
+        }
         Ok(Select {
             items,
             from,
@@ -737,6 +778,76 @@ mod tests {
         ));
         assert!(matches!(parse_sql(""), Err(RelStoreError::EmptyStatement)));
         assert!(matches!(parse_sql("   \t\n"), Err(RelStoreError::EmptyStatement)));
+    }
+
+    fn syntax_msg(sql: &str) -> String {
+        match parse_sql(sql) {
+            Err(RelStoreError::Syntax { msg, .. }) => msg,
+            other => panic!("expected Syntax error for {sql:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_distinct_is_rejected() {
+        assert_eq!(syntax_msg("SELECT DISTINCT a FROM t"), "DISTINCT is not supported by LuraSQL");
+        assert_eq!(syntax_msg("select distinct * from t"), "DISTINCT is not supported by LuraSQL");
+    }
+
+    #[test]
+    fn test_join_types_other_than_left_are_rejected() {
+        for kw in ["INNER", "RIGHT", "FULL", "CROSS"] {
+            let msg = syntax_msg(&format!("SELECT * FROM a {kw} JOIN b ON a.id = b.id"));
+            assert_eq!(
+                msg,
+                format!(
+                    "only LEFT JOIN is supported; {kw} JOIN is not (use LEFT JOIN and a WHERE on the joined column)"
+                )
+            );
+        }
+        assert_eq!(
+            syntax_msg("SELECT * FROM a JOIN b ON a.id = b.id"),
+            "only LEFT JOIN is supported; JOIN without LEFT is not (use LEFT JOIN and a WHERE on the joined column)"
+        );
+        assert!(syntax_msg("SELECT * FROM a LEFT JOIN b ON a.id = b.id INNER JOIN c ON b.id = c.id")
+            .contains("INNER JOIN is not"));
+    }
+
+    #[test]
+    fn test_unsupported_trailing_clauses_are_rejected() {
+        assert_eq!(
+            syntax_msg("SELECT a FROM t GROUP BY a"),
+            "GROUP BY is not supported by LuraSQL; COUNT(*) without GROUP BY is the only aggregate"
+        );
+        assert_eq!(
+            syntax_msg("SELECT a FROM t WHERE a = 1 ORDER BY a LIMIT 5 OFFSET 1 GROUP BY a"),
+            "GROUP BY is not supported by LuraSQL; COUNT(*) without GROUP BY is the only aggregate"
+        );
+        for kw in ["HAVING", "UNION", "EXCEPT", "INTERSECT"] {
+            assert_eq!(
+                syntax_msg(&format!("SELECT a FROM t LIMIT 5 {kw} SELECT a FROM u")),
+                format!("{kw} is not supported by LuraSQL")
+            );
+        }
+        assert_eq!(syntax_msg("SELECT a FROM t UNION SELECT a FROM u"), "UNION is not supported by LuraSQL");
+    }
+
+    #[test]
+    fn test_stray_tokens_after_statement_are_syntax_errors() {
+        let msg = syntax_msg("SELECT * FROM t FROM u");
+        assert_eq!(msg, "unexpected FROM after the end of the statement");
+        assert_eq!(
+            syntax_msg("SELECT * FROM t WHERE a = 1 b"),
+            "unexpected identifier 'b' after the end of the statement"
+        );
+        assert!(matches!(
+            parse_sql("SELECT * FROM t; SELECT * FROM t"),
+            Err(RelStoreError::MultipleStatements)
+        ));
+        assert!(matches!(
+            parse_sql("SELECT * FROM t SELECT * FROM u"),
+            Err(RelStoreError::MultipleStatements)
+        ));
+        assert!(matches!(parse_sql("SELECT * FROM t; FROM u"), Err(RelStoreError::MultipleStatements)));
     }
 
     // 4. CREATE TABLE with every constraint kind parses to the right AST.

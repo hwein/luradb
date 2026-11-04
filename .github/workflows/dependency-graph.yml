@@ -1,0 +1,34 @@
+name: Dependency graph
+
+# GitHub reads Cargo.lock on its own, but that parse has gone stale before and
+# raised Dependabot alerts for crate versions long gone from the lockfile.
+# Every push that changes the lockfile submits a snapshot built from the real
+# Cargo.lock, so the graph and its alerts match what is actually built.
+# Dependabot evaluates the default branch (main); the snapshot for next only
+# keeps that branch's graph current for pull-request dependency review.
+on:
+  push:
+    branches: [main, next]
+    paths:
+      - "Cargo.lock"
+      - "scripts/dependency-snapshot.sh"
+      - ".github/workflows/dependency-graph.yml"
+  workflow_dispatch:
+
+# Submitting a snapshot writes to the repository's dependency graph.
+permissions:
+  contents: write
+
+jobs:
+  submit:
+    name: Submit snapshot
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+
+      - name: Build and submit snapshot
+        run: |
+          scripts/dependency-snapshot.sh > snapshot.json
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/dependency-graph/snapshots" --input snapshot.json

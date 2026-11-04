@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING** API: with `server.swagger_enabled = true`, the Swagger UI, its assets and `/api-docs/openapi.json` are served without an API key also when `auth.enabled = true`; the API calls made from the UI still need one.
+
 ### Removed
 
 - Config keys `storage.db_path`, `buffer_pool.pool_size` and `rate_limit.default_max_storage_bytes`; the server no longer creates the empty `luradb.db` page file. A `luradb.toml` that still sets them starts with a warning per key.

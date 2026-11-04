@@ -1,5 +1,6 @@
 [server]
-# Serves the Swagger UI and /api-docs/openapi.json; with auth on, they need a valid key.
+# Serves the Swagger UI and /api-docs/openapi.json without a key, also with auth on;
+# the API calls made from the UI still need one.
 swagger_enabled = false
 # URL path of the Swagger UI.
 swagger_url = "/test-ui"

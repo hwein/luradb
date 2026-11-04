@@ -247,11 +247,9 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
     /// Set to `true` to enable the Swagger UI + `/api-docs/openapi.json`
-    /// (default: `false`, safe for production). When `auth.enabled = true`,
-    /// these docs routes require the same "any valid key, no domain
-    /// permission" check as `GET /version` (enforced by
-    /// `auth::middleware::docs_auth_layer`) — when auth is
-    /// disabled, they're served openly like everything else.
+    /// (default: `false`, safe for production). The UI, its assets and the
+    /// contract are served without a key even with auth on; the API calls
+    /// the UI makes need one like any other request.
     pub swagger_enabled: bool,
     /// URL path at which Swagger UI is served (default: `/test-ui`).
     pub swagger_url: String,

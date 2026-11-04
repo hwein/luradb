@@ -22,15 +22,14 @@ pub use migrate::migrate_shards;
 
 use crate::{
     api::{self, middleware::ParsedCidr, ApiDoc},
-    auth::{middleware::docs_auth_layer, AuthCache},
+    auth::AuthCache,
     bridge::{self, EngineDispatch, Job, Lane, ShardRouter},
     config::LuraConfig,
     core::{coop, engine_runtime},
     cors, tls, uds,
 };
 use axum::{
-    extract::connect_info::ConnectInfo, http::Extensions, middleware::from_fn_with_state, response::Json,
-    routing::get, Router,
+    extract::connect_info::ConnectInfo, http::Extensions, response::Json, routing::get, Router,
 };
 use control::Ready;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -292,20 +291,16 @@ fn build_router(
     let mut app = Router::new();
 
     if cfg.server.swagger_enabled {
-        // Swagger UI is registered here, not inside api::create_router, so it
-        // needs its own auth layer — the router-contract gate would
-        // otherwise trip on docs routes with no contract entry.
-        // `docs_auth_layer` wraps this whole sub-router, so every path
-        // SwaggerUi registers under `swagger_url` (index, redirect, static
-        // assets) is covered without listing them individually.
-        let mut docs_router = Router::new().merge(
+        // Swagger UI is registered here, not inside api::create_router, so the
+        // router-contract gate does not trip on docs routes with no contract
+        // entry. The UI, its assets and openapi.json are served without a key:
+        // a browser cannot send one for the page itself, and the key the UI's
+        // "Authorize" button collects goes to the API calls, which the
+        // frontend auth layer checks like any other request.
+        app = app.merge(
             SwaggerUi::new(cfg.server.swagger_url.clone())
                 .url("/api-docs/openapi.json", ApiDoc::openapi()),
         );
-        if cfg.auth.enabled {
-            docs_router = docs_router.layer(from_fn_with_state(Arc::clone(&auth_cache), docs_auth_layer));
-        }
-        app = app.merge(docs_router);
     }
 
     if cfg.server.hello_enabled {
@@ -818,11 +813,10 @@ mod tests {
         (state, dir)
     }
 
-    // The CorsLayer must sit outside both
-    // the frontend auth_layer AND the Swagger sub-router's docs_auth_layer.
-    // Regression-critical: if the layer moved inward (e.g. into
-    // create_router), a request to the Swagger docs route would never reach
-    // it — docs_auth_layer would 401 first, with no CORS header.
+    // The CorsLayer must sit outside the frontend auth_layer, covering the
+    // Swagger routes too. Regression-critical: if the layer moved inward
+    // (e.g. into create_router), the docs routes would never reach it and a
+    // 401 from the API would carry no CORS header.
     #[test]
     fn cors_layer_wraps_swagger_and_survives_401() {
         crate::core::engine_runtime::block_on(async {
@@ -837,8 +831,7 @@ mod tests {
             let ship = ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]);
             let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
 
-            // (a) Preflight without Authorization -> 200 with the CORS header,
-            // even though this path sits behind docs_auth_layer.
+            // (a) Preflight without Authorization -> 200 with the CORS header.
             let resp = app
                 .clone()
                 .oneshot(
@@ -858,13 +851,32 @@ mod tests {
                 "https://example.com"
             );
 
-            // (b) GET with an allowed Origin but no Authorization -> 401 from
-            // docs_auth_layer, but still carrying the CORS header — proof the
+            // (b) GET on the docs route with an allowed Origin -> 200 with the
+            // CORS header.
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api-docs/openapi.json")
+                        .header("origin", "https://example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("access-control-allow-origin").unwrap(),
+                "https://example.com"
+            );
+
+            // (c) GET on an API route without Authorization -> 401 from the
+            // frontend auth layer, still carrying the CORS header — proof the
             // layer sits outside that auth check, not inside it.
             let resp = app
                 .oneshot(
                     Request::builder()
-                        .uri("/api-docs/openapi.json")
+                        .uri("/version")
                         .header("origin", "https://example.com")
                         .body(Body::empty())
                         .unwrap(),
@@ -876,6 +888,37 @@ mod tests {
                 resp.headers().get("access-control-allow-origin").unwrap(),
                 "https://example.com"
             );
+        })
+    }
+
+    // The Swagger UI, its assets and openapi.json are served without a key
+    // even with auth on; the API behind them still needs one.
+    #[test]
+    fn swagger_routes_open_without_key_when_auth_enabled() {
+        crate::core::engine_runtime::block_on(async {
+            let mut cfg = LuraConfig::default();
+            cfg.server.swagger_enabled = true;
+            cfg.auth.enabled = true;
+
+            let (state, _dir) = make_test_state(true).await;
+            let auth_cache = Arc::clone(&state.auth_cache);
+            let ship = ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]);
+            let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
+
+            for uri in ["/api-docs/openapi.json", "/test-ui/", "/test-ui/swagger-ui.css"] {
+                let resp = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+
+            let resp = app
+                .oneshot(Request::builder().uri("/version").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         })
     }
 

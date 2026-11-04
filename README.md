@@ -166,10 +166,10 @@ curl -X POST http://127.0.0.1:3000/store-api/json/default/documents \
 ```
 
 In development, a browsable Swagger UI is available at `/test-ui` (disabled
-by default; the dev `luradb.toml` turns it on explicitly). With
-`auth.enabled = true`, the UI and `/api-docs/openapi.json` need the same
-valid API key as the rest of the API; use the UI's "Authorize" button to
-set it.
+by default; the dev `luradb.toml` turns it on explicitly). The UI and
+`/api-docs/openapi.json` load without a key, also with `auth.enabled = true`;
+the API calls made from the UI need one like any other request — set it with
+the UI's "Authorize" button.
 
 Requests on one connection are processed in order (HTTP/1.1 pipelining and
 HTTP/2 alike); open several connections for parallelism.

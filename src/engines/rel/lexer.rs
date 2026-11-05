@@ -42,16 +42,6 @@ pub enum Keyword {
     Desc,
     Limit,
     Offset,
-    Distinct,
-    Inner,
-    Right,
-    Full,
-    Cross,
-    Union,
-    Except,
-    Intersect,
-    Group,
-    Having,
     And,
     Or,
     Not,
@@ -124,16 +114,6 @@ impl Keyword {
             "desc" => Desc,
             "limit" => Limit,
             "offset" => Offset,
-            "distinct" => Distinct,
-            "inner" => Inner,
-            "right" => Right,
-            "full" => Full,
-            "cross" => Cross,
-            "union" => Union,
-            "except" => Except,
-            "intersect" => Intersect,
-            "group" => Group,
-            "having" => Having,
             "and" => And,
             "or" => Or,
             "not" => Not,
@@ -207,16 +187,6 @@ impl Keyword {
             Desc => "DESC",
             Limit => "LIMIT",
             Offset => "OFFSET",
-            Distinct => "DISTINCT",
-            Inner => "INNER",
-            Right => "RIGHT",
-            Full => "FULL",
-            Cross => "CROSS",
-            Union => "UNION",
-            Except => "EXCEPT",
-            Intersect => "INTERSECT",
-            Group => "GROUP",
-            Having => "HAVING",
             And => "AND",
             Or => "OR",
             Not => "NOT",
@@ -612,22 +582,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_clause_words_are_reserved() {
-        for (word, kw) in [
-            ("distinct", Keyword::Distinct),
-            ("inner", Keyword::Inner),
-            ("right", Keyword::Right),
-            ("full", Keyword::Full),
-            ("cross", Keyword::Cross),
-            ("union", Keyword::Union),
-            ("except", Keyword::Except),
-            ("intersect", Keyword::Intersect),
-            ("group", Keyword::Group),
-            ("having", Keyword::Having),
+    fn test_unsupported_clause_words_lex_as_identifiers() {
+        for word in [
+            "distinct", "inner", "right", "full", "cross", "union", "except", "intersect", "group",
+            "having",
         ] {
-            assert_eq!(toks(word), vec![Token::Keyword(kw)]);
-            assert_eq!(toks(&word.to_uppercase()), vec![Token::Keyword(kw)]);
-            assert_eq!(kw.as_str(), word.to_uppercase());
+            assert_eq!(toks(word), vec![Token::Ident(word.to_string())]);
+            assert_eq!(toks(&word.to_uppercase()), vec![Token::Ident(word.to_string())]);
         }
     }
 

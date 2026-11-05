@@ -996,15 +996,140 @@ mod tests {
     fn test_unsupported_select_constructs_return_400_with_reason() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_default_app().await;
+            run_sql(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
             for (stmt, reason) in [
                 ("SELECT DISTINCT id FROM t", "DISTINCT is not supported by LuraSQL"),
                 ("SELECT * FROM t INNER JOIN u ON t.id = u.id", "only LEFT JOIN is supported; INNER JOIN is not"),
             ] {
-                let (status, body) = sql(&app, "default", &json!({ "sql": stmt }).to_string()).await;
+                let (status, text) = run_sql(&app, stmt).await;
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{stmt}");
-                let text = body["_raw"].as_str().unwrap_or_default();
                 assert!(text.contains(reason), "{stmt}: {text}");
             }
+        })
+    }
+
+    async fn run_sql(app: &axum::Router, stmt: &str) -> (StatusCode, String) {
+        let (status, body) = sql(app, "default", &json!({ "sql": stmt }).to_string()).await;
+        (status, body["_raw"].as_str().unwrap_or_default().to_string())
+    }
+
+    async fn assert_all_ok(app: &axum::Router, stmts: &[&str]) {
+        for stmt in stmts {
+            let (status, text) = run_sql(app, stmt).await;
+            assert_eq!(status, StatusCode::OK, "{stmt}: {text}");
+        }
+    }
+
+    #[test]
+    fn test_clause_words_work_as_table_column_and_index_names() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE cross (id INTEGER PRIMARY KEY, group TEXT, full TEXT, right INTEGER)",
+                    "INSERT INTO cross (id, group, full, right) VALUES (1, 'g', 'f', 0)",
+                    "SELECT group, full FROM cross",
+                    "SELECT c.group FROM cross c",
+                    "UPDATE cross SET right = 1 WHERE id = 1",
+                    "ALTER TABLE cross RENAME COLUMN full TO full2",
+                    "CREATE INDEX union ON cross (group)",
+                    "DROP INDEX union",
+                    "DROP TABLE cross",
+                ],
+            )
+            .await;
+        })
+    }
+
+    #[test]
+    fn test_clause_words_stay_aliases_in_queries_and_views() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+                    "CREATE TABLE u (uid INTEGER PRIMARY KEY, b INTEGER)",
+                    "INSERT INTO t (id, a) VALUES (1, 1)",
+                    "INSERT INTO u (uid, b) VALUES (1, 2)",
+                ],
+            )
+            .await;
+            for (i, select) in [
+                "SELECT * FROM t full LEFT JOIN u ON full.id = u.uid",
+                "SELECT * FROM t LEFT JOIN u having ON t.id = having.uid",
+                "SELECT a having FROM t",
+                "SELECT * FROM t having WHERE a = 1",
+                "SELECT * FROM t group",
+                "SELECT * FROM t union",
+                "SELECT distinct.a FROM t distinct",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let view = format!("v{i}");
+                assert_all_ok(&app, &[select, &format!("CREATE VIEW {view} AS {select}"), &format!("SELECT * FROM {view}")])
+                    .await;
+            }
+        })
+    }
+
+    #[test]
+    fn test_unsupported_constructs_are_rejected_with_reason() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+                    "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE g (id INTEGER PRIMARY KEY, distinct INTEGER, a INTEGER)",
+                ],
+            )
+            .await;
+            for (stmt, reason) in [
+                ("SELECT * FROM t FULL JOIN u ON t.id = u.id", "only LEFT JOIN is supported; FULL JOIN is not"),
+                ("SELECT * FROM t GROUP BY a", "GROUP BY is not supported by LuraSQL"),
+                ("SELECT * FROM t UNION SELECT * FROM u", "UNION is not supported by LuraSQL"),
+                ("SELECT * FROM t UNION ALL SELECT * FROM u", "UNION is not supported by LuraSQL"),
+                ("SELECT * FROM t HAVING a = 1", "HAVING is not supported by LuraSQL"),
+                ("SELECT DISTINCT * FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT DISTINCT t.a FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT DISTINCT a AS x FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT DISTINCT a FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("CREATE VIEW dv AS SELECT DISTINCT a FROM t", "DISTINCT is not supported by LuraSQL"),
+            ] {
+                let (status, text) = run_sql(&app, stmt).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{stmt}: {text}");
+                assert!(text.contains(reason), "{stmt}: {text}");
+            }
+            // A real column named `distinct` is still read as before.
+            assert_all_ok(&app, &["SELECT distinct a FROM g"]).await;
+            // Without an alias or with a qualifier there is no DISTINCT to report:
+            // the missing column stays a 404.
+            for stmt in ["SELECT distinct FROM t", "SELECT t.distinct a FROM t"] {
+                let (status, text) = run_sql(&app, stmt).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{stmt}: {text}");
+            }
+        })
+    }
+
+    #[test]
+    fn test_view_over_clause_word_column_does_not_block_ddl() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE g (id INTEGER PRIMARY KEY, group TEXT)",
+                    "CREATE TABLE x (id INTEGER PRIMARY KEY)",
+                    "CREATE VIEW v AS SELECT group FROM g",
+                    "SELECT * FROM v",
+                    "DROP TABLE x",
+                ],
+            )
+            .await;
         })
     }
 

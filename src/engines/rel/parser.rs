@@ -22,6 +22,21 @@ use super::types::ColumnType;
 /// legitimate query and far below the overflow point.
 const MAX_EXPR_DEPTH: usize = 100;
 
+// DISTINCT, the join kinds, the set operators, GROUP and HAVING are ordinary
+// names; they open an unsupported construct only where the next tokens say so.
+const UNSUPPORTED_JOIN_KINDS: [&str; 4] = ["INNER", "RIGHT", "FULL", "CROSS"];
+const SET_OPERATORS: [&str; 3] = ["UNION", "EXCEPT", "INTERSECT"];
+pub(super) const DISTINCT_UNSUPPORTED: &str = "DISTINCT is not supported by LuraSQL";
+
+fn is_word(tok: Option<&Token>, word: &str) -> bool {
+    matches!(tok, Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
+}
+
+/// The entry of `words` (uppercase) that the identifier `tok` spells.
+fn spelled_word(tok: Option<&Token>, words: &[&'static str]) -> Option<&'static str> {
+    words.iter().copied().find(|w| is_word(tok, w))
+}
+
 /// Parses one full statement (with an optional single trailing `;`) from
 /// already-lexed `(Token, byte_pos)` pairs. Empty input → `EmptyStatement`;
 /// a second statement (tokens after a `;`, or a statement keyword right after
@@ -71,6 +86,10 @@ impl<'a> Parser<'a> {
 
     fn peek2(&self) -> Option<&Token> {
         self.tokens.get(self.pos + 1).map(|(t, _)| t)
+    }
+
+    fn peek3(&self) -> Option<&Token> {
+        self.tokens.get(self.pos + 2).map(|(t, _)| t)
     }
 
     /// Byte position for error reporting: the current token's start, or just
@@ -451,8 +470,8 @@ impl<'a> Parser<'a> {
 
     fn parse_select(&mut self) -> Result<Select, RelStoreError> {
         self.expect_kw(Keyword::Select)?;
-        if self.peek() == Some(&Token::Keyword(Keyword::Distinct)) {
-            return Err(self.err("DISTINCT is not supported by LuraSQL"));
+        if self.starts_distinct() {
+            return Err(self.err(DISTINCT_UNSUPPORTED));
         }
         let items = self.parse_select_list()?;
         self.expect_kw(Keyword::From)?;
@@ -468,31 +487,14 @@ impl<'a> Parser<'a> {
             let right = self.parse_column_ref()?;
             joins.push(Join { table, left, right });
         }
-        let other_join = match self.peek() {
-            Some(Token::Keyword(Keyword::Join)) => Some("JOIN without LEFT".to_string()),
-            Some(Token::Keyword(kw @ (Keyword::Inner | Keyword::Right | Keyword::Full | Keyword::Cross))) => {
-                Some(format!("{} JOIN", kw.as_str()))
-            }
-            _ => None,
-        };
-        if let Some(what) = other_join {
-            return Err(self.err(format!(
-                "only LEFT JOIN is supported; {what} is not (use LEFT JOIN and a WHERE on the joined column)"
-            )));
+        if let Some(msg) = self.unsupported_join() {
+            return Err(self.err(msg));
         }
         let where_clause = self.try_parse_where()?;
         let order_by = self.try_parse_order_by()?;
         let limit = self.try_parse_limit()?;
-        match self.peek() {
-            Some(Token::Keyword(Keyword::Group)) => {
-                return Err(self.err(
-                    "GROUP BY is not supported by LuraSQL; COUNT(*) without GROUP BY is the only aggregate",
-                ));
-            }
-            Some(Token::Keyword(
-                kw @ (Keyword::Having | Keyword::Union | Keyword::Except | Keyword::Intersect),
-            )) => return Err(self.err(format!("{} is not supported by LuraSQL", kw.as_str()))),
-            _ => {}
+        if let Some(msg) = self.unsupported_closing_clause() {
+            return Err(self.err(msg));
         }
         Ok(Select {
             items,
@@ -529,11 +531,70 @@ impl<'a> Parser<'a> {
         Ok(SelectItem::Column { col, alias })
     }
 
-    /// `[ [ AS ] ident ]` — an explicit `AS`, or a bare trailing identifier
-    /// (never ambiguous: every reserved word is lexed as a `Keyword`, not
-    /// an `Ident`).
+    /// DISTINCT right after `SELECT`, unless the tokens after it can continue a
+    /// column list that starts with a column called `distinct`.
+    fn starts_distinct(&self) -> bool {
+        is_word(self.peek(), "distinct")
+            && match self.peek2() {
+                Some(Token::Comma | Token::Dot | Token::Keyword(Keyword::From | Keyword::As)) => false,
+                Some(Token::Ident(_)) => {
+                    !matches!(self.peek3(), Some(Token::Comma | Token::Keyword(Keyword::From)))
+                }
+                _ => true,
+            }
+    }
+
+    /// Error text for a join other than LEFT JOIN at the cursor; a kind word
+    /// counts only when `JOIN` or `OUTER` follows.
+    fn unsupported_join(&self) -> Option<String> {
+        let what = match self.peek() {
+            Some(Token::Keyword(Keyword::Join)) => "JOIN without LEFT".to_string(),
+            tok if matches!(self.peek2(), Some(Token::Keyword(Keyword::Join | Keyword::Outer))) => {
+                format!("{} JOIN", spelled_word(tok, &UNSUPPORTED_JOIN_KINDS)?)
+            }
+            _ => return None,
+        };
+        Some(format!(
+            "only LEFT JOIN is supported; {what} is not (use LEFT JOIN and a WHERE on the joined column)"
+        ))
+    }
+
+    /// Error text for GROUP BY, HAVING or a set operator at the cursor. GROUP
+    /// counts before `BY`, a set operator before `SELECT` or `ALL`; HAVING
+    /// counts unless a token that may follow an alias comes next.
+    fn unsupported_closing_clause(&self) -> Option<String> {
+        let (tok, next) = (self.peek(), self.peek2());
+        if is_word(tok, "group") && matches!(next, Some(Token::Keyword(Keyword::By))) {
+            return Some(
+                "GROUP BY is not supported by LuraSQL; COUNT(*) without GROUP BY is the only aggregate".to_string(),
+            );
+        }
+        if let Some(op) = spelled_word(tok, &SET_OPERATORS) {
+            if matches!(next, Some(Token::Keyword(Keyword::Select))) || is_word(next, "all") {
+                return Some(format!("{op} is not supported by LuraSQL"));
+            }
+        }
+        let alias_follower = matches!(
+            next,
+            None | Some(
+                Token::Comma
+                    | Token::Semicolon
+                    | Token::Keyword(
+                        Keyword::From | Keyword::Where | Keyword::Order | Keyword::Limit | Keyword::Left | Keyword::On
+                    )
+            )
+        );
+        (is_word(tok, "having") && !alias_follower).then(|| "HAVING is not supported by LuraSQL".to_string())
+    }
+
+    /// `[ [ AS ] ident ]` — after an explicit `AS` any identifier is the
+    /// alias; a bare identifier is not when it opens a construct that has its
+    /// own error.
     fn try_parse_alias(&mut self) -> Result<Option<String>, RelStoreError> {
-        if self.eat_kw(Keyword::As) || matches!(self.peek(), Some(Token::Ident(_))) {
+        let bare = matches!(self.peek(), Some(Token::Ident(_)))
+            && self.unsupported_join().is_none()
+            && self.unsupported_closing_clause().is_none();
+        if self.eat_kw(Keyword::As) || bare {
             Ok(Some(self.expect_ident()?))
         } else {
             Ok(None)
@@ -787,10 +848,98 @@ mod tests {
         }
     }
 
+    fn select_of(sql: &str) -> Select {
+        match parse_sql(sql) {
+            Ok(Statement::Select(sel)) => sel,
+            other => panic!("expected a Select for {sql:?}, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_distinct_is_rejected() {
-        assert_eq!(syntax_msg("SELECT DISTINCT a FROM t"), "DISTINCT is not supported by LuraSQL");
-        assert_eq!(syntax_msg("select distinct * from t"), "DISTINCT is not supported by LuraSQL");
+        for sql in [
+            "select distinct * from t",
+            "SELECT DISTINCT COUNT(*) FROM t",
+            "SELECT DISTINCT t.a FROM t",
+            "SELECT DISTINCT a AS x FROM t",
+            "SELECT DISTINCT a b FROM t",
+        ] {
+            assert_eq!(syntax_msg(sql), "DISTINCT is not supported by LuraSQL", "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_distinct_stays_usable_as_a_column_name() {
+        for sql in [
+            "SELECT distinct FROM t",
+            "SELECT distinct, b FROM t",
+            "SELECT distinct.a FROM t",
+            "SELECT distinct AS d FROM t",
+            "SELECT distinct a FROM t",
+            "SELECT distinct a, b FROM t",
+        ] {
+            assert!(parse_sql(sql).is_ok(), "{sql}");
+        }
+        let sel = select_of("SELECT distinct a FROM t");
+        assert_eq!(
+            sel.items,
+            vec![SelectItem::Column {
+                col: ColumnRef { qualifier: None, name: "distinct".into() },
+                alias: Some("a".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_clause_words_stay_usable_as_names_and_aliases() {
+        let sel = select_of("SELECT * FROM t full LEFT JOIN u ON full.id = u.id");
+        assert_eq!(sel.from.alias.as_deref(), Some("full"));
+        assert_eq!(sel.joins.len(), 1);
+
+        let sel = select_of("SELECT * FROM t LEFT JOIN u having ON t.id = having.id");
+        assert_eq!(sel.joins[0].table.alias.as_deref(), Some("having"));
+
+        let sel = select_of("SELECT a having FROM t");
+        assert_eq!(
+            sel.items,
+            vec![SelectItem::Column {
+                col: ColumnRef { qualifier: None, name: "a".into() },
+                alias: Some("having".into()),
+            }]
+        );
+
+        let sel = select_of("SELECT * FROM t having WHERE a = 1");
+        assert_eq!(sel.from.alias.as_deref(), Some("having"));
+        assert!(sel.where_clause.is_some());
+
+        for (sql, alias) in [
+            ("SELECT * FROM t group", "group"),
+            ("SELECT * FROM t union", "union"),
+            ("SELECT * FROM t cross;", "cross"),
+            ("SELECT distinct.a FROM t distinct", "distinct"),
+            ("SELECT * FROM t AS having WHERE a = 1", "having"),
+            ("SELECT * FROM t AS union", "union"),
+        ] {
+            assert_eq!(select_of(sql).from.alias.as_deref(), Some(alias), "{sql}");
+        }
+
+        for sql in [
+            "CREATE TABLE cross (id INTEGER PRIMARY KEY, group TEXT, full TEXT, right INTEGER)",
+            "INSERT INTO cross (group, full, right) VALUES ('a', 'b', 1)",
+            "SELECT group, full FROM cross",
+            "SELECT c.group FROM cross c WHERE c.right = 1 ORDER BY c.full",
+            "UPDATE cross SET right = 1 WHERE id = 1",
+            "DELETE FROM union WHERE group = 1",
+            "ALTER TABLE cross RENAME COLUMN full TO full2",
+            "ALTER TABLE cross DROP COLUMN group",
+            "CREATE INDEX union ON cross (group)",
+            "DROP INDEX union",
+            "DROP TABLE cross",
+            "DROP VIEW having",
+            "CREATE VIEW intersect AS SELECT group FROM except",
+        ] {
+            assert!(parse_sql(sql).is_ok(), "{sql}");
+        }
     }
 
     #[test]
@@ -829,6 +978,31 @@ mod tests {
             );
         }
         assert_eq!(syntax_msg("SELECT a FROM t UNION SELECT a FROM u"), "UNION is not supported by LuraSQL");
+    }
+
+    #[test]
+    fn test_unsupported_constructs_are_recognised_in_any_spelling() {
+        let join = |kw: &str| {
+            format!("only LEFT JOIN is supported; {kw} JOIN is not (use LEFT JOIN and a WHERE on the joined column)")
+        };
+        let group = "GROUP BY is not supported by LuraSQL; COUNT(*) without GROUP BY is the only aggregate";
+        let having = "HAVING is not supported by LuraSQL";
+        for (sql, msg) in [
+            ("SELECT * FROM t FULL JOIN u ON t.id = u.id", join("FULL")),
+            ("SELECT * FROM t x full outer join u ON x.id = u.id", join("FULL")),
+            ("SELECT * FROM t cross JOIN u ON t.id = u.id", join("CROSS")),
+            ("SELECT * FROM t LEFT JOIN u ON t.id = u.id right join v ON u.id = v.id", join("RIGHT")),
+            ("SELECT * FROM t GROUP BY a", group.to_string()),
+            ("SELECT * FROM t UNION SELECT * FROM u", "UNION is not supported by LuraSQL".to_string()),
+            ("SELECT * FROM t union all SELECT * FROM u", "UNION is not supported by LuraSQL".to_string()),
+            ("SELECT * FROM t WHERE a = 1 except SELECT * FROM u", "EXCEPT is not supported by LuraSQL".to_string()),
+            ("SELECT * FROM t intersect all SELECT * FROM u", "INTERSECT is not supported by LuraSQL".to_string()),
+            ("SELECT * FROM t HAVING a = 1", having.to_string()),
+            ("SELECT * FROM t GROUP BY a HAVING a = 1", group.to_string()),
+            ("SELECT * FROM t ORDER BY a having a = 1", having.to_string()),
+        ] {
+            assert_eq!(syntax_msg(sql), msg, "{sql}");
+        }
     }
 
     #[test]

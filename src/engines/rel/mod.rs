@@ -501,15 +501,19 @@ impl RelEngine {
             // view body is the *raw* SELECT substring, not a re-serialized
             // AST) — routed here rather than into `execute_dml`, which only
             // sees the bound `Statement`, not the original source string.
-            binder::BoundStatement::Pending { stmt, .. } => match stmt {
-                ast::Statement::CreateView(cv) => {
-                    view::execute_create_view(self, domain, cv, sql).await.map(ExecOutcome::Ddl)?
-                }
-                ast::Statement::DropView(dv) => {
-                    view::execute_drop_view(self, domain, dv).await.map(ExecOutcome::Ddl)?
-                }
-                other => self.execute_dml(domain, other, params, auth).await?,
-            },
+            binder::BoundStatement::Pending { stmt, .. } => {
+                let leading_distinct = starts_with_distinct_alias(&stmt);
+                let result = match stmt {
+                    ast::Statement::CreateView(cv) => {
+                        view::execute_create_view(self, domain, cv, sql).await.map(ExecOutcome::Ddl)
+                    }
+                    ast::Statement::DropView(dv) => {
+                        view::execute_drop_view(self, domain, dv).await.map(ExecOutcome::Ddl)
+                    }
+                    other => self.execute_dml(domain, other, params, auth).await,
+                };
+                result.map_err(|e| if leading_distinct { distinct_not_a_column(e) } else { e })?
+            }
         };
         if let ExecOutcome::Ddl(ddl_outcome) = &outcome {
             self.publish_ddl_event(domain, ddl_outcome);
@@ -540,6 +544,32 @@ impl RelEngine {
             DdlOutcome::ViewCreated(view) => publish("view_created", &view.name),
             DdlOutcome::ViewDropped { name } => publish("view_dropped", name),
         }
+    }
+}
+
+/// True for `SELECT distinct <alias> …`: the parser reads it as a column named
+/// `distinct` (valid when the table has one), which is also how
+/// `SELECT DISTINCT a FROM …` and `SELECT DISTINCT a, …` parse.
+fn starts_with_distinct_alias(stmt: &ast::Statement) -> bool {
+    let select = match stmt {
+        ast::Statement::Select(sel) => sel,
+        ast::Statement::CreateView(cv) => &*cv.select,
+        _ => return false,
+    };
+    matches!(
+        select.items.first(),
+        Some(ast::SelectItem::Column { col, alias: Some(_) }) if col.qualifier.is_none() && col.name == "distinct"
+    )
+}
+
+/// The `distinct` column does not exist, so the statement was a DISTINCT query.
+fn distinct_not_a_column(err: RelStoreError) -> RelStoreError {
+    match err {
+        RelStoreError::ColumnNotFound { name, .. } if name == "distinct" => RelStoreError::Syntax {
+            pos: 0,
+            msg: parser::DISTINCT_UNSUPPORTED.to_string(),
+        },
+        other => other,
     }
 }
 

@@ -1688,11 +1688,11 @@ mod tests {
     }
 
     // Test 5: a tiny wal_event_channel_capacity plus a non-draining
-    // receiver must eventually lag (tokio::broadcast's own detection) --
-    // proves watch_from actually wires the configured capacity through
-    // rather than a hardcoded value. The Lagged-to-reset(lagged) mapping
-    // itself is unit-tested at the kv.rs handler level (pure function, no
-    // timing dependency).
+    // receiver must eventually lag -- proves watch_from wires the configured
+    // capacity through rather than a hardcoded value. Whether this channel
+    // overflows (Lagged) or the relay task falls behind on the engine channel
+    // and reports a Gap depends on when the relay task runs; both become the
+    // same reset(lagged) at the kv.rs handler level.
     #[test]
     fn test_watch_slow_client_channel_lags_when_capacity_exceeded() {
         crate::core::engine_runtime::block_on(async {
@@ -1708,17 +1708,19 @@ mod tests {
                 store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
             }
 
-            let mut saw_lag = false;
-            for _ in 0..10 {
-                match rx.recv().await {
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        saw_lag = true;
-                        break;
+            let lagged = async {
+                for _ in 0..10 {
+                    match rx.recv().await {
+                        Err(broadcast::error::RecvError::Lagged(_)) | Ok(WatchMessage::Gap) => return true,
+                        Ok(WatchMessage::Event(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return false,
                     }
-                    Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-            }
+                false
+            };
+            let saw_lag = compio::time::timeout(std::time::Duration::from_secs(30), lagged)
+                .await
+                .expect("the receiver neither lagged nor saw a gap");
             assert!(saw_lag, "a burst past channel capacity must eventually lag a non-draining receiver");
         })
     }

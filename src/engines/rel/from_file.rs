@@ -859,6 +859,15 @@ mod tests {
     }
 
     #[test]
+    fn test_documented_header_example() {
+        let raw = |h: &str| h.split(',').map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            normalize_headers(&raw("SKU,Product Name,2024 Price,,sku,Order")),
+            ["sku", "product_name", "c2024_price", "col_4", "sku_2", "order_"]
+        );
+    }
+
+    #[test]
     fn test_keyword_pk_matches_suffixed_column() {
         crate::core::engine_runtime::block_on(async {
             let (rel, _dir) = make_engine().await;

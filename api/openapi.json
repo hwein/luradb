@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.15.0",
+    "version": "0.15.1",
     "x-luradb-server-version": "0.5.2-dev"
   },
   "paths": {
@@ -4426,7 +4426,8 @@
         "tags": [
           "Relational Import"
         ],
-        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column, then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues. A column header that is a LuraSQL keyword (`key`, `order`, ...)\ngets a `_` appended (`key_`) so SQL can name the column; the response\nshows both the column `name` and its `source_header`. Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement.",
+        "summary": "Creates a table from an uploaded CSV/TSV file, with one type per column\ninferred from its values, and imports its rows; a row that fails is logged\nand the import continues. Requires DDL access.",
+        "description": "Recommended headers: lowercase letters `a`-`z`, digits and `_`, starting\nwith a letter, at most 50 characters, each used only once, and not a LuraSQL\nkeyword (for example `key`, `order`, `count`, `text`, `timestamp`). If every\nheader of a file follows this, each column is named exactly like its header\nand `pk` is the header itself.\n\nEvery header is turned into a column name by these rules, applied in this\norder; a header that follows the recommendation only changes when an\nearlier column already has its name:\n\n- The header is trimmed and lowercased.\n- An empty header becomes `col_<n>`, where `n` is its 1-based position.\n- Every character other than `a`-`z`, `0`-`9` and `_` becomes `_`.\n- A leading digit gets a `c` in front.\n- A name longer than 50 characters is cut to 50 characters; otherwise a\n  name that is a LuraSQL keyword gets a `_` appended (`key` becomes `key_`).\n- A name that an earlier column already has gets the first free suffix of\n  `_2`, `_3`, ... appended, from left to right, with the name shortened so\n  the result stays within 50 characters; the first column keeps the plain\n  name.\n\nThe name `_row` is reserved for the generated primary key column: a header\nthat becomes `_row` is only accepted together with `pk=_row`, which makes\nthat file column the primary key.\n\nExample: the header line `SKU,Product Name,2024 Price,,sku,Order` gives the\ncolumns `sku`, `product_name`, `c2024_price`, `col_4`, `sku_2` and `order_`.\nThe response shows each column's `name` and its `source_header`.",
         "operationId": "create_table_from_file",
         "parameters": [
           {
@@ -4459,7 +4460,7 @@
           {
             "name": "header",
             "in": "query",
-            "description": "Whether the first line is a header row (default true)",
+            "description": "Whether the first line is a header row (default true); without one the columns are named `col_1`, `col_2`, ...",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -4468,7 +4469,7 @@
           {
             "name": "pk",
             "in": "query",
-            "description": "Existing (normalized) column to use as primary key; omitted -> synthetic `_row` column. A LuraSQL keyword gets a `_` suffix, like the column header (`key` -> `key_`)",
+            "description": "Column to use as primary key, named as the response shows it in `name`. Only upper/lower case is ignored, and for a LuraSQL keyword the trailing `_` may be left out (`key` matches `key_`); any other difference gives 400. Omitted -> the generated `_row` column",
             "required": false,
             "schema": {
               "type": "string"
@@ -4498,7 +4499,7 @@
             }
           },
           "400": {
-            "description": "Missing/invalid name or format, a table name that is a LuraSQL keyword, empty file, too many columns, invalid header UTF-8, or an unknown pk column",
+            "description": "Missing/invalid name or format, a `header` value other than `true` or `false`, a table name that is a LuraSQL keyword, empty file, too many columns, invalid UTF-8 in the first line (the header row, or the first row with `header=false`), an unknown pk column, or a header that becomes `_row` without `pk=_row`",
             "content": {
               "text/plain": {
                 "schema": {

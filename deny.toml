@@ -14,7 +14,10 @@ yanked = "deny"
 unmaintained = "all"
 # Exceptions only for advisories without an available fix (or not relevant to
 # our usage profile), each with `reason` and a `# review by YYYY-MM-DD` note.
-ignore = []
+ignore = [
+    # review by 2027-02-05 (or earlier when a loom release drops pin-utils)
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is only reachable through loom, which compio and synchrony depend on under cfg(loom) for their own model tests; it is never compiled into the luradb binary, and every loom release still depends on it" },
+]
 
 [licenses]
 allow = [

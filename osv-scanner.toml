@@ -4,4 +4,7 @@
 # Companion file: deny.toml (cargo-deny policy). Advisory exceptions needed by
 # both tools must be kept in sync between the two files.
 #
-# No exceptions currently in force.
+# review by 2027-02-05 (or earlier when a loom release drops pin-utils)
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0441"
+reason = "pin-utils is only reachable through loom, which compio and synchrony depend on under cfg(loom) for their own model tests; it is never compiled into the luradb binary, and every loom release still depends on it"

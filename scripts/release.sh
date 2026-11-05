@@ -15,6 +15,15 @@ DRY_RUN=0
 MODE="final"
 REPORT=""
 
+# The handbook at docs.luradb.org follows final releases: its Release workflow
+# fetches everything it needs from the tag, so a trigger with the tag is enough.
+DOCS_REPO="hwein/luradb-docs"
+DOCS_API="https://api.github.com/repos/$DOCS_REPO"
+DOCS_ACTIONS_URL="https://github.com/$DOCS_REPO/actions/workflows/release.yml"
+HANDBOOK=0
+HANDBOOK_FAILED=0
+HANDBOOK_TAG=""
+
 TMP_DIRS=()
 cleanup() {
     # Save $?: otherwise the trap handler overwrites the script's real exit
@@ -135,6 +144,88 @@ wait_for_release_workflow() {
     assets=$(curl -fsS "$api/releases/tags/$tag" | jq -r '.assets | length' 2>/dev/null || echo 0)
     [ "$assets" -gt 0 ] || die "the Release workflow passed but no GitHub release with assets exists for $tag: $html_url"
     log "Release $tag published with $assets assets: $(resolve_repo_url)/releases/tag/$tag"
+}
+
+# Authenticated request to the handbook repository. Prints the HTTP status on
+# the first line and the response body after it (status 000: no answer). The
+# token only travels through pipes, never through a variable or an argument.
+docs_api() {
+    local -; set +x
+    local method="$1" path="$2" body="${3:-}" out
+    local -a data=()
+    [ -z "$body" ] || data=(--data-raw "$body")
+    if out=$(
+        printf 'protocol=https\nhost=github.com\n\n' \
+            | GCM_INTERACTIVE=never WSLENV="GCM_INTERACTIVE:${WSLENV:-}" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= \
+                timeout 30 git credential fill 2>/dev/null \
+            | sed -n 's/^password=\(.*\)$/header = "Authorization: Bearer \1"/p' \
+            | curl -sS --max-time 60 --config - -X "$method" \
+                -H 'Accept: application/vnd.github+json' \
+                "${data[@]}" -w '\n%{http_code}' "$DOCS_API/$path" 2>/dev/null
+    ); then
+        printf '%s\n%s' "${out##*$'\n'}" "${out%$'\n'*}"
+    else
+        printf '000\n'
+    fi
+}
+
+# Checks that the handbook workflow can be started, before anything changes.
+check_handbook_access() {
+    HANDBOOK=0
+    if [ "$(resolve_repo_url)" != "https://github.com/hwein/luradb" ]; then
+        log "handbook trigger skipped: origin is not hwein/luradb"
+        return
+    fi
+    HANDBOOK=1
+    local resp code body state urls
+    resp=$(docs_api GET actions/workflows/release.yml)
+    code=${resp%%$'\n'*}; body=${resp#*$'\n'}
+    [ "$code" = "200" ] \
+        || die "cannot read the handbook workflow of $DOCS_REPO (HTTP $code): sign in to GitHub with the git credential helper and retry"
+    state=$(jq -r '.state // empty' <<<"$body" 2>/dev/null || true)
+    [ "$state" = "active" ] || die "the handbook workflow Release of $DOCS_REPO is not active (state: ${state:-unknown})"
+    log "handbook workflow Release: active"
+    resp=$(docs_api GET 'issues?state=open&per_page=100')
+    code=${resp%%$'\n'*}; body=${resp#*$'\n'}
+    if [ "$code" = "200" ]; then
+        urls=$(jq -r '.[] | select(.pull_request == null and (.title | startswith("Handbook text check for"))) | .html_url' <<<"$body" 2>/dev/null || true)
+        [ -z "$urls" ] || printf 'warning: open handbook text check issue:\n%s\n' "$urls" >&2
+    fi
+}
+
+trigger_handbook() {
+    local tag="$1" resp code body url
+    [ "$HANDBOOK" -eq 1 ] || return 0
+    HANDBOOK_TAG="$tag"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] start the handbook workflow for %s\n' "$tag"
+        return
+    fi
+    step "starting the handbook workflow for $tag"
+    resp=$(docs_api POST actions/workflows/release.yml/dispatches "$(jq -nc --arg tag "$tag" '{ref: "main", inputs: {tag: $tag}}')")
+    code=${resp%%$'\n'*}; body=${resp#*$'\n'}
+    case "$code" in
+        204) log "handbook workflow started: $DOCS_ACTIONS_URL" ;;
+        200)
+            url=$(jq -r '.html_url // empty' <<<"$body" 2>/dev/null || true)
+            log "handbook workflow started: ${url:-$DOCS_ACTIONS_URL}"
+            ;;
+        *)
+            HANDBOOK_FAILED=1
+            printf 'release.sh: starting the handbook workflow failed (HTTP %s)\n' "$code" >&2
+            ;;
+    esac
+}
+
+# Last output of a release: where the handbook text check shows up, and the
+# manual start when the trigger failed (the tag and the release stay).
+finish_handbook() {
+    [ "$HANDBOOK" -eq 1 ] || return 0
+    log "Open handbook text check issues: https://github.com/$DOCS_REPO/issues?q=is:open+\"Handbook text check\""
+    if [ "$HANDBOOK_FAILED" -eq 1 ]; then
+        printf 'Tag and release are pushed. Start the workflow Release by hand with the tag %s: %s\n' "$HANDBOOK_TAG" "$DOCS_ACTIONS_URL" >&2
+        exit 1
+    fi
 }
 
 check_branch() {
@@ -420,11 +511,14 @@ detect_pending_push_final() {
 
 run_final() {
     check_branch next
+    check_handbook_access
 
     local resume_tag
     if resume_tag=$(detect_pending_push_final); then
         log "Detected a half-finished release state (tag $resume_tag local, push pending) — catching up the push only."
         push_atomic main next "$resume_tag"
+        trigger_handbook "$resume_tag"
+        finish_handbook
         return
     fi
 
@@ -470,6 +564,8 @@ run_final() {
     commit_paths "chore(release): begin v$next_dev cycle" Cargo.toml Cargo.lock api/openapi.json
 
     push_atomic main next "$tag"
+    trigger_handbook "$tag"
+    finish_handbook
 }
 
 detect_pending_push_rc() {
@@ -520,11 +616,8 @@ run_rc() {
 }
 
 detect_pending_push_hotfix() {
-    local version="$1"
-    [ "$(current_branch)" = "main" ] || return 1
-    local head tag
-    head=$(git -C "$REPO_ROOT" rev-parse HEAD)
-    tag=$(git -C "$REPO_ROOT" tag --points-at "$head" -l "v$version")
+    local tag
+    tag=$(git -C "$REPO_ROOT" tag --points-at HEAD -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -vE -- '-rc\.' | head -1)
     [ -n "$tag" ] || return 1
     git -C "$REPO_ROOT" ls-remote --exit-code origin "refs/tags/$tag" >/dev/null 2>&1 && return 1
     printf '%s' "$tag"
@@ -534,17 +627,21 @@ run_hotfix() {
     local branch version major minor patch prev_patch tag
 
     branch=$(current_branch)
+    # A failed push leaves the hotfix run on main, with the new tag on HEAD.
+    if [ "$branch" = main ]; then
+        check_handbook_access
+        tag=$(detect_pending_push_hotfix) || die "must be on hotfix/vX.Y.Z (currently: main)"
+        log "Detected a half-finished hotfix state (tag $tag local, push pending) — catching up the push only."
+        push_atomic main "$tag"
+        trigger_handbook "$tag"
+        log "Don't forget to merge back: git checkout next && git merge main, then delete hotfix/$tag."
+        finish_handbook
+        return
+    fi
     [[ "$branch" == hotfix/v* ]] || die "must be on hotfix/vX.Y.Z (currently: $branch)"
     version="${branch#hotfix/v}"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "expected branch name hotfix/vX.Y.Z (currently: $branch)"
-
-    local resume_tag
-    if resume_tag=$(detect_pending_push_hotfix "$version"); then
-        log "Detected a half-finished hotfix state (tag $resume_tag local, push pending) — catching up the push only."
-        push_atomic main "$resume_tag"
-        log "Don't forget to merge back: git checkout next && git merge main, then delete $branch."
-        return
-    fi
+    check_handbook_access
 
     IFS='.' read -r major minor patch <<<"$version"
     prev_patch="$major.$minor.$((patch - 1))"
@@ -574,12 +671,14 @@ run_hotfix() {
     fi
     create_tag "$tag" "LuraDB $tag"
     push_atomic main "$tag"
+    trigger_handbook "$tag"
 
     log ""
     log "Merge back into next (conflicts in Cargo.toml/CHANGELOG.md expected):"
     log "  git checkout next && git merge main"
     log "  cargo run --quiet -- --dump-openapi > api/openapi.json   (restore dev version)"
     log "Then delete $branch: git branch -d $branch"
+    finish_handbook
 }
 
 while [ $# -gt 0 ]; do

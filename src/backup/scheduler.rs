@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Steps back of the clock up to this size (time sync, early timer wake-up)
+/// are ignored; a larger one is treated as a clock correction.
+const CLOCK_STEP_BACK_TOLERANCE_MINUTES: u64 = 5;
+
 /// One `[[backup.schedule]]` entry, pre-parsed at scheduler construction
 /// (config was already validated at startup — `BackupConfig::validate` — so
 /// parsing here cannot fail in practice; it is still propagated, not
@@ -24,7 +28,7 @@ struct SchedulerEntry {
     scope: BackupScope,
     include_auth: bool,
     keep_last: usize,
-    /// Last cron minute (`unix / 60`) this schedule matched; 0 = never.
+    /// Last cron minute (`unix / 60`) this schedule matched; 0 = none since the start or the last clock correction.
     last_minute: AtomicU64,
 }
 
@@ -78,12 +82,23 @@ impl BackupScheduler {
     /// One minute tick: evaluates every schedule's cron against `now`'s UTC
     /// calendar fields (match against the current minute, not next-fire
     /// computation; no catch-up of missed ticks). A schedule is attempted at
-    /// most once per cron minute, whether or not the job starts. Callable
-    /// directly so tests can drive it without a real 60s sleep loop.
+    /// most once per cron minute, whether or not the job starts, unless the
+    /// clock was set back by more than `CLOCK_STEP_BACK_TOLERANCE_MINUTES`.
+    /// Callable directly so tests can drive it without a real 60s sleep loop.
     pub async fn tick(&self, now: u64) {
         let t = cron::civil_from_unix(now);
         let minute = now / 60;
         for entry in &self.entries {
+            let last = entry.last_minute.load(Ordering::Relaxed);
+            if last > minute + CLOCK_STEP_BACK_TOLERANCE_MINUTES {
+                tracing::warn!(
+                    "[Backup Scheduler] the clock moved back by at least {} minutes; schedule '{}' resumes from the \
+                     current time",
+                    last - minute,
+                    entry.name
+                );
+                entry.last_minute.store(0, Ordering::Relaxed);
+            }
             if !entry.cron.matches(t.minute, t.hour, t.day, t.month, t.weekday) {
                 continue;
             }
@@ -369,6 +384,53 @@ mod tests {
             tick_and_finish(&scheduler, 60).await;
 
             assert_eq!(manager.list_backups().unwrap().len(), 1, "an already served minute must not run again");
+        })
+    }
+
+    // Keeps more backups than any test here makes, so retention deletes none of them.
+    fn scheduler_keeping_ten(manager: &Arc<BackupManager>) -> BackupScheduler {
+        let schedule = BackupScheduleConfig { keep_last: 10, ..always_matching_schedule("nightly") };
+        BackupScheduler::new(Arc::clone(manager), &[schedule], Arc::new(AtomicBool::new(false))).unwrap()
+    }
+
+    #[test]
+    fn test_tick_resumes_after_the_clock_is_set_back_by_a_year() {
+        crate::core::engine_runtime::block_on(async {
+            const DAY: u64 = 86_400;
+            let (manager, _e, _b) = make_manager().await;
+            let scheduler = scheduler_keeping_ten(&manager);
+
+            tick_and_finish(&scheduler, 600 + 365 * DAY).await;
+            tick_and_finish(&scheduler, 600).await;
+            tick_and_finish(&scheduler, 660).await;
+
+            assert_eq!(manager.list_backups().unwrap().len(), 3, "each tick after the correction must run");
+        })
+    }
+
+    #[test]
+    fn test_tick_does_not_rerun_after_a_step_back_of_exactly_the_tolerance() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let scheduler = scheduler_keeping_ten(&manager);
+
+            tick_and_finish(&scheduler, 600).await;
+            tick_and_finish(&scheduler, 600 - CLOCK_STEP_BACK_TOLERANCE_MINUTES * 60).await;
+
+            assert_eq!(manager.list_backups().unwrap().len(), 1, "a step back of five minutes is still ignored");
+        })
+    }
+
+    #[test]
+    fn test_tick_resumes_after_a_step_back_beyond_the_tolerance() {
+        crate::core::engine_runtime::block_on(async {
+            let (manager, _e, _b) = make_manager().await;
+            let scheduler = scheduler_keeping_ten(&manager);
+
+            tick_and_finish(&scheduler, 600).await;
+            tick_and_finish(&scheduler, 600 - (CLOCK_STEP_BACK_TOLERANCE_MINUTES + 1) * 60).await;
+
+            assert_eq!(manager.list_backups().unwrap().len(), 2, "a step back of six minutes resumes the schedule");
         })
     }
 

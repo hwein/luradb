@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.14.4",
+    "version": "0.15.0",
     "x-luradb-server-version": "0.5.2-dev"
   },
   "paths": {
@@ -4426,7 +4426,7 @@
         "tags": [
           "Relational Import"
         ],
-        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column, then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues. Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement.",
+        "summary": "Creates a relational table from an uploaded CSV/TSV file: infers one\nLuraDB type per column, then imports every row through the\nexisting DML write path -- a row that fails is logged, the import\ncontinues. A column header that is a LuraSQL keyword (`key`, `order`, ...)\ngets a `_` appended (`key_`) so SQL can name the column; the response\nshows both the column `name` and its `source_header`. Requires DDL access, enforced the same way the\n`/sql` handler enforces a DDL statement.",
         "operationId": "create_table_from_file",
         "parameters": [
           {
@@ -4441,7 +4441,7 @@
           {
             "name": "name",
             "in": "query",
-            "description": "Name of the table to create",
+            "description": "Name of the table to create; a LuraSQL keyword (for example `select`) is rejected with 400",
             "required": true,
             "schema": {
               "type": "string"
@@ -4468,7 +4468,7 @@
           {
             "name": "pk",
             "in": "query",
-            "description": "Existing (normalized) column to use as primary key; omitted -> synthetic `_row` column",
+            "description": "Existing (normalized) column to use as primary key; omitted -> synthetic `_row` column. A LuraSQL keyword gets a `_` suffix, like the column header (`key` -> `key_`)",
             "required": false,
             "schema": {
               "type": "string"
@@ -4498,7 +4498,7 @@
             }
           },
           "400": {
-            "description": "Missing/invalid name or format, empty file, too many columns, invalid header UTF-8, or an unknown pk column",
+            "description": "Missing/invalid name or format, a table name that is a LuraSQL keyword, empty file, too many columns, invalid header UTF-8, or an unknown pk column",
             "content": {
               "text/plain": {
                 "schema": {

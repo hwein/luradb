@@ -60,15 +60,15 @@ pub struct CreateFromFileResponse {
     path = "/store-api/rel/{domain}/tables/from-file",
     params(
         ("domain" = String, Path, description = "Relational domain"),
-        ("name" = String, Query, description = "Name of the table to create"),
+        ("name" = String, Query, description = "Name of the table to create; a LuraSQL keyword (for example `select`) is rejected with 400"),
         ("format" = String, Query, description = "\"csv\" or \"tsv\" -- no format sniffing"),
         ("header" = Option<bool>, Query, description = "Whether the first line is a header row (default true)"),
-        ("pk" = Option<String>, Query, description = "Existing (normalized) column to use as primary key; omitted -> synthetic `_row` column"),
+        ("pk" = Option<String>, Query, description = "Existing (normalized) column to use as primary key; omitted -> synthetic `_row` column. A LuraSQL keyword gets a `_` suffix, like the column header (`key` -> `key_`)"),
     ),
     request_body(content = String, description = "Raw CSV/TSV file bytes -- Content-Type is not enforced, `format` decides"),
     responses(
         (status = 201, description = "Table created and its rows imported (imported/failed counts, per-row error log)", body = CreateFromFileResponse),
-        (status = 400, description = "Missing/invalid name or format, empty file, too many columns, invalid header UTF-8, or an unknown pk column", body = String, content_type = "text/plain"),
+        (status = 400, description = "Missing/invalid name or format, a table name that is a LuraSQL keyword, empty file, too many columns, invalid header UTF-8, or an unknown pk column", body = String, content_type = "text/plain"),
         (status = 403, description = "Missing DDL access on the domain", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 409, description = "A table or view with that name already exists", body = String, content_type = "text/plain"),
@@ -82,7 +82,9 @@ pub struct CreateFromFileResponse {
 /// Creates a relational table from an uploaded CSV/TSV file: infers one
 /// LuraDB type per column, then imports every row through the
 /// existing DML write path -- a row that fails is logged, the import
-/// continues. Requires DDL access, enforced the same way the
+/// continues. A column header that is a LuraSQL keyword (`key`, `order`, ...)
+/// gets a `_` appended (`key_`) so SQL can name the column; the response
+/// shows both the column `name` and its `source_header`. Requires DDL access, enforced the same way the
 /// `/sql` handler enforces a DDL statement.
 pub async fn create_table_from_file(
     State(state): State<AppState>,
@@ -273,6 +275,57 @@ mod tests {
             let amount_col = cols.iter().find(|c| c["name"] == json!("amount")).unwrap();
             assert_eq!(amount_col["type"], json!("INTEGER"));
             assert_eq!(amount_col["source_header"], json!("amount"));
+        })
+    }
+
+    async fn sql(app: &axum::Router, domain: &str, sql: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/store-api/rel/{domain}/sql"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "sql": sql }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        (status, serde_json::from_str(&text).unwrap_or_else(|_| json!({"_raw": text})))
+    }
+
+    // Keyword headers get a `_` suffix (and `?pk=` follows), so SQL can name
+    // them; a keyword table name is rejected and nothing is created.
+    #[test]
+    fn test_keyword_names() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            let (status, body) =
+                upload(&app, "default", "name=t&format=csv&pk=key", b"id,key,order\n1,a,x\n", None).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let cols = body["columns"].as_array().unwrap();
+            let key = cols.iter().find(|c| c["name"] == json!("key_")).unwrap();
+            assert_eq!(key["primary_key"], json!(true));
+            assert_eq!(key["source_header"], json!("key"));
+            assert!(cols.iter().any(|c| c["name"] == json!("order_")));
+
+            let (status, body) = sql(&app, "default", "SELECT key_, order_ FROM t").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let names: Vec<&str> = body["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+            assert_eq!(names, ["key_", "order_"], "{body}");
+            assert_eq!(body["rows"], json!([["a", "x"]]), "{body}");
+
+            let (status, body) = upload(&app, "default", "name=select&format=csv", b"a\n1\n", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body["_raw"].as_str().unwrap().contains("'select' is a reserved word in LuraSQL and cannot be used as a table name"),
+                "{body}"
+            );
+            let req = Request::builder().uri("/store-api/rel/default/tables").body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let tables: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert!(!tables.to_string().contains("select"), "{tables}");
+            assert!(tables.to_string().contains("\"t\""), "{tables}");
         })
     }
 

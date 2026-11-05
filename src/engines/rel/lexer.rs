@@ -78,6 +78,11 @@ pub enum Keyword {
     Jsonref,
 }
 
+/// Whether `word` is a LuraSQL keyword, in any letter case.
+pub(crate) fn is_keyword(word: &str) -> bool {
+    Keyword::from_lowercase(&word.to_ascii_lowercase()).is_some()
+}
+
 impl Keyword {
     /// Case-insensitive keyword lookup; `word` must already be lowercase.
     fn from_lowercase(word: &str) -> Option<Keyword> {

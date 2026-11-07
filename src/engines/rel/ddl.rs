@@ -253,7 +253,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
+        let domains = Arc::new(RelDomainRegistry::recover_with_default(Arc::clone(&engine)).await.unwrap());
         let metrics = MetricsStore::new(MetricsConfig::default());
         let limits = CatalogLimits {
             max_columns: 128,

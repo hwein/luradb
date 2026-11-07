@@ -8,22 +8,21 @@ use super::writer::{
 };
 use super::{BackupError, MAX_LINE_BYTES};
 use crate::auth::{DomainPermission, UserRecord};
-use crate::control::{AuthChange, ControlPlane, Engine};
-use crate::engines::json::{JsonDomainState, JsonEngine};
-use crate::engines::lsm::domain::{now_secs, DomainRegistry, DomainStore};
+use crate::control::{AuthChange, ConditionalWrites, ControlPlane, Engine, Lifecycle};
+use crate::engines::json::JsonEngine;
+use crate::engines::lsm::domain::{now_secs, DomainStore};
 use crate::engines::rel::dml::coerce_json;
-use crate::engines::rel::{ColumnInput, ColumnType, DefaultValue, IndexInput, RelDomainState, RelEngine, TableInput};
+use crate::engines::rel::{ColumnInput, ColumnType, DefaultValue, IndexInput, RelEngine, TableInput};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use crate::core::engine_runtime;
 use std::time::{Duration, Instant};
 
-/// Poll interval while waiting for the domain purger to finalize a deletion
-/// in `replace` mode. The purger itself runs as an independent background
-/// task; this loop only observes its progress.
+/// Poll interval while waiting for the purgers in `replace` mode. They run
+/// as independent background tasks; this loop only observes their progress.
 const PURGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Deadline for that wait. Without it a stalled purger parks the restore
@@ -51,9 +50,9 @@ pub(crate) struct RestoreParams<'a> {
     pub mode: RestoreMode,
     pub into_domain: Option<&'a str>,
     pub include_auth: bool,
-    /// Creates and deletes the target domains, leads each one to the engines
-    /// of the data shard that owns it here, and takes the auth records as
-    /// auth changes.
+    /// Creates the target domains or clears their engines, leads each one to
+    /// the engines of the data shard that owns it here, and takes the auth
+    /// records as auth changes.
     pub control: &'a ControlPlane,
     pub scan_batch_size: usize,
     pub scan_pause_ms: u64,
@@ -100,12 +99,13 @@ pub(crate) async fn run_restore(params: RestoreParams<'_>) -> anyhow::Result<Res
     let path = params.dir.join(format!("{}.ndjson", params.backup_id));
 
     let scan = verify_and_scan(&path).await?;
-    // An archive with JSON or relational sections cannot be applied without
-    // that engine — silently dropping those sections would be data loss.
-    if !scan.json_domains.is_empty() && !json_enabled(params.control) {
+    // An archive with JSON or relational data cannot be applied without that
+    // engine — silently dropping it would be data loss. Its domain lines
+    // alone need no engine.
+    if scan.json_data && !json_enabled(params.control) {
         return Err(BackupError::JsonEngineDisabled.into());
     }
-    if !scan.rel_domains.is_empty() && !params.control.shard_owners().any(|owners| owners.rel.is_some()) {
+    if scan.rel_data && !params.control.shard_owners().any(|owners| owners.rel.is_some()) {
         return Err(BackupError::RelEngineDisabled.into());
     }
     let remap = build_remap(params.into_domain, &scan)?;
@@ -130,17 +130,20 @@ fn rel_of<'c>(control: &'c ControlPlane, domain: &str) -> anyhow::Result<&'c Arc
 }
 
 pub(crate) struct ArchiveScan {
-    kv_domains: Vec<String>,
-    json_domains: Vec<String>,
-    rel_domains: Vec<String>,
+    /// Every domain of the archive with the engines it has domain lines of
+    /// and, from version 3 on, their `require_conditional_writes`; domain
+    /// lines of one name in several engines are one domain.
+    domains: BTreeMap<String, Vec<(Engine, Option<bool>)>>,
+    /// Whether the archive holds JSON or relational data lines.
+    json_data: bool,
+    rel_data: bool,
     /// Exposed for the "manifest fields" response of POST
-    /// /backups/upload — restore itself only needs the
-    /// domain-name lists above.
+    /// /backups/upload — restore itself only needs the domains above.
     pub(crate) manifest: ManifestLine,
 }
 
 /// Full read pass ahead of any write: verifies the SHA-256 checksum line
-/// and, along the way, collects every kv-, json- and rel-domain name — needed
+/// and, along the way, collects every kv-, json- and rel-domain line — needed
 /// up front so `fail_if_exists`/`replace` and the `into_domain` single-name
 /// check can run before any write in pass 2. Data lines naming an
 /// undeclared domain are rejected here: the apply pass takes its target from
@@ -152,6 +155,7 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
 
     let mut hasher = Sha256::new();
     let mut line_count: u64 = 0;
+    let mut domains: BTreeMap<String, Vec<(Engine, Option<bool>)>> = BTreeMap::new();
     let mut kv_domains: Vec<String> = Vec::new();
     let mut json_domains: Vec<String> = Vec::new();
     let mut rel_domains: Vec<String> = Vec::new();
@@ -216,14 +220,17 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
         match t.as_str() {
             "kv-domain" => {
                 let line: KvDomainLine = parse_line(value)?;
+                domains.entry(line.name.clone()).or_default().push((Engine::Kv, line.require_conditional_writes));
                 kv_domains.push(line.name);
             }
             "json-domain" => {
                 let line: JsonDomainLine = parse_line(value)?;
+                domains.entry(line.name.clone()).or_default().push((Engine::Json, line.require_conditional_writes));
                 json_domains.push(line.name);
             }
             "rel-domain" => {
                 let line: RelDomainLine = parse_line(value)?;
+                domains.entry(line.name.clone()).or_default().push((Engine::Rel, None));
                 rel_domains.push(line.name);
             }
             "kv" => collect_ref(&value, &mut kv_refs),
@@ -264,9 +271,9 @@ pub(crate) async fn verify_and_scan(path: &Path) -> anyhow::Result<ArchiveScan> 
     }
 
     Ok(ArchiveScan {
-        kv_domains,
-        json_domains,
-        rel_domains,
+        domains,
+        json_data: !json_refs.is_empty(),
+        rel_data: !rel_refs.is_empty(),
         manifest: manifest_line.expect("checked above: the first line is always a manifest when saw_checksum is true"),
     })
 }
@@ -362,14 +369,11 @@ async fn read_line_capped(reader: &mut ArchiveReader, buf: &mut Vec<u8>) -> anyh
 /// `(archived_name, target_name)` substitution to apply everywhere.
 fn build_remap(into_domain: Option<&str>, scan: &ArchiveScan) -> anyhow::Result<Option<(String, String)>> {
     let Some(target) = into_domain else { return Ok(None) };
-
-    let names: HashSet<&str> =
-        scan.kv_domains.iter().chain(&scan.json_domains).chain(&scan.rel_domains).map(String::as_str).collect();
-    if names.len() != 1 {
-        return Err(BackupError::RemapRequiresSingleDomain.into());
+    let mut names = scan.domains.keys();
+    match (names.next(), names.next()) {
+        (Some(only), None) => Ok(Some((only.clone(), target.to_string()))),
+        _ => Err(BackupError::RemapRequiresSingleDomain.into()),
     }
-    let only = *names.iter().next().unwrap();
-    Ok(Some((only.to_string(), target.to_string())))
 }
 
 fn remapped<'a>(remap: &'a Option<(String, String)>, archived_name: &'a str) -> &'a str {
@@ -379,135 +383,73 @@ fn remapped<'a>(remap: &'a Option<(String, String)>, archived_name: &'a str) -> 
     }
 }
 
-/// Phase A (checks / replace-deletes only, no domain is created yet) then
-/// Phase B (create every target domain) — kept as two full sweeps so
-/// `fail_if_exists` truly aborts before the first write: if any domain in
-/// phase A already exists, we return before phase B ever runs. Each check
-/// and each wait for a purge runs against the shard that owns the domain.
+/// Phase A (checks only, nothing is written yet) then phase B (create every
+/// missing target domain, or, with `replace`, clear the engines the archive
+/// has of an existing one) — kept as two full sweeps so `fail_if_exists`
+/// truly aborts before the first write: if any domain in phase A already
+/// exists, we return before phase B ever runs.
 async fn prepare_domains(
     scan: &ArchiveScan,
     mode: RestoreMode,
     remap: &Option<(String, String)>,
     control: &ControlPlane,
 ) -> anyhow::Result<()> {
-    for name in &scan.kv_domains {
-        ready_kv_domain(remapped(remap, name), mode, control).await?;
-    }
-    for name in &scan.json_domains {
-        ready_json_domain(remapped(remap, name), mode, control).await?;
-    }
-    for name in &scan.rel_domains {
-        ready_rel_domain(remapped(remap, name), mode, control).await?;
+    if mode == RestoreMode::FailIfExists {
+        if let Some(name) = scan.domains.keys().map(|name| remapped(remap, name)).find(|t| control.directory().get(t).is_some()) {
+            return Err(BackupError::DomainExists(name.to_string()).into());
+        }
     }
 
-    for name in &scan.kv_domains {
-        control.create_domain(Engine::Kv, remapped(remap, name), false).await?;
+    for (name, engines) in &scan.domains {
+        let target = remapped(remap, name);
+        let existing = control.directory().get(target).map(|entry| entry.state);
+        match (mode, existing) {
+            (RestoreMode::FailIfExists, Some(_)) => return Err(BackupError::DomainExists(target.to_string()).into()),
+            (RestoreMode::Replace, Some(Lifecycle::Active)) => replace_engines(target, engines, control).await?,
+            (_, existing) => {
+                if existing.is_some() {
+                    wait_for_purge(target, PURGE_WAIT_TIMEOUT, || control.directory().get(target).is_none()).await?;
+                }
+                let mut setting = ConditionalWrites::default();
+                for (engine, value) in engines {
+                    setting.set(*engine, value.unwrap_or(false));
+                }
+                control.create_domain(target, setting).await?;
+            }
+        }
     }
-    for name in &scan.json_domains {
-        control.create_domain(Engine::Json, remapped(remap, name), false).await?;
-    }
-    for name in &scan.rel_domains {
-        control.create_domain(Engine::Rel, remapped(remap, name), false).await?;
-    }
-
     Ok(())
 }
 
-async fn ready_rel_domain(target: &str, mode: RestoreMode, control: &ControlPlane) -> anyhow::Result<()> {
-    let rel = rel_of(control, target)?;
-    let existing = rel.get_domain_any(target);
-    match mode {
-        RestoreMode::FailIfExists => {
-            if existing.is_some() {
-                return Err(BackupError::DomainExists(target.to_string()).into());
-            }
-            Ok(())
-        }
-        RestoreMode::Replace => {
-            match existing {
-                Some(d) if d.state == RelDomainState::Active => {
-                    control.delete_domain(Engine::Rel, target).await?;
-                    wait_for_rel_domain_gone(target, rel).await?;
-                }
-                Some(_) => wait_for_rel_domain_gone(target, rel).await?,
-                None => {}
-            }
-            Ok(())
-        }
+/// Clears each engine of `target` that `engines` names, through the control
+/// plane, and waits until each enabled one is active again; the domain and
+/// its other engines stay as they are. Archives before version 3 keep the
+/// engines' `require_conditional_writes`.
+async fn replace_engines(target: &str, engines: &[(Engine, Option<bool>)], control: &ControlPlane) -> anyhow::Result<()> {
+    for (engine, setting) in engines {
+        control.clear_engine(*engine, target, *setting).await?;
     }
-}
-
-async fn wait_for_rel_domain_gone(name: &str, rel: &Arc<RelEngine>) -> anyhow::Result<()> {
-    wait_for_purge(name, PURGE_WAIT_TIMEOUT, || {
-        !matches!(rel.get_domain_any(name), Some(d) if d.state == RelDomainState::Deleting)
+    let owners = control.owners_of(target);
+    let enabled = owners.engines();
+    wait_for_purge(target, PURGE_WAIT_TIMEOUT, || {
+        let directory = control.directory();
+        let Some(entry) = directory.get(target) else { return true };
+        !entry.purging.iter().any(|engine| enabled.contains(engine))
+            && engines
+                .iter()
+                .filter(|(engine, _)| enabled.contains(engine))
+                .all(|(engine, _)| owners.record(*engine, target).is_some_and(|part| part.state == Lifecycle::Active))
     })
-    .await
-}
-
-async fn ready_kv_domain(target: &str, mode: RestoreMode, control: &ControlPlane) -> anyhow::Result<()> {
-    let kv_registry = &control.owners_of(target).kv;
-    let active = kv_registry.get_domain(target).await?;
-    let deleting = kv_registry.list_deleting_domains().into_iter().any(|d| d.name == target);
-    match mode {
-        RestoreMode::FailIfExists => {
-            if active.is_some() || deleting {
-                return Err(BackupError::DomainExists(target.to_string()).into());
-            }
-            Ok(())
-        }
-        RestoreMode::Replace => {
-            if active.is_some() {
-                control.delete_domain(Engine::Kv, target).await?;
-                wait_for_kv_domain_gone(target, kv_registry).await?;
-            } else if deleting {
-                wait_for_kv_domain_gone(target, kv_registry).await?;
-            }
-            Ok(())
-        }
+    .await?;
+    if control.directory().get(target).is_none() {
+        return Err(BackupError::DomainNotFound(target.to_string()).into());
     }
+    Ok(())
 }
 
-async fn wait_for_kv_domain_gone(name: &str, kv_registry: &Arc<DomainRegistry>) -> anyhow::Result<()> {
-    wait_for_purge(name, PURGE_WAIT_TIMEOUT, || {
-        !kv_registry.list_deleting_domains().into_iter().any(|d| d.name == name)
-    })
-    .await
-}
-
-async fn ready_json_domain(target: &str, mode: RestoreMode, control: &ControlPlane) -> anyhow::Result<()> {
-    let json = json_of(control, target)?;
-    let existing = json.get_domain_any(target);
-    match mode {
-        RestoreMode::FailIfExists => {
-            if existing.is_some() {
-                return Err(BackupError::DomainExists(target.to_string()).into());
-            }
-            Ok(())
-        }
-        RestoreMode::Replace => {
-            match existing {
-                Some(d) if d.state == JsonDomainState::Active => {
-                    control.delete_domain(Engine::Json, target).await?;
-                    wait_for_json_domain_gone(target, json).await?;
-                }
-                Some(_) => wait_for_json_domain_gone(target, json).await?,
-                None => {}
-            }
-            Ok(())
-        }
-    }
-}
-
-async fn wait_for_json_domain_gone(name: &str, json: &Arc<JsonEngine>) -> anyhow::Result<()> {
-    wait_for_purge(name, PURGE_WAIT_TIMEOUT, || {
-        !matches!(json.get_domain_any(name), Some(d) if d.state == JsonDomainState::Deleting)
-    })
-    .await
-}
-
-/// Polls `is_gone` until the purger finished the deletion. Bounded by
-/// `timeout`: a stalled purger must not park the restore (and its job slot)
-/// for the process lifetime.
+/// Polls `is_gone` until the purgers finished. Bounded by `timeout`: a
+/// stalled purger must not park the restore (and its job slot) for the
+/// process lifetime.
 async fn wait_for_purge(name: &str, timeout: Duration, is_gone: impl Fn() -> bool) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -862,7 +804,7 @@ mod tests {
     use crate::config::JsonStoreConfig;
     use crate::control::testing;
     use crate::engines::json::{IndexFieldType, JsonDomainPurger};
-    use crate::engines::lsm::domain::{DomainConfig, DomainPurger};
+    use crate::engines::lsm::domain::{DomainConfig, DomainPurger, DomainRegistry};
     use crate::engines::lsm::engine::{LsmEngineOptions, LsmStorageEngine};
     use crate::engines::lsm::reader::GetResult;
     use crate::engines::StorageEngine;
@@ -917,8 +859,8 @@ mod tests {
     }
 
     impl Instance {
-        async fn create(&self, engine: Engine, name: &str) {
-            self.control.create_domain(engine, name, false).await.unwrap();
+        async fn create(&self, name: &str) {
+            self.control.create_domain(name, Default::default()).await.unwrap();
         }
 
         async fn store(&self, name: &str) -> DomainStore {
@@ -1028,7 +970,7 @@ mod tests {
     fn test_roundtrip_kv_domain() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             let store = src.store("shop").await;
             store.put(b"order:1", b"hello").await.unwrap();
             store.put_with_ttl(b"session", b"tok", 3600).await.unwrap();
@@ -1063,7 +1005,7 @@ mod tests {
     fn test_roundtrip_json_domain_with_index() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(true).await;
-            src.create(Engine::Json, "catalog").await;
+            src.create("catalog").await;
             src.json().create_index("catalog", "city", IndexFieldType::String).await.unwrap();
             src.json().put_document("catalog", "d1", json!({"city": "Lyon"})).await.unwrap();
             src.json().put_document("catalog", "d2", json!({"city": "Porto"})).await.unwrap();
@@ -1097,7 +1039,7 @@ mod tests {
     fn test_restore_rejects_legacy_document_with_reserved_field() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(true).await;
-            src.create(Engine::Json, "legacy").await;
+            src.create("legacy").await;
             src.json().put_document("legacy", "ok", json!({"n": 1})).await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1135,8 +1077,7 @@ mod tests {
     fn test_roundtrip_domain_scope_both_engines() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(true).await;
-            src.create(Engine::Kv, "shop").await;
-            src.create(Engine::Json, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
             src.json().put_document("shop", "d1", json!({"n": 1})).await.unwrap();
 
@@ -1151,18 +1092,18 @@ mod tests {
         })
     }
 
-    // 3b. Roundtrip: `all` scope backs up every kv AND json domain (incl. the
-    //     auto-created "default" one) in a single archive. Since `all`/`kv`
-    //     always include "default", and a fresh instance always has one too,
-    //     `replace` mode is used here.
+    // 3b. Roundtrip: `all` scope backs up every domain (incl. the default one
+    //     a start creates) of both engines in a single archive. Since
+    //     `all`/`kv` always include "default", and a fresh instance always has
+    //     one too, `replace` mode is used here.
     #[test]
     fn test_roundtrip_all_scope() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(true).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("default").await.put(b"root-key", b"root-val").await.unwrap();
             src.store("shop").await.put(b"k", b"v").await.unwrap();
-            src.create(Engine::Json, "catalog").await;
+            src.create("catalog").await;
             src.json().put_document("default", "d0", json!({"n": 0})).await.unwrap();
             src.json().put_document("catalog", "d1", json!({"n": 1})).await.unwrap();
 
@@ -1217,7 +1158,7 @@ mod tests {
     fn test_corrupted_checksum_rejected() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1239,7 +1180,7 @@ mod tests {
     fn test_missing_checksum_line_rejected() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1260,14 +1201,14 @@ mod tests {
     fn test_fail_if_exists_aborts_before_first_write() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k1", b"v1").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
             src.backup(out_dir.path(), "bk_exists", BackupScope::KvDomain("shop".to_string()), false).await;
 
             let dst = instance(false).await;
-            dst.create(Engine::Kv, "shop").await;
+            dst.create("shop").await;
             dst.store("shop").await.put(b"pre-existing", b"untouched").await.unwrap();
 
             let err =
@@ -1280,20 +1221,20 @@ mod tests {
         })
     }
 
-    // 6b. replace deletes and recreates the target domain, importing the
-    //     archive's content only (old content is gone).
+    // 6b. replace clears the target domain's part of the archive's engine,
+    //     importing the archive's content only (old content is gone).
     #[test]
     fn test_replace_mode_wipes_target_first() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"new-key", b"new-val").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
             src.backup(out_dir.path(), "bk_replace", BackupScope::KvDomain("shop".to_string()), false).await;
 
             let dst = instance(false).await;
-            dst.create(Engine::Kv, "shop").await;
+            dst.create("shop").await;
             dst.store("shop").await.put(b"old-key", b"old-val").await.unwrap();
 
             let _purging = dst.purging();
@@ -1306,20 +1247,20 @@ mod tests {
         })
     }
 
-    // 6c. replace mode also wipes an existing JSON target domain first
-    //     (mirrors test 6b for the JSON engine's own purger).
+    // 6c. replace mode also wipes the JSON part of an existing target
+    //     domain first (mirrors test 6b for the JSON engine's own purger).
     #[test]
     fn test_replace_mode_wipes_json_target_first() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(true).await;
-            src.create(Engine::Json, "catalog").await;
+            src.create("catalog").await;
             src.json().put_document("catalog", "new", json!({"n": 2})).await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
             src.backup(out_dir.path(), "bk_jreplace", BackupScope::JsonDomain("catalog".to_string()), false).await;
 
             let dst = instance(true).await;
-            dst.create(Engine::Json, "catalog").await;
+            dst.create("catalog").await;
             dst.json().put_document("catalog", "old", json!({"n": 1})).await.unwrap();
 
             let _purging = dst.purging();
@@ -1337,7 +1278,7 @@ mod tests {
     fn test_into_domain_remap_single_engine() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1358,8 +1299,7 @@ mod tests {
     fn test_into_domain_remap_domain_scope_both_engines() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(true).await;
-            src.create(Engine::Kv, "shop").await;
-            src.create(Engine::Json, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
             src.json().put_document("shop", "d1", json!({"n": 1})).await.unwrap();
 
@@ -1381,8 +1321,8 @@ mod tests {
     fn test_into_domain_rejects_multi_domain_archive() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "a").await;
-            src.create(Engine::Kv, "b").await;
+            src.create("a").await;
+            src.create("b").await;
             src.store("a").await.put(b"k", b"v").await.unwrap();
             src.store("b").await.put(b"k", b"v").await.unwrap();
 
@@ -1404,7 +1344,7 @@ mod tests {
     fn test_include_auth_opt_in() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             let system = src.control.system_store();
             let record = UserRecord {
                 name: "alice".to_string(),
@@ -1422,9 +1362,9 @@ mod tests {
             let out_dir = tempfile::TempDir::new().unwrap();
             src.backup(out_dir.path(), "bk_auth", BackupScope::All, true).await;
 
-            // A scope="all" archive always contains "default" (every registry
-            // auto-creates it), so restoring into a fresh instance needs
-            // `replace` -- `fail_if_exists` would legitimately reject it.
+            // A scope="all" archive always contains "default" (every start
+            // creates it), so restoring into a fresh instance needs `replace`
+            // -- `fail_if_exists` would legitimately reject it.
             async fn replace_restore(out_dir: &Path, include_auth: bool) -> (Instance, RestoreOutcome) {
                 let dst = instance(false).await;
                 let purging = dst.purging();
@@ -1520,7 +1460,7 @@ mod tests {
     fn test_restore_respects_small_batch_size() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             let store = src.store("shop").await;
             for i in 0..5 {
                 store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
@@ -1545,7 +1485,7 @@ mod tests {
     fn test_restore_bypasses_domain_rate_limiter() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             let store = src.store("shop").await;
             for i in 0..5 {
                 store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
@@ -1567,7 +1507,7 @@ mod tests {
     fn test_data_after_checksum_line_rejected() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1589,7 +1529,7 @@ mod tests {
     fn test_blank_line_in_archive_rejected() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1611,7 +1551,7 @@ mod tests {
     fn test_restore_json_archive_without_engine_rejected() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(true).await;
-            src.create(Engine::Json, "catalog").await;
+            src.create("catalog").await;
             src.json().put_document("catalog", "d1", json!({"n": 1})).await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1631,7 +1571,7 @@ mod tests {
     fn test_data_line_for_undeclared_domain_rejected() {
         crate::core::engine_runtime::block_on(async {
             let src = instance(false).await;
-            src.create(Engine::Kv, "shop").await;
+            src.create("shop").await;
             src.store("shop").await.put(b"k", b"v").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
@@ -1648,7 +1588,7 @@ mod tests {
             reseal(&path, &body);
 
             let dst = instance(false).await;
-            dst.create(Engine::Kv, "live").await;
+            dst.create("live").await;
             dst.store("live").await.put(b"production", b"untouched").await.unwrap();
 
             let err = dst.restore(out_dir.path(), "bk_undecl", RestoreMode::FailIfExists, None, false).await.unwrap_err();
@@ -1689,6 +1629,120 @@ mod tests {
             assert!(err.to_string().contains("still being purged"), "{err}");
 
             wait_for_purge("shop", Duration::from_millis(120), || true).await.unwrap();
+        })
+    }
+
+    /// An archive of format version 2, written by hand: its manifest, then
+    /// `lines`.
+    fn v2_archive(path: &Path, scope: &str, lines: &[Value]) {
+        let manifest = json!({
+            "t": "manifest", "format_version": 2, "id": "bk_v2", "created_at": 1_700_000_000u64,
+            "luradb_version": "0.5.0", "scope": scope, "include_auth": false, "kv_snapshot_ts": 1,
+            "json_snapshot_ts": 1, "encoding": "hex", "schedule": null, "shards": 1, "lsn_cut": {"kv": 1, "json": 1},
+        });
+        let body: Vec<String> = std::iter::once(&manifest).chain(lines).map(Value::to_string).collect();
+        reseal(path, &body);
+    }
+
+    fn setting_of(dst: &Instance, name: &str) -> ConditionalWrites {
+        dst.control.directory().get(name).expect("the domain exists").require_conditional_writes
+    }
+
+    // A version 3 archive carries require_conditional_writes of each engine
+    // into the domain it creates.
+    #[test]
+    fn a_v3_archive_restores_the_conditional_writes_setting() {
+        crate::core::engine_runtime::block_on(async {
+            let src = instance(true).await;
+            let setting = ConditionalWrites { kv: true, json: false };
+            src.control.create_domain("strict", setting).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            src.backup(out_dir.path(), "bk_rcw", BackupScope::Domain("strict".to_string()), false).await;
+
+            let dst = instance(true).await;
+            dst.restore(out_dir.path(), "bk_rcw", RestoreMode::FailIfExists, None, false).await.unwrap();
+            assert_eq!(setting_of(&dst, "strict"), setting);
+            assert!(dst.kv.get_domain("strict").await.unwrap().unwrap().require_conditional_writes);
+            assert!(!dst.json().get_domain("strict").unwrap().require_conditional_writes);
+        })
+    }
+
+    // The domain lines of one name in a version 2 archive, one per engine,
+    // become one domain, without conditional writes.
+    #[test]
+    fn a_v2_archive_with_domain_lines_per_engine_restores_one_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let out_dir = tempfile::TempDir::new().unwrap();
+            v2_archive(
+                &out_dir.path().join("bk_v2.ndjson"),
+                "domain:shop",
+                &[
+                    json!({"t": "kv-domain", "name": "shop", "created_at": 1}),
+                    json!({"t": "kv", "domain": "shop", "k": hex::encode("clé"), "v": hex::encode(b"v"), "expires_at": 0}),
+                    json!({"t": "json-domain", "name": "shop", "created_at": 1}),
+                    json!({"t": "doc", "domain": "shop", "key": "d", "version": 1, "content": {"n": 1}}),
+                ],
+            );
+            let dst = instance(true).await;
+            let outcome = dst.restore(out_dir.path(), "bk_v2", RestoreMode::FailIfExists, None, false).await.unwrap();
+            assert_eq!((outcome.imported, outcome.failed), (2, 0));
+            let names: Vec<_> = dst.control.directory().domains().map(|d| d.name.clone()).collect();
+            assert_eq!(names, ["default", "shop"]);
+            assert_eq!(setting_of(&dst, "shop"), ConditionalWrites::default());
+            assert_eq!(dst.store("shop").await.get("clé".as_bytes()).await.unwrap(), GetResult::Present(b"v".to_vec()));
+            assert!(dst.json().get_document("shop", "d").await.unwrap().is_some());
+        })
+    }
+
+    // A domain line of an engine that is off is no reason to abort; its
+    // data would be.
+    #[test]
+    fn a_domain_line_of_a_disabled_engine_does_not_abort_the_restore() {
+        crate::core::engine_runtime::block_on(async {
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let lines = [
+                json!({"t": "kv-domain", "name": "shop", "created_at": 1}),
+                json!({"t": "json-domain", "name": "shop", "created_at": 1}),
+            ];
+            v2_archive(&out_dir.path().join("bk_v2.ndjson"), "domain:shop", &lines);
+            let dst = instance(false).await;
+            dst.restore(out_dir.path(), "bk_v2", RestoreMode::FailIfExists, None, false).await.unwrap();
+            assert!(dst.kv.get_domain("shop").await.unwrap().is_some());
+
+            let doc = json!({"t": "doc", "domain": "shop", "key": "d", "version": 1, "content": {"n": 1}});
+            v2_archive(&out_dir.path().join("bk_v2.ndjson"), "domain:shop", &[lines[0].clone(), lines[1].clone(), doc]);
+            let err = dst.restore(out_dir.path(), "bk_v2", RestoreMode::Replace, None, false).await.unwrap_err();
+            assert!(err.downcast_ref::<BackupError>().is_some_and(|e| matches!(e, BackupError::JsonEngineDisabled)));
+        })
+    }
+
+    // Replacing from a version 2 archive keeps the replaced engine's
+    // conditional-writes setting; a version 3 archive brings its own.
+    #[test]
+    fn a_replace_from_a_v2_archive_keeps_the_conditional_writes_setting() {
+        crate::core::engine_runtime::block_on(async {
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let kv_line = json!({"t": "kv", "domain": "strict", "k": hex::encode(b"k"), "v": hex::encode(b"v"), "expires_at": 0});
+            v2_archive(
+                &out_dir.path().join("bk_v2.ndjson"),
+                "kv:strict",
+                &[json!({"t": "kv-domain", "name": "strict", "created_at": 1}), kv_line],
+            );
+            let dst = instance(false).await;
+            dst.control.create_domain("strict", ConditionalWrites { kv: true, json: true }).await.unwrap();
+            let _purging = dst.purging();
+            dst.restore(out_dir.path(), "bk_v2", RestoreMode::Replace, None, false).await.unwrap();
+            assert_eq!(setting_of(&dst, "strict"), ConditionalWrites { kv: true, json: true });
+            let store = dst.store("strict").await;
+            assert!(store.domain().require_conditional_writes);
+            assert_eq!(store.get(b"k").await.unwrap(), GetResult::Present(b"v".to_vec()));
+
+            let src = instance(false).await;
+            src.create("strict").await;
+            src.backup(out_dir.path(), "bk_v3", BackupScope::KvDomain("strict".to_string()), false).await;
+            dst.restore(out_dir.path(), "bk_v3", RestoreMode::Replace, None, false).await.unwrap();
+            assert_eq!(setting_of(&dst, "strict"), ConditionalWrites { kv: false, json: true });
+            assert!(!dst.store("strict").await.domain().require_conditional_writes);
         })
     }
 }

@@ -558,7 +558,7 @@ mod tests {
 
     async fn make_kv(dir: &Path, metrics: Arc<MetricsStore>) -> Arc<DomainRegistry> {
         let engine = make_lsm(dir, "kv").await;
-        Arc::new(DomainRegistry::recover(engine, DomainConfig::default(), metrics).await.unwrap())
+        Arc::new(DomainRegistry::recover_with_default(engine, DomainConfig::default(), metrics).await.unwrap())
     }
 
     async fn make_json(dir: &Path, metrics: Arc<MetricsStore>) -> Arc<JsonEngine> {
@@ -1606,7 +1606,9 @@ mod tests {
             drop(running);
             sweeper.sweep_domain(&dom).await.unwrap();
             assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Null);
+            // The start gave the domain an empty JSON part again: a link to a
+            // missing document, not to a gone target.
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Text("j1".into()));
         })
     }
 }

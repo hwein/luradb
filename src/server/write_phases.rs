@@ -93,10 +93,9 @@ impl Engine {
     fn setup(self) -> Vec<String> {
         let name = format!(r#"{{"name":"{}"}}"#, self.domain());
         match self {
-            Engine::Kv => vec![request("POST", "/store-api/domains", &name)],
-            Engine::Json => vec![request("POST", "/store-api/json/domains", &name)],
+            Engine::Kv | Engine::Json => vec![request("POST", "/store-api/domains", &name)],
             Engine::Rel => vec![
-                request("POST", "/store-api/rel/domains", &name),
+                request("POST", "/store-api/domains", &name),
                 request(
                     "POST",
                     &format!("/store-api/rel/{}/sql", self.domain()),

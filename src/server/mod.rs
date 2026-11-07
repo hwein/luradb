@@ -1351,7 +1351,7 @@ mod tests {
         engine_runtime::block_on(async {
             let (kv, _hub) = open_kv_engine(cfg, None).await;
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-            let registry = crate::engines::lsm::DomainRegistry::recover(
+            let registry = crate::engines::lsm::DomainRegistry::recover_with_default(
                 Arc::clone(&kv),
                 crate::engines::lsm::domain::DomainConfig::default(),
                 metrics,
@@ -1588,7 +1588,7 @@ mod tests {
         let addr = server.http_addr.expect("HTTP listener enabled");
         client.block_on(async {
             let create = json!({ "name": name }).to_string();
-            assert_eq!(request(addr, &with_body("POST", "/store-api/json/domains", &create)).await.0, 201);
+            assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
         });
@@ -1637,7 +1637,7 @@ mod tests {
         let addr = server.http_addr.expect("HTTP listener enabled");
         client.block_on(async {
             let create = json!({ "name": name }).to_string();
-            assert_eq!(request(addr, &with_body("POST", "/store-api/json/domains", &create)).await.0, 201);
+            assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
         });
@@ -2215,14 +2215,12 @@ mod tests {
                 for (shard, name) in names.iter().enumerate() {
                     let thread = format!("luradb-shard-{shard}");
                     let create = json!({ "name": name }).to_string();
-                    for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
-                        let (status, head, body) = exchange(addr, &with_body("POST", path, &create)).await;
-                        assert_eq!(status, 201, "{path}: {}", String::from_utf8_lossy(&body));
-                        assert_eq!(thread_of(&head), "luradb-control", "{path}");
-                        let (status, head, body) = exchange(addr, &get(&format!("{path}/{name}"))).await;
-                        assert_eq!(status, 200, "{path}/{name}: {}", String::from_utf8_lossy(&body));
-                        assert_eq!(shard_in(&head), shard.to_string(), "{path}/{name}");
-                    }
+                    let (status, head, body) = exchange(addr, &with_body("POST", "/store-api/domains", &create)).await;
+                    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+                    assert_eq!(thread_of(&head), "luradb-control");
+                    let (status, head, body) = exchange(addr, &get(&format!("/store-api/domains/{name}"))).await;
+                    assert_eq!(status, 200, "{name}: {}", String::from_utf8_lossy(&body));
+                    assert_eq!(shard_in(&head), shard.to_string(), "{name}");
 
                     let key = format!("/store-api/kv/{name}/keys/ref");
                     let (status, head, _) = exchange(addr, &with_body("PUT", &key, "clé")).await;
@@ -2334,10 +2332,10 @@ mod tests {
         );
     }
 
-    // The domain lists of all three engines name the domains of every shard,
-    // in name order, as with a single shard.
+    // The domain list names the domains of every shard, in name order, as
+    // with a single shard.
     #[test]
-    fn domain_lists_name_the_domains_of_every_shard_in_order() {
+    fn the_domain_list_names_the_domains_of_every_shard_in_order() {
         use crate::control::slots::domain_name_for_shard;
         let names: Vec<String> =
             (0..3).flat_map(|seed| [domain_name_for_shard(1, 2, seed), domain_name_for_shard(0, 2, seed)]).collect();
@@ -2352,20 +2350,18 @@ mod tests {
                     cfg.rel.enabled = true;
                 },
                 |addr| async move {
-                    for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
-                        for name in &names {
-                            let create = json!({ "name": name }).to_string();
-                            assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path} {name}");
-                        }
-                        let (status, body) = request(addr, &get(path)).await;
-                        assert_eq!(status, 200, "{path}");
-                        let listed: Vec<String> = serde_json::from_slice::<Vec<Value>>(&body)
-                            .unwrap()
-                            .iter()
-                            .map(|domain| domain["name"].as_str().unwrap().to_string())
-                            .collect();
-                        assert_eq!(listed, expected, "{shards} shards: {path}");
+                    for name in &names {
+                        let create = json!({ "name": name }).to_string();
+                        assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201, "{name}");
                     }
+                    let (status, body) = request(addr, &get("/store-api/domains")).await;
+                    assert_eq!(status, 200);
+                    let listed: Vec<String> = serde_json::from_slice::<Vec<Value>>(&body)
+                        .unwrap()
+                        .iter()
+                        .map(|domain| domain["name"].as_str().unwrap().to_string())
+                        .collect();
+                    assert_eq!(listed, expected, "{shards} shards");
                 },
             );
         }
@@ -2387,9 +2383,7 @@ mod tests {
                 let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
                 assert_eq!(request(addr, &user).await.0, 201);
                 let create = json!({ "name": name }).to_string();
-                for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
-                    assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path}");
-                }
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
                 for store_type in ["kv", "json", "rel"] {
                     for (domain, expected) in [(name.as_str(), 200), ("ghost", 404)] {
                         let grant = json!({ "domain": domain, "access": "read", "store_type": store_type }).to_string();
@@ -2439,16 +2433,12 @@ mod tests {
         let source = (&mut archive, &mut expiries, &mut users, &names);
         with_tuned_server(with_shards(2), |addr| async move {
             let (archive, expiries, users, names) = source;
-            // The default domains would make the restore wait for their purge.
-            for path in ["/store-api/domains/default", "/store-api/json/domains/default"] {
-                let delete = format!("DELETE {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-                assert_eq!(request(addr, &delete).await.0, 202, "{path}");
-            }
+            // Out of the archive: the targets have a default domain of their own.
+            let delete = "DELETE /store-api/domains/default HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+            assert_eq!(request(addr, delete).await.0, 202);
             for name in names {
                 let create = json!({ "name": name }).to_string();
-                for path in ["/store-api/domains", "/store-api/json/domains"] {
-                    assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path}");
-                }
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
                 let kv = format!("/store-api/kv/{name}/keys");
                 assert_eq!(request(addr, &with_body("PUT", &format!("{kv}/k"), &format!("clé {name}"))).await.0, 200);
                 assert_eq!(request(addr, &with_body("PUT", &format!("{kv}/session?ttl=86400"), "tok")).await.0, 200);
@@ -2550,6 +2540,120 @@ mod tests {
                 assert_eq!(shard_statuses(&body), json!([{ "id": 0, "status": "ok" }, { "id": 1, "status": "ok" }]));
                 let body = serde_json::from_slice::<Value>(&body).unwrap();
                 assert_eq!((&body["status"], &body["domain_count"]), (&json!("ok"), &json!(3)));
+            },
+        );
+    }
+
+    /// Runs `client` against a server on `cfg`, then shuts it down.
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn serve_on<F, Fut, T>(cfg: LuraConfig, dir: &Path, client: F) -> T
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let server = Server::start(Arc::new(cfg), &dir.join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let out = tokio::runtime::Runtime::new().unwrap().block_on(client(addr));
+        server.shutdown().unwrap();
+        out
+    }
+
+    fn delete_request(path: &str) -> String {
+        format!("DELETE {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+    }
+
+    // An engine that is off keeps the domains' life cycle: a domain created
+    // while the relational engine is off gets its relational part at the
+    // first start with it on; one deleted while the JSON engine is off keeps
+    // its name taken until a start with it on has purged its documents.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn a_disabled_engine_catches_up_at_the_next_start_with_it_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = |json: bool, rel: bool| {
+            let mut cfg = test_config(dir.path());
+            (cfg.json.enabled, cfg.rel.enabled) = (json, rel);
+            cfg
+        };
+        serve_on(config(true, false), dir.path(), |addr| async move {
+            for name in ["made", "gone"] {
+                let create = json!({ "name": name }).to_string();
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201, "{name}");
+            }
+            assert_eq!(request(addr, &with_body("PUT", "/store-api/json/gone/documents/d", "{}")).await.0, 201);
+        });
+        serve_on(config(true, true), dir.path(), |addr| async move {
+            let create = with_body("POST", "/store-api/rel/made/sql", &sql_body("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+            let (status, body) = request(addr, &create).await;
+            assert_eq!(status, 200, "the relational part is there: {}", String::from_utf8_lossy(&body));
+        });
+        serve_on(config(false, true), dir.path(), |addr| async move {
+            assert_eq!(request(addr, &delete_request("/store-api/domains/gone")).await.0, 202);
+            let (status, body) = request(addr, &with_body("POST", "/store-api/domains", r#"{"name": "gone"}"#)).await;
+            assert_eq!((status, body.as_slice()), (409, b"409 Conflict: domain 'gone' is being deleted".as_slice()));
+        });
+        serve_on(config(true, true), dir.path(), |addr| async move {
+            // Upper bound against hanging only.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while request(addr, &get("/store-api/domains/gone")).await.0 != 404 {
+                assert!(std::time::Instant::now() < deadline, "the JSON part of gone is never purged");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(request(addr, &with_body("POST", "/store-api/domains", r#"{"name": "gone"}"#)).await.0, 201);
+            assert_eq!(request(addr, &get("/store-api/json/gone/documents/d")).await.0, 404, "the documents were purged");
+        });
+    }
+
+    // With `domains.max_name_length = 80`, a name of 80 characters works in
+    // every engine and takes permissions; one of 81 does not.
+    #[test]
+    fn a_longer_name_limit_holds_in_every_engine() {
+        with_tuned_server(
+            |cfg| {
+                cfg.domains.max_name_length = 80;
+                (cfg.json.enabled, cfg.rel.enabled) = (true, true);
+            },
+            |addr| async move {
+                let name = "n".repeat(80);
+                let create = json!({ "name": name }).to_string();
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
+                assert_eq!(request(addr, &with_body("PUT", &format!("/store-api/kv/{name}/keys/k"), "clé")).await.0, 200);
+                let put = with_body("PUT", &format!("/store-api/json/{name}/documents/d"), r#"{"n": 1}"#);
+                assert_eq!(request(addr, &put).await.0, 201);
+                let sql = with_body("POST", &format!("/store-api/rel/{name}/sql"), &sql_body("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+                assert_eq!(request(addr, &sql).await.0, 200);
+                let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
+                assert_eq!(request(addr, &user).await.0, 201);
+                for store_type in ["kv", "json", "rel"] {
+                    let grant = json!({ "domain": name, "access": "read", "store_type": store_type }).to_string();
+                    let (status, body) = request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await;
+                    assert_eq!(status, 200, "{store_type}: {}", String::from_utf8_lossy(&body));
+                }
+                let longer = json!({ "name": "n".repeat(81) }).to_string();
+                let (status, body) = request(addr, &with_body("POST", "/store-api/domains", &longer)).await;
+                assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+                assert!(String::from_utf8_lossy(&body).ends_with("1 to 80 characters"));
+            },
+        );
+    }
+
+    // `domains.default_domain` names the default domain of every engine.
+    #[test]
+    fn the_configured_default_domain_exists_in_every_engine() {
+        with_tuned_server(
+            |cfg| {
+                cfg.domains.default_domain = "main".to_string();
+                (cfg.json.enabled, cfg.rel.enabled) = (true, true);
+            },
+            |addr| async move {
+                let (status, body) = request(addr, &get("/store-api/domains")).await;
+                assert_eq!(status, 200);
+                let names: Vec<Value> = serde_json::from_slice::<Vec<Value>>(&body).unwrap().iter().map(|d| d["name"].clone()).collect();
+                assert_eq!(names, [json!("main")]);
+                assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/main/keys/k", "v")).await.0, 200);
+                assert_eq!(request(addr, &with_body("PUT", "/store-api/json/main/documents/d", "{}")).await.0, 201);
+                let sql = with_body("POST", "/store-api/rel/main/sql", &sql_body("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+                assert_eq!(request(addr, &sql).await.0, 200);
             },
         );
     }

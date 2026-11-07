@@ -181,13 +181,15 @@ interval_secs = 60
 # Candidates checked per tick — discarded ones count too.
 batch_size = 500
 
-# Domains of the key-value engine.
+# Domains: each holds data in the key-value, JSON and relational engines.
 [domains]
-# Longest domain name in characters ([a-zA-Z0-9_-]).
+# Longest domain name in characters ([a-zA-Z0-9_-]), in every engine. At most 438, so
+# that the name fits the keys of the system store; json.lsm.max_key_length and
+# rel.lsm.max_key_length are raised at the start, with a warning, to take it.
 max_name_length = 50
-# Longest key a client may use, in bytes.
+# Longest key a client may use in the key-value engine, in bytes.
 max_user_key_length = 256
-# Domain created at every start if it is missing.
+# Domain created in every engine at a start if it is missing.
 default_domain = "default"
 # Keys removed per step while a deleted domain is purged in the background.
 purger_batch_size = 100
@@ -206,7 +208,9 @@ default_write_iops = 500
 # JSON document engine with its own LSM storage.
 [json]
 # Starts the JSON document engine.
-# While disabled, relational tables show JSON references as NULL.
+# While disabled, relational tables show JSON references as NULL and the document routes
+# answer 503; the domains stay, and a start with the engine on creates, deletes and
+# clears their JSON parts as the domains changed meanwhile.
 enabled = true
 # Write-ahead log; relative paths resolve against the working directory. A directory of
 # segment files the server creates, writes and deletes; never change anything in it by
@@ -224,7 +228,8 @@ bulk_body_limit_bytes = 67108864
 
 [json.lsm]
 # Longest stored key in bytes; document keys get this minus an internal
-# prefix, at most 256 bytes.
+# prefix, at most 256 bytes. Raised at the start, with a warning, below
+# 19 + domains.max_name_length.
 max_key_length = 256
 # Largest stored document in bytes.
 max_value_size = 524288
@@ -232,6 +237,9 @@ max_value_size = 524288
 # Relational engine with its own LSM storage.
 [rel]
 # Starts the relational engine.
+# While disabled, the relational routes answer 503; the domains stay, and a start with
+# the engine on creates, deletes and clears their relational parts as the domains
+# changed meanwhile.
 enabled = true
 # Write-ahead log; relative paths resolve against the working directory. A directory of
 # segment files the server creates, writes and deletes; never change anything in it by
@@ -262,7 +270,8 @@ allow_unindexed_joins = false
 import_body_limit_bytes = 67108864
 
 [rel.lsm]
-# Longest stored key in bytes; it bounds primary-key and index values.
+# Longest stored key in bytes; it bounds primary-key and index values. Raised at
+# the start, with a warning, below 23 + domains.max_name_length.
 max_key_length = 256
 
 # Live broadcast for GET /store-api/events.
@@ -378,7 +387,8 @@ dir = "luradb_backups"
 # name = "nightly"
 # When the schedule runs: a 5-field cron expression in UTC that fires within 4 years.
 # cron = "0 3 * * *"
-# Data to back up: all, kv, json, rel, kv:<domain>, json:<domain>, rel:<domain> or domain:<name>.
+# Data to back up: all, kv, json, rel, kv:<domain>, json:<domain>, rel:<domain> or domain:<name>;
+# domain:<name> is the whole domain, kv:, json: and rel: one engine's part of it.
 # scope = "all"
 # Also backs up users and permissions (scopes all and kv only).
 # The backup file then contains API key hashes.

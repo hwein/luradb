@@ -1507,8 +1507,8 @@ mod tests {
             let (status, _) = req_json(&app, Method::GET, "/store-api/rel/ghost/tables/t/count", None).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "unknown domain");
 
-            request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "gone"}"#)).await;
-            request(&app, Method::DELETE, "/store-api/rel/domains/gone", None).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "gone"}"#)).await;
+            request(&app, Method::DELETE, "/store-api/domains/gone", None).await;
             let (status, _) = req_json(&app, Method::GET, "/store-api/rel/gone/tables/t/count", None).await;
             assert_eq!(status, StatusCode::GONE, "deleting domain");
 
@@ -1588,7 +1588,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let resp = send(Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#), admin_key)
+            let resp = send(Method::POST, "/store-api/domains", Some(r#"{"name": "shop"}"#), admin_key)
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);

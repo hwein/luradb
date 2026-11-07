@@ -280,7 +280,8 @@ mod tests {
             let sys = open_with_wal(&dir, hub.wal(WalTarget::Sys)).await.unwrap();
             let auth = Arc::new(crate::auth::AuthCache::new(Arc::clone(&sys), None));
             let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
-            let control = ControlPlane::start(Owners { shards: Vec::new(), auth }, Arc::clone(&sys), bus, Default::default()).await.unwrap();
+            let owners = Owners { shards: Vec::new(), auth };
+            let control = ControlPlane::start(owners, Arc::clone(&sys), bus, Default::default(), 50).await.unwrap();
             let checkpoints =
                 WalCheckpoint::new(control, vec![(Holder::System, hub.wal(WalTarget::Sys))], 3 * SEGMENT, Default::default());
             let user = |i: usize| format!("{PREFIX_USER}user-{i}").into_bytes();

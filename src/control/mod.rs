@@ -1,10 +1,12 @@
-//! Control plane: runs the rare, global mutations — domain create and delete
-//! in every engine, auth changes — one at a time on a single worker task,
-//! holds the directory of all domains, owns the system store, is the one
-//! publisher of the global event stream and takes consistent cuts, metrics
-//! samples and write-ahead log checkpoints across the data shards.
+//! Control plane: runs the rare, global mutations — domain create, delete
+//! and engine clears across the engines, auth changes — one at a time on a
+//! single worker task, holds the directory of all domains, owns the system
+//! store, is the one publisher of the global event stream and takes
+//! consistent cuts, metrics samples and write-ahead log checkpoints across
+//! the data shards.
 
 pub mod checkpoint;
+pub mod domains;
 pub mod resources;
 pub mod slots;
 pub mod system;
@@ -12,23 +14,27 @@ pub mod system;
 use crate::auth::oauth::{OAuthClient, RedeemCode, Refresh, TokenRecord};
 use crate::auth::{AuthCache, DomainPermission, UserRecord};
 use crate::core::events::GlobalEventBus;
-use crate::engines::json::{JsonDomain, JsonDomainState, JsonEngine, JsonStoreError};
-use crate::engines::lsm::domain::{Domain, DomainRegistry, DomainState};
+use crate::engines::json::{JsonDomainState, JsonEngine};
+use crate::engines::lsm::domain::{DomainRegistry, DomainState};
 use crate::engines::lsm::engine::LsmStorageEngine;
 use crate::engines::lsm::reader::{RegistrySnapshot, Snapshot};
-use crate::engines::rel::{RelDomain, RelDomainState, RelEngine, RelStoreError};
+use crate::engines::rel::{RelDomainState, RelEngine};
 use crate::metrics::MetricsSample;
 use anyhow::Context;
+pub use domains::{ConditionalWrites, DomainRules};
+use domains::DomainRecord;
 use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-/// Storage engine a domain lives in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Storage engine that holds a part of every domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Engine {
     Kv,
     Json,
@@ -36,6 +42,9 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// Every engine, in the order a domain's parts are created.
+    pub const ALL: [Engine; 3] = [Engine::Kv, Engine::Json, Engine::Rel];
+
     /// The engine's tag on the global event stream.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -57,8 +66,9 @@ impl From<Engine> for crate::core::storage_thread::WalTarget {
     }
 }
 
-/// Lifecycle state of a domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle state of a domain, or of its part in one engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Lifecycle {
     Active,
     /// Takes no requests; the purger removes its data.
@@ -79,82 +89,64 @@ impl Lifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainEntry {
     pub name: String,
-    pub engine: Engine,
     pub state: Lifecycle,
     pub slot: u16,
     /// Unix seconds.
     pub created_at: u64,
-    /// Always false for relational domains, which have no such setting.
-    pub require_conditional_writes: bool,
+    pub require_conditional_writes: ConditionalWrites,
+    /// The engines whose data of the domain is still to be removed.
+    pub purging: Vec<Engine>,
 }
 
 impl DomainEntry {
-    fn new(engine: Engine, name: &str, state: Lifecycle, created_at: u64, require_conditional_writes: bool) -> Self {
+    fn new(name: &str, record: &DomainRecord) -> Self {
         Self {
             name: name.to_string(),
-            engine,
-            state,
+            state: record.state,
             slot: slots::slot_of_domain(name),
-            created_at,
-            require_conditional_writes,
+            created_at: record.created_at,
+            require_conditional_writes: record.require_conditional_writes,
+            purging: record.purging.clone(),
         }
     }
 
-    fn kv(d: &Domain) -> Self {
-        let state = match d.state {
-            DomainState::Active => Lifecycle::Active,
-            DomainState::Deleting => Lifecycle::Deleting,
-        };
-        Self::new(Engine::Kv, &d.name, state, d.created_at, d.require_conditional_writes)
+    fn record(&self) -> DomainRecord {
+        DomainRecord {
+            state: self.state,
+            created_at: self.created_at,
+            require_conditional_writes: self.require_conditional_writes,
+            purging: self.purging.clone(),
+        }
     }
 
-    fn json(d: &JsonDomain) -> Self {
-        let state = match d.state {
-            JsonDomainState::Active => Lifecycle::Active,
-            JsonDomainState::Deleting => Lifecycle::Deleting,
-        };
-        Self::new(Engine::Json, &d.name, state, d.created_at, d.require_conditional_writes)
-    }
-
-    fn rel(d: &RelDomain) -> Self {
-        let state = match d.state {
-            RelDomainState::Active => Lifecycle::Active,
-            RelDomainState::Deleting => Lifecycle::Deleting,
-        };
-        Self::new(Engine::Rel, &d.name, state, d.created_at, false)
+    /// The state of the domain's part in `engine`: deleting while that part
+    /// is still to be removed.
+    pub fn state_in(&self, engine: Engine) -> Lifecycle {
+        self.record().state_in(engine)
     }
 }
 
-/// Every domain of every engine; read-only, replaced as a whole on change.
+/// Every domain, by name; read-only, replaced as a whole on change.
 #[derive(Debug, Clone, Default)]
 pub struct Directory {
-    entries: BTreeMap<(Engine, String), DomainEntry>,
+    entries: BTreeMap<String, DomainEntry>,
     generation: u64,
 }
 
 impl Directory {
-    async fn of(shards: &[Shard]) -> anyhow::Result<Self> {
-        let mut directory = Self::default();
-        for Shard { owners, .. } in shards {
-            let kv = owners.kv.list_domains().await?.into_iter().chain(owners.kv.list_deleting_domains());
-            kv.for_each(|d| directory.insert(DomainEntry::kv(&d)));
-            if let Some(json) = &owners.json {
-                json.list_domains().iter().for_each(|d| directory.insert(DomainEntry::json(d)));
-            }
-            if let Some(rel) = &owners.rel {
-                rel.list_domains().iter().for_each(|d| directory.insert(DomainEntry::rel(d)));
-            }
-        }
-        Ok(directory)
+    async fn of(system: &LsmStorageEngine) -> anyhow::Result<Self> {
+        let records = domains::load_all(system).await?;
+        let entries = records.iter().map(|(name, record)| (name.clone(), DomainEntry::new(name, record))).collect();
+        Ok(Self { entries, generation: 0 })
     }
 
-    /// The domains of `engine`, ordered by name.
-    pub fn domains(&self, engine: Engine) -> impl Iterator<Item = &DomainEntry> {
-        self.entries.values().filter(move |entry| entry.engine == engine)
+    /// Every domain, ordered by name.
+    pub fn domains(&self) -> impl Iterator<Item = &DomainEntry> {
+        self.entries.values()
     }
 
-    pub fn get(&self, engine: Engine, name: &str) -> Option<&DomainEntry> {
-        self.entries.get(&(engine, name.to_string()))
+    pub fn get(&self, name: &str) -> Option<&DomainEntry> {
+        self.entries.get(name)
     }
 
     /// Counts the changes since the start: equal generations, equal directories.
@@ -163,35 +155,66 @@ impl Directory {
     }
 
     fn insert(&mut self, entry: DomainEntry) {
-        self.entries.insert((entry.engine, entry.name.clone()), entry);
+        self.entries.insert(entry.name.clone(), entry);
     }
 
-    fn set_deleting(&mut self, engine: Engine, name: &str) {
-        if let Some(entry) = self.entries.get_mut(&(engine, name.to_string())) {
-            entry.state = Lifecycle::Deleting;
-        }
-    }
-
-    fn remove(&mut self, engine: Engine, name: &str) {
-        self.entries.remove(&(engine, name.to_string()));
+    fn remove(&mut self, name: &str) {
+        self.entries.remove(name);
     }
 }
 
-/// A failed domain create or delete, in the error type of its engine.
+/// A failed domain command.
 #[derive(Debug, thiserror::Error)]
 pub enum DomainError {
-    #[error("{0}")]
-    Kv(anyhow::Error),
-    #[error(transparent)]
-    Json(#[from] JsonStoreError),
-    #[error(transparent)]
-    Rel(#[from] RelStoreError),
-    /// The engine is disabled by config.
-    #[error("the {} engine is disabled", .0.as_str())]
-    Disabled(Engine),
+    #[error("invalid domain name '{name}': allowed are [a-zA-Z0-9_-], 1 to {max} characters")]
+    InvalidName { name: String, max: usize },
+    #[error("domain '{0}' already exists")]
+    Exists(String),
+    #[error("domain '{0}' is being deleted")]
+    Deleting(String),
+    #[error("domain '{0}' not found")]
+    NotFound(String),
+    /// A step in the system store or an engine failed.
+    #[error("{0:#}")]
+    Failed(anyhow::Error),
     /// The worker that runs the commands is gone.
     #[error("the control plane is not running")]
     Stopped,
+}
+
+/// A domain's record in one engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EngineRecord {
+    pub state: Lifecycle,
+    pub created_at: u64,
+    pub require_conditional_writes: bool,
+}
+
+impl EngineRecord {
+    fn of(state: Lifecycle, created_at: u64, require_conditional_writes: bool) -> Self {
+        Self { state, created_at, require_conditional_writes }
+    }
+}
+
+fn lifecycle_kv(state: &DomainState) -> Lifecycle {
+    match state {
+        DomainState::Active => Lifecycle::Active,
+        DomainState::Deleting => Lifecycle::Deleting,
+    }
+}
+
+fn lifecycle_json(state: &JsonDomainState) -> Lifecycle {
+    match state {
+        JsonDomainState::Active => Lifecycle::Active,
+        JsonDomainState::Deleting => Lifecycle::Deleting,
+    }
+}
+
+fn lifecycle_rel(state: &RelDomainState) -> Lifecycle {
+    match state {
+        RelDomainState::Active => Lifecycle::Active,
+        RelDomainState::Deleting => Lifecycle::Deleting,
+    }
 }
 
 /// A change to the auth records.
@@ -212,12 +235,17 @@ pub enum AuthChange {
 
 enum Command {
     CreateDomain {
-        engine: Engine,
         name: String,
-        require_conditional_writes: bool,
+        require_conditional_writes: ConditionalWrites,
         reply: oneshot::Sender<Result<DomainEntry, DomainError>>,
     },
-    DeleteDomain { engine: Engine, name: String, reply: oneshot::Sender<Result<(), DomainError>> },
+    DeleteDomain { name: String, reply: oneshot::Sender<Result<(), DomainError>> },
+    ClearEngine {
+        engine: Engine,
+        name: String,
+        require_conditional_writes: Option<bool>,
+        reply: oneshot::Sender<Result<(), DomainError>>,
+    },
     FinalizeDeletion { engine: Engine, name: String, reply: oneshot::Sender<anyhow::Result<()>> },
     ChangeAuth { change: AuthChange, reply: oneshot::Sender<anyhow::Result<()>> },
 }
@@ -240,13 +268,71 @@ impl ShardOwners {
         }
     }
 
+    /// The enabled engines, in the order a domain's parts are created.
+    pub(crate) fn engines(&self) -> Vec<Engine> {
+        Engine::ALL.into_iter().filter(|engine| self.instance(*engine).is_some()).collect()
+    }
+
+    /// The record of `name` in `engine`, in any state.
+    pub(crate) fn record(&self, engine: Engine, name: &str) -> Option<EngineRecord> {
+        match engine {
+            Engine::Kv => self
+                .kv
+                .get_domain_any(name)
+                .map(|d| EngineRecord::of(lifecycle_kv(&d.state), d.created_at, d.require_conditional_writes)),
+            Engine::Json => self.json.as_ref()?.get_domain_any(name).map(|d| {
+                EngineRecord::of(lifecycle_json(&d.state), d.created_at, d.require_conditional_writes)
+            }),
+            Engine::Rel => {
+                self.rel.as_ref()?.get_domain_any(name).map(|d| EngineRecord::of(lifecycle_rel(&d.state), d.created_at, false))
+            }
+        }
+    }
+
+    /// Every record of `engine`, by name.
+    pub(crate) async fn records(&self, engine: Engine) -> anyhow::Result<Vec<(String, EngineRecord)>> {
+        let names: Vec<String> = match engine {
+            Engine::Kv => {
+                let active = self.kv.list_domains().await?.into_iter();
+                active.chain(self.kv.list_deleting_domains()).map(|d| d.name).collect()
+            }
+            Engine::Json => self.json.iter().flat_map(|json| json.list_domains()).map(|d| d.name).collect(),
+            Engine::Rel => self.rel.iter().flat_map(|rel| rel.list_domains()).map(|d| d.name).collect(),
+        };
+        Ok(names.into_iter().filter_map(|name| self.record(engine, &name).map(|record| (name, record))).collect())
+    }
+
+    /// Writes an empty record of `name` in the enabled `engine`.
+    pub(crate) async fn create_record(&self, engine: Engine, name: &str, require_conditional_writes: bool) -> anyhow::Result<()> {
+        match engine {
+            Engine::Kv => self.kv.create_domain_with(name, require_conditional_writes).await.map(drop),
+            Engine::Json => Ok(self.json()?.create_domain_with(name, require_conditional_writes).await.map(drop)?),
+            Engine::Rel => Ok(self.rel()?.create_domain(name).await.map(drop)?),
+        }
+    }
+
+    /// Turns the active record of `name` in the enabled `engine` deleting.
+    pub(crate) async fn mark_deleting(&self, engine: Engine, name: &str) -> anyhow::Result<()> {
+        match engine {
+            Engine::Kv => self.kv.delete_domain(name).await,
+            Engine::Json => Ok(self.json()?.delete_domain(name).await?),
+            Engine::Rel => Ok(self.rel()?.delete_domain(name).await?),
+        }
+    }
+
+    fn json(&self) -> anyhow::Result<&Arc<JsonEngine>> {
+        self.json.as_ref().context("the json engine is disabled")
+    }
+
+    fn rel(&self) -> anyhow::Result<&Arc<RelEngine>> {
+        self.rel.as_ref().context("the rel engine is disabled")
+    }
+
     async fn finalize_deletion(&self, engine: Engine, name: &str) -> anyhow::Result<()> {
         match engine {
             Engine::Kv => self.kv.finalize_domain_deletion(name).await,
-            Engine::Json => {
-                Ok(self.json.as_ref().ok_or(DomainError::Disabled(Engine::Json))?.finalize_deletion(name).await?)
-            }
-            Engine::Rel => Ok(self.rel.as_ref().ok_or(DomainError::Disabled(Engine::Rel))?.finalize_deletion(name).await?),
+            Engine::Json => Ok(self.json()?.finalize_deletion(name).await?),
+            Engine::Rel => Ok(self.rel()?.finalize_deletion(name).await?),
         }
     }
 
@@ -385,7 +471,7 @@ pub async fn serve_shard(owners: ShardOwners, mut commands: mpsc::UnboundedRecei
                 compio::runtime::spawn(async move {
                     let persisted = match instance {
                         Some(instance) => instance.raise_flushed_lsn(up_to).await,
-                        None => Err(DomainError::Disabled(engine).into()),
+                        None => Err(anyhow::anyhow!("the {} engine is disabled", engine.as_str())),
                     };
                     let _ = reply.send(persisted);
                 })
@@ -474,6 +560,7 @@ pub struct ControlPlane {
     /// The last ping sent to each data shard, by shard index.
     pings: Mutex<Vec<Option<Shared<BoxFuture<'static, bool>>>>>,
     resources: resources::Resources,
+    max_name_length: usize,
 }
 
 /// Marks a restore as running until it drops, on every exit path.
@@ -486,21 +573,22 @@ impl Drop for RestoreRunning<'_> {
 }
 
 impl ControlPlane {
-    /// Reads the owners' domains into the directory, attaches itself to the
+    /// Reads the domain records into the directory, attaches itself to the
     /// engines of every shard — before any purger runs, so none finishes a
     /// deletion behind its back — and starts the worker on the current
-    /// runtime.
+    /// runtime. Domain names are valid up to `max_name_length`.
     pub async fn start(
         owners: Owners,
         system: Arc<LsmStorageEngine>,
         bus: Arc<GlobalEventBus>,
         resources: resources::Resources,
+        max_name_length: usize,
     ) -> anyhow::Result<Arc<Self>> {
         let Owners { shards, auth } = owners;
         let (commands, inbox) = mpsc::unbounded_channel();
         let control = Arc::new(Self {
             commands,
-            directory: RwLock::new(Arc::new(Directory::of(&shards).await?)),
+            directory: RwLock::new(Arc::new(Directory::of(&system).await?)),
             bus,
             system,
             pings: Mutex::new(vec![None; shards.len()]),
@@ -508,6 +596,7 @@ impl ControlPlane {
             rounds: tokio::sync::Mutex::new(()),
             restoring: AtomicBool::new(false),
             resources,
+            max_name_length,
         });
         for Shard { owners, .. } in &control.shards {
             owners.kv.attach_control_plane(Arc::clone(&control));
@@ -518,7 +607,7 @@ impl ControlPlane {
                 rel.attach_control_plane(Arc::clone(&control));
             }
         }
-        let worker = Worker { auth, control: Arc::clone(&control) };
+        let worker = Worker { auth, control: Arc::clone(&control), abandoned: Mutex::default() };
         compio::runtime::spawn(worker.run(inbox)).detach();
         Ok(control)
     }
@@ -710,9 +799,10 @@ impl ControlPlane {
         &self.system
     }
 
-    /// Whether a restore job runs. A restore that replaces a domain leaves it
-    /// briefly deleted, so the link sweep of the relational engine waits
-    /// meanwhile instead of clearing links to it for good.
+    /// Whether a restore job runs. A restore that replaces a domain's part in
+    /// an engine leaves that part briefly deleted, so the link sweep of the
+    /// relational engine waits meanwhile instead of clearing links to it for
+    /// good.
     pub fn restore_running(&self) -> bool {
         self.restoring.load(Ordering::SeqCst)
     }
@@ -723,26 +813,52 @@ impl ControlPlane {
         RestoreRunning(self)
     }
 
-    /// Creates a domain; `require_conditional_writes` has no effect on a
-    /// relational domain.
+    /// The longest valid domain name.
+    pub fn max_name_length(&self) -> usize {
+        self.max_name_length
+    }
+
+    /// Fails unless `name` is a valid domain name.
+    pub fn check_name(&self, name: &str) -> Result<(), DomainError> {
+        if domains::is_valid_name(name, self.max_name_length) {
+            Ok(())
+        } else {
+            Err(DomainError::InvalidName { name: name.to_string(), max: self.max_name_length })
+        }
+    }
+
+    /// Creates a domain in every enabled engine.
     pub async fn create_domain(
         &self,
-        engine: Engine,
         name: &str,
-        require_conditional_writes: bool,
+        require_conditional_writes: ConditionalWrites,
     ) -> Result<DomainEntry, DomainError> {
-        self.request(|reply| Command::CreateDomain { engine, name: name.to_string(), require_conditional_writes, reply })
-            .await
+        self.request(|reply| Command::CreateDomain { name: name.to_string(), require_conditional_writes, reply }).await
     }
 
     /// Deletes a domain in two phases: it turns away new requests at once,
     /// and the call returns only after the writes already admitted ended.
-    /// The purger removes its data afterwards.
-    pub async fn delete_domain(&self, engine: Engine, name: &str) -> Result<(), DomainError> {
-        self.request(|reply| Command::DeleteDomain { engine, name: name.to_string(), reply }).await
+    /// The purgers remove its data afterwards.
+    pub async fn delete_domain(&self, name: &str) -> Result<(), DomainError> {
+        self.request(|reply| Command::DeleteDomain { name: name.to_string(), reply }).await
     }
 
-    /// Removes a deleted domain whose data the purger has removed.
+    /// Empties the part of the active domain `name` in `engine`, as a delete
+    /// does, and gives it an empty part again once the purger is done; the
+    /// domain and its other parts stay. `require_conditional_writes`, when
+    /// set, becomes the engine's setting for the new part.
+    pub(crate) async fn clear_engine(
+        &self,
+        engine: Engine,
+        name: &str,
+        require_conditional_writes: Option<bool>,
+    ) -> Result<(), DomainError> {
+        self.request(|reply| Command::ClearEngine { engine, name: name.to_string(), require_conditional_writes, reply })
+            .await
+    }
+
+    /// Removes the deleted part of `name` in `engine`, whose data the purger
+    /// has removed.
     pub(crate) async fn finalize_deletion(&self, engine: Engine, name: &str) -> anyhow::Result<()> {
         self.request(|reply| Command::FinalizeDeletion { engine, name: name.to_string(), reply }).await
     }
@@ -751,15 +867,20 @@ impl ControlPlane {
         self.request(|reply| Command::ChangeAuth { change, reply }).await
     }
 
-    /// Publishes one event on the global event stream; this and
-    /// [`Self::publish_global_many`] are the stream's only entries.
+    /// Publishes one event of an object in `engine` on the global event
+    /// stream; this, [`Self::publish_global_many`] and the domain events of
+    /// the worker are the stream's only entries.
     pub fn publish_global(&self, engine: Engine, kind: &'static str, domain: &str, object: Option<String>) {
-        self.bus.publish(engine.as_str(), kind, domain, object);
+        self.bus.publish(Some(engine.as_str()), kind, domain, object);
     }
 
     /// Publishes `events` as adjacent events with no foreign one between them.
     pub fn publish_global_many(&self, engine: Engine, domain: &str, events: &[(&'static str, Option<String>)]) {
         self.bus.publish_many(engine.as_str(), domain, events);
+    }
+
+    fn publish_domain(&self, kind: &'static str, domain: &str) {
+        self.bus.publish(None, kind, domain, None);
     }
 
     async fn request<T, E: From<DomainError>>(
@@ -784,6 +905,9 @@ impl ControlPlane {
 struct Worker {
     auth: Arc<AuthCache>,
     control: Arc<ControlPlane>,
+    /// The domains whose create failed in this run: no event announced them,
+    /// none reports their fall.
+    abandoned: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Worker {
@@ -791,11 +915,14 @@ impl Worker {
         while let Some(command) = inbox.recv().await {
             // A caller that gave up does not stop its command.
             match command {
-                Command::CreateDomain { engine, name, require_conditional_writes, reply } => {
-                    let _ = reply.send(self.create_domain(engine, &name, require_conditional_writes).await);
+                Command::CreateDomain { name, require_conditional_writes, reply } => {
+                    let _ = reply.send(self.create_domain(&name, require_conditional_writes).await);
                 }
-                Command::DeleteDomain { engine, name, reply } => {
-                    let _ = reply.send(self.delete_domain(engine, &name).await);
+                Command::DeleteDomain { name, reply } => {
+                    let _ = reply.send(self.delete_domain(&name).await);
+                }
+                Command::ClearEngine { engine, name, require_conditional_writes, reply } => {
+                    let _ = reply.send(self.clear_engine(engine, &name, require_conditional_writes).await);
                 }
                 Command::FinalizeDeletion { engine, name, reply } => {
                     let _ = reply.send(self.finalize_deletion(engine, &name).await);
@@ -807,60 +934,151 @@ impl Worker {
         }
     }
 
-    fn json<'a>(&self, owner: &'a Shard) -> Result<&'a Arc<JsonEngine>, DomainError> {
-        owner.owners.json.as_ref().ok_or(DomainError::Disabled(Engine::Json))
+    /// The directory entry of `name`, unless it is missing or deleting.
+    fn active(&self, name: &str) -> Result<DomainEntry, DomainError> {
+        match self.control.directory().get(name) {
+            None => Err(DomainError::NotFound(name.to_string())),
+            Some(entry) if entry.state == Lifecycle::Deleting => Err(DomainError::Deleting(name.to_string())),
+            Some(entry) => Ok(entry.clone()),
+        }
     }
 
-    fn rel<'a>(&self, owner: &'a Shard) -> Result<&'a Arc<RelEngine>, DomainError> {
-        owner.owners.rel.as_ref().ok_or(DomainError::Disabled(Engine::Rel))
+    /// Writes `record` of `name` and shows it in the directory.
+    async fn store(&self, name: &str, record: &DomainRecord) -> anyhow::Result<()> {
+        domains::put(&self.control.system, name, record).await?;
+        self.control.change_directory(|d| d.insert(DomainEntry::new(name, record)));
+        Ok(())
     }
 
+    /// Lets every write of `engines` admitted so far end, each on the
+    /// owner's thread; all quiesces reach the shard before the first wait.
+    async fn quiesce(&self, owner: &Shard, engines: &[Engine]) -> Result<(), DomainError> {
+        let quiesces = engines.iter().map(|&engine| owner.request(move |reply| ShardCommand::Quiesce { engine, reply }));
+        futures::future::try_join_all(quiesces).await.map_err(|_| DomainError::Stopped)?;
+        Ok(())
+    }
+
+    /// The domain record first, then its part in each enabled engine; a
+    /// failed part deletes what was created, without an event.
     async fn create_domain(
         &self,
-        engine: Engine,
         name: &str,
-        require_conditional_writes: bool,
+        require_conditional_writes: ConditionalWrites,
     ) -> Result<DomainEntry, DomainError> {
-        let owner = self.control.owner(name);
-        let entry = match engine {
-            Engine::Kv => DomainEntry::kv(
-                &owner.owners.kv.create_domain_with(name, require_conditional_writes).await.map_err(DomainError::Kv)?,
-            ),
-            Engine::Json => DomainEntry::json(
-                &self
-                    .json(owner)?
-                    .create_domain_with(name, require_conditional_writes)
-                    .await
-                    .map_err(DomainError::Json)?,
-            ),
-            Engine::Rel => DomainEntry::rel(&self.rel(owner)?.create_domain(name).await.map_err(DomainError::Rel)?),
-        };
+        self.control.check_name(name)?;
+        match self.control.directory().get(name) {
+            Some(entry) if entry.state == Lifecycle::Deleting => return Err(DomainError::Deleting(name.to_string())),
+            Some(_) => return Err(DomainError::Exists(name.to_string())),
+            None => {}
+        }
+        let owners = &self.control.owner(name).owners;
+        let mut record = DomainRecord::new(crate::engines::lsm::domain::now_secs(), require_conditional_writes);
+        domains::put(&self.control.system, name, &record).await.map_err(DomainError::Failed)?;
+        for engine in owners.engines() {
+            if let Err(e) = owners.create_record(engine, name, require_conditional_writes.of(engine)).await {
+                if let Err(undo) = self.abandon(name, &mut record).await {
+                    tracing::warn!("domain '{name}': removing the failed create failed: {undo:#}");
+                }
+                return Err(DomainError::Failed(e));
+            }
+        }
+        let entry = DomainEntry::new(name, &record);
         self.control.change_directory(|d| d.insert(entry.clone()));
-        self.control.publish_global(engine, "domain_created", name, None);
+        self.control.publish_domain("domain_created", name);
         Ok(entry)
     }
 
-    async fn delete_domain(&self, engine: Engine, name: &str) -> Result<(), DomainError> {
-        let owner = self.control.owner(name);
-        match engine {
-            Engine::Kv => owner.owners.kv.delete_domain(name).await.map_err(DomainError::Kv)?,
-            Engine::Json => self.json(owner)?.delete_domain(name).await.map_err(DomainError::Json)?,
-            Engine::Rel => self.rel(owner)?.delete_domain(name).await.map_err(DomainError::Rel)?,
+    /// Takes a failed create down the delete path; the engines that never
+    /// got their part have nothing to purge. The record turns deleting
+    /// before any part does, so a crash in between leaves no live domain.
+    async fn abandon(&self, name: &str, record: &mut DomainRecord) -> anyhow::Result<()> {
+        let owners = &self.control.owner(name).owners;
+        let enabled = owners.engines();
+        record.state = Lifecycle::Deleting;
+        record.purging = Engine::ALL
+            .into_iter()
+            .filter(|engine| !enabled.contains(engine) || owners.record(*engine, name).is_some())
+            .collect();
+        if record.purging.is_empty() {
+            return domains::remove(&self.control.system, name).await;
         }
-        self.control.change_directory(|d| d.set_deleting(engine, name));
-        // Writes that passed the domain check before it turned `Deleting`;
-        // the owner drains its engine on its own thread.
-        owner.request(|reply| ShardCommand::Quiesce { engine, reply }).await.map_err(|_| DomainError::Stopped)?;
-        self.control.publish_global(engine, "domain_deleted", name, None);
+        self.abandoned.lock().insert(name.to_string());
+        self.store(name, record).await?;
+        for engine in enabled {
+            if owners.record(engine, name).is_some_and(|part| part.state == Lifecycle::Active) {
+                owners.mark_deleting(engine, name).await?;
+            }
+        }
         Ok(())
     }
 
+    async fn delete_domain(&self, name: &str) -> Result<(), DomainError> {
+        let mut record = self.active(name)?.record();
+        record.state = Lifecycle::Deleting;
+        record.purging = Engine::ALL.to_vec();
+        // The directory follows the record before any engine does: a purger
+        // that finishes early never reads it active.
+        self.store(name, &record).await.map_err(DomainError::Failed)?;
+        let owner = self.control.owner(name);
+        let engines = owner.owners.engines();
+        for &engine in &engines {
+            // A part an engine clear already deletes stays as it is.
+            if owner.owners.record(engine, name).is_some_and(|part| part.state == Lifecycle::Active) {
+                owner.owners.mark_deleting(engine, name).await.map_err(DomainError::Failed)?;
+            }
+        }
+        // Writes that passed the domain check before it turned `Deleting`.
+        self.quiesce(owner, &engines).await?;
+        self.control.publish_domain("domain_deleted", name);
+        Ok(())
+    }
+
+    async fn clear_engine(
+        &self,
+        engine: Engine,
+        name: &str,
+        require_conditional_writes: Option<bool>,
+    ) -> Result<(), DomainError> {
+        let mut record = self.active(name)?.record();
+        if let Some(value) = require_conditional_writes {
+            record.require_conditional_writes.set(engine, value);
+        }
+        record.add_purging(engine);
+        self.store(name, &record).await.map_err(DomainError::Failed)?;
+        let owner = self.control.owner(name);
+        let enabled = owner.owners.instance(engine).is_some();
+        if enabled && owner.owners.record(engine, name).is_some_and(|part| part.state == Lifecycle::Active) {
+            owner.owners.mark_deleting(engine, name).await.map_err(DomainError::Failed)?;
+        }
+        if enabled {
+            self.quiesce(owner, &[engine]).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes the purged part of `name` in `engine`. An active domain gets
+    /// an empty part there again; a deleted one falls with its last part.
     async fn finalize_deletion(&self, engine: Engine, name: &str) -> anyhow::Result<()> {
         let owner = self.control.owner(name);
         owner.request(|reply| ShardCommand::FinalizeDeletion { engine, name: name.to_string(), reply }).await??;
-        self.control.change_directory(|d| d.remove(engine, name));
-        self.control.publish_global(engine, "domain_purged", name, None);
-        Ok(())
+        let Some(entry) = self.control.directory().get(name).cloned() else { return Ok(()) };
+        let mut record = entry.record();
+        record.purging.retain(|e| *e != engine);
+        if record.state == Lifecycle::Active {
+            // The record first: a crash before the part leaves one the start creates empty.
+            self.store(name, &record).await?;
+            owner.owners.create_record(engine, name, record.require_conditional_writes.of(engine)).await
+        } else if record.purging.is_empty() {
+            domains::remove(&self.control.system, name).await?;
+            owner.owners.kv.metrics().remove_domain(name);
+            self.control.change_directory(|d| d.remove(name));
+            if !self.abandoned.lock().remove(name) {
+                self.control.publish_domain("domain_purged", name);
+            }
+            Ok(())
+        } else {
+            self.store(name, &record).await
+        }
     }
 
     async fn change_auth(&self, change: AuthChange) -> anyhow::Result<()> {
@@ -917,16 +1135,20 @@ pub(crate) mod testing {
     }
 
     /// A control plane over `shards` as they are, with a system store of its
-    /// own under `dir/sys` and an auth cache on it.
+    /// own under `dir/sys` and an auth cache on it, after the reconciliation
+    /// a start runs.
     pub(super) async fn start_over(
         dir: &Path,
         shards: Vec<Shard>,
         bus: Arc<GlobalEventBus>,
     ) -> (Arc<ControlPlane>, Arc<AuthCache>) {
         let system = system::open(&dir.join("sys")).await.unwrap();
+        let rules = DomainRules::default();
+        let owners: Vec<_> = shards.iter().map(|shard| shard.owners.clone()).collect();
+        domains::reconcile(&system, &owners, &rules).await.unwrap();
         let auth = Arc::new(AuthCache::new(Arc::clone(&system), None));
         let owners = Owners { shards, auth: Arc::clone(&auth) };
-        (ControlPlane::start(owners, system, bus, Default::default()).await.unwrap(), auth)
+        (ControlPlane::start(owners, system, bus, Default::default(), rules.max_name_length).await.unwrap(), auth)
     }
 
     /// A key-value domain registry on an engine of its own under `dir/kv`.
@@ -946,6 +1168,30 @@ pub(crate) mod testing {
         Arc::new(DomainRegistry::recover(engine, config, metrics).await.unwrap())
     }
 
+    /// A key-value, a JSON and a relational engine under `dir`, the last two
+    /// with a default domain of their own, as engines of one data shard.
+    pub(crate) async fn all_engines(dir: &Path) -> ShardOwners {
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
+        let kv = kv_registry(dir).await;
+        let json_config = crate::config::JsonStoreConfig {
+            wal_path: path("json.wal"),
+            vlog_path: path("json.vlog"),
+            sstable_dir: path("json_sstables"),
+            ..Default::default()
+        };
+        let json = JsonEngine::bootstrap(&json_config, Arc::clone(&metrics)).await.unwrap();
+        let rel_config = crate::config::RelStoreConfig {
+            wal_path: path("rel.wal"),
+            vlog_path: path("rel.vlog"),
+            sstable_dir: path("rel_sstables"),
+            ..Default::default()
+        };
+        let resolver = crate::engines::rel::CrossEngineResolver::disabled(Arc::clone(&metrics));
+        let rel = RelEngine::bootstrap(&rel_config, metrics, resolver).await.unwrap();
+        ShardOwners { kv, json: Some(json), rel: Some(rel) }
+    }
+
     /// The files of the key-value shards of [`kv_shards`] under `dir`, laid
     /// out as the server lays them out.
     pub(crate) fn kv_shard_files(dir: &Path) -> crate::server::recovery::EngineFiles {
@@ -954,8 +1200,7 @@ pub(crate) mod testing {
     }
 
     /// `n` data shards' key-value engines writing one log through `hub`,
-    /// `tune` applied to engine `k` before it is shared; only the shard that
-    /// owns the default domain creates it.
+    /// `tune` applied to engine `k` before it is shared.
     pub(crate) async fn kv_shards(
         dir: &Path,
         hub: &crate::core::storage_thread::TestHub,
@@ -971,11 +1216,9 @@ pub(crate) mod testing {
                 .await
                 .unwrap();
             tune(k, &mut engine);
-            let owns_default = usize::from(slots::shard_of_domain("default", n)) == k;
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
             let config = crate::engines::lsm::domain::DomainConfig::default();
-            let registry =
-                DomainRegistry::recover_on_shard(Arc::new(engine), config, metrics, owns_default).await.unwrap();
+            let registry = DomainRegistry::recover(Arc::new(engine), config, metrics).await.unwrap();
             shards.push(ShardOwners { kv: Arc::new(registry), json: None, rel: None });
         }
         shards
@@ -1045,14 +1288,32 @@ mod tests {
             (Self { kv, json, rel, auth, control, events, _dir: dir }, serving)
         }
 
-        fn state(&self, engine: Engine, name: &str) -> Option<Lifecycle> {
-            self.control.directory().get(engine, name).map(|entry| entry.state)
+        fn state(&self, name: &str) -> Option<Lifecycle> {
+            self.control.directory().get(name).map(|entry| entry.state)
         }
 
-        /// Waits until `name` is `Deleting` — the delete's first phase ran.
-        async fn until_deleting(&self, engine: Engine, name: &str) {
+        fn purging(&self, name: &str) -> Vec<Engine> {
+            self.control.directory().get(name).map(|entry| entry.purging.clone()).unwrap_or_default()
+        }
+
+        /// The domain record of `name` in the system store.
+        async fn record(&self, name: &str) -> Option<DomainRecord> {
+            domains::load_all(&self.control.system).await.unwrap().remove(name)
+        }
+
+        /// The state of the record of `name` in each engine.
+        fn parts(&self, name: &str) -> [Option<Lifecycle>; 3] {
+            let owners = &self.control.shards[0].owners;
+            Engine::ALL.map(|engine| owners.record(engine, name).map(|part| part.state))
+        }
+
+        /// Waits until `name` and its part in every engine are `Deleting` —
+        /// the delete's first phase ran.
+        async fn until_deleting(&self, name: &str) {
             let wait = async {
-                while self.state(engine, name) != Some(Lifecycle::Deleting) {
+                while self.state(name) != Some(Lifecycle::Deleting)
+                    || self.parts(name) != [Some(Lifecycle::Deleting); 3]
+                {
                     tokio::task::yield_now().await;
                 }
             };
@@ -1060,9 +1321,31 @@ mod tests {
             compio::time::timeout(Duration::from_secs(30), wait).await.expect("the domain never turned Deleting");
         }
 
-        fn next_event(&mut self) -> (&'static str, &'static str, String) {
+        fn next_event(&mut self) -> (Option<&'static str>, &'static str, String) {
             let event = self.events.try_recv().expect("an event");
             (event.engine, event.kind, event.domain)
+        }
+
+        /// Two ticks of the purger of `engine`: one removes the data, one
+        /// finishes the deletion.
+        async fn purge(&self, engine: Engine) {
+            for _ in 0..2 {
+                match engine {
+                    Engine::Kv => purger(self).purge_tick().await.unwrap(),
+                    Engine::Json => {
+                        crate::engines::json::JsonDomainPurger::new(Arc::clone(&self.json), 100).purge_tick().await.unwrap()
+                    }
+                    Engine::Rel => {
+                        crate::engines::rel::RelDomainPurger::new(Arc::clone(&self.rel), 100).purge_tick().await.unwrap()
+                    }
+                }
+            }
+        }
+
+        async fn purge_all(&self) {
+            for engine in Engine::ALL {
+                self.purge(engine).await;
+            }
         }
 
         /// Whether a ping sent to the data shard now is answered while every
@@ -1089,19 +1372,147 @@ mod tests {
     }
 
     #[test]
+    fn a_create_writes_the_domain_record_and_a_part_in_every_engine() {
+        crate::core::engine_runtime::block_on(async {
+            let mut f = Fixture::new().await;
+            assert!(f.events.try_recv().is_err(), "the start creates the default domain without an event");
+            assert_eq!(f.parts("default"), [Some(Lifecycle::Active); 3]);
+            let setting = ConditionalWrites { kv: true, json: false };
+            let created = f.control.create_domain("shop", setting).await.unwrap();
+            assert_eq!((created.state, created.require_conditional_writes), (Lifecycle::Active, setting));
+            assert!(created.purging.is_empty());
+
+            let record = f.record("shop").await.expect("a domain record");
+            assert_eq!((record.state, record.require_conditional_writes), (Lifecycle::Active, setting));
+            assert_eq!(f.parts("shop"), [Some(Lifecycle::Active); 3]);
+            assert!(f.kv.get_domain("shop").await.unwrap().unwrap().require_conditional_writes);
+            assert!(!f.json.get_domain("shop").unwrap().require_conditional_writes);
+            assert_eq!(f.next_event(), (None, "domain_created", "shop".to_string()));
+            assert!(f.events.try_recv().is_err(), "one event for the domain");
+        })
+    }
+
+    // A part that cannot be created takes the domain down the delete path:
+    // no event, the name stays taken until the purgers are done.
+    #[test]
+    fn a_create_failing_in_json_or_rel_deletes_what_it_created_without_events() {
+        crate::core::engine_runtime::block_on(async {
+            let mut f = Fixture::new().await;
+            f.json.create_domain_with("clash-json", false).await.unwrap();
+            f.rel.create_domain("clash-rel").await.unwrap();
+            for (name, failed) in [("clash-json", Engine::Json), ("clash-rel", Engine::Rel)] {
+                let refused = f.control.create_domain(name, Default::default()).await.unwrap_err();
+                assert!(matches!(refused, DomainError::Failed(_)), "{name}: {refused:?}");
+                assert_eq!(f.state(name), Some(Lifecycle::Deleting), "{name}");
+                let again = f.control.create_domain(name, Default::default()).await.unwrap_err();
+                assert!(matches!(again, DomainError::Deleting(_)), "{name}: {again:?}");
+                let expected = match failed {
+                    Engine::Json => [Some(Lifecycle::Deleting), Some(Lifecycle::Deleting), None],
+                    _ => [Some(Lifecycle::Deleting), Some(Lifecycle::Deleting), Some(Lifecycle::Deleting)],
+                };
+                assert_eq!(f.parts(name), expected, "{name}");
+            }
+            f.purge_all().await;
+            for name in ["clash-json", "clash-rel"] {
+                assert_eq!(f.state(name), None, "{name}");
+                assert_eq!(f.record(name).await, None, "{name}");
+            }
+            assert!(f.events.try_recv().is_err(), "no event for a failed create");
+            f.control.create_domain("clash-json", Default::default()).await.unwrap();
+            assert_eq!(f.next_event(), (None, "domain_created", "clash-json".to_string()));
+        })
+    }
+
+    // A delete marks the record and every engine deleting, waits for the
+    // writes of each engine, and the domain falls once the last purger is done.
+    #[test]
+    fn a_delete_purges_every_engine_and_the_domain_falls_after_the_last_one() {
+        crate::core::engine_runtime::block_on(async {
+            let mut f = Fixture::new().await;
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
+            f.kv.store("doomed").await.unwrap().put(b"k", "clé ✓".as_bytes()).await.unwrap();
+            f.json.put_document("doomed", "d", json!({"n": 1})).await.unwrap();
+            f.rel.execute("doomed", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
+            f.next_event();
+            f.next_event();
+
+            f.control.delete_domain("doomed").await.unwrap();
+            let record = f.record("doomed").await.unwrap();
+            assert_eq!((record.state, record.purging), (Lifecycle::Deleting, Engine::ALL.to_vec()));
+            assert_eq!(f.parts("doomed"), [Some(Lifecycle::Deleting); 3]);
+            assert_eq!(f.next_event(), (None, "domain_deleted", "doomed".to_string()));
+
+            for (engine, left) in [(Engine::Kv, vec![Engine::Json, Engine::Rel]), (Engine::Json, vec![Engine::Rel])] {
+                f.purge(engine).await;
+                assert_eq!(f.purging("doomed"), left);
+                assert!(f.events.try_recv().is_err(), "no domain_purged before the last purger");
+            }
+            f.purge(Engine::Rel).await;
+            assert_eq!(f.next_event(), (None, "domain_purged", "doomed".to_string()));
+            assert_eq!((f.state("doomed"), f.record("doomed").await), (None, None));
+            assert_eq!(f.parts("doomed"), [None; 3]);
+        })
+    }
+
+    #[test]
+    fn a_deleting_name_refuses_a_create_and_a_second_delete() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
+            f.control.delete_domain("doomed").await.unwrap();
+            let created = f.control.create_domain("doomed", Default::default()).await.unwrap_err();
+            assert!(matches!(created, DomainError::Deleting(_)), "{created:?}");
+            let deleted = f.control.delete_domain("doomed").await.unwrap_err();
+            assert!(matches!(deleted, DomainError::Deleting(_)), "{deleted:?}");
+            let missing = f.control.delete_domain("ghost").await.unwrap_err();
+            assert!(matches!(missing, DomainError::NotFound(_)), "{missing:?}");
+        })
+    }
+
+    // Clearing an engine empties its part like a delete does; the purger
+    // gives it an empty part again, and the domain stays, without an event.
+    #[test]
+    fn clearing_an_engine_empties_its_part_and_keeps_the_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let mut f = Fixture::new().await;
+            f.control.create_domain("shop", Default::default()).await.unwrap();
+            f.next_event();
+            f.kv.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
+            f.json.put_document("shop", "d", json!({"n": 1})).await.unwrap();
+
+            f.control.clear_engine(Engine::Kv, "shop", Some(true)).await.unwrap();
+            assert_eq!((f.state("shop"), f.purging("shop")), (Some(Lifecycle::Active), vec![Engine::Kv]));
+            assert_eq!(f.parts("shop"), [Some(Lifecycle::Deleting), Some(Lifecycle::Active), Some(Lifecycle::Active)]);
+            let refused = f.kv.store("shop").await.err().expect("the cleared part takes no request");
+            assert!(refused.to_string().starts_with("410"), "{refused}");
+            assert!(f.json.get_document("shop", "d").await.unwrap().is_some());
+
+            f.purge(Engine::Kv).await;
+            assert_eq!((f.state("shop"), f.purging("shop")), (Some(Lifecycle::Active), vec![]));
+            assert_eq!(f.parts("shop"), [Some(Lifecycle::Active); 3]);
+            let store = f.kv.store("shop").await.unwrap();
+            assert!(store.scan_keys(b"").await.unwrap().is_empty());
+            assert!(store.domain().require_conditional_writes, "the setting the clear brought");
+            assert!(f.record("shop").await.unwrap().require_conditional_writes.kv);
+            assert!(f.json.get_document("shop", "d").await.unwrap().is_some());
+            assert!(f.events.try_recv().is_err(), "a clear sends no event");
+        })
+    }
+
+    #[test]
     fn a_kv_delete_waits_for_in_flight_writes_and_then_hands_over_to_the_purger() {
         crate::core::engine_runtime::block_on(async {
             let mut f = Fixture::new().await;
-            f.control.create_domain(Engine::Kv, "doomed", false).await.unwrap();
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
             f.kv.store("doomed").await.unwrap().put(b"k", "clé ✓".as_bytes()).await.unwrap();
-            assert_eq!(f.next_event(), ("kv", "domain_created", "doomed".to_string()));
+            assert_eq!(f.next_event(), (None, "domain_created", "doomed".to_string()));
 
             let in_flight = f.kv.engine().in_flight_write_for_test().await;
             let delete = compio::runtime::spawn({
                 let control = Arc::clone(&f.control);
-                async move { control.delete_domain(Engine::Kv, "doomed").await }
+                async move { control.delete_domain("doomed").await }
             });
-            f.until_deleting(Engine::Kv, "doomed").await;
+            f.until_deleting("doomed").await;
             settle().await;
             assert!(!delete.is_finished(), "the delete must wait for the write in flight");
             assert!(f.ping_answers().await, "the shard answers a ping while the delete waits");
@@ -1112,13 +1523,11 @@ mod tests {
 
             drop(in_flight);
             delete.await.unwrap().unwrap();
-            assert_eq!(f.next_event(), ("kv", "domain_deleted", "doomed".to_string()));
+            assert_eq!(f.next_event(), (None, "domain_deleted", "doomed".to_string()));
 
-            let purger = purger(&f);
-            purger.purge_tick().await.unwrap(); // tombstones the key
-            purger.purge_tick().await.unwrap(); // finalizes
-            assert_eq!(f.next_event(), ("kv", "domain_purged", "doomed".to_string()));
-            assert_eq!(f.state(Engine::Kv, "doomed"), None);
+            f.purge_all().await;
+            assert_eq!(f.next_event(), (None, "domain_purged", "doomed".to_string()));
+            assert_eq!(f.state("doomed"), None);
             assert!(f.kv.get_domain("doomed").await.unwrap().is_none());
         })
     }
@@ -1129,7 +1538,7 @@ mod tests {
     fn a_kv_write_that_reaches_its_guard_during_the_delete_is_refused() {
         crate::core::engine_runtime::block_on(async {
             let f = Fixture::new().await;
-            f.control.create_domain(Engine::Kv, "doomed", false).await.unwrap();
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
             let store = f.kv.store("doomed").await.unwrap();
             let late = f.kv.store("doomed").await.unwrap();
             let prefix = store.domain().system_prefix.clone();
@@ -1137,9 +1546,9 @@ mod tests {
             let in_flight = f.kv.engine().in_flight_write_for_test().await;
             let delete = compio::runtime::spawn({
                 let control = Arc::clone(&f.control);
-                async move { control.delete_domain(Engine::Kv, "doomed").await }
+                async move { control.delete_domain("doomed").await }
             });
-            f.until_deleting(Engine::Kv, "doomed").await;
+            f.until_deleting("doomed").await;
             let late_write = compio::runtime::spawn(async move { late.put(b"late", b"v").await });
             settle().await;
             assert!(!delete.is_finished(), "the delete must wait for the write in flight");
@@ -1148,7 +1557,7 @@ mod tests {
             delete.await.unwrap().unwrap();
             assert_eq!(late_write.await.unwrap().unwrap_err().to_string(), KV_GONE);
             assert_eq!(store.put(b"again", b"v").await.unwrap_err().to_string(), KV_GONE);
-            assert_eq!(f.state(Engine::Kv, "doomed"), Some(Lifecycle::Deleting), "refused before the finalize");
+            assert_eq!(f.state("doomed"), Some(Lifecycle::Deleting), "refused before the finalize");
             assert!(f.kv.engine().scan_keys(&prefix).await.unwrap().is_empty());
         })
     }
@@ -1157,21 +1566,19 @@ mod tests {
     fn a_kv_store_taken_before_the_delete_stays_refused_after_the_purge() {
         crate::core::engine_runtime::block_on(async {
             let f = Fixture::new().await;
-            f.control.create_domain(Engine::Kv, "doomed", false).await.unwrap();
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
             let store = f.kv.store("doomed").await.unwrap();
             store.put(b"k", b"v").await.unwrap();
             let prefix = store.domain().system_prefix.clone();
 
-            f.control.delete_domain(Engine::Kv, "doomed").await.unwrap();
-            let purger = purger(&f);
-            purger.purge_tick().await.unwrap(); // tombstones the key
-            purger.purge_tick().await.unwrap(); // finalizes
-            assert_eq!(f.state(Engine::Kv, "doomed"), None);
+            f.control.delete_domain("doomed").await.unwrap();
+            f.purge_all().await;
+            assert_eq!(f.state("doomed"), None);
 
             assert_eq!(store.put(b"late", b"v").await.unwrap_err().to_string(), KV_GONE);
             assert!(f.kv.engine().scan_keys(&prefix).await.unwrap().is_empty());
 
-            f.control.create_domain(Engine::Kv, "doomed", false).await.unwrap();
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
             assert_eq!(store.put(b"late", b"v").await.unwrap_err().to_string(), KV_GONE);
             let reborn = f.kv.store("doomed").await.unwrap();
             assert!(reborn.scan_keys(b"").await.unwrap().is_empty(), "no orphan in the new domain");
@@ -1182,16 +1589,16 @@ mod tests {
     fn a_json_delete_waits_for_a_held_document_lock_and_then_hands_over_to_the_purger() {
         crate::core::engine_runtime::block_on(async {
             let mut f = Fixture::new().await;
-            f.control.create_domain(Engine::Json, "doomed", false).await.unwrap();
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
             f.json.put_document("doomed", "k", json!({"n": 1})).await.unwrap();
             f.next_event();
 
             let lock = f.json.doc_write_lock_for_test("doomed", "held").await;
             let delete = compio::runtime::spawn({
                 let control = Arc::clone(&f.control);
-                async move { control.delete_domain(Engine::Json, "doomed").await }
+                async move { control.delete_domain("doomed").await }
             });
-            f.until_deleting(Engine::Json, "doomed").await;
+            f.until_deleting("doomed").await;
             settle().await;
             assert!(!delete.is_finished(), "the delete must wait for the held document lock");
             assert!(f.ping_answers().await, "the shard answers a ping while the delete waits");
@@ -1205,14 +1612,12 @@ mod tests {
             drop(lock);
             delete.await.unwrap().unwrap();
             let refused = late_write.await.unwrap().unwrap_err();
-            assert!(matches!(refused, JsonStoreError::DomainDeleting(_)), "got: {refused}");
-            assert_eq!(f.next_event(), ("json", "domain_deleted", "doomed".to_string()));
+            assert!(matches!(refused, crate::engines::json::JsonStoreError::DomainDeleting(_)), "got: {refused}");
+            assert_eq!(f.next_event(), (None, "domain_deleted", "doomed".to_string()));
 
-            let purger = crate::engines::json::JsonDomainPurger::new(Arc::clone(&f.json), 100);
-            purger.purge_tick().await.unwrap();
-            purger.purge_tick().await.unwrap();
-            assert_eq!(f.next_event(), ("json", "domain_purged", "doomed".to_string()));
-            assert_eq!(f.state(Engine::Json, "doomed"), None);
+            f.purge_all().await;
+            assert_eq!(f.next_event(), (None, "domain_purged", "doomed".to_string()));
+            assert_eq!(f.state("doomed"), None);
         })
     }
 
@@ -1220,17 +1625,17 @@ mod tests {
     fn a_rel_delete_waits_for_the_write_guard_and_then_hands_over_to_the_purger() {
         crate::core::engine_runtime::block_on(async {
             let mut f = Fixture::new().await;
-            f.control.create_domain(Engine::Rel, "doomed", false).await.unwrap();
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
             f.rel.execute("doomed", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
-            assert_eq!(f.next_event(), ("rel", "domain_created", "doomed".to_string()));
-            assert_eq!(f.next_event(), ("rel", "table_created", "doomed".to_string()));
+            assert_eq!(f.next_event(), (None, "domain_created", "doomed".to_string()));
+            assert_eq!(f.next_event(), (Some("rel"), "table_created", "doomed".to_string()));
 
             let guard = f.rel.write_guard_for_test().await;
             let delete = compio::runtime::spawn({
                 let control = Arc::clone(&f.control);
-                async move { control.delete_domain(Engine::Rel, "doomed").await }
+                async move { control.delete_domain("doomed").await }
             });
-            f.until_deleting(Engine::Rel, "doomed").await;
+            f.until_deleting("doomed").await;
             settle().await;
             assert!(!delete.is_finished(), "the delete must wait for the write guard");
             assert!(f.ping_answers().await, "the shard answers a ping while the delete waits");
@@ -1244,14 +1649,12 @@ mod tests {
             drop(guard);
             delete.await.unwrap().unwrap();
             let refused = late_write.await.unwrap().unwrap_err();
-            assert!(matches!(refused, RelStoreError::DomainDeleting(_)), "got: {refused}");
-            assert_eq!(f.next_event(), ("rel", "domain_deleted", "doomed".to_string()));
+            assert!(matches!(refused, crate::engines::rel::RelStoreError::DomainDeleting(_)), "got: {refused}");
+            assert_eq!(f.next_event(), (None, "domain_deleted", "doomed".to_string()));
 
-            let purger = crate::engines::rel::RelDomainPurger::new(Arc::clone(&f.rel), 100);
-            purger.purge_tick().await.unwrap();
-            purger.purge_tick().await.unwrap();
-            assert_eq!(f.next_event(), ("rel", "domain_purged", "doomed".to_string()));
-            assert_eq!(f.state(Engine::Rel, "doomed"), None);
+            f.purge_all().await;
+            assert_eq!(f.next_event(), (None, "domain_purged", "doomed".to_string()));
+            assert_eq!(f.state("doomed"), None);
         })
     }
 
@@ -1261,13 +1664,13 @@ mod tests {
     fn a_metrics_round_ends_while_a_delete_waits() {
         crate::core::engine_runtime::block_on(async {
             let f = Fixture::new().await;
-            f.control.create_domain(Engine::Rel, "doomed", false).await.unwrap();
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
             let guard = f.rel.write_guard_for_test().await;
             let delete = compio::runtime::spawn({
                 let control = Arc::clone(&f.control);
-                async move { control.delete_domain(Engine::Rel, "doomed").await }
+                async move { control.delete_domain("doomed").await }
             });
-            f.until_deleting(Engine::Rel, "doomed").await;
+            f.until_deleting("doomed").await;
             settle().await;
 
             // Upper bound against hanging only.
@@ -1288,14 +1691,14 @@ mod tests {
     fn a_drain_waits_for_a_delete_in_progress() {
         crate::core::engine_runtime::block_on(async {
             let (mut f, serving) = Fixture::serving().await;
-            f.control.create_domain(Engine::Rel, "doomed", false).await.unwrap();
-            assert_eq!(f.next_event(), ("rel", "domain_created", "doomed".to_string()));
+            f.control.create_domain("doomed", Default::default()).await.unwrap();
+            assert_eq!(f.next_event(), (None, "domain_created", "doomed".to_string()));
             let guard = f.rel.write_guard_for_test().await;
             let delete = compio::runtime::spawn({
                 let control = Arc::clone(&f.control);
-                async move { control.delete_domain(Engine::Rel, "doomed").await }
+                async move { control.delete_domain("doomed").await }
             });
-            f.until_deleting(Engine::Rel, "doomed").await;
+            f.until_deleting("doomed").await;
             let (reply, _flushed) = oneshot::channel();
             f.control.shards[0].commands.send(ShardCommand::Drain { reply }).unwrap();
             settle().await;
@@ -1305,18 +1708,19 @@ mod tests {
             drop(guard);
             assert!(serving.await.unwrap().is_some(), "the loop ends with the drain");
             delete.await.unwrap().unwrap();
-            assert_eq!(f.next_event(), ("rel", "domain_deleted", "doomed".to_string()));
+            assert_eq!(f.next_event(), (None, "domain_deleted", "doomed".to_string()));
         })
     }
 
     #[test]
-    fn concurrent_creates_of_one_name_have_exactly_one_winner_in_every_engine() {
+    fn concurrent_creates_of_one_name_have_exactly_one_winner() {
         crate::core::engine_runtime::block_on(async {
             let f = Fixture::new().await;
-            for engine in [Engine::Kv, Engine::Json, Engine::Rel] {
-                let creates = (0..8).map(|_| f.control.create_domain(engine, "contested", false));
-                let created = futures::future::join_all(creates).await;
-                assert_eq!(created.iter().filter(|r| r.is_ok()).count(), 1, "{engine:?}");
+            let creates = (0..8).map(|_| f.control.create_domain("contested", Default::default()));
+            let created = futures::future::join_all(creates).await;
+            assert_eq!(created.iter().filter(|r| r.is_ok()).count(), 1);
+            for result in created.into_iter().filter_map(Result::err) {
+                assert!(matches!(result, DomainError::Exists(_)), "got: {result:?}");
             }
         })
     }
@@ -1325,12 +1729,12 @@ mod tests {
     fn concurrent_deletes_of_one_domain_have_exactly_one_winner() {
         crate::core::engine_runtime::block_on(async {
             let f = Fixture::new().await;
-            f.control.create_domain(Engine::Rel, "contested", false).await.unwrap();
-            let deletes = (0..8).map(|_| f.control.delete_domain(Engine::Rel, "contested"));
+            f.control.create_domain("contested", Default::default()).await.unwrap();
+            let deletes = (0..8).map(|_| f.control.delete_domain("contested"));
             let results = futures::future::join_all(deletes).await;
             assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
             for result in results.into_iter().filter_map(Result::err) {
-                assert!(matches!(result, DomainError::Rel(RelStoreError::DomainDeleting(_))), "got: {result:?}");
+                assert!(matches!(result, DomainError::Deleting(_)), "got: {result:?}");
             }
         })
     }
@@ -1339,31 +1743,31 @@ mod tests {
     fn a_delete_sent_during_a_create_runs_after_it() {
         crate::core::engine_runtime::block_on(async {
             let mut f = Fixture::new().await;
-            let create = f.control.create_domain(Engine::Kv, "racy", false);
-            let delete = f.control.delete_domain(Engine::Kv, "racy");
+            let create = f.control.create_domain("racy", Default::default());
+            let delete = f.control.delete_domain("racy");
             let (created, deleted) = futures::future::join(create, delete).await;
             created.unwrap();
             deleted.unwrap();
-            assert_eq!(f.state(Engine::Kv, "racy"), Some(Lifecycle::Deleting));
-            assert_eq!(f.next_event(), ("kv", "domain_created", "racy".to_string()));
-            assert_eq!(f.next_event(), ("kv", "domain_deleted", "racy".to_string()));
+            assert_eq!(f.state("racy"), Some(Lifecycle::Deleting));
+            assert_eq!(f.next_event(), (None, "domain_created", "racy".to_string()));
+            assert_eq!(f.next_event(), (None, "domain_deleted", "racy".to_string()));
         })
     }
 
     #[test]
-    fn lifecycle_events_carry_engine_domain_and_time() {
+    fn lifecycle_events_carry_domain_and_time_without_an_engine() {
         crate::core::engine_runtime::block_on(async {
             let mut f = Fixture::new().await;
-            for engine in [Engine::Kv, Engine::Json, Engine::Rel] {
-                f.control.create_domain(engine, "evdom", false).await.unwrap();
-                f.control.delete_domain(engine, "evdom").await.unwrap();
-                for kind in ["domain_created", "domain_deleted"] {
-                    let event = f.events.try_recv().unwrap();
-                    assert_eq!((event.engine, event.kind, event.domain.as_str()), (engine.as_str(), kind, "evdom"));
-                    assert_eq!(event.object, None);
-                    assert!(event.ts > 0);
-                }
+            f.control.create_domain("evdom", Default::default()).await.unwrap();
+            f.control.delete_domain("evdom").await.unwrap();
+            f.purge_all().await;
+            for kind in ["domain_created", "domain_deleted", "domain_purged"] {
+                let event = f.events.try_recv().unwrap();
+                assert_eq!((event.engine, event.kind, event.domain.as_str()), (None, kind, "evdom"));
+                assert_eq!(event.object, None);
+                assert!(event.ts > 0);
             }
+            assert!(f.events.try_recv().is_err(), "one event each for the domain");
         })
     }
 
@@ -1371,13 +1775,32 @@ mod tests {
     fn failed_lifecycle_commands_publish_nothing() {
         crate::core::engine_runtime::block_on(async {
             let mut f = Fixture::new().await;
-            let duplicate = f.control.create_domain(Engine::Rel, "default", false).await.unwrap_err();
-            assert!(matches!(duplicate, DomainError::Rel(RelStoreError::DomainAlreadyExists(_))), "{duplicate:?}");
-            let missing = f.control.delete_domain(Engine::Json, "ghost").await.unwrap_err();
-            assert!(matches!(missing, DomainError::Json(JsonStoreError::DomainNotFound(_))), "{missing:?}");
-            let invalid = f.control.create_domain(Engine::Kv, "bad name!", false).await.unwrap_err();
-            assert!(matches!(invalid, DomainError::Kv(_)), "{invalid:?}");
+            let duplicate = f.control.create_domain("default", Default::default()).await.unwrap_err();
+            assert!(matches!(duplicate, DomainError::Exists(_)), "{duplicate:?}");
+            let missing = f.control.delete_domain("ghost").await.unwrap_err();
+            assert!(matches!(missing, DomainError::NotFound(_)), "{missing:?}");
+            let missing = f.control.clear_engine(Engine::Json, "ghost", None).await.unwrap_err();
+            assert!(matches!(missing, DomainError::NotFound(_)), "{missing:?}");
+            for bad in ["", "bad name!", "a:b", &"a".repeat(51)] {
+                let invalid = f.control.create_domain(bad, Default::default()).await.unwrap_err();
+                assert!(matches!(invalid, DomainError::InvalidName { max: 50, .. }), "{bad:?}: {invalid:?}");
+            }
             assert!(f.events.try_recv().is_err());
+        })
+    }
+
+    // The name rule is the same in every engine; "domains" is a name like
+    // any other.
+    #[test]
+    fn a_name_of_the_longest_length_and_the_name_domains_work_in_every_engine() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            for name in ["a".repeat(50), "domains".to_string(), "b_-9".to_string()] {
+                f.control.create_domain(&name, Default::default()).await.unwrap();
+                assert_eq!(f.parts(&name), [Some(Lifecycle::Active); 3], "{name}");
+            }
+            f.json.put_document("domains", "d", json!({"n": 1})).await.unwrap();
+            f.rel.execute("domains", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await.unwrap();
         })
     }
 
@@ -1390,10 +1813,14 @@ mod tests {
     #[test]
     fn a_domain_error_reads_as_its_cause() {
         let errors = [
-            (DomainError::Kv(anyhow::anyhow!("400 Bad Request: bad name")), "400 Bad Request: bad name"),
-            (DomainError::Json(JsonStoreError::DomainNotFound("ghost".to_string())), "domain 'ghost' not found"),
-            (DomainError::Rel(RelStoreError::DomainDeleting("doomed".to_string())), "domain 'doomed' is being deleted"),
-            (DomainError::Disabled(Engine::Json), "the json engine is disabled"),
+            (
+                DomainError::InvalidName { name: "a:b".to_string(), max: 50 },
+                "invalid domain name 'a:b': allowed are [a-zA-Z0-9_-], 1 to 50 characters",
+            ),
+            (DomainError::Exists("shop".to_string()), "domain 'shop' already exists"),
+            (DomainError::NotFound("ghost".to_string()), "domain 'ghost' not found"),
+            (DomainError::Deleting("doomed".to_string()), "domain 'doomed' is being deleted"),
+            (DomainError::Failed(anyhow::anyhow!("disk gone")), "disk gone"),
             (DomainError::Stopped, "the control plane is not running"),
         ];
         for (error, text) in errors {
@@ -1405,23 +1832,22 @@ mod tests {
     fn the_directory_lists_every_domain_with_its_state_and_slot() {
         crate::core::engine_runtime::block_on(async {
             let f = Fixture::new().await;
-            for engine in [Engine::Kv, Engine::Json, Engine::Rel] {
-                assert_eq!(f.state(engine, "default"), Some(Lifecycle::Active), "{engine:?}");
-            }
+            assert_eq!(f.state("default"), Some(Lifecycle::Active));
 
-            f.control.create_domain(Engine::Kv, "alpha", true).await.unwrap();
+            let setting = ConditionalWrites { kv: true, json: true };
+            f.control.create_domain("alpha", setting).await.unwrap();
             let before_delete = f.control.directory();
-            f.control.delete_domain(Engine::Kv, "alpha").await.unwrap();
+            f.control.delete_domain("alpha").await.unwrap();
 
-            let alpha = before_delete.get(Engine::Kv, "alpha").unwrap();
+            let alpha = before_delete.get("alpha").unwrap();
             assert_eq!(alpha.state, Lifecycle::Active, "an earlier view keeps its state");
             assert_eq!(alpha.slot, slots::slot_of_domain("alpha"));
-            assert!(alpha.require_conditional_writes);
+            assert_eq!(alpha.require_conditional_writes, setting);
             assert!(alpha.created_at > 0);
-            assert_eq!(f.state(Engine::Kv, "alpha"), Some(Lifecycle::Deleting));
-            assert_eq!(f.state(Engine::Json, "alpha"), None, "engines do not share domains");
-            let kv_names: Vec<_> = f.control.directory().domains(Engine::Kv).map(|d| d.name.clone()).collect();
-            assert_eq!(kv_names, ["alpha", "default"]);
+            assert_eq!(f.state("alpha"), Some(Lifecycle::Deleting));
+            assert_eq!(f.control.directory().get("alpha").unwrap().state_in(Engine::Json), Lifecycle::Deleting);
+            let names: Vec<_> = f.control.directory().domains().map(|d| d.name.clone()).collect();
+            assert_eq!(names, ["alpha", "default"]);
         })
     }
 
@@ -1431,12 +1857,14 @@ mod tests {
             let mut f = Fixture::new().await;
             let purger = DomainPurger::new(Arc::clone(f.kv.engine()), Arc::clone(&f.kv), 1);
 
-            f.control.create_domain(Engine::Kv, "late-purge", false).await.unwrap();
-            f.control.delete_domain(Engine::Kv, "late-purge").await.unwrap();
+            f.control.create_domain("late-purge", Default::default()).await.unwrap();
+            f.control.delete_domain("late-purge").await.unwrap();
             f.next_event();
             f.next_event();
             purger.purge_tick().await.unwrap();
-            assert_eq!(f.next_event(), ("kv", "domain_purged", "late-purge".to_string()));
+            f.purge(Engine::Json).await;
+            f.purge(Engine::Rel).await;
+            assert_eq!(f.next_event(), (None, "domain_purged", "late-purge".to_string()));
         })
     }
 
@@ -1651,7 +2079,7 @@ mod tests {
         }
 
         fn state(&self, name: &str) -> Option<Lifecycle> {
-            self.control.directory().get(Engine::Kv, name).map(|entry| entry.state)
+            self.control.directory().get(name).map(|entry| entry.state)
         }
 
         /// The commands shard `k` got so far, by name.
@@ -1858,7 +2286,7 @@ mod tests {
             })
             .await;
             for name in [&a, &b] {
-                s.control.create_domain(Engine::Kv, name, false).await.unwrap();
+                s.control.create_domain(name, Default::default()).await.unwrap();
             }
             for key in [b"k1", b"k2"] {
                 s.registries[0].store(&a).await.unwrap().put(key, b"v").await.unwrap();
@@ -1891,7 +2319,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let s = TwoShards::new(|_, _| {}).await;
             for (k, name) in [0, 1].map(|shard| slots::domain_name_for_shard(shard, 2, 21)).iter().enumerate() {
-                s.control.create_domain(Engine::Kv, name, false).await.unwrap();
+                s.control.create_domain(name, Default::default()).await.unwrap();
                 s.registries[k].store(name).await.unwrap().put(b"k", b"v").await.unwrap();
             }
 
@@ -1974,18 +2402,18 @@ mod tests {
             let s = TwoShards::new(|_, _| {}).await;
             let [first, second] = [17, 18].map(|seed| slots::domain_name_for_shard(1, 2, seed));
             for name in [&first, &second] {
-                s.control.create_domain(Engine::Kv, name, false).await.unwrap();
+                s.control.create_domain(name, Default::default()).await.unwrap();
                 s.registries[1].store(name).await.unwrap().put(b"k", b"v").await.unwrap();
             }
 
             let elsewhere = s.engines[0].in_flight_write_for_test().await;
-            s.control.delete_domain(Engine::Kv, &first).await.unwrap();
+            s.control.delete_domain(&first).await.unwrap();
             drop(elsewhere);
 
             let in_flight = s.engines[1].in_flight_write_for_test().await;
             let delete = compio::runtime::spawn({
                 let (control, name) = (Arc::clone(&s.control), second.clone());
-                async move { control.delete_domain(Engine::Kv, &name).await }
+                async move { control.delete_domain(&name).await }
             });
             while s.state(&second) != Some(Lifecycle::Deleting) {
                 tokio::task::yield_now().await;
@@ -2000,12 +2428,15 @@ mod tests {
             for _ in 0..2 {
                 purge(0).purge_tick().await.unwrap();
             }
-            assert_eq!(s.state(&first), Some(Lifecycle::Deleting), "shard 0 does not own it");
+            assert_eq!(s.control.directory().get(&first).unwrap().purging, Engine::ALL, "shard 0 does not own it");
             for _ in 0..2 {
                 purge(1).purge_tick().await.unwrap();
             }
-            assert_eq!(s.state(&first), None);
-            assert_eq!(s.state(&second), None);
+            // The disabled engines stay to purge until a start with them on.
+            for name in [&first, &second] {
+                let entry = s.control.directory().get(name).cloned().unwrap();
+                assert_eq!((entry.state, entry.purging), (Lifecycle::Deleting, vec![Engine::Json, Engine::Rel]));
+            }
             assert_eq!(s.commands_of(1), ["quiesce", "quiesce", "finalize", "finalize"]);
             assert!(s.commands_of(0).is_empty(), "{:?}", s.commands_of(0));
         })
@@ -2646,6 +3077,7 @@ mod tests {
             restoring: AtomicBool::new(false),
             pings: Mutex::default(),
             resources: Default::default(),
+            max_name_length: 50,
         };
         (control, inbox)
     }
@@ -2657,10 +3089,12 @@ mod tests {
             let (control, inbox) = without_worker(&dir).await;
             drop(inbox);
 
-            let created = control.create_domain(Engine::Kv, "orphan", false).await.unwrap_err();
+            let created = control.create_domain("orphan", Default::default()).await.unwrap_err();
             assert!(matches!(created, DomainError::Stopped), "{created:?}");
-            let deleted = control.delete_domain(Engine::Kv, "orphan").await.unwrap_err();
+            let deleted = control.delete_domain("orphan").await.unwrap_err();
             assert!(matches!(deleted, DomainError::Stopped), "{deleted:?}");
+            let cleared = control.clear_engine(Engine::Kv, "orphan", None).await.unwrap_err();
+            assert!(matches!(cleared, DomainError::Stopped), "{cleared:?}");
             let record = UserRecord {
                 name: "alice".to_string(),
                 api_key_hash: hash_api_key("lura_alice"),
@@ -2680,7 +3114,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let (control, inbox) = without_worker(&dir).await;
             // Queued first, then dropped with the inbox, as when the worker panics.
-            let create = control.create_domain(Engine::Kv, "orphan", false);
+            let create = control.create_domain("orphan", Default::default());
             let (created, ()) = futures::future::join(create, async move { drop(inbox) }).await;
             assert!(matches!(created, Err(DomainError::Stopped)), "{created:?}");
         })

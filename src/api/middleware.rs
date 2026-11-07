@@ -68,18 +68,18 @@ impl From<anyhow::Error> for ApiError {
 
 impl From<DomainError> for ApiError {
     fn from(e: DomainError) -> Self {
-        match e {
-            DomainError::Kv(e) => e.into(),
-            DomainError::Json(e) => e.into(),
-            DomainError::Rel(e) => e.into(),
-            DomainError::Disabled(engine) => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("503 Service Unavailable: the {} engine is disabled", engine.as_str()),
-            ),
-            DomainError::Stopped => {
-                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable: the control plane is not running")
-            }
+        if let Some(blocked) = match &e { DomainError::Failed(cause) => WriteBlocked::in_chain(cause), _ => None } {
+            return blocked.into();
         }
+        let (status, prefix) = match &e {
+            DomainError::InvalidName { .. } => (StatusCode::BAD_REQUEST, "400 Bad Request"),
+            DomainError::Exists(_) => (StatusCode::CONFLICT, "409 Conflict"),
+            DomainError::Deleting(_) => (StatusCode::GONE, "410 Gone"),
+            DomainError::NotFound(_) => (StatusCode::NOT_FOUND, "404 Not Found"),
+            DomainError::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error"),
+            DomainError::Stopped => (StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
+        };
+        ApiError::new(status, format!("{prefix}: {e}"))
     }
 }
 

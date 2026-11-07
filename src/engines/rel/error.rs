@@ -10,8 +10,6 @@ pub enum RelStoreError {
     DomainDeleting(String),
     #[error("domain '{0}' already exists")]
     DomainAlreadyExists(String),
-    #[error("invalid domain name: {0}")]
-    InvalidDomainName(String),
 
     /// Table/view/column/index name violates the identifier rules (→ 400).
     #[error("invalid identifier: {0}")]

@@ -24,6 +24,8 @@ use tokio::sync::RwLock;
 
 pub(crate) const PREFIX_USER: &str = "__sys:auth:user:";
 pub(crate) const PREFIX_PERM: &str = "__sys:auth:perm:";
+/// Longest user name.
+pub(crate) const MAX_USER_NAME_LENGTH: usize = 50;
 
 pub(crate) fn user_key(name: &str) -> Vec<u8> {
     format!("{PREFIX_USER}{name}").into_bytes()

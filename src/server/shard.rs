@@ -8,19 +8,19 @@ use crate::{
     api::{self, AppState},
     bridge::{self, Job},
     config::LuraConfig,
-    control::{self, slots, Engine, ShardCommand, ShardOwners},
+    control::{self, Engine, ShardCommand, ShardOwners},
     core::{
         engine_runtime,
         io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID},
     },
-    engines::json::{domain as json_domain, JsonEngine},
+    engines::json::JsonEngine,
     engines::lsm::{
         domain::{DomainPurger, DomainRegistry},
         engine::LsmStorageEngine,
         rate_limiter::DomainQuota,
         ttl_sweeper::TtlSweeper,
     },
-    engines::rel::{domain as rel_domain, RelEngine},
+    engines::rel::RelEngine,
     metrics::{MetricsConfig, MetricsStore, MetricsTicker},
 };
 use anyhow::Context;
@@ -144,15 +144,12 @@ async fn run(boot: ShardBoot) {
 }
 
 /// Puts the registered buffers (shard 0 of a single one only) and the domain
-/// layers, with a metrics store of their own, on the shard's instances. Only
-/// the shard that owns the default domain creates it.
+/// layers, with a metrics store of their own, on the shard's instances.
 async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOwners> {
     let ShardBoot { shard, shards, config, kv, json, rel, .. } = boot;
-    let (shard, shards) = (*shard, *shards);
     let metrics = MetricsStore::new(MetricsConfig::default());
-    let owns = |name: &str| usize::from(slots::shard_of_domain(name, shards)) == shard;
 
-    if shard == 0 && shards == 1 {
+    if *shard == 0 && *shards == 1 {
         let vlog_path = layout::shard_file(Path::new(&config.storage.vlog_path), 0);
         storage.io_engine = init_io_engine(config, &vlog_path).await;
         if let Some(io_engine) = storage.io_engine.as_mut() {
@@ -161,20 +158,14 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
     }
 
     let domain_config = super::control::domain_config(config);
-    let owns_kv_default = owns(&domain_config.default_domain);
-    let registry = Arc::new(
-        DomainRegistry::recover_on_shard(Arc::clone(kv), domain_config, Arc::clone(&metrics), owns_kv_default).await?,
-    );
+    let registry = Arc::new(DomainRegistry::recover(Arc::clone(kv), domain_config, Arc::clone(&metrics)).await?);
     let json = match json {
-        Some(json) => Some(
-            JsonEngine::open(&config.json, Arc::clone(json), Arc::clone(&metrics), owns(json_domain::DEFAULT_DOMAIN))
-                .await?,
-        ),
+        Some(json) => Some(JsonEngine::open(&config.json, Arc::clone(json), Arc::clone(&metrics)).await?),
         None => None,
     };
     let rel = match rel {
         Some(rel) => {
-            // Same-named KV and JSON domains live on this shard too.
+            // A domain's key-value and JSON parts live on this shard too.
             let resolver = crate::engines::rel::CrossEngineResolver::new(
                 Some(Arc::clone(&registry)),
                 json.clone(),
@@ -184,8 +175,7 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
                 read_iops: config.rate_limit.default_read_iops,
                 write_iops: config.rate_limit.default_write_iops,
             };
-            let owns_default = owns(rel_domain::DEFAULT_DOMAIN);
-            Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(&metrics), resolver, owns_default).await?)
+            Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(&metrics), resolver).await?)
         }
         None => None,
     };

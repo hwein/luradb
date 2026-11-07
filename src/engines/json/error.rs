@@ -15,8 +15,6 @@ pub enum JsonStoreError {
     DomainDeleting(String),
     #[error("domain '{0}' already exists")]
     DomainAlreadyExists(String),
-    #[error("invalid domain name: {0}")]
-    InvalidDomainName(String),
     #[error("index on field '{field}' already exists in domain '{domain}'")]
     IndexAlreadyExists { domain: String, field: String },
     #[error("no index on field '{field}' in domain '{domain}'")]

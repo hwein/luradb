@@ -83,7 +83,8 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
     let config_path = resolve_config_path(cli.config, |p| p.exists());
-    let (config, unknown_keys) = LuraConfig::load(&config_path)?;
+    let (mut config, unknown_keys) = LuraConfig::load(&config_path)?;
+    let raised_key_lengths = config.raise_key_lengths();
     let config = Arc::new(config);
     config.server.validate()?;
     config.log.validate()?;
@@ -121,6 +122,9 @@ fn run() -> anyhow::Result<()> {
     }
     for key in &unknown_keys {
         tracing::warn!("unknown config key '{key}' is ignored");
+    }
+    for warning in &raised_key_lengths {
+        tracing::warn!("{warning}");
     }
     // `config.auth.validate` already rejected a non-loopback bind above,
     // so reaching here with auth disabled means the dev-mode loopback

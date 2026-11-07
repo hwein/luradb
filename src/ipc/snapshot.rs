@@ -151,7 +151,7 @@ impl SnapshotBuilder {
         let registries: Vec<_> = self.control.shard_owners().map(|owners| Arc::clone(&owners.kv)).collect();
         let shards = u16::try_from(registries.len()).context("too many data shards")?;
         let mut domains = Vec::new();
-        for entry in directory.domains(Engine::Kv).filter(|entry| entry.state == Lifecycle::Active) {
+        for entry in directory.domains().filter(|entry| entry.state_in(Engine::Kv) == Lifecycle::Active) {
             let shard = usize::from(slots::shard_of(entry.slot, shards));
             // `None`: deleted since the directory was read.
             if let Some(domain) = registries[shard].get_domain(&entry.name).await? {
@@ -640,7 +640,7 @@ mod tests {
     /// Creates the key-value domain `name` through the control plane, on
     /// the shard of `registry`, its owner.
     async fn create(fx: &Fixture, registry: &DomainRegistry, name: &str) -> Domain {
-        fx.control.create_domain(Engine::Kv, name, false).await.unwrap();
+        fx.control.create_domain(name, Default::default()).await.unwrap();
         registry.get_domain(name).await.unwrap().expect("created on its owner")
     }
 
@@ -1114,11 +1114,32 @@ mod tests {
             let (_, registry, fx) = make_setup().await;
             create(&fx, &registry, "temp").await;
             registry.store("temp").await.unwrap().put(b"k", b"v").await.unwrap();
-            fx.control.delete_domain(Engine::Kv, "temp").await.unwrap();
+            fx.control.delete_domain("temp").await.unwrap();
 
             let snap = decode(&builder(&fx, 1 << 20).build().await.unwrap().bytes);
             assert!(find(&snap, "temp").is_none(), "deleting domain must be absent");
             assert!(find(&snap, "default").is_some(), "active domain still present");
+        })
+    }
+
+    // A data directory from before the domain records: a key-value domain
+    // with a key and no domain record. The start adopts it, and the snapshot
+    // holds it with its key.
+    #[test]
+    fn test_build_holds_a_domain_the_start_adopted() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let registry = crate::control::testing::kv_registry(dir.path()).await;
+            registry.create_domain_with("legacy", false).await.unwrap();
+            registry.store("legacy").await.unwrap().put(b"k", b"v").await.unwrap();
+            let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
+            let (control, _) = crate::control::testing::start(dir.path(), registry, None, None, bus).await;
+            let fx = Fixture { control, _dir: dir };
+
+            let snap = decode(&builder(&fx, 1 << 20).build().await.unwrap().bytes);
+            let dom = find(&snap, "legacy").expect("the adopted domain");
+            let entries: Vec<_> = dom.entries.iter().map(|e| (e.key.as_slice(), e.value.as_slice())).collect();
+            assert_eq!(entries, [(b"k".as_slice(), b"v".as_slice())]);
         })
     }
 
@@ -1305,7 +1326,7 @@ mod tests {
             assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             assert_eq!(domain_names(&arena.read()), ["default", "fresh"]);
 
-            fx.control.delete_domain(Engine::Kv, "fresh").await.unwrap();
+            fx.control.delete_domain("fresh").await.unwrap();
             assert_eq!(publish.step(BEFORE_ANY_EXPIRY, Instant::now()).await, Tick::Rebuilt(PublishOutcome::Published));
             assert_eq!(domain_names(&arena.read()), ["default"]);
         })

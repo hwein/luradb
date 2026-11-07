@@ -316,9 +316,11 @@ mod tests {
     // a 1-byte field fits the startup lower bound of json.lsm.max_key_length.
     #[test]
     fn test_sys_index_key_at_max_domain_fits_key_limit_lower_bound() {
-        use crate::engines::json::domain::{MAX_DOMAIN_NAME_LEN, MIN_LSM_KEY_LENGTH};
-        let key = sys_index_key(&"d".repeat(MAX_DOMAIN_NAME_LEN), "f");
-        assert!(key.len() <= MIN_LSM_KEY_LENGTH, "{}", key.len());
+        use crate::engines::json::domain::min_lsm_key_length;
+        for max in [50, 80] {
+            let key = sys_index_key(&"d".repeat(max), "f");
+            assert!(key.len() <= min_lsm_key_length(max), "{}", key.len());
+        }
     }
 
     // 1. extract_field with a top-level field.

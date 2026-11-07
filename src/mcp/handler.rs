@@ -83,9 +83,10 @@ impl ServerHandler for LuraMcp {
         ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("luradb", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "LuraDB: key-value, JSON document and relational (LuraSQL) domains. Start with list_domains, \
-                 then describe the domain, its tables or indexes. Every call runs with the permissions of the \
-                 caller's API key.",
+                "LuraDB: each domain holds key-value, JSON document and relational (LuraSQL) data. Start \
+                 with list_domains, then describe the domain, its tables or indexes. Every call runs with the \
+                 permissions of the caller's API key. The data tools of an engine that is switched off \
+                 answer 503.",
             )
     }
 

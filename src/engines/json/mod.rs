@@ -21,6 +21,7 @@ pub use reindex::{ReindexResult, ReindexStatus};
 
 use crate::config::{BlockCacheConfig, JsonStoreConfig};
 use crate::control::{ControlPlane, Engine};
+#[cfg(test)]
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
@@ -28,9 +29,8 @@ use crate::engines::lsm::janitor::JanitorConfig;
 use crate::engines::lsm::reader::Snapshot;
 use crate::engines::StorageEngine;
 use crate::metrics::{EngineKind, MetricsStore};
-use crate::storage::file_manager::FileManager;
-use crate::storage::manifest::ManifestManager;
-use crate::storage::vlog::VLog;
+#[cfg(test)]
+use crate::storage::{file_manager::FileManager, manifest::ManifestManager, vlog::VLog};
 use anyhow::Result;
 use document::{
     doc_key, generate_uuid_v4, new_generation, reject_reserved_fields, validate_document_key,
@@ -42,6 +42,7 @@ use parking_lot::{Mutex as SyncMutex, RwLock};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -101,9 +102,11 @@ impl JsonEngine {
         Self::bootstrap_with_wal(config, wal, metrics).await
     }
 
-    /// Creates the dedicated JSON LSM instance from `config`, with `wal` as
-    /// the log at `config.wal_path`, and starts its background tasks (flush,
-    /// compaction, janitor).
+    /// Tests only: creates the dedicated JSON LSM instance from `config`,
+    /// with `wal` as the log at `config.wal_path`, starts its background
+    /// tasks (flush, compaction, janitor) and creates the default domain if
+    /// it is missing, as a start does.
+    #[cfg(test)]
     pub async fn bootstrap_with_wal(
         config: &JsonStoreConfig,
         wal: WriteAheadLog,
@@ -120,7 +123,11 @@ impl JsonEngine {
             LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options).await?,
         );
         engine.start_background_tasks();
-        Self::open(config, engine, metrics, true).await
+        let json = Self::open(config, engine, metrics).await?;
+        if json.get_domain_any("default").is_none() {
+            json.create_domain("default").await?;
+        }
+        Ok(json)
     }
 
     /// Options of the JSON engine's LSM instances, with `block_cache`.
@@ -140,15 +147,13 @@ impl JsonEngine {
     }
 
     /// The JSON engine on `engine`, a recovered instance whose background
-    /// tasks run; with `owns_default` it creates the default domain if that
-    /// is missing.
+    /// tasks run.
     pub async fn open(
         config: &JsonStoreConfig,
         engine: Arc<LsmStorageEngine>,
         metrics: Arc<MetricsStore>,
-        owns_default: bool,
     ) -> Result<Arc<Self>> {
-        let domains = Arc::new(JsonDomainRegistry::recover(Arc::clone(&engine), owns_default).await?);
+        let domains = Arc::new(JsonDomainRegistry::recover(Arc::clone(&engine)).await?);
         let indexes = Arc::new(IndexRegistry::recover(Arc::clone(&engine)).await?);
         Ok(Arc::new(Self {
             engine,
@@ -855,22 +860,6 @@ mod tests {
         })
     }
 
-    // 13. Invalid domain names → InvalidDomainName. "domains" is reserved:
-    //     the static /json/domains routes shadow such a domain.
-    #[test]
-    fn test_invalid_domain_name_rejected() {
-        crate::core::engine_runtime::block_on(async {
-            let (json, _dir) = make_engine().await;
-            for bad in ["", "bad name!", "bad/slash", "domains", &"x".repeat(51)] {
-                let err = json.create_domain(bad).await.unwrap_err();
-                assert!(
-                    matches!(err, JsonStoreError::InvalidDomainName(_)),
-                    "'{bad}' got: {err}"
-                );
-            }
-        })
-    }
-
     // 14. Same key in two domains is isolated.
     #[test]
     fn test_domain_isolation() {
@@ -1553,7 +1542,7 @@ mod tests {
                 vlog_path: dir.path().join("json.vlog").to_string_lossy().into_owned(),
                 sstable_dir: dir.path().join("json_sstables").to_string_lossy().into_owned(),
                 lsm: crate::config::JsonLsmConfig {
-                    max_key_length: domain::MIN_LSM_KEY_LENGTH,
+                    max_key_length: domain::min_lsm_key_length(50),
                     max_value_size: crate::config::JSON_LSM_MIN_VALUE_SIZE,
                 },
                 ..JsonStoreConfig::default()
@@ -1562,7 +1551,7 @@ mod tests {
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
             let json = JsonEngine::bootstrap(&config, metrics).await.unwrap();
 
-            let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
+            let domain = "d".repeat(50);
             json.create_domain(&domain).await.unwrap();
             json.put_document(&domain, "a", json!({"n": 1})).await.unwrap();
             let doc = json.get_document(&domain, "a").await.unwrap().expect("document stored");
@@ -1586,7 +1575,7 @@ mod tests {
             json.delete_index("default", "city").await.unwrap();
 
             let created = rx.try_recv().unwrap();
-            assert_eq!(created.engine, "json");
+            assert_eq!(created.engine, Some("json"));
             assert_eq!(created.kind, "index_created");
             assert_eq!(created.domain, "default");
             assert_eq!(created.object.as_deref(), Some("city"));

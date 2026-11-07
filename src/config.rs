@@ -61,6 +61,27 @@ impl LuraConfig {
         Ok((config, unknown_keys(keys, &known_keys())))
     }
 
+    /// Raises `json.lsm.max_key_length` and `rel.lsm.max_key_length` to the
+    /// least that takes the keys of domain names up to
+    /// `domains.max_name_length`; returns a warning for each raised value.
+    pub fn raise_key_lengths(&mut self) -> Vec<String> {
+        let names = self.domains.max_name_length;
+        let mut warnings = Vec::new();
+        for (key, value, min) in [
+            ("json.lsm.max_key_length", &mut self.json.lsm.max_key_length, json_domain::min_lsm_key_length(names)),
+            ("rel.lsm.max_key_length", &mut self.rel.lsm.max_key_length, rel_catalog::min_lsm_key_length(names)),
+        ] {
+            if *value < min {
+                warnings.push(format!(
+                    "{key} ({value}) is raised to {min}, the least that takes domain names of \
+                     domains.max_name_length ({names}) characters"
+                ));
+                *value = min;
+            }
+        }
+        warnings
+    }
+
     /// Rejects data paths that share a real location or land on a vLog
     /// generation file `<vlog_path>.<n>`; relative paths resolve against `base`.
     pub fn validate_data_paths(&self, base: &Path) -> anyhow::Result<()> {
@@ -664,7 +685,6 @@ impl JsonLsmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         check_min("json.lsm.max_value_size", self.max_value_size, JSON_LSM_MIN_VALUE_SIZE)?;
         check_wal_field("json.lsm.max_value_size", self.max_value_size)?;
-        check_min("json.lsm.max_key_length", self.max_key_length, json_domain::MIN_LSM_KEY_LENGTH)?;
         check_wal_field("json.lsm.max_key_length", self.max_key_length)
     }
 }
@@ -685,7 +705,6 @@ impl Default for RelLsmConfig {
 
 impl RelLsmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        check_min("rel.lsm.max_key_length", self.max_key_length, rel_catalog::MIN_LSM_KEY_LENGTH)?;
         check_wal_field("rel.lsm.max_key_length", self.max_key_length)
     }
 }
@@ -792,6 +811,12 @@ impl Default for DomainsConfig {
 
 impl DomainsConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        let max = crate::control::domains::max_name_length_limit();
+        anyhow::ensure!(
+            self.max_name_length <= max,
+            "domains.max_name_length = {} exceeds the maximum of {max}",
+            self.max_name_length
+        );
         check_min("domains.purger_interval_secs", self.purger_interval_secs, 1)
     }
 }
@@ -3186,25 +3211,49 @@ mod tests {
         );
     }
 
-    // Test 6: one byte below the lower bounds is a startup error, the bounds
-    // themselves and the WAL field cap are accepted.
+    // Key limits below the least the domain names need are raised with a
+    // warning, never a startup error; the WAL field cap and the value size
+    // bound still are.
     #[test]
-    fn test_json_and_rel_lsm_lower_bounds() {
+    fn test_json_and_rel_key_lengths_are_raised_to_take_the_domain_names() {
         let parse = |toml: &str| -> LuraConfig { toml::from_str(toml).unwrap() };
 
-        let config = parse("[json.lsm]\nmax_key_length = 68\n");
-        assert_invalid(config.json.validate(), "json.lsm.max_key_length (68)", "at least 69");
-        assert!(parse("[json.lsm]\nmax_key_length = 69\n").json.validate().is_ok());
-        assert!(parse(&format!("[json.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).json.validate().is_ok());
+        let mut config = parse("[json.lsm]\nmax_key_length = 68\n[rel.lsm]\nmax_key_length = 72\n");
+        assert_eq!(
+            config.raise_key_lengths(),
+            [
+                "json.lsm.max_key_length (68) is raised to 69, the least that takes domain names of \
+                 domains.max_name_length (50) characters",
+                "rel.lsm.max_key_length (72) is raised to 73, the least that takes domain names of \
+                 domains.max_name_length (50) characters",
+            ]
+        );
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (69, 73));
+        assert!(config.json.validate().is_ok() && config.rel.validate().is_ok());
 
+        let mut config = parse("[domains]\nmax_name_length = 80\n[rel.lsm]\nmax_key_length = 100\n");
+        assert_eq!(config.raise_key_lengths().len(), 1);
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (256, 103));
+        let mut config = parse("[domains]\nmax_name_length = 300\n");
+        config.raise_key_lengths();
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (319, 323));
+
+        let mut config = parse(&format!("[json.lsm]\nmax_key_length = {}\n", WAL_MAX_FIELD_LEN + 1));
+        assert!(config.raise_key_lengths().is_empty());
+        assert!(config.json.validate().is_err());
         let config = parse("[json.lsm]\nmax_value_size = 4095\n");
         assert_invalid(config.json.validate(), "json.lsm.max_value_size (4095)", "at least 4096");
         assert!(parse("[json.lsm]\nmax_value_size = 4096\n").json.validate().is_ok());
+    }
 
-        let config = parse("[rel.lsm]\nmax_key_length = 72\n");
-        assert_invalid(config.rel.validate(), "rel.lsm.max_key_length (72)", "at least 73");
-        assert!(parse("[rel.lsm]\nmax_key_length = 73\n").rel.validate().is_ok());
-        assert!(parse(&format!("[rel.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).rel.validate().is_ok());
+    // A domain name must fit the permission key of the longest user name in
+    // the system store's 512-byte keys: 512 - 16 - 50 - 8 bytes.
+    #[test]
+    fn test_domains_max_name_length_above_the_key_room_is_a_startup_error() {
+        let parse = |toml: &str| -> LuraConfig { toml::from_str(toml).unwrap() };
+        assert!(parse("[domains]\nmax_name_length = 438\n").domains.validate().is_ok());
+        let err = parse("[domains]\nmax_name_length = 439\n").domains.validate().unwrap_err();
+        assert_eq!(err.to_string(), "domains.max_name_length = 439 exceeds the maximum of 438");
     }
 
     // Test 3: optional fields and list elements count, section paths and

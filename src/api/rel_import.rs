@@ -271,7 +271,7 @@ mod tests {
     async fn create_domain(app: &axum::Router, name: &str, bearer: &str) -> StatusCode {
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/store-api/rel/domains")
+            .uri("/store-api/domains")
             .header("authorization", format!("Bearer {bearer}"))
             .header("content-type", "application/json")
             .body(Body::from(format!(r#"{{"name": "{name}"}}"#)))

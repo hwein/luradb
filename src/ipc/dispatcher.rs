@@ -790,7 +790,7 @@ mod tests {
             let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
             let (control, _) = crate::control::testing::start_shards(dir.path(), shards, bus).await;
             let name = crate::control::slots::domain_name_for_shard(1, 2, 25);
-            control.create_domain(crate::control::Engine::Kv, &name, false).await.unwrap();
+            control.create_domain(&name, Default::default()).await.unwrap();
             let mut h = harness_over(control, Arc::clone(&registries[1]), dir, 4096);
 
             let put = ShmCommand::Put {

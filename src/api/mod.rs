@@ -4,7 +4,6 @@ pub mod backup;
 pub mod domains;
 pub mod events;
 pub mod json;
-pub mod json_domains;
 pub mod kv;
 pub mod kvpair;
 pub mod logs;
@@ -12,7 +11,6 @@ pub mod metrics;
 pub mod middleware;
 pub mod rel;
 pub mod rel_browse;
-pub mod rel_domains;
 pub mod rel_import;
 
 use crate::auth::{handlers::AuthState, middleware::auth_layer, AuthCache};
@@ -92,7 +90,7 @@ fn write_blocked_response() -> utoipa::openapi::Response {
 /// API contract version (SemVer) — independent of the server version in Cargo.toml.
 /// Breaking bumps the middle digit, anything else the last. Single source of
 /// truth; the OpenAPI contract and GET /version both read from here.
-pub const API_VERSION: &str = "0.15.1";
+pub const API_VERSION: &str = "0.16.0";
 
 struct VersionInfo;
 
@@ -162,8 +160,6 @@ pub fn create_router(state: AppState) -> Router {
         cache: Arc::clone(&state.auth_cache),
         control: Arc::clone(&state.control),
         auth_enabled: state.auth_enabled,
-        json_engine: state.json_engine.clone(),
-        rel_engine: state.rel_engine.clone(),
     };
 
     let store_router = Router::new()
@@ -187,14 +183,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/kv/{domain}/count", get(kv::count_keys))
         .route("/kv/{domain}/watch", get(kv::watch))
         // JSON document store (handlers answer 503 when the engine is disabled)
-        .route(
-            "/json/domains",
-            post(json_domains::create_domain).get(json_domains::list_domains),
-        )
-        .route(
-            "/json/domains/{name}",
-            get(json_domains::get_domain).delete(json_domains::delete_domain),
-        )
         .route(
             "/json/{domain}/documents",
             post(json::create_document).get(json::list_documents),
@@ -241,14 +229,6 @@ pub fn create_router(state: AppState) -> Router {
         // `/backups*` etc. (auth::middleware::extract_domain returns `None`).
         .route("/events", get(events::get_events))
         // Relational store (handlers answer 503 when the engine is disabled)
-        .route(
-            "/rel/domains",
-            post(rel_domains::create_domain).get(rel_domains::list_domains),
-        )
-        .route(
-            "/rel/domains/{name}",
-            get(rel_domains::get_domain).delete(rel_domains::delete_domain),
-        )
         .route("/rel/{domain}/sql", post(rel::execute_sql))
         // CSV/TSV file import: a body-size cap analogous
         // to the JSON bulk route above, sized from the engine config; when
@@ -363,11 +343,6 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         kv::delete_keys_by_prefix,
         kv::count_keys,
         kv::watch,
-        // JSON domains
-        json_domains::create_domain,
-        json_domains::list_domains,
-        json_domains::get_domain,
-        json_domains::delete_domain,
         // JSON documents / search / bulk / re-index
         json::create_document,
         json::put_document,
@@ -383,11 +358,6 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
         json::export_documents,
         json::trigger_reindex,
         json::reindex_status,
-        // Relational domains
-        rel_domains::create_domain,
-        rel_domains::list_domains,
-        rel_domains::get_domain,
-        rel_domains::delete_domain,
         // Relational SQL
         rel::execute_sql,
         // Relational file import
@@ -434,12 +404,11 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             crate::metrics::ShardHealth,
             domains::CreateDomainRequest,
             domains::DomainResponse,
+            domains::ConditionalWritesSetting,
             kv::KeyMetaResponse,
             kv::KeyScanResponse,
             kv::BulkDeleteResponse,
             CountResponse,
-            json_domains::CreateJsonDomainRequest,
-            json_domains::JsonDomainResponse,
             json::CreateIndexRequest,
             json::IndexResponse,
             json::SearchRequest,
@@ -451,8 +420,6 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
             json::BulkLoadResponse,
             json::ReindexRequest,
             json::ReindexAcceptedResponse,
-            rel_domains::CreateRelDomainRequest,
-            rel_domains::RelDomainResponse,
             rel::SqlRequest,
             rel_import::CreateFromFileColumn,
             rel_import::CreateFromFileErrorEntry,
@@ -491,11 +458,10 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     security(("bearer_auth" = [])),
     tags(
         (name = "Metrics", description = "Heartbeat and performance metrics"),
-        (name = "Domains", description = "Domain lifecycle — create, list, get, delete"),
+        (name = "Domains", description = "Domain lifecycle — create, list, get, delete; a domain holds data in all three engines"),
         (name = "Key-Value Store", description = "Domain-scoped key-value operations"),
         (name = "JSON Document Store", description = "Domain-scoped JSON document operations"),
         (name = "JSON Indexes", description = "Index management for JSON domains"),
-        (name = "Relational Domains", description = "Relational domain lifecycle"),
         (name = "Relational Store", description = "Domain-scoped LuraSQL execution"),
         (name = "Relational Import", description = "CSV/TSV file upload -> new relational table with inferred schema"),
         (name = "Relational Browse", description = "Catalog and row browsing for relational domains"),
@@ -507,7 +473,8 @@ pub fn router_inline(state: AppState, trusted_cidrs: Arc<Vec<ParsedCidr>>) -> Ro
     ),
     info(
         title = "LuraDB API",
-        description = "REST-native multi-model database — KeyValue and JSON engines. \
+        description = "REST-native multi-model database — key-value, JSON document and relational (LuraSQL) \
+            engines; every domain holds data in all three. \
             `version` is the API contract version (see API_VERSION), independent of the \
             server version; the latter is in the `x-luradb-server-version` extension. \
             Runtime check: GET /version. \
@@ -553,6 +520,33 @@ mod contract_tests {
             }
         }
         assert!(duplicates.is_empty(), "duplicate operationIds: {duplicates:#?}");
+    }
+
+    // One domain API for all engines: exactly four operations carry the
+    // `Domains` tag, and no engine has domain routes of its own.
+    #[test]
+    fn the_contract_has_exactly_four_domain_operations() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let mut domain_operations = Vec::new();
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            assert!(!path.starts_with("/store-api/json/domains"), "{path}");
+            assert!(!path.starts_with("/store-api/rel/domains"), "{path}");
+            for (method, operation) in item.as_object().unwrap() {
+                if operation["tags"].as_array().is_some_and(|tags| tags.contains(&serde_json::json!("Domains"))) {
+                    domain_operations.push((operation["operationId"].as_str().unwrap().to_string(), format!("{method} {path}")));
+                }
+            }
+        }
+        domain_operations.sort();
+        assert_eq!(
+            domain_operations,
+            [
+                ("create_domain".to_string(), "post /store-api/domains".to_string()),
+                ("delete_domain".to_string(), "delete /store-api/domains/{name}".to_string()),
+                ("get_domain".to_string(), "get /store-api/domains/{name}".to_string()),
+                ("list_domains".to_string(), "get /store-api/domains".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -634,9 +628,8 @@ mod contract_tests {
 
     // 410 coverage: every document-side JSON
     // endpoint whose engine call reaches `require_active` documents a 410
-    // response. Domain-management routes in json_domains.rs document their
-    // own 410 separately and reindex_status (task-map lookup
-    // only, no domain-state check) is deliberately excluded.
+    // response. reindex_status (task-map lookup only, no domain-state check)
+    // is deliberately excluded.
     #[test]
     fn json_document_endpoints_document_410_gone() {
         let json = serde_json::to_value(ApiDoc::openapi()).unwrap();
@@ -1037,8 +1030,6 @@ mod router_coverage_tests {
         ("get", "/store-api/kv/{domain}/keys"),
         ("get", "/store-api/kv/{domain}/count"),
         ("get", "/store-api/kv/{domain}/watch"),
-        ("get", "/store-api/json/domains"),
-        ("get", "/store-api/json/domains/{name}"),
         ("get", "/store-api/json/{domain}/documents"),
         ("get", "/store-api/json/{domain}/documents/count"),
         ("get", "/store-api/json/{domain}/indexes"),
@@ -1052,8 +1043,6 @@ mod router_coverage_tests {
         ("get", "/store-api/logs"),
         ("get", "/store-api/logs/files"),
         ("get", "/store-api/events"),
-        ("get", "/store-api/rel/domains"),
-        ("get", "/store-api/rel/domains/{name}"),
         ("post", "/store-api/rel/{domain}/sql"),
         ("get", "/store-api/rel/{domain}/tables"),
         ("get", "/store-api/rel/{domain}/tables/{table}"),
@@ -1073,8 +1062,6 @@ mod router_coverage_tests {
         ("delete", "/store-api/kv/{domain}/keys/{key}"),
         ("patch", "/store-api/kv/{domain}/keys/{key}/null"),
         ("delete", "/store-api/kv/{domain}/keys"),
-        ("post", "/store-api/json/domains"),
-        ("delete", "/store-api/json/domains/{name}"),
         ("post", "/store-api/json/{domain}/documents"),
         ("put", "/store-api/json/{domain}/documents/{key}"),
         ("delete", "/store-api/json/{domain}/documents/{key}"),
@@ -1086,8 +1073,6 @@ mod router_coverage_tests {
         ("post", "/store-api/backups/upload"),
         ("delete", "/store-api/backups/{id}"),
         ("post", "/store-api/backups/{id}/restore"),
-        ("post", "/store-api/rel/domains"),
-        ("delete", "/store-api/rel/domains/{name}"),
         ("post", "/store-api/rel/{domain}/tables/from-file"),
         ("post", "/store-api/rel/{domain}/tables/{table}/rows"),
         ("put", "/store-api/rel/{domain}/tables/{table}/rows/{pk}"),

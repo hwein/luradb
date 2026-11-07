@@ -7,9 +7,19 @@ All notable changes to LuraDB are documented in this file.
 ### Changed
 
 - **BREAKING** API: with `server.swagger_enabled = true`, the Swagger UI, its assets and `/api-docs/openapi.json` are served without an API key also when `auth.enabled = true`; the API calls made from the UI still need one.
-- **BREAKING** API: operation ids of the domain endpoints are unique per engine (`kv_`, `json_`, `rel_` prefix).
 - Default of `lsm.max_key_length` raised from 256 to 512; a `domains.max_user_key_length` that does not fit into `lsm.max_key_length` minus the 19-byte internal domain prefix is capped with a startup warning (256/256 → 237-byte keys).
 - **BREAKING** API: Table import suffixes column names that are LuraSQL keywords with `_` and rejects a keyword as table name.
+- **BREAKING** API: one domain API for every engine: `POST`, `GET` and `DELETE /store-api/domains…` create, list, describe and delete a domain that holds keys, documents and tables alike; the domain endpoints under `/store-api/json/` and `/store-api/rel/` are removed.
+- **BREAKING** API: `require_conditional_writes` of a domain is an object `{"kv": bool, "json": bool}` in requests and responses; `document_count` is gone from the domain object.
+- **BREAKING** API: a domain that is being deleted answers 410 on its key-value routes instead of 404; the domain list shows active domains only.
+- **BREAKING** API: `domain_created`, `domain_deleted` and `domain_purged` come once per domain and carry no `engine` field; a restore with `replace` sends no domain events.
+- **BREAKING** API: the MCP tools `list_domains`, `describe_domain` and `create_domain` take no `engine`; `unavailable_engines` is gone from `list_domains`.
+- **BREAKING** API: the domain name rule of `[domains]` (`max_name_length`, default 50) applies to every engine; the name `domains` is allowed.
+- **BREAKING** API: a restore with `replace` replaces only the engines the archive holds and keeps the domain and its permissions.
+- **BREAKING** API: `domains.default_domain` names the default domain of every engine.
+- The first start after the update merges the domains of the three engines into one domain per name.
+- Backup archive format 3: domain lines carry `require_conditional_writes`; archives of formats 1 to 3 restore.
+- `json.lsm.max_key_length` and `rel.lsm.max_key_length` are raised with a warning instead of a startup error when too short for `domains.max_name_length`; `domains.max_name_length` above 438 is a startup error.
 
 ### Fixed
 
@@ -20,6 +30,7 @@ All notable changes to LuraDB are documented in this file.
 - LuraSQL rejects `DISTINCT`, `GROUP BY`, `HAVING`, `UNION`, `EXCEPT`, `INTERSECT` and join types other than `LEFT JOIN` with a clear 400 instead of a misleading error.
 - Startup rejects a `server.swagger_url` that would shadow the API or crash the router (/, /store-api, /health, /version, /api-docs/openapi.json, path placeholders) instead of starting a server that answers 404 to every request.
 - Scheduled backups resume after the system clock is set back by more than five minutes, with a warning in the log, instead of staying silent until the clock catches up.
+- `require_conditional_writes` of a domain survives backup and restore.
 
 ### Removed
 

@@ -41,7 +41,6 @@ impl From<JsonStoreError> for ApiError {
             JsonStoreError::DomainNotFound(_) => StatusCode::NOT_FOUND,
             JsonStoreError::DomainDeleting(_) => StatusCode::GONE,
             JsonStoreError::DomainAlreadyExists(_) => StatusCode::CONFLICT,
-            JsonStoreError::InvalidDomainName(_) => StatusCode::BAD_REQUEST,
             JsonStoreError::InvalidKey(_) => StatusCode::BAD_REQUEST,
             JsonStoreError::ReservedField { .. } => StatusCode::BAD_REQUEST,
             JsonStoreError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -1018,7 +1017,7 @@ mod tests {
     fn test_reindex_status_scoped_to_domain() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(true).await;
-            request(&app, Method::POST, "/store-api/json/domains", Some(r#"{"name": "other"}"#)).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "other"}"#)).await;
             let (status, body) = request(&app, Method::POST, "/store-api/json/default/reindex", None).await;
             assert_eq!(status, StatusCode::ACCEPTED, "{body}");
             let task_id = serde_json::from_str::<Value>(&body).unwrap()["task_id"]
@@ -1057,11 +1056,13 @@ mod tests {
     fn test_disabled_engine_returns_503() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(false).await;
-            let (status, body) = request(&app, Method::GET, "/store-api/json/domains", None).await;
+            let (status, body) = request(&app, Method::GET, "/store-api/json/default/documents", None).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert!(body.contains("disabled"), "{body}");
             let (status, _) = request(&app, Method::GET, "/store-api/json/default/documents/x", None).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            let (status, _) = request(&app, Method::GET, "/store-api/domains/default", None).await;
+            assert_eq!(status, StatusCode::OK, "the domain stays while its JSON engine is off");
         })
     }
 
@@ -1098,11 +1099,6 @@ mod tests {
             ).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["count"], json!(5));
-
-            // Domain detail includes the document count.
-            let (status, body) = request(&app, Method::GET, "/store-api/json/domains/default", None).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["document_count"], json!(5));
         })
     }
 
@@ -1381,12 +1377,13 @@ mod tests {
     fn test_conditional_writes_domain_rejects_unconditional_writes_428() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(true).await;
-            let (status, body) = request(&app, Method::POST, "/store-api/json/domains",
-                Some(r#"{"name": "strict", "require_conditional_writes": true}"#)).await;
+            let (status, body) = request(&app, Method::POST, "/store-api/domains",
+                Some(r#"{"name": "strict", "require_conditional_writes": {"json": true}}"#)).await;
             assert_eq!(status, StatusCode::CREATED, "{body}");
-            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["require_conditional_writes"], json!(true));
-            let (_, body) = request(&app, Method::GET, "/store-api/json/domains/strict", None).await;
-            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["require_conditional_writes"], json!(true));
+            let setting = json!({"kv": false, "json": true});
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["require_conditional_writes"], setting);
+            let (_, body) = request(&app, Method::GET, "/store-api/domains/strict", None).await;
+            assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["require_conditional_writes"], setting);
 
             let uri = "/store-api/json/strict/documents/d";
             for (method, body) in [(Method::PUT, Some("{}")), (Method::DELETE, None)] {
@@ -1433,8 +1430,8 @@ mod tests {
     fn test_conditional_writes_domain_400_before_428() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(true).await;
-            request(&app, Method::POST, "/store-api/json/domains",
-                Some(r#"{"name": "strict", "require_conditional_writes": true}"#)).await;
+            request(&app, Method::POST, "/store-api/domains",
+                Some(r#"{"name": "strict", "require_conditional_writes": {"json": true}}"#)).await;
 
             let invalid_key = "/store-api/json/strict/documents/a:b";
             let (status, body) = request(&app, Method::PUT, invalid_key, Some("{}")).await;
@@ -1559,7 +1556,7 @@ mod tests {
             let resp = send(Method::POST, "/store-api/json/default/bulk",
                 Some(r#"{"_key": "a", "n": 1}"#), user_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            let resp = send(Method::POST, "/store-api/json/domains",
+            let resp = send(Method::POST, "/store-api/domains",
                 Some(r#"{"name": "own"}"#), user_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
@@ -1574,7 +1571,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let resp = send(Method::GET, "/store-api/json/domains", None, admin_key).await.unwrap();
+            let resp = send(Method::GET, "/store-api/domains", None, admin_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
         })
     }
@@ -1588,10 +1585,10 @@ mod tests {
 
             let (state, _dir) = make_state(false, true).await;
             let cache = Arc::clone(&state.auth_cache);
-            let registry = Arc::clone(&state.registry);
+            let control = Arc::clone(&state.control);
             let app = crate::api::router_inline(state, Arc::new(vec![]));
 
-            registry.create_domain("orders").await.unwrap();
+            control.create_domain("orders", Default::default()).await.unwrap();
 
             let user_key = "lura_test_user_key";
             cache
@@ -1659,9 +1656,9 @@ mod tests {
         })
     }
 
-    // 17. Usernames and JSON permission domains share the domain charset:
+    // 17. Usernames and permission domains share the domain charset:
     //     ':' in a username would make the persisted perm key ambiguous,
-    //     invalid JSON domain names would create dead permissions.
+    //     invalid domain names would create dead permissions.
     #[test]
     fn test_auth_name_and_permission_domain_validation() {
         crate::core::engine_runtime::block_on(async {
@@ -1706,13 +1703,13 @@ mod tests {
                 Some(r#"{"name": "svc-json_1"}"#), admin_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
 
-            // JSON permissions skip the existence check but not the name rules.
-            let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions",
+            // Skipping the existence check does not skip the name rule.
+            let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions?allow_missing=true",
                 Some(r#"{"domain": "my data", "access": "read", "store_type": "json"}"#),
                 admin_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-            let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions",
+            let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions?allow_missing=true",
                 Some(r#"{"domain": "data", "access": "read", "store_type": "json"}"#),
                 admin_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
@@ -1728,7 +1725,7 @@ mod tests {
 
             let req = Request::builder()
                 .method(Method::GET)
-                .uri("/store-api/json/domains")
+                .uri("/store-api/json/default/documents")
                 .body(Body::empty())
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
@@ -1736,7 +1733,7 @@ mod tests {
 
             let mut req = Request::builder()
                 .method(Method::GET)
-                .uri("/store-api/json/domains")
+                .uri("/store-api/json/default/documents")
                 .body(Body::empty())
                 .unwrap();
             req.extensions_mut().insert(crate::auth::middleware::TrustedPeer);
@@ -1745,40 +1742,21 @@ mod tests {
         })
     }
 
-    // 10. JSON domain endpoints.
+    // 10. A domain's JSON part follows the domain: created and deleted with
+    //     it, its documents answer 410 Gone while the purge runs.
     #[test]
-    fn test_json_domain_endpoints() {
+    fn test_json_part_follows_the_domain() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(true).await;
-            let (status, _) = request(&app, Method::POST, "/store-api/json/domains",
+            let (status, _) = request(&app, Method::POST, "/store-api/domains",
                 Some(r#"{"name": "api-dom"}"#)).await;
             assert_eq!(status, StatusCode::CREATED);
-            let (status, body) = request(&app, Method::GET, "/store-api/json/domains", None).await;
-            assert_eq!(status, StatusCode::OK);
-            assert!(body.contains("api-dom"));
-            let (status, _) = request(&app, Method::GET, "/store-api/json/domains/api-dom", None).await;
-            assert_eq!(status, StatusCode::OK);
-            let (status, _) = request(&app, Method::DELETE, "/store-api/json/domains/api-dom", None).await;
+            let (status, _) = request(&app, Method::PUT, "/store-api/json/api-dom/documents/x", Some("{}")).await;
+            assert_eq!(status, StatusCode::CREATED);
+            let (status, _) = request(&app, Method::DELETE, "/store-api/domains/api-dom", None).await;
             assert_eq!(status, StatusCode::ACCEPTED);
-            // While the purge runs, the domain answers 410 Gone.
-            let (status, body) = request(&app, Method::GET, "/store-api/json/domains/api-dom", None).await;
-            assert_eq!(status, StatusCode::GONE, "{body}");
             let (status, _) = request(&app, Method::PUT, "/store-api/json/api-dom/documents/x", Some("{}")).await;
             assert_eq!(status, StatusCode::GONE);
-        })
-    }
-
-    // 10b. Invalid JSON domain names → 400.
-    #[test]
-    fn test_json_domain_invalid_name_400() {
-        crate::core::engine_runtime::block_on(async {
-            let (app, _dir) = make_app(true).await;
-            let long = "a".repeat(51);
-            for bad in ["", long.as_str(), "bad name!"] {
-                let req = json!({ "name": bad }).to_string();
-                let (status, body) = request(&app, Method::POST, "/store-api/json/domains", Some(&req)).await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {body}");
-            }
         })
     }
 

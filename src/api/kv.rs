@@ -862,18 +862,16 @@ mod tests {
             let (app, _dir) = make_app().await;
             let json = [("content-type", "application/json")];
             let long = "a".repeat(51);
-            let cases = [
-                ("", "must not be empty"),
-                (long.as_str(), "exceeds maximum of 50 characters"),
-                ("bad name!", "contains invalid characters"),
-            ];
-            for (bad, reason) in cases {
+            for bad in ["", long.as_str(), "bad name!"] {
                 let body = serde_json::json!({ "name": bad }).to_string();
                 let resp = send_with(&app, Method::POST, "/store-api/domains", &json, Body::from(body)).await;
                 assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
                 let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
                 let text = String::from_utf8_lossy(&bytes);
-                assert!(text.starts_with("400 Bad Request: Domain name") && text.contains(reason), "{bad:?}: {text}");
+                let expected = format!(
+                    "400 Bad Request: invalid domain name '{bad}': allowed are [a-zA-Z0-9_-], 1 to 50 characters"
+                );
+                assert_eq!(text, expected, "{bad:?}");
             }
 
             for expected in [StatusCode::CREATED, StatusCode::CONFLICT] {
@@ -2310,13 +2308,14 @@ mod tests {
                 Method::POST,
                 "/store-api/domains",
                 &[("content-type", "application/json")],
-                Body::from(r#"{"name": "strict", "require_conditional_writes": true}"#),
+                Body::from(r#"{"name": "strict", "require_conditional_writes": {"kv": true}}"#),
             )
             .await;
             assert_eq!(resp.status(), StatusCode::CREATED);
-            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], true);
+            let setting = serde_json::json!({"kv": true, "json": false});
+            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], setting);
             let resp = send(&app, Method::GET, "/store-api/domains/strict", Body::empty()).await;
-            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], true);
+            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], setting);
 
             let uri = "/store-api/kv/strict/keys/k";
             let unconditional = [

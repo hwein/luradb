@@ -541,9 +541,7 @@ mod tests {
     async fn fill(addr: SocketAddr, names: &[String]) {
         for name in names {
             let create = json!({ "name": name }).to_string();
-            for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
-                expect(addr, &with_body("POST", path, &create), 201).await;
-            }
+            expect(addr, &with_body("POST", "/store-api/domains", &create), 201).await;
             let kv = format!("/store-api/kv/{name}/keys");
             expect(addr, &with_body("PUT", &format!("{kv}/k"), &format!("clé {name}")), 200).await;
             expect(addr, &with_body("PUT", &format!("{kv}/ttl?ttl=86400"), "tok"), 200).await;
@@ -591,7 +589,7 @@ mod tests {
 
     /// Every answer a client gets about `names`, request by request.
     async fn observe(addr: SocketAddr, names: &[String]) -> Vec<(String, u16, String)> {
-        let mut requests = vec![get("/store-api/domains"), get("/store-api/json/domains"), get("/store-api/rel/domains")];
+        let mut requests = vec![get("/store-api/domains")];
         for name in names {
             let kv = format!("/store-api/kv/{name}/keys");
             requests.push(get(&kv));
@@ -685,9 +683,10 @@ mod tests {
         expire_one(&config(dir.path(), 1), &names[0]);
         let before = serve(config(dir.path(), 1), |addr| async move { observe(addr, &two_domains()).await });
         let count = |status: u16| before.iter().filter(|(_, got, _)| *got == status).count();
-        // Per domain 13 answers with data, the NULL key, and 5 misses: the
-        // deleted and expired keys with their metadata and the deleted document.
-        assert_eq!((count(200), count(204), count(404)), (3 + 2 * 13, 2, 2 * 5), "{before:#?}");
+        // The domain list and per domain 13 answers with data, the NULL key,
+        // and 5 misses: the deleted and expired keys with their metadata and
+        // the deleted document.
+        assert_eq!((count(200), count(204), count(404)), (1 + 2 * 13, 2, 2 * 5), "{before:#?}");
 
         migrate_shards(&config(dir.path(), 0), 2).unwrap();
         let (after, shards) = serve(config(dir.path(), 0), |addr| async move {
@@ -946,7 +945,6 @@ mod tests {
             for name in &two_domains() {
                 let create = json!({ "name": name }).to_string();
                 expect(addr, &with_body("POST", "/store-api/domains", &create), 201).await;
-                expect(addr, &with_body("POST", "/store-api/json/domains", &create), 201).await;
                 expect(addr, &with_body("PUT", &format!("/store-api/kv/{name}/keys/k"), "v"), 200).await;
                 let doc = json!({ "city": "Lyon" }).to_string();
                 expect(addr, &with_body("PUT", &format!("/store-api/json/{name}/documents/d"), &doc), 201).await;

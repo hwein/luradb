@@ -21,8 +21,9 @@ use crate::{
     config::{BlockCacheConfig, LuraConfig},
     control::{
         checkpoint::{Holder, WalCheckpoint, WAL_CHECKPOINT_INTERVAL},
+        domains,
         resources::{self, ResourceWatch, Resources, RESOURCE_WATCH_INTERVAL},
-        system, ControlPlane, Engine, Owners, Shard, ShardCommand, ShardOwners,
+        system, ControlPlane, DomainRules, Engine, Owners, Shard, ShardCommand, ShardOwners,
     },
     core::{
         coop,
@@ -389,7 +390,7 @@ async fn bootstrap(
     };
 
     // The first reading before any client or background writer runs; the
-    // shards' own start writes, a default domain for one, went in before.
+    // domain reconciliation's writes went in before.
     let watch = Arc::new(parking_lot::Mutex::new(watch));
     resources::log(&watch.lock().tick());
     let relief = watch.lock().relief();
@@ -487,6 +488,13 @@ async fn prepare_control(
     }
     tracing::info!("{} data shard(s) ready.", owners.len());
     system::migrate_auth(owners[0].kv.engine(), system_store).await?;
+    // Before the shards are released: no request and no purger sees an
+    // engine out of line with the domain records.
+    let rules = DomainRules {
+        default_domain: config.domains.default_domain.clone(),
+        max_name_length: config.domains.max_name_length,
+    };
+    domains::reconcile(system_store, &owners, &rules).await?;
 
     // The auth cache on the system store, after the auth move above.
     let oauth_resource =
@@ -510,7 +518,8 @@ async fn prepare_control(
         .map(|(owners, thread)| Shard { owners: owners.clone(), commands: thread.commands.clone() })
         .collect();
     let owners_auth = Owners { shards, auth: Arc::clone(&auth_cache) };
-    let control = ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus, resources).await?;
+    let control =
+        ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus, resources, rules.max_name_length).await?;
 
     let loops = spawn_loops(config);
     let backup_manager = init_backup(config, &control, &loops);
@@ -566,7 +575,6 @@ pub(super) fn domain_config(cfg: &LuraConfig) -> DomainConfig {
         );
     }
     DomainConfig {
-        max_name_length: cfg.domains.max_name_length,
         max_user_key_length,
         max_value_size: cfg.lsm.max_value_size,
         default_domain: cfg.domains.default_domain.clone(),

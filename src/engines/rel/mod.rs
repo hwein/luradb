@@ -54,19 +54,20 @@ pub enum ExecOutcome {
 
 use crate::config::{BlockCacheConfig, RelStoreConfig};
 use crate::control::{ControlPlane, Engine};
+#[cfg(test)]
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
 use crate::engines::lsm::janitor::JanitorConfig;
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::metrics::MetricsStore;
-use crate::storage::file_manager::FileManager;
-use crate::storage::manifest::ManifestManager;
-use crate::storage::vlog::VLog;
+#[cfg(test)]
+use crate::storage::{file_manager::FileManager, manifest::ManifestManager, vlog::VLog};
 use anyhow::Result;
 use domain::RelDomainRegistry;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -155,10 +156,12 @@ impl RelEngine {
         Self::bootstrap_with_wal(config, DomainQuota::default(), wal, metrics, cross_engine).await
     }
 
-    /// Creates the dedicated relational LSM instance from `config`, with
-    /// `wal` as the log at `config.wal_path`, starts its background tasks,
-    /// and recovers the domain registry and the catalog. `quota` is the
-    /// rate limit of every domain.
+    /// Tests only: creates the dedicated relational LSM instance from
+    /// `config`, with `wal` as the log at `config.wal_path`, starts its
+    /// background tasks, recovers the domain registry and the catalog and
+    /// creates the default domain if it is missing, as a start does. `quota`
+    /// is the rate limit of every domain.
+    #[cfg(test)]
     pub async fn bootstrap_with_wal(
         config: &RelStoreConfig,
         quota: DomainQuota,
@@ -177,7 +180,11 @@ impl RelEngine {
             LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options).await?,
         );
         engine.start_background_tasks();
-        Self::open(config, quota, engine, metrics, cross_engine, true).await
+        let rel = Self::open(config, quota, engine, metrics, cross_engine).await?;
+        if rel.get_domain_any(domain::DEFAULT_DOMAIN).is_none() {
+            rel.create_domain(domain::DEFAULT_DOMAIN).await?;
+        }
+        Ok(rel)
     }
 
     /// Options of the relational engine's LSM instances, with `block_cache`.
@@ -197,8 +204,7 @@ impl RelEngine {
     }
 
     /// The relational engine on `engine`, a recovered instance whose
-    /// background tasks run: recovers the domain registry and the catalog;
-    /// with `owns_default` it creates the default domain if that is missing.
+    /// background tasks run: recovers the domain registry and the catalog.
     /// `quota` is the rate limit of every domain.
     pub async fn open(
         config: &RelStoreConfig,
@@ -206,9 +212,8 @@ impl RelEngine {
         engine: Arc<LsmStorageEngine>,
         metrics: Arc<MetricsStore>,
         cross_engine: Arc<CrossEngineResolver>,
-        owns_default: bool,
     ) -> Result<Arc<Self>> {
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), owns_default).await?);
+        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await?);
         let limits = CatalogLimits {
             max_columns: MAX_COLUMNS,
             max_indexes_per_table: MAX_INDEXES_PER_TABLE,
@@ -649,7 +654,7 @@ mod tests {
                 wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
                 vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
                 sstable_dir: dir.path().join("rel_sstables").to_string_lossy().into_owned(),
-                lsm: crate::config::RelLsmConfig { max_key_length: catalog::MIN_LSM_KEY_LENGTH },
+                lsm: crate::config::RelLsmConfig { max_key_length: catalog::min_lsm_key_length(50) },
                 ..RelStoreConfig::default()
             };
             config.validate().unwrap();
@@ -657,7 +662,7 @@ mod tests {
             let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
             let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
 
-            let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
+            let domain = "d".repeat(50);
             rel.create_domain(&domain).await.unwrap();
             rel.execute(&domain, "CREATE TABLE t (k TEXT PRIMARY KEY)", &[]).await.unwrap();
             rel.execute(&domain, "INSERT INTO t VALUES ('a')", &[]).await.unwrap();
@@ -1038,7 +1043,7 @@ mod tests {
             ];
             for (kind, object) in expected {
                 let event = rx.try_recv().unwrap();
-                assert_eq!(event.engine, "rel");
+                assert_eq!(event.engine, Some("rel"));
                 assert_eq!(event.kind, kind);
                 assert_eq!(event.object.as_deref(), object, "kind {kind}");
                 assert_eq!(event.domain, "default");

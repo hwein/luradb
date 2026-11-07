@@ -40,7 +40,6 @@ impl From<RelStoreError> for ApiError {
             | RelStoreError::InvalidSchema(_)
             | RelStoreError::TypeMismatch { .. }
             | RelStoreError::LimitExceeded { .. }
-            | RelStoreError::InvalidDomainName(_)
             | RelStoreError::InvalidIdentifier(_)
             | RelStoreError::NotWritable { .. }
             | RelStoreError::NotNull { .. }
@@ -474,60 +473,38 @@ mod tests {
         })
     }
 
-    // 1. Domain roundtrip: create → 201; list contains it with state=active;
-    //    detail → 200; duplicate → 409; invalid names → 400.
+    // 1. A created domain takes SQL in its relational part, the name
+    //    `domains` too.
     #[test]
-    fn test_domain_roundtrip() {
+    fn test_a_created_domain_takes_sql() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_default_app().await;
-            let (status, body) =
-                request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#)).await;
-            assert_eq!(status, StatusCode::CREATED, "{body}");
-            let created: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(created["state"], json!("active"));
-
-            let (status, body) = request(&app, Method::GET, "/store-api/rel/domains", None).await;
-            assert_eq!(status, StatusCode::OK);
-            let list: Value = serde_json::from_str(&body).unwrap();
-            let entry = list.as_array().unwrap().iter().find(|d| d["name"] == json!("shop")).unwrap();
-            assert_eq!(entry["state"], json!("active"));
-
-            let (status, _) = request(&app, Method::GET, "/store-api/rel/domains/shop", None).await;
-            assert_eq!(status, StatusCode::OK);
-
-            let (status, _) =
-                request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#)).await;
-            assert_eq!(status, StatusCode::CONFLICT);
-
-            let long = "a".repeat(51);
-            for bad in ["", long.as_str(), "bad name!", "domains"] {
-                let req = json!({ "name": bad }).to_string();
-                let (status, body) = request(&app, Method::POST, "/store-api/rel/domains", Some(&req)).await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {body}");
+            for name in ["shop", "domains"] {
+                let req = json!({ "name": name }).to_string();
+                let (status, body) = request(&app, Method::POST, "/store-api/domains", Some(&req)).await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+                let (status, body) = sql(&app, name, r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
+                assert_eq!(status, StatusCode::OK, "{name}: {body}");
             }
         })
     }
 
-    // 2. Domain delete: DELETE → 202; detail afterwards → 410 with status
-    //    info; SQL against the deleted domain → 410 (require_active).
+    // 2. Domain delete: DELETE → 202; SQL against the deleted domain → 410
+    //    (require_active); a second DELETE → 410.
     #[test]
     fn test_domain_delete_then_410() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_default_app().await;
-            request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "gone"}"#)).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "gone"}"#)).await;
 
-            let (status, _) = request(&app, Method::DELETE, "/store-api/rel/domains/gone", None).await;
+            let (status, _) = request(&app, Method::DELETE, "/store-api/domains/gone", None).await;
             assert_eq!(status, StatusCode::ACCEPTED);
-
-            let (status, body) = request(&app, Method::GET, "/store-api/rel/domains/gone", None).await;
-            assert_eq!(status, StatusCode::GONE, "{body}");
-            assert!(body.contains("deleting"), "{body}");
 
             let (status, body) = sql(&app, "gone", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::GONE, "{body}");
 
             // A repeated DELETE of an already-deleting domain is also 410.
-            let (status, _) = request(&app, Method::DELETE, "/store-api/rel/domains/gone", None).await;
+            let (status, _) = request(&app, Method::DELETE, "/store-api/domains/gone", None).await;
             assert_eq!(status, StatusCode::GONE);
         })
     }
@@ -546,8 +523,8 @@ mod tests {
             let (status, _) = sql(&app, "ghost", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
 
-            request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "d1"}"#)).await;
-            request(&app, Method::DELETE, "/store-api/rel/domains/d1", None).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "d1"}"#)).await;
+            request(&app, Method::DELETE, "/store-api/domains/d1", None).await;
             let (status, _) = sql(&app, "d1", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::GONE);
         })
@@ -952,8 +929,8 @@ mod tests {
             let (status, _) = sql(&app, "default", r#"{"sql": "CREATE TABLE dup (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::CONFLICT);
             // 410
-            request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "d410"}"#)).await;
-            request(&app, Method::DELETE, "/store-api/rel/domains/d410", None).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "d410"}"#)).await;
+            request(&app, Method::DELETE, "/store-api/domains/d410", None).await;
             let (status, _) = sql(&app, "d410", r#"{"sql": "CREATE TABLE x (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::GONE);
             // 413 and 429 are covered by their own dedicated tests (need custom config/state).
@@ -965,7 +942,7 @@ mod tests {
     fn test_disabled_engine_returns_503() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(None).await;
-            let (status, body) = request(&app, Method::GET, "/store-api/rel/domains", None).await;
+            let (status, body) = request(&app, Method::GET, "/store-api/rel/default/tables", None).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert!(body.contains("relational engine is disabled (rel.enabled = false)"), "{body}");
             let (status, _) = sql(&app, "default", r#"{"sql": "SELECT 1"}"#).await;
@@ -1173,7 +1150,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let resp = send(Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#), admin_key)
+            let resp = send(Method::POST, "/store-api/domains", Some(r#"{"name": "shop"}"#), admin_key)
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
@@ -1390,11 +1367,6 @@ mod tests {
                 app.clone().oneshot(req)
             };
 
-            // KV domain "shop" (bare namespace), seeded directly through the
-            // registry with an existing key.
-            kv_registry.create_domain("shop").await.unwrap();
-            kv_registry.store("shop").await.unwrap().put(b"realkey", b"realvalue").await.unwrap();
-
             let admin_key = "lura_test_admin_key";
             cache
                 .upsert_user(UserRecord {
@@ -1405,10 +1377,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let resp = send(Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#), admin_key)
+            let resp = send(Method::POST, "/store-api/domains", Some(r#"{"name": "shop"}"#), admin_key)
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
+            // The key-value part of "shop" (bare namespace), seeded directly
+            // through the registry with an existing key.
+            kv_registry.store("shop").await.unwrap().put(b"realkey", b"realvalue").await.unwrap();
             let resp = send(
                 Method::POST,
                 "/store-api/rel/shop/sql",

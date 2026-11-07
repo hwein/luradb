@@ -20,8 +20,9 @@ use crate::core::engine_runtime::{self, spawn_io};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Version 2 adds `shards` and `lsn_cut` to the manifest.
-pub(crate) const FORMAT_VERSION: u32 = 2;
+/// Version 2 adds `shards` and `lsn_cut` to the manifest, version 3
+/// `require_conditional_writes` to the key-value and JSON domain lines.
+pub(crate) const FORMAT_VERSION: u32 = 3;
 
 /// Whether restore reads archives of `format_version`.
 pub(crate) fn is_supported_format(format_version: u32) -> bool {
@@ -65,11 +66,14 @@ pub(crate) struct LsnCut {
     pub rel: u64,
 }
 
+/// `require_conditional_writes` is absent in archives before version 3.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct KvDomainLine {
     pub t: String,
     pub name: String,
     pub created_at: u64,
+    #[serde(default)]
+    pub require_conditional_writes: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,11 +85,14 @@ pub(crate) struct KvLine {
     pub expires_at: u64,
 }
 
+/// `require_conditional_writes` is absent in archives before version 3.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct JsonDomainLine {
     pub t: String,
     pub name: String,
     pub created_at: u64,
+    #[serde(default)]
+    pub require_conditional_writes: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -251,11 +258,11 @@ struct AuthPermLine<'a> {
     perm: &'a DomainPermission,
 }
 
-/// The concrete domains a scope resolves to, from the directory of every
-/// data shard, each engine's in name order and only `Active` ones. Either
-/// list can be empty for any scope — every domain of an engine may be
-/// deleted at runtime — and only means there is no *domain* data to export;
-/// auth records live outside any domain and still need the KV cut.
+/// The concrete domains a scope resolves to, from the directory, per engine
+/// in name order and only those whose part in that engine is active. Either
+/// list can be empty for any scope — every domain may be deleted at runtime
+/// — and only means there is no *domain* data to export; auth records live
+/// outside any domain and still need the KV cut.
 #[derive(Debug, Default)]
 pub(crate) struct ResolvedScope {
     pub kv_domains: Vec<DomainEntry>,
@@ -263,16 +270,25 @@ pub(crate) struct ResolvedScope {
     pub rel_domains: Vec<DomainEntry>,
 }
 
-/// A disabled engine has no domain in the directory, so `all` and
-/// `domain:<name>` leave it out on their own.
+/// `all` and `domain:<name>` leave a disabled engine out.
 pub(crate) fn resolve_scope(scope: &BackupScope, control: &ControlPlane) -> Result<ResolvedScope, BackupError> {
     let directory = control.directory();
     let json_enabled = control.shard_owners().any(|owners| owners.json.is_some());
     let rel_enabled = control.shard_owners().any(|owners| owners.rel.is_some());
-    let all = |engine| -> Vec<DomainEntry> {
-        directory.domains(engine).filter(|d| d.state == Lifecycle::Active).cloned().collect()
+    let enabled = |engine| match engine {
+        Engine::Kv => true,
+        Engine::Json => json_enabled,
+        Engine::Rel => rel_enabled,
     };
-    let one = |engine, name: &str| directory.get(engine, name).filter(|d| d.state == Lifecycle::Active).cloned();
+    let all = |engine| -> Vec<DomainEntry> {
+        if !enabled(engine) {
+            return Vec::new();
+        }
+        directory.domains().filter(|d| d.state_in(engine) == Lifecycle::Active).cloned().collect()
+    };
+    let one = |engine, name: &str| {
+        directory.get(name).filter(|d| enabled(engine) && d.state_in(engine) == Lifecycle::Active).cloned()
+    };
     let not_found = |name: &String| BackupError::DomainNotFound(name.clone());
     match scope {
         BackupScope::All => Ok(ResolvedScope {
@@ -498,7 +514,12 @@ async fn write_kv_section(
             out,
             hasher,
             lines,
-            &KvDomainLine { t: "kv-domain".to_string(), name: domain.name.clone(), created_at: domain.created_at },
+            &KvDomainLine {
+                t: "kv-domain".to_string(),
+                name: domain.name.clone(),
+                created_at: domain.created_at,
+                require_conditional_writes: Some(domain.require_conditional_writes.kv),
+            },
         )
         .await?;
 
@@ -572,7 +593,12 @@ async fn write_json_section(
             out,
             hasher,
             lines,
-            &JsonDomainLine { t: "json-domain".to_string(), name: domain.name.clone(), created_at: domain.created_at },
+            &JsonDomainLine {
+                t: "json-domain".to_string(),
+                name: domain.name.clone(),
+                created_at: domain.created_at,
+                require_conditional_writes: Some(domain.require_conditional_writes.json),
+            },
         )
         .await?;
 
@@ -750,8 +776,8 @@ mod tests {
     }
 
     impl Fixture {
-        async fn create(&self, engine: Engine, name: &str) {
-            self.control.create_domain(engine, name, false).await.unwrap();
+        async fn create(&self, name: &str) {
+            self.control.create_domain(name, Default::default()).await.unwrap();
         }
 
         fn json(&self) -> &Arc<JsonEngine> {
@@ -780,11 +806,11 @@ mod tests {
         serde_json::from_str(content.lines().next().unwrap()).unwrap()
     }
 
-    // A version 2 manifest reads back as written; one of version 1, without
+    // A version 3 manifest reads back as written; one of version 1, without
     // the fields version 2 added, still reads, with zero shards and a zero
-    // LSN cut, and both versions are restorable.
+    // LSN cut, and versions 1 to 3 are restorable.
     #[test]
-    fn a_v2_manifest_round_trips_and_a_v1_manifest_still_reads() {
+    fn a_v3_manifest_round_trips_and_older_manifests_still_read() {
         let manifest = ManifestLine {
             t: "manifest".to_string(),
             format_version: FORMAT_VERSION,
@@ -803,7 +829,7 @@ mod tests {
         };
         let line = serde_json::to_string(&manifest).unwrap();
         let value: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(value["format_version"], json!(2));
+        assert_eq!(value["format_version"], json!(3));
         assert_eq!(value["shards"], json!(3));
         assert_eq!(value["lsn_cut"], json!({"kv": 41, "json": 12, "rel": 5}));
         assert_eq!(value["rel_snapshot_ts"], json!(11));
@@ -827,7 +853,73 @@ mod tests {
         });
         let old: ManifestLine = serde_json::from_value(v1).unwrap();
         assert_eq!((old.format_version, old.kv_snapshot_ts, old.shards, old.lsn_cut), (1, 5, 0, LsnCut::default()));
-        assert_eq!([0, 1, 2, 3].map(is_supported_format), [false, true, true, false]);
+        assert_eq!([0, 1, 2, 3, 4].map(is_supported_format), [false, true, true, true, false]);
+    }
+
+    // The domain lines of version 3 carry require_conditional_writes; those
+    // of older archives read without it.
+    #[test]
+    fn domain_lines_carry_the_conditional_writes_setting_from_version_3() {
+        crate::core::engine_runtime::block_on(async {
+            let fx = fixture(true).await;
+            fx.control.create_domain("strict", crate::control::ConditionalWrites { kv: true, json: false }).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            backup(&fx.control, out_dir.path(), "bk_rcw", BackupScope::Domain("strict".to_string()), false).await;
+            let content = std::fs::read_to_string(out_dir.path().join("bk_rcw.ndjson")).unwrap();
+            let line = |t: &str| -> Value {
+                content.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["t"] == t).unwrap()
+            };
+            assert_eq!(line("kv-domain")["require_conditional_writes"], json!(true));
+            assert_eq!(line("json-domain")["require_conditional_writes"], json!(false));
+
+            let old: KvDomainLine = serde_json::from_value(json!({"t": "kv-domain", "name": "a", "created_at": 1})).unwrap();
+            assert_eq!(old.require_conditional_writes, None);
+        })
+    }
+
+    // A domain deleted while its `domain:` backup runs: the backup ends with
+    // an error and leaves no archive, or with the whole domain as of its
+    // cuts, never with part of it.
+    #[test]
+    fn a_domain_deleted_during_its_backup_gives_an_error_or_a_whole_archive() {
+        crate::core::engine_runtime::block_on(async {
+            let fx = fixture(true).await;
+            fx.create("shop").await;
+            let store = fx.kv.store("shop").await.unwrap();
+            for i in 0..20 {
+                store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+                fx.json().put_document("shop", &format!("d{i}"), json!({"n": i})).await.unwrap();
+            }
+            let scope = BackupScope::Domain("shop".to_string());
+            let resolved = resolve_scope(&scope, &fx.control).unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let (out, control) = (out_dir.path().to_path_buf(), Arc::clone(&fx.control));
+            let job = compio::runtime::spawn(async move {
+                let params = BackupParams {
+                    dir: &out,
+                    id: "bk_racing",
+                    scope: &scope,
+                    include_auth: false,
+                    schedule: None,
+                    resolved: &resolved,
+                    control: &control,
+                    scan_batch_size: 1,
+                    scan_pause_ms: 1,
+                };
+                run_backup(params).await
+            });
+            tokio::task::yield_now().await;
+            fx.control.delete_domain("shop").await.unwrap();
+            let archive = out_dir.path().join("bk_racing.ndjson");
+            match job.await.unwrap() {
+                Err(_) => assert!(!archive.exists()),
+                Ok(()) => {
+                    let content = std::fs::read_to_string(&archive).unwrap();
+                    let count = |t: &str| content.lines().filter(|l| l.contains(&format!("\"t\":\"{t}\""))).count();
+                    assert_eq!((count("kv"), count("doc")), (20, 20), "the whole domain");
+                }
+            }
+        })
     }
 
     // 1. resolve_scope: `all` picks up every active KV domain.
@@ -835,7 +927,7 @@ mod tests {
     fn test_resolve_all_scope_kv_only() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(false).await;
-            fx.create(Engine::Kv, "shop").await;
+            fx.create("shop").await;
             let resolved = resolve_scope(&BackupScope::All, &fx.control).unwrap();
             let names: Vec<_> = resolved.kv_domains.iter().map(|d| d.name.clone()).collect();
             assert_eq!(names, ["default", "shop"]);
@@ -865,15 +957,18 @@ mod tests {
         })
     }
 
-    // 4. resolve_scope: domain:<name> present in only one engine backs up only that one.
+    // 4. resolve_scope: domain:<name> is the whole domain, every enabled
+    //    engine; an engine scope is that engine's part.
     #[test]
-    fn test_resolve_domain_scope_single_engine() {
+    fn test_resolve_domain_scope_takes_every_enabled_engine() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(true).await;
-            fx.create(Engine::Kv, "only-kv").await;
-            let resolved = resolve_scope(&BackupScope::Domain("only-kv".to_string()), &fx.control).unwrap();
-            assert_eq!(resolved.kv_domains.len(), 1);
-            assert!(resolved.json_domains.is_empty());
+            fx.create("shop").await;
+            let resolved = resolve_scope(&BackupScope::Domain("shop".to_string()), &fx.control).unwrap();
+            assert_eq!((resolved.kv_domains.len(), resolved.json_domains.len()), (1, 1));
+            assert!(resolved.rel_domains.is_empty(), "the relational engine is off");
+            let resolved = resolve_scope(&BackupScope::KvDomain("shop".to_string()), &fx.control).unwrap();
+            assert_eq!((resolved.kv_domains.len(), resolved.json_domains.len()), (1, 0));
         })
     }
 
@@ -889,12 +984,12 @@ mod tests {
 
     // 6. run_backup: kv-only roundtrip produces a well-formed, checksummed
     //    NDJSON file with the expected line shapes and section order, under
-    //    a version 2 manifest that names the shard count and the cut.
+    //    a version 3 manifest that names the shard count and the cut.
     #[test]
     fn test_run_backup_kv_only_writes_valid_ndjson() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(false).await;
-            fx.create(Engine::Kv, "shop").await;
+            fx.create("shop").await;
             let store = fx.kv.store("shop").await.unwrap();
             store.put(b"order:1", b"hello").await.unwrap();
             store.put_with_ttl(b"session", b"tok", 3600).await.unwrap();
@@ -911,7 +1006,7 @@ mod tests {
 
             let manifest: ManifestLine = serde_json::from_str(raw_lines[0]).unwrap();
             assert_eq!(manifest.t, "manifest");
-            assert_eq!(manifest.format_version, 2);
+            assert_eq!(manifest.format_version, 3);
             assert_eq!(manifest.scope, "kv:shop");
             assert_eq!(manifest.encoding, "hex");
             assert_eq!(manifest.shards, 1);
@@ -920,7 +1015,7 @@ mod tests {
             assert!(manifest.kv_snapshot_ts > 0);
 
             let dom: KvDomainLine = serde_json::from_str(raw_lines[1]).unwrap();
-            assert_eq!(dom.name, "shop");
+            assert_eq!((dom.name.as_str(), dom.require_conditional_writes), ("shop", Some(false)));
 
             let kv_lines: Vec<KvLine> = raw_lines[2..5].iter().map(|l| serde_json::from_str(l).unwrap()).collect();
             let by_key: std::collections::HashMap<String, KvLine> =
@@ -949,7 +1044,7 @@ mod tests {
     fn test_run_backup_snapshot_excludes_writes_during_export() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(false).await;
-            fx.create(Engine::Kv, "shop").await;
+            fx.create("shop").await;
             let store = fx.kv.store("shop").await.unwrap();
             store.put(b"a1", b"v1").await.unwrap();
             store.put(b"a2", b"v2").await.unwrap();
@@ -996,7 +1091,7 @@ mod tests {
     fn test_include_auth_ignored_for_domain_scope() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(false).await;
-            fx.create(Engine::Kv, "shop").await;
+            fx.create("shop").await;
             let out_dir = tempfile::TempDir::new().unwrap();
             backup(&fx.control, out_dir.path(), "bk_authflag", BackupScope::KvDomain("shop".to_string()), true).await;
             let content = std::fs::read_to_string(out_dir.path().join("bk_authflag.ndjson")).unwrap();
@@ -1055,7 +1150,7 @@ mod tests {
     fn test_backup_exports_auth_without_any_kv_domain() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(false).await;
-            fx.control.delete_domain(Engine::Kv, "default").await.unwrap();
+            fx.control.delete_domain("default").await.unwrap();
             let record = UserRecord {
                 name: "erin".to_string(),
                 api_key_hash: "cafe".to_string(),
@@ -1087,7 +1182,7 @@ mod tests {
     fn test_run_backup_json_domain_with_index_and_docs() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(true).await;
-            fx.create(Engine::Json, "catalog").await;
+            fx.create("catalog").await;
             fx.json().create_index("catalog", "city", IndexFieldType::String).await.unwrap();
             fx.json().put_document("catalog", "d1", json!({"city": "Lyon"})).await.unwrap();
 
@@ -1110,9 +1205,9 @@ mod tests {
     fn test_backup_section_order_kv_json_auth_checksum() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(true).await;
-            fx.create(Engine::Kv, "shop").await;
+            fx.create("shop").await;
             fx.kv.store("shop").await.unwrap().put(b"k", b"v").await.unwrap();
-            fx.create(Engine::Json, "catalog").await;
+            fx.create("catalog").await;
             fx.json().put_document("catalog", "d1", serde_json::json!({"n": 1})).await.unwrap();
             let record = UserRecord {
                 name: "dave".to_string(),
@@ -1144,7 +1239,7 @@ mod tests {
     fn test_checksum_line_is_valid() {
         crate::core::engine_runtime::block_on(async {
             let fx = fixture(false).await;
-            fx.create(Engine::Kv, "shop").await;
+            fx.create("shop").await;
             let store = fx.kv.store("shop").await.unwrap();
             store.put(b"k1", b"v1").await.unwrap();
             store.put(b"k2", b"v2").await.unwrap();
@@ -1176,9 +1271,9 @@ mod tests {
             // A scope resolving to a KV domain that was deleted right after
             // resolution simulates a mid-job failure: `store()` on a Deleting
             // domain errors out inside the writer.
-            fx.create(Engine::Kv, "gone").await;
+            fx.create("gone").await;
             let resolved = resolve_scope(&BackupScope::KvDomain("gone".to_string()), &fx.control).unwrap();
-            fx.control.delete_domain(Engine::Kv, "gone").await.unwrap();
+            fx.control.delete_domain("gone").await.unwrap();
 
             let out_dir = tempfile::TempDir::new().unwrap();
             let scope = BackupScope::KvDomain("gone".to_string());
@@ -1237,7 +1332,7 @@ mod tests {
             let bus = Arc::new(crate::core::events::GlobalEventBus::new(16, 16));
             let (control, _) = testing::start_shards(dir.path(), owners, bus).await;
             for name in [&a, &b] {
-                control.create_domain(Engine::Kv, name, false).await.unwrap();
+                control.create_domain(name, Default::default()).await.unwrap();
             }
             let stores = [registries[0].store(&a).await.unwrap(), registries[1].store(&b).await.unwrap()];
             let stores = Arc::new(stores);

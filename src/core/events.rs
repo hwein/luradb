@@ -208,7 +208,9 @@ fn now_secs() -> u64 {
 pub struct GlobalEvent {
     #[serde(skip)]
     pub seq: u64,
-    pub engine: &'static str,
+    /// The engine of the object; none for a domain event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<&'static str>,
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub domain: String,
@@ -256,7 +258,7 @@ impl GlobalEventBus {
     /// Publishes one event, filling `seq`/`ts` and delegating to
     /// `SeqRing::publish` — same mutex-coupled sequence/broadcast ordering as
     /// the KV watch.
-    pub fn publish(&self, engine: &'static str, kind: &'static str, domain: &str, object: Option<String>) {
+    pub fn publish(&self, engine: Option<&'static str>, kind: &'static str, domain: &str, object: Option<String>) {
         let domain = domain.to_string();
         self.log.publish(&self.tx, |seq| GlobalEvent {
             seq,
@@ -278,7 +280,7 @@ impl GlobalEventBus {
         let mut items = events.iter();
         self.log.publish_many(&self.tx, events.len(), |seq| {
             let (kind, object) = items.next().expect("publish_many: make is called exactly events.len() times");
-            GlobalEvent { seq, engine, kind, domain: domain.to_string(), object: object.clone(), ts }
+            GlobalEvent { seq, engine: Some(engine), kind, domain: domain.to_string(), object: object.clone(), ts }
         });
     }
 }
@@ -465,10 +467,25 @@ mod tests {
     fn test_global_event_bus_publish_populates_fields_and_advances_head() {
         let bus = GlobalEventBus::new(16, 16);
         let mut rx = bus.subscribe();
-        bus.publish("kv", "domain_created", "sales", None);
+        bus.publish(Some("rel"), "table_created", "sales", Some("t".to_string()));
         let event = rx.try_recv().unwrap();
         assert_eq!(event.seq, 1);
-        assert_eq!(event.engine, "kv");
+        assert_eq!(event.engine, Some("rel"));
+        assert_eq!(event.kind, "table_created");
+        assert_eq!(event.domain, "sales");
+        assert_eq!(event.object.as_deref(), Some("t"));
+        assert!(event.ts > 0);
+        assert_eq!(bus.head(), 1);
+    }
+
+    #[test]
+    fn test_global_event_bus_publishes_domain_events_without_an_engine() {
+        let bus = GlobalEventBus::new(16, 16);
+        let mut rx = bus.subscribe();
+        bus.publish(None, "domain_created", "sales", None);
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.seq, 1);
+        assert_eq!(event.engine, None);
         assert_eq!(event.kind, "domain_created");
         assert_eq!(event.domain, "sales");
         assert_eq!(event.object, None);
@@ -498,11 +515,12 @@ mod tests {
     fn test_global_event_serializes_with_type_field_and_omits_absent_object_and_seq() {
         let bus = GlobalEventBus::new(16, 16);
         let mut rx = bus.subscribe();
-        bus.publish("kv", "domain_created", "sales", None);
+        bus.publish(None, "domain_created", "sales", None);
         let event = rx.try_recv().unwrap();
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "domain_created");
         assert!(json.get("object").is_none(), "absent object must be omitted, got {json}");
+        assert!(json.get("engine").is_none(), "a domain event names no engine, got {json}");
         assert!(json.get("seq").is_none(), "seq is wire-internal only, must not appear in data");
     }
 
@@ -511,7 +529,7 @@ mod tests {
     #[test]
     fn test_global_event_bus_decide_resume_rejects_foreign_tag() {
         let bus = GlobalEventBus::new(16, 16);
-        bus.publish("kv", "domain_created", "sales", None);
+        bus.publish(None, "domain_created", "sales", None);
         let foreign = format_event_id("w", stream_epoch(CONTROL_PLANE_SHARD), 1);
         match bus.decide_resume(Some(&foreign)) {
             Resume::Reset { reason: ResetReason::UnknownId, .. } => {}

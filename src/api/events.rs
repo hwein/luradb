@@ -104,7 +104,7 @@ fn global_live_item(
         ("Last-Event-ID" = Option<String>, Header, description = "Resume id from a previous `id:` (or `event: reset`); set automatically by a native `EventSource`'s auto-reconnect. Takes precedence over `?last_event_id=`."),
     ),
     responses(
-        (status = 200, description = "SSE stream of lifecycle/DDL events across the KV, JSON and relational engines: domains created/deleted/purged, and (rel) table/view/index DDL, (json) index DDL. No per-key data events — use a domain's `watch` for those. Every event carries an `id:`; `event:` matches its `type` field (e.g. `domain_created`, `table_altered`). `data:` is JSON `{engine, type, domain, object?, ts}` — `object` is the table/view/index/field name, absent for domain events. `event: reset` (`data: {\"reason\": ...}`) is emitted whenever gapless resume cannot be guaranteed.", content_type = "text/event-stream"),
+        (status = 200, description = "SSE stream of lifecycle/DDL events across the KV, JSON and relational engines: domains created/deleted/purged, and (rel) table/view/index DDL, (json) index DDL. No per-key data events — use a domain's `watch` for those. Every event carries an `id:`; `event:` matches its `type` field (e.g. `domain_created`, `table_altered`). `data:` is JSON `{engine?, type, domain, object?, ts}` — `engine` (`kv`, `json` or `rel`) and `object`, the table/view/index/field name, are absent for domain events, which come once per domain. `event: reset` (`data: {\"reason\": ...}`) is emitted whenever gapless resume cannot be guaranteed.", content_type = "text/event-stream"),
         (status = 401, description = "Missing or invalid API key", body = String, content_type = "text/plain"),
         (status = 403, description = "Non-admin caller — this endpoint has no `{domain}` segment, so it is admin-only", body = String, content_type = "text/plain"),
     ),
@@ -412,7 +412,7 @@ mod tests {
             assert!(fields.contains(&("event".to_string(), "domain_created".to_string())), "got {fields:?}");
             let data = fields.iter().find(|(f, _)| f == "data").map(|(_, v)| v.clone()).expect("data field");
             let json: serde_json::Value = serde_json::from_str(&data).unwrap();
-            assert_eq!(json["engine"], "kv");
+            assert!(json.get("engine").is_none(), "a domain event names no engine: {json}");
             assert_eq!(json["type"], "domain_created");
             assert_eq!(json["domain"], "sales");
             assert!(json.get("object").is_none());
@@ -648,7 +648,7 @@ mod tests {
         use super::*;
 
         fn event(seq: u64) -> GlobalEvent {
-            GlobalEvent { seq, engine: "kv", kind: "domain_created", domain: "d".to_string(), object: None, ts: 1 }
+            GlobalEvent { seq, engine: None, kind: "domain_created", domain: "d".to_string(), object: None, ts: 1 }
         }
 
         #[test]

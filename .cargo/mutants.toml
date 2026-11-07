@@ -1,0 +1,7 @@
+# Mutants without an observable difference: the two guards only skip writes
+# that would leave the stored permissions as they are (a put of the same
+# value, a delete of a key that is not there).
+exclude_re = [
+    "replace match guard held\\.get\\(&grant\\) != Some\\(&access\\) with true in AuthCache::change_permission",
+    "replace match guard held\\.contains_key\\(&grant\\) with true in AuthCache::change_permission",
+]

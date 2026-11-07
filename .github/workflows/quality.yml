@@ -7,6 +7,11 @@ on:
   push:
     branches: [next]
   workflow_dispatch:
+    inputs:
+      range:
+        description: "Commit range to mutate, <before>..<after>; empty mutates the last commit"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -63,15 +68,20 @@ jobs:
       # Only the lines changed by the push are mutated: a full run over the
       # whole code base would take days, and new work has to bring its tests.
       # A manual run or a new branch has no usable previous commit, so it
-      # falls back to the last commit.
+      # falls back to the last commit. A manual run may name the range
+      # instead, to rerun the gate for pushes whose run was cancelled or superseded.
       - name: Diff of the push
         id: diff
         env:
           BEFORE: ${{ github.event.before }}
+          RANGE: ${{ inputs.range }}
         run: |
           range="HEAD~1..HEAD"
           if [ "$GITHUB_EVENT_NAME" = push ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
             range="$BEFORE..$GITHUB_SHA"
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -n "$RANGE" ]; then
+            range="$RANGE"
           fi
           git diff "$range" -- . > "$RUNNER_TEMP/mutants.diff"
           if [ -n "$(git diff --name-only "$range" -- src)" ]; then

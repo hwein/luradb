@@ -6,4 +6,7 @@ profile = "mutants"
 exclude_re = [
     "replace match guard held\\.get\\(&grant\\) != Some\\(&access\\) with true in AuthCache::change_permission",
     "replace match guard held\\.contains_key\\(&grant\\) with true in AuthCache::change_permission",
+    # The program entry point, which no test starts; anchored to its file, as
+    # src/server/migrate.rs has a `run` of the same signature.
+    "src/main\\.rs:.*replace run -> anyhow::Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]

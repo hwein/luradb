@@ -918,7 +918,7 @@ mod tests {
             include_auth: bool,
             (scan_batch_size, scan_pause_ms): (usize, u64),
         ) -> anyhow::Result<RestoreOutcome> {
-            run_restore(RestoreParams {
+            let restore = run_restore(RestoreParams {
                 dir: out,
                 backup_id: id,
                 mode,
@@ -927,8 +927,9 @@ mod tests {
                 control: &self.control,
                 scan_batch_size,
                 scan_pause_ms,
-            })
-            .await
+            });
+            // Upper bound against hanging only: a stalled purge holds a restore for minutes.
+            compio::time::timeout(Duration::from_secs(10), restore).await.expect("the restore never ends")
         }
 
         /// Runs the purgers of this instance until the handle drops, so a

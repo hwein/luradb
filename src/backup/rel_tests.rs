@@ -165,7 +165,7 @@ impl Server {
         mode: RestoreMode,
         into_domain: Option<&str>,
     ) -> anyhow::Result<RestoreOutcome> {
-        run_restore(RestoreParams {
+        let restore = run_restore(RestoreParams {
             dir: out,
             backup_id: id,
             mode,
@@ -174,8 +174,9 @@ impl Server {
             control: &self.control,
             scan_batch_size: 7,
             scan_pause_ms: 0,
-        })
-        .await
+        });
+        // Upper bound against hanging only: a stalled purge holds a restore for minutes.
+        compio::time::timeout(Duration::from_secs(10), restore).await.expect("the restore never ends")
     }
 
     /// Runs the purgers of every engine of every shard until the handle drops.

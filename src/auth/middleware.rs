@@ -276,7 +276,13 @@ mod tests {
         assert_eq!(extract_domain("/store-api/auth/users"), None);
         assert_eq!(extract_domain("/store-api/domains"), None);
         assert_eq!(extract_domain("/health"), None);
-        for empty in ["/store-api/kv//keys", "/store-api/json//documents", "/store-api/rel//sql"] {
+        for empty in [
+            "/store-api/kv//keys",
+            "/store-api/json//documents",
+            "/store-api/rel//sql",
+            "/store-api/domains/",
+            "/store-api/metrics/domains/",
+        ] {
             assert_eq!(extract_domain(empty), None, "{empty}");
         }
     }

@@ -1335,7 +1335,7 @@ mod tests {
                 }
             };
             // Upper bound against hanging only.
-            compio::time::timeout(Duration::from_secs(30), wait).await.expect("the domain never turned Deleting");
+            compio::time::timeout(Duration::from_secs(10), wait).await.expect("the domain never turned Deleting");
         }
 
         fn next_event(&mut self) -> (Option<&'static str>, &'static str, String) {
@@ -1516,6 +1516,24 @@ mod tests {
             assert!(f.record("shop").await.unwrap().require_conditional_writes.kv);
             assert!(f.json.get_document("shop", "d").await.unwrap().is_some());
             assert!(f.events.try_recv().is_err(), "a clear sends no event");
+        })
+    }
+
+    // A clear while the part of an earlier clear is still being purged
+    // leaves that part as it is.
+    #[test]
+    fn clearing_an_engine_again_before_its_purge_succeeds() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            f.control.create_domain("shop", Default::default()).await.unwrap();
+            for _ in 0..2 {
+                f.control.clear_engine(Engine::Json, "shop", None).await.unwrap();
+            }
+            assert_eq!(f.purging("shop"), [Engine::Json]);
+            assert_eq!(f.parts("shop"), [Some(Lifecycle::Active), Some(Lifecycle::Deleting), Some(Lifecycle::Active)]);
+
+            f.purge(Engine::Json).await;
+            assert_eq!(f.parts("shop"), [Some(Lifecycle::Active); 3]);
         })
     }
 
@@ -1815,6 +1833,7 @@ mod tests {
     fn a_name_of_the_longest_length_and_the_name_domains_work_in_every_engine() {
         crate::core::engine_runtime::block_on(async {
             let f = Fixture::new().await;
+            assert_eq!(f.control.max_name_length(), 50);
             for name in ["a".repeat(50), "domains".to_string(), "b_-9".to_string()] {
                 f.control.create_domain(&name, Default::default()).await.unwrap();
                 assert_eq!(f.parts(&name), [Some(Lifecycle::Active); 3], "{name}");

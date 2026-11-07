@@ -1143,12 +1143,19 @@ mod tests {
     }
 
     /// Reads from `stream` into `seen` until `needle` shows up in it.
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     async fn read_until(stream: &mut TcpStream, seen: &mut Vec<u8>, needle: &[u8]) {
-        let mut buf = [0u8; 4096];
-        while find(seen, needle).is_none() {
-            let n = stream.read(&mut buf).await.unwrap();
-            assert!(n > 0, "connection closed before {:?}: {}", String::from_utf8_lossy(needle), String::from_utf8_lossy(seen));
-            seen.extend_from_slice(&buf[..n]);
+        let read = async {
+            let mut buf = [0u8; 4096];
+            while find(seen, needle).is_none() {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "connection closed before {:?}: {}", String::from_utf8_lossy(needle), String::from_utf8_lossy(seen));
+                seen.extend_from_slice(&buf[..n]);
+            }
+        };
+        // Upper bound against hanging only.
+        if tokio::time::timeout(Duration::from_secs(10), read).await.is_err() {
+            panic!("no {:?} within 10 s: {}", String::from_utf8_lossy(needle), String::from_utf8_lossy(seen));
         }
     }
 
@@ -2599,7 +2606,7 @@ mod tests {
         });
         serve_on(config(true, true), dir.path(), |addr| async move {
             // Upper bound against hanging only.
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             while request(addr, &get("/store-api/domains/gone")).await.0 != 404 {
                 assert!(std::time::Instant::now() < deadline, "the JSON part of gone is never purged");
                 tokio::time::sleep(Duration::from_millis(50)).await;

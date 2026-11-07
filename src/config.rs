@@ -3231,6 +3231,10 @@ mod tests {
         assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (69, 73));
         assert!(config.json.validate().is_ok() && config.rel.validate().is_ok());
 
+        let mut config = parse("[json.lsm]\nmax_key_length = 69\n[rel.lsm]\nmax_key_length = 73\n");
+        assert!(config.raise_key_lengths().is_empty());
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (69, 73));
+
         let mut config = parse("[domains]\nmax_name_length = 80\n[rel.lsm]\nmax_key_length = 100\n");
         assert_eq!(config.raise_key_lengths().len(), 1);
         assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (256, 103));

@@ -373,6 +373,29 @@ mod tests {
         })
     }
 
+    // A clear that stopped after its purge removed the JSON part, before the
+    // domain record let go of the engine: the start creates the part anew.
+    #[test]
+    fn the_start_recreates_the_part_a_clear_cut_short_after_its_purge_removed() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (owners, system) = start_of(dir.path()).await;
+            let rules = DomainRules::default();
+            run(&system, &owners, &rules).await;
+            let mut shop = DomainRecord::new(1, ConditionalWrites::default());
+            shop.purging = vec![Engine::Json];
+            put(&system, "shop", &shop).await.unwrap();
+            for engine in [Engine::Kv, Engine::Rel] {
+                owners.create_record(engine, "shop", false).await.unwrap();
+            }
+
+            let done = run(&system, &owners, &rules).await;
+            assert_eq!(done, Reconciled { adopted: 0, created: 1, resumed: 0 });
+            assert_eq!(parts(&owners, "shop"), [Some(Lifecycle::Active); 3]);
+            assert!(load_all(&system).await.unwrap()["shop"].purging.is_empty());
+        })
+    }
+
     // A data directory from before the domain records: names of one
     // engine, a name deleting in one engine and active in another, a name
     // deleting everywhere. The first start adopts each name once, with its

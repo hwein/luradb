@@ -1279,6 +1279,40 @@ mod tests {
         })
     }
 
+    // 6d. replace also waits for a purge another engine still runs on the
+    //     target domain: a key-value replace beside a JSON clear ends only
+    //     once the JSON part is back.
+    #[test]
+    fn test_replace_mode_waits_for_the_purge_of_another_engine() {
+        crate::core::engine_runtime::block_on(async {
+            let src = instance(false).await;
+            src.create("shop").await;
+            src.store("shop").await.put(b"k", b"v").await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            src.backup(out_dir.path(), "bk_kv", BackupScope::KvDomain("shop".to_string()), false).await;
+
+            let dst = instance(true).await;
+            dst.create("shop").await;
+            dst.control.clear_engine(Engine::Json, "shop", None).await.unwrap();
+            let kv_purger = DomainPurger::new(Arc::clone(dst.kv.engine()), Arc::clone(&dst.kv), 100);
+            let kv_purging = compio::runtime::spawn(async move {
+                loop {
+                    let _ = kv_purger.purge_tick().await;
+                    compio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+            let mut restore = std::pin::pin!(dst.restore(out_dir.path(), "bk_kv", RestoreMode::Replace, None, false));
+            // Nothing purges the JSON part yet: the restore cannot end, whatever the bound.
+            let early = compio::time::timeout(Duration::from_secs(2), restore.as_mut()).await;
+            assert!(early.is_err(), "the restore ended while the JSON part was still being purged");
+
+            drop(kv_purging);
+            let _purging = dst.purging();
+            assert_eq!(restore.await.unwrap().imported, 1);
+            assert_eq!(dst.store("shop").await.get(b"k").await.unwrap(), GetResult::Present(b"v".to_vec()));
+        })
+    }
+
     // 7. into_domain remaps kv:<domain>/json:<domain>; domain:<name> remaps
     //    the name in both engines at once.
     #[test]

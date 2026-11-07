@@ -149,7 +149,7 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
     let ShardBoot { shard, shards, config, kv, json, rel, .. } = boot;
     let metrics = MetricsStore::new(MetricsConfig::default());
 
-    if *shard == 0 && *shards == 1 {
+    if holds_registered_buffers(*shard, *shards) {
         let vlog_path = layout::shard_file(Path::new(&config.storage.vlog_path), 0);
         storage.io_engine = init_io_engine(config, &vlog_path).await;
         if let Some(io_engine) = storage.io_engine.as_mut() {
@@ -180,6 +180,11 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
         None => None,
     };
     Ok(ShardOwners { kv: registry, json, rel })
+}
+
+/// Whether data shard `shard` of `shards` takes the registered buffers.
+fn holds_registered_buffers(shard: usize, shards: u16) -> bool {
+    shard == 0 && shards == 1
 }
 
 /// Stops the instances' background tasks and flushes each instance once its
@@ -410,5 +415,14 @@ mod tests {
                 assert_eq!(kv.get(key.as_bytes()).await.unwrap(), Some(b"v".to_vec()), "{key}");
             }
         })
+    }
+
+    // Whether the kernel grants the buffers depends on the host's lockable
+    // memory, so the rule is checked on its own.
+    #[test]
+    fn only_the_shard_of_a_single_shard_server_holds_the_registered_buffers() {
+        assert!(holds_registered_buffers(0, 1));
+        assert!(!holds_registered_buffers(0, 2));
+        assert!(!holds_registered_buffers(1, 2));
     }
 }

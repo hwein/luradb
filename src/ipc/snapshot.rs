@@ -703,10 +703,11 @@ mod tests {
             let engine_thread = std::thread::current().id();
             let builder = builder(&fx, ARENA_LEN);
             let build = compio::runtime::spawn(async move { builder.build().await.unwrap() });
-            // Waits off the engine thread and lets a scan parked on the engine
-            // thread itself go at once, so that case fails instead of hanging.
+            // Waits off the engine thread, at most 10 s for a build that never
+            // scans, and lets a scan parked on the engine thread itself go at
+            // once, so either case fails instead of hanging.
             let (scan_thread, release) = tokio::task::spawn_blocking(move || {
-                let scan_thread = reached.recv().unwrap();
+                let scan_thread = reached.recv_timeout(Duration::from_secs(10)).expect("the build never scanned");
                 if scan_thread == engine_thread {
                     release.send(()).unwrap();
                 }

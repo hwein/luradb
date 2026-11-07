@@ -94,6 +94,11 @@ manual_async_fn = "allow"
 # would add churn without helping any call site.
 too_many_arguments = "allow"
 
+# Mutation test runs only: without debug info, each mutant rebuilds faster.
+[profile.mutants]
+inherits = "test"
+debug = "none"
+
 [package.metadata.deb]
 maintainer = "Heiko Wein <heiko.wein.hw@gmail.com>"
 copyright = "2026 Heiko Wein"

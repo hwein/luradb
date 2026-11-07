@@ -115,8 +115,8 @@ jobs:
           SHARDS: 16
           # Setup and baseline build and test of one shard, from earlier runs.
           SETUP_SECONDS: 240
-          # Rebuild and test run of one mutant, from earlier runs.
-          MUTANT_SECONDS: 90
+          # Rebuild and test run of one mutant, median of a sharded run.
+          MUTANT_SECONDS: 40
         run: |
           git diff "$RANGE" -- . > "$RUNNER_TEMP/mutants.diff"
           cargo mutants --list --in-diff "$RUNNER_TEMP/mutants.diff" > "$RUNNER_TEMP/mutants.list"

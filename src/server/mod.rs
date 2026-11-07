@@ -2384,12 +2384,12 @@ mod tests {
                 assert_eq!(request(addr, &user).await.0, 201);
                 let create = json!({ "name": name }).to_string();
                 assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
-                for store_type in ["kv", "json", "rel"] {
+                for engine in [None, Some("kv"), Some("json"), Some("rel")] {
                     for (domain, expected) in [(name.as_str(), 200), ("ghost", 404)] {
-                        let grant = json!({ "domain": domain, "access": "read", "store_type": store_type }).to_string();
+                        let grant = json!({ "domain": domain, "access": "read", "engine": engine }).to_string();
                         let (status, body) =
                             request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await;
-                        assert_eq!(status, expected, "{store_type} {domain}: {}", String::from_utf8_lossy(&body));
+                        assert_eq!(status, expected, "{engine:?} {domain}: {}", String::from_utf8_lossy(&body));
                     }
                 }
             },
@@ -2455,8 +2455,13 @@ mod tests {
             }
             let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
             assert_eq!(request(addr, &user).await.0, 201);
-            let grant = json!({ "domain": names[1], "access": "read", "store_type": "json" }).to_string();
-            assert_eq!(request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await.0, 200);
+            for grant in [
+                json!({ "domain": names[1], "access": "read", "engine": "json" }),
+                json!({ "domain": names[0], "access": "write" }),
+            ] {
+                let grant = grant.to_string();
+                assert_eq!(request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await.0, 200);
+            }
             *users = serde_json::from_slice(&request(addr, &get("/store-api/auth/users")).await.1).unwrap();
 
             let start = json!({ "scope": "all", "include_auth": true }).to_string();
@@ -2605,7 +2610,8 @@ mod tests {
     }
 
     // With `domains.max_name_length = 80`, a name of 80 characters works in
-    // every engine and takes permissions; one of 81 does not.
+    // every engine and takes permissions on each engine and on the whole
+    // domain; one of 81 does not, and user names stay at 50 at most.
     #[test]
     fn a_longer_name_limit_holds_in_every_engine() {
         with_tuned_server(
@@ -2624,11 +2630,13 @@ mod tests {
                 assert_eq!(request(addr, &sql).await.0, 200);
                 let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
                 assert_eq!(request(addr, &user).await.0, 201);
-                for store_type in ["kv", "json", "rel"] {
-                    let grant = json!({ "domain": name, "access": "read", "store_type": store_type }).to_string();
+                for engine in [Some("kv"), Some("json"), Some("rel"), None] {
+                    let grant = json!({ "domain": name, "access": "read", "engine": engine }).to_string();
                     let (status, body) = request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await;
-                    assert_eq!(status, 200, "{store_type}: {}", String::from_utf8_lossy(&body));
+                    assert_eq!(status, 200, "{engine:?}: {}", String::from_utf8_lossy(&body));
                 }
+                let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "u".repeat(51) }).to_string());
+                assert_eq!(request(addr, &user).await.0, 400);
                 let longer = json!({ "name": "n".repeat(81) }).to_string();
                 let (status, body) = request(addr, &with_body("POST", "/store-api/domains", &longer)).await;
                 assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));

@@ -7,18 +7,17 @@
 //! POST   /store-api/auth/users                           → create_user   (201 | 409)
 //! GET    /store-api/auth/users                           → list_users    (200, incl. permissions)
 //! DELETE /store-api/auth/users/:name                     → delete_user   (204 | 404)
-//! POST   /store-api/auth/users/:name/permissions         → set_permission (200 | 404)
-//! DELETE /store-api/auth/users/:name/permissions/:domain → remove_permission (204 | 404)
+//! POST   /store-api/auth/users/:name/permissions         → set_permission (200 | 400 | 404)
+//! DELETE /store-api/auth/users/:name/permissions/:domain → remove_permission (204 | 400 | 404)
 //! POST   /store-api/auth/users/:name/rotate-key          → rotate_key    (200 | 404)
 
-use crate::auth::middleware::{split_permission_domain, McpInternal, StoreType, TrustedPeer};
+use crate::auth::middleware::{split_permission_domain, McpInternal, TrustedPeer};
 use crate::auth::{
-    generate_api_key, hash_api_key, now_secs, AccessLevel, AuthCache, DomainPermission, UserRecord, UserRole,
-    MAX_USER_NAME_LENGTH,
+    generate_api_key, hash_api_key, now_secs, AccessLevel, AuthCache, UserRecord, UserRole, MAX_USER_NAME_LENGTH,
 };
-use crate::control::{AuthChange, ControlPlane, Lifecycle};
+use crate::control::{AuthChange, ControlPlane, Engine, Lifecycle};
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{rejection::JsonRejection, Extension, Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -72,51 +71,71 @@ pub struct UserListItem {
     pub permissions: Vec<PermissionItem>,
 }
 
-/// One entry of a user's domain permission matrix. `store_type`/`access` are
-/// lowercase and match the write-endpoint vocabulary exactly (`parse_store_type`,
-/// `access` parsing in `set_permission`) — usable as-is in a follow-up request.
+/// One entry of a user's domain permission matrix. `engine`/`access` are
+/// lowercase and match the write-endpoint vocabulary exactly — usable as-is
+/// in a follow-up request.
 #[derive(Serialize, ToSchema)]
 pub struct PermissionItem {
     pub domain: String,
-    /// `"kv"`, `"json"`, or `"rel"`.
-    pub store_type: String,
+    /// `"kv"`, `"json"` or `"rel"`; missing for a permission on the whole domain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     /// `"read"`, `"write"`, or `"ddl"`.
     pub access: String,
 }
 
 #[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetPermissionRequest {
     /// Domain name.
     pub domain: String,
-    /// Access level: `"read"`, `"write"` or `"ddl"`.
+    /// Access level: `"read"`, `"write"` or `"ddl"`; `"ddl"` acts as
+    /// `"write"` on keys and documents.
     pub access: String,
-    /// Store type of the domain: `"kv"` (default), `"json"` or `"rel"`.
-    pub store_type: Option<String>,
+    /// Limits the permission to one engine of the domain: `"kv"`, `"json"`
+    /// or `"rel"`. Without it, the permission covers the whole domain.
+    pub engine: Option<String>,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize)]
 pub struct RemovePermissionParams {
-    /// Store type of the domain: `"kv"` (default), `"json"` or `"rel"`.
-    pub store_type: Option<String>,
+    engine: Option<String>,
+    /// Refused with `400`.
+    store_type: Option<String>,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize)]
 pub struct SetPermissionParams {
-    /// Skip the domain existence check (pre-provisioning).
-    pub allow_missing: Option<bool>,
+    allow_missing: Option<bool>,
+    /// Refused with `400`.
+    store_type: Option<String>,
 }
 
-/// Resolves the optional store_type field to the permission namespace.
-fn parse_store_type(value: &Option<String>) -> Result<StoreType, Box<Response>> {
-    match value.as_deref() {
-        None | Some("kv") => Ok(StoreType::Kv),
-        Some("json") => Ok(StoreType::Json),
-        Some("rel") => Ok(StoreType::Rel),
+/// The answer to a request that still names `store_type`.
+const STORE_TYPE_REFUSED: &str = "400 Bad Request: 'store_type' is no longer accepted, use 'engine'";
+
+/// Resolves the optional `engine` field; `None` is the whole domain.
+fn parse_engine(value: Option<&str>) -> Result<Option<Engine>, Box<Response>> {
+    match value {
+        None => Ok(None),
+        Some("kv") => Ok(Some(Engine::Kv)),
+        Some("json") => Ok(Some(Engine::Json)),
+        Some("rel") => Ok(Some(Engine::Rel)),
         Some(other) => Err(Box::new(err(
             StatusCode::BAD_REQUEST,
-            &format!("store_type must be 'kv', 'json' or 'rel', got '{other}'"),
+            &format!("400 Bad Request: engine must be 'kv', 'json' or 'rel', got '{other}'"),
         ))),
     }
+}
+
+/// The request body, or `400` with the reason it is unusable.
+fn permission_request(body: Result<Json<serde_json::Value>, JsonRejection>) -> Result<SetPermissionRequest, Box<Response>> {
+    let bad_request = |reason: &str| Box::new(err(StatusCode::BAD_REQUEST, &format!("400 Bad Request: {reason}")));
+    let Json(value) = body.map_err(|rejection| bad_request(&rejection.body_text()))?;
+    if value.get("store_type").is_some() {
+        return Err(Box::new(err(StatusCode::BAD_REQUEST, STORE_TYPE_REFUSED)));
+    }
+    serde_json::from_value(value).map_err(|e| bad_request(&e.to_string()))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -128,7 +147,7 @@ pub struct RotateKeyResponse {
 
 /// Rule for usernames: non-empty, max 50 chars, only [a-zA-Z0-9_-] (same
 /// charset as domain names). Keeps the persisted
-/// `__sys:auth:perm:{user}:{domain}` key unambiguous — a ':' in a name would
+/// `__sys:auth:perm:{user}:{grant}` key unambiguous — a ':' in a name would
 /// collide with the key separator.
 pub(crate) fn valid_name(name: &str) -> bool {
     crate::control::domains::is_valid_name(name, MAX_USER_NAME_LENGTH)
@@ -247,15 +266,6 @@ fn access_level_str(level: AccessLevel) -> &'static str {
     }
 }
 
-/// Lowercase wire form of `StoreType`, matching `parse_store_type`'s input vocabulary.
-fn store_type_str(store_type: StoreType) -> &'static str {
-    match store_type {
-        StoreType::Kv => "kv",
-        StoreType::Json => "json",
-        StoreType::Rel => "rel",
-    }
-}
-
 #[utoipa::path(
     get,
     path = "/store-api/auth/users",
@@ -275,8 +285,9 @@ fn store_type_str(store_type: StoreType) -> &'static str {
 /// a restriction on an Admin row.
 ///
 /// The list reflects the permission table as stored — it is not cross-checked
-/// against existing domains, so an entry for a since-deleted (or not-yet-created)
-/// domain is shown unchanged.
+/// against existing domains, so an entry set with `?allow_missing=true` for a
+/// domain not created yet is shown too. Deleting a domain removes the
+/// permissions on it.
 pub async fn list_users(State(state): State<AuthState>) -> Json<Vec<UserListItem>> {
     let users = state.cache.all_users().await;
     let mut items = Vec::with_capacity(users.len());
@@ -287,16 +298,16 @@ pub async fn list_users(State(state): State<AuthState>) -> Json<Vec<UserListItem
             .await
             .into_iter()
             .map(|p| {
-                let (store_type, domain) = split_permission_domain(&p.domain);
+                let (engine, domain) = split_permission_domain(&p.domain);
                 PermissionItem {
                     domain: domain.to_string(),
-                    store_type: store_type_str(store_type).to_string(),
+                    engine: engine.map(|engine| engine.as_str().to_string()),
                     access: access_level_str(p.access).to_string(),
                 }
             })
             .collect();
         // Deterministic order: permissions_for_user iterates a HashMap.
-        permissions.sort_by(|a, b| (&a.store_type, &a.domain).cmp(&(&b.store_type, &b.domain)));
+        permissions.sort_by(|a, b| (&a.engine, &a.domain).cmp(&(&b.engine, &b.domain)));
         items.push(UserListItem {
             name: r.name,
             role: format!("{:?}", r.role),
@@ -343,24 +354,37 @@ pub async fn delete_user(
     responses(
         (status = 200, description = "Permission set"),
         (status = 404, description = "User or domain not found", body = String, content_type = "text/plain"),
-        (status = 400, description = "Invalid access or domain value", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid access, engine or domain value, an unknown field, or `store_type`, which is no longer accepted (use `engine`)", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
-/// Sets or overwrites a user's access permission on a domain.
-/// `access` must be `"read"`, `"write"`, or `"ddl"` — each level includes the
-/// lower ones. The domain must exist and be active, whatever its engines;
+/// Sets or overwrites a user's access permission on a domain: without
+/// `engine` on the whole domain (keys, documents and tables), with `engine`
+/// on that engine only. `access` must be `"read"`, `"write"`, or `"ddl"` —
+/// each level includes the lower ones; `"ddl"` acts as `"write"` on keys and
+/// documents. A user holds either a permission on the whole domain or
+/// permissions on engines: one on the whole domain replaces the user's engine
+/// permissions on it, and one on an engine turns a permission on the whole
+/// domain into one of the same level per engine first, then sets the named
+/// engine. The domain must exist and be active, whatever its engines;
 /// `?allow_missing=true` skips that check.
 pub async fn set_permission(
     State(state): State<AuthState>,
     Path(name): Path<String>,
     axum::extract::Query(params): axum::extract::Query<SetPermissionParams>,
-    Json(body): Json<SetPermissionRequest>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
+    if params.store_type.is_some() {
+        return err(StatusCode::BAD_REQUEST, STORE_TYPE_REFUSED);
+    }
+    let body = match permission_request(body) {
+        Ok(body) => body,
+        Err(resp) => return *resp,
+    };
     if state.cache.get_user_by_name(&name).await.is_none() {
         return err(StatusCode::NOT_FOUND, "404 Not Found: user not found");
     }
-    let store_type = match parse_store_type(&body.store_type) {
+    let engine = match parse_engine(body.engine.as_deref()) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -377,12 +401,8 @@ pub async fn set_permission(
         "ddl" => AccessLevel::Ddl,
         _ => return err(StatusCode::BAD_REQUEST, "access must be 'read', 'write' or 'ddl'"),
     };
-    let perm = DomainPermission {
-        username: name,
-        domain: crate::auth::middleware::permission_domain(store_type, &body.domain),
-        access,
-    };
-    match state.control.change_auth(AuthChange::SetPermission(perm)).await {
+    let change = AuthChange::SetPermission { username: name, domain: body.domain, engine, access };
+    match state.control.change_auth(change).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -394,31 +414,36 @@ pub async fn set_permission(
     params(
         ("name" = String, Path, description = "Username"),
         ("domain" = String, Path, description = "Domain name"),
-        ("store_type" = Option<String>, Query, description = "'kv' (default), 'json' or 'rel'"),
+        ("engine" = Option<String>, Query, description = "'kv', 'json' or 'rel': revoke the permission on that engine only. Without it, every permission of the user on the domain."),
     ),
     responses(
         (status = 204, description = "Permission revoked"),
-        (status = 404, description = "Permission not found", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid engine, or `store_type`, which is no longer accepted (use `engine`)", body = String, content_type = "text/plain"),
+        (status = 404, description = "Neither a permission on the domain nor on the engine", body = String, content_type = "text/plain"),
     ),
     tag = "Auth"
 )]
-/// Revokes a user's access permission on a specific domain.
-/// `?store_type=json`/`rel` revokes a JSON/rel domain permission (default: kv).
-/// After this call, the user's requests to this domain get `403 Forbidden`.
+/// Revokes a user's permissions on a domain: without `engine` every one —
+/// on the whole domain and on its engines —, with `?engine=` the one on that
+/// engine. A permission on the whole domain then becomes one of the same
+/// level on each of the other two engines. Afterwards, the user's requests
+/// to what was revoked get `403 Forbidden`.
 pub async fn remove_permission(
     State(state): State<AuthState>,
     Path((name, domain)): Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<RemovePermissionParams>,
 ) -> Response {
-    let store_type = match parse_store_type(&params.store_type) {
+    if params.store_type.is_some() {
+        return err(StatusCode::BAD_REQUEST, STORE_TYPE_REFUSED);
+    }
+    let engine = match parse_engine(params.engine.as_deref()) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let perm_domain = crate::auth::middleware::permission_domain(store_type, &domain);
-    if state.cache.get_permission(&name, &perm_domain).await.is_none() {
+    if state.cache.effective(&name, &domain, engine).await.is_none() {
         return err(StatusCode::NOT_FOUND, "404 Not Found: permission not found");
     }
-    match state.control.change_auth(AuthChange::RemovePermission { username: name, domain: perm_domain }).await {
+    match state.control.change_auth(AuthChange::RemovePermission { username: name, domain, engine }).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -464,12 +489,12 @@ mod tests {
     use crate::engines::rel::RelEngine;
 
     #[test]
-    fn parse_store_type_accepts_kv_json_rel() {
-        assert!(matches!(parse_store_type(&None), Ok(StoreType::Kv)));
-        assert!(matches!(parse_store_type(&Some("kv".to_string())), Ok(StoreType::Kv)));
-        assert!(matches!(parse_store_type(&Some("json".to_string())), Ok(StoreType::Json)));
-        assert!(matches!(parse_store_type(&Some("rel".to_string())), Ok(StoreType::Rel)));
-        assert!(parse_store_type(&Some("xxx".to_string())).is_err());
+    fn parse_engine_accepts_kv_json_rel_and_none_for_the_whole_domain() {
+        assert!(matches!(parse_engine(None), Ok(None)));
+        assert!(matches!(parse_engine(Some("kv")), Ok(Some(Engine::Kv))));
+        assert!(matches!(parse_engine(Some("json")), Ok(Some(Engine::Json))));
+        assert!(matches!(parse_engine(Some("rel")), Ok(Some(Engine::Rel))));
+        assert!(parse_engine(Some("xxx")).is_err());
     }
 
     use axum::body::{to_bytes, Body};
@@ -642,22 +667,24 @@ mod tests {
         })
     }
 
-    // Tests 3 + 4: set kv/json/rel -> list shows all three with correct
-    // store_type/domain (prefix stripped); "ddl" on the rel entry round-trips
-    // lowercase despite the PascalCase persisted form.
+    // Tests 3 + 4: set kv/json/rel and the whole domain -> list shows all
+    // four with correct engine/domain (prefix stripped, no engine on the whole
+    // domain); "ddl" on the rel entry round-trips lowercase despite the
+    // PascalCase persisted form.
     #[test]
-    fn list_users_permissions_roundtrip_all_store_types() {
+    fn list_users_permissions_roundtrip_every_engine_and_the_whole_domain() {
         crate::core::engine_runtime::block_on(async {
             let (app, auth_cache, _dir) = make_app(false).await;
             add_user(&auth_cache, "bob", "lura_bob", UserRole::User).await;
-            for name in ["kvdom", "jsondom", "reldom"] {
+            for name in ["kvdom", "jsondom", "reldom", "alldom"] {
                 create_domain(&app, name).await;
             }
 
             for body in [
-                serde_json::json!({"domain": "kvdom", "access": "read"}),
-                serde_json::json!({"domain": "jsondom", "access": "write", "store_type": "json"}),
-                serde_json::json!({"domain": "reldom", "access": "ddl", "store_type": "rel"}),
+                serde_json::json!({"domain": "kvdom", "access": "read", "engine": "kv"}),
+                serde_json::json!({"domain": "jsondom", "access": "write", "engine": "json"}),
+                serde_json::json!({"domain": "reldom", "access": "ddl", "engine": "rel"}),
+                serde_json::json!({"domain": "alldom", "access": "write"}),
             ] {
                 let resp = send(
                     &app,
@@ -672,17 +699,15 @@ mod tests {
             let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
             let body = json_body(resp).await;
             let bob = body.as_array().unwrap().iter().find(|u| u["name"] == "bob").unwrap();
-            let perms = bob["permissions"].as_array().unwrap();
-            assert_eq!(perms.len(), 3);
-            assert!(perms
-                .iter()
-                .any(|p| p["domain"] == "kvdom" && p["store_type"] == "kv" && p["access"] == "read"));
-            assert!(perms
-                .iter()
-                .any(|p| p["domain"] == "jsondom" && p["store_type"] == "json" && p["access"] == "write"));
-            assert!(perms
-                .iter()
-                .any(|p| p["domain"] == "reldom" && p["store_type"] == "rel" && p["access"] == "ddl"));
+            assert_eq!(
+                bob["permissions"],
+                serde_json::json!([
+                    {"domain": "alldom", "access": "write"},
+                    {"domain": "jsondom", "engine": "json", "access": "write"},
+                    {"domain": "kvdom", "engine": "kv", "access": "read"},
+                    {"domain": "reldom", "engine": "rel", "access": "ddl"},
+                ])
+            );
         })
     }
 
@@ -705,7 +730,7 @@ mod tests {
                 &app,
                 Method::POST,
                 "/store-api/auth/users/root/permissions",
-                Body::from(serde_json::json!({"domain": "jsondom", "access": "read", "store_type": "json"}).to_string()),
+                Body::from(serde_json::json!({"domain": "jsondom", "access": "read", "engine": "json"}).to_string()),
             )
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
@@ -715,12 +740,12 @@ mod tests {
             let root = body.as_array().unwrap().iter().find(|u| u["name"] == "root").unwrap();
             assert_eq!(
                 root["permissions"],
-                serde_json::json!([{"domain": "jsondom", "store_type": "json", "access": "read"}])
+                serde_json::json!([{"domain": "jsondom", "engine": "json", "access": "read"}])
             );
         })
     }
 
-    // Test 6: multiple permissions come back in a fixed (store_type, domain) order.
+    // Test 6: multiple permissions come back in a fixed (engine, domain) order.
     #[test]
     fn list_users_permissions_sorted_deterministically() {
         crate::core::engine_runtime::block_on(async {
@@ -730,12 +755,12 @@ mod tests {
                 create_domain(&app, name).await;
             }
 
-            for (store_type, domain) in [("rel", "zzz"), ("kv", "bbb"), ("json", "aaa"), ("kv", "aaa")] {
+            for (engine, domain) in [(Some("rel"), "zzz"), (Some("kv"), "bbb"), (None, "zzz"), (Some("json"), "aaa"), (Some("kv"), "aaa")] {
                 let resp = send(
                     &app,
                     Method::POST,
                     "/store-api/auth/users/carol/permissions",
-                    Body::from(serde_json::json!({"domain": domain, "access": "read", "store_type": store_type}).to_string()),
+                    Body::from(serde_json::json!({"domain": domain, "access": "read", "engine": engine}).to_string()),
                 )
                 .await;
                 assert_eq!(resp.status(), StatusCode::OK);
@@ -744,14 +769,15 @@ mod tests {
             let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
             let body = json_body(resp).await;
             let carol = body.as_array().unwrap().iter().find(|u| u["name"] == "carol").unwrap();
-            let actual: Vec<(&str, &str)> = carol["permissions"]
+            let actual: Vec<(Option<&str>, &str)> = carol["permissions"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|p| (p["store_type"].as_str().unwrap(), p["domain"].as_str().unwrap()))
+                .map(|p| (p["engine"].as_str(), p["domain"].as_str().unwrap()))
                 .collect();
-            // (store_type, domain), lexicographic: "json" < "kv" < "rel".
-            assert_eq!(actual, vec![("json", "aaa"), ("kv", "aaa"), ("kv", "bbb"), ("rel", "zzz")]);
+            // (engine, domain), the whole domain first, then "json" < "kv" < "rel";
+            // the grant on all of zzz replaced the one on its rel engine.
+            assert_eq!(actual, vec![(None, "zzz"), (Some("json"), "aaa"), (Some("kv"), "aaa"), (Some("kv"), "bbb")]);
         })
     }
 
@@ -779,13 +805,15 @@ mod tests {
         })
     }
 
-    // Test 8: a permission on a since-deleted KV domain still shows up
-    // unchanged -- the read path doesn't cross-check the registry.
+    // Test 8: deleting a domain removes the permissions on it, and a new
+    // domain of the same name starts without any.
     #[test]
-    fn list_users_shows_phantom_permission_after_domain_deleted() {
+    fn deleting_a_domain_removes_the_permissions_on_it() {
         crate::core::engine_runtime::block_on(async {
             let (app, auth_cache, _dir) = make_app(false).await;
             add_user(&auth_cache, "dana", "lura_dana", UserRole::User).await;
+            add_user(&auth_cache, "eve", "lura_eve", UserRole::User).await;
+            create_domain(&app, "stays").await;
 
             let resp = send(
                 &app,
@@ -796,25 +824,28 @@ mod tests {
             .await;
             assert_eq!(resp.status(), StatusCode::CREATED);
 
-            let resp = send(
-                &app,
-                Method::POST,
-                "/store-api/auth/users/dana/permissions",
-                Body::from(serde_json::json!({"domain": "gonesoon", "access": "write"}).to_string()),
-            )
-            .await;
-            assert_eq!(resp.status(), StatusCode::OK);
+            for (user, grant) in [
+                ("dana", serde_json::json!({"domain": "gonesoon", "access": "write"})),
+                ("eve", serde_json::json!({"domain": "gonesoon", "access": "read", "engine": "kv"})),
+                ("eve", serde_json::json!({"domain": "gonesoon", "access": "write", "engine": "json"})),
+                ("eve", serde_json::json!({"domain": "stays", "access": "read", "engine": "kv"})),
+            ] {
+                let uri = format!("/store-api/auth/users/{user}/permissions");
+                assert_eq!(send(&app, Method::POST, &uri, Body::from(grant.to_string())).await.status(), StatusCode::OK);
+            }
 
             let resp = send(&app, Method::DELETE, "/store-api/domains/gonesoon", Body::empty()).await;
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-            let resp = send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await;
-            let body = json_body(resp).await;
-            let dana = body.as_array().unwrap().iter().find(|u| u["name"] == "dana").unwrap();
-            assert_eq!(
-                dana["permissions"],
-                serde_json::json!([{"domain": "gonesoon", "store_type": "kv", "access": "write"}])
-            );
+            let permissions_of = |user: &'static str| {
+                let app = app.clone();
+                async move {
+                    let body = json_body(send(&app, Method::GET, "/store-api/auth/users", Body::empty()).await).await;
+                    body.as_array().unwrap().iter().find(|u| u["name"] == user).unwrap()["permissions"].clone()
+                }
+            };
+            assert_eq!(permissions_of("dana").await, serde_json::json!([]));
+            assert_eq!(permissions_of("eve").await, serde_json::json!([{"domain": "stays", "engine": "kv", "access": "read"}]));
         })
     }
 
@@ -971,14 +1002,14 @@ mod tests {
         app: &axum::Router,
         user: &str,
         domain: &str,
-        store_type: &str,
+        engine: Option<&str>,
         allow_missing: Option<bool>,
     ) -> StatusCode {
         let uri = match allow_missing {
             Some(v) => format!("/store-api/auth/users/{user}/permissions?allow_missing={v}"),
             None => format!("/store-api/auth/users/{user}/permissions"),
         };
-        let body = serde_json::json!({"domain": domain, "access": "read", "store_type": store_type});
+        let body = serde_json::json!({"domain": domain, "access": "read", "engine": engine});
         send(app, Method::POST, &uri, Body::from(body.to_string())).await.status()
     }
 
@@ -1014,28 +1045,30 @@ mod tests {
         app.clone().oneshot(req).await.unwrap()
     }
 
-    // Every store type checks the domain record: an active domain -> 200;
-    // a missing one -> 404, also while its engine is off; missing +
-    // allow_missing=true -> 200.
+    const GRANTS: [Option<&str>; 4] = [None, Some("kv"), Some("json"), Some("rel")];
+
+    // Every engine and the whole domain check the domain record: an active
+    // domain -> 200; a missing one -> 404, also while its engine is off;
+    // missing + allow_missing=true -> 200.
     #[test]
-    fn set_permission_checks_the_domain_record_for_every_store_type() {
+    fn set_permission_checks_the_domain_record_for_every_engine() {
         crate::core::engine_runtime::block_on(async {
             for (json, rel) in [(true, true), (false, false)] {
                 let (app, auth_cache, _json, _rel, _dir) = make_app_with_engines(false, json, rel).await;
                 add_user(&auth_cache, "alice", "lura_alice", UserRole::User).await;
                 create_domain(&app, "dom").await;
-                for store_type in ["kv", "json", "rel"] {
-                    let case = format!("{store_type}, engines on: {json}");
-                    assert_eq!(set_perm(&app, "alice", "dom", store_type, None).await, StatusCode::OK, "{case}");
-                    assert_eq!(set_perm(&app, "alice", "ghost", store_type, None).await, StatusCode::NOT_FOUND, "{case}");
-                    assert_eq!(set_perm(&app, "alice", "ghost", store_type, Some(true)).await, StatusCode::OK, "{case}");
+                for engine in GRANTS {
+                    let case = format!("{engine:?}, engines on: {json}");
+                    assert_eq!(set_perm(&app, "alice", "dom", engine, None).await, StatusCode::OK, "{case}");
+                    assert_eq!(set_perm(&app, "alice", "ghost", engine, None).await, StatusCode::NOT_FOUND, "{case}");
+                    assert_eq!(set_perm(&app, "alice", "ghost", engine, Some(true)).await, StatusCode::OK, "{case}");
                 }
             }
         })
     }
 
     // An invalid domain name -> 400 under the domain-name rule, for every
-    // store type, with or without allow_missing.
+    // engine and the whole domain, with or without allow_missing.
     #[test]
     fn set_permission_checks_the_name_by_the_domain_rule() {
         crate::core::engine_runtime::block_on(async {
@@ -1044,10 +1077,10 @@ mod tests {
             let long_name = "a".repeat(51);
 
             for bad in ["a:b", "", long_name.as_str()] {
-                for store_type in ["kv", "json", "rel"] {
+                for engine in GRANTS {
                     for allow_missing in [None, Some(true)] {
-                        let status = set_perm(&app, "erin", bad, store_type, allow_missing).await;
-                        assert_eq!(status, StatusCode::BAD_REQUEST, "{store_type} {bad:?} {allow_missing:?}");
+                        let status = set_perm(&app, "erin", bad, engine, allow_missing).await;
+                        assert_eq!(status, StatusCode::BAD_REQUEST, "{engine:?} {bad:?} {allow_missing:?}");
                     }
                 }
             }
@@ -1068,8 +1101,8 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let (app, _auth_cache, _json, _rel, _dir) = make_app_with_engines(false, false, false).await;
 
-            assert_eq!(set_perm(&app, "ghost_user", "dom", "kv", None).await, StatusCode::NOT_FOUND);
-            assert_eq!(set_perm(&app, "ghost_user", "dom", "json", Some(true)).await, StatusCode::NOT_FOUND);
+            assert_eq!(set_perm(&app, "ghost_user", "dom", Some("kv"), None).await, StatusCode::NOT_FOUND);
+            assert_eq!(set_perm(&app, "ghost_user", "dom", None, Some(true)).await, StatusCode::NOT_FOUND);
         })
     }
 
@@ -1089,7 +1122,7 @@ mod tests {
                 "lura_root",
                 Method::POST,
                 "/store-api/auth/users/alice/permissions?allow_missing=true",
-                Some(&serde_json::json!({"domain": "predom", "access": "write", "store_type": "json"}).to_string()),
+                Some(&serde_json::json!({"domain": "predom", "access": "write", "engine": "json"}).to_string()),
             )
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
@@ -1129,8 +1162,8 @@ mod tests {
     }
 
     // Test 8: a domain in Deleting state answers 404 without allow_missing,
-    // for every store type. This harness never spawns a purger, so the
-    // state can't race the assertion below.
+    // for every engine and the whole domain. This harness never spawns a
+    // purger, so the state can't race the assertion below.
     #[test]
     fn set_permission_deleting_domain_answers_404() {
         crate::core::engine_runtime::block_on(async {
@@ -1147,8 +1180,8 @@ mod tests {
                 rel.unwrap().get_domain_any("doomed").map(|d| d.state),
                 Some(crate::engines::rel::RelDomainState::Deleting)
             );
-            for store_type in ["kv", "json", "rel"] {
-                assert_eq!(set_perm(&app, "frank", "doomed", store_type, None).await, StatusCode::NOT_FOUND, "{store_type}");
+            for engine in GRANTS {
+                assert_eq!(set_perm(&app, "frank", "doomed", engine, None).await, StatusCode::NOT_FOUND, "{engine:?}");
             }
         })
     }
@@ -1171,8 +1204,10 @@ mod tests {
         (app, cache, dir)
     }
 
+    /// Stores the grant `domain` (a stored key, see `permission_domain`) of `worker` as it is.
     async fn grant(cache: &AuthCache, domain: &str, access: AccessLevel) {
-        let permission = DomainPermission { username: "worker".to_string(), domain: domain.to_string(), access };
+        let permission =
+            crate::auth::DomainPermission { username: "worker".to_string(), domain: domain.to_string(), access };
         cache.set_permission(permission).await.unwrap();
     }
 
@@ -1410,6 +1445,241 @@ mod tests {
             );
             let (status, body) = call(Method::GET, "/store-api/kv/shop/keys/k", "").await;
             assert_eq!(status, StatusCode::GONE, "{body}");
+        })
+    }
+
+    /// `listing_fixture` with a key `k`, a document `d` and a table `t` in
+    /// the domain `a`.
+    async fn data_fixture() -> (axum::Router, Arc<AuthCache>, tempfile::TempDir) {
+        let (app, cache, dir) = listing_fixture().await;
+        for (method, uri, body) in [
+            (Method::PUT, "/store-api/kv/a/keys/k", "clé"),
+            (Method::PUT, "/store-api/json/a/documents/d", r#"{"n": 1}"#),
+            (Method::POST, "/store-api/rel/a/sql", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#),
+        ] {
+            let resp = authed(&app, LISTING_ADMIN_KEY, method, uri, Some(body)).await;
+            assert!(resp.status().is_success(), "{uri}: {}", resp.status());
+        }
+        (app, cache, dir)
+    }
+
+    /// POSTs `grant` as a permission of `worker`, as the admin.
+    async fn permit(app: &axum::Router, grant: serde_json::Value) -> (StatusCode, String) {
+        let uri = "/store-api/auth/users/worker/permissions";
+        text_of(authed(app, LISTING_ADMIN_KEY, Method::POST, uri, Some(&grant.to_string())).await).await
+    }
+
+    /// DELETEs the permissions of `worker` on `domain`, `query` appended, as the admin.
+    async fn revoke(app: &axum::Router, domain: &str, query: &str) -> (StatusCode, String) {
+        let uri = format!("/store-api/auth/users/worker/permissions/{domain}{query}");
+        text_of(authed(app, LISTING_ADMIN_KEY, Method::DELETE, &uri, None).await).await
+    }
+
+    /// The permissions of `worker` as `GET …/users` lists them.
+    async fn worker_permissions(app: &axum::Router) -> serde_json::Value {
+        let body = json_body(authed(app, LISTING_ADMIN_KEY, Method::GET, "/store-api/auth/users", None).await).await;
+        body.as_array().unwrap().iter().find(|u| u["name"] == "worker").unwrap()["permissions"].clone()
+    }
+
+    /// Whether `worker` passes: a success is a pass, `403` none, anything else a failed test.
+    async fn passes(app: &axum::Router, method: Method, uri: &str, body: Option<&str>) -> bool {
+        let resp = authed(app, LISTING_USER_KEY, method.clone(), uri, body).await;
+        match resp.status() {
+            status if status.is_success() => true,
+            StatusCode::FORBIDDEN => false,
+            status => panic!("{method} {uri}: {status} {}", text_of(resp).await.1),
+        }
+    }
+
+    /// What `worker` may do in the domain `a`: read, write, each per engine
+    /// (kv, json, rel), and run DDL in LuraSQL. `round` keeps rows and tables apart.
+    async fn reach(app: &axum::Router, round: u32) -> ([bool; 3], [bool; 3], bool) {
+        let sql = |statement: String| serde_json::json!({ "sql": statement }).to_string();
+        let read = [
+            passes(app, Method::GET, "/store-api/kv/a/keys/k", None).await,
+            passes(app, Method::GET, "/store-api/json/a/documents/d", None).await,
+            passes(app, Method::POST, "/store-api/rel/a/sql", Some(&sql("SELECT * FROM t".into()))).await,
+        ];
+        let write = [
+            passes(app, Method::PUT, "/store-api/kv/a/keys/k", Some("clé")).await,
+            passes(app, Method::PUT, "/store-api/json/a/documents/d", Some(r#"{"n": 2}"#)).await,
+            passes(app, Method::POST, "/store-api/rel/a/sql", Some(&sql(format!("INSERT INTO t VALUES ({round})")))).await,
+        ];
+        let create = sql(format!("CREATE TABLE t{round} (id INTEGER PRIMARY KEY)"));
+        (read, write, passes(app, Method::POST, "/store-api/rel/a/sql", Some(&create)).await)
+    }
+
+    // A permission on the whole domain holds in all three engines at its
+    // level; ddl acts as write on keys and documents.
+    #[test]
+    fn a_domain_permission_holds_in_every_engine_at_its_level() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = data_fixture().await;
+            let (all, none) = ([true; 3], [false; 3]);
+            for (round, access, expected) in [
+                (1, "read", (all, none, false)),
+                (2, "write", (all, all, false)),
+                (3, "ddl", (all, all, true)),
+            ] {
+                assert_eq!(permit(&app, serde_json::json!({"domain": "a", "access": access})).await.0, StatusCode::OK);
+                assert_eq!(reach(&app, round).await, expected, "{access}");
+            }
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTING).await, ["a"]);
+            assert_eq!(authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/domains/a", None).await.status(), StatusCode::OK);
+            let metrics = authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/metrics/domains/a", None).await;
+            assert_ne!(metrics.status(), StatusCode::FORBIDDEN);
+            assert_eq!(authed(&app, LISTING_USER_KEY, Method::DELETE, "/store-api/domains/a", None).await.status(), StatusCode::FORBIDDEN);
+        })
+    }
+
+    // A permission on one engine holds there only; with only a JSON one, the
+    // domain still shows in the listing and its detail.
+    #[test]
+    fn an_engine_permission_holds_in_its_engine_only() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = data_fixture().await;
+            let grant = serde_json::json!({"domain": "a", "access": "write", "engine": "json"});
+            assert_eq!(permit(&app, grant).await.0, StatusCode::OK);
+            assert_eq!(reach(&app, 1).await, ([false, true, false], [false, true, false], false));
+            assert_eq!(listed_names(&app, LISTING_USER_KEY, DOMAIN_LISTING).await, ["a"]);
+            assert_eq!(authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/domains/a", None).await.status(), StatusCode::OK);
+            let metrics = authed(&app, LISTING_USER_KEY, Method::GET, "/store-api/metrics/domains/a", None).await;
+            assert_ne!(metrics.status(), StatusCode::FORBIDDEN);
+        })
+    }
+
+    // A user with write on the key-value engine, then read on the whole
+    // domain, writes no key: the domain grant replaced the engine grant.
+    #[test]
+    fn a_domain_permission_downgrades_an_engine_permission() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = data_fixture().await;
+            permit(&app, serde_json::json!({"domain": "a", "access": "write", "engine": "kv"})).await;
+            assert!(passes(&app, Method::PUT, "/store-api/kv/a/keys/k", Some("clé")).await);
+            permit(&app, serde_json::json!({"domain": "a", "access": "read"})).await;
+            assert!(!passes(&app, Method::PUT, "/store-api/kv/a/keys/k", Some("clé")).await);
+            assert!(passes(&app, Method::GET, "/store-api/kv/a/keys/k", None).await);
+        })
+    }
+
+    #[test]
+    fn a_domain_permission_replaces_the_engine_permissions_and_an_engine_one_splits_it() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = listing_fixture().await;
+            for engine in ["kv", "json", "rel"] {
+                permit(&app, serde_json::json!({"domain": "a", "access": "read", "engine": engine})).await;
+            }
+            permit(&app, serde_json::json!({"domain": "b", "access": "read", "engine": "kv"})).await;
+            assert_eq!(permit(&app, serde_json::json!({"domain": "a", "access": "write"})).await.0, StatusCode::OK);
+            assert_eq!(
+                worker_permissions(&app).await,
+                serde_json::json!([{"domain": "a", "access": "write"}, {"domain": "b", "engine": "kv", "access": "read"}])
+            );
+
+            let grant = serde_json::json!({"domain": "a", "access": "ddl", "engine": "rel"});
+            assert_eq!(permit(&app, grant).await.0, StatusCode::OK);
+            assert_eq!(
+                worker_permissions(&app).await,
+                serde_json::json!([
+                    {"domain": "a", "engine": "json", "access": "write"},
+                    {"domain": "a", "engine": "kv", "access": "write"},
+                    {"domain": "b", "engine": "kv", "access": "read"},
+                    {"domain": "a", "engine": "rel", "access": "ddl"},
+                ])
+            );
+        })
+    }
+
+    // Taking the key-value engine away from a user with the whole domain
+    // leaves that user the other two engines at the same level.
+    #[test]
+    fn revoking_one_engine_of_a_domain_permission_leaves_the_other_two() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = data_fixture().await;
+            permit(&app, serde_json::json!({"domain": "a", "access": "write"})).await;
+            assert_eq!(revoke(&app, "a", "?engine=kv").await.0, StatusCode::NO_CONTENT);
+            assert_eq!(
+                worker_permissions(&app).await,
+                serde_json::json!([
+                    {"domain": "a", "engine": "json", "access": "write"},
+                    {"domain": "a", "engine": "rel", "access": "write"},
+                ])
+            );
+            assert_eq!(reach(&app, 1).await, ([false, true, true], [false, true, true], false));
+        })
+    }
+
+    #[test]
+    fn revoking_answers_404_without_a_permission_on_the_engine_or_the_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = listing_fixture().await;
+            let missing = (StatusCode::NOT_FOUND, "404 Not Found: permission not found".to_string());
+            assert_eq!(revoke(&app, "a", "?engine=kv").await, missing);
+            assert_eq!(revoke(&app, "a", "").await, missing);
+            permit(&app, serde_json::json!({"domain": "a", "access": "read", "engine": "json"})).await;
+            assert_eq!(revoke(&app, "a", "?engine=kv").await, missing);
+            assert_eq!(revoke(&app, "a", "?engine=json").await.0, StatusCode::NO_CONTENT);
+        })
+    }
+
+    #[test]
+    fn revoking_without_an_engine_removes_every_permission_on_the_domain() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = listing_fixture().await;
+            permit(&app, serde_json::json!({"domain": "a", "access": "read", "engine": "json"})).await;
+            permit(&app, serde_json::json!({"domain": "a", "access": "write", "engine": "rel"})).await;
+            permit(&app, serde_json::json!({"domain": "b", "access": "read"})).await;
+            assert_eq!(revoke(&app, "a", "").await.0, StatusCode::NO_CONTENT);
+            assert_eq!(worker_permissions(&app).await, serde_json::json!([{"domain": "b", "access": "read"}]));
+            assert_eq!(revoke(&app, "b", "").await.0, StatusCode::NO_CONTENT);
+            assert_eq!(worker_permissions(&app).await, serde_json::json!([]));
+        })
+    }
+
+    // `store_type` answers 400 with a fixed text, in the body and in either
+    // query; so do an unknown field and an unknown engine.
+    #[test]
+    fn store_type_and_unknown_fields_are_refused() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = listing_fixture().await;
+            let refused = (StatusCode::BAD_REQUEST, STORE_TYPE_REFUSED.to_string());
+            assert_eq!(STORE_TYPE_REFUSED, "400 Bad Request: 'store_type' is no longer accepted, use 'engine'");
+            for store_type in ["kv", "json"] {
+                let grant = serde_json::json!({"domain": "a", "access": "read", "store_type": store_type});
+                assert_eq!(permit(&app, grant).await, refused, "{store_type}");
+            }
+            let grant = serde_json::json!({"domain": "a", "access": "read"}).to_string();
+            let uri = "/store-api/auth/users/worker/permissions?store_type=kv";
+            assert_eq!(text_of(authed(&app, LISTING_ADMIN_KEY, Method::POST, uri, Some(&grant)).await).await, refused);
+            assert_eq!(revoke(&app, "a", "?store_type=kv").await, refused);
+            assert_eq!(worker_permissions(&app).await, serde_json::json!([]), "nothing was granted");
+
+            let (status, text) = permit(&app, serde_json::json!({"domain": "a", "access": "read", "scope": "kv"})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(text.starts_with("400 Bad Request: unknown field `scope`"), "{text}");
+            let (status, text) = permit(&app, serde_json::json!({"domain": "a", "access": "read", "engine": "sql"})).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (StatusCode::BAD_REQUEST, "400 Bad Request: engine must be 'kv', 'json' or 'rel', got 'sql'")
+            );
+            assert_eq!(revoke(&app, "a", "?engine=sql").await.0, StatusCode::BAD_REQUEST);
+            let (status, text) =
+                text_of(authed(&app, LISTING_ADMIN_KEY, Method::POST, "/store-api/auth/users/worker/permissions", Some("{")).await)
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(text.starts_with("400 Bad Request: "), "{text}");
+        })
+    }
+
+    // User names stay limited to 50 characters.
+    #[test]
+    fn a_user_name_over_50_characters_answers_400() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _cache, _dir) = make_app(false).await;
+            for (name, expected) in [("u".repeat(50), StatusCode::CREATED), ("u".repeat(51), StatusCode::BAD_REQUEST)] {
+                let body = Body::from(serde_json::json!({ "name": name }).to_string());
+                assert_eq!(send(&app, Method::POST, "/store-api/auth/users", body).await.status(), expected);
+            }
         })
     }
 }

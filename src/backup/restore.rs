@@ -7,6 +7,7 @@ use super::writer::{
     ManifestLine, RelDefault, RelDomainLine, RelRowLine, RelSeqLine, RelTableLine, RelViewLine,
 };
 use super::{BackupError, MAX_LINE_BYTES};
+use crate::auth::middleware::split_permission_domain;
 use crate::auth::{DomainPermission, UserRecord};
 use crate::control::{AuthChange, ConditionalWrites, ControlPlane, Engine, Lifecycle};
 use crate::engines::json::JsonEngine;
@@ -789,7 +790,12 @@ async fn apply_auth_perm(value: &Value, control: &ControlPlane, outcome: &mut Re
         }
     };
     let label = format!("{}:{}", perm.username, perm.domain);
-    match control.change_auth(AuthChange::SetPermission(perm)).await {
+    // The grant as POST …/permissions sets it: the archive cannot hold a user
+    // with both a whole-domain grant and engine grants afterwards.
+    let (engine, domain) = split_permission_domain(&perm.domain);
+    let change =
+        AuthChange::SetPermission { username: perm.username, domain: domain.to_string(), engine, access: perm.access };
+    match control.change_auth(change).await {
         Ok(()) => outcome.imported += 1,
         Err(e) => outcome.fail(label, e.to_string()),
     }
@@ -1415,7 +1421,86 @@ mod tests {
             assert!(system.get("__sys:auth:perm:zoé:json:shop".as_bytes()).await.unwrap().is_some());
             assert!(dst.kv.engine().scan_keys(b"__sys:auth:").await.unwrap().is_empty());
             assert_eq!(dst.auth.get_user_by_name("zoé").await.unwrap().api_key_hash, "f00d", "the cache knows the user");
-            assert_eq!(dst.auth.get_permission("zoé", "json:shop").await, Some(crate::auth::AccessLevel::Write));
+            let json = Some(crate::control::Engine::Json);
+            assert_eq!(dst.auth.effective("zoé", "shop", json).await, Some(crate::auth::AccessLevel::Write));
+            assert_eq!(dst.auth.effective("zoé", "shop", Some(crate::control::Engine::Kv)).await, None);
+        })
+    }
+
+    /// The permission keys of `dst`'s system store, without their prefix.
+    async fn stored_permissions(dst: &Instance) -> Vec<String> {
+        let keys = dst.control.system_store().scan_keys(PREFIX_PERM.as_bytes()).await.unwrap();
+        keys.iter().map(|key| String::from_utf8_lossy(&key[PREFIX_PERM.len()..]).into_owned()).collect()
+    }
+
+    fn perm_line(domain: &str, access: &str) -> Value {
+        json!({"t": "auth-perm", "username": "zoé", "domain": domain, "access": access})
+    }
+
+    // A version 2 archive, from before whole-domain grants, holds key-value
+    // grants without a prefix: they come back as key-value grants only.
+    #[test]
+    fn a_v2_archive_grant_without_a_prefix_stays_a_key_value_grant() {
+        crate::core::engine_runtime::block_on(async {
+            let out_dir = tempfile::TempDir::new().unwrap();
+            v2_archive(&out_dir.path().join("bk_v2.ndjson"), "kv", &[perm_line("shop", "Write")]);
+            let dst = instance(false).await;
+            let outcome = dst.restore(out_dir.path(), "bk_v2", RestoreMode::FailIfExists, None, true).await.unwrap();
+
+            assert_eq!((outcome.imported, outcome.failed), (1, 0));
+            assert_eq!(stored_permissions(&dst).await, ["zoé:shop"]);
+            let level = |engine| dst.auth.effective("zoé", "shop", Some(engine));
+            assert_eq!(level(Engine::Kv).await, Some(crate::auth::AccessLevel::Write));
+            assert_eq!(level(Engine::Json).await, None);
+            assert_eq!(level(Engine::Rel).await, None);
+        })
+    }
+
+    // A grant on the whole domain goes into the archive under its own key
+    // and comes back as one.
+    #[test]
+    fn a_domain_grant_goes_through_a_backup_and_back() {
+        crate::core::engine_runtime::block_on(async {
+            let src = instance(false).await;
+            src.create("shop").await;
+            let grant = AuthChange::SetPermission {
+                username: "zoé".to_string(),
+                domain: "shop".to_string(),
+                engine: None,
+                access: crate::auth::AccessLevel::Write,
+            };
+            src.control.change_auth(grant).await.unwrap();
+            let out_dir = tempfile::TempDir::new().unwrap();
+            let path = src.backup(out_dir.path(), "bk_domain_grant", BackupScope::All, true).await;
+            assert!(std::fs::read_to_string(path).unwrap().contains(r#""domain":"domain:shop""#));
+
+            let dst = instance(false).await;
+            let purging = dst.purging();
+            dst.restore(out_dir.path(), "bk_domain_grant", RestoreMode::Replace, None, true).await.unwrap();
+            drop(purging);
+            assert_eq!(stored_permissions(&dst).await, ["zoé:domain:shop"]);
+            assert_eq!(dst.auth.effective("zoé", "shop", Some(Engine::Rel)).await, Some(crate::auth::AccessLevel::Write));
+        })
+    }
+
+    // An archive with a grant on the whole domain and one on an engine of the
+    // same user restores as the two requests would set them, in archive
+    // order: never both kinds side by side.
+    #[test]
+    fn a_restore_leaves_a_user_either_a_domain_grant_or_engine_grants() {
+        crate::core::engine_runtime::block_on(async {
+            let cases = [
+                ([perm_line("domain:shop", "Read"), perm_line("json:shop", "Write")], vec!["zoé:json:shop", "zoé:rel:shop", "zoé:shop"]),
+                ([perm_line("json:shop", "Write"), perm_line("domain:shop", "Read")], vec!["zoé:domain:shop"]),
+            ];
+            for (lines, expected) in cases {
+                let out_dir = tempfile::TempDir::new().unwrap();
+                v2_archive(&out_dir.path().join("bk_v2.ndjson"), "kv", &lines);
+                let dst = instance(false).await;
+                let outcome = dst.restore(out_dir.path(), "bk_v2", RestoreMode::FailIfExists, None, true).await.unwrap();
+                assert_eq!((outcome.imported, outcome.failed), (2, 0));
+                assert_eq!(stored_permissions(&dst).await, expected);
+            }
         })
     }
 

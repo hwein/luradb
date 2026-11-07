@@ -4,6 +4,7 @@
 //!   Request → AuthMiddleware → DomainResolver → RateLimiter → Handler
 
 use crate::auth::{AccessLevel, AuthCache};
+use crate::control::Engine;
 use axum::{
     extract::Request,
     http::{header, Method, StatusCode},
@@ -25,29 +26,20 @@ pub struct TrustedPeer;
 #[derive(Clone, Copy, Debug)]
 pub struct McpInternal;
 
-/// Store type of a domain-scoped request — KV, JSON and rel domains are
-/// separate permission namespaces.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum StoreType {
-    Kv,
-    Json,
-    Rel,
-}
-
-/// Extracts `(store_type, domain, management)` from domain-scoped API paths;
-/// a store type of `None` is any engine of the domain:
+/// Extracts `(engine, domain, management)` from domain-scoped API paths;
+/// an engine of `None` is the domain as a whole:
 ///   /store-api/kv/{domain}/…             → (Kv, domain, false)
 ///   /store-api/json/{domain}/…           → (Json, domain, false)
 ///   /store-api/rel/{domain}/…            → (Rel, domain, false)
 ///   /store-api/domains/{domain}[/…]      → (None, domain, true)   domain management
 ///   /store-api/metrics/domains/{domain}  → (None, domain, false)  domain metrics
 /// The domain listing (`/store-api/domains`) and everything else → None.
-pub(crate) fn extract_domain(path: &str) -> Option<(Option<StoreType>, &str, bool)> {
+pub(crate) fn extract_domain(path: &str) -> Option<(Option<Engine>, &str, bool)> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
-        ["store-api", "kv", domain, ..] if !domain.is_empty() => Some((Some(StoreType::Kv), domain, false)),
-        ["store-api", "json", domain, ..] if !domain.is_empty() => Some((Some(StoreType::Json), domain, false)),
-        ["store-api", "rel", domain, ..] if !domain.is_empty() => Some((Some(StoreType::Rel), domain, false)),
+        ["store-api", "kv", domain, ..] if !domain.is_empty() => Some((Some(Engine::Kv), domain, false)),
+        ["store-api", "json", domain, ..] if !domain.is_empty() => Some((Some(Engine::Json), domain, false)),
+        ["store-api", "rel", domain, ..] if !domain.is_empty() => Some((Some(Engine::Rel), domain, false)),
         ["store-api", "domains", domain, ..] if !domain.is_empty() => Some((None, domain, true)),
         ["store-api", "metrics", "domains", domain, ..] if !domain.is_empty() => Some((None, domain, false)),
         _ => None,
@@ -69,28 +61,27 @@ fn is_write_request(method: &Method, path: &str) -> bool {
     }
 }
 
-/// Permission-table key for a domain: JSON/rel domains live in their own
-/// namespace (`json:{domain}` / `rel:{domain}`), plain names are KV permissions.
-pub(crate) fn permission_domain(store_type: StoreType, domain: &str) -> String {
-    match store_type {
-        StoreType::Kv => domain.to_string(),
-        StoreType::Json => format!("json:{domain}"),
-        StoreType::Rel => format!("rel:{domain}"),
+/// Permission-table key of a grant on `domain`: on the whole domain (`None`)
+/// `domain:{domain}`, on one engine `{domain}` (key-value), `json:{domain}`
+/// or `rel:{domain}`.
+pub(crate) fn permission_domain(engine: Option<Engine>, domain: &str) -> String {
+    match engine {
+        None => format!("domain:{domain}"),
+        Some(Engine::Kv) => domain.to_string(),
+        Some(Engine::Json) => format!("json:{domain}"),
+        Some(Engine::Rel) => format!("rel:{domain}"),
     }
 }
 
-/// Reverses `permission_domain`. Domain names never contain `:` (enforced by
-/// the domain-name rule at creation time), and
-/// `permission_domain` is the only writer of these keys — so the prefix
-/// match below is unambiguous and total, with no fallback branch needed.
-pub(crate) fn split_permission_domain(stored: &str) -> (StoreType, &str) {
-    if let Some(domain) = stored.strip_prefix("json:") {
-        (StoreType::Json, domain)
-    } else if let Some(domain) = stored.strip_prefix("rel:") {
-        (StoreType::Rel, domain)
-    } else {
-        (StoreType::Kv, stored)
+/// Reverses `permission_domain`. Domain names never contain `:`, so the
+/// prefix is unambiguous; a key without one is a key-value grant.
+pub(crate) fn split_permission_domain(stored: &str) -> (Option<Engine>, &str) {
+    for (prefix, engine) in [("domain:", None), ("json:", Some(Engine::Json)), ("rel:", Some(Engine::Rel))] {
+        if let Some(domain) = stored.strip_prefix(prefix) {
+            return (engine, domain);
+        }
     }
+    (Some(Engine::Kv), stored)
 }
 
 fn unauthorized() -> Response {
@@ -196,7 +187,7 @@ pub async fn auth_layer(
     }
 
     // Regular user: check domain permission
-    let (store_type, domain, management) = match extract_domain(&path) {
+    let (engine, domain, management) = match extract_domain(&path) {
         Some(x) => x,
         None => {
             // Path doesn't include a domain (e.g. /auth/*, /metrics, /config).
@@ -216,19 +207,11 @@ pub async fn auth_layer(
         return forbidden();
     }
 
-    let perm = match store_type {
-        Some(store_type) => cache.get_permission(&user.name, &permission_domain(store_type, domain)).await,
-        None => {
-            let mut highest = None;
-            for store_type in [StoreType::Kv, StoreType::Json, StoreType::Rel] {
-                highest = highest.max(cache.get_permission(&user.name, &permission_domain(store_type, domain)).await);
-            }
-            highest
-        }
-    };
-    // Ddl > Write > Read: a higher grant covers path-based
-    // writes too. `/sql` never requires more than Read here — the exact
-    // statement level is the handler's job (`enforce_sql_level`).
+    let perm = cache.effective(&user.name, domain, engine).await;
+    // Ddl > Write > Read: a higher grant covers path-based writes too, so Ddl
+    // acts as Write on keys and documents. `/sql` never requires more than
+    // Read here — the exact statement level is the handler's job
+    // (`enforce_sql_level`).
     let required_min = if is_write_request(request.method(), &path) {
         AccessLevel::Write
     } else {
@@ -262,31 +245,31 @@ mod tests {
     fn domain_extraction() {
         assert_eq!(
             extract_domain("/store-api/kv/analytics/keys/foo"),
-            Some((Some(StoreType::Kv), "analytics", false))
+            Some((Some(Engine::Kv), "analytics", false))
         );
         assert_eq!(
             extract_domain("/store-api/json/users/documents/doc1"),
-            Some((Some(StoreType::Json), "users", false))
+            Some((Some(Engine::Json), "users", false))
         );
         assert_eq!(
             extract_domain("/store-api/json/users/search"),
-            Some((Some(StoreType::Json), "users", false))
+            Some((Some(Engine::Json), "users", false))
         );
         assert_eq!(
             extract_domain("/store-api/json/domains/documents"),
-            Some((Some(StoreType::Json), "domains", false))
+            Some((Some(Engine::Json), "domains", false))
         );
         assert_eq!(
             extract_domain("/store-api/rel/sales/sql"),
-            Some((Some(StoreType::Rel), "sales", false))
+            Some((Some(Engine::Rel), "sales", false))
         );
         assert_eq!(
             extract_domain("/store-api/rel/sales/tables/orders/rows"),
-            Some((Some(StoreType::Rel), "sales", false))
+            Some((Some(Engine::Rel), "sales", false))
         );
         assert_eq!(
             extract_domain("/store-api/rel/sales/tables/from-file"),
-            Some((Some(StoreType::Rel), "sales", false))
+            Some((Some(Engine::Rel), "sales", false))
         );
         assert_eq!(extract_domain("/store-api/domains/analytics"), Some((None, "analytics", true)));
         assert_eq!(extract_domain("/store-api/metrics/domains/myapp"), Some((None, "myapp", false)));
@@ -313,23 +296,27 @@ mod tests {
 
     #[test]
     fn permission_domain_scoping() {
-        assert_eq!(permission_domain(StoreType::Kv, "users"), "users");
-        assert_eq!(permission_domain(StoreType::Json, "users"), "json:users");
-        assert_eq!(permission_domain(StoreType::Rel, "sales"), "rel:sales");
+        assert_eq!(permission_domain(None, "users"), "domain:users");
+        assert_eq!(permission_domain(Some(Engine::Kv), "users"), "users");
+        assert_eq!(permission_domain(Some(Engine::Json), "users"), "json:users");
+        assert_eq!(permission_domain(Some(Engine::Rel), "sales"), "rel:sales");
     }
 
     #[test]
     fn split_permission_domain_roundtrip() {
-        for (store_type, domain) in [
-            (StoreType::Kv, "analytics"),
-            (StoreType::Json, "users"),
-            (StoreType::Rel, "sales"),
+        for (engine, domain) in [
+            (None, "shop"),
+            (Some(Engine::Kv), "analytics"),
+            (Some(Engine::Json), "users"),
+            (Some(Engine::Rel), "sales"),
         ] {
-            let stored = permission_domain(store_type, domain);
-            assert_eq!(split_permission_domain(&stored), (store_type, domain));
+            let stored = permission_domain(engine, domain);
+            assert_eq!(split_permission_domain(&stored), (engine, domain));
         }
-        // No prefix (pre-existing plain KV keys) -> Kv.
-        assert_eq!(split_permission_domain("plain"), (StoreType::Kv, "plain"));
+        // No prefix -> Kv, also for domains named like a prefix.
+        for plain in ["plain", "domain", "json"] {
+            assert_eq!(split_permission_domain(plain), (Some(Engine::Kv), plain));
+        }
     }
 
     #[test]

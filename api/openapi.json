@@ -10,7 +10,7 @@
       "name": "FSL-1.1-ALv2",
       "identifier": "FSL-1.1-ALv2"
     },
-    "version": "0.16.0",
+    "version": "0.17.0",
     "x-luradb-server-version": "0.6.0-rc.2"
   },
   "paths": {
@@ -55,7 +55,7 @@
           "Auth"
         ],
         "summary": "Returns all created users (admins and regular users) with their domain\npermission matrix. API keys are not included.",
-        "description": "For `role == \"Admin\"`, `permissions` is meaningless for access control:\nadmins have unconditional access regardless of its contents. It\nis usually empty for an admin but not guaranteed to be — e.g. a user\npromoted to admin via `luradb.toml` keeps any permissions set before the\npromotion. Never read an empty array as \"no access\" or a non-empty one as\na restriction on an Admin row.\n\nThe list reflects the permission table as stored — it is not cross-checked\nagainst existing domains, so an entry for a since-deleted (or not-yet-created)\ndomain is shown unchanged.",
+        "description": "For `role == \"Admin\"`, `permissions` is meaningless for access control:\nadmins have unconditional access regardless of its contents. It\nis usually empty for an admin but not guaranteed to be — e.g. a user\npromoted to admin via `luradb.toml` keeps any permissions set before the\npromotion. Never read an empty array as \"no access\" or a non-empty one as\na restriction on an Admin row.\n\nThe list reflects the permission table as stored — it is not cross-checked\nagainst existing domains, so an entry set with `?allow_missing=true` for a\ndomain not created yet is shown too. Deleting a domain removes the\npermissions on it.",
         "operationId": "list_users",
         "responses": {
           "200": {
@@ -163,7 +163,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Sets or overwrites a user's access permission on a domain.\n`access` must be `\"read\"`, `\"write\"`, or `\"ddl\"` — each level includes the\nlower ones. The domain must exist and be active, whatever its engines;\n`?allow_missing=true` skips that check.",
+        "summary": "Sets or overwrites a user's access permission on a domain: without\n`engine` on the whole domain (keys, documents and tables), with `engine`\non that engine only. `access` must be `\"read\"`, `\"write\"`, or `\"ddl\"` —\neach level includes the lower ones; `\"ddl\"` acts as `\"write\"` on keys and\ndocuments. A user holds either a permission on the whole domain or\npermissions on engines: one on the whole domain replaces the user's engine\npermissions on it, and one on an engine turns a permission on the whole\ndomain into one of the same level per engine first, then sets the named\nengine. The domain must exist and be active, whatever its engines;\n`?allow_missing=true` skips that check.",
         "operationId": "set_permission",
         "parameters": [
           {
@@ -200,7 +200,7 @@
             "description": "Permission set"
           },
           "400": {
-            "description": "Invalid access or domain value",
+            "description": "Invalid access, engine or domain value, an unknown field, or `store_type`, which is no longer accepted (use `engine`)",
             "content": {
               "text/plain": {
                 "schema": {
@@ -227,7 +227,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "Revokes a user's access permission on a specific domain.\n`?store_type=json`/`rel` revokes a JSON/rel domain permission (default: kv).\nAfter this call, the user's requests to this domain get `403 Forbidden`.",
+        "summary": "Revokes a user's permissions on a domain: without `engine` every one —\non the whole domain and on its engines —, with `?engine=` the one on that\nengine. A permission on the whole domain then becomes one of the same\nlevel on each of the other two engines. Afterwards, the user's requests\nto what was revoked get `403 Forbidden`.",
         "operationId": "remove_permission",
         "parameters": [
           {
@@ -249,9 +249,9 @@
             }
           },
           {
-            "name": "store_type",
+            "name": "engine",
             "in": "query",
-            "description": "'kv' (default), 'json' or 'rel'",
+            "description": "'kv', 'json' or 'rel': revoke the permission on that engine only. Without it, every permission of the user on the domain.",
             "required": false,
             "schema": {
               "type": "string"
@@ -262,8 +262,18 @@
           "204": {
             "description": "Permission revoked"
           },
+          "400": {
+            "description": "Invalid engine, or `store_type`, which is no longer accepted (use `engine`)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "Permission not found",
+            "description": "Neither a permission on the domain nor on the engine",
             "content": {
               "text/plain": {
                 "schema": {
@@ -6028,10 +6038,9 @@
       },
       "PermissionItem": {
         "type": "object",
-        "description": "One entry of a user's domain permission matrix. `store_type`/`access` are\nlowercase and match the write-endpoint vocabulary exactly (`parse_store_type`,\n`access` parsing in `set_permission`) — usable as-is in a follow-up request.",
+        "description": "One entry of a user's domain permission matrix. `engine`/`access` are\nlowercase and match the write-endpoint vocabulary exactly — usable as-is\nin a follow-up request.",
         "required": [
           "domain",
-          "store_type",
           "access"
         ],
         "properties": {
@@ -6042,9 +6051,12 @@
           "domain": {
             "type": "string"
           },
-          "store_type": {
-            "type": "string",
-            "description": "`\"kv\"`, `\"json\"`, or `\"rel\"`."
+          "engine": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`\"kv\"`, `\"json\"` or `\"rel\"`; missing for a permission on the whole domain."
           }
         }
       },
@@ -6345,20 +6357,21 @@
         "properties": {
           "access": {
             "type": "string",
-            "description": "Access level: `\"read\"`, `\"write\"` or `\"ddl\"`."
+            "description": "Access level: `\"read\"`, `\"write\"` or `\"ddl\"`; `\"ddl\"` acts as\n`\"write\"` on keys and documents."
           },
           "domain": {
             "type": "string",
             "description": "Domain name."
           },
-          "store_type": {
+          "engine": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Store type of the domain: `\"kv\"` (default), `\"json\"` or `\"rel\"`."
+            "description": "Limits the permission to one engine of the domain: `\"kv\"`, `\"json\"`\nor `\"rel\"`. Without it, the permission covers the whole domain."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ShardHealth": {
         "type": "object",

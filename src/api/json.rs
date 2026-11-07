@@ -1705,12 +1705,12 @@ mod tests {
 
             // Skipping the existence check does not skip the name rule.
             let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions?allow_missing=true",
-                Some(r#"{"domain": "my data", "access": "read", "store_type": "json"}"#),
+                Some(r#"{"domain": "my data", "access": "read", "engine": "json"}"#),
                 admin_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
             let resp = send(Method::POST, "/store-api/auth/users/svc-json_1/permissions?allow_missing=true",
-                Some(r#"{"domain": "data", "access": "read", "store_type": "json"}"#),
+                Some(r#"{"domain": "data", "access": "read", "engine": "json"}"#),
                 admin_key).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
         })

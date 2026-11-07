@@ -7,6 +7,7 @@ use crate::api::{middleware::ApiError, AppState};
 use crate::auth::middleware::{enforce_sql_level, AuthOutcome, AuthUser};
 use crate::auth::AccessLevel;
 use crate::bridge::EngineForward;
+use crate::control::Engine;
 use crate::engines::rel::{
     scalar_to_json, ColumnType, DmlResult, LinkAuth, RelEngine, RelStoreError, SqlOutcome, StatementClass,
 };
@@ -104,10 +105,9 @@ pub(crate) fn rel_engine(state: &AppState) -> Result<&Arc<RelEngine>, ApiError> 
 
 /// Builds the cross-engine `LinkAuth` for one rel request:
 /// auth disabled, or an admin/trusted-peer `AuthOutcome::Full`, gets
-/// unrestricted access. A Scoped user's KV/JSON read rights are looked up
-/// against the same-named `{domain}` (bare KV namespace) / `json:{domain}`
-/// permission entries — the same domain-per-engine split the middleware
-/// already enforces elsewhere. Fail-closed (both
+/// unrestricted access. A Scoped user needs `read` on the key-value or JSON
+/// engine of the same-named domain, or on the whole domain, as the middleware
+/// does for those engines. Fail-closed (both
 /// `false`) if auth is on but the outcome/user extension is unexpectedly
 /// missing — a middleware bug must never grant silent access.
 pub(crate) async fn compute_link_auth(
@@ -125,14 +125,10 @@ pub(crate) async fn compute_link_auth(
             let Some(AuthUser(name)) = user else {
                 return LinkAuth { kv_read: false, json_read: false };
             };
-            let kv_read =
-                state.auth_cache.get_permission(name, domain).await.is_some_and(|l| l >= AccessLevel::Read);
-            let json_read = state
-                .auth_cache
-                .get_permission(name, &format!("json:{domain}"))
-                .await
-                .is_some_and(|l| l >= AccessLevel::Read);
-            LinkAuth { kv_read, json_read }
+            let reads = |engine| async move {
+                state.auth_cache.effective(name, domain, Some(engine)).await.is_some_and(|l| l >= AccessLevel::Read)
+            };
+            LinkAuth { kv_read: reads(Engine::Kv).await, json_read: reads(Engine::Json).await }
         }
         None => LinkAuth { kv_read: false, json_read: false },
     }
@@ -1250,11 +1246,10 @@ mod tests {
         })
     }
 
-    // set_permission accepts access="ddl" and store_type="rel"
+    // set_permission accepts access="ddl" and engine="rel"
     // for a domain that doesn't exist yet via the explicit ?allow_missing=true
-    // opt-in (replaces the former implicit no-check behavior); an
-    // invalid access value still -> 400; remove_permission with
-    // ?store_type=rel removes it.
+    // opt-in; an invalid access value still -> 400; remove_permission with
+    // ?engine=rel removes it.
     #[test]
     fn test_auth_handlers_rel_ddl_permission() {
         crate::core::engine_runtime::block_on(async {
@@ -1303,7 +1298,7 @@ mod tests {
             let resp = send(
                 Method::POST,
                 "/store-api/auth/users/worker/permissions?allow_missing=true",
-                Some(r#"{"domain": "shop", "access": "xxx", "store_type": "rel"}"#),
+                Some(r#"{"domain": "shop", "access": "xxx", "engine": "rel"}"#),
                 admin_key,
             )
             .await
@@ -1315,25 +1310,24 @@ mod tests {
             let resp = send(
                 Method::POST,
                 "/store-api/auth/users/worker/permissions?allow_missing=true",
-                Some(r#"{"domain": "shop", "access": "ddl", "store_type": "rel"}"#),
+                Some(r#"{"domain": "shop", "access": "ddl", "engine": "rel"}"#),
                 admin_key,
             )
             .await
             .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(cache.get_permission("worker", "rel:shop").await, Some(AccessLevel::Ddl));
+            assert_eq!(cache.effective("worker", "shop", Some(Engine::Rel)).await, Some(AccessLevel::Ddl));
 
-            // Removing it via ?store_type=rel drops the rel:shop entry.
             let resp = send(
                 Method::DELETE,
-                "/store-api/auth/users/worker/permissions/shop?store_type=rel",
+                "/store-api/auth/users/worker/permissions/shop?engine=rel",
                 None,
                 admin_key,
             )
             .await
             .unwrap();
             assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-            assert_eq!(cache.get_permission("worker", "rel:shop").await, None);
+            assert_eq!(cache.effective("worker", "shop", None).await, None);
         })
     }
 
@@ -1507,6 +1501,29 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(resp.status(), StatusCode::CONFLICT, "admin keeps the ordinary CrossEngineLinkMissing 409");
+        })
+    }
+
+    // Links read the target engine with `read` on it or on the whole domain:
+    // a grant on the domain covers key-value and JSON links, one on the JSON
+    // engine only JSON links.
+    #[test]
+    fn link_auth_follows_the_domain_grant_and_the_engine_grants() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::auth::AccessLevel;
+
+            let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
+            let cache = Arc::clone(&state.auth_cache);
+            cache.change_permission("whole", "shop", None, Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("doc", "shop", Some(Engine::Rel), Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("doc", "shop", Some(Engine::Json), Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("table", "shop", Some(Engine::Rel), Some(AccessLevel::Ddl)).await.unwrap();
+            for (user, expected) in [("whole", (true, true)), ("doc", (false, true)), ("table", (false, false))] {
+                let user = AuthUser(user.to_string());
+                let outcome = Some(AuthOutcome::Scoped(AccessLevel::Read));
+                let auth = compute_link_auth(&state, outcome, Some(&user), "shop").await;
+                assert_eq!((auth.kv_read, auth.json_read), expected, "{}", user.0);
+            }
         })
     }
 

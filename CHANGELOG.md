@@ -17,6 +17,10 @@ All notable changes to LuraDB are documented in this file.
 - **BREAKING** API: the domain name rule of `[domains]` (`max_name_length`, default 50) applies to every engine; the name `domains` is allowed.
 - **BREAKING** API: a restore with `replace` replaces only the engines the archive holds and keeps the domain and its permissions.
 - **BREAKING** API: `domains.default_domain` names the default domain of every engine.
+- **BREAKING** API: permissions name their engine with `engine` instead of `store_type`; a permission without `engine` covers the whole domain (keys, documents and tables), and a request with `store_type` answers 400.
+- **BREAKING** API: a user holds either a permission on the whole domain or permissions on engines: one on the whole domain replaces the user's engine permissions on that domain, one on an engine splits a whole-domain permission into one per engine first.
+- **BREAKING** API: `DELETE /store-api/auth/users/{name}/permissions/{domain}` without `engine` removes every permission of the user on the domain instead of the key-value one; `GET /store-api/auth/users` lists `engine` instead of `store_type`, absent for whole-domain permissions.
+- **BREAKING** API: deleting a domain deletes the permissions on it; a restore with `replace` keeps them.
 - The first start after the update merges the domains of the three engines into one domain per name.
 - Backup archive format 3: domain lines carry `require_conditional_writes`; archives of formats 1 to 3 restore.
 - `json.lsm.max_key_length` and `rel.lsm.max_key_length` are raised with a warning instead of a startup error when too short for `domains.max_name_length`; `domains.max_name_length` above 438 is a startup error.

@@ -863,19 +863,20 @@ fn a_refused_view_fails_the_restore_naming_the_view() {
 }
 
 /// Domain `r` with key `k` set to `value`, document `d`, table `t` with one
-/// row, and a permission of `worker` on it.
+/// row, and a permission of `worker` on the whole domain.
 async fn domain_r(server: &Server, value: &str) {
     server.create("r").await;
     server.owners_kv("r").store("r").await.unwrap().put(b"k", value.as_bytes()).await.unwrap();
     server.json("r").put_document("r", "d", json!({"v": value})).await.unwrap();
     server.sql("r", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).await;
     server.sql("r", "INSERT INTO t VALUES (1, ?)", &[json!(value)]).await;
-    let permission = crate::auth::DomainPermission {
+    let permission = crate::control::AuthChange::SetPermission {
         username: "worker".to_string(),
         domain: "r".to_string(),
+        engine: None,
         access: crate::auth::AccessLevel::Read,
     };
-    server.control.change_auth(crate::control::AuthChange::SetPermission(permission)).await.unwrap();
+    server.control.change_auth(permission).await.unwrap();
 }
 
 /// The key, the document and the row of domain `r`.
@@ -900,7 +901,7 @@ fn replace_swaps_only_the_engines_of_the_archive_and_keeps_the_domain() {
         let dst = server(1, true, true).await;
         domain_r(&dst, "old").await;
         let created_at = dst.control.directory().get("r").unwrap().created_at;
-        let permission = || async { dst.control.system_store().get(b"__sys:auth:perm:worker:r").await.unwrap() };
+        let permission = || async { dst.control.system_store().get(b"__sys:auth:perm:worker:domain:r").await.unwrap() };
         let purging = dst.purging();
 
         dst.restore(out.path(), "bk_kv_r", RestoreMode::Replace, None).await.unwrap();

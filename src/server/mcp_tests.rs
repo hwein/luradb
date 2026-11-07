@@ -177,9 +177,9 @@ pub(super) async fn create_user(rest: SocketAddr, admin_key: &str, name: &str) -
     serde_json::from_slice::<Value>(&body).unwrap()["api_key"].as_str().unwrap().to_string()
 }
 
-/// Grants `user` `access` on the domain `domain` of `store_type`.
-async fn grant(rest: SocketAddr, admin_key: &str, user: &str, store_type: &str, domain: &str, access: &str) {
-    let body = json!({ "domain": domain, "access": access, "store_type": store_type }).to_string();
+/// Grants `user` `access` on `engine` of the domain `domain`.
+async fn grant(rest: SocketAddr, admin_key: &str, user: &str, engine: &str, domain: &str, access: &str) {
+    let body = json!({ "domain": domain, "access": access, "engine": engine }).to_string();
     rest_ok(rest, "POST", &format!("/store-api/auth/users/{user}/permissions"), admin_key, &body).await;
 }
 

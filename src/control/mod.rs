@@ -12,7 +12,7 @@ pub mod slots;
 pub mod system;
 
 use crate::auth::oauth::{OAuthClient, RedeemCode, Refresh, TokenRecord};
-use crate::auth::{AuthCache, DomainPermission, UserRecord};
+use crate::auth::{AccessLevel, AuthCache, UserRecord};
 use crate::core::events::GlobalEventBus;
 use crate::engines::json::{JsonDomainState, JsonEngine};
 use crate::engines::lsm::domain::{DomainRegistry, DomainState};
@@ -224,8 +224,12 @@ pub enum AuthChange {
     /// Removes the user and all its permissions.
     RemoveUser(String),
     RotateKey { name: String, new_hash: String },
-    SetPermission(DomainPermission),
-    RemovePermission { username: String, domain: String },
+    /// Grants `access` on `engine` of `domain`, `None` the whole domain; a
+    /// user holds either a grant on the whole domain or engine grants.
+    SetPermission { username: String, domain: String, engine: Option<Engine>, access: AccessLevel },
+    /// Revokes the grant on `engine` of `domain`; `None` revokes every grant
+    /// on the domain.
+    RemovePermission { username: String, domain: String, engine: Option<Engine> },
     RegisterClient(OAuthClient),
     IssueCode { hash: String, record: TokenRecord, now: u64 },
     RedeemCode(RedeemCode),
@@ -950,6 +954,14 @@ impl Worker {
         Ok(())
     }
 
+    /// Like [`Self::store`], and removes every permission on the domain in
+    /// the same write.
+    async fn store_without_permissions(&self, name: &str, record: &DomainRecord) -> anyhow::Result<()> {
+        self.auth.remove_domain(name, domains::put_op(name, record)?).await?;
+        self.control.change_directory(|d| d.insert(DomainEntry::new(name, record)));
+        Ok(())
+    }
+
     /// Lets every write of `engines` admitted so far end, each on the
     /// owner's thread; all quiesces reach the shard before the first wait.
     async fn quiesce(&self, owner: &Shard, engines: &[Engine]) -> Result<(), DomainError> {
@@ -1000,10 +1012,10 @@ impl Worker {
             .filter(|engine| !enabled.contains(engine) || owners.record(*engine, name).is_some())
             .collect();
         if record.purging.is_empty() {
-            return domains::remove(&self.control.system, name).await;
+            return self.auth.remove_domain(name, domains::remove_op(name)).await;
         }
         self.abandoned.lock().insert(name.to_string());
-        self.store(name, record).await?;
+        self.store_without_permissions(name, record).await?;
         for engine in enabled {
             if owners.record(engine, name).is_some_and(|part| part.state == Lifecycle::Active) {
                 owners.mark_deleting(engine, name).await?;
@@ -1017,8 +1029,8 @@ impl Worker {
         record.state = Lifecycle::Deleting;
         record.purging = Engine::ALL.to_vec();
         // The directory follows the record before any engine does: a purger
-        // that finishes early never reads it active.
-        self.store(name, &record).await.map_err(DomainError::Failed)?;
+        // that finishes early never reads it active. The permissions go with it.
+        self.store_without_permissions(name, &record).await.map_err(DomainError::Failed)?;
         let owner = self.control.owner(name);
         let engines = owner.owners.engines();
         for &engine in &engines {
@@ -1069,7 +1081,8 @@ impl Worker {
             self.store(name, &record).await?;
             owner.owners.create_record(engine, name, record.require_conditional_writes.of(engine)).await
         } else if record.purging.is_empty() {
-            domains::remove(&self.control.system, name).await?;
+            // Again: permissions may have been set while the domain was deleting.
+            self.auth.remove_domain(name, domains::remove_op(name)).await?;
             owner.owners.kv.metrics().remove_domain(name);
             self.control.change_directory(|d| d.remove(name));
             if !self.abandoned.lock().remove(name) {
@@ -1087,8 +1100,12 @@ impl Worker {
             AuthChange::UpsertUser(record) => auth.upsert_user(record).await,
             AuthChange::RemoveUser(name) => auth.remove_user(&name).await,
             AuthChange::RotateKey { name, new_hash } => auth.rotate_key(&name, &new_hash).await,
-            AuthChange::SetPermission(perm) => auth.set_permission(perm).await,
-            AuthChange::RemovePermission { username, domain } => auth.remove_permission(&username, &domain).await,
+            AuthChange::SetPermission { username, domain, engine, access } => {
+                auth.change_permission(&username, &domain, engine, Some(access)).await
+            }
+            AuthChange::RemovePermission { username, domain, engine } => {
+                auth.change_permission(&username, &domain, engine, None).await
+            }
             AuthChange::RegisterClient(client) => auth.register_client(client).await,
             AuthChange::IssueCode { hash, record, now } => auth.issue_code(hash, record, now).await,
             AuthChange::RedeemCode(redeem) => auth.redeem_code(redeem).await,
@@ -1401,9 +1418,12 @@ mod tests {
             f.json.create_domain_with("clash-json", false).await.unwrap();
             f.rel.create_domain("clash-rel").await.unwrap();
             for (name, failed) in [("clash-json", Engine::Json), ("clash-rel", Engine::Rel)] {
+                f.control.change_auth(grant("ana", name, None, AccessLevel::Read)).await.unwrap();
                 let refused = f.control.create_domain(name, Default::default()).await.unwrap_err();
                 assert!(matches!(refused, DomainError::Failed(_)), "{name}: {refused:?}");
                 assert_eq!(f.state(name), Some(Lifecycle::Deleting), "{name}");
+                assert_eq!(f.auth.effective("ana", name, None).await, None, "{name}: a grant set beforehand goes");
+                assert!(stored_permissions(&f).await.is_empty(), "{name}");
                 let again = f.control.create_domain(name, Default::default()).await.unwrap_err();
                 assert!(matches!(again, DomainError::Deleting(_)), "{name}: {again:?}");
                 let expected = match failed {
@@ -1890,6 +1910,70 @@ mod tests {
             f.control.change_auth(AuthChange::RemoveUser("alice".to_string())).await.unwrap();
             assert!(f.auth.get_user_by_name("alice").await.is_none());
             assert!(f.control.system_store().get(b"__sys:auth:user:alice").await.unwrap().is_none());
+        })
+    }
+
+    fn grant(username: &str, domain: &str, engine: Option<Engine>, access: AccessLevel) -> AuthChange {
+        AuthChange::SetPermission { username: username.to_string(), domain: domain.to_string(), engine, access }
+    }
+
+    /// The stored permission keys, without their prefix.
+    async fn stored_permissions(f: &Fixture) -> Vec<String> {
+        let keys = f.control.system_store().scan_keys(crate::auth::PREFIX_PERM.as_bytes()).await.unwrap();
+        keys.iter().map(|key| String::from_utf8_lossy(&key[crate::auth::PREFIX_PERM.len()..]).into_owned()).collect()
+    }
+
+    // The delete removes the grants of every user on the domain with the
+    // record turning deleting, before any purger ran; a new domain of the
+    // same name starts without any.
+    #[test]
+    fn deleting_a_domain_removes_every_permission_on_it() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            for name in ["shop", "keep"] {
+                f.control.create_domain(name, Default::default()).await.unwrap();
+            }
+            for change in [
+                grant("ana", "shop", None, AccessLevel::Write),
+                grant("ben", "shop", Some(Engine::Json), AccessLevel::Read),
+                grant("ben", "shop", Some(Engine::Rel), AccessLevel::Ddl),
+                grant("ben", "keep", Some(Engine::Kv), AccessLevel::Read),
+            ] {
+                f.control.change_auth(change).await.unwrap();
+            }
+
+            f.control.delete_domain("shop").await.unwrap();
+            assert_eq!(f.state("shop"), Some(Lifecycle::Deleting));
+            for user in ["ana", "ben"] {
+                assert_eq!(f.auth.effective(user, "shop", None).await, None, "{user}");
+            }
+            assert_eq!(stored_permissions(&f).await, ["ben:keep"]);
+
+            f.purge_all().await;
+            assert_eq!(f.state("shop"), None);
+            f.control.create_domain("shop", Default::default()).await.unwrap();
+            assert_eq!(f.auth.effective("ana", "shop", Some(Engine::Kv)).await, None);
+            assert_eq!(f.auth.effective("ben", "keep", Some(Engine::Kv)).await, Some(AccessLevel::Read));
+        })
+    }
+
+    // A grant set while the domain is deleting goes when its record falls.
+    #[test]
+    fn a_permission_set_while_the_domain_is_deleting_goes_with_its_record() {
+        crate::core::engine_runtime::block_on(async {
+            let f = Fixture::new().await;
+            f.control.create_domain("shop", Default::default()).await.unwrap();
+            f.control.delete_domain("shop").await.unwrap();
+            f.control.change_auth(grant("ana", "shop", None, AccessLevel::Read)).await.unwrap();
+            f.control.change_auth(grant("ana", "keep", Some(Engine::Json), AccessLevel::Read)).await.unwrap();
+            f.purge(Engine::Kv).await;
+            f.purge(Engine::Json).await;
+            assert_eq!(f.auth.effective("ana", "shop", None).await, Some(AccessLevel::Read), "still deleting");
+
+            f.purge(Engine::Rel).await;
+            assert_eq!(f.state("shop"), None);
+            assert_eq!(f.auth.effective("ana", "shop", None).await, None);
+            assert_eq!(stored_permissions(&f).await, ["ana:json:keep"]);
         })
     }
 

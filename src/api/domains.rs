@@ -23,7 +23,8 @@ pub(crate) struct DomainFilter(Option<HashSet<String>>);
 
 impl DomainFilter {
     /// Admins, trusted peers and auth-off setups see every domain; a user sees
-    /// the domains they hold any permission on, in any engine. Auth on with
+    /// the domains they hold a permission on, on the whole domain or on any
+    /// engine. Auth on with
     /// neither outcome nor user is a middleware bug: fail closed.
     pub(crate) async fn for_caller(
         state: &AppState,

@@ -4,7 +4,7 @@
 //! records.
 
 use super::{slots, Engine, EngineRecord, Lifecycle, ShardOwners};
-use crate::engines::lsm::engine::{LsmEngineConfig, LsmStorageEngine};
+use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmStorageEngine};
 use crate::engines::StorageEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -104,8 +104,14 @@ pub(crate) async fn put(system: &LsmStorageEngine, name: &str, record: &DomainRe
     system.put(&key(name), &serde_json::to_vec(record)?).await
 }
 
-pub(crate) async fn remove(system: &LsmStorageEngine, name: &str) -> anyhow::Result<()> {
-    system.delete(&key(name)).await
+/// [`put`] as a write of a batch.
+pub(crate) fn put_op(name: &str, record: &DomainRecord) -> anyhow::Result<BatchOp> {
+    Ok(BatchOp::Put { key: key(name), value: serde_json::to_vec(record)? })
+}
+
+/// The removal of the record of `name`, as a write of a batch.
+pub(crate) fn remove_op(name: &str) -> BatchOp {
+    BatchOp::Delete { key: key(name) }
 }
 
 /// The longest name `domains.max_name_length` may allow: the longest key a
@@ -204,7 +210,10 @@ pub(crate) async fn reconcile(
             }
         }
         if record.state == Lifecycle::Deleting && record.purging.is_empty() {
-            remove(system, name).await?;
+            let mut ops = vec![remove_op(name)];
+            let permissions = crate::auth::domain_permission_keys(system, name).await?;
+            ops.extend(permissions.into_iter().map(|key| BatchOp::Delete { key }));
+            system.write_batch(ops).await?;
         } else if *record != before {
             put(system, name, record).await?;
         }
@@ -508,6 +517,28 @@ mod tests {
             assert_eq!(after_the_purge.created, 3);
             assert_eq!(load_all(&system).await.unwrap()["main"].state, Lifecycle::Active);
             assert_eq!(parts(&owners, "main"), [Some(Lifecycle::Active); 3]);
+        })
+    }
+
+    // A deleting record with nothing left to purge falls at the start, and
+    // every grant of every user on its domain goes with it.
+    #[test]
+    fn a_domain_record_falling_at_the_start_takes_every_permission_on_it() {
+        use crate::auth::{perm_key, AccessLevel, DomainPermission, PREFIX_PERM};
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (owners, system) = start_of(dir.path()).await;
+            let mut shop = DomainRecord::new(1, ConditionalWrites::default());
+            shop.state = Lifecycle::Deleting;
+            put(&system, "shop", &shop).await.unwrap();
+            for (user, grant) in [("ana", "domain:shop"), ("ben", "json:shop"), ("ben", "shop"), ("ben", "keep")] {
+                let perm = DomainPermission { username: user.to_string(), domain: grant.to_string(), access: AccessLevel::Read };
+                system.put(&perm_key(user, grant), &serde_json::to_vec(&perm).unwrap()).await.unwrap();
+            }
+
+            run(&system, &owners, &DomainRules::default()).await;
+            assert!(!load_all(&system).await.unwrap().contains_key("shop"));
+            assert_eq!(system.scan_keys(PREFIX_PERM.as_bytes()).await.unwrap(), [perm_key("ben", "keep")]);
         })
     }
 

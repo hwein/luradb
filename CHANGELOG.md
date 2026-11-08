@@ -40,6 +40,7 @@ All notable changes to LuraDB are documented in this file.
 
 - Config keys `storage.db_path`, `buffer_pool.pool_size` and `rate_limit.default_max_storage_bytes`; the server no longer creates the empty `luradb.db` page file. A `luradb.toml` that still sets them starts with a warning per key.
 - **BREAKING** API: GET /store-api/config no longer reports these three keys.
+- The background sweep that set links to a purged key-value or JSON part to NULL in stored rows (`rel.cross_engine_sweep_interval_secs`, `rel.cross_engine_sweep_batch_size`); such links still read as NULL while the part is purged and keep their stored value.
 
 ## [0.5.1] - 2026-11-03
 

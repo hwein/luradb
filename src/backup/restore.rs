@@ -94,9 +94,8 @@ fn short_label(mut key: String) -> String {
 /// wrote the archive. Per-entry KV and JSON failures are counted in the
 /// returned [`RestoreOutcome`] and the job keeps going; an `Err` here means
 /// an engine-level failure or a failed relational line aborted the whole
-/// job. The control plane counts the restore as running until it ends.
+/// job.
 pub(crate) async fn run_restore(params: RestoreParams<'_>) -> anyhow::Result<RestoreOutcome> {
-    let _running = params.control.mark_restore_running();
     let path = params.dir.join(format!("{}.ndjson", params.backup_id));
 
     let scan = verify_and_scan(&path).await?;

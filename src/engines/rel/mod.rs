@@ -34,7 +34,7 @@ pub use catalog::{
     CatalogEntry, CatalogLimits, ColumnDef, ColumnInput, DefaultValue, IndexInput, IndexMeta, RelCatalog,
     TableInput, TableSchema, ViewSchema,
 };
-pub use cross_engine::{CrossEngineResolver, LinkAuth, RelCrossEngineSweeper};
+pub use cross_engine::{CrossEngineResolver, LinkAuth};
 pub use ddl::DdlOutcome;
 pub use dml::{DmlResult, SelectResult};
 pub use domain::{RelDomain, RelDomainState};
@@ -106,12 +106,11 @@ pub struct RelEngine {
     /// Per-table write locks for the atomic DML path.
     table_locks: dml::TableLocks,
     /// Engine-global write serialization for the domain finalization guard:
-    /// DML has only per-table locks, so the DML-commit and
-    /// cross-engine-sweep paths hold this around their `write_batch` + a domain
-    /// re-check, and the purger holds it around its emptiness check +
-    /// finalization — no in-flight row write can land after a domain is
-    /// finalized (which would orphan a `ROW:` key into a recreated same-name
-    /// domain sharing the FNV `system_prefix`).
+    /// DML has only per-table locks, so the DML-commit path holds this around
+    /// its `write_batch` + a domain re-check, and the purger holds it around
+    /// its emptiness check + finalization — no in-flight row write can land
+    /// after a domain is finalized (which would orphan a `ROW:` key into a
+    /// recreated same-name domain sharing the FNV `system_prefix`).
     write_guard: tokio::sync::Mutex<()>,
     /// DML write-path guards.
     max_text_len: usize,
@@ -393,12 +392,6 @@ impl RelEngine {
     #[cfg(test)]
     pub(crate) fn set_max_response_bytes(&mut self, bytes: usize) {
         self.max_response_bytes = bytes;
-    }
-
-    /// Whether at least one target engine is wired — the sweeper is only worth
-    /// spawning at startup then.
-    pub fn cross_engine_has_target(&self) -> bool {
-        self.cross_engine.has_target()
     }
 
     /// DDL engine-enabled check: a `KVREF`/`JSONREF` column may only

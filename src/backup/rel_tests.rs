@@ -6,7 +6,7 @@ use super::restore::{run_restore, RestoreMode, RestoreOutcome, RestoreParams};
 use super::writer::{resolve_scope, run_backup, BackupParams};
 use super::{BackupError, BackupManager, BackupScope, RestoreState};
 use crate::config::{BackupConfig, BlockCacheConfig, JsonStoreConfig, RelStoreConfig};
-use crate::control::{slots, testing, ControlPlane, Engine, Lifecycle, ShardOwners};
+use crate::control::{slots, testing, ControlPlane, Lifecycle, ShardOwners};
 use crate::core::wal::WriteAheadLog;
 use crate::engines::json::{JsonDomainPurger, JsonEngine};
 use crate::engines::lsm::domain::{DomainConfig, DomainPurger, DomainRegistry};
@@ -14,7 +14,7 @@ use crate::engines::lsm::engine::{LsmEngineOptions, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::DomainQuota;
 use crate::engines::lsm::reader::GetResult;
 use crate::engines::rel::{
-    CrossEngineResolver, ExecOutcome, FileFormat, LinkAuth, RelCrossEngineSweeper, RelDomainPurger, RelEngine,
+    CrossEngineResolver, ExecOutcome, FileFormat, LinkAuth, RelDomainPurger, RelEngine,
     ScalarValue, SqlOutcome,
 };
 use crate::engines::StorageEngine;
@@ -684,23 +684,12 @@ fn links_without_their_targets_expand_as_missing_after_a_restore() {
     })
 }
 
-/// Waits until the directory shows the part of `name` in `engine` as `Deleting`.
-async fn until_deleting(control: &ControlPlane, engine: Engine, name: &str) {
-    let wait = async {
-        while control.directory().get(name).map(|d| d.state_in(engine)) != Some(Lifecycle::Deleting) {
-            tokio::task::yield_now().await;
-        }
-    };
-    // Upper bound against hanging only.
-    compio::time::timeout(Duration::from_secs(30), wait).await.expect("the domain never turned Deleting");
-}
-
-// While a restore replaces the KV part that links of a relational table
-// point to, a sweep of orphaned links leaves them alone.
+// A restore that replaces only the key-value part of a domain leaves the
+// links of its relational tables stored, and they resolve to the restored key.
 #[test]
-fn the_link_sweep_waits_while_a_restore_replaces_a_domain() {
+fn a_key_value_replace_restore_keeps_the_links_of_relational_tables() {
     crate::core::engine_runtime::block_on(async {
-        let server = Arc::new(server(1, false, true).await);
+        let server = server(1, false, true).await;
         server.create("d").await;
         server.owners_kv("d").store("d").await.unwrap().put(b"k1", b"v1").await.unwrap();
         server.sql("d", "CREATE TABLE kl (id INTEGER PRIMARY KEY, k KVREF)", &[]).await;
@@ -708,20 +697,12 @@ fn the_link_sweep_waits_while_a_restore_replaces_a_domain() {
         let out = tempfile::TempDir::new().unwrap();
         server.backup(out.path(), "bk_kv", BackupScope::KvDomain("d".to_string())).await;
 
-        let restore = compio::runtime::spawn({
-            let (server, out) = (Arc::clone(&server), out.path().to_path_buf());
-            async move { server.restore(&out, "bk_kv", RestoreMode::Replace, None).await }
-        });
-        until_deleting(&server.control, Engine::Kv, "d").await;
-        assert!(server.control.restore_running());
-        RelCrossEngineSweeper::new(Arc::clone(server.rel("d")), 100).sweep_tick().await.unwrap();
-
         let purging = server.purging();
-        restore.await.unwrap().unwrap();
+        server.restore(out.path(), "bk_kv", RestoreMode::Replace, None).await.unwrap();
         drop(purging);
-        assert!(!server.control.restore_running());
         let row = [ScalarValue::Integer(1), ScalarValue::Text("k1".to_string())];
         assert_eq!(server.rows("d", "SELECT * FROM kl").await, [row]);
+        assert_eq!(expanded(&server, "d", "kl", "k").await, [json!({"exists": true, "value": "v1", "encoding": "utf8"})]);
     })
 }
 
@@ -829,7 +810,6 @@ fn a_refused_relational_row_fails_the_restore_job() {
         assert_eq!(status.state, RestoreState::Failed);
         let (_, message) = status.errors.last().unwrap();
         assert!(message.contains("'f'") && message.contains("'t'"), "{message}");
-        assert!(!dst.control.restore_running());
     })
 }
 

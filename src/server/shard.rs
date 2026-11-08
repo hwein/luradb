@@ -303,17 +303,6 @@ fn spawn_loops(cfg: &LuraConfig, owners: &ShardOwners) -> Loops {
     }
 
     if let Some(engine) = &owners.rel {
-        if engine.cross_engine_has_target() {
-            let sweeper = Arc::new(crate::engines::rel::RelCrossEngineSweeper::new(
-                Arc::clone(engine),
-                crate::engines::rel::cross_engine::SWEEP_BATCH_SIZE,
-            ));
-            let interval = Duration::from_secs(crate::engines::rel::cross_engine::SWEEP_INTERVAL_SECS);
-            loops.spawn("RelCrossEngineSweeper", interval, move || {
-                let sweeper = Arc::clone(&sweeper);
-                async move { sweeper.sweep_tick().await }
-            });
-        }
         let rel_purger = Arc::new(crate::engines::rel::RelDomainPurger::new(
             Arc::clone(engine),
             crate::engines::rel::purger::PURGER_BATCH_SIZE,

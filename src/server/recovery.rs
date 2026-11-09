@@ -163,7 +163,7 @@ mod tests {
             assert!(matches!(moved, Resume::Reset { reason: ResetReason::Restart, .. }));
 
             let bus = GlobalEventBus::new(16, 16);
-            bus.publish("kv", "domain_created", "shop", None);
+            bus.publish(None, "domain_created", "shop", None);
             let cursor = format_event_id(EVENTS_TAG, control, 1);
             assert!(matches!(bus.decide_resume(Some(&cursor)), Resume::Replay { .. }));
         })

@@ -6,7 +6,7 @@
 
 use crate::api::middleware::ApiError;
 use crate::api::AppState;
-use crate::control::{Engine, Lifecycle};
+use crate::control::Lifecycle;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -48,7 +48,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
     let answered = state.control.ping_shards(timeout).await;
     let engines: Vec<_> = state.control.shard_owners().map(|owners| owners.kv.engine().heartbeat_data()).collect();
     let directory = state.control.directory();
-    let domain_count = directory.domains(Engine::Kv).filter(|d| d.state == Lifecycle::Active).count();
+    let domain_count = directory.domains().filter(|d| d.state == Lifecycle::Active).count();
     let resources = state.control.resources();
     let hb = state.metrics.heartbeat(&engines, domain_count, &answered, resources.report(), resources.io().report());
     let status = if answered.iter().all(|&ok| ok) { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };

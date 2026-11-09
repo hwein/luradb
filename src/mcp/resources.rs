@@ -12,7 +12,7 @@ const SCHEMA_TEMPLATE: &str = "luradb://{engine}/{name}/schema";
 
 pub(crate) fn listed() -> Vec<Resource> {
     vec![Resource::new(DOMAINS_URI, "domains")
-        .with_description("Domains of all engines the caller may access; each entry names its engine.")
+        .with_description("Domains the caller may access; each holds data in the key-value, JSON and relational engines.")
         .with_mime_type("application/json")]
 }
 
@@ -129,10 +129,7 @@ mod tests {
         assert_eq!(targets(&read("luradb://rel/sales/schema").unwrap()), ["/store-api/rel/sales/tables", "/store-api/rel/sales/views"]);
         assert_eq!(targets(&read("luradb://json/docs/schema").unwrap()), ["/store-api/json/docs/indexes"]);
         assert_eq!(targets(&read("luradb://kv/cache/schema").unwrap()), ["/store-api/domains/cache"]);
-        assert_eq!(
-            targets(&read(DOMAINS_URI).unwrap()),
-            ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"]
-        );
+        assert_eq!(targets(&read(DOMAINS_URI).unwrap()), ["/store-api/domains"]);
     }
 
     #[test]
@@ -154,10 +151,10 @@ mod tests {
     }
 
     #[test]
-    fn the_domain_list_is_the_merged_listing() {
+    fn the_domain_list_is_the_list_domains_result() {
         let read = read(DOMAINS_URI).unwrap();
-        let replies = [reply(200, r#"[{"name":"a"}]"#), reply(503, "off"), reply(404, "")];
-        let result = read.result(DOMAINS_URI, &replies).unwrap();
-        assert_eq!(text(&result), json!({"domains": [{"name": "a", "engine": "kv"}], "unavailable_engines": ["json", "rel"]}));
+        let listing = r#"[{"name":"a","created_at":3,"state":"active","require_conditional_writes":{"kv":false,"json":true}}]"#;
+        let result = read.result(DOMAINS_URI, &[reply(200, listing)]).unwrap();
+        assert_eq!(text(&result), json!({"domains": [{"name": "a", "created_at": 3, "state": "active"}]}));
     }
 }

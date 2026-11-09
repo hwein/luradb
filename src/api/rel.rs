@@ -7,6 +7,7 @@ use crate::api::{middleware::ApiError, AppState};
 use crate::auth::middleware::{enforce_sql_level, AuthOutcome, AuthUser};
 use crate::auth::AccessLevel;
 use crate::bridge::EngineForward;
+use crate::control::Engine;
 use crate::engines::rel::{
     scalar_to_json, ColumnType, DmlResult, LinkAuth, RelEngine, RelStoreError, SqlOutcome, StatementClass,
 };
@@ -40,7 +41,6 @@ impl From<RelStoreError> for ApiError {
             | RelStoreError::InvalidSchema(_)
             | RelStoreError::TypeMismatch { .. }
             | RelStoreError::LimitExceeded { .. }
-            | RelStoreError::InvalidDomainName(_)
             | RelStoreError::InvalidIdentifier(_)
             | RelStoreError::NotWritable { .. }
             | RelStoreError::NotNull { .. }
@@ -93,11 +93,7 @@ impl From<RelStoreError> for ApiError {
     }
 }
 
-/// Resolves the rel engine or fails with 503 when `rel.enabled = false`. With
-/// conditional router registration (`create_router`) the rel routes
-/// don't even exist in that case, so this never actually fires in normal
-/// operation — kept as a defensive guard (parity with `json_engine`) in case
-/// a path is ever reachable while `rel_engine` is `None`.
+/// Resolves the rel engine or fails with 503 when `rel.enabled = false`.
 pub(crate) fn rel_engine(state: &AppState) -> Result<&Arc<RelEngine>, ApiError> {
     state.rel_engine.as_ref().ok_or_else(|| {
         ApiError::new(
@@ -109,10 +105,9 @@ pub(crate) fn rel_engine(state: &AppState) -> Result<&Arc<RelEngine>, ApiError> 
 
 /// Builds the cross-engine `LinkAuth` for one rel request:
 /// auth disabled, or an admin/trusted-peer `AuthOutcome::Full`, gets
-/// unrestricted access. A Scoped user's KV/JSON read rights are looked up
-/// against the same-named `{domain}` (bare KV namespace) / `json:{domain}`
-/// permission entries — the same domain-per-engine split the middleware
-/// already enforces elsewhere. Fail-closed (both
+/// unrestricted access. A Scoped user needs `read` on the key-value or JSON
+/// engine of the same-named domain, or on the whole domain, as the middleware
+/// does for those engines. Fail-closed (both
 /// `false`) if auth is on but the outcome/user extension is unexpectedly
 /// missing — a middleware bug must never grant silent access.
 pub(crate) async fn compute_link_auth(
@@ -130,14 +125,10 @@ pub(crate) async fn compute_link_auth(
             let Some(AuthUser(name)) = user else {
                 return LinkAuth { kv_read: false, json_read: false };
             };
-            let kv_read =
-                state.auth_cache.get_permission(name, domain).await.is_some_and(|l| l >= AccessLevel::Read);
-            let json_read = state
-                .auth_cache
-                .get_permission(name, &format!("json:{domain}"))
-                .await
-                .is_some_and(|l| l >= AccessLevel::Read);
-            LinkAuth { kv_read, json_read }
+            let reads = |engine| async move {
+                state.auth_cache.effective(name, domain, Some(engine)).await.is_some_and(|l| l >= AccessLevel::Read)
+            };
+            LinkAuth { kv_read: reads(Engine::Kv).await, json_read: reads(Engine::Json).await }
         }
         None => LinkAuth { kv_read: false, json_read: false },
     }
@@ -322,7 +313,6 @@ mod tests {
     use axum::body::to_bytes;
     use axum::body::Body;
     use axum::http::{Method, Request};
-    use axum::response::IntoResponse;
     use tower::util::ServiceExt;
 
     /// `rel_config = None` ⇒ `rel.enabled = false`; `Some(cfg)` ⇒ enabled
@@ -479,60 +469,38 @@ mod tests {
         })
     }
 
-    // 1. Domain roundtrip: create → 201; list contains it with state=active;
-    //    detail → 200; duplicate → 409; invalid names → 400.
+    // 1. A created domain takes SQL in its relational part, the name
+    //    `domains` too.
     #[test]
-    fn test_domain_roundtrip() {
+    fn test_a_created_domain_takes_sql() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_default_app().await;
-            let (status, body) =
-                request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#)).await;
-            assert_eq!(status, StatusCode::CREATED, "{body}");
-            let created: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(created["state"], json!("active"));
-
-            let (status, body) = request(&app, Method::GET, "/store-api/rel/domains", None).await;
-            assert_eq!(status, StatusCode::OK);
-            let list: Value = serde_json::from_str(&body).unwrap();
-            let entry = list.as_array().unwrap().iter().find(|d| d["name"] == json!("shop")).unwrap();
-            assert_eq!(entry["state"], json!("active"));
-
-            let (status, _) = request(&app, Method::GET, "/store-api/rel/domains/shop", None).await;
-            assert_eq!(status, StatusCode::OK);
-
-            let (status, _) =
-                request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#)).await;
-            assert_eq!(status, StatusCode::CONFLICT);
-
-            let long = "a".repeat(51);
-            for bad in ["", long.as_str(), "bad name!", "domains"] {
-                let req = json!({ "name": bad }).to_string();
-                let (status, body) = request(&app, Method::POST, "/store-api/rel/domains", Some(&req)).await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {body}");
+            for name in ["shop", "domains"] {
+                let req = json!({ "name": name }).to_string();
+                let (status, body) = request(&app, Method::POST, "/store-api/domains", Some(&req)).await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+                let (status, body) = sql(&app, name, r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
+                assert_eq!(status, StatusCode::OK, "{name}: {body}");
             }
         })
     }
 
-    // 2. Domain delete: DELETE → 202; detail afterwards → 410 with status
-    //    info; SQL against the deleted domain → 410 (require_active).
+    // 2. Domain delete: DELETE → 202; SQL against the deleted domain → 410
+    //    (require_active); a second DELETE → 410.
     #[test]
     fn test_domain_delete_then_410() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_default_app().await;
-            request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "gone"}"#)).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "gone"}"#)).await;
 
-            let (status, _) = request(&app, Method::DELETE, "/store-api/rel/domains/gone", None).await;
+            let (status, _) = request(&app, Method::DELETE, "/store-api/domains/gone", None).await;
             assert_eq!(status, StatusCode::ACCEPTED);
-
-            let (status, body) = request(&app, Method::GET, "/store-api/rel/domains/gone", None).await;
-            assert_eq!(status, StatusCode::GONE, "{body}");
-            assert!(body.contains("deleting"), "{body}");
 
             let (status, body) = sql(&app, "gone", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::GONE, "{body}");
 
             // A repeated DELETE of an already-deleting domain is also 410.
-            let (status, _) = request(&app, Method::DELETE, "/store-api/rel/domains/gone", None).await;
+            let (status, _) = request(&app, Method::DELETE, "/store-api/domains/gone", None).await;
             assert_eq!(status, StatusCode::GONE);
         })
     }
@@ -551,8 +519,8 @@ mod tests {
             let (status, _) = sql(&app, "ghost", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
 
-            request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "d1"}"#)).await;
-            request(&app, Method::DELETE, "/store-api/rel/domains/d1", None).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "d1"}"#)).await;
+            request(&app, Method::DELETE, "/store-api/domains/d1", None).await;
             let (status, _) = sql(&app, "d1", r#"{"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::GONE);
         })
@@ -957,31 +925,24 @@ mod tests {
             let (status, _) = sql(&app, "default", r#"{"sql": "CREATE TABLE dup (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::CONFLICT);
             // 410
-            request(&app, Method::POST, "/store-api/rel/domains", Some(r#"{"name": "d410"}"#)).await;
-            request(&app, Method::DELETE, "/store-api/rel/domains/d410", None).await;
+            request(&app, Method::POST, "/store-api/domains", Some(r#"{"name": "d410"}"#)).await;
+            request(&app, Method::DELETE, "/store-api/domains/d410", None).await;
             let (status, _) = sql(&app, "d410", r#"{"sql": "CREATE TABLE x (id INTEGER PRIMARY KEY)"}"#).await;
             assert_eq!(status, StatusCode::GONE);
             // 413 and 429 are covered by their own dedicated tests (need custom config/state).
         })
     }
 
-    // 17. Disabled engine: rel paths are not registered at all (404, axum
-    //     default for an unmatched route); the `rel_engine` guard itself
-    //     answers 503 when called directly (defensive path).
+    // 17. Disabled engine: the rel routes stay registered and answer 503.
     #[test]
-    fn test_disabled_engine_routes_absent_and_guard_503() {
+    fn test_disabled_engine_returns_503() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(None).await;
-            let (status, _) = request(&app, Method::GET, "/store-api/rel/domains", None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "route must not exist when rel.enabled = false");
+            let (status, body) = request(&app, Method::GET, "/store-api/rel/default/tables", None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(body.contains("relational engine is disabled (rel.enabled = false)"), "{body}");
             let (status, _) = sql(&app, "default", r#"{"sql": "SELECT 1"}"#).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
-
-            let (state, _dir2) = make_state(None, false).await;
-            match rel_engine(&state) {
-                Ok(_) => panic!("rel_engine guard must fail when rel_engine is None"),
-                Err(err) => assert_eq!(err.into_response().status(), StatusCode::SERVICE_UNAVAILABLE),
-            }
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         })
     }
 
@@ -1001,6 +962,147 @@ mod tests {
 
             let (status, _) = sql(&app, "default", r#"{"sql": ""}"#).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        })
+    }
+
+    #[test]
+    fn test_unsupported_select_constructs_return_400_with_reason() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            run_sql(&app, "CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+            for (stmt, reason) in [
+                ("SELECT DISTINCT id FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT * FROM t INNER JOIN u ON t.id = u.id", "only LEFT JOIN is supported; INNER JOIN is not"),
+            ] {
+                let (status, text) = run_sql(&app, stmt).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{stmt}");
+                assert!(text.contains(reason), "{stmt}: {text}");
+            }
+        })
+    }
+
+    async fn run_sql(app: &axum::Router, stmt: &str) -> (StatusCode, String) {
+        let (status, body) = sql(app, "default", &json!({ "sql": stmt }).to_string()).await;
+        (status, body["_raw"].as_str().unwrap_or_default().to_string())
+    }
+
+    async fn assert_all_ok(app: &axum::Router, stmts: &[&str]) {
+        for stmt in stmts {
+            let (status, text) = run_sql(app, stmt).await;
+            assert_eq!(status, StatusCode::OK, "{stmt}: {text}");
+        }
+    }
+
+    #[test]
+    fn test_clause_words_work_as_table_column_and_index_names() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE cross (id INTEGER PRIMARY KEY, group TEXT, full TEXT, right INTEGER)",
+                    "INSERT INTO cross (id, group, full, right) VALUES (1, 'g', 'f', 0)",
+                    "SELECT group, full FROM cross",
+                    "SELECT c.group FROM cross c",
+                    "UPDATE cross SET right = 1 WHERE id = 1",
+                    "ALTER TABLE cross RENAME COLUMN full TO full2",
+                    "CREATE INDEX union ON cross (group)",
+                    "DROP INDEX union",
+                    "DROP TABLE cross",
+                ],
+            )
+            .await;
+        })
+    }
+
+    #[test]
+    fn test_clause_words_stay_aliases_in_queries_and_views() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+                    "CREATE TABLE u (uid INTEGER PRIMARY KEY, b INTEGER)",
+                    "INSERT INTO t (id, a) VALUES (1, 1)",
+                    "INSERT INTO u (uid, b) VALUES (1, 2)",
+                ],
+            )
+            .await;
+            for (i, select) in [
+                "SELECT * FROM t full LEFT JOIN u ON full.id = u.uid",
+                "SELECT * FROM t LEFT JOIN u having ON t.id = having.uid",
+                "SELECT a having FROM t",
+                "SELECT * FROM t having WHERE a = 1",
+                "SELECT * FROM t group",
+                "SELECT * FROM t union",
+                "SELECT distinct.a FROM t distinct",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let view = format!("v{i}");
+                assert_all_ok(&app, &[select, &format!("CREATE VIEW {view} AS {select}"), &format!("SELECT * FROM {view}")])
+                    .await;
+            }
+        })
+    }
+
+    #[test]
+    fn test_unsupported_constructs_are_rejected_with_reason() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+                    "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE g (id INTEGER PRIMARY KEY, distinct INTEGER, a INTEGER)",
+                ],
+            )
+            .await;
+            for (stmt, reason) in [
+                ("SELECT * FROM t FULL JOIN u ON t.id = u.id", "only LEFT JOIN is supported; FULL JOIN is not"),
+                ("SELECT * FROM t GROUP BY a", "GROUP BY is not supported by LuraSQL"),
+                ("SELECT * FROM t UNION SELECT * FROM u", "UNION is not supported by LuraSQL"),
+                ("SELECT * FROM t UNION ALL SELECT * FROM u", "UNION is not supported by LuraSQL"),
+                ("SELECT * FROM t HAVING a = 1", "HAVING is not supported by LuraSQL"),
+                ("SELECT DISTINCT * FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT DISTINCT t.a FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT DISTINCT a AS x FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("SELECT DISTINCT a FROM t", "DISTINCT is not supported by LuraSQL"),
+                ("CREATE VIEW dv AS SELECT DISTINCT a FROM t", "DISTINCT is not supported by LuraSQL"),
+            ] {
+                let (status, text) = run_sql(&app, stmt).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{stmt}: {text}");
+                assert!(text.contains(reason), "{stmt}: {text}");
+            }
+            // A real column named `distinct` is still read as before.
+            assert_all_ok(&app, &["SELECT distinct a FROM g"]).await;
+            // Without an alias or with a qualifier there is no DISTINCT to report:
+            // the missing column stays a 404.
+            for stmt in ["SELECT distinct FROM t", "SELECT t.distinct a FROM t"] {
+                let (status, text) = run_sql(&app, stmt).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{stmt}: {text}");
+            }
+        })
+    }
+
+    #[test]
+    fn test_view_over_clause_word_column_does_not_block_ddl() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            assert_all_ok(
+                &app,
+                &[
+                    "CREATE TABLE g (id INTEGER PRIMARY KEY, group TEXT)",
+                    "CREATE TABLE x (id INTEGER PRIMARY KEY)",
+                    "CREATE VIEW v AS SELECT group FROM g",
+                    "SELECT * FROM v",
+                    "DROP TABLE x",
+                ],
+            )
+            .await;
         })
     }
 
@@ -1044,7 +1146,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let resp = send(Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#), admin_key)
+            let resp = send(Method::POST, "/store-api/domains", Some(r#"{"name": "shop"}"#), admin_key)
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
@@ -1144,11 +1246,10 @@ mod tests {
         })
     }
 
-    // set_permission accepts access="ddl" and store_type="rel"
+    // set_permission accepts access="ddl" and engine="rel"
     // for a domain that doesn't exist yet via the explicit ?allow_missing=true
-    // opt-in (replaces the former implicit no-check behavior); an
-    // invalid access value still -> 400; remove_permission with
-    // ?store_type=rel removes it.
+    // opt-in; an invalid access value still -> 400; remove_permission with
+    // ?engine=rel removes it.
     #[test]
     fn test_auth_handlers_rel_ddl_permission() {
         crate::core::engine_runtime::block_on(async {
@@ -1197,7 +1298,7 @@ mod tests {
             let resp = send(
                 Method::POST,
                 "/store-api/auth/users/worker/permissions?allow_missing=true",
-                Some(r#"{"domain": "shop", "access": "xxx", "store_type": "rel"}"#),
+                Some(r#"{"domain": "shop", "access": "xxx", "engine": "rel"}"#),
                 admin_key,
             )
             .await
@@ -1209,25 +1310,24 @@ mod tests {
             let resp = send(
                 Method::POST,
                 "/store-api/auth/users/worker/permissions?allow_missing=true",
-                Some(r#"{"domain": "shop", "access": "ddl", "store_type": "rel"}"#),
+                Some(r#"{"domain": "shop", "access": "ddl", "engine": "rel"}"#),
                 admin_key,
             )
             .await
             .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(cache.get_permission("worker", "rel:shop").await, Some(AccessLevel::Ddl));
+            assert_eq!(cache.effective("worker", "shop", Some(Engine::Rel)).await, Some(AccessLevel::Ddl));
 
-            // Removing it via ?store_type=rel drops the rel:shop entry.
             let resp = send(
                 Method::DELETE,
-                "/store-api/auth/users/worker/permissions/shop?store_type=rel",
+                "/store-api/auth/users/worker/permissions/shop?engine=rel",
                 None,
                 admin_key,
             )
             .await
             .unwrap();
             assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-            assert_eq!(cache.get_permission("worker", "rel:shop").await, None);
+            assert_eq!(cache.effective("worker", "shop", None).await, None);
         })
     }
 
@@ -1261,11 +1361,6 @@ mod tests {
                 app.clone().oneshot(req)
             };
 
-            // KV domain "shop" (bare namespace), seeded directly through the
-            // registry with an existing key.
-            kv_registry.create_domain("shop").await.unwrap();
-            kv_registry.store("shop").await.unwrap().put(b"realkey", b"realvalue").await.unwrap();
-
             let admin_key = "lura_test_admin_key";
             cache
                 .upsert_user(UserRecord {
@@ -1276,10 +1371,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let resp = send(Method::POST, "/store-api/rel/domains", Some(r#"{"name": "shop"}"#), admin_key)
+            let resp = send(Method::POST, "/store-api/domains", Some(r#"{"name": "shop"}"#), admin_key)
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
+            // The key-value part of "shop" (bare namespace), seeded directly
+            // through the registry with an existing key.
+            kv_registry.store("shop").await.unwrap().put(b"realkey", b"realvalue").await.unwrap();
             let resp = send(
                 Method::POST,
                 "/store-api/rel/shop/sql",
@@ -1403,6 +1501,29 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(resp.status(), StatusCode::CONFLICT, "admin keeps the ordinary CrossEngineLinkMissing 409");
+        })
+    }
+
+    // Links read the target engine with `read` on it or on the whole domain:
+    // a grant on the domain covers key-value and JSON links, one on the JSON
+    // engine only JSON links.
+    #[test]
+    fn link_auth_follows_the_domain_grant_and_the_engine_grants() {
+        crate::core::engine_runtime::block_on(async {
+            use crate::auth::AccessLevel;
+
+            let (state, _dir) = make_state(Some(RelStoreConfig::default()), true).await;
+            let cache = Arc::clone(&state.auth_cache);
+            cache.change_permission("whole", "shop", None, Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("doc", "shop", Some(Engine::Rel), Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("doc", "shop", Some(Engine::Json), Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("table", "shop", Some(Engine::Rel), Some(AccessLevel::Ddl)).await.unwrap();
+            for (user, expected) in [("whole", (true, true)), ("doc", (false, true)), ("table", (false, false))] {
+                let user = AuthUser(user.to_string());
+                let outcome = Some(AuthOutcome::Scoped(AccessLevel::Read));
+                let auth = compute_link_auth(&state, outcome, Some(&user), "shop").await;
+                assert_eq!((auth.kv_read, auth.json_read), expected, "{}", user.0);
+            }
         })
     }
 

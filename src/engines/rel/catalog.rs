@@ -71,11 +71,12 @@ fn seq_key(domain: &str) -> Vec<u8> {
     k
 }
 
-/// Lower bound of `rel.lsm.max_key_length`: the longest
-/// management key, `__sys:rel_catalog_seq:{domain}` at a maximal name, plus
-/// 1 byte.
-pub(crate) const MIN_LSM_KEY_LENGTH: usize =
-    SYS_CATALOG_SEQ_PREFIX.len() + super::domain::MAX_DOMAIN_NAME_LEN + 1;
+/// Lower bound of `rel.lsm.max_key_length` for domain names up to
+/// `max_name_length`: the longest management key,
+/// `__sys:rel_catalog_seq:{domain}` at a maximal name, plus 1 byte.
+pub(crate) fn min_lsm_key_length(max_name_length: usize) -> usize {
+    SYS_CATALOG_SEQ_PREFIX.len() + max_name_length + 1
+}
 
 /// Splits a `CAT:` key into `(system_prefix, name)`.
 fn parse_cat_key(key: &[u8]) -> Option<(Vec<u8>, String)> {
@@ -1515,9 +1516,9 @@ mod tests {
     // lower bound of rel.lsm.max_key_length.
     #[test]
     fn test_management_keys_at_max_names_fit_key_limit_lower_bound() {
-        let bound = MIN_LSM_KEY_LENGTH;
+        let bound = min_lsm_key_length(50);
         let system_prefix = [b'f'; 16];
-        let seq = seq_key(&"d".repeat(crate::engines::rel::domain::MAX_DOMAIN_NAME_LEN));
+        let seq = seq_key(&"d".repeat(50));
         assert!(seq.len() < bound, "{}", seq.len());
         let cat = cat_key(&system_prefix, &"t".repeat(MAX_IDENTIFIER_LEN));
         assert!(cat.len() < bound, "{}", cat.len());
@@ -1557,7 +1558,7 @@ mod tests {
     ) {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = make_engine(dir.path()).await;
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
+        let domains = Arc::new(RelDomainRegistry::recover_with_default(Arc::clone(&engine)).await.unwrap());
         let metrics = MetricsStore::new(MetricsConfig::default());
         let catalog = Arc::new(
             RelCatalog::recover(Arc::clone(&engine), limits, metrics)
@@ -2217,7 +2218,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let engine = make_engine(dir.path()).await;
-            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
+            let domains = Arc::new(RelDomainRegistry::recover_with_default(Arc::clone(&engine)).await.unwrap());
             let metrics = MetricsStore::new(MetricsConfig::default());
             let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
                 .await
@@ -2260,7 +2261,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let engine = make_engine(dir.path()).await;
-            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
+            let domains = Arc::new(RelDomainRegistry::recover_with_default(Arc::clone(&engine)).await.unwrap());
             let metrics = MetricsStore::new(MetricsConfig::default());
             let catalog = RelCatalog::recover(Arc::clone(&engine), default_limits(), metrics)
                 .await
@@ -2299,7 +2300,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let engine = make_engine(dir.path()).await;
-            let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
+            let domains = Arc::new(RelDomainRegistry::recover_with_default(Arc::clone(&engine)).await.unwrap());
             domains.create_domain("gamma").await.unwrap();
 
             let metrics = MetricsStore::new(MetricsConfig::default());

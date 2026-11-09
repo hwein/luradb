@@ -71,7 +71,6 @@ fn config(dir: &Path, instance_id: &str, sock: &Path) -> LuraConfig {
     let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
     let mut cfg = LuraConfig::default();
     cfg.server.port = 0;
-    cfg.storage.db_path = path("luradb.db");
     cfg.storage.wal_path = path("luradb.wal");
     cfg.storage.vlog_path = path("luradb.vlog");
     cfg.storage.sstable_dir = path("sstables");

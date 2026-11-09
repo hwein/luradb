@@ -77,7 +77,6 @@ type Param = (&'static str, &'static str, &'static str, bool);
 
 const DOMAIN: Param = ("domain", "string", "Domain name", true);
 const KEY: Param = ("key", "string", "Key", true);
-const ENGINE: Param = ("engine", "string", "Engine of the domain: \"kv\", \"json\" or \"rel\"", true);
 const NAME: Param = ("name", "string", "Domain name", true);
 const LIMIT: Param = ("limit", "integer", "Page size; the route's maximum applies", false);
 const OFFSET: Param = ("offset", "integer", "Entries to skip", false);
@@ -88,12 +87,18 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     ToolSpec { name: "whoami", description: "Name and role of the caller's API key.", access: Access::Read, admin_only: false, params: &[] },
     ToolSpec {
         name: "list_domains",
-        description: "Domains the caller may access, of all engines or of one; each entry names its engine.",
+        description: "Domains the caller may access; each holds keys, documents and tables in the key-value, JSON and relational engines.",
         access: Access::Read,
         admin_only: false,
-        params: &[("engine", "string", "Only this engine: \"kv\", \"json\" or \"rel\"", false)],
+        params: &[],
     },
-    ToolSpec { name: "describe_domain", description: "Details of one domain.", access: Access::Read, admin_only: false, params: &[ENGINE, NAME] },
+    ToolSpec {
+        name: "describe_domain",
+        description: "Details of one domain, which holds data in the key-value, JSON and relational engines.",
+        access: Access::Read,
+        admin_only: false,
+        params: &[NAME],
+    },
     ToolSpec { name: "metrics", description: "Server metrics (admins only).", access: Access::Read, admin_only: true, params: &[] },
     ToolSpec { name: "list_tables", description: "Tables of a relational domain.", access: Access::Read, admin_only: false, params: &[DOMAIN] },
     ToolSpec {
@@ -185,7 +190,21 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         admin_only: false,
         params: &[DOMAIN, SQL, SQL_PARAMS],
     },
-    ToolSpec { name: "create_domain", description: "Creates a domain (admins only).", access: Access::Ddl, admin_only: true, params: &[ENGINE, NAME] },
+    ToolSpec {
+        name: "create_domain",
+        description: "Creates a domain in the key-value, JSON and relational engines (admins only).",
+        access: Access::Ddl,
+        admin_only: true,
+        params: &[
+            NAME,
+            (
+                "require_conditional_writes",
+                "object",
+                "{\"kv\": bool, \"json\": bool}: single-object writes of that engine need a precondition; fixed at creation",
+                false,
+            ),
+        ],
+    },
     ToolSpec {
         name: "create_json_index",
         description: "Creates an index on a field of a JSON domain.",
@@ -267,8 +286,8 @@ pub(crate) struct Plan {
 enum Merge {
     /// The last answer is the result.
     Last,
-    /// One domain listing per engine, in the order of the calls.
-    Domains(Vec<&'static str>),
+    /// The last answer is the domain listing.
+    Domains,
     /// The last answer is a KV value as raw bytes.
     KvValue,
 }
@@ -282,7 +301,7 @@ impl Plan {
     pub(crate) fn result(&self, replies: &[Reply]) -> CallToolResult {
         match &self.merge {
             Merge::Last => replies.last().map_or_else(|| tool_error("no answer"), reply_result),
-            Merge::Domains(engines) => merge_domains(engines, replies),
+            Merge::Domains => replies.last().map_or_else(|| tool_error("no answer"), domains_result),
             Merge::KvValue => replies.last().map_or_else(|| tool_error("no answer"), kv_value_result),
         }
     }
@@ -339,31 +358,19 @@ fn kv_value_result(reply: &Reply) -> CallToolResult {
     }
 }
 
-/// The domain listings of several engines as one list; an engine that is
-/// off is named instead.
-fn merge_domains(engines: &[&'static str], replies: &[Reply]) -> CallToolResult {
-    let mut domains = Vec::new();
-    let mut unavailable = Vec::new();
-    for (engine, reply) in engines.iter().zip(replies) {
-        if reply.body.is_none() {
-            return too_large();
-        }
-        // A disabled relational engine has no routes at all.
-        if matches!(reply.status, StatusCode::SERVICE_UNAVAILABLE | StatusCode::NOT_FOUND) {
-            unavailable.push(json!(engine));
-            continue;
-        }
-        let Some(Value::Array(entries)) = reply.json().filter(|_| reply.status.is_success()) else {
-            return status_error(reply);
-        };
-        for mut entry in entries {
-            if let Value::Object(fields) = &mut entry {
-                fields.insert("engine".into(), json!(engine));
-            }
-            domains.push(entry);
-        }
+/// The domain listing as `{"domains": [{name, created_at, state}]}`.
+fn domains_result(reply: &Reply) -> CallToolResult {
+    if reply.body.is_none() {
+        return too_large();
     }
-    CallToolResult::structured(json!({ "domains": domains, "unavailable_engines": unavailable }))
+    let Some(Value::Array(entries)) = reply.json().filter(|_| reply.status.is_success()) else {
+        return status_error(reply);
+    };
+    let domains: Vec<Value> = entries
+        .iter()
+        .map(|entry| json!({ "name": entry["name"], "created_at": entry["created_at"], "state": entry["state"] }))
+        .collect();
+    CallToolResult::structured(json!({ "domains": domains }))
 }
 
 /// Why the arguments of a call make no plan: missing or mistyped arguments,
@@ -414,20 +421,7 @@ impl Args<'_> {
     fn value(&self, name: &str, kind: &str) -> Result<Value, Refusal> {
         self.opt_value(name, kind)?.ok_or_else(|| Refusal(format!("missing argument '{name}'")))
     }
-
-    /// `engine` as the path prefix of its domain routes.
-    fn engine(&self, name: &str) -> Result<(&'static str, &'static str), Refusal> {
-        match self.string(name)?.as_str() {
-            "kv" => Ok(("kv", "/store-api/domains")),
-            "json" => Ok(("json", "/store-api/json/domains")),
-            "rel" => Ok(("rel", "/store-api/rel/domains")),
-            other => Err(Refusal(format!("argument '{name}' must be \"kv\", \"json\" or \"rel\", got '{other}'"))),
-        }
-    }
 }
-
-const ENGINES: [(&str, &str); 3] =
-    [("kv", "/store-api/domains"), ("json", "/store-api/json/domains"), ("rel", "/store-api/rel/domains")];
 
 fn path(parts: &[&str]) -> String {
     parts.concat()
@@ -460,20 +454,8 @@ pub(crate) fn plan(spec: &ToolSpec, arguments: &JsonObject, max_statement_len: u
     };
     let plan = match spec.name {
         "whoami" => Plan::single(Call::get("/store-api/auth/whoami".into())),
-        "list_domains" => {
-            let only = args.opt_string("engine")?;
-            let selected: Vec<_> = match only {
-                None => ENGINES.to_vec(),
-                Some(_) => vec![args.engine("engine")?],
-            };
-            let names = selected.iter().map(|(engine, _)| *engine).collect();
-            let calls = selected.iter().map(|(_, route)| Call::get(route.to_string())).collect();
-            Plan { calls, merge: Merge::Domains(names) }
-        }
-        "describe_domain" => {
-            let (_, route) = args.engine("engine")?;
-            Plan::single(Call::get(path(&[route, "/", &encode(&args.string("name")?)])))
-        }
+        "list_domains" => Plan { calls: vec![Call::get("/store-api/domains".into())], merge: Merge::Domains },
+        "describe_domain" => Plan::single(Call::get(path(&["/store-api/domains/", &encode(&args.string("name")?)]))),
         "metrics" => Plan::single(Call::get("/store-api/metrics".into())),
         "list_tables" => Plan::single(Call::get(path(&["/store-api/rel/", &domain()?, "/tables"]))),
         "describe_table" => Plan::single(Call::get(path(&[
@@ -540,8 +522,12 @@ pub(crate) fn plan(spec: &ToolSpec, arguments: &JsonObject, max_statement_len: u
         }
         "sql_execute" => sql_call(SqlTool::Execute)?,
         "create_domain" => {
-            let (_, route) = args.engine("engine")?;
-            Plan::single(Call::new(Method::POST, route.to_string()).json(json!({ "name": args.string("name")? })))
+            let mut body = Map::new();
+            body.insert("name".into(), json!(args.string("name")?));
+            if let Some(setting) = args.opt_value("require_conditional_writes", "object")? {
+                body.insert("require_conditional_writes".into(), setting);
+            }
+            Plan::single(Call::new(Method::POST, "/store-api/domains".into()).json(Value::Object(body)))
         }
         "create_json_index" => Plan::single(
             Call::new(Method::POST, path(&["/store-api/json/", &domain()?, "/indexes"]))
@@ -585,10 +571,10 @@ mod tests {
 
     #[test]
     fn read_tools_map_to_get_requests() {
-        let d = json!({"domain": "shop", "key": "a/b clé", "table": "orders", "name": "shop", "engine": "json"});
+        let d = json!({"domain": "shop", "key": "a/b clé", "table": "orders", "name": "shop"});
         let cases = [
             ("whoami", "/store-api/auth/whoami"),
-            ("describe_domain", "/store-api/json/domains/shop"),
+            ("describe_domain", "/store-api/domains/shop"),
             ("metrics", "/store-api/metrics"),
             ("list_tables", "/store-api/rel/shop/tables"),
             ("describe_table", "/store-api/rel/shop/tables/orders"),
@@ -633,11 +619,11 @@ mod tests {
         assert_eq!(call.body, Some(CallBody::Json(json!({"n": 1}))));
         let call = only_call("json_delete", json!({"domain": "d", "key": "k"}));
         assert_eq!((call.method.clone(), call.target()), (Method::DELETE, "/store-api/json/d/documents/k".to_string()));
-        for (engine, route) in [("kv", "/store-api/domains"), ("json", "/store-api/json/domains"), ("rel", "/store-api/rel/domains")] {
-            let call = only_call("create_domain", json!({"engine": engine, "name": "n"}));
-            assert_eq!((call.method.clone(), call.target()), (Method::POST, route.to_string()));
-            assert_eq!(call.body, Some(CallBody::Json(json!({"name": "n"}))));
-        }
+        let call = only_call("create_domain", json!({"name": "n"}));
+        assert_eq!((call.method.clone(), call.target()), (Method::POST, "/store-api/domains".to_string()));
+        assert_eq!(call.body, Some(CallBody::Json(json!({"name": "n"}))));
+        let call = only_call("create_domain", json!({"name": "n", "require_conditional_writes": {"kv": true}}));
+        assert_eq!(call.body, Some(CallBody::Json(json!({"name": "n", "require_conditional_writes": {"kv": true}}))));
         let call = only_call("create_json_index", json!({"domain": "d", "field": "a.b", "type": "string"}));
         assert_eq!((call.method.clone(), call.target()), (Method::POST, "/store-api/json/d/indexes".to_string()));
         assert_eq!(call.body, Some(CallBody::Json(json!({"field": "a.b", "type": "string"}))));
@@ -666,12 +652,9 @@ mod tests {
     }
 
     #[test]
-    fn list_domains_asks_every_engine_or_the_one_named() {
+    fn list_domains_asks_the_one_domain_listing() {
         let plan = plan_of("list_domains", json!({})).unwrap();
-        let targets: Vec<String> = plan.calls.iter().map(Call::target).collect();
-        assert_eq!(targets, ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"]);
-        let plan = plan_of("list_domains", json!({"engine": "rel"})).unwrap();
-        assert_eq!(plan.calls, vec![Call::get("/store-api/rel/domains".into())]);
+        assert_eq!(plan.calls, vec![Call::get("/store-api/domains".into())]);
     }
 
     #[test]
@@ -689,32 +672,28 @@ mod tests {
         assert_eq!(refused, Refusal("missing argument 'key'".into()));
         let refused = plan_of("kv_scan", json!({"domain": "d", "limit": "ten"})).unwrap_err();
         assert_eq!(refused, Refusal("argument 'limit' must be of type integer".into()));
-        let refused = plan_of("describe_domain", json!({"engine": "graph", "name": "n"})).unwrap_err();
-        assert!(matches!(refused, Refusal(m) if m.contains("\"kv\", \"json\" or \"rel\"")));
+        let refused = plan_of("create_domain", json!({"name": "n", "require_conditional_writes": true})).unwrap_err();
+        assert_eq!(refused, Refusal("argument 'require_conditional_writes' must be of type object".into()));
+        let refused = plan_of("describe_domain", json!({})).unwrap_err();
+        assert_eq!(refused, Refusal("missing argument 'name'".into()));
     }
 
     #[test]
-    fn list_domains_merges_the_engines_and_names_the_unavailable_ones() {
+    fn list_domains_names_each_domain_with_its_creation_and_state() {
         let plan = plan_of("list_domains", json!({})).unwrap();
-        let replies = [
-            reply(200, r#"[{"name":"a"},{"name":"b"}]"#),
-            reply(503, "503 Service Unavailable: the JSON engine is disabled"),
-            reply(200, r#"[{"name":"s"}]"#),
-        ];
-        let result = plan.result(&replies);
+        let listing = r#"[{"name":"a","created_at":7,"state":"active","require_conditional_writes":{"kv":true,"json":false}},
+            {"name":"clé","created_at":9,"state":"active","require_conditional_writes":{"kv":false,"json":false}}]"#;
+        let result = plan.result(&[reply(200, listing)]);
         assert_eq!(result.is_error, Some(false));
         assert_eq!(
             result.structured_content,
-            Some(json!({
-                "domains": [{"name": "a", "engine": "kv"}, {"name": "b", "engine": "kv"}, {"name": "s", "engine": "rel"}],
-                "unavailable_engines": ["json"],
-            }))
+            Some(json!({"domains": [
+                {"name": "a", "created_at": 7, "state": "active"},
+                {"name": "clé", "created_at": 9, "state": "active"},
+            ]}))
         );
-        let replies = [reply(200, "[]"), reply(200, "[]"), reply(404, "")];
-        let result = plan.result(&replies);
-        assert_eq!(result.structured_content, Some(json!({"domains": [], "unavailable_engines": ["rel"]})));
-        let replies = [reply(200, "[]"), reply(500, "boom"), reply(200, "[]")];
-        assert_eq!(plan.result(&replies).is_error, Some(true));
+        assert_eq!(plan.result(&[reply(200, "[]")]).structured_content, Some(json!({"domains": []})));
+        assert_eq!(plan.result(&[reply(500, "boom")]).is_error, Some(true));
     }
 
     #[test]

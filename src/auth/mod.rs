@@ -2,7 +2,9 @@
 //!
 //! System keys layout:
 //!   __sys:auth:user:<name>          → serialised UserRecord (JSON)
-//!   __sys:auth:perm:<name>:<domain> → serialised DomainPermission (JSON)
+//!   __sys:auth:perm:<name>:<grant>  → serialised DomainPermission (JSON); <grant> is
+//!                                     domain:<d> (whole domain), <d> (key-value),
+//!                                     json:<d> or rel:<d>
 //!   __sys:oauth:client:<id>         → serialised OAuthClient (JSON), with a TTL until its first code
 //!   __sys:oauth:token:<hash>        → serialised TokenRecord (JSON), with a TTL
 
@@ -10,20 +12,24 @@ pub mod handlers;
 pub mod middleware;
 pub mod oauth;
 
-use crate::engines::lsm::engine::LsmStorageEngine;
+use crate::control::Engine;
+use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
 use crate::engines::StorageEngine;
 use anyhow::Result;
 use hex;
+use middleware::{permission_domain, split_permission_domain};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 pub(crate) const PREFIX_USER: &str = "__sys:auth:user:";
 pub(crate) const PREFIX_PERM: &str = "__sys:auth:perm:";
+/// Longest user name.
+pub(crate) const MAX_USER_NAME_LENGTH: usize = 50;
 
 pub(crate) fn user_key(name: &str) -> Vec<u8> {
     format!("{PREFIX_USER}{name}").into_bytes()
@@ -31,6 +37,15 @@ pub(crate) fn user_key(name: &str) -> Vec<u8> {
 
 pub(crate) fn perm_key(name: &str, domain: &str) -> Vec<u8> {
     format!("{PREFIX_PERM}{name}:{domain}").into_bytes()
+}
+
+/// The stored keys of every grant of every user on `domain`.
+pub(crate) async fn domain_permission_keys(engine: &LsmStorageEngine, domain: &str) -> Result<Vec<Vec<u8>>> {
+    let on_domain = |key: &[u8]| {
+        let rest = std::str::from_utf8(&key[PREFIX_PERM.len()..]).ok();
+        rest.and_then(|rest| rest.split_once(':')).is_some_and(|(_, grant)| split_permission_domain(grant).1 == domain)
+    };
+    Ok(engine.scan_keys(PREFIX_PERM.as_bytes()).await?.into_iter().filter(|key| on_domain(key)).collect())
 }
 
 /// Generates a new `lura_<64 hex chars>` API key.
@@ -85,10 +100,37 @@ pub struct DomainPermission {
     pub access: AccessLevel,
 }
 
+/// What one user holds on one domain, by grant: `None` the whole domain.
+type Grants = BTreeMap<Option<Engine>, AccessLevel>;
+
+/// The grants of a user on a domain, `held`, once the grant on `engine`
+/// (`None` the whole domain) is set to `access` or, without, revoked. A user
+/// holds either a grant on the whole domain or grants on engines: a change on
+/// the whole domain replaces the engine grants, a change on an engine first
+/// splits a whole-domain grant into one of its level per engine.
+fn changed(mut held: Grants, engine: Option<Engine>, access: Option<AccessLevel>) -> Grants {
+    match engine {
+        None => held.clear(),
+        Some(_) => {
+            if let Some(level) = held.remove(&None) {
+                held.extend(Engine::ALL.map(|engine| (Some(engine), level)));
+            }
+        }
+    }
+    match access {
+        Some(access) => held.insert(engine, access),
+        None => held.remove(&engine),
+    };
+    held
+}
+
+/// Every grant a user can hold on a domain.
+const GRANTS: [Option<Engine>; 4] = [None, Some(Engine::Kv), Some(Engine::Json), Some(Engine::Rel)];
+
 pub struct AuthCache {
     /// api_key_hash → UserRecord
     users: RwLock<HashMap<String, UserRecord>>,
-    /// (username, domain_name) → AccessLevel
+    /// (username, stored grant, see the module doc) → AccessLevel
     permissions: RwLock<HashMap<(String, String), AccessLevel>>,
     /// OAuth clients and tokens of the MCP listener.
     oauth: RwLock<oauth::OAuthState>,
@@ -187,13 +229,17 @@ impl AuthCache {
             .collect()
     }
 
-    /// Returns the access level for (username, domain), or None.
-    pub async fn get_permission(&self, username: &str, domain: &str) -> Option<AccessLevel> {
-        self.permissions
-            .read()
-            .await
-            .get(&(username.to_string(), domain.to_string()))
-            .cloned()
+    /// The level `username` holds on `engine` of `domain`: the grant on the
+    /// whole domain, else the grant on the engine. Without an engine, on the
+    /// domain as a whole: the grant on the whole domain, else the highest
+    /// engine grant.
+    pub async fn effective(&self, username: &str, domain: &str, engine: Option<Engine>) -> Option<AccessLevel> {
+        let permissions = self.permissions.read().await;
+        let level = |grant| permissions.get(&(username.to_string(), permission_domain(grant, domain))).copied();
+        level(None).or_else(|| match engine {
+            Some(engine) => level(Some(engine)),
+            None => Engine::ALL.into_iter().filter_map(|engine| level(Some(engine))).max(),
+        })
     }
 
     /// Persists and caches a UserRecord.
@@ -256,26 +302,68 @@ impl AuthCache {
         Ok(())
     }
 
-    /// Persists and caches a domain permission.
-    pub async fn set_permission(&self, perm: DomainPermission) -> Result<()> {
-        let key = perm_key(&perm.username, &perm.domain);
-        let value = serde_json::to_vec(&perm)?;
-        self.engine.put(&key, &value).await?;
-        self.permissions
-            .write()
-            .await
-            .insert((perm.username.clone(), perm.domain.clone()), perm.access);
+    /// Sets the grant of `username` on `engine` of `domain` (`None` the whole
+    /// domain) to `access`, or revokes it without, under the rule of
+    /// [`changed`]; every key it touches changes in one write. Changes run
+    /// one at a time (the control plane's worker).
+    pub async fn change_permission(
+        &self,
+        username: &str,
+        domain: &str,
+        engine: Option<Engine>,
+        access: Option<AccessLevel>,
+    ) -> Result<()> {
+        let entry = |grant| (username.to_string(), permission_domain(grant, domain));
+        let held: Grants = {
+            let permissions = self.permissions.read().await;
+            GRANTS.into_iter().filter_map(|grant| permissions.get(&entry(grant)).map(|level| (grant, *level))).collect()
+        };
+        let wanted = changed(held.clone(), engine, access);
+        let mut ops = Vec::new();
+        for grant in GRANTS {
+            let key = perm_key(username, &entry(grant).1);
+            match wanted.get(&grant) {
+                Some(&access) if held.get(&grant) != Some(&access) => {
+                    let perm = DomainPermission { username: username.to_string(), domain: entry(grant).1, access };
+                    ops.push(BatchOp::Put { key, value: serde_json::to_vec(&perm)? });
+                }
+                None if held.contains_key(&grant) => ops.push(BatchOp::Delete { key }),
+                _ => {}
+            }
+        }
+        self.engine.write_batch(ops).await?;
+        let mut permissions = self.permissions.write().await;
+        for grant in GRANTS {
+            match wanted.get(&grant) {
+                Some(&access) => permissions.insert(entry(grant), access),
+                None => permissions.remove(&entry(grant)),
+            };
+        }
         Ok(())
     }
 
-    /// Removes a domain permission from the engine and cache.
-    pub async fn remove_permission(&self, username: &str, domain: &str) -> Result<()> {
-        let key = perm_key(username, domain);
-        self.engine.delete(&key).await?;
-        self.permissions
-            .write()
-            .await
-            .remove(&(username.to_string(), domain.to_string()));
+    /// Writes `with` and removes every grant of every user on `domain`, in one write.
+    pub async fn remove_domain(&self, domain: &str, with: BatchOp) -> Result<()> {
+        let held: Vec<(String, String)> = {
+            let permissions = self.permissions.read().await;
+            permissions.keys().filter(|(_, grant)| split_permission_domain(grant).1 == domain).cloned().collect()
+        };
+        let mut ops = vec![with];
+        ops.extend(held.iter().map(|(user, grant)| BatchOp::Delete { key: perm_key(user, grant) }));
+        self.engine.write_batch(ops).await?;
+        let mut permissions = self.permissions.write().await;
+        for entry in &held {
+            permissions.remove(entry);
+        }
+        Ok(())
+    }
+
+    /// Writes one permission as it is, past the rule of [`changed`].
+    #[cfg(test)]
+    pub async fn set_permission(&self, perm: DomainPermission) -> Result<()> {
+        let key = perm_key(&perm.username, &perm.domain);
+        self.engine.put(&key, &serde_json::to_vec(&perm)?).await?;
+        self.permissions.write().await.insert((perm.username.clone(), perm.domain.clone()), perm.access);
         Ok(())
     }
 }
@@ -499,6 +587,166 @@ mod tests {
                 cache.get_user_by_name("admin").await.unwrap().api_key_hash,
                 new_hash
             );
+        })
+    }
+
+    use crate::control::Engine;
+
+    /// Every level `user` holds on `domain`, by grant: `None` the whole domain.
+    async fn held(cache: &AuthCache, user: &str, domain: &str) -> Vec<(Option<Engine>, AccessLevel)> {
+        let mut held: Vec<_> = cache
+            .permissions_for_user(user)
+            .await
+            .iter()
+            .filter_map(|p| {
+                let (engine, on) = split_permission_domain(&p.domain);
+                (on == domain).then_some((engine, p.access))
+            })
+            .collect();
+        held.sort();
+        held
+    }
+
+    /// What a fresh cache over the same store holds: the store matches the cache.
+    async fn reloaded(cache: &AuthCache, user: &str, domain: &str) -> Vec<(Option<Engine>, AccessLevel)> {
+        let fresh = AuthCache::new(Arc::clone(&cache.engine), None);
+        fresh.load_from_engine().await.unwrap();
+        held(&fresh, user, domain).await
+    }
+
+    const ENGINES: [Option<Engine>; 3] = [Some(Engine::Kv), Some(Engine::Json), Some(Engine::Rel)];
+
+    #[test]
+    fn a_domain_grant_holds_in_every_engine_and_an_engine_grant_only_in_its_own() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            cache.change_permission("ana", "shop", None, Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("ben", "shop", Some(Engine::Json), Some(AccessLevel::Read)).await.unwrap();
+            for engine in ENGINES {
+                assert_eq!(cache.effective("ana", "shop", engine).await, Some(AccessLevel::Write), "{engine:?}");
+            }
+            assert_eq!(cache.effective("ana", "shop", None).await, Some(AccessLevel::Write));
+            assert_eq!(cache.effective("ana", "other", None).await, None);
+            assert_eq!(cache.effective("ben", "shop", Some(Engine::Json)).await, Some(AccessLevel::Read));
+            assert_eq!(cache.effective("ben", "shop", Some(Engine::Kv)).await, None);
+            assert_eq!(cache.effective("ben", "shop", Some(Engine::Rel)).await, None);
+            assert_eq!(cache.effective("ben", "shop", None).await, Some(AccessLevel::Read));
+        })
+    }
+
+    // Without an engine, the highest engine grant counts.
+    #[test]
+    fn the_domain_as_a_whole_reads_the_highest_engine_grant() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            cache.change_permission("ana", "shop", Some(Engine::Kv), Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("ana", "shop", Some(Engine::Rel), Some(AccessLevel::Ddl)).await.unwrap();
+            assert_eq!(cache.effective("ana", "shop", None).await, Some(AccessLevel::Ddl));
+        })
+    }
+
+    #[test]
+    fn a_domain_grant_replaces_the_engine_grants() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            for engine in ENGINES {
+                cache.change_permission("ana", "shop", engine, Some(AccessLevel::Write)).await.unwrap();
+            }
+            cache.change_permission("ana", "other", Some(Engine::Kv), Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("ana", "shop", None, Some(AccessLevel::Read)).await.unwrap();
+            let expected = vec![(None, AccessLevel::Read)];
+            assert_eq!(held(&cache, "ana", "shop").await, expected);
+            assert_eq!(reloaded(&cache, "ana", "shop").await, expected);
+            assert_eq!(held(&cache, "ana", "other").await, vec![(Some(Engine::Kv), AccessLevel::Write)]);
+        })
+    }
+
+    // A downgrade through the domain grant holds: no engine grant beside it
+    // keeps the higher level.
+    #[test]
+    fn a_domain_grant_downgrades_an_engine_grant() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            cache.change_permission("ana", "shop", Some(Engine::Kv), Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("ana", "shop", None, Some(AccessLevel::Read)).await.unwrap();
+            assert_eq!(cache.effective("ana", "shop", Some(Engine::Kv)).await, Some(AccessLevel::Read));
+        })
+    }
+
+    #[test]
+    fn an_engine_grant_splits_the_domain_grant() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            cache.change_permission("ana", "shop", None, Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("ana", "shop", Some(Engine::Rel), Some(AccessLevel::Ddl)).await.unwrap();
+            let expected = vec![
+                (Some(Engine::Kv), AccessLevel::Write),
+                (Some(Engine::Json), AccessLevel::Write),
+                (Some(Engine::Rel), AccessLevel::Ddl),
+            ];
+            assert_eq!(held(&cache, "ana", "shop").await, expected);
+            assert_eq!(reloaded(&cache, "ana", "shop").await, expected);
+        })
+    }
+
+    #[test]
+    fn revoking_one_engine_of_a_domain_grant_keeps_the_other_two() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            cache.change_permission("ana", "shop", None, Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("ana", "shop", Some(Engine::Kv), None).await.unwrap();
+            let expected = vec![(Some(Engine::Json), AccessLevel::Write), (Some(Engine::Rel), AccessLevel::Write)];
+            assert_eq!(held(&cache, "ana", "shop").await, expected);
+            assert_eq!(reloaded(&cache, "ana", "shop").await, expected);
+            assert_eq!(cache.effective("ana", "shop", Some(Engine::Kv)).await, None);
+        })
+    }
+
+    #[test]
+    fn revoking_the_domain_removes_every_grant_on_it() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            cache.change_permission("ana", "shop", Some(Engine::Kv), Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("ana", "shop", Some(Engine::Json), Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("ana", "other", None, Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("ana", "shop", None, None).await.unwrap();
+            assert_eq!(held(&cache, "ana", "shop").await, vec![]);
+            assert_eq!(reloaded(&cache, "ana", "shop").await, vec![]);
+            assert_eq!(held(&cache, "ana", "other").await, vec![(None, AccessLevel::Read)]);
+        })
+    }
+
+    // A grant stored without a prefix, as every key-value grant before
+    // whole-domain grants, stays a key-value grant.
+    #[test]
+    fn a_stored_grant_without_a_prefix_stays_a_key_value_grant() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            let perm = DomainPermission { username: "ana".into(), domain: "shop".into(), access: AccessLevel::Write };
+            cache.engine.put(&perm_key("ana", "shop"), &serde_json::to_vec(&perm).unwrap()).await.unwrap();
+            cache.load_from_engine().await.unwrap();
+            assert_eq!(cache.effective("ana", "shop", Some(Engine::Kv)).await, Some(AccessLevel::Write));
+            assert_eq!(cache.effective("ana", "shop", Some(Engine::Json)).await, None);
+            assert_eq!(cache.effective("ana", "shop", Some(Engine::Rel)).await, None);
+        })
+    }
+
+    #[test]
+    fn removing_a_domain_drops_the_grants_of_every_user_on_it() {
+        crate::core::engine_runtime::block_on(async {
+            let (cache, _dir) = test_cache().await;
+            cache.change_permission("ana", "shop", None, Some(AccessLevel::Write)).await.unwrap();
+            cache.change_permission("ben", "shop", Some(Engine::Json), Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("ben", "shop", Some(Engine::Kv), Some(AccessLevel::Read)).await.unwrap();
+            cache.change_permission("ben", "keep", Some(Engine::Kv), Some(AccessLevel::Read)).await.unwrap();
+            let marker = BatchOp::Put { key: b"__sys:test:marker".to_vec(), value: b"1".to_vec() };
+            cache.remove_domain("shop", marker).await.unwrap();
+            for user in ["ana", "ben"] {
+                assert_eq!(held(&cache, user, "shop").await, vec![], "{user}");
+                assert_eq!(reloaded(&cache, user, "shop").await, vec![], "{user}");
+            }
+            assert_eq!(held(&cache, "ben", "keep").await, vec![(Some(Engine::Kv), AccessLevel::Read)]);
+            assert!(cache.engine.get(b"__sys:test:marker").await.unwrap().is_some(), "the write it came with");
         })
     }
 

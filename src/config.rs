@@ -1,6 +1,7 @@
 use crate::control::system;
 use crate::core::wal::WAL_MAX_FIELD_LEN;
 use crate::engines::json::domain as json_domain;
+use crate::engines::lsm::domain::DOMAIN_KEY_PREFIX_LEN;
 use crate::engines::rel::{catalog as rel_catalog, row::ROW_HEADER_LEN};
 use serde::de::{self, value::StrDeserializer, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,6 @@ pub struct LuraConfig {
     pub storage: StorageConfig,
     pub resources: ResourcesConfig,
     pub io_engine: IoEngineConfig,
-    pub buffer_pool: BufferPoolConfig,
     pub lsm: LsmConfig,
     pub compaction: CompactionCfg,
     pub janitor: JanitorCfg,
@@ -61,6 +61,27 @@ impl LuraConfig {
         Ok((config, unknown_keys(keys, &known_keys())))
     }
 
+    /// Raises `json.lsm.max_key_length` and `rel.lsm.max_key_length` to the
+    /// least that takes the keys of domain names up to
+    /// `domains.max_name_length`; returns a warning for each raised value.
+    pub fn raise_key_lengths(&mut self) -> Vec<String> {
+        let names = self.domains.max_name_length;
+        let mut warnings = Vec::new();
+        for (key, value, min) in [
+            ("json.lsm.max_key_length", &mut self.json.lsm.max_key_length, json_domain::min_lsm_key_length(names)),
+            ("rel.lsm.max_key_length", &mut self.rel.lsm.max_key_length, rel_catalog::min_lsm_key_length(names)),
+        ] {
+            if *value < min {
+                warnings.push(format!(
+                    "{key} ({value}) is raised to {min}, the least that takes domain names of \
+                     domains.max_name_length ({names}) characters"
+                ));
+                *value = min;
+            }
+        }
+        warnings
+    }
+
     /// Rejects data paths that share a real location or land on a vLog
     /// generation file `<vlog_path>.<n>`; relative paths resolve against `base`.
     pub fn validate_data_paths(&self, base: &Path) -> anyhow::Result<()> {
@@ -68,7 +89,6 @@ impl LuraConfig {
         let [system_wal, system_vlog, system_sstables] = [system::WAL_FILE, system::VLOG_FILE, system::SSTABLE_DIR]
             .map(|name| Path::new(&self.storage.system_dir).join(name).to_string_lossy().into_owned());
         let mut entries: Vec<(&str, &str, bool)> = vec![
-            ("storage.db_path", self.storage.db_path.as_str(), false),
             ("storage.wal_path", self.storage.wal_path.as_str(), false),
             ("storage.vlog_path", self.storage.vlog_path.as_str(), true),
             ("storage.sstable_dir", self.storage.sstable_dir.as_str(), false),
@@ -249,11 +269,9 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
     /// Set to `true` to enable the Swagger UI + `/api-docs/openapi.json`
-    /// (default: `false`, safe for production). When `auth.enabled = true`,
-    /// these docs routes require the same "any valid key, no domain
-    /// permission" check as `GET /version` (enforced by
-    /// `auth::middleware::docs_auth_layer`) — when auth is
-    /// disabled, they're served openly like everything else.
+    /// (default: `false`, safe for production). The UI, its assets and the
+    /// contract are served without a key even with auth on; the API calls
+    /// the UI makes need one like any other request.
     pub swagger_enabled: bool,
     /// URL path at which Swagger UI is served (default: `/test-ui`).
     pub swagger_url: String,
@@ -295,10 +313,11 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Startup validation: at least one TCP listener must
-    /// be enabled, and HTTP/HTTPS cannot share the same port. Cert/key
-    /// readability and parsability are checked when the TLS listener is
-    /// actually built (`tls::load_tls_acceptor`), not here.
+    /// Startup validation: at least one TCP listener must be enabled,
+    /// HTTP/HTTPS cannot share the same port, and an enabled Swagger UI
+    /// needs a usable path. Cert/key readability and parsability are
+    /// checked when the TLS listener is actually built
+    /// (`tls::load_tls_acceptor`), not here.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.http_enabled || self.tls_enabled,
@@ -310,6 +329,36 @@ impl ServerConfig {
             self.tls_port,
             self.port
         );
+        if self.swagger_enabled {
+            anyhow::ensure!(
+                self.swagger_url.starts_with('/'),
+                "invalid config: server.swagger_url ({}) must start with /",
+                self.swagger_url
+            );
+            let path = self.swagger_url.strip_suffix('/').unwrap_or(&self.swagger_url);
+            anyhow::ensure!(
+                path.len() > 1,
+                "invalid config: server.swagger_url ({}) would shadow every API route; use a sub-path such as /test-ui",
+                self.swagger_url
+            );
+            anyhow::ensure!(
+                !path.contains(['{', '}']) && !path.split('/').any(|s| s.starts_with(['*', ':'])),
+                "invalid config: server.swagger_url ({}) contains a path placeholder ({{ or }}) or a segment starting with * or :; use a plain sub-path such as /test-ui",
+                self.swagger_url
+            );
+            let first_segment = path[1..].split('/').next().unwrap_or_default();
+            anyhow::ensure!(
+                !crate::api::RESERVED_TOP_LEVEL_SEGMENTS.contains(&first_segment),
+                "invalid config: server.swagger_url ({}) would shadow the API route /{}; use a sub-path such as /test-ui",
+                self.swagger_url,
+                first_segment
+            );
+            anyhow::ensure!(
+                path != "/api-docs/openapi.json",
+                "invalid config: server.swagger_url ({}) would shadow the API route /api-docs/openapi.json; use a sub-path such as /test-ui",
+                self.swagger_url
+            );
+        }
         Ok(())
     }
 }
@@ -317,7 +366,6 @@ impl ServerConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    pub db_path: String,
     pub wal_path: String,
     pub vlog_path: String,
     pub sstable_dir: String,
@@ -335,7 +383,6 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            db_path: "luradb.db".to_string(),
             wal_path: "luradb.wal".to_string(),
             vlog_path: "luradb.vlog".to_string(),
             sstable_dir: "luradb_sstables".to_string(),
@@ -532,18 +579,6 @@ pub struct IoEngineConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct BufferPoolConfig {
-    pub pool_size: usize,
-}
-
-impl Default for BufferPoolConfig {
-    fn default() -> Self {
-        Self { pool_size: 1024 }
-    }
-}
-
 /// Block-cache sizing of one LSM instance. A parameter type, not a config
 /// section: the engines pass fixed values.
 #[derive(Debug)]
@@ -587,7 +622,7 @@ impl Default for LsmConfig {
         Self {
             vlog_inline_threshold: 1024,
             memtable_size_threshold: 4 * 1024 * 1024,
-            max_key_length: 256,
+            max_key_length: 512,
             max_value_size: 512 * 1024,
             flush_check_interval_ms: 100,
             compaction_check_interval_ms: 1000,
@@ -599,7 +634,11 @@ impl Default for LsmConfig {
 
 impl LsmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("lsm.flush_check_interval_ms", self.flush_check_interval_ms, 1)?;
+        check_min("lsm.compaction_check_interval_ms", self.compaction_check_interval_ms, 1)?;
+        check_min("lsm.wal_event_channel_capacity", self.wal_event_channel_capacity, 1)?;
         check_wal_field("lsm.max_value_size", self.max_value_size)?;
+        check_min("lsm.max_key_length", self.max_key_length, DOMAIN_KEY_PREFIX_LEN + 1)?;
         check_wal_field("lsm.max_key_length", self.max_key_length)
     }
 }
@@ -616,7 +655,7 @@ fn check_wal_field(key: &str, value: usize) -> anyhow::Result<()> {
 }
 
 /// Startup validation: rejects `value` below `min`.
-fn check_min(key: &str, value: usize, min: usize) -> anyhow::Result<()> {
+fn check_min<T: PartialOrd + std::fmt::Display>(key: &str, value: T, min: T) -> anyhow::Result<()> {
     anyhow::ensure!(value >= min, "invalid config: {key} ({value}) must be at least {min}");
     Ok(())
 }
@@ -646,7 +685,6 @@ impl JsonLsmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         check_min("json.lsm.max_value_size", self.max_value_size, JSON_LSM_MIN_VALUE_SIZE)?;
         check_wal_field("json.lsm.max_value_size", self.max_value_size)?;
-        check_min("json.lsm.max_key_length", self.max_key_length, json_domain::MIN_LSM_KEY_LENGTH)?;
         check_wal_field("json.lsm.max_key_length", self.max_key_length)
     }
 }
@@ -667,7 +705,6 @@ impl Default for RelLsmConfig {
 
 impl RelLsmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        check_min("rel.lsm.max_key_length", self.max_key_length, rel_catalog::MIN_LSM_KEY_LENGTH)?;
         check_wal_field("rel.lsm.max_key_length", self.max_key_length)
     }
 }
@@ -710,6 +747,12 @@ impl Default for JanitorCfg {
     }
 }
 
+impl JanitorCfg {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("janitor.check_interval_secs", self.check_interval_secs, 1)
+    }
+}
+
 /// Background task that tombstones TTL-expired keys and emits their delete
 /// events. Only the KV instance runs one.
 #[derive(Debug, Deserialize, Serialize)]
@@ -729,6 +772,12 @@ impl Default for TtlSweeperCfg {
             interval_secs: 60,
             batch_size: 500,
         }
+    }
+}
+
+impl TtlSweeperCfg {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("ttl_sweeper.interval_secs", self.interval_secs, 1)
     }
 }
 
@@ -760,13 +809,23 @@ impl Default for DomainsConfig {
     }
 }
 
+impl DomainsConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let max = crate::control::domains::max_name_length_limit();
+        anyhow::ensure!(
+            self.max_name_length <= max,
+            "domains.max_name_length = {} exceeds the maximum of {max}",
+            self.max_name_length
+        );
+        check_min("domains.purger_interval_secs", self.purger_interval_secs, 1)
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RateLimitConfig {
     pub default_read_iops: u32,
     pub default_write_iops: u32,
-    /// `0` means no limit.
-    pub default_max_storage_bytes: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -774,7 +833,6 @@ impl Default for RateLimitConfig {
         Self {
             default_read_iops: 1000,
             default_write_iops: 500,
-            default_max_storage_bytes: 0,
         }
     }
 }
@@ -839,6 +897,15 @@ pub enum LogFormat {
     Json,
 }
 
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogRotation {
+    None,
+    #[default]
+    Daily,
+    Hourly,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct LogConfig {
@@ -846,8 +913,8 @@ pub struct LogConfig {
     pub format: LogFormat,
     /// Empty = stdout only; the directory is created if missing.
     pub path: String,
-    /// "none" | "daily" | "hourly" — ignored when path is empty.
-    pub rotation: String,
+    /// Ignored when path is empty.
+    pub rotation: LogRotation,
     /// 0 = never delete.
     pub retention_days: u64,
     pub modules: LogModulesConfig,
@@ -862,7 +929,7 @@ impl Default for LogConfig {
             level: LogLevel::Info,
             format: LogFormat::Text,
             path: String::new(),
-            rotation: "daily".to_string(),
+            rotation: LogRotation::Daily,
             retention_days: 30,
             modules: LogModulesConfig::default(),
             http_access: false,
@@ -938,8 +1005,7 @@ impl JsonStoreConfig {
 }
 
 /// Config for the relational engine's dedicated LSM instance (own paths &
-/// limits). No `db_path` — like the JSON engine, this LSM instance has no
-/// buffer-pool/DiskManager stack, so there is no database file to point at.
+/// limits).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RelStoreConfig {
@@ -1205,6 +1271,12 @@ impl Default for EventsConfig {
     }
 }
 
+impl EventsConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_min("events.channel_capacity", self.channel_capacity, 1)
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CorsConfig {
@@ -1404,7 +1476,7 @@ pub struct MulticoreConfig {
     pub frontend_workers: usize,
     /// Data shards, each a thread with its own engine instances. `0` = auto
     /// = the count the data directory was written with; for a new one a
-    /// quarter of the cores, 1 to 8, and 1 while shared memory is enabled.
+    /// quarter of the cores, 1 to 8.
     pub shards: u16,
     /// Requests a data shard takes at once, running or waiting; beyond that
     /// it answers 503 with `Retry-After`.
@@ -1705,6 +1777,9 @@ pub(crate) const REMOVED_KEYS: &[&str] = &[
     "rel.block_cache.small_ratio",
     "rel.block_cache.ghost_capacity",
     "multicore.engine_queue_capacity",
+    "storage.db_path",
+    "buffer_pool.pool_size",
+    "rate_limit.default_max_storage_bytes",
 ];
 
 #[cfg(test)]
@@ -1715,7 +1790,7 @@ mod tests {
     // values have no effect.
     #[test]
     fn test_removed_keys_load_without_effect() {
-        assert_eq!(REMOVED_KEYS.len(), 73);
+        assert_eq!(REMOVED_KEYS.len(), 76);
         let toml_str: String = REMOVED_KEYS.iter().map(|key| format!("{key} = 1\n")).collect();
         let config: LuraConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(
@@ -1990,11 +2065,9 @@ mod tests {
         let config: LuraConfig = toml::from_str("").unwrap();
         assert_eq!(config.rate_limit.default_read_iops, 1000);
         assert_eq!(config.rate_limit.default_write_iops, 500);
-        assert_eq!(config.rate_limit.default_max_storage_bytes, 0);
         let quota = crate::engines::lsm::rate_limiter::DomainQuota::default();
         assert_eq!(quota.read_iops, config.rate_limit.default_read_iops);
         assert_eq!(quota.write_iops, config.rate_limit.default_write_iops);
-        assert_eq!(quota.max_storage_bytes, config.rate_limit.default_max_storage_bytes);
     }
 
     #[test]
@@ -2531,6 +2604,123 @@ mod tests {
     }
 
     #[test]
+    fn test_log_rotation_parses_the_three_values_and_defaults_to_daily() {
+        assert_eq!(LogConfig::default().rotation, LogRotation::Daily);
+        for (text, expected) in [
+            ("none", LogRotation::None),
+            ("daily", LogRotation::Daily),
+            ("hourly", LogRotation::Hourly),
+        ] {
+            let config: LuraConfig = toml::from_str(&format!("[log]\nrotation = \"{text}\"\n")).unwrap();
+            assert_eq!(config.log.rotation, expected);
+        }
+    }
+
+    #[test]
+    fn test_log_rotation_rejects_other_text_when_parsing() {
+        let err = toml::from_str::<LuraConfig>("[log]\nrotation = \"weekly\"\n").unwrap_err().to_string();
+        assert!(err.contains("weekly") && err.contains("hourly"), "{err}");
+    }
+
+    #[test]
+    fn test_lsm_validate_rejects_zero_intervals_and_capacity() {
+        for key in ["flush_check_interval_ms", "compaction_check_interval_ms", "wal_event_channel_capacity"] {
+            let config: LuraConfig = toml::from_str(&format!("[lsm]\n{key} = 0\n")).unwrap();
+            assert_invalid(config.lsm.validate(), &format!("lsm.{key} (0)"), "at least 1");
+        }
+        let config: LuraConfig = toml::from_str(
+            "[lsm]\nflush_check_interval_ms = 1\ncompaction_check_interval_ms = 1\nwal_event_channel_capacity = 1\n",
+        )
+        .unwrap();
+        assert!(config.lsm.validate().is_ok());
+    }
+
+    #[test]
+    fn test_janitor_validate_rejects_zero_interval() {
+        let config: LuraConfig = toml::from_str("[janitor]\ncheck_interval_secs = 0\n").unwrap();
+        assert_invalid(config.janitor.validate(), "janitor.check_interval_secs (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[janitor]\ncheck_interval_secs = 1\n").unwrap();
+        assert!(config.janitor.validate().is_ok());
+    }
+
+    #[test]
+    fn test_ttl_sweeper_validate_rejects_zero_interval() {
+        let config: LuraConfig = toml::from_str("[ttl_sweeper]\ninterval_secs = 0\n").unwrap();
+        assert_invalid(config.ttl_sweeper.validate(), "ttl_sweeper.interval_secs (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[ttl_sweeper]\ninterval_secs = 1\n").unwrap();
+        assert!(config.ttl_sweeper.validate().is_ok());
+    }
+
+    #[test]
+    fn test_domains_validate_rejects_zero_purger_interval() {
+        let config: LuraConfig = toml::from_str("[domains]\npurger_interval_secs = 0\n").unwrap();
+        assert_invalid(config.domains.validate(), "domains.purger_interval_secs (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[domains]\npurger_interval_secs = 1\n").unwrap();
+        assert!(config.domains.validate().is_ok());
+    }
+
+    #[test]
+    fn test_events_validate_rejects_zero_channel_capacity() {
+        let config: LuraConfig = toml::from_str("[events]\nchannel_capacity = 0\n").unwrap();
+        assert_invalid(config.events.validate(), "events.channel_capacity (0)", "at least 1");
+        let config: LuraConfig = toml::from_str("[events]\nchannel_capacity = 1\nreplay_buffer_size = 0\n").unwrap();
+        assert!(config.events.validate().is_ok());
+    }
+
+    #[test]
+    fn test_server_validate_swagger_url_needs_a_leading_slash_when_swagger_is_on() {
+        let config: LuraConfig = toml::from_str("[server]\nswagger_enabled = true\nswagger_url = \"docs\"\n").unwrap();
+        assert_invalid(config.server.validate(), "server.swagger_url (docs)", "start with /");
+        let config: LuraConfig = toml::from_str("[server]\nswagger_enabled = true\nswagger_url = \"\"\n").unwrap();
+        assert_invalid(config.server.validate(), "server.swagger_url ()", "start with /");
+        let config: LuraConfig = toml::from_str("[server]\nswagger_enabled = true\nswagger_url = \"/docs\"\n").unwrap();
+        assert!(config.server.validate().is_ok());
+    }
+
+    #[test]
+    fn test_server_validate_swagger_url_rejects_values_that_shadow_the_api_or_crash_the_router() {
+        let server = |url: &str, hello: bool| {
+            let toml_str = format!("[server]\nswagger_enabled = true\nswagger_url = '{url}'\nhello_enabled = {hello}\n");
+            toml::from_str::<LuraConfig>(&toml_str).unwrap().server
+        };
+        let rejected = [
+            ("/", "would shadow every API route"),
+            ("//", "would shadow every API route"),
+            ("/store-api", "would shadow the API route /store-api"),
+            ("/store-api/", "would shadow the API route /store-api"),
+            ("/store-api/kv", "would shadow the API route /store-api"),
+            ("/health", "would shadow the API route /health"),
+            ("/version", "would shadow the API route /version"),
+            ("/api-docs/openapi.json", "would shadow the API route /api-docs/openapi.json"),
+            ("/api-docs/openapi.json/", "would shadow the API route /api-docs/openapi.json"),
+            ("/{x}", "path placeholder"),
+            ("/{*x}", "path placeholder"),
+            ("/a{b}", "path placeholder"),
+            ("/:x", "path placeholder"),
+            ("/*x", "path placeholder"),
+            ("/a/:x", "path placeholder"),
+        ];
+        for (url, expected) in rejected {
+            for hello in [true, false] {
+                assert_invalid(server(url, hello).validate(), &format!("server.swagger_url ({url})"), expected);
+            }
+        }
+        for url in ["/docs", "/test-ui", "/test-ui/", "/ops/swagger", "/api-docs", "/api-docs/ui", "///", "/a*b"] {
+            for hello in [true, false] {
+                assert!(server(url, hello).validate().is_ok(), "{url} hello={hello}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_validate_ignores_swagger_url_while_swagger_is_off() {
+        let config: LuraConfig = toml::from_str("[server]\nswagger_url = \"docs\"\n").unwrap();
+        assert!(config.server.validate().is_ok());
+        let config: LuraConfig = toml::from_str("[server]\nswagger_url = \"/\"\n").unwrap();
+        assert!(config.server.validate().is_ok());
+    }
+
+    #[test]
     fn test_server_default_bind_address_is_loopback() {
         assert_eq!(ServerConfig::default().bind_address, "127.0.0.1");
     }
@@ -2785,6 +2975,13 @@ mod tests {
     }
 
     #[test]
+    fn test_lsm_validate_max_key_length_must_exceed_domain_prefix() {
+        let at = |max_key_length| LsmConfig { max_key_length, ..Default::default() };
+        assert_invalid(at(19).validate(), "lsm.max_key_length (19)", "at least 20");
+        assert!(at(20).validate().is_ok());
+    }
+
+    #[test]
     fn test_lsm_validate_json_lsm_over_cap_rejected() {
         let mut config = LuraConfig::default();
         config.json.lsm.max_value_size = WAL_MAX_FIELD_LEN + 1;
@@ -3014,25 +3211,53 @@ mod tests {
         );
     }
 
-    // Test 6: one byte below the lower bounds is a startup error, the bounds
-    // themselves and the WAL field cap are accepted.
+    // Key limits below the least the domain names need are raised with a
+    // warning, never a startup error; the WAL field cap and the value size
+    // bound still are.
     #[test]
-    fn test_json_and_rel_lsm_lower_bounds() {
+    fn test_json_and_rel_key_lengths_are_raised_to_take_the_domain_names() {
         let parse = |toml: &str| -> LuraConfig { toml::from_str(toml).unwrap() };
 
-        let config = parse("[json.lsm]\nmax_key_length = 68\n");
-        assert_invalid(config.json.validate(), "json.lsm.max_key_length (68)", "at least 69");
-        assert!(parse("[json.lsm]\nmax_key_length = 69\n").json.validate().is_ok());
-        assert!(parse(&format!("[json.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).json.validate().is_ok());
+        let mut config = parse("[json.lsm]\nmax_key_length = 68\n[rel.lsm]\nmax_key_length = 72\n");
+        assert_eq!(
+            config.raise_key_lengths(),
+            [
+                "json.lsm.max_key_length (68) is raised to 69, the least that takes domain names of \
+                 domains.max_name_length (50) characters",
+                "rel.lsm.max_key_length (72) is raised to 73, the least that takes domain names of \
+                 domains.max_name_length (50) characters",
+            ]
+        );
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (69, 73));
+        assert!(config.json.validate().is_ok() && config.rel.validate().is_ok());
 
+        let mut config = parse("[json.lsm]\nmax_key_length = 69\n[rel.lsm]\nmax_key_length = 73\n");
+        assert!(config.raise_key_lengths().is_empty());
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (69, 73));
+
+        let mut config = parse("[domains]\nmax_name_length = 80\n[rel.lsm]\nmax_key_length = 100\n");
+        assert_eq!(config.raise_key_lengths().len(), 1);
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (256, 103));
+        let mut config = parse("[domains]\nmax_name_length = 300\n");
+        config.raise_key_lengths();
+        assert_eq!((config.json.lsm.max_key_length, config.rel.lsm.max_key_length), (319, 323));
+
+        let mut config = parse(&format!("[json.lsm]\nmax_key_length = {}\n", WAL_MAX_FIELD_LEN + 1));
+        assert!(config.raise_key_lengths().is_empty());
+        assert!(config.json.validate().is_err());
         let config = parse("[json.lsm]\nmax_value_size = 4095\n");
         assert_invalid(config.json.validate(), "json.lsm.max_value_size (4095)", "at least 4096");
         assert!(parse("[json.lsm]\nmax_value_size = 4096\n").json.validate().is_ok());
+    }
 
-        let config = parse("[rel.lsm]\nmax_key_length = 72\n");
-        assert_invalid(config.rel.validate(), "rel.lsm.max_key_length (72)", "at least 73");
-        assert!(parse("[rel.lsm]\nmax_key_length = 73\n").rel.validate().is_ok());
-        assert!(parse(&format!("[rel.lsm]\nmax_key_length = {WAL_MAX_FIELD_LEN}\n")).rel.validate().is_ok());
+    // A domain name must fit the permission key of the longest user name in
+    // the system store's 512-byte keys: 512 - 16 - 50 - 8 bytes.
+    #[test]
+    fn test_domains_max_name_length_above_the_key_room_is_a_startup_error() {
+        let parse = |toml: &str| -> LuraConfig { toml::from_str(toml).unwrap() };
+        assert!(parse("[domains]\nmax_name_length = 438\n").domains.validate().is_ok());
+        let err = parse("[domains]\nmax_name_length = 439\n").domains.validate().unwrap_err();
+        assert_eq!(err.to_string(), "domains.max_name_length = 439 exceeds the maximum of 438");
     }
 
     // Test 3: optional fields and list elements count, section paths and
@@ -3272,6 +3497,10 @@ flag = true
             config.auth.validate(&config.server).unwrap();
             config.cors.validate().unwrap();
             config.lsm.validate().unwrap();
+            config.janitor.validate().unwrap();
+            config.ttl_sweeper.validate().unwrap();
+            config.domains.validate().unwrap();
+            config.events.validate().unwrap();
             config.json.validate().unwrap();
             config.rel.validate().unwrap();
             config.shm.validate().unwrap();

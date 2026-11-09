@@ -177,9 +177,9 @@ pub(super) async fn create_user(rest: SocketAddr, admin_key: &str, name: &str) -
     serde_json::from_slice::<Value>(&body).unwrap()["api_key"].as_str().unwrap().to_string()
 }
 
-/// Grants `user` `access` on the domain `domain` of `store_type`.
-async fn grant(rest: SocketAddr, admin_key: &str, user: &str, store_type: &str, domain: &str, access: &str) {
-    let body = json!({ "domain": domain, "access": access, "store_type": store_type }).to_string();
+/// Grants `user` `access` on `engine` of the domain `domain`.
+async fn grant(rest: SocketAddr, admin_key: &str, user: &str, engine: &str, domain: &str, access: &str) {
+    let body = json!({ "domain": domain, "access": access, "engine": engine }).to_string();
     rest_ok(rest, "POST", &format!("/store-api/auth/users/{user}/permissions"), admin_key, &body).await;
 }
 
@@ -302,7 +302,7 @@ fn resources_list_and_read_the_schema() {
     with_mcp(
         |cfg| cfg.rel.enabled = true,
         |rest, mcp| async move {
-            let (status, _) = super::tests::request(rest, &rest_call("POST", "/store-api/rel/domains", None, r#"{"name":"sales"}"#)).await;
+            let (status, _) = super::tests::request(rest, &rest_call("POST", "/store-api/domains", None, r#"{"name":"sales"}"#)).await;
             assert_eq!(status, 201);
             let sql = json!({"sql": "CREATE TABLE orders (id INTEGER PRIMARY KEY)"}).to_string();
             let (status, _) = super::tests::request(rest, &rest_call("POST", "/store-api/rel/sales/sql", None, &sql)).await;
@@ -340,8 +340,8 @@ fn a_user_key_sees_and_does_what_its_permissions_allow() {
             cfg.mcp.allow_ddl = true;
         },
         |rest, mcp| async move {
-            for (route, name) in [("/store-api/domains", "mine"), ("/store-api/domains", "theirs"), ("/store-api/rel/domains", "mine")] {
-                rest_ok(rest, "POST", route, admin_key, &json!({ "name": name }).to_string()).await;
+            for name in ["mine", "theirs"] {
+                rest_ok(rest, "POST", "/store-api/domains", admin_key, &json!({ "name": name }).to_string()).await;
             }
             let sql = json!({"sql": "CREATE TABLE t (id INTEGER PRIMARY KEY)"}).to_string();
             rest_ok(rest, "POST", "/store-api/rel/mine/sql", admin_key, &sql).await;
@@ -359,13 +359,14 @@ fn a_user_key_sees_and_does_what_its_permissions_allow() {
             assert!(names.contains(&"kv_put".to_string()) && names.contains(&"sql_ddl".to_string()), "{names:?}");
 
             let domains = client.call("list_domains", json!({})).await;
-            let listed: Vec<(String, String)> = domains.result()["structuredContent"]["domains"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|d| (d["engine"].as_str().unwrap().to_string(), d["name"].as_str().unwrap().to_string()))
-                .collect();
-            assert_eq!(listed, [("kv".to_string(), "mine".to_string()), ("rel".to_string(), "mine".to_string())]);
+            let listed = &domains.result()["structuredContent"]["domains"];
+            assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+            assert_eq!((listed[0]["name"].clone(), listed[0]["state"].clone()), (json!("mine"), json!("active")));
+            assert!(listed[0]["created_at"].is_u64() && listed[0].get("engine").is_none(), "{listed}");
+            let described = client.call("describe_domain", json!({"name": "mine"})).await;
+            assert_eq!(described.result()["structuredContent"]["name"], json!("mine"), "{}", described.text());
+            let refused = client.call("describe_domain", json!({"name": "theirs"})).await;
+            assert!(refused.is_error() && refused.text().starts_with("HTTP 403"), "{}", refused.text());
 
             let tables = client.call("list_tables", json!({"domain": "mine"})).await;
             assert!(!tables.is_error() && tables.text().contains("\"t\""), "{}", tables.text());
@@ -373,7 +374,7 @@ fn a_user_key_sees_and_does_what_its_permissions_allow() {
             assert_eq!(value.result()["structuredContent"]["value"], json!("clé"));
             let put = client.call("kv_put", json!({"domain": "mine", "key": "k", "value": "x"})).await;
             assert!(put.is_error() && put.text().starts_with("HTTP 403"), "{}", put.text());
-            let create = client.call("create_domain", json!({"engine": "kv", "name": "new"})).await;
+            let create = client.call("create_domain", json!({"name": "new"})).await;
             assert!(create.is_error() && create.text().starts_with("HTTP 403"), "{}", create.text());
             let metrics = client.call("metrics", json!({})).await;
             assert!(metrics.is_error() && metrics.text().starts_with("HTTP 403"), "{}", metrics.text());
@@ -381,8 +382,8 @@ fn a_user_key_sees_and_does_what_its_permissions_allow() {
     );
 }
 
-// An admin key reads, writes and creates structure in every engine; the
-// domain list spans all three.
+// An admin key reads, writes and creates structure in every engine of one
+// domain; the domain list and its resource name the domain once.
 #[test]
 fn an_admin_key_works_every_engine() {
     let admin_key = "lura_mcp_engines_admin";
@@ -402,19 +403,22 @@ fn an_admin_key_works_every_engine() {
                 assert!(!answer.is_error(), "{}", answer.text());
                 answer
             };
-            for engine in ["kv", "json", "rel"] {
-                ok(client.call("create_domain", json!({"engine": engine, "name": "zoo"})).await);
-            }
+            let setting = json!({"kv": false, "json": false});
+            ok(client.call("create_domain", json!({"name": "zoo", "require_conditional_writes": setting})).await);
             let listed = ok(client.call("list_domains", json!({})).await);
-            let engines: Vec<&str> = listed.result()["structuredContent"]["domains"]
+            let names: Vec<&str> = listed.result()["structuredContent"]["domains"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|d| d["name"] == json!("zoo"))
-                .map(|d| d["engine"].as_str().unwrap())
+                .map(|d| d["name"].as_str().unwrap())
                 .collect();
-            assert_eq!(engines, ["kv", "json", "rel"]);
-            assert_eq!(listed.result()["structuredContent"]["unavailable_engines"], json!([]));
+            assert_eq!(names, ["default", "zoo"]);
+            assert!(listed.result()["structuredContent"].get("unavailable_engines").is_none());
+            let described = ok(client.call("describe_domain", json!({"name": "zoo"})).await);
+            assert_eq!(described.result()["structuredContent"]["require_conditional_writes"], setting);
+            let read = client.request("resources/read", json!({"uri": "luradb://domains"})).await;
+            let text = read.result()["contents"][0]["text"].as_str().unwrap().to_string();
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), listed.result()["structuredContent"]);
 
             ok(client.call("kv_put", json!({"domain": "zoo", "key": "k", "value": "clé"})).await);
             let value = ok(client.call("kv_get", json!({"domain": "zoo", "key": "k"})).await);

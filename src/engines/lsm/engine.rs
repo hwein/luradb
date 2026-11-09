@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch, Notify};
 
 // Default limits — kept as constants so tests can reference them directly.
-const MAX_KEY_LENGTH: usize = 256;
+const MAX_KEY_LENGTH: usize = 512;
 const MAX_VALUE_SIZE_LIMIT: usize = 512 * 1024;
 
 /// Per-instance tuning parameters for the LSM storage engine.
@@ -2559,8 +2559,8 @@ pub enum BatchOp {
 }
 
 impl StorageEngine for LsmStorageEngine {
-    // Generic two-valued contract (shared with the unrelated `KvStore` engine):
-    // collapses `Null` into `None`, like every caller outside the KV engine.
+    // Generic two-valued contract: collapses `Null` into `None`, like every
+    // caller outside the KV engine.
     // Callers that must distinguish Null use `get_with_snapshot`.
     fn get(&self, key: &[u8]) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
         async move { Ok(self.get_latest_with_expiry(key).await?.0.into_option()) }

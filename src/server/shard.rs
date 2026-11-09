@@ -8,21 +8,19 @@ use crate::{
     api::{self, AppState},
     bridge::{self, Job},
     config::LuraConfig,
-    control::{self, slots, Engine, ShardCommand, ShardOwners},
+    control::{self, Engine, ShardCommand, ShardOwners},
     core::{
-        buffer_pool::BufferPoolManager,
-        disk_manager::DiskManager,
         engine_runtime,
         io_engine::{IoEngine, REGISTERED_BUFFER_COUNT, REGISTERED_BUFFER_SIZE, VLOG_LOGICAL_ID},
     },
-    engines::json::{domain as json_domain, JsonEngine},
+    engines::json::JsonEngine,
     engines::lsm::{
         domain::{DomainPurger, DomainRegistry},
         engine::LsmStorageEngine,
         rate_limiter::DomainQuota,
         ttl_sweeper::TtlSweeper,
     },
-    engines::rel::{domain as rel_domain, RelEngine},
+    engines::rel::RelEngine,
     metrics::{MetricsConfig, MetricsStore, MetricsTicker},
 };
 use anyhow::Context;
@@ -40,7 +38,6 @@ pub(super) struct ShardBoot {
     pub(super) kv: Arc<LsmStorageEngine>,
     pub(super) json: Option<Arc<LsmStorageEngine>>,
     pub(super) rel: Option<Arc<LsmStorageEngine>>,
-    pub(super) buffer_pool_pages: usize,
     pub(super) jobs: mpsc::Receiver<Job>,
     pub(super) commands: mpsc::UnboundedReceiver<ShardCommand>,
     /// The shard's engines once they are up.
@@ -77,7 +74,6 @@ pub(super) fn spawn(boot: ShardBoot, frontend: tokio::runtime::Handle) -> anyhow
 /// The shard's engine instances and the storage stack beside them.
 struct Storage {
     instances: Vec<(Engine, Arc<LsmStorageEngine>)>,
-    buffer_pool: Option<Arc<BufferPoolManager>>,
     /// Registered buffers and files stay alive for the whole run; dropping
     /// this closes their descriptors (a blocking `close(2)` each).
     io_engine: Option<IoEngine>,
@@ -90,7 +86,7 @@ async fn run(boot: ShardBoot) {
     for (_, instance) in &instances {
         instance.start_background_tasks();
     }
-    let mut storage = Storage { instances, buffer_pool: None, io_engine: None };
+    let mut storage = Storage { instances, io_engine: None };
     let opened = open(&mut storage, &boot).await;
     let ShardBoot { config, jobs, commands, ready, start, .. } = boot;
     #[cfg(test)]
@@ -147,19 +143,13 @@ async fn run(boot: ShardBoot) {
     drop(storage.io_engine);
 }
 
-/// Puts the page store, the registered buffers (shard 0 of a single one
-/// only) and the domain layers, with a metrics store of their own, on the
-/// shard's instances. Only the shard that owns the default domain creates it.
+/// Puts the registered buffers (shard 0 of a single one only) and the domain
+/// layers, with a metrics store of their own, on the shard's instances.
 async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOwners> {
-    let ShardBoot { shard, shards, config, kv, json, rel, buffer_pool_pages, .. } = boot;
-    let (shard, shards) = (*shard, *shards);
+    let ShardBoot { shard, shards, config, kv, json, rel, .. } = boot;
     let metrics = MetricsStore::new(MetricsConfig::default());
-    let owns = |name: &str| usize::from(slots::shard_of_domain(name, shards)) == shard;
 
-    let db_path = layout::shard_file(Path::new(&config.storage.db_path), shard);
-    let disk_manager = DiskManager::new(&db_path).await?;
-    storage.buffer_pool = Some(Arc::new(BufferPoolManager::new(*buffer_pool_pages, disk_manager)));
-    if shard == 0 && shards == 1 {
+    if holds_registered_buffers(*shard, *shards) {
         let vlog_path = layout::shard_file(Path::new(&config.storage.vlog_path), 0);
         storage.io_engine = init_io_engine(config, &vlog_path).await;
         if let Some(io_engine) = storage.io_engine.as_mut() {
@@ -168,20 +158,14 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
     }
 
     let domain_config = super::control::domain_config(config);
-    let owns_kv_default = owns(&domain_config.default_domain);
-    let registry = Arc::new(
-        DomainRegistry::recover_on_shard(Arc::clone(kv), domain_config, Arc::clone(&metrics), owns_kv_default).await?,
-    );
+    let registry = Arc::new(DomainRegistry::recover(Arc::clone(kv), domain_config, Arc::clone(&metrics)).await?);
     let json = match json {
-        Some(json) => Some(
-            JsonEngine::open(&config.json, Arc::clone(json), Arc::clone(&metrics), owns(json_domain::DEFAULT_DOMAIN))
-                .await?,
-        ),
+        Some(json) => Some(JsonEngine::open(&config.json, Arc::clone(json), Arc::clone(&metrics)).await?),
         None => None,
     };
     let rel = match rel {
         Some(rel) => {
-            // Same-named KV and JSON domains live on this shard too.
+            // A domain's key-value and JSON parts live on this shard too.
             let resolver = crate::engines::rel::CrossEngineResolver::new(
                 Some(Arc::clone(&registry)),
                 json.clone(),
@@ -190,29 +174,26 @@ async fn open(storage: &mut Storage, boot: &ShardBoot) -> anyhow::Result<ShardOw
             let quota = DomainQuota {
                 read_iops: config.rate_limit.default_read_iops,
                 write_iops: config.rate_limit.default_write_iops,
-                max_storage_bytes: config.rate_limit.default_max_storage_bytes,
             };
-            let owns_default = owns(rel_domain::DEFAULT_DOMAIN);
-            Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(&metrics), resolver, owns_default).await?)
+            Some(RelEngine::open(&config.rel, quota, Arc::clone(rel), Arc::clone(&metrics), resolver).await?)
         }
         None => None,
     };
     Ok(ShardOwners { kv: registry, json, rel })
 }
 
+/// Whether data shard `shard` of `shards` takes the registered buffers.
+fn holds_registered_buffers(shard: usize, shards: u16) -> bool {
+    shard == 0 && shards == 1
+}
+
 /// Stops the instances' background tasks and flushes each instance once its
-/// writes in flight have applied, then the page store; the result of each
-/// instance's flush.
+/// writes in flight have applied; the result of each instance's flush.
 async fn close(storage: &Storage) -> Vec<(Engine, anyhow::Result<()>)> {
     let mut flushed = Vec::with_capacity(storage.instances.len());
     for (engine, instance) in &storage.instances {
         instance.quiesce_writes().await;
         flushed.push((*engine, instance.shutdown_flush().await));
-    }
-    if let Some(buffer_pool) = &storage.buffer_pool {
-        if let Err(e) = buffer_pool.flush_all_pages().await {
-            tracing::error!("Failed to flush pages: {}", e);
-        }
     }
     flushed
 }
@@ -322,17 +303,6 @@ fn spawn_loops(cfg: &LuraConfig, owners: &ShardOwners) -> Loops {
     }
 
     if let Some(engine) = &owners.rel {
-        if engine.cross_engine_has_target() {
-            let sweeper = Arc::new(crate::engines::rel::RelCrossEngineSweeper::new(
-                Arc::clone(engine),
-                crate::engines::rel::cross_engine::SWEEP_BATCH_SIZE,
-            ));
-            let interval = Duration::from_secs(crate::engines::rel::cross_engine::SWEEP_INTERVAL_SECS);
-            loops.spawn("RelCrossEngineSweeper", interval, move || {
-                let sweeper = Arc::clone(&sweeper);
-                async move { sweeper.sweep_tick().await }
-            });
-        }
         let rel_purger = Arc::new(crate::engines::rel::RelDomainPurger::new(
             Arc::clone(engine),
             crate::engines::rel::purger::PURGER_BATCH_SIZE,
@@ -414,7 +384,7 @@ mod tests {
             });
             hook.reached.notified().await;
 
-            let storage = Storage { instances: vec![(Engine::Kv, Arc::clone(&kv))], buffer_pool: None, io_engine: None };
+            let storage = Storage { instances: vec![(Engine::Kv, Arc::clone(&kv))], io_engine: None };
             let shutdown = compio::runtime::spawn(async move {
                 loops.stop().await;
                 close(&storage).await
@@ -434,5 +404,14 @@ mod tests {
                 assert_eq!(kv.get(key.as_bytes()).await.unwrap(), Some(b"v".to_vec()), "{key}");
             }
         })
+    }
+
+    // Whether the kernel grants the buffers depends on the host's lockable
+    // memory, so the rule is checked on its own.
+    #[test]
+    fn only_the_shard_of_a_single_shard_server_holds_the_registered_buffers() {
+        assert!(holds_registered_buffers(0, 1));
+        assert!(!holds_registered_buffers(0, 2));
+        assert!(!holds_registered_buffers(1, 2));
     }
 }

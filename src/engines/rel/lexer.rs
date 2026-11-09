@@ -78,6 +78,11 @@ pub enum Keyword {
     Jsonref,
 }
 
+/// Whether `word` is a LuraSQL keyword, in any letter case.
+pub(crate) fn is_keyword(word: &str) -> bool {
+    Keyword::from_lowercase(&word.to_ascii_lowercase()).is_some()
+}
+
 impl Keyword {
     /// Case-insensitive keyword lookup; `word` must already be lowercase.
     fn from_lowercase(word: &str) -> Option<Keyword> {
@@ -579,6 +584,17 @@ mod tests {
             toks("CREATE TABLE"),
             vec![Token::Keyword(Keyword::Create), Token::Keyword(Keyword::Table)]
         );
+    }
+
+    #[test]
+    fn test_unsupported_clause_words_lex_as_identifiers() {
+        for word in [
+            "distinct", "inner", "right", "full", "cross", "union", "except", "intersect", "group",
+            "having",
+        ] {
+            assert_eq!(toks(word), vec![Token::Ident(word.to_string())]);
+            assert_eq!(toks(&word.to_uppercase()), vec![Token::Ident(word.to_string())]);
+        }
     }
 
     // 1b. Identifiers vs keywords; identifiers normalize to lowercase.

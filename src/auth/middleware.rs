@@ -4,6 +4,7 @@
 //!   Request → AuthMiddleware → DomainResolver → RateLimiter → Handler
 
 use crate::auth::{AccessLevel, AuthCache};
+use crate::control::Engine;
 use axum::{
     extract::Request,
     http::{header, Method, StatusCode},
@@ -25,57 +26,28 @@ pub struct TrustedPeer;
 #[derive(Clone, Copy, Debug)]
 pub struct McpInternal;
 
-/// Store type of a domain-scoped request — KV, JSON and rel domains are
-/// separate permission namespaces.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum StoreType {
-    Kv,
-    Json,
-    Rel,
-}
-
-/// Extracts `(store_type, domain, management)` from domain-scoped API paths:
+/// Extracts `(engine, domain, management)` from domain-scoped API paths;
+/// an engine of `None` is the domain as a whole:
 ///   /store-api/kv/{domain}/…             → (Kv, domain, false)
 ///   /store-api/json/{domain}/…           → (Json, domain, false)
 ///   /store-api/rel/{domain}/…            → (Rel, domain, false)
-///   /store-api/domains/{domain}[/…]      → (Kv, domain, true)   KV domain management
-///   /store-api/json/domains/{domain}     → (Json, domain, true) JSON domain management
-///   /store-api/rel/domains/{domain}      → (Rel, domain, true)  rel domain management
-///   /store-api/metrics/domains/{domain}  → (Kv, domain, false)  domain metrics
-/// The domain listings (`/store-api/{,json/,rel/}domains`) and everything
-/// else → None.
-pub(crate) fn extract_domain(path: &str) -> Option<(StoreType, &str, bool)> {
+///   /store-api/domains/{domain}[/…]      → (None, domain, true)   domain management
+///   /store-api/metrics/domains/{domain}  → (None, domain, false)  domain metrics
+/// The domain listing (`/store-api/domains`) and everything else → None.
+pub(crate) fn extract_domain(path: &str) -> Option<(Option<Engine>, &str, bool)> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
-        ["store-api", "kv", domain, ..] if !domain.is_empty() => {
-            Some((StoreType::Kv, domain, false))
-        }
-        ["store-api", "json", "domains", domain] if !domain.is_empty() => {
-            Some((StoreType::Json, domain, true))
-        }
-        ["store-api", "json", "domains", ..] => None,
-        ["store-api", "json", domain, ..] if !domain.is_empty() => {
-            Some((StoreType::Json, domain, false))
-        }
-        ["store-api", "rel", "domains", domain] if !domain.is_empty() => {
-            Some((StoreType::Rel, domain, true))
-        }
-        ["store-api", "rel", "domains", ..] => None,
-        ["store-api", "rel", domain, ..] if !domain.is_empty() => {
-            Some((StoreType::Rel, domain, false))
-        }
-        ["store-api", "domains", domain, ..] if !domain.is_empty() => {
-            Some((StoreType::Kv, domain, true))
-        }
-        ["store-api", "metrics", "domains", domain, ..] if !domain.is_empty() => {
-            Some((StoreType::Kv, domain, false))
-        }
+        ["store-api", "kv", domain, ..] if !domain.is_empty() => Some((Some(Engine::Kv), domain, false)),
+        ["store-api", "json", domain, ..] if !domain.is_empty() => Some((Some(Engine::Json), domain, false)),
+        ["store-api", "rel", domain, ..] if !domain.is_empty() => Some((Some(Engine::Rel), domain, false)),
+        ["store-api", "domains", domain, ..] if !domain.is_empty() => Some((None, domain, true)),
+        ["store-api", "metrics", "domains", domain, ..] if !domain.is_empty() => Some((None, domain, false)),
         _ => None,
     }
 }
 
 fn is_domain_listing(path: &str) -> bool {
-    matches!(path, "/store-api/domains" | "/store-api/json/domains" | "/store-api/rel/domains")
+    path == "/store-api/domains"
 }
 
 /// POST counts as a write except for the read-only `/search` endpoint and
@@ -89,28 +61,27 @@ fn is_write_request(method: &Method, path: &str) -> bool {
     }
 }
 
-/// Permission-table key for a domain: JSON/rel domains live in their own
-/// namespace (`json:{domain}` / `rel:{domain}`), plain names are KV permissions.
-pub(crate) fn permission_domain(store_type: StoreType, domain: &str) -> String {
-    match store_type {
-        StoreType::Kv => domain.to_string(),
-        StoreType::Json => format!("json:{domain}"),
-        StoreType::Rel => format!("rel:{domain}"),
+/// Permission-table key of a grant on `domain`: on the whole domain (`None`)
+/// `domain:{domain}`, on one engine `{domain}` (key-value), `json:{domain}`
+/// or `rel:{domain}`.
+pub(crate) fn permission_domain(engine: Option<Engine>, domain: &str) -> String {
+    match engine {
+        None => format!("domain:{domain}"),
+        Some(Engine::Kv) => domain.to_string(),
+        Some(Engine::Json) => format!("json:{domain}"),
+        Some(Engine::Rel) => format!("rel:{domain}"),
     }
 }
 
-/// Reverses `permission_domain`. Domain names never contain `:` (enforced by
-/// each engine's domain-name validation at creation time), and
-/// `permission_domain` is the only writer of these keys — so the prefix
-/// match below is unambiguous and total, with no fallback branch needed.
-pub(crate) fn split_permission_domain(stored: &str) -> (StoreType, &str) {
-    if let Some(domain) = stored.strip_prefix("json:") {
-        (StoreType::Json, domain)
-    } else if let Some(domain) = stored.strip_prefix("rel:") {
-        (StoreType::Rel, domain)
-    } else {
-        (StoreType::Kv, stored)
+/// Reverses `permission_domain`. Domain names never contain `:`, so the
+/// prefix is unambiguous; a key without one is a key-value grant.
+pub(crate) fn split_permission_domain(stored: &str) -> (Option<Engine>, &str) {
+    for (prefix, engine) in [("domain:", None), ("json:", Some(Engine::Json)), ("rel:", Some(Engine::Rel))] {
+        if let Some(domain) = stored.strip_prefix(prefix) {
+            return (engine, domain);
+        }
     }
+    (Some(Engine::Kv), stored)
 }
 
 fn unauthorized() -> Response {
@@ -216,7 +187,7 @@ pub async fn auth_layer(
     }
 
     // Regular user: check domain permission
-    let (store_type, domain, management) = match extract_domain(&path) {
+    let (engine, domain, management) = match extract_domain(&path) {
         Some(x) => x,
         None => {
             // Path doesn't include a domain (e.g. /auth/*, /metrics, /config).
@@ -236,11 +207,11 @@ pub async fn auth_layer(
         return forbidden();
     }
 
-    let perm_domain = permission_domain(store_type, domain);
-    let perm = cache.get_permission(&user.name, &perm_domain).await;
-    // Ddl > Write > Read: a higher grant covers path-based
-    // writes too. `/sql` never requires more than Read here — the exact
-    // statement level is the handler's job (`enforce_sql_level`).
+    let perm = cache.effective(&user.name, domain, engine).await;
+    // Ddl > Write > Read: a higher grant covers path-based writes too, so Ddl
+    // acts as Write on keys and documents. `/sql` never requires more than
+    // Read here — the exact statement level is the handler's job
+    // (`enforce_sql_level`).
     let required_min = if is_write_request(request.method(), &path) {
         AccessLevel::Write
     } else {
@@ -254,30 +225,6 @@ pub async fn auth_layer(
         }
         _ => forbidden(),
     }
-}
-
-/// Axum middleware for the OpenAPI/Swagger docs routes.
-/// Applied only to the Swagger sub-router in `build_router` — never merged
-/// into `create_router`'s route surface, which would trip the
-/// router-contract coverage gate. Same "any valid key, no domain permission"
-/// rule as the `/version` handshake in `auth_layer` above, since docs routes
-/// aren't domain-scoped either.
-pub async fn docs_auth_layer(
-    axum::extract::State(cache): axum::extract::State<Arc<AuthCache>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if request.extensions().get::<TrustedPeer>().is_some() {
-        return next.run(request).await;
-    }
-    let hash = match extract_bearer(request.headers()) {
-        Some(h) => h,
-        None => return unauthorized(),
-    };
-    if cache.get_user_by_key_hash(&hash).await.is_none() {
-        return unauthorized();
-    }
-    next.run(request).await
 }
 
 pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -298,53 +245,46 @@ mod tests {
     fn domain_extraction() {
         assert_eq!(
             extract_domain("/store-api/kv/analytics/keys/foo"),
-            Some((StoreType::Kv, "analytics", false))
+            Some((Some(Engine::Kv), "analytics", false))
         );
         assert_eq!(
             extract_domain("/store-api/json/users/documents/doc1"),
-            Some((StoreType::Json, "users", false))
+            Some((Some(Engine::Json), "users", false))
         );
         assert_eq!(
             extract_domain("/store-api/json/users/search"),
-            Some((StoreType::Json, "users", false))
+            Some((Some(Engine::Json), "users", false))
         );
-        assert_eq!(extract_domain("/store-api/json/domains"), None);
         assert_eq!(
-            extract_domain("/store-api/json/domains/users"),
-            Some((StoreType::Json, "users", true))
+            extract_domain("/store-api/json/domains/documents"),
+            Some((Some(Engine::Json), "domains", false))
         );
-        assert_eq!(extract_domain("/store-api/json/domains/users/extra"), None);
-        assert_eq!(extract_domain("/store-api/json/domains/"), None);
         assert_eq!(
             extract_domain("/store-api/rel/sales/sql"),
-            Some((StoreType::Rel, "sales", false))
+            Some((Some(Engine::Rel), "sales", false))
         );
         assert_eq!(
             extract_domain("/store-api/rel/sales/tables/orders/rows"),
-            Some((StoreType::Rel, "sales", false))
+            Some((Some(Engine::Rel), "sales", false))
         );
         assert_eq!(
             extract_domain("/store-api/rel/sales/tables/from-file"),
-            Some((StoreType::Rel, "sales", false))
+            Some((Some(Engine::Rel), "sales", false))
         );
-        assert_eq!(extract_domain("/store-api/rel/domains"), None);
-        assert_eq!(
-            extract_domain("/store-api/rel/domains/sales"),
-            Some((StoreType::Rel, "sales", true))
-        );
-        assert_eq!(extract_domain("/store-api/rel/domains/sales/extra"), None);
-        assert_eq!(extract_domain("/store-api/rel/domains/"), None);
-        assert_eq!(
-            extract_domain("/store-api/domains/analytics"),
-            Some((StoreType::Kv, "analytics", true))
-        );
-        assert_eq!(
-            extract_domain("/store-api/metrics/domains/myapp"),
-            Some((StoreType::Kv, "myapp", false))
-        );
+        assert_eq!(extract_domain("/store-api/domains/analytics"), Some((None, "analytics", true)));
+        assert_eq!(extract_domain("/store-api/metrics/domains/myapp"), Some((None, "myapp", false)));
         assert_eq!(extract_domain("/store-api/auth/users"), None);
         assert_eq!(extract_domain("/store-api/domains"), None);
         assert_eq!(extract_domain("/health"), None);
+        for empty in [
+            "/store-api/kv//keys",
+            "/store-api/json//documents",
+            "/store-api/rel//sql",
+            "/store-api/domains/",
+            "/store-api/metrics/domains/",
+        ] {
+            assert_eq!(extract_domain(empty), None, "{empty}");
+        }
     }
 
     #[test]
@@ -365,23 +305,27 @@ mod tests {
 
     #[test]
     fn permission_domain_scoping() {
-        assert_eq!(permission_domain(StoreType::Kv, "users"), "users");
-        assert_eq!(permission_domain(StoreType::Json, "users"), "json:users");
-        assert_eq!(permission_domain(StoreType::Rel, "sales"), "rel:sales");
+        assert_eq!(permission_domain(None, "users"), "domain:users");
+        assert_eq!(permission_domain(Some(Engine::Kv), "users"), "users");
+        assert_eq!(permission_domain(Some(Engine::Json), "users"), "json:users");
+        assert_eq!(permission_domain(Some(Engine::Rel), "sales"), "rel:sales");
     }
 
     #[test]
     fn split_permission_domain_roundtrip() {
-        for (store_type, domain) in [
-            (StoreType::Kv, "analytics"),
-            (StoreType::Json, "users"),
-            (StoreType::Rel, "sales"),
+        for (engine, domain) in [
+            (None, "shop"),
+            (Some(Engine::Kv), "analytics"),
+            (Some(Engine::Json), "users"),
+            (Some(Engine::Rel), "sales"),
         ] {
-            let stored = permission_domain(store_type, domain);
-            assert_eq!(split_permission_domain(&stored), (store_type, domain));
+            let stored = permission_domain(engine, domain);
+            assert_eq!(split_permission_domain(&stored), (engine, domain));
         }
-        // No prefix (pre-existing plain KV keys) -> Kv.
-        assert_eq!(split_permission_domain("plain"), (StoreType::Kv, "plain"));
+        // No prefix -> Kv, also for domains named like a prefix.
+        for plain in ["plain", "domain", "json"] {
+            assert_eq!(split_permission_domain(plain), (Some(Engine::Kv), plain));
+        }
     }
 
     #[test]
@@ -414,10 +358,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::util::ServiceExt;
-    use utoipa::OpenApi;
 
-    /// Shared engine/state bootstrap for `make_app_with_auth` and
-    /// `make_docs_app` below.
+    /// Shared engine/state bootstrap for `make_app_with_auth` below.
     async fn make_test_state(auth_enabled: bool) -> (crate::api::AppState, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_path = dir.path().join("wal.log");
@@ -470,26 +412,6 @@ mod tests {
         let (state, dir) = make_test_state(true).await;
         let auth_cache = Arc::clone(&state.auth_cache);
         let app = crate::api::router_inline(state, Arc::new(vec![]));
-        (app, auth_cache, dir)
-    }
-
-    /// Builds the Swagger/docs sub-router + `docs_auth_layer`, merged with the
-    /// regular API router — the docs part of the frontend router
-    /// (`server::build_router`), without the engine bridge.
-    async fn make_docs_app(auth_enabled: bool) -> (axum::Router, Arc<crate::auth::AuthCache>, tempfile::TempDir) {
-        let (state, dir) = make_test_state(auth_enabled).await;
-        let auth_cache = Arc::clone(&state.auth_cache);
-        let mut docs_router = axum::Router::new().merge(
-            utoipa_swagger_ui::SwaggerUi::new("/test-ui")
-                .url("/api-docs/openapi.json", crate::api::ApiDoc::openapi()),
-        );
-        if auth_enabled {
-            docs_router = docs_router.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&auth_cache),
-                docs_auth_layer,
-            ));
-        }
-        let app = docs_router.merge(crate::api::router_inline(state, Arc::new(vec![])));
         (app, auth_cache, dir)
     }
 
@@ -607,113 +529,4 @@ mod tests {
         })
     }
 
-    #[test]
-    fn docs_routes_require_key_when_auth_enabled() {
-        crate::core::engine_runtime::block_on(async {
-            let (app, _auth_cache, _dir) = make_docs_app(true).await;
-
-            // openapi.json, the bare swagger_url (redirects to .../), and an
-            // asset sub-path under it — the `{*rest}` wildcard SwaggerUi
-            // registers for its own static assets is part of the same
-            // sub-router, so it's covered by the same layer too, no path list
-            // needed.
-            for uri in ["/api-docs/openapi.json", "/test-ui", "/test-ui/does-not-exist.js"] {
-                let resp = app
-                    .clone()
-                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
-            }
-
-            // /health is untouched by this change.
-            let resp = app
-                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-        })
-    }
-
-    #[test]
-    fn docs_routes_accept_any_valid_key_no_domain_permission() {
-        crate::core::engine_runtime::block_on(async {
-            let (app, auth_cache, _dir) = make_docs_app(true).await;
-
-            // Non-admin key with no domain permission at all -> still 200, same
-            // "any valid key" rule as /version (not 403 from the extract_domain
-            // fallback that `auth_layer` would otherwise apply).
-            let key = "lura_test_docs_key";
-            auth_cache
-                .upsert_user(crate::auth::UserRecord {
-                    name: "worker".to_string(),
-                    api_key_hash: crate::auth::hash_api_key(key),
-                    role: crate::auth::UserRole::User,
-                    created_at: 0,
-                })
-                .await
-                .unwrap();
-
-            for uri in ["/api-docs/openapi.json", "/test-ui/"] {
-                let resp = app
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .uri(uri)
-                            .header("authorization", format!("Bearer {key}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            }
-        })
-    }
-
-    #[test]
-    fn docs_routes_accept_admin_key() {
-        crate::core::engine_runtime::block_on(async {
-            let (app, auth_cache, _dir) = make_docs_app(true).await;
-
-            let key = "lura_test_docs_admin_key";
-            auth_cache
-                .upsert_user(crate::auth::UserRecord {
-                    name: "admin".to_string(),
-                    api_key_hash: crate::auth::hash_api_key(key),
-                    role: crate::auth::UserRole::Admin,
-                    created_at: 0,
-                })
-                .await
-                .unwrap();
-
-            let resp = app
-                .oneshot(
-                    Request::builder()
-                        .uri("/api-docs/openapi.json")
-                        .header("authorization", format!("Bearer {key}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-        })
-    }
-
-    #[test]
-    fn docs_routes_open_without_key_when_auth_disabled() {
-        crate::core::engine_runtime::block_on(async {
-            let (app, _auth_cache, _dir) = make_docs_app(false).await;
-
-            for uri in ["/api-docs/openapi.json", "/test-ui/"] {
-                let resp = app
-                    .clone()
-                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            }
-        })
-    }
 }

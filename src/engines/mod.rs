@@ -5,7 +5,6 @@
 //! Relational models.
 
 pub mod json;
-pub mod kv;
 pub mod lsm;
 pub mod rel;
 

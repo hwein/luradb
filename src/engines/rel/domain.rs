@@ -16,46 +16,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const SYS_REL_DOMAIN_PREFIX: &[u8] = b"__sys:rel_domain:";
+#[cfg(test)]
 pub(crate) const DEFAULT_DOMAIN: &str = "default";
-pub(super) const MAX_DOMAIN_NAME_LEN: usize = 50;
 
 fn sys_key(name: &str) -> Vec<u8> {
     let mut k = SYS_REL_DOMAIN_PREFIX.to_vec();
     k.extend_from_slice(name.as_bytes());
     k
-}
-
-fn validate_domain_name(name: &str) -> Result<(), RelStoreError> {
-    if name.is_empty() {
-        return Err(RelStoreError::InvalidDomainName(
-            "name must not be empty".to_string(),
-        ));
-    }
-    if name.len() > MAX_DOMAIN_NAME_LEN {
-        return Err(RelStoreError::InvalidDomainName(format!(
-            "name length {} exceeds maximum of {} characters",
-            name.len(),
-            MAX_DOMAIN_NAME_LEN
-        )));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(RelStoreError::InvalidDomainName(format!(
-            "name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
-            name
-        )));
-    }
-    // Shadowed by the static /store-api/rel/domains routes: data
-    // endpoints of such a domain would answer 404/405 (matchit prefers
-    // static segments).
-    if name == "domains" {
-        return Err(RelStoreError::InvalidDomainName(
-            "name 'domains' is reserved".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -96,9 +63,8 @@ pub struct RelDomainRegistry {
 }
 
 impl RelDomainRegistry {
-    /// Loads all persisted domains, then, with `owns_default`, creates the
-    /// default domain if it is missing in any state.
-    pub async fn recover(engine: Arc<LsmStorageEngine>, owns_default: bool) -> anyhow::Result<Self> {
+    /// Loads all persisted domains.
+    pub async fn recover(engine: Arc<LsmStorageEngine>) -> anyhow::Result<Self> {
         let keys = engine.scan_keys(SYS_REL_DOMAIN_PREFIX).await?;
         let mut loaded = HashMap::new();
         for key in keys {
@@ -114,20 +80,16 @@ impl RelDomainRegistry {
                 }
             }
         }
-        let registry = Self { domains: RwLock::new(loaded), engine };
-        // Any state counts: creating over a Deleting default would fail with
-        // DomainAlreadyExists and abort every boot. The purger
-        // finalizes it; the next recover() then recreates it.
-        match registry.get_domain_any(DEFAULT_DOMAIN) {
-            None if !owns_default => {}
-            None => {
-                registry.create_domain(DEFAULT_DOMAIN).await?;
-            }
-            Some(d) if d.state == RelDomainState::Deleting => tracing::warn!(
-                "[RelDomainRegistry] default domain is Deleting at startup; \
-                 it will be recreated on the first start after the purge finishes"
-            ),
-            Some(_) => {}
+        Ok(Self { domains: RwLock::new(loaded), engine })
+    }
+
+    /// Tests only: [`Self::recover`], then the default domain unless it
+    /// exists in any state, as a start creates it.
+    #[cfg(test)]
+    pub(crate) async fn recover_with_default(engine: Arc<LsmStorageEngine>) -> anyhow::Result<Self> {
+        let registry = Self::recover(engine).await?;
+        if registry.get_domain_any(DEFAULT_DOMAIN).is_none() {
+            registry.create_domain(DEFAULT_DOMAIN).await?;
         }
         Ok(registry)
     }
@@ -136,7 +98,6 @@ impl RelDomainRegistry {
     /// deleting). The check and the insert span an await: callers must not
     /// run two lifecycle changes at once.
     pub(crate) async fn create_domain(&self, name: &str) -> Result<RelDomain, RelStoreError> {
-        validate_domain_name(name)?;
         if self.domains.read().contains_key(name) {
             return Err(RelStoreError::DomainAlreadyExists(name.to_string()));
         }
@@ -251,8 +212,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let registry =
-            Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap());
+        let registry = Arc::new(RelDomainRegistry::recover_with_default(Arc::clone(&engine)).await.unwrap());
         (engine, registry, dir)
     }
 
@@ -265,8 +225,10 @@ mod tests {
     // startup lower bound of rel.lsm.max_key_length.
     #[test]
     fn test_sys_key_at_max_name_fits_key_limit_lower_bound() {
-        let key = sys_key(&"d".repeat(MAX_DOMAIN_NAME_LEN));
-        assert!(key.len() < crate::engines::rel::catalog::MIN_LSM_KEY_LENGTH, "{}", key.len());
+        for max in [50, 80] {
+            let key = sys_key(&"d".repeat(max));
+            assert!(key.len() < crate::engines::rel::catalog::min_lsm_key_length(max), "{}", key.len());
+        }
     }
 
     // 1. create_domain -> get_domain returns it; system_prefix is 16 bytes.
@@ -306,22 +268,6 @@ mod tests {
         })
     }
 
-    // 4. Invalid names -> InvalidDomainName. "domains" is reserved: the
-    //    static /store-api/rel/domains routes would shadow it.
-    #[test]
-    fn test_invalid_domain_name_rejected() {
-        crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            for bad in ["", "bad name!", "bad/slash", "domains", &"x".repeat(51)] {
-                let err = registry.create_domain(bad).await.unwrap_err();
-                assert!(
-                    matches!(err, RelStoreError::InvalidDomainName(_)),
-                    "'{bad}' got: {err}"
-                );
-            }
-        })
-    }
-
     // 5. system_prefix is deterministic, collision-free and colon-free.
     #[test]
     fn test_system_prefix_deterministic_and_colon_free() {
@@ -341,16 +287,18 @@ mod tests {
         })
     }
 
-    // 6. Default domain exists after recover; survives a simulated restart
-    //    (second recover on the same engine instance).
+    // 6. A domain survives a simulated restart (second recover on the same
+    //    engine instance); the recover creates none.
     #[test]
-    fn test_default_domain_persists_across_recover() {
+    fn test_domain_persists_across_recover() {
         crate::core::engine_runtime::block_on(async {
             let (engine, registry, _dir) = make_setup().await;
-            assert!(registry.get_domain(DEFAULT_DOMAIN).is_some());
+            registry.create_domain("kept").await.unwrap();
 
-            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine), true).await.unwrap();
-            assert!(registry2.get_domain(DEFAULT_DOMAIN).is_some());
+            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap();
+            let mut names: Vec<_> = registry2.list_domains().into_iter().map(|d| d.name).collect();
+            names.sort();
+            assert_eq!(names, [DEFAULT_DOMAIN, "kept"]);
         })
     }
 
@@ -408,17 +356,15 @@ mod tests {
         })
     }
 
-    // 11. recover survives a Deleting default domain without a 409 boot loop;
-    //     it stays invisible/Deleting (until the purger runs).
+    // 11. A Deleting domain stays Deleting across a recover (until the
+    //     purger runs).
     #[test]
-    fn test_recover_survives_deleting_default_domain() {
+    fn test_recover_keeps_a_deleting_domain() {
         crate::core::engine_runtime::block_on(async {
             let (engine, registry, _dir) = make_setup().await;
             registry.delete_domain(DEFAULT_DOMAIN).await.unwrap();
 
-            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine), true)
-                .await
-                .expect("recover must survive a Deleting default domain");
+            let registry2 = RelDomainRegistry::recover(Arc::clone(&engine)).await.unwrap();
             assert!(registry2.get_domain(DEFAULT_DOMAIN).is_none());
             assert!(matches!(
                 registry2.require_active(DEFAULT_DOMAIN).unwrap_err(),

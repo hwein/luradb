@@ -9,6 +9,7 @@ use super::catalog::{ColumnInput, TableInput, MAX_IDENTIFIER_LEN};
 use super::cross_engine::LinkAuth;
 use super::dml::{coerce_json, InsertChecks, RowPlan};
 use super::error::RelStoreError;
+use super::lexer::is_keyword;
 use super::types::{ColumnType, ScalarValue};
 use super::RelEngine;
 use crate::core::coop::{self, YieldEvery};
@@ -87,7 +88,8 @@ struct PlannedColumn {
 impl RelEngine {
     /// Creates a table from an uploaded CSV/TSV file and imports its rows.
     /// `pk` is the caller's raw query value, if any; matched against the
-    /// normalized column names case-insensitively.
+    /// normalized column names case-insensitively, with the same keyword
+    /// suffix a column header gets.
     /// Parsing, header normalization and Pass-1 inference are pure CPU work
     /// and run on the blocking pool, which is why the body
     /// arrives owned; the insert pass below stays on the engine thread.
@@ -100,8 +102,13 @@ impl RelEngine {
         pk: Option<&str>,
         body: Bytes,
     ) -> Result<CreateFromFileResult, RelStoreError> {
+        if is_keyword(table) {
+            return Err(RelStoreError::InvalidIdentifier(format!(
+                "'{table}' is a reserved word in LuraSQL and cannot be used as a table name"
+            )));
+        }
         let max_columns = self.catalog.max_columns();
-        let pk = pk.map(|s| s.to_ascii_lowercase());
+        let pk = pk.map(|s| avoid_keyword(s.to_ascii_lowercase()));
         let owned_pk = pk.clone();
         let ParsedFile { raw_headers, data_records, names, col_types } =
             coop::offload(move || parse_file(format, header, &body, owned_pk.as_deref(), max_columns))
@@ -344,7 +351,7 @@ fn read_records(
 
 /// Header normalization: trim, lowercase, invalid chars -> `_`,
 /// leading digit -> prefix `c`, empty -> `col_{i}`, over `MAX_IDENTIFIER_LEN`
-/// -> truncated, collisions (including ones truncation creates) -> `_2`,
+/// -> truncated, a LuraSQL keyword -> `_` appended, collisions (including ones truncation creates) -> `_2`,
 /// `_3`, … suffixed, still within the length cap.
 fn normalize_headers(raw: &[Option<String>]) -> Vec<String> {
     let mut names: Vec<String> = raw
@@ -376,8 +383,16 @@ fn normalize_one_header(raw: &str, position: usize) -> String {
     if prefixed.len() > MAX_IDENTIFIER_LEN {
         prefixed.chars().take(MAX_IDENTIFIER_LEN).collect()
     } else {
-        prefixed
+        avoid_keyword(prefixed)
     }
+}
+
+/// Appends `_` to a LuraSQL keyword so SQL can name the column.
+fn avoid_keyword(mut name: String) -> String {
+    if is_keyword(&name) {
+        name.push('_');
+    }
+    name
 }
 
 /// Suffixes `_2`, `_3`, … onto later occurrences of a name already seen —
@@ -830,6 +845,63 @@ mod tests {
             ["col", "col_2", "col"].iter().map(|s| s.to_string()).collect();
         dedupe_names(&mut mixed);
         assert_eq!(mixed, vec!["col", "col_2", "col_3"]);
+    }
+
+    #[test]
+    fn test_keyword_headers_get_underscore_suffix() {
+        let raw = |h: &str| h.split(',').map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            normalize_headers(&raw("id,group,key,order,limit,count,text,timestamp,default")),
+            ["id", "group", "key_", "order_", "limit_", "count_", "text_", "timestamp_", "default_"]
+        );
+        assert_eq!(normalize_headers(&raw("Key,ORDER")), ["key_", "order_"]);
+        assert_eq!(normalize_headers(&raw("key,key_")), ["key_", "key__2"]);
+    }
+
+    #[test]
+    fn test_documented_header_example() {
+        let raw = |h: &str| h.split(',').map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            normalize_headers(&raw("SKU,Product Name,2024 Price,,sku,Order")),
+            ["sku", "product_name", "c2024_price", "col_4", "sku_2", "order_"]
+        );
+    }
+
+    #[test]
+    fn test_keyword_pk_matches_suffixed_column() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            let result = rel
+                .create_table_from_file("default", "t", FileFormat::Csv, true, Some("KEY"), Bytes::from_static(b"id,key,order\n1,a,x\n"))
+                .await
+                .unwrap();
+            let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, ["id", "key_", "order_"]);
+            let key = &result.columns[1];
+            assert!(key.primary_key);
+            assert_eq!(key.source_header.as_deref(), Some("key"));
+            assert!(!result.columns[0].primary_key);
+        })
+    }
+
+    #[test]
+    fn test_keyword_table_name_rejected_before_any_work() {
+        crate::core::engine_runtime::block_on(async {
+            let (rel, _dir) = make_engine().await;
+            // An invalid file would fail differently if it were read first.
+            for name in ["select", "SELECT"] {
+                let err = rel
+                    .create_table_from_file("default", name, FileFormat::Csv, true, None, Bytes::from_static(b""))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, RelStoreError::InvalidIdentifier(_)), "got: {err}");
+                assert!(
+                    err.to_string().contains(&format!("'{name}' is a reserved word in LuraSQL and cannot be used as a table name")),
+                    "got: {err}"
+                );
+                assert!(rel.get_object("default", "select").is_err(), "no table created");
+            }
+        })
     }
 
     // 8. Top-level failures: an existing table name, an

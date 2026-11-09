@@ -6,7 +6,7 @@ use super::restore::{run_restore, RestoreMode, RestoreOutcome, RestoreParams};
 use super::writer::{resolve_scope, run_backup, BackupParams};
 use super::{BackupError, BackupManager, BackupScope, RestoreState};
 use crate::config::{BackupConfig, BlockCacheConfig, JsonStoreConfig, RelStoreConfig};
-use crate::control::{slots, testing, ControlPlane, Engine, Lifecycle, ShardOwners};
+use crate::control::{slots, testing, ControlPlane, Lifecycle, ShardOwners};
 use crate::core::wal::WriteAheadLog;
 use crate::engines::json::{JsonDomainPurger, JsonEngine};
 use crate::engines::lsm::domain::{DomainConfig, DomainPurger, DomainRegistry};
@@ -14,9 +14,10 @@ use crate::engines::lsm::engine::{LsmEngineOptions, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::DomainQuota;
 use crate::engines::lsm::reader::GetResult;
 use crate::engines::rel::{
-    CrossEngineResolver, ExecOutcome, FileFormat, LinkAuth, RelCrossEngineSweeper, RelDomainPurger, RelEngine,
+    CrossEngineResolver, ExecOutcome, FileFormat, LinkAuth, RelDomainPurger, RelEngine,
     ScalarValue, SqlOutcome,
 };
+use crate::engines::StorageEngine;
 use crate::metrics::{MetricsConfig, MetricsStore};
 use crate::storage::file_manager::FileManager;
 use crate::storage::manifest::ManifestManager;
@@ -39,7 +40,7 @@ async fn lsm(dir: &Path, options: LsmEngineOptions) -> Arc<LsmStorageEngine> {
 
 /// A server in a temp dir: `shards` data shards, each with a key-value
 /// engine and, when asked for, a JSON and a relational engine whose links
-/// reach the engines of its shard; only the owner of `default` creates it.
+/// reach the engines of its shard.
 struct Server {
     control: Arc<ControlPlane>,
     owners: Vec<ShardOwners>,
@@ -58,20 +59,15 @@ async fn server_on(dir: tempfile::TempDir, rel_root: Option<&Path>, shards: u16,
     let metrics = MetricsStore::new(MetricsConfig::default());
     let mut owners = Vec::new();
     for k in 0..shards {
-        let owns_default = slots::shard_of_domain("default", shards) == k;
         let at = dir.path().join(format!("shard-{k}"));
         let kv_engine = lsm(&at.join("kv"), LsmEngineOptions::default()).await;
-        let kv = Arc::new(
-            DomainRegistry::recover_on_shard(kv_engine, DomainConfig::default(), Arc::clone(&metrics), owns_default)
-                .await
-                .unwrap(),
-        );
+        let kv = Arc::new(DomainRegistry::recover(kv_engine, DomainConfig::default(), Arc::clone(&metrics)).await.unwrap());
         let json = match json {
             true => {
                 let engine = lsm(&at.join("json"), LsmEngineOptions::default()).await;
                 engine.start_background_tasks();
                 let config = JsonStoreConfig::default();
-                Some(JsonEngine::open(&config, engine, Arc::clone(&metrics), owns_default).await.unwrap())
+                Some(JsonEngine::open(&config, engine, Arc::clone(&metrics)).await.unwrap())
             }
             false => None,
         };
@@ -83,7 +79,7 @@ async fn server_on(dir: tempfile::TempDir, rel_root: Option<&Path>, shards: u16,
                 engine.start_background_tasks();
                 let resolver = CrossEngineResolver::new(Some(Arc::clone(&kv)), json.clone(), Arc::clone(&metrics));
                 let quota = DomainQuota::default();
-                Some(RelEngine::open(&config, quota, engine, Arc::clone(&metrics), resolver, owns_default).await.unwrap())
+                Some(RelEngine::open(&config, quota, engine, Arc::clone(&metrics), resolver).await.unwrap())
             }
             None => None,
         };
@@ -95,8 +91,8 @@ async fn server_on(dir: tempfile::TempDir, rel_root: Option<&Path>, shards: u16,
 }
 
 impl Server {
-    async fn create(&self, engine: Engine, name: &str) {
-        self.control.create_domain(engine, name, false).await.unwrap();
+    async fn create(&self, name: &str) {
+        self.control.create_domain(name, Default::default()).await.unwrap();
     }
 
     fn rel(&self, domain: &str) -> &Arc<RelEngine> {
@@ -169,7 +165,7 @@ impl Server {
         mode: RestoreMode,
         into_domain: Option<&str>,
     ) -> anyhow::Result<RestoreOutcome> {
-        run_restore(RestoreParams {
+        let restore = run_restore(RestoreParams {
             dir: out,
             backup_id: id,
             mode,
@@ -178,8 +174,9 @@ impl Server {
             control: &self.control,
             scan_batch_size: 7,
             scan_pause_ms: 0,
-        })
-        .await
+        });
+        // Upper bound against hanging only: a stalled purge holds a restore for minutes.
+        compio::time::timeout(Duration::from_secs(10), restore).await.expect("the restore never ends")
     }
 
     /// Runs the purgers of every engine of every shard until the handle drops.
@@ -252,7 +249,7 @@ fn last_pk(outcome: ExecOutcome) -> Option<ScalarValue> {
 
 /// Builds the domain `shop` on `src`.
 async fn build_shop(src: &Server) {
-    src.create(Engine::Rel, "shop").await;
+    src.create("shop").await;
     let ddl = [
         "CREATE TABLE parent (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, ratio REAL DEFAULT 1.5, \
          note TEXT DEFAULT 'it''s', missing TEXT DEFAULT NULL, stamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
@@ -405,7 +402,7 @@ fn the_archive_holds_tables_rows_and_high_water_marks_in_their_own_form() {
 fn cycles_dangling_references_and_unbindable_views_restore() {
     crate::core::engine_runtime::block_on(async {
         let src = server(1, false, true).await;
-        src.create(Engine::Rel, "edge").await;
+        src.create("edge").await;
         for sql in [
             "CREATE TABLE b (id INTEGER PRIMARY KEY, code INTEGER)",
             "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER REFERENCES b, code INTEGER)",
@@ -443,11 +440,10 @@ fn scopes_select_relational_domains() {
     crate::core::engine_runtime::block_on(async {
         let src = server(1, true, true).await;
         for name in ["d1", "d2"] {
-            src.create(Engine::Rel, name).await;
+            src.create(name).await;
             src.sql(name, "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await;
             src.sql(name, "INSERT INTO t VALUES (1)", &[]).await;
         }
-        src.create(Engine::Kv, "d1").await;
         let out = tempfile::TempDir::new().unwrap();
 
         let all = src.backup(out.path(), "bk_all", BackupScope::All).await;
@@ -498,7 +494,7 @@ fn an_archive_with_a_later_relational_write_holds_every_one_confirmed_before_it(
         let src = server(2, false, true).await;
         let [a, b] = [0, 1].map(|shard| slots::domain_name_for_shard(shard, 2, 23));
         for name in [&a, &b] {
-            src.create(Engine::Rel, name).await;
+            src.create(name).await;
             src.sql(name, "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await;
         }
         let rels = Arc::new([Arc::clone(src.rel(&a)), Arc::clone(src.rel(&b))]);
@@ -565,10 +561,10 @@ fn relational_domains_restore_into_another_shard_count() {
     crate::core::engine_runtime::block_on(async {
         let src = server(2, false, true).await;
         // Only the domains of this test go into the archive.
-        src.control.delete_domain(Engine::Rel, "default").await.unwrap();
+        src.control.delete_domain("default").await.unwrap();
         let names: Vec<String> = (0..6).map(|i| slots::domain_name_for_shard(i % 2, 2, 50 + u64::from(i))).collect();
         for name in &names {
-            src.create(Engine::Rel, name).await;
+            src.create(name).await;
             src.sql(name, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)", &[]).await;
             src.sql(name, "INSERT INTO t (v) VALUES (?), (?), (?)", &[json!(name), json!("x"), json!("é")]).await;
         }
@@ -602,11 +598,10 @@ async fn expanded(server: &Server, domain: &str, table: &str, column: &str) -> V
     }
 }
 
-/// KV domain `d` with key `k1`, JSON domain `d` with document `doc1`.
+/// Domain `d` with key `k1` and document `doc1`.
 async fn link_targets(server: &Server) {
-    server.create(Engine::Kv, "d").await;
+    server.create("d").await;
     server.owners_kv("d").store("d").await.unwrap().put(b"k1", b"v1").await.unwrap();
-    server.create(Engine::Json, "d").await;
     server.json("d").put_document("d", "doc1", json!({"n": 1})).await.unwrap();
 }
 
@@ -623,7 +618,6 @@ fn links_resolve_after_restoring_every_engine_of_a_domain() {
     crate::core::engine_runtime::block_on(async {
         let src = server(1, true, true).await;
         link_targets(&src).await;
-        src.create(Engine::Rel, "d").await;
         src.sql("d", "CREATE TABLE links (id INTEGER PRIMARY KEY, kv KVREF, doc JSONREF)", &[]).await;
         src.sql("d", "INSERT INTO links VALUES (1, 'k1', 'doc1')", &[]).await;
 
@@ -644,9 +638,8 @@ fn links_to_a_disabled_engine_are_backed_up_as_stored() {
     crate::core::engine_runtime::block_on(async {
         let rel_root = tempfile::TempDir::new().unwrap();
         let before = server_on(tempfile::TempDir::new().unwrap(), Some(rel_root.path()), 1, true).await;
-        before.create(Engine::Json, "d").await;
+        before.create("d").await;
         before.json("d").put_document("d", "doc1", json!({"n": 1})).await.unwrap();
-        before.create(Engine::Rel, "d").await;
         before.sql("d", "CREATE TABLE jl (id INTEGER PRIMARY KEY, doc JSONREF)", &[]).await;
         before.sql("d", "INSERT INTO jl VALUES (1, 'doc1')", &[]).await;
         before.rel("d").shutdown().await;
@@ -659,21 +652,23 @@ fn links_to_a_disabled_engine_are_backed_up_as_stored() {
         assert_eq!(row["row"]["doc"], "doc1");
 
         let dst = server(1, true, true).await;
-        dst.create(Engine::Json, "d").await;
+        dst.create("d").await;
         dst.json("d").put_document("d", "doc1", json!({"n": 2})).await.unwrap();
-        dst.restore(out.path(), "bk_raw", RestoreMode::FailIfExists, None).await.unwrap();
+        let purging = dst.purging();
+        dst.restore(out.path(), "bk_raw", RestoreMode::Replace, None).await.unwrap();
+        drop(purging);
         assert_eq!(expanded(&dst, "d", "jl", "doc").await, [json!({"exists": true, "document": {"n": 2}})]);
     })
 }
 
-// Restoring only the relational domain into a server without the KV and
-// JSON domain of its name succeeds; its links read as missing.
+// Restoring only the relational part of a domain into a server without the
+// domain creates it with empty key-value and JSON parts; its links keep
+// their values and expand to missing targets.
 #[test]
-fn links_without_their_target_domain_read_as_missing_after_a_restore() {
+fn links_without_their_targets_expand_as_missing_after_a_restore() {
     crate::core::engine_runtime::block_on(async {
         let src = server(1, true, true).await;
         link_targets(&src).await;
-        src.create(Engine::Rel, "d").await;
         src.sql("d", "CREATE TABLE links (id INTEGER PRIMARY KEY, kv KVREF, doc JSONREF)", &[]).await;
         src.sql("d", "INSERT INTO links VALUES (1, 'k1', 'doc1')", &[]).await;
 
@@ -681,58 +676,39 @@ fn links_without_their_target_domain_read_as_missing_after_a_restore() {
         src.backup(out.path(), "bk_rel_only", BackupScope::RelDomain("d".to_string())).await;
         let dst = server(1, true, true).await;
         dst.restore(out.path(), "bk_rel_only", RestoreMode::FailIfExists, None).await.unwrap();
-        assert_eq!(
-            dst.rows("d", "SELECT * FROM links").await,
-            [[ScalarValue::Integer(1), ScalarValue::Null, ScalarValue::Null]]
-        );
+        let stored = [ScalarValue::Integer(1), ScalarValue::Text("k1".to_string()), ScalarValue::Text("doc1".to_string())];
+        assert_eq!(dst.rows("d", "SELECT * FROM links").await, [stored]);
+        for column in ["kv", "doc"] {
+            assert_eq!(expanded(&dst, "d", "links", column).await[0]["exists"], json!(false), "{column}");
+        }
     })
 }
 
-/// Waits until the directory shows `name` of `engine` as `Deleting`.
-async fn until_deleting(control: &ControlPlane, engine: Engine, name: &str) {
-    let wait = async {
-        while control.directory().get(engine, name).map(|d| d.state) != Some(Lifecycle::Deleting) {
-            tokio::task::yield_now().await;
-        }
-    };
-    // Upper bound against hanging only.
-    compio::time::timeout(Duration::from_secs(30), wait).await.expect("the domain never turned Deleting");
-}
-
-// While a restore replaces the KV domain that links of a relational table
-// point to, a sweep of orphaned links leaves them alone.
+// A restore that replaces only the key-value part of a domain leaves the
+// links of its relational tables stored, and they resolve to the restored key.
 #[test]
-fn the_link_sweep_waits_while_a_restore_replaces_a_domain() {
+fn a_key_value_replace_restore_keeps_the_links_of_relational_tables() {
     crate::core::engine_runtime::block_on(async {
-        let server = Arc::new(server(1, false, true).await);
-        server.create(Engine::Kv, "d").await;
+        let server = server(1, false, true).await;
+        server.create("d").await;
         server.owners_kv("d").store("d").await.unwrap().put(b"k1", b"v1").await.unwrap();
-        server.create(Engine::Rel, "d").await;
         server.sql("d", "CREATE TABLE kl (id INTEGER PRIMARY KEY, k KVREF)", &[]).await;
         server.sql("d", "INSERT INTO kl VALUES (1, 'k1')", &[]).await;
         let out = tempfile::TempDir::new().unwrap();
         server.backup(out.path(), "bk_kv", BackupScope::KvDomain("d".to_string())).await;
 
-        let restore = compio::runtime::spawn({
-            let (server, out) = (Arc::clone(&server), out.path().to_path_buf());
-            async move { server.restore(&out, "bk_kv", RestoreMode::Replace, None).await }
-        });
-        until_deleting(&server.control, Engine::Kv, "d").await;
-        assert!(server.control.restore_running());
-        RelCrossEngineSweeper::new(Arc::clone(server.rel("d")), 100).sweep_tick().await.unwrap();
-
         let purging = server.purging();
-        restore.await.unwrap().unwrap();
+        server.restore(out.path(), "bk_kv", RestoreMode::Replace, None).await.unwrap();
         drop(purging);
-        assert!(!server.control.restore_running());
         let row = [ScalarValue::Integer(1), ScalarValue::Text("k1".to_string())];
         assert_eq!(server.rows("d", "SELECT * FROM kl").await, [row]);
+        assert_eq!(expanded(&server, "d", "kl", "k").await, [json!({"exists": true, "value": "v1", "encoding": "utf8"})]);
     })
 }
 
 /// Domain `m` with table `t` holding `rows` rows.
 async fn table_m(server: &Server, table: &str, rows: i64) {
-    server.create(Engine::Rel, "m").await;
+    server.create("m").await;
     server.sql("m", &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"), &[]).await;
     for i in 1..=rows {
         server.sql("m", &format!("INSERT INTO {table} VALUES (?)"), &[json!(i)]).await;
@@ -747,7 +723,6 @@ fn restore_modes_apply_to_relational_domains() {
     crate::core::engine_runtime::block_on(async {
         let src = server(1, false, true).await;
         table_m(&src, "fresh", 3).await;
-        src.create(Engine::Kv, "m").await;
         let out = tempfile::TempDir::new().unwrap();
         src.backup(out.path(), "bk_m", BackupScope::Domain("m".to_string())).await;
         let rows = src.rows("m", "SELECT * FROM fresh ORDER BY id").await;
@@ -757,8 +732,7 @@ fn restore_modes_apply_to_relational_domains() {
         let err = dst.restore(out.path(), "bk_m", RestoreMode::FailIfExists, None).await.unwrap_err();
         assert!(matches!(backup_error(&err), Some(BackupError::DomainExists(_))), "{err}");
         assert_eq!(dst.rows("m", "SELECT * FROM stale").await.len(), 2);
-        assert!(dst.rel("m").get_object("m", "fresh").is_err());
-        assert!(dst.owners_kv("m").get_domain("m").await.unwrap().is_none(), "nothing applied");
+        assert!(dst.rel("m").get_object("m", "fresh").is_err(), "nothing applied");
 
         let purging = dst.purging();
         dst.restore(out.path(), "bk_m", RestoreMode::Replace, None).await.unwrap();
@@ -813,7 +787,7 @@ fn archives_without_relational_lines_restore_as_before() {
 fn a_refused_relational_row_fails_the_restore_job() {
     crate::core::engine_runtime::block_on(async {
         let src = server(1, false, true).await;
-        src.create(Engine::Rel, "f").await;
+        src.create("f").await;
         src.sql("f", "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", &[]).await;
         src.sql("f", "INSERT INTO t VALUES (1, 'ok'), (2, 'fine')", &[]).await;
         let dir = tempfile::TempDir::new().unwrap();
@@ -836,7 +810,6 @@ fn a_refused_relational_row_fails_the_restore_job() {
         assert_eq!(status.state, RestoreState::Failed);
         let (_, message) = status.errors.last().unwrap();
         assert!(message.contains("'f'") && message.contains("'t'"), "{message}");
-        assert!(!dst.control.restore_running());
     })
 }
 
@@ -846,7 +819,7 @@ fn a_refused_relational_row_fails_the_restore_job() {
 fn a_refused_view_fails_the_restore_naming_the_view() {
     crate::core::engine_runtime::block_on(async {
         let src = server(1, false, true).await;
-        src.create(Engine::Rel, "f").await;
+        src.create("f").await;
         src.sql("f", "CREATE TABLE t (id INTEGER PRIMARY KEY)", &[]).await;
         src.sql("f", "CREATE VIEW v AS SELECT id FROM t", &[]).await;
         let dir = tempfile::TempDir::new().unwrap();
@@ -867,5 +840,66 @@ fn a_refused_view_fails_the_restore_naming_the_view() {
         let err = dst.restore(dir.path(), "bk_bad_view", RestoreMode::FailIfExists, None).await.unwrap_err();
         let message = err.to_string();
         assert!(message.contains("'f'") && message.contains("view 't'"), "{message}");
+    })
+}
+
+/// Domain `r` with key `k` set to `value`, document `d`, table `t` with one
+/// row, and a permission of `worker` on the whole domain.
+async fn domain_r(server: &Server, value: &str) {
+    server.create("r").await;
+    server.owners_kv("r").store("r").await.unwrap().put(b"k", value.as_bytes()).await.unwrap();
+    server.json("r").put_document("r", "d", json!({"v": value})).await.unwrap();
+    server.sql("r", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).await;
+    server.sql("r", "INSERT INTO t VALUES (1, ?)", &[json!(value)]).await;
+    let permission = crate::control::AuthChange::SetPermission {
+        username: "worker".to_string(),
+        domain: "r".to_string(),
+        engine: None,
+        access: crate::auth::AccessLevel::Read,
+    };
+    server.control.change_auth(permission).await.unwrap();
+}
+
+/// The key, the document and the row of domain `r`.
+async fn contents_of_r(server: &Server) -> (GetResult, Option<Value>, Vec<Vec<ScalarValue>>) {
+    let key = server.owners_kv("r").store("r").await.unwrap().get(b"k").await.unwrap();
+    let doc = server.json("r").get_document("r", "d").await.unwrap().map(|d| d.content);
+    (key, doc, server.rows("r", "SELECT * FROM t").await)
+}
+
+// `replace` replaces the engines the archive has: `kv:r` the keys alone,
+// with documents, tables and permissions staying; `domain:r` all three.
+// The domain itself stays throughout, with its creation time.
+#[test]
+fn replace_swaps_only_the_engines_of_the_archive_and_keeps_the_domain() {
+    crate::core::engine_runtime::block_on(async {
+        let src = server(1, true, true).await;
+        domain_r(&src, "new").await;
+        let out = tempfile::TempDir::new().unwrap();
+        src.backup(out.path(), "bk_kv_r", BackupScope::KvDomain("r".to_string())).await;
+        src.backup(out.path(), "bk_domain_r", BackupScope::Domain("r".to_string())).await;
+
+        let dst = server(1, true, true).await;
+        domain_r(&dst, "old").await;
+        let created_at = dst.control.directory().get("r").unwrap().created_at;
+        let permission = || async { dst.control.system_store().get(b"__sys:auth:perm:worker:domain:r").await.unwrap() };
+        let purging = dst.purging();
+
+        dst.restore(out.path(), "bk_kv_r", RestoreMode::Replace, None).await.unwrap();
+        let (key, doc, rows) = contents_of_r(&dst).await;
+        assert_eq!(key, GetResult::Present(b"new".to_vec()));
+        assert_eq!(doc, Some(json!({"v": "old"})), "documents stay");
+        assert_eq!(rows, [[ScalarValue::Integer(1), ScalarValue::Text("old".to_string())]], "tables stay");
+        assert!(permission().await.is_some(), "permissions stay");
+
+        dst.restore(out.path(), "bk_domain_r", RestoreMode::Replace, None).await.unwrap();
+        drop(purging);
+        let (key, doc, rows) = contents_of_r(&dst).await;
+        assert_eq!(key, GetResult::Present(b"new".to_vec()));
+        assert_eq!(doc, Some(json!({"v": "new"})));
+        assert_eq!(rows, [[ScalarValue::Integer(1), ScalarValue::Text("new".to_string())]]);
+        assert!(permission().await.is_some(), "permissions stay");
+        let entry = dst.control.directory().get("r").cloned().unwrap();
+        assert_eq!((entry.state, entry.created_at, entry.purging), (Lifecycle::Active, created_at, vec![]));
     })
 }

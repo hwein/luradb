@@ -1,6 +1,6 @@
 //! Domain-scoped KV REST handlers.
 //!
-//! PUT    /store-api/kv/{domain}/keys/{key}          → put_key   (200 | 429 | 400 | 412 | 428)
+//! PUT    /store-api/kv/{domain}/keys/{key}          → put_key   (200 | 429 | 400 | 412 | 413 | 428)
 //! PUT    /store-api/kv/{domain}/keys/{key}?ttl=N    → put_key   (TTL variant)
 //! GET    /store-api/kv/{domain}/keys/{key}          → get_key   (200 | 204 | 404 | 429)
 //! DELETE /store-api/kv/{domain}/keys/{key}          → delete_key (204 | 429 | 412 | 428)
@@ -240,6 +240,7 @@ fn watch_item(
         (status = 410, description = "Domain is being deleted", body = String, content_type = "text/plain"),
         (status = 412, description = "If-Match or If-None-Match does not hold; nothing was written", body = String, content_type = "text/plain",
          headers(("ETag" = String, description = "ETag of the key's current version; absent when the key does not exist"))),
+        (status = 413, description = "The value exceeds lsm.max_value_size; nothing was written", body = String, content_type = "text/plain"),
         (status = 428, description = "The domain requires conditional writes and neither If-Match nor If-None-Match is set", body = String, content_type = "text/plain",
          headers(("Cache-Control" = String, description = "no-store"))),
     ),
@@ -861,18 +862,16 @@ mod tests {
             let (app, _dir) = make_app().await;
             let json = [("content-type", "application/json")];
             let long = "a".repeat(51);
-            let cases = [
-                ("", "must not be empty"),
-                (long.as_str(), "exceeds maximum of 50 characters"),
-                ("bad name!", "contains invalid characters"),
-            ];
-            for (bad, reason) in cases {
+            for bad in ["", long.as_str(), "bad name!"] {
                 let body = serde_json::json!({ "name": bad }).to_string();
                 let resp = send_with(&app, Method::POST, "/store-api/domains", &json, Body::from(body)).await;
                 assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
                 let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
                 let text = String::from_utf8_lossy(&bytes);
-                assert!(text.starts_with("400 Bad Request: Domain name") && text.contains(reason), "{bad:?}: {text}");
+                let expected = format!(
+                    "400 Bad Request: invalid domain name '{bad}': allowed are [a-zA-Z0-9_-], 1 to 50 characters"
+                );
+                assert_eq!(text, expected, "{bad:?}");
             }
 
             for expected in [StatusCode::CREATED, StatusCode::CONFLICT] {
@@ -1608,6 +1607,45 @@ mod tests {
         })
     }
 
+    #[test]
+    fn test_put_value_over_max_value_size_413_at_limit_200() {
+        crate::core::engine_runtime::block_on(async {
+            let config = crate::engines::lsm::domain::DomainConfig { max_value_size: 1000, ..Default::default() };
+            let (app, _dir) = make_app_with_config(config).await;
+
+            let resp = send(&app, Method::PUT, "/store-api/kv/testdom/keys/big", Body::from(vec![b'x'; 1001])).await;
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                "413 Payload Too Large: value of 1001 bytes exceeds lsm.max_value_size (1000 bytes)"
+            );
+            let resp = send(&app, Method::GET, "/store-api/kv/testdom/keys/big", Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a rejected value must not be stored");
+
+            let resp = send(&app, Method::PUT, "/store-api/kv/testdom/keys/big", Body::from(vec![b'x'; 1000])).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+    }
+
+    // Default key limits: the longest accepted key can be written and then
+    // removed by a prefix delete (the internal domain prefix counts toward
+    // the engine's key limit).
+    #[test]
+    fn test_bulk_delete_removes_longest_accepted_key() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_app().await;
+            let key = "k".repeat(256);
+
+            let resp = send(&app, Method::PUT, &format!("/store-api/kv/testdom/keys/{key}"), Body::from("v")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let resp = send(&app, Method::DELETE, &format!("/store-api/kv/testdom/keys?prefix={key}"), Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp.into_body()).await["deleted"].as_u64().unwrap(), 1);
+        })
+    }
+
     // Test 13: auth scoping -- a Read-only grant is not enough (403), a
     // Write grant is (200), and an admin passes regardless (200). DELETE is
     // unconditionally a write per `is_write_request`.
@@ -2270,13 +2308,14 @@ mod tests {
                 Method::POST,
                 "/store-api/domains",
                 &[("content-type", "application/json")],
-                Body::from(r#"{"name": "strict", "require_conditional_writes": true}"#),
+                Body::from(r#"{"name": "strict", "require_conditional_writes": {"kv": true}}"#),
             )
             .await;
             assert_eq!(resp.status(), StatusCode::CREATED);
-            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], true);
+            let setting = serde_json::json!({"kv": true, "json": false});
+            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], setting);
             let resp = send(&app, Method::GET, "/store-api/domains/strict", Body::empty()).await;
-            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], true);
+            assert_eq!(body_json(resp.into_body()).await["require_conditional_writes"], setting);
 
             let uri = "/store-api/kv/strict/keys/k";
             let unconditional = [

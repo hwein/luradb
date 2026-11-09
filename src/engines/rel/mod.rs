@@ -34,7 +34,7 @@ pub use catalog::{
     CatalogEntry, CatalogLimits, ColumnDef, ColumnInput, DefaultValue, IndexInput, IndexMeta, RelCatalog,
     TableInput, TableSchema, ViewSchema,
 };
-pub use cross_engine::{CrossEngineResolver, LinkAuth, RelCrossEngineSweeper};
+pub use cross_engine::{CrossEngineResolver, LinkAuth};
 pub use ddl::DdlOutcome;
 pub use dml::{DmlResult, SelectResult};
 pub use domain::{RelDomain, RelDomainState};
@@ -54,19 +54,20 @@ pub enum ExecOutcome {
 
 use crate::config::{BlockCacheConfig, RelStoreConfig};
 use crate::control::{ControlPlane, Engine};
+#[cfg(test)]
 use crate::core::wal::WriteAheadLog;
 use crate::engines::lsm::compaction::CompactionConfig;
 use crate::engines::lsm::engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine};
 use crate::engines::lsm::janitor::JanitorConfig;
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::metrics::MetricsStore;
-use crate::storage::file_manager::FileManager;
-use crate::storage::manifest::ManifestManager;
-use crate::storage::vlog::VLog;
+#[cfg(test)]
+use crate::storage::{file_manager::FileManager, manifest::ManifestManager, vlog::VLog};
 use anyhow::Result;
 use domain::RelDomainRegistry;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -105,12 +106,11 @@ pub struct RelEngine {
     /// Per-table write locks for the atomic DML path.
     table_locks: dml::TableLocks,
     /// Engine-global write serialization for the domain finalization guard:
-    /// DML has only per-table locks, so the DML-commit and
-    /// cross-engine-sweep paths hold this around their `write_batch` + a domain
-    /// re-check, and the purger holds it around its emptiness check +
-    /// finalization — no in-flight row write can land after a domain is
-    /// finalized (which would orphan a `ROW:` key into a recreated same-name
-    /// domain sharing the FNV `system_prefix`).
+    /// DML has only per-table locks, so the DML-commit path holds this around
+    /// its `write_batch` + a domain re-check, and the purger holds it around
+    /// its emptiness check + finalization — no in-flight row write can land
+    /// after a domain is finalized (which would orphan a `ROW:` key into a
+    /// recreated same-name domain sharing the FNV `system_prefix`).
     write_guard: tokio::sync::Mutex<()>,
     /// DML write-path guards.
     max_text_len: usize,
@@ -155,10 +155,12 @@ impl RelEngine {
         Self::bootstrap_with_wal(config, DomainQuota::default(), wal, metrics, cross_engine).await
     }
 
-    /// Creates the dedicated relational LSM instance from `config`, with
-    /// `wal` as the log at `config.wal_path`, starts its background tasks,
-    /// and recovers the domain registry and the catalog. `quota` is the
-    /// rate limit of every domain.
+    /// Tests only: creates the dedicated relational LSM instance from
+    /// `config`, with `wal` as the log at `config.wal_path`, starts its
+    /// background tasks, recovers the domain registry and the catalog and
+    /// creates the default domain if it is missing, as a start does. `quota`
+    /// is the rate limit of every domain.
+    #[cfg(test)]
     pub async fn bootstrap_with_wal(
         config: &RelStoreConfig,
         quota: DomainQuota,
@@ -177,7 +179,11 @@ impl RelEngine {
             LsmStorageEngine::new(wal, wal_path, vlog, vlog_path, file_manager, manifest_manager, options).await?,
         );
         engine.start_background_tasks();
-        Self::open(config, quota, engine, metrics, cross_engine, true).await
+        let rel = Self::open(config, quota, engine, metrics, cross_engine).await?;
+        if rel.get_domain_any(domain::DEFAULT_DOMAIN).is_none() {
+            rel.create_domain(domain::DEFAULT_DOMAIN).await?;
+        }
+        Ok(rel)
     }
 
     /// Options of the relational engine's LSM instances, with `block_cache`.
@@ -197,8 +203,7 @@ impl RelEngine {
     }
 
     /// The relational engine on `engine`, a recovered instance whose
-    /// background tasks run: recovers the domain registry and the catalog;
-    /// with `owns_default` it creates the default domain if that is missing.
+    /// background tasks run: recovers the domain registry and the catalog.
     /// `quota` is the rate limit of every domain.
     pub async fn open(
         config: &RelStoreConfig,
@@ -206,9 +211,8 @@ impl RelEngine {
         engine: Arc<LsmStorageEngine>,
         metrics: Arc<MetricsStore>,
         cross_engine: Arc<CrossEngineResolver>,
-        owns_default: bool,
     ) -> Result<Arc<Self>> {
-        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine), owns_default).await?);
+        let domains = Arc::new(RelDomainRegistry::recover(Arc::clone(&engine)).await?);
         let limits = CatalogLimits {
             max_columns: MAX_COLUMNS,
             max_indexes_per_table: MAX_INDEXES_PER_TABLE,
@@ -390,12 +394,6 @@ impl RelEngine {
         self.max_response_bytes = bytes;
     }
 
-    /// Whether at least one target engine is wired — the sweeper is only worth
-    /// spawning at startup then.
-    pub fn cross_engine_has_target(&self) -> bool {
-        self.cross_engine.has_target()
-    }
-
     /// DDL engine-enabled check: a `KVREF`/`JSONREF` column may only
     /// be created when its target engine is enabled (the domain may still be
     /// absent — that first fails at the DML value check). `domain` = `None`
@@ -501,15 +499,19 @@ impl RelEngine {
             // view body is the *raw* SELECT substring, not a re-serialized
             // AST) — routed here rather than into `execute_dml`, which only
             // sees the bound `Statement`, not the original source string.
-            binder::BoundStatement::Pending { stmt, .. } => match stmt {
-                ast::Statement::CreateView(cv) => {
-                    view::execute_create_view(self, domain, cv, sql).await.map(ExecOutcome::Ddl)?
-                }
-                ast::Statement::DropView(dv) => {
-                    view::execute_drop_view(self, domain, dv).await.map(ExecOutcome::Ddl)?
-                }
-                other => self.execute_dml(domain, other, params, auth).await?,
-            },
+            binder::BoundStatement::Pending { stmt, .. } => {
+                let leading_distinct = starts_with_distinct_alias(&stmt);
+                let result = match stmt {
+                    ast::Statement::CreateView(cv) => {
+                        view::execute_create_view(self, domain, cv, sql).await.map(ExecOutcome::Ddl)
+                    }
+                    ast::Statement::DropView(dv) => {
+                        view::execute_drop_view(self, domain, dv).await.map(ExecOutcome::Ddl)
+                    }
+                    other => self.execute_dml(domain, other, params, auth).await,
+                };
+                result.map_err(|e| if leading_distinct { distinct_not_a_column(e) } else { e })?
+            }
         };
         if let ExecOutcome::Ddl(ddl_outcome) = &outcome {
             self.publish_ddl_event(domain, ddl_outcome);
@@ -540,6 +542,32 @@ impl RelEngine {
             DdlOutcome::ViewCreated(view) => publish("view_created", &view.name),
             DdlOutcome::ViewDropped { name } => publish("view_dropped", name),
         }
+    }
+}
+
+/// True for `SELECT distinct <alias> …`: the parser reads it as a column named
+/// `distinct` (valid when the table has one), which is also how
+/// `SELECT DISTINCT a FROM …` and `SELECT DISTINCT a, …` parse.
+fn starts_with_distinct_alias(stmt: &ast::Statement) -> bool {
+    let select = match stmt {
+        ast::Statement::Select(sel) => sel,
+        ast::Statement::CreateView(cv) => &*cv.select,
+        _ => return false,
+    };
+    matches!(
+        select.items.first(),
+        Some(ast::SelectItem::Column { col, alias: Some(_) }) if col.qualifier.is_none() && col.name == "distinct"
+    )
+}
+
+/// The `distinct` column does not exist, so the statement was a DISTINCT query.
+fn distinct_not_a_column(err: RelStoreError) -> RelStoreError {
+    match err {
+        RelStoreError::ColumnNotFound { name, .. } if name == "distinct" => RelStoreError::Syntax {
+            pos: 0,
+            msg: parser::DISTINCT_UNSUPPORTED.to_string(),
+        },
+        other => other,
     }
 }
 
@@ -619,7 +647,7 @@ mod tests {
                 wal_path: dir.path().join("rel.wal").to_string_lossy().into_owned(),
                 vlog_path: dir.path().join("rel.vlog").to_string_lossy().into_owned(),
                 sstable_dir: dir.path().join("rel_sstables").to_string_lossy().into_owned(),
-                lsm: crate::config::RelLsmConfig { max_key_length: catalog::MIN_LSM_KEY_LENGTH },
+                lsm: crate::config::RelLsmConfig { max_key_length: catalog::min_lsm_key_length(50) },
                 ..RelStoreConfig::default()
             };
             config.validate().unwrap();
@@ -627,7 +655,7 @@ mod tests {
             let cross_engine = CrossEngineResolver::disabled(Arc::clone(&metrics));
             let rel = RelEngine::bootstrap(&config, metrics, cross_engine).await.unwrap();
 
-            let domain = "d".repeat(domain::MAX_DOMAIN_NAME_LEN);
+            let domain = "d".repeat(50);
             rel.create_domain(&domain).await.unwrap();
             rel.execute(&domain, "CREATE TABLE t (k TEXT PRIMARY KEY)", &[]).await.unwrap();
             rel.execute(&domain, "INSERT INTO t VALUES ('a')", &[]).await.unwrap();
@@ -1008,7 +1036,7 @@ mod tests {
             ];
             for (kind, object) in expected {
                 let event = rx.try_recv().unwrap();
-                assert_eq!(event.engine, "rel");
+                assert_eq!(event.engine, Some("rel"));
                 assert_eq!(event.kind, kind);
                 assert_eq!(event.object.as_deref(), object, "kind {kind}");
                 assert_eq!(event.domain, "default");

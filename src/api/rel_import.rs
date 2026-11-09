@@ -60,15 +60,15 @@ pub struct CreateFromFileResponse {
     path = "/store-api/rel/{domain}/tables/from-file",
     params(
         ("domain" = String, Path, description = "Relational domain"),
-        ("name" = String, Query, description = "Name of the table to create"),
+        ("name" = String, Query, description = "Name of the table to create; a LuraSQL keyword (for example `select`) is rejected with 400"),
         ("format" = String, Query, description = "\"csv\" or \"tsv\" -- no format sniffing"),
-        ("header" = Option<bool>, Query, description = "Whether the first line is a header row (default true)"),
-        ("pk" = Option<String>, Query, description = "Existing (normalized) column to use as primary key; omitted -> synthetic `_row` column"),
+        ("header" = Option<bool>, Query, description = "Whether the first line is a header row (default true); without one the columns are named `col_1`, `col_2`, ..."),
+        ("pk" = Option<String>, Query, description = "Column to use as primary key, named as the response shows it in `name`. Only upper/lower case is ignored, and for a LuraSQL keyword the trailing `_` may be left out (`key` matches `key_`); any other difference gives 400. Omitted -> the generated `_row` column"),
     ),
     request_body(content = String, description = "Raw CSV/TSV file bytes -- Content-Type is not enforced, `format` decides"),
     responses(
         (status = 201, description = "Table created and its rows imported (imported/failed counts, per-row error log)", body = CreateFromFileResponse),
-        (status = 400, description = "Missing/invalid name or format, empty file, too many columns, invalid header UTF-8, or an unknown pk column", body = String, content_type = "text/plain"),
+        (status = 400, description = "Missing/invalid name or format, a `header` value other than `true` or `false`, a table name that is a LuraSQL keyword, empty file, too many columns, invalid UTF-8 in the first line (the header row, or the first row with `header=false`), an unknown pk column, or a header that becomes `_row` without `pk=_row`", body = String, content_type = "text/plain"),
         (status = 403, description = "Missing DDL access on the domain", body = String, content_type = "text/plain"),
         (status = 404, description = "Domain not found", body = String, content_type = "text/plain"),
         (status = 409, description = "A table or view with that name already exists", body = String, content_type = "text/plain"),
@@ -79,11 +79,38 @@ pub struct CreateFromFileResponse {
     ),
     tag = "Relational Import"
 )]
-/// Creates a relational table from an uploaded CSV/TSV file: infers one
-/// LuraDB type per column, then imports every row through the
-/// existing DML write path -- a row that fails is logged, the import
-/// continues. Requires DDL access, enforced the same way the
-/// `/sql` handler enforces a DDL statement.
+/// Creates a table from an uploaded CSV/TSV file, with one type per column
+/// inferred from its values, and imports its rows; a row that fails is logged
+/// and the import continues. Requires DDL access.
+///
+/// Recommended headers: lowercase letters `a`-`z`, digits and `_`, starting
+/// with a letter, at most 50 characters, each used only once, and not a LuraSQL
+/// keyword (for example `key`, `order`, `count`, `text`, `timestamp`). If every
+/// header of a file follows this, each column is named exactly like its header
+/// and `pk` is the header itself.
+///
+/// Every header is turned into a column name by these rules, applied in this
+/// order; a header that follows the recommendation only changes when an
+/// earlier column already has its name:
+///
+/// - The header is trimmed and lowercased.
+/// - An empty header becomes `col_<n>`, where `n` is its 1-based position.
+/// - Every character other than `a`-`z`, `0`-`9` and `_` becomes `_`.
+/// - A leading digit gets a `c` in front.
+/// - A name longer than 50 characters is cut to 50 characters; otherwise a
+///   name that is a LuraSQL keyword gets a `_` appended (`key` becomes `key_`).
+/// - A name that an earlier column already has gets the first free suffix of
+///   `_2`, `_3`, ... appended, from left to right, with the name shortened so
+///   the result stays within 50 characters; the first column keeps the plain
+///   name.
+///
+/// The name `_row` is reserved for the generated primary key column: a header
+/// that becomes `_row` is only accepted together with `pk=_row`, which makes
+/// that file column the primary key.
+///
+/// Example: the header line `SKU,Product Name,2024 Price,,sku,Order` gives the
+/// columns `sku`, `product_name`, `c2024_price`, `col_4`, `sku_2` and `order_`.
+/// The response shows each column's `name` and its `source_header`.
 pub async fn create_table_from_file(
     State(state): State<AppState>,
     Path(domain): Path<String>,
@@ -244,7 +271,7 @@ mod tests {
     async fn create_domain(app: &axum::Router, name: &str, bearer: &str) -> StatusCode {
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/store-api/rel/domains")
+            .uri("/store-api/domains")
             .header("authorization", format!("Bearer {bearer}"))
             .header("content-type", "application/json")
             .body(Body::from(format!(r#"{{"name": "{name}"}}"#)))
@@ -273,6 +300,57 @@ mod tests {
             let amount_col = cols.iter().find(|c| c["name"] == json!("amount")).unwrap();
             assert_eq!(amount_col["type"], json!("INTEGER"));
             assert_eq!(amount_col["source_header"], json!("amount"));
+        })
+    }
+
+    async fn sql(app: &axum::Router, domain: &str, sql: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/store-api/rel/{domain}/sql"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "sql": sql }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        (status, serde_json::from_str(&text).unwrap_or_else(|_| json!({"_raw": text})))
+    }
+
+    // Keyword headers get a `_` suffix (and `?pk=` follows), so SQL can name
+    // them; a keyword table name is rejected and nothing is created.
+    #[test]
+    fn test_keyword_names() {
+        crate::core::engine_runtime::block_on(async {
+            let (app, _dir) = make_default_app().await;
+            let (status, body) =
+                upload(&app, "default", "name=t&format=csv&pk=key", b"id,key,order\n1,a,x\n", None).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let cols = body["columns"].as_array().unwrap();
+            let key = cols.iter().find(|c| c["name"] == json!("key_")).unwrap();
+            assert_eq!(key["primary_key"], json!(true));
+            assert_eq!(key["source_header"], json!("key"));
+            assert!(cols.iter().any(|c| c["name"] == json!("order_")));
+
+            let (status, body) = sql(&app, "default", "SELECT key_, order_ FROM t").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let names: Vec<&str> = body["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+            assert_eq!(names, ["key_", "order_"], "{body}");
+            assert_eq!(body["rows"], json!([["a", "x"]]), "{body}");
+
+            let (status, body) = upload(&app, "default", "name=select&format=csv", b"a\n1\n", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body["_raw"].as_str().unwrap().contains("'select' is a reserved word in LuraSQL and cannot be used as a table name"),
+                "{body}"
+            );
+            let req = Request::builder().uri("/store-api/rel/default/tables").body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let tables: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert!(!tables.to_string().contains("select"), "{tables}");
+            assert!(tables.to_string().contains("\"t\""), "{tables}");
         })
     }
 
@@ -393,14 +471,13 @@ mod tests {
         })
     }
 
-    // Disabled engine: the route is not registered at all (404, axum's
-    // default for an unmatched route) -- same contract as every other rel route.
+    // Disabled engine: 503, same contract as every other rel route.
     #[test]
-    fn test_disabled_engine_route_absent() {
+    fn test_disabled_engine_returns_503() {
         crate::core::engine_runtime::block_on(async {
             let (app, _dir) = make_app(None).await;
             let (status, _) = upload(&app, "default", "name=t&format=csv", b"a\n1\n", None).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         })
     }
 }

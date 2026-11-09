@@ -1,5 +1,5 @@
 //! Data directory layout: every engine keeps the files of data shard `k` —
-//! value log, SSTables, page file — in a `shard_<k>/` directory beside the
+//! value log and SSTables — in a `shard_<k>/` directory beside the
 //! configured path; its write-ahead log, one directory of segments at its
 //! configured path, serves all shards. A data directory from before this
 //! layout moves into `shard_0/` on the first start.
@@ -96,7 +96,7 @@ async fn legacy_files(config: &LuraConfig) -> anyhow::Result<Vec<(PathBuf, PathB
         (&config.json.vlog_path, &config.json.sstable_dir),
         (&config.rel.vlog_path, &config.rel.sstable_dir),
     ];
-    let mut files = vec![PathBuf::from(&config.storage.db_path)];
+    let mut files = Vec::new();
     for (vlog, sstables) in roots {
         let vlog = Path::new(vlog);
         files.push(vlog.to_path_buf());
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn shard_paths_insert_the_shard_directory() {
         assert_eq!(shard_file(Path::new("/data/luradb.vlog"), 0), PathBuf::from("/data/shard_0/luradb.vlog"));
-        assert_eq!(shard_file(Path::new("luradb.db"), 3), PathBuf::from("shard_3/luradb.db"));
+        assert_eq!(shard_file(Path::new("luradb.vlog"), 3), PathBuf::from("shard_3/luradb.vlog"));
         assert_eq!(shard_dir(Path::new("/data/sstables"), 1), PathBuf::from("/data/sstables/shard_1"));
     }
 
@@ -149,8 +149,7 @@ mod tests {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let config = super::super::tests::test_config(dir.path());
-            let (db, vlog) = (Path::new(&config.storage.db_path), Path::new(&config.storage.vlog_path));
-            std::fs::write(db, b"").unwrap();
+            let vlog = Path::new(&config.storage.vlog_path);
             std::fs::write(vlog, b"old").unwrap();
             let moved = shard_file(vlog, 0);
             std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
@@ -160,7 +159,6 @@ mod tests {
             let err = migrate(&config, &sys, 1).await.unwrap_err();
             let expected = format!("{} and {} both exist", vlog.display(), moved.display());
             assert!(format!("{err:#}").contains(&expected), "{err:#}");
-            assert!(db.is_file() && !shard_file(db, 0).exists(), "nothing moved");
             assert_eq!((std::fs::read(vlog).unwrap(), std::fs::read(&moved).unwrap()), (b"old".to_vec(), b"new".to_vec()));
             assert!(!system::layout_is_sharded(&sys).await.unwrap());
             sys.shutdown().await;
@@ -185,7 +183,7 @@ mod tests {
                 let sys = system::open(Path::new(&config.storage.system_dir)).await.unwrap();
                 match existing {
                     "stored" => system::check_shard_count(&sys, 1).await.unwrap(),
-                    "legacy" => std::fs::write(&config.storage.db_path, b"").unwrap(),
+                    "legacy" => std::fs::write(&config.storage.vlog_path, b"").unwrap(),
                     _ => {}
                 }
                 assert_eq!(on_twelve_cores(&config, &sys).await.unwrap(), expected, "{existing}");
@@ -202,7 +200,7 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let mut config = super::super::tests::test_config(dir.path());
             config.multicore.shards = 0;
-            std::fs::write(&config.storage.db_path, b"").unwrap();
+            std::fs::write(&config.storage.vlog_path, b"").unwrap();
             let system_dir = Path::new(&config.storage.system_dir);
             let sys = system::open(system_dir).await.unwrap();
             let shards = on_twelve_cores(&config, &sys).await.unwrap();
@@ -213,6 +211,39 @@ mod tests {
             assert!(legacy_files(&config).await.unwrap().is_empty(), "moved into shard_0/");
             assert_eq!(on_twelve_cores(&config, &sys).await.unwrap(), 1);
             sys.shutdown().await;
+        })
+    }
+
+    // An empty `luradb.db` that an older version left, in the data directory
+    // or in `shard_0/`, is no part of the layout: it does not make the
+    // directory an old one, it is never moved and it stops no start.
+    #[test]
+    fn a_leftover_luradb_db_is_neither_detected_nor_moved() {
+        crate::core::engine_runtime::block_on(async {
+            for (with_vlog, expected) in [(false, 3), (true, 1)] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut config = super::super::tests::test_config(dir.path());
+                config.multicore.shards = 0;
+                let leftover = dir.path().join("luradb.db");
+                let leftover_in_shard = shard_file(&leftover, 0);
+                std::fs::write(&leftover, b"").unwrap();
+                std::fs::create_dir_all(leftover_in_shard.parent().unwrap()).unwrap();
+                std::fs::write(&leftover_in_shard, b"").unwrap();
+                if with_vlog {
+                    std::fs::write(&config.storage.vlog_path, b"").unwrap();
+                }
+                let sys = system::open(Path::new(&config.storage.system_dir)).await.unwrap();
+
+                let shards = on_twelve_cores(&config, &sys).await.unwrap();
+                assert_eq!(shards, expected, "vlog {with_vlog}");
+                migrate(&config, &sys, shards).await.unwrap();
+
+                assert!(leftover.is_file() && leftover_in_shard.is_file(), "vlog {with_vlog}");
+                let vlog = Path::new(&config.storage.vlog_path);
+                assert_eq!(shard_file(vlog, 0).is_file(), with_vlog, "vlog {with_vlog}");
+                assert!(legacy_files(&config).await.unwrap().is_empty(), "vlog {with_vlog}");
+                sys.shutdown().await;
+            }
         })
     }
 

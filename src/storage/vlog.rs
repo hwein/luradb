@@ -161,6 +161,12 @@ impl VLog {
         if cached == len {
             return Ok(buf);
         }
+        self.read_rest(buf, offset, cached).await
+    }
+
+    /// Fills `buf[cached..]` from `offset + cached` on the blocking pool;
+    /// `buf[..cached]` is already in place.
+    async fn read_rest(self: &Arc<Self>, mut buf: Vec<u8>, offset: u64, cached: usize) -> Result<Vec<u8>, VLogError> {
         // Waits here, not in the pool: a read dropped meanwhile takes no thread.
         let permit = COLD_READS.acquire().await.map_err(|e| VLogError::Io(std::io::Error::other(e)))?;
         #[cfg(test)]
@@ -176,7 +182,9 @@ impl VLog {
     }
 
     /// Fills `buf` from `offset` as far as the page cache holds it, without
-    /// blocking (`RWF_NOWAIT`); the bytes read, 0 on any error.
+    /// blocking (`RWF_NOWAIT`); the bytes read, 0 on any error. A gap in the
+    /// cache starts the kernel's readahead, so the call can return more than
+    /// the cache held before it.
     fn read_cached(&self, buf: &mut [u8], offset: u64) -> usize {
         let iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
         // SAFETY: `iov` describes `buf`, which outlives the call.
@@ -325,59 +333,40 @@ mod tests {
         })
     }
 
-    // `read_async` takes what the page cache holds in place and reads the
-    // rest off the calling thread, from where the cached part ends: all,
-    // part or none of the value cached, exactly the appended bytes, and a
-    // read past the end is an error, never a short value.
+    // `read_async` returns exactly the appended bytes, and a read past the
+    // end is an error, never a short value.
     #[test]
-    fn test_read_async_returns_the_bytes_cached_or_not() {
+    fn test_read_async_returns_the_appended_bytes() {
         crate::core::engine_runtime::block_on(async {
-            // On disk, not in `/tmp`: a tmpfs serves no `RWF_NOWAIT` reads on
-            // some kernels, and this test is about the page cache.
-            let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+            let dir = tempfile::TempDir::new().unwrap();
             let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
             let value: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
             let offset = vlog.append(&value).await.unwrap();
             assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
             assert!(vlog.read_async(vlog.size(), 1).await.is_err());
+        })
+    }
 
-            let file = std::fs::File::open(vlog.path()).unwrap();
-            file.sync_all().unwrap();
-            let advise = |advice| {
-                assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) }, 0);
-            };
-            // Drops the file's clean pages, after a blocking read that waits out
-            // any readahead still in flight (pages under I/O would stay). The
-            // whole file: a large folio reaching below a range start stays too.
-            let drop_pages = || {
-                assert_eq!(vlog.read(offset, value.len()).unwrap(), value);
-                advise(libc::POSIX_FADV_DONTNEED);
-            };
-            // Caches the first half alone: `file` reads without readahead.
-            advise(libc::POSIX_FADV_RANDOM);
-            let half = value.len() / 2;
-            let cache_first_half = || {
-                let mut first = vec![0u8; half];
-                file.read_exact_at(&mut first, offset).unwrap();
-            };
-            let mut buf = vec![0u8; value.len()];
+    // With the first `cached` bytes already in the buffer, `read_rest` reads
+    // the remainder from where they end. The value sits behind other bytes
+    // and the rest of the buffer holds a byte the value never contains, so a
+    // wrong file offset or buffer range changes the result.
+    #[test]
+    fn test_read_rest_continues_where_the_cached_part_ends() {
+        crate::core::engine_runtime::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let vlog = Arc::new(VLog::new(dir.path().join("vlog")).await.unwrap());
+            vlog.append(b"prefix before the value").await.unwrap();
+            let value: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+            let offset = vlog.append(&value).await.unwrap();
+            assert_ne!(offset, 0);
+            vlog.append(b"suffix after the value").await.unwrap();
 
-            drop_pages();
-            let cached = vlog.read_cached(&mut buf, offset);
-            if cached == value.len() {
-                return; // the filesystem keeps its pages regardless of the advice
-            }
-            assert_eq!(cached, 0, "nothing is cached");
-            drop_pages();
-            assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
-
-            drop_pages();
-            cache_first_half();
-            let cached = vlog.read_cached(&mut buf, offset);
-            assert!(0 < cached && cached < value.len(), "only the first half is cached, read {cached}");
-            drop_pages();
-            cache_first_half();
-            assert_eq!(vlog.read_async(offset, value.len()).await.unwrap(), value);
+            let cached = value.len() / 2;
+            let mut buf = vec![0xFF; value.len()];
+            buf[..cached].copy_from_slice(&value[..cached]);
+            let read = vlog.read_rest(buf, offset, cached).await.unwrap();
+            assert_eq!(read, value);
         })
     }
 

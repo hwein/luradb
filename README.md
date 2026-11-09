@@ -5,6 +5,10 @@
 
 #
 
+**Handbook:** <https://docs.luradb.org> — install, operate and use LuraDB, with the configuration reference and the REST API.
+
+The handbook is available to agents as one text file: <https://docs.luradb.org/llms-full.txt>.
+
 LuraDB is a Linux-first, REST-native multi-model database built on io_uring.
 One small, fast process covers the three shapes of data a typical backend
 needs: a key-value store (TTLs, watches), JSON documents (indexes, queries),
@@ -164,10 +168,10 @@ curl -X POST http://127.0.0.1:3000/store-api/json/default/documents \
 ```
 
 In development, a browsable Swagger UI is available at `/test-ui` (disabled
-by default; the dev `luradb.toml` turns it on explicitly). With
-`auth.enabled = true`, the UI and `/api-docs/openapi.json` need the same
-valid API key as the rest of the API; use the UI's "Authorize" button to
-set it.
+by default; the dev `luradb.toml` turns it on explicitly). The UI and
+`/api-docs/openapi.json` load without a key, also with `auth.enabled = true`;
+the API calls made from the UI need one like any other request — set it with
+the UI's "Authorize" button.
 
 Requests on one connection are processed in order (HTTP/1.1 pipelining and
 HTTP/2 alike); open several connections for parallelism.
@@ -178,6 +182,8 @@ LuraDB ships an MCP server for AI assistants and agents (opt-in, `[mcp]` in
 `luradb.toml`). It listens on its own port (3100 by default) on the
 server's bind address and offers tools to list and describe domains, read
 keys and documents, search, run SQL queries and read health and metrics.
+A domain holds keys, documents and tables alike, so the domain tools take
+no engine; the data tools of an engine that is switched off answer `503`.
 Writing keys, documents and rows (`read_only = false`) and creating
 domains, tables, views and indexes (`allow_ddl = true`) are separate
 opt-ins; no tool deletes a domain, table, view or index. Clients
@@ -219,12 +225,14 @@ are set in `[resources]` in `luradb.toml`; details in
 ## Backups
 
 A backup (`POST /store-api/backups`, or a schedule in `[backup]`) is a
-logical NDJSON archive of key-value, JSON and relational domains: keys,
-documents with their index definitions, and tables with their rows,
-indexes, views and AUTOINCREMENT state. The scope picks what goes in: `all`,
-one engine (`kv`, `json`, `rel`), one domain of one engine (`kv:<domain>`,
-`json:<domain>`, `rel:<domain>`) or one domain name in every engine
-(`domain:<name>`).
+logical NDJSON archive of domains: keys, documents with their index
+definitions, and tables with their rows, indexes, views and AUTOINCREMENT
+state, plus each domain's conditional-write setting. The scope picks what
+goes in: `all`, one engine of every domain (`kv`, `json`, `rel`), one whole
+domain (`domain:<name>`) or one engine of one domain (`kv:<name>`,
+`json:<name>`, `rel:<name>`). A restore creates a missing domain whole; with
+`replace` it empties and refills exactly the engines the archive holds and
+keeps the domain and its permissions.
 
 KVREF and JSONREF columns link to the KV and JSON domain of the same name.
 They resolve after a restore when that domain is restored too or already

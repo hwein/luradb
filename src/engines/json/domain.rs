@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const SYS_JSON_DOMAIN_PREFIX: &[u8] = b"__sys:json_domain:";
-pub(crate) const DEFAULT_DOMAIN: &str = "default";
-pub(super) const MAX_DOMAIN_NAME_LEN: usize = 50;
 
 fn sys_key(name: &str) -> Vec<u8> {
     let mut k = SYS_JSON_DOMAIN_PREFIX.to_vec();
@@ -24,40 +22,11 @@ fn sys_key(name: &str) -> Vec<u8> {
     k
 }
 
-/// Lower bound of `json.lsm.max_key_length`: the longest
-/// management key, `__sys:json_domain:{name}` at a maximal name, plus 1 byte.
-pub(crate) const MIN_LSM_KEY_LENGTH: usize = SYS_JSON_DOMAIN_PREFIX.len() + MAX_DOMAIN_NAME_LEN + 1;
-
-fn validate_domain_name(name: &str) -> Result<(), JsonStoreError> {
-    if name.is_empty() {
-        return Err(JsonStoreError::InvalidDomainName(
-            "name must not be empty".to_string(),
-        ));
-    }
-    if name.len() > MAX_DOMAIN_NAME_LEN {
-        return Err(JsonStoreError::InvalidDomainName(format!(
-            "name length {} exceeds maximum of {} characters",
-            name.len(),
-            MAX_DOMAIN_NAME_LEN
-        )));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(JsonStoreError::InvalidDomainName(format!(
-            "name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
-            name
-        )));
-    }
-    // Shadowed by the static /json/domains routes: data endpoints of
-    // such a domain would answer 404/405 (matchit prefers static segments).
-    if name == "domains" {
-        return Err(JsonStoreError::InvalidDomainName(
-            "name 'domains' is reserved".to_string(),
-        ));
-    }
-    Ok(())
+/// Lower bound of `json.lsm.max_key_length` for domain names up to
+/// `max_name_length`: the longest management key,
+/// `__sys:json_domain:{name}` at a maximal name, plus 1 byte.
+pub(crate) fn min_lsm_key_length(max_name_length: usize) -> usize {
+    SYS_JSON_DOMAIN_PREFIX.len() + max_name_length + 1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -102,9 +71,8 @@ pub struct JsonDomainRegistry {
 }
 
 impl JsonDomainRegistry {
-    /// Loads all persisted domains, then, with `owns_default`, creates the
-    /// default domain if it is missing in any state.
-    pub async fn recover(engine: Arc<LsmStorageEngine>, owns_default: bool) -> anyhow::Result<Self> {
+    /// Loads all persisted domains.
+    pub async fn recover(engine: Arc<LsmStorageEngine>) -> anyhow::Result<Self> {
         let keys = engine.scan_keys(SYS_JSON_DOMAIN_PREFIX).await?;
         let mut loaded = HashMap::new();
         for key in keys {
@@ -120,38 +88,24 @@ impl JsonDomainRegistry {
                 }
             }
         }
-        let registry = Self { domains: RwLock::new(loaded), engine };
-        // Any state counts: creating over a Deleting default would fail with
-        // DomainAlreadyExists and abort every boot. The purger finalizes it;
-        // the next recover() then recreates it.
-        match registry.get_domain_any(DEFAULT_DOMAIN) {
-            None if !owns_default => {}
-            None => {
-                registry.create_domain(DEFAULT_DOMAIN).await?;
-            }
-            Some(d) if d.state == JsonDomainState::Deleting => tracing::warn!(
-                "[JsonDomainRegistry] default domain is Deleting at startup; \
-                 it will be recreated on the first start after the purge finishes"
-            ),
-            Some(_) => {}
-        }
-        Ok(registry)
+        Ok(Self { domains: RwLock::new(loaded), engine })
     }
 
     /// Creates a new domain. Fails if the name already exists (incl. deleting).
+    #[cfg(test)]
     pub(crate) async fn create_domain(&self, name: &str) -> Result<JsonDomain, JsonStoreError> {
         self.create_domain_with(name, false).await
     }
 
-    /// [`Self::create_domain`] with the domain's
-    /// [`JsonDomain::require_conditional_writes`] setting. The check and the
-    /// insert span an await: callers must not run two lifecycle changes at once.
+    /// Creates a new domain with its
+    /// [`JsonDomain::require_conditional_writes`] setting; fails if the name
+    /// already exists (incl. deleting). The check and the insert span an
+    /// await: callers must not run two lifecycle changes at once.
     pub(crate) async fn create_domain_with(
         &self,
         name: &str,
         require_conditional_writes: bool,
     ) -> Result<JsonDomain, JsonStoreError> {
-        validate_domain_name(name)?;
         if self.domains.read().contains_key(name) {
             return Err(JsonStoreError::DomainAlreadyExists(name.to_string()));
         }
@@ -238,7 +192,9 @@ mod tests {
     // startup lower bound of json.lsm.max_key_length.
     #[test]
     fn test_sys_key_at_max_name_fits_key_limit_lower_bound() {
-        let key = sys_key(&"d".repeat(MAX_DOMAIN_NAME_LEN));
-        assert!(key.len() < MIN_LSM_KEY_LENGTH, "{}", key.len());
+        for max in [50, 80] {
+            let key = sys_key(&"d".repeat(max));
+            assert!(key.len() < min_lsm_key_length(max), "{}", key.len());
+        }
     }
 }

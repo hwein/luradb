@@ -1,23 +1,17 @@
 //! Cross-engine links: the `CrossEngineResolver` bridge from
-//! the rel engine to the same-named KV/JSON domains, the per-query read
-//! `LinkMask`, and the background `RelCrossEngineSweeper` that physically nulls
-//! orphaned link cells. This is the **only** rel module that imports `kv`/`json`
+//! the rel engine to the same-named KV/JSON domains, and the per-query read
+//! `LinkMask`. This is the **only** rel module that imports `kv`/`json`
 //! types — the rest of the engine stays link-agnostic (rel never appears in
 //! `kv`/`json`, so no cycles).
 
-use super::catalog::{CatalogEntry, ColumnDef, IndexMeta, TableSchema};
-use super::domain::{RelDomain, RelDomainState};
+use super::catalog::TableSchema;
 use super::error::RelStoreError;
-use super::keys;
-use super::row::{decode_row, decode_value, encode_row};
-use super::types::{encode_sortable, ColumnType, ScalarValue};
+use super::types::{ColumnType, ScalarValue};
 use super::RelEngine;
 use crate::engines::json::{JsonEngine, JsonStoreError};
 use crate::engines::lsm::domain::DomainRegistry;
-use crate::engines::lsm::engine::BatchOp;
-use crate::engines::lsm::reader::{GetResult, Snapshot};
+use crate::engines::lsm::reader::GetResult;
 use crate::metrics::MetricsStore;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// State of the same-named target domain in the target engine.
@@ -31,12 +25,6 @@ pub enum TargetDomain {
 impl TargetDomain {
     fn is_active(self) -> bool {
         matches!(self, TargetDomain::Active)
-    }
-
-    /// Only a gone/`Deleting` domain is swept, never a disabled engine: its
-    /// data stays on disk and is visible again once re-enabled.
-    fn should_sweep(self) -> bool {
-        matches!(self, TargetDomain::GoneOrDeleting)
     }
 }
 
@@ -58,7 +46,7 @@ pub enum JsonResolution {
 
 /// Bridge from the rel engine to the same-named KV/JSON domains. Both handles
 /// are optional: an engine can be disabled by config. Reads and writes treat a
-/// disabled engine like a gone target; the sweep does not.
+/// disabled engine like a gone target.
 pub struct CrossEngineResolver {
     kv: Option<Arc<DomainRegistry>>,
     json: Option<Arc<JsonEngine>>,
@@ -78,12 +66,6 @@ impl CrossEngineResolver {
     /// 409s. Used by the rel-module tests that boot without target engines.
     pub fn disabled(metrics: Arc<MetricsStore>) -> Arc<Self> {
         Self::new(None, None, metrics)
-    }
-
-    /// Whether at least one target engine is wired (main.rs only spawns the
-    /// sweeper then).
-    pub fn has_target(&self) -> bool {
-        self.kv.is_some() || self.json.is_some()
     }
 
     pub(crate) fn kv_enabled(&self) -> bool {
@@ -160,10 +142,6 @@ impl CrossEngineResolver {
 
     pub(crate) fn record_write_validation(&self, engine: &str) {
         self.metrics.record_rel_cross_engine_write_validation(engine);
-    }
-
-    pub(crate) fn record_swept_cells(&self, n: u64) {
-        self.metrics.record_rel_cross_engine_swept_cells(n);
     }
 }
 
@@ -244,24 +222,6 @@ impl RelEngine {
             && (!auth.json_read || !self.cross_engine.json_domain_status(domain).is_active());
         Ok(LinkMask { kvref, jsonref })
     }
-
-    /// All KVREF/JSONREF columns of a domain's tables (sweeper candidate set).
-    pub(crate) fn link_columns(
-        &self,
-        domain: &str,
-    ) -> Result<Vec<(TableSchema, ColumnDef)>, RelStoreError> {
-        let mut out = Vec::new();
-        for entry in self.catalog.list(&self.domains, domain)? {
-            if let CatalogEntry::Table(t) = entry {
-                for c in &t.columns {
-                    if matches!(c.col_type, ColumnType::KvRef | ColumnType::JsonRef) {
-                        out.push((t.clone(), c.clone()));
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -281,249 +241,17 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Seconds between sweep ticks and the max cells nulled per (domain,
-/// column, tick): a gentler cadence than the domain purger, since it
-/// rewrites live rows.
-pub const SWEEP_INTERVAL_SECS: u64 = 10;
-pub const SWEEP_BATCH_SIZE: usize = 100;
-
-/// Background task that physically nulls link cells whose same-named target
-/// domain vanished in a foreign engine — the durable half of "nulled stays
-/// nulled". Distinct from the domain purger (which tombstones a rel domain's
-/// own orphaned prefix ranges); this one rewrites cells in *live* tables.
-pub struct RelCrossEngineSweeper {
-    engine: Arc<RelEngine>,
-    batch_size: usize,
-}
-
-impl RelCrossEngineSweeper {
-    pub fn new(engine: Arc<RelEngine>, batch_size: usize) -> Self {
-        Self { engine, batch_size }
-    }
-
-    fn restore_running(&self) -> bool {
-        self.engine.control.get().is_some_and(|control| control.restore_running())
-    }
-
-    /// Skipped while a restore runs: a domain it replaces is briefly gone;
-    /// and while writes are refused for want of disk space or memory.
-    pub async fn sweep_tick(&self) -> anyhow::Result<()> {
-        if self.restore_running() || self.engine.engine().writes_refused() {
-            return Ok(());
-        }
-        for dom in self.engine.domains.list_domains() {
-            // `list_domains` surfaces `Deleting` domains too; the domain
-            // purger owns those (it tombstones every row), so the
-            // cross-engine sweeper must skip them — rewriting a cell here could
-            // resurrect a row the purger already reaped.
-            if dom.state != RelDomainState::Active {
-                continue;
-            }
-            self.sweep_domain(&dom).await?;
-        }
-        Ok(())
-    }
-
-    async fn sweep_domain(&self, dom: &RelDomain) -> anyhow::Result<()> {
-        let kv_gone = self.engine.cross_engine.kv_domain_status(&dom.name).await?.should_sweep();
-        let json_gone = self.engine.cross_engine.json_domain_status(&dom.name).should_sweep();
-        if !kv_gone && !json_gone {
-            return Ok(());
-        }
-        let columns = match self.engine.link_columns(&dom.name) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("[RelCrossEngineSweeper] {}: {e}", dom.name);
-                return Ok(());
-            }
-        };
-        for (table, col) in columns {
-            if !link_target_gone(col.col_type, kv_gone, json_gone) {
-                continue;
-            }
-            if let Err(e) = self.sweep_column(dom, &table, &col).await {
-                tracing::warn!("[RelCrossEngineSweeper] {}.{}: {e}", table.name, col.name);
-            }
-        }
-        Ok(())
-    }
-
-    /// Nulls up to `batch_size` unchanged non-NULL cells of one link column,
-    /// under the table write lock (same serialization as the DML path).
-    async fn sweep_column(
-        &self,
-        dom: &RelDomain,
-        table: &TableSchema,
-        col: &ColumnDef,
-    ) -> anyhow::Result<()> {
-        let prefix = &dom.system_prefix;
-        let engine = &self.engine.engine;
-        let snapshot = engine.snapshot().await;
-        let snap = snapshot.snapshot();
-        let ix = table.indexes.iter().find(|ix| ix.column == col.name);
-
-        let pk_encs = self.candidate_pk_encs(prefix, table, col, ix, snap).await?;
-
-        let lock = self.engine.table_locks.get(prefix, table.table_id);
-        let _guard = lock.lock().await;
-        let mut swept = 0u64;
-        for pk_enc in pk_encs {
-            if swept >= self.batch_size as u64 {
-                break;
-            }
-            let row_key = keys::row_key(prefix, table.table_id, &pk_enc);
-            let Some((now_bytes, v_now)) = self.unchanged_link_value(&row_key, col, snap).await? else {
-                continue;
-            };
-            let ops = null_cell_ops(table, col, ix, prefix, &pk_enc, row_key, &now_bytes, &v_now);
-            // Purge guard: commit under the engine write guard and re-check
-            // the rel domain is still active. If the domain purger is
-            // finalizing this domain, stop — otherwise this row rewrite could
-            // land after the domain was emptied and orphan a `ROW:` key.
-            // The restore flag is read again after the target was seen gone:
-            // a restore sets it before it removes a domain, so the flag shows.
-            {
-                let _wg = self.engine.write_guard.lock().await;
-                if self.engine.domains.require_active(&dom.name).is_err() || self.restore_running() {
-                    break;
-                }
-                engine.write_batch(ops).await?;
-            }
-            swept += 1;
-        }
-        if swept > 0 {
-            self.engine.cross_engine.record_swept_cells(swept);
-        }
-        Ok(())
-    }
-
-    /// Candidate pk_encs: index scan lists exactly the non-NULL cells (NULL
-    /// is never indexed), else a table scan decodes and checks the cell.
-    async fn candidate_pk_encs(
-        &self,
-        prefix: &[u8],
-        table: &TableSchema,
-        col: &ColumnDef,
-        ix: Option<&IndexMeta>,
-        snap: &Snapshot,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
-        let engine = &self.engine.engine;
-        let mut pk_encs: Vec<Vec<u8>> = Vec::new();
-        if let Some(ix) = ix {
-            let scan_prefix = keys::index_value_prefix(prefix, ix.index_id, &[]);
-            for k in engine.scan_keys(&scan_prefix).await? {
-                if let Some(pk_enc) = split_text_val_pk(&k[scan_prefix.len()..]) {
-                    pk_encs.push(pk_enc.to_vec());
-                }
-            }
-        } else {
-            let row_prefix = keys::row_table_prefix(prefix, table.table_id);
-            for rk in engine.scan_keys(&row_prefix).await? {
-                if let Some(bytes) = engine.get_with_snapshot(&rk, snap).await?.into_option() {
-                    if !matches!(decode_value(&bytes, col), ScalarValue::Null) {
-                        pk_encs.push(rk[row_prefix.len()..].to_vec());
-                    }
-                }
-            }
-        }
-        Ok(pk_encs)
-    }
-
-    async fn unchanged_link_value(
-        &self,
-        row_key: &[u8],
-        col: &ColumnDef,
-        snap: &Snapshot,
-    ) -> anyhow::Result<Option<(Vec<u8>, ScalarValue)>> {
-        let engine = &self.engine.engine;
-        // v_snap: state at tick start.
-        let Some(snap_bytes) = engine.get_with_snapshot(row_key, snap).await?.into_option() else {
-            return Ok(None);
-        };
-        let v_snap = decode_value(&snap_bytes, col);
-        if matches!(v_snap, ScalarValue::Null) {
-            return Ok(None);
-        }
-        // v_now: latest committed. Only null it if untouched since the snapshot
-        // (a fresh valid link against a recreated domain must survive).
-        let now_guard = engine.snapshot().await;
-        let Some(now_bytes) = engine.get_with_snapshot(row_key, now_guard.snapshot()).await?.into_option() else {
-            return Ok(None);
-        };
-        let v_now = decode_value(&now_bytes, col);
-        if matches!(v_now, ScalarValue::Null) || v_now != v_snap {
-            return Ok(None);
-        }
-        Ok(Some((now_bytes, v_now)))
-    }
-}
-
-fn link_target_gone(col_type: ColumnType, kv_gone: bool, json_gone: bool) -> bool {
-    match col_type {
-        ColumnType::KvRef => kv_gone,
-        ColumnType::JsonRef => json_gone,
-        _ => false,
-    }
-}
-
-fn null_cell_ops(
-    table: &TableSchema,
-    col: &ColumnDef,
-    ix: Option<&IndexMeta>,
-    prefix: &[u8],
-    pk_enc: &[u8],
-    row_key: Vec<u8>,
-    now_bytes: &[u8],
-    v_now: &ScalarValue,
-) -> Vec<BatchOp> {
-    let mut values: HashMap<u16, ScalarValue> = table
-        .columns
-        .iter()
-        .zip(decode_row(now_bytes, table))
-        .map(|(c, v)| (c.col_id, v))
-        .collect();
-    values.insert(col.col_id, ScalarValue::Null);
-    let new_row = encode_row(table, &values);
-
-    let mut ops = Vec::new();
-    if let Some(ix) = ix {
-        if let Some(old_enc) = encode_sortable(v_now) {
-            ops.push(BatchOp::Delete {
-                key: keys::index_key(prefix, ix.index_id, &old_enc, pk_enc),
-            });
-        }
-    }
-    ops.push(BatchOp::Put { key: row_key, value: new_row });
-    ops
-}
-
-/// Splits `val_enc ++ pk_enc` (after an index's `IDX:…:{index_id}:` prefix) at
-/// the text value's `0x00 0x00` terminator, honoring `0x00 0xFF` escapes
-/// (sortable text encoding); returns `pk_enc`. KVREF/JSONREF are physically TEXT.
-fn split_text_val_pk(rest: &[u8]) -> Option<&[u8]> {
-    let mut i = 0;
-    while i + 1 < rest.len() {
-        if rest[i] == 0x00 {
-            match rest[i + 1] {
-                0x00 => return Some(&rest[i + 2..]),
-                0xFF => i += 2,
-                _ => return None,
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{JsonStoreConfig, RelStoreConfig};
     use crate::core::wal::WriteAheadLog;
-    use crate::engines::lsm::domain::DomainConfig;
+    use crate::engines::lsm::domain::{DomainConfig, DomainPurger};
     use crate::engines::lsm::engine::LsmStorageEngine;
-    use crate::engines::json::JsonDomainPurger;
+    use crate::engines::rel::catalog::CatalogEntry;
+    use crate::engines::rel::keys;
+    use crate::engines::rel::row::decode_value;
+    use crate::engines::rel::types::encode_sortable;
     use crate::engines::rel::{ExecOutcome, ExpandedBlock, SqlOutcome};
     use crate::metrics::MetricsConfig;
     use crate::storage::file_manager::FileManager;
@@ -558,7 +286,7 @@ mod tests {
 
     async fn make_kv(dir: &Path, metrics: Arc<MetricsStore>) -> Arc<DomainRegistry> {
         let engine = make_lsm(dir, "kv").await;
-        Arc::new(DomainRegistry::recover(engine, DomainConfig::default(), metrics).await.unwrap())
+        Arc::new(DomainRegistry::recover_with_default(engine, DomainConfig::default(), metrics).await.unwrap())
     }
 
     async fn make_json(dir: &Path, metrics: Arc<MetricsStore>) -> Arc<JsonEngine> {
@@ -681,13 +409,6 @@ mod tests {
         let ix = schema.indexes.iter().find(|i| i.name == index).unwrap();
         let scan = keys::index_value_prefix(&prefix, ix.index_id, &[]);
         rel.engine().scan_keys(&scan).await.unwrap().len()
-    }
-
-    async fn sweep_once(rel: &Arc<RelEngine>, batch: usize) {
-        RelCrossEngineSweeper::new(Arc::clone(rel), batch)
-            .sweep_tick()
-            .await
-            .unwrap();
     }
 
     #[test]
@@ -1031,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sweep_physically_nulls() {
+    fn test_purging_target_part_is_masked_and_links_stay_stored() {
         crate::core::engine_runtime::block_on(async {
             let e = env().await;
             e.rel.create_domain("d").await.unwrap();
@@ -1040,137 +761,22 @@ mod tests {
             ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
             ok(&e.rel, "d", "CREATE INDEX ix ON t (payload)").await;
             ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k')").await;
-            assert_eq!(index_entries(&e.rel, "d", "t", "ix").await, 1);
 
             e.kv.delete_domain("d").await.unwrap();
-            sweep_once(&e.rel, 100).await;
+            let r = rows(&e.rel, "d", "SELECT payload FROM t WHERE id = 1").await;
+            assert_eq!(r[0][0], ScalarValue::Null, "link to a purging part reads as NULL");
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Text("k".into()), "stored cell unchanged");
+            assert_eq!(index_entries(&e.rel, "d", "t", "ix").await, 1, "index entry kept");
 
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null, "cell physically NULL");
-            assert_eq!(index_entries(&e.rel, "d", "t", "ix").await, 0, "index entry removed");
-
-            // Recreate the KV domain: the physically-nulled cell stays NULL.
-            e.kv.finalize_domain_deletion("d").await.unwrap();
+            // The purge finishes and an empty part is laid again.
+            let purger = DomainPurger::new(Arc::clone(e.kv.engine()), Arc::clone(&e.kv), 100);
+            purger.purge_tick().await.unwrap();
+            purger.purge_tick().await.unwrap();
             e.kv.create_domain("d").await.unwrap();
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null, "nulled stays nulled");
+            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Text("k".into()), "stored cell still the old key");
+            let exp = expand_block(&e.rel, "d", "SELECT * FROM t", &["payload"]).await;
+            assert_eq!(colv(&exp, "payload")[0], json!({ "exists": false, "value": null }));
         })
-    }
-
-    // Test 6: while writes are refused, a sweep writes nothing; the next one
-    // after the block nulls the cell.
-    #[test]
-    fn test_sweep_waits_while_writes_are_refused() {
-        crate::core::engine_runtime::block_on(async {
-            let e = env().await;
-            e.rel.create_domain("d").await.unwrap();
-            e.kv.create_domain("d").await.unwrap();
-            kv_put(&e.kv, "d", b"k", b"v").await;
-            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
-            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k')").await;
-            e.kv.delete_domain("d").await.unwrap();
-
-            let resources = e.rel.engine().resources();
-            resources.block_for_test(false, false);
-            let lsn = e.rel.engine().last_applied_lsn();
-            sweep_once(&e.rel, 100).await;
-            assert_eq!(e.rel.engine().last_applied_lsn(), lsn, "no write during the block");
-            assert_ne!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
-
-            resources.unblock_for_test();
-            sweep_once(&e.rel, 100).await;
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
-        })
-    }
-
-    #[test]
-    fn test_sweep_optimistic_recreate() {
-        crate::core::engine_runtime::block_on(async {
-            let e = env().await;
-            e.rel.create_domain("d").await.unwrap();
-            e.kv.create_domain("d").await.unwrap();
-            kv_put(&e.kv, "d", b"k1", b"v").await;
-            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
-            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k1')").await;
-
-            // Delete, finalize, recreate, seed a new key, and write a fresh link.
-            e.kv.delete_domain("d").await.unwrap();
-            e.kv.finalize_domain_deletion("d").await.unwrap();
-            e.kv.create_domain("d").await.unwrap();
-            kv_put(&e.kv, "d", b"k2", b"v").await;
-            ok(&e.rel, "d", "UPDATE t SET payload = 'k2' WHERE id = 1").await;
-
-            // Domain is Active again → the sweep leaves the new cell untouched.
-            sweep_once(&e.rel, 100).await;
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Text("k2".into()));
-        })
-    }
-
-    #[test]
-    fn test_sweep_index_vs_table_scan() {
-        crate::core::engine_runtime::block_on(async {
-            let e = env().await;
-            e.rel.create_domain("d").await.unwrap();
-            e.kv.create_domain("d").await.unwrap();
-            kv_put(&e.kv, "d", b"k", b"v").await;
-            // indexed KVREF + a co-resident non-link column, plus an all-TEXT table.
-            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF, note TEXT)").await;
-            ok(&e.rel, "d", "CREATE INDEX ix ON t (payload)").await;
-            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k', 'keep')").await;
-            ok(&e.rel, "d", "CREATE TABLE plain (id INTEGER PRIMARY KEY, s TEXT)").await;
-            ok(&e.rel, "d", "INSERT INTO plain VALUES (1, 'untouched')").await;
-
-            e.kv.delete_domain("d").await.unwrap();
-            sweep_once(&e.rel, 100).await;
-
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "note").await, ScalarValue::Text("keep".into()), "co-resident column untouched");
-            assert_eq!(index_entries(&e.rel, "d", "t", "ix").await, 0);
-            assert_eq!(raw_cell(&e.rel, "d", "plain", 1, "s").await, ScalarValue::Text("untouched".into()), "other table untouched");
-        })
-    }
-
-    #[test]
-    fn test_sweep_convergence_and_budget() {
-        crate::core::engine_runtime::block_on(async {
-            let e = env().await;
-            e.rel.create_domain("d").await.unwrap();
-            e.kv.create_domain("d").await.unwrap();
-            for i in 0..3 {
-                kv_put(&e.kv, "d", format!("k{i}").as_bytes(), b"v").await;
-            }
-            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
-            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k0'), (2, 'k1'), (3, 'k2')").await;
-
-            e.kv.delete_domain("d").await.unwrap();
-
-            // batch_size = 1 → one cell per tick; three ticks converge.
-            let before = e.metrics.system.rel_cross_engine_swept_cells_total.load(Ordering::Relaxed);
-            for _ in 0..3 {
-                sweep_once(&e.rel, 1).await;
-            }
-            let swept = e.metrics.system.rel_cross_engine_swept_cells_total.load(Ordering::Relaxed) - before;
-            assert_eq!(swept, 3, "three cells nulled across three ticks");
-            assert_eq!(count_nonnull_payload(&e.rel, "d").await, 0, "all cells NULL");
-
-            // Steady-state: a further tick is a no-op.
-            let before = e.metrics.system.rel_cross_engine_swept_cells_total.load(Ordering::Relaxed);
-            sweep_once(&e.rel, 100).await;
-            assert_eq!(e.metrics.system.rel_cross_engine_swept_cells_total.load(Ordering::Relaxed), before, "no-op steady state");
-        })
-    }
-
-    async fn count_nonnull_payload(rel: &RelEngine, domain: &str) -> usize {
-        let (prefix, schema) = table_of(rel, domain, "t");
-        let col = schema.columns.iter().find(|c| c.name == "payload").unwrap();
-        let mut n = 0;
-        for rk in rel.engine().scan_keys(&keys::row_table_prefix(&prefix, schema.table_id)).await.unwrap() {
-            let snap = rel.engine().snapshot().await;
-            if let Some(bytes) = rel.engine().get_with_snapshot(&rk, snap.snapshot()).await.unwrap().into_option() {
-                if !matches!(decode_value(&bytes, col), ScalarValue::Null) {
-                    n += 1;
-                }
-            }
-        }
-        n
     }
 
     #[test]
@@ -1231,36 +837,6 @@ mod tests {
             let exp = expand_block(&rel, "default", "SELECT * FROM t WHERE id = 4", &["*"]).await;
             assert_eq!(colv(&exp, "payload")[0], Value::Null);
             assert_eq!(colv(&exp, "doc")[0], Value::Null);
-        })
-    }
-
-    // 25. sweep_tick skip: a rel-Deleting domain is left untouched even though
-    // its KV target is gone — the domain purger owns it, not the sweeper.
-    #[test]
-    fn test_sweep_skips_deleting_rel_domain() {
-        crate::core::engine_runtime::block_on(async {
-            let e = env().await;
-            e.rel.create_domain("d").await.unwrap();
-            e.kv.create_domain("d").await.unwrap();
-            kv_put(&e.kv, "d", b"k", b"v").await;
-            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF)").await;
-            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k')").await;
-            let (prefix, schema) = table_of(&e.rel, "d", "t");
-            let col = schema.columns.iter().find(|c| c.name == "payload").unwrap().clone();
-
-            e.kv.delete_domain("d").await.unwrap(); // target gone: would normally be swept
-            e.rel.delete_domain("d").await.unwrap(); // but the rel domain itself is Deleting
-
-            sweep_once(&e.rel, 100).await;
-
-            let row_key = keys::row_key(&prefix, schema.table_id, &encode_sortable(&ScalarValue::Integer(1)).unwrap());
-            let snap = e.rel.engine().snapshot().await;
-            let bytes = e.rel.engine().get_with_snapshot(&row_key, snap.snapshot()).await.unwrap().into_option().unwrap();
-            assert_eq!(
-                decode_value(&bytes, &col),
-                ScalarValue::Text("k".into()),
-                "Deleting rel domain untouched by the cross-engine sweeper"
-            );
         })
     }
 
@@ -1424,12 +1000,11 @@ mod tests {
         })
     }
 
-    // Tests 1+2 (JSONREF): masked while JSON is disabled, sweeper ticks must
-    // not physically null the cell, and the reference is back once JSON is
-    // re-enabled. Test 4 (regression): a non-NULL JSONREF write still 409s
-    // while JSON stays disabled.
+    // JSONREF: masked while JSON is disabled, the stored cell is untouched,
+    // and the reference is back once JSON is re-enabled. A non-NULL JSONREF
+    // write still 409s while JSON stays disabled.
     #[test]
-    fn test_jsonref_survives_disable_reenable_sweep() {
+    fn test_jsonref_survives_disable_reenable() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let metrics = MetricsStore::new(MetricsConfig::default());
@@ -1447,21 +1022,18 @@ mod tests {
                 rel.shutdown().await;
             }
 
-            // Phase 2: JSON disabled — masked read, several sweep ticks must
-            // leave the cell physically untouched, and a non-NULL write 409s.
+            // Phase 2: JSON disabled — masked read, the cell stays physically
+            // untouched, and a non-NULL write 409s.
             {
                 let resolver = CrossEngineResolver::new(Some(Arc::clone(&kv)), None, Arc::clone(&metrics));
                 let rel = boot_rel(dir.path(), RelStoreConfig::default(), Arc::clone(&metrics), resolver).await;
                 let r = rows(&rel, "default", "SELECT doc FROM t WHERE id = 1").await;
                 assert_eq!(r[0][0], ScalarValue::Null, "masked while JSON disabled");
 
-                for _ in 0..3 {
-                    sweep_once(&rel, 100).await;
-                }
                 assert_eq!(
                     raw_cell(&rel, "default", "t", 1, "doc").await,
                     ScalarValue::Text("d1".into()),
-                    "sweep must not physically null a cell merely because its target engine is disabled"
+                    "a disabled target engine must not change the stored cell"
                 );
 
                 let err = exec_err(&rel, "default", "INSERT INTO t VALUES (2, 'd1')").await;
@@ -1484,11 +1056,10 @@ mod tests {
         })
     }
 
-    // Test 5 (KVREF counterpart): masked while KV is disabled, sweeper ticks
-    // must not physically null the cell, and the reference is back once KV is
-    // re-enabled.
+    // KVREF counterpart: masked while KV is disabled, the stored cell is
+    // untouched, and the reference is back once KV is re-enabled.
     #[test]
-    fn test_kvref_survives_disable_reenable_sweep() {
+    fn test_kvref_survives_disable_reenable() {
         crate::core::engine_runtime::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let metrics = MetricsStore::new(MetricsConfig::default());
@@ -1506,21 +1077,18 @@ mod tests {
                 rel.shutdown().await;
             }
 
-            // Phase 2: KV disabled — masked read, several sweep ticks must leave
-            // the cell physically untouched.
+            // Phase 2: KV disabled — masked read, the cell stays physically
+            // untouched.
             {
                 let resolver = CrossEngineResolver::new(None, Some(Arc::clone(&json)), Arc::clone(&metrics));
                 let rel = boot_rel(dir.path(), RelStoreConfig::default(), Arc::clone(&metrics), resolver).await;
                 let r = rows(&rel, "default", "SELECT payload FROM t WHERE id = 1").await;
                 assert_eq!(r[0][0], ScalarValue::Null, "masked while KV disabled");
 
-                for _ in 0..3 {
-                    sweep_once(&rel, 100).await;
-                }
                 assert_eq!(
                     raw_cell(&rel, "default", "t", 1, "payload").await,
                     ScalarValue::Text("k".into()),
-                    "sweep must not physically null a cell merely because its target engine is disabled"
+                    "a disabled target engine must not change the stored cell"
                 );
                 rel.shutdown().await;
             }
@@ -1532,81 +1100,6 @@ mod tests {
                 let r = rows(&rel, "default", "SELECT payload FROM t WHERE id = 1").await;
                 assert_eq!(r[0][0], ScalarValue::Text("k".into()), "KVREF survives disable+re-enable");
             }
-        })
-    }
-
-    // Test 3 (regression): a JSON domain that is really deleted — engine
-    // stays enabled throughout — is still swept: the JSONREF cell is
-    // physically nulled and stays NULL after the domain is finalized and
-    // recreated same-named.
-    #[test]
-    fn test_sweep_physically_nulls_jsonref_on_domain_delete() {
-        crate::core::engine_runtime::block_on(async {
-            let e = env().await;
-            e.rel.create_domain("d").await.unwrap();
-            e.json.create_domain("d").await.unwrap();
-            e.json.put_document("d", "j1", json!({"a": 1})).await.unwrap();
-            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, doc JSONREF)").await;
-            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'j1')").await;
-
-            e.json.delete_domain("d").await.unwrap();
-            sweep_once(&e.rel, 100).await;
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Null, "cell physically NULL");
-
-            // Finalize the deletion (a document is present -> two ticks, mirrors
-            // the JSON purger tests) before recreating the domain same-named.
-            let purger = JsonDomainPurger::new(Arc::clone(&e.json), 100);
-            purger.purge_tick().await.unwrap();
-            purger.purge_tick().await.unwrap();
-
-            e.json.create_domain("d").await.unwrap();
-            let r = rows(&e.rel, "d", "SELECT doc FROM t WHERE id = 1").await;
-            assert_eq!(r[0][0], ScalarValue::Null, "nulled stays nulled");
-        })
-    }
-
-    // A tick that already passed the restore check at its start still finds
-    // the target gone later; it must leave the links alone while a restore runs.
-    #[test]
-    fn test_sweep_after_gone_target_writes_nothing_while_a_restore_runs() {
-        crate::core::engine_runtime::block_on(async {
-            let e = env().await;
-            e.rel.create_domain("d").await.unwrap();
-            e.kv.create_domain("d").await.unwrap();
-            e.json.create_domain("d").await.unwrap();
-            kv_put(&e.kv, "d", b"k", b"v").await;
-            e.json.put_document("d", "j1", json!({"a": 1})).await.unwrap();
-            ok(&e.rel, "d", "CREATE TABLE t (id INTEGER PRIMARY KEY, payload KVREF, doc JSONREF)").await;
-            ok(&e.rel, "d", "INSERT INTO t VALUES (1, 'k', 'j1')").await;
-
-            // KV target Deleting, JSON target missing altogether.
-            e.kv.delete_domain("d").await.unwrap();
-            e.json.delete_domain("d").await.unwrap();
-            let purger = JsonDomainPurger::new(Arc::clone(&e.json), 100);
-            purger.purge_tick().await.unwrap();
-            purger.purge_tick().await.unwrap();
-            assert!(e.json.get_domain_any("d").is_none());
-
-            let bus = Arc::new(crate::core::events::GlobalEventBus::new(64, 64));
-            let (control, _) = crate::control::testing::start(
-                e._dir.path(),
-                Arc::clone(&e.kv),
-                Some(Arc::clone(&e.json)),
-                Some(Arc::clone(&e.rel)),
-                bus,
-            )
-            .await;
-            let sweeper = RelCrossEngineSweeper::new(Arc::clone(&e.rel), 100);
-            let dom = e.rel.get_domain("d").unwrap();
-            let running = control.mark_restore_running();
-            sweeper.sweep_domain(&dom).await.unwrap();
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Text("k".into()));
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Text("j1".into()));
-
-            drop(running);
-            sweeper.sweep_domain(&dom).await.unwrap();
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "payload").await, ScalarValue::Null);
-            assert_eq!(raw_cell(&e.rel, "d", "t", 1, "doc").await, ScalarValue::Null);
         })
     }
 }

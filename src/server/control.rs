@@ -21,8 +21,9 @@ use crate::{
     config::{BlockCacheConfig, LuraConfig},
     control::{
         checkpoint::{Holder, WalCheckpoint, WAL_CHECKPOINT_INTERVAL},
+        domains,
         resources::{self, ResourceWatch, Resources, RESOURCE_WATCH_INTERVAL},
-        system, ControlPlane, Engine, Owners, Shard, ShardCommand, ShardOwners,
+        system, ControlPlane, DomainRules, Engine, Owners, Shard, ShardCommand, ShardOwners,
     },
     core::{
         coop,
@@ -32,7 +33,7 @@ use crate::{
     engines::json::JsonEngine,
     engines::lsm::{
         compaction::CompactionConfig,
-        domain::DomainConfig,
+        domain::{effective_user_key_limit, DomainConfig, DOMAIN_KEY_PREFIX_LEN},
         engine::{LsmEngineConfig, LsmEngineOptions, LsmStorageEngine},
         janitor::JanitorConfig,
         TtlSweeper,
@@ -208,17 +209,11 @@ impl Cluster {
 pub(super) struct MemorySplit {
     /// Block cache of each engine instance; an engine's budget splits evenly.
     block_cache_bytes: usize,
-    /// Pages of each shard's buffer pool.
-    buffer_pool_pages: usize,
 }
 
 impl MemorySplit {
-    pub(super) fn of(config: &LuraConfig, shards: u16) -> Self {
-        let shards = usize::from(shards);
-        Self {
-            block_cache_bytes: BlockCacheConfig::default().capacity_bytes / shards,
-            buffer_pool_pages: (config.buffer_pool.pool_size / shards).max(1),
-        }
+    pub(super) fn of(shards: u16) -> Self {
+        Self { block_cache_bytes: BlockCacheConfig::default().capacity_bytes / usize::from(shards) }
     }
 
     pub(super) fn block_cache(&self) -> BlockCacheConfig {
@@ -232,10 +227,9 @@ impl MemorySplit {
             .map(|shard| {
                 format!(
                     "Shard {shard}: block cache {} KiB per engine; MemTable threshold {} bytes per engine; \
-                     buffer pool {} pages; registered I/O buffers {}.",
+                     registered I/O buffers {}.",
                     self.block_cache_bytes / 1024,
                     config.lsm.memtable_size_threshold,
-                    self.buffer_pool_pages,
                     if io_engine && shard == 0 { "on" } else { "off" }
                 )
             })
@@ -303,7 +297,7 @@ async fn bootstrap(
 
     // Every log is recovered once, onto the instances of all shards, and cut
     // back only once every engine has flushed what it recovered.
-    let memory = MemorySplit::of(config, shards);
+    let memory = MemorySplit::of(shards);
     for line in memory.report(config, shards) {
         tracing::info!("{line}");
     }
@@ -367,7 +361,6 @@ async fn bootstrap(
             kv: Arc::clone(&kv[k]),
             json: json.as_ref().map(|json| Arc::clone(&json[k])),
             rel: rel.as_ref().map(|rel| Arc::clone(&rel[k])),
-            buffer_pool_pages: memory.buffer_pool_pages,
             jobs,
             commands: commands_rx,
             ready,
@@ -397,7 +390,7 @@ async fn bootstrap(
     };
 
     // The first reading before any client or background writer runs; the
-    // shards' own start writes, a default domain for one, went in before.
+    // domain reconciliation's writes went in before.
     let watch = Arc::new(parking_lot::Mutex::new(watch));
     resources::log(&watch.lock().tick());
     let relief = watch.lock().relief();
@@ -495,6 +488,13 @@ async fn prepare_control(
     }
     tracing::info!("{} data shard(s) ready.", owners.len());
     system::migrate_auth(owners[0].kv.engine(), system_store).await?;
+    // Before the shards are released: no request and no purger sees an
+    // engine out of line with the domain records.
+    let rules = DomainRules {
+        default_domain: config.domains.default_domain.clone(),
+        max_name_length: config.domains.max_name_length,
+    };
+    domains::reconcile(system_store, &owners, &rules).await?;
 
     // The auth cache on the system store, after the auth move above.
     let oauth_resource =
@@ -518,7 +518,8 @@ async fn prepare_control(
         .map(|(owners, thread)| Shard { owners: owners.clone(), commands: thread.commands.clone() })
         .collect();
     let owners_auth = Owners { shards, auth: Arc::clone(&auth_cache) };
-    let control = ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus, resources).await?;
+    let control =
+        ControlPlane::start(owners_auth, Arc::clone(system_store), event_bus, resources, rules.max_name_length).await?;
 
     let loops = spawn_loops(config);
     let backup_manager = init_backup(config, &control, &loops);
@@ -563,13 +564,22 @@ async fn prepare_control(
 
 /// Settings of the key-value engine's domain layer.
 pub(super) fn domain_config(cfg: &LuraConfig) -> DomainConfig {
+    let max_user_key_length = effective_user_key_limit(cfg.domains.max_user_key_length, cfg.lsm.max_key_length);
+    if max_user_key_length < cfg.domains.max_user_key_length {
+        tracing::warn!(
+            "domains.max_user_key_length ({}) is capped to {} by lsm.max_key_length ({}) minus the {}-byte internal domain prefix; raise lsm.max_key_length to use the full length",
+            cfg.domains.max_user_key_length,
+            max_user_key_length,
+            cfg.lsm.max_key_length,
+            DOMAIN_KEY_PREFIX_LEN
+        );
+    }
     DomainConfig {
-        max_name_length: cfg.domains.max_name_length,
-        max_user_key_length: cfg.domains.max_user_key_length,
+        max_user_key_length,
+        max_value_size: cfg.lsm.max_value_size,
         default_domain: cfg.domains.default_domain.clone(),
         default_read_iops: cfg.rate_limit.default_read_iops,
         default_write_iops: cfg.rate_limit.default_write_iops,
-        default_max_storage_bytes: cfg.rate_limit.default_max_storage_bytes,
         purger_batch_size: cfg.domains.purger_batch_size,
         purger_interval_secs: cfg.domains.purger_interval_secs,
         max_bulk_delete_keys: cfg.domains.max_bulk_delete_keys,
@@ -780,21 +790,16 @@ fn start_shm(cfg: &LuraConfig, manager: &Arc<ShmManager>, state: &AppState) -> a
 mod tests {
     use super::*;
 
-    // The block cache of each engine and the buffer pool split evenly
-    // across the shards; the MemTable threshold stays per instance.
+    // The block cache of each engine splits evenly across the shards; the
+    // MemTable threshold stays per instance.
     #[test]
     fn the_memory_budgets_split_across_the_shards() {
-        let mut config = LuraConfig::default();
-        config.buffer_pool.pool_size = 1024;
-        let one = MemorySplit::of(&config, 1);
-        assert_eq!((one.block_cache_bytes, one.buffer_pool_pages), (64 * 1024 * 1024, 1024));
-        let four = MemorySplit::of(&config, 4);
-        assert_eq!((four.block_cache_bytes, four.buffer_pool_pages), (16 * 1024 * 1024, 256));
+        let config = LuraConfig::default();
+        assert_eq!(MemorySplit::of(1).block_cache_bytes, 64 * 1024 * 1024);
+        let four = MemorySplit::of(4);
+        assert_eq!(four.block_cache_bytes, 16 * 1024 * 1024);
         assert_eq!(four.block_cache().capacity_bytes, 16 * 1024 * 1024);
         assert_eq!(kv_options(&config, &four).engine.memtable_size_threshold, config.lsm.memtable_size_threshold);
-
-        config.buffer_pool.pool_size = 3;
-        assert_eq!(MemorySplit::of(&config, 4).buffer_pool_pages, 1, "every shard keeps a page");
     }
 
     // The start log reports each shard's share; registered I/O buffers stay
@@ -802,23 +807,22 @@ mod tests {
     #[test]
     fn the_start_log_reports_the_split_of_every_shard() {
         let mut config = LuraConfig::default();
-        config.buffer_pool.pool_size = 1024;
         config.lsm.memtable_size_threshold = 4_194_304;
         config.io_engine.enabled = true;
         assert_eq!(
-            MemorySplit::of(&config, 2).report(&config, 2),
+            MemorySplit::of(2).report(&config, 2),
             [
                 "Shard 0: block cache 32768 KiB per engine; MemTable threshold 4194304 bytes per engine; \
-                 buffer pool 512 pages; registered I/O buffers off.",
+                 registered I/O buffers off.",
                 "Shard 1: block cache 32768 KiB per engine; MemTable threshold 4194304 bytes per engine; \
-                 buffer pool 512 pages; registered I/O buffers off.",
+                 registered I/O buffers off.",
                 "io_engine.enabled has no effect with more than one data shard.",
             ]
         );
         assert_eq!(
-            MemorySplit::of(&config, 1).report(&config, 1),
+            MemorySplit::of(1).report(&config, 1),
             ["Shard 0: block cache 65536 KiB per engine; MemTable threshold 4194304 bytes per engine; \
-              buffer pool 1024 pages; registered I/O buffers on."]
+              registered I/O buffers on."]
         );
     }
 }

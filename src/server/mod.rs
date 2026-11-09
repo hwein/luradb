@@ -22,15 +22,14 @@ pub use migrate::migrate_shards;
 
 use crate::{
     api::{self, middleware::ParsedCidr, ApiDoc},
-    auth::{middleware::docs_auth_layer, AuthCache},
+    auth::AuthCache,
     bridge::{self, EngineDispatch, Job, Lane, ShardRouter},
     config::LuraConfig,
     core::{coop, engine_runtime},
     cors, tls, uds,
 };
 use axum::{
-    extract::connect_info::ConnectInfo, http::Extensions, middleware::from_fn_with_state, response::Json,
-    routing::get, Router,
+    extract::connect_info::ConnectInfo, http::Extensions, response::Json, routing::get, Router,
 };
 use control::Ready;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -292,20 +291,16 @@ fn build_router(
     let mut app = Router::new();
 
     if cfg.server.swagger_enabled {
-        // Swagger UI is registered here, not inside api::create_router, so it
-        // needs its own auth layer — the router-contract gate would
-        // otherwise trip on docs routes with no contract entry.
-        // `docs_auth_layer` wraps this whole sub-router, so every path
-        // SwaggerUi registers under `swagger_url` (index, redirect, static
-        // assets) is covered without listing them individually.
-        let mut docs_router = Router::new().merge(
+        // Swagger UI is registered here, not inside api::create_router, so the
+        // router-contract gate does not trip on docs routes with no contract
+        // entry. The UI, its assets and openapi.json are served without a key:
+        // a browser cannot send one for the page itself, and the key the UI's
+        // "Authorize" button collects goes to the API calls, which the
+        // frontend auth layer checks like any other request.
+        app = app.merge(
             SwaggerUi::new(cfg.server.swagger_url.clone())
                 .url("/api-docs/openapi.json", ApiDoc::openapi()),
         );
-        if cfg.auth.enabled {
-            docs_router = docs_router.layer(from_fn_with_state(Arc::clone(&auth_cache), docs_auth_layer));
-        }
-        app = app.merge(docs_router);
     }
 
     if cfg.server.hello_enabled {
@@ -818,11 +813,10 @@ mod tests {
         (state, dir)
     }
 
-    // The CorsLayer must sit outside both
-    // the frontend auth_layer AND the Swagger sub-router's docs_auth_layer.
-    // Regression-critical: if the layer moved inward (e.g. into
-    // create_router), a request to the Swagger docs route would never reach
-    // it — docs_auth_layer would 401 first, with no CORS header.
+    // The CorsLayer must sit outside the frontend auth_layer, covering the
+    // Swagger routes too. Regression-critical: if the layer moved inward
+    // (e.g. into create_router), the docs routes would never reach it and a
+    // 401 from the API would carry no CORS header.
     #[test]
     fn cors_layer_wraps_swagger_and_survives_401() {
         crate::core::engine_runtime::block_on(async {
@@ -837,8 +831,7 @@ mod tests {
             let ship = ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]);
             let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
 
-            // (a) Preflight without Authorization -> 200 with the CORS header,
-            // even though this path sits behind docs_auth_layer.
+            // (a) Preflight without Authorization -> 200 with the CORS header.
             let resp = app
                 .clone()
                 .oneshot(
@@ -858,13 +851,32 @@ mod tests {
                 "https://example.com"
             );
 
-            // (b) GET with an allowed Origin but no Authorization -> 401 from
-            // docs_auth_layer, but still carrying the CORS header — proof the
+            // (b) GET on the docs route with an allowed Origin -> 200 with the
+            // CORS header.
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api-docs/openapi.json")
+                        .header("origin", "https://example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("access-control-allow-origin").unwrap(),
+                "https://example.com"
+            );
+
+            // (c) GET on an API route without Authorization -> 401 from the
+            // frontend auth layer, still carrying the CORS header — proof the
             // layer sits outside that auth check, not inside it.
             let resp = app
                 .oneshot(
                     Request::builder()
-                        .uri("/api-docs/openapi.json")
+                        .uri("/version")
                         .header("origin", "https://example.com")
                         .body(Body::empty())
                         .unwrap(),
@@ -876,6 +888,74 @@ mod tests {
                 resp.headers().get("access-control-allow-origin").unwrap(),
                 "https://example.com"
             );
+        })
+    }
+
+    // The Swagger UI, its assets and openapi.json are served without a key
+    // even with auth on; the API behind them still needs one.
+    #[test]
+    fn swagger_routes_open_without_key_when_auth_enabled() {
+        crate::core::engine_runtime::block_on(async {
+            let mut cfg = LuraConfig::default();
+            cfg.server.swagger_enabled = true;
+            cfg.auth.enabled = true;
+
+            let (state, _dir) = make_test_state(true).await;
+            let auth_cache = Arc::clone(&state.auth_cache);
+            let ship = ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]);
+            let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
+
+            for uri in ["/api-docs/openapi.json", "/test-ui/", "/test-ui/swagger-ui.css"] {
+                let resp = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+
+            let resp = app
+                .oneshot(Request::builder().uri("/version").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        })
+    }
+
+    #[test]
+    fn accepted_swagger_urls_keep_the_api_and_auth_reachable() {
+        crate::core::engine_runtime::block_on(async {
+            for (swagger_url, page) in [
+                ("/docs", "/docs/"),
+                ("/test-ui/", "/test-ui/"),
+                ("/ops/swagger", "/ops/swagger/"),
+                ("/api-docs", "/api-docs/"),
+            ] {
+                let mut cfg = LuraConfig::default();
+                cfg.server.swagger_enabled = true;
+                cfg.server.swagger_url = swagger_url.to_string();
+                cfg.auth.enabled = true;
+                cfg.server.validate().unwrap();
+
+                let (state, _dir) = make_test_state(true).await;
+                let auth_cache = Arc::clone(&state.auth_cache);
+                let ship = ShardRouter::new(vec![EngineDispatch::Inline(api::create_router(state))]);
+                let app = build_router(&cfg, auth_cache, Arc::new(vec![]), ship);
+
+                for (uri, expected) in [
+                    ("/health", StatusCode::OK),
+                    ("/version", StatusCode::UNAUTHORIZED),
+                    (page, StatusCode::OK),
+                    ("/api-docs/openapi.json", StatusCode::OK),
+                ] {
+                    let resp = app
+                        .clone()
+                        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), expected, "{swagger_url} {uri}");
+                }
+            }
         })
     }
 
@@ -934,7 +1014,6 @@ mod tests {
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let mut cfg = LuraConfig::default();
         cfg.server.port = 0;
-        cfg.storage.db_path = path("luradb.db");
         cfg.storage.wal_path = path("luradb.wal");
         cfg.storage.vlog_path = path("luradb.vlog");
         cfg.storage.sstable_dir = path("sstables");
@@ -1064,12 +1143,19 @@ mod tests {
     }
 
     /// Reads from `stream` into `seen` until `needle` shows up in it.
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
     async fn read_until(stream: &mut TcpStream, seen: &mut Vec<u8>, needle: &[u8]) {
-        let mut buf = [0u8; 4096];
-        while find(seen, needle).is_none() {
-            let n = stream.read(&mut buf).await.unwrap();
-            assert!(n > 0, "connection closed before {:?}: {}", String::from_utf8_lossy(needle), String::from_utf8_lossy(seen));
-            seen.extend_from_slice(&buf[..n]);
+        let read = async {
+            let mut buf = [0u8; 4096];
+            while find(seen, needle).is_none() {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "connection closed before {:?}: {}", String::from_utf8_lossy(needle), String::from_utf8_lossy(seen));
+                seen.extend_from_slice(&buf[..n]);
+            }
+        };
+        // Upper bound against hanging only.
+        if tokio::time::timeout(Duration::from_secs(10), read).await.is_err() {
+            panic!("no {:?} within 10 s: {}", String::from_utf8_lossy(needle), String::from_utf8_lossy(seen));
         }
     }
 
@@ -1261,13 +1347,18 @@ mod tests {
         (crate::control::system::open_with_wal(dir, hub.wal(WalTarget::Sys)).await.unwrap(), hub)
     }
 
+    /// The empty page file that older versions left in the data directory.
+    fn leftover_page_file(cfg: &LuraConfig) -> PathBuf {
+        PathBuf::from(&cfg.storage.vlog_path).with_file_name("luradb.db")
+    }
+
     /// A data directory from before the shard layout, its default domain
-    /// holding `key` in an SSTable.
+    /// holding `key` in an SSTable, with a leftover page file beside it.
     fn legacy_data_directory(cfg: &LuraConfig, key: &[u8]) {
         engine_runtime::block_on(async {
             let (kv, _hub) = open_kv_engine(cfg, None).await;
             let metrics = crate::metrics::MetricsStore::new(crate::metrics::MetricsConfig::default());
-            let registry = crate::engines::lsm::DomainRegistry::recover(
+            let registry = crate::engines::lsm::DomainRegistry::recover_with_default(
                 Arc::clone(&kv),
                 crate::engines::lsm::domain::DomainConfig::default(),
                 metrics,
@@ -1277,7 +1368,7 @@ mod tests {
             registry.store("default").await.unwrap().put(key, "clé".as_bytes()).await.unwrap();
             kv.shutdown().await;
         });
-        std::fs::write(&cfg.storage.db_path, b"").unwrap();
+        std::fs::write(leftover_page_file(cfg), b"").unwrap();
     }
 
     // The first start moves the files of an older data directory into
@@ -1289,11 +1380,8 @@ mod tests {
         let mut cfg = test_config(dir.path());
         cfg.multicore.shards = 1;
         legacy_data_directory(&cfg, b"moved");
-        let (vlog, sstables, db) = (
-            PathBuf::from(&cfg.storage.vlog_path),
-            PathBuf::from(&cfg.storage.sstable_dir),
-            PathBuf::from(&cfg.storage.db_path),
-        );
+        let (vlog, sstables, db) =
+            (PathBuf::from(&cfg.storage.vlog_path), PathBuf::from(&cfg.storage.sstable_dir), leftover_page_file(&cfg));
         let legacy_tables: Vec<_> = std::fs::read_dir(&sstables).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert!(legacy_tables.iter().any(|name| name == "MANIFEST"), "{legacy_tables:?}");
 
@@ -1306,8 +1394,8 @@ mod tests {
             server.shutdown().unwrap();
             assert_eq!((status, value.as_slice()), (200, "clé".as_bytes()), "{start} start");
 
-            assert!(!vlog.exists() && !db.exists(), "{start} start");
-            assert!(layout::shard_file(&vlog, 0).is_file() && layout::shard_file(&db, 0).is_file(), "{start} start");
+            assert!(!vlog.exists() && layout::shard_file(&vlog, 0).is_file(), "{start} start");
+            assert!(db.is_file() && !layout::shard_file(&db, 0).exists(), "{start} start: the page file stays");
             for table in &legacy_tables {
                 assert!(!sstables.join(table).exists(), "{start} start: {table:?}");
             }
@@ -1507,7 +1595,7 @@ mod tests {
         let addr = server.http_addr.expect("HTTP listener enabled");
         client.block_on(async {
             let create = json!({ "name": name }).to_string();
-            assert_eq!(request(addr, &with_body("POST", "/store-api/json/domains", &create)).await.0, 201);
+            assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
         });
@@ -1556,7 +1644,7 @@ mod tests {
         let addr = server.http_addr.expect("HTTP listener enabled");
         client.block_on(async {
             let create = json!({ "name": name }).to_string();
-            assert_eq!(request(addr, &with_body("POST", "/store-api/json/domains", &create)).await.0, 201);
+            assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", &document, r#"{"n": 1}"#)).await.0, 201);
             assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
         });
@@ -1638,6 +1726,16 @@ mod tests {
         }
     }
 
+    // A start creates no page file, in the data directory or in a shard's.
+    #[test]
+    fn a_start_creates_no_page_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let page_file = leftover_page_file(&cfg);
+        Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).unwrap().shutdown().unwrap();
+        assert!(!page_file.exists() && !layout::shard_file(&page_file, 0).exists());
+    }
+
     // A shard capacity the channel cannot take down must fail the
     // in-process start before the engines, SHM and background tasks are up.
     #[test]
@@ -1645,9 +1743,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cfg = test_config(dir.path());
         cfg.multicore.shard_queue_capacity = 0;
-        let db_path = PathBuf::from(cfg.storage.db_path.clone());
+        let system_dir = PathBuf::from(cfg.storage.system_dir.clone());
         assert!(Server::start(Arc::new(cfg), &dir.path().join("luradb.toml")).is_err());
-        assert!(!db_path.exists(), "the engine booted before the bridge channel existed");
+        assert!(!system_dir.exists(), "the engine booted before the bridge channel existed");
     }
 
     // A live keep-alive connection learns about the shutdown: hyper closes it
@@ -2124,14 +2222,12 @@ mod tests {
                 for (shard, name) in names.iter().enumerate() {
                     let thread = format!("luradb-shard-{shard}");
                     let create = json!({ "name": name }).to_string();
-                    for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
-                        let (status, head, body) = exchange(addr, &with_body("POST", path, &create)).await;
-                        assert_eq!(status, 201, "{path}: {}", String::from_utf8_lossy(&body));
-                        assert_eq!(thread_of(&head), "luradb-control", "{path}");
-                        let (status, head, body) = exchange(addr, &get(&format!("{path}/{name}"))).await;
-                        assert_eq!(status, 200, "{path}/{name}: {}", String::from_utf8_lossy(&body));
-                        assert_eq!(shard_in(&head), shard.to_string(), "{path}/{name}");
-                    }
+                    let (status, head, body) = exchange(addr, &with_body("POST", "/store-api/domains", &create)).await;
+                    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+                    assert_eq!(thread_of(&head), "luradb-control");
+                    let (status, head, body) = exchange(addr, &get(&format!("/store-api/domains/{name}"))).await;
+                    assert_eq!(status, 200, "{name}: {}", String::from_utf8_lossy(&body));
+                    assert_eq!(shard_in(&head), shard.to_string(), "{name}");
 
                     let key = format!("/store-api/kv/{name}/keys/ref");
                     let (status, head, _) = exchange(addr, &with_body("PUT", &key, "clé")).await;
@@ -2243,10 +2339,10 @@ mod tests {
         );
     }
 
-    // The domain lists of all three engines name the domains of every shard,
-    // in name order, as with a single shard.
+    // The domain list names the domains of every shard, in name order, as
+    // with a single shard.
     #[test]
-    fn domain_lists_name_the_domains_of_every_shard_in_order() {
+    fn the_domain_list_names_the_domains_of_every_shard_in_order() {
         use crate::control::slots::domain_name_for_shard;
         let names: Vec<String> =
             (0..3).flat_map(|seed| [domain_name_for_shard(1, 2, seed), domain_name_for_shard(0, 2, seed)]).collect();
@@ -2261,20 +2357,18 @@ mod tests {
                     cfg.rel.enabled = true;
                 },
                 |addr| async move {
-                    for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
-                        for name in &names {
-                            let create = json!({ "name": name }).to_string();
-                            assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path} {name}");
-                        }
-                        let (status, body) = request(addr, &get(path)).await;
-                        assert_eq!(status, 200, "{path}");
-                        let listed: Vec<String> = serde_json::from_slice::<Vec<Value>>(&body)
-                            .unwrap()
-                            .iter()
-                            .map(|domain| domain["name"].as_str().unwrap().to_string())
-                            .collect();
-                        assert_eq!(listed, expected, "{shards} shards: {path}");
+                    for name in &names {
+                        let create = json!({ "name": name }).to_string();
+                        assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201, "{name}");
                     }
+                    let (status, body) = request(addr, &get("/store-api/domains")).await;
+                    assert_eq!(status, 200);
+                    let listed: Vec<String> = serde_json::from_slice::<Vec<Value>>(&body)
+                        .unwrap()
+                        .iter()
+                        .map(|domain| domain["name"].as_str().unwrap().to_string())
+                        .collect();
+                    assert_eq!(listed, expected, "{shards} shards");
                 },
             );
         }
@@ -2296,15 +2390,13 @@ mod tests {
                 let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
                 assert_eq!(request(addr, &user).await.0, 201);
                 let create = json!({ "name": name }).to_string();
-                for path in ["/store-api/domains", "/store-api/json/domains", "/store-api/rel/domains"] {
-                    assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path}");
-                }
-                for store_type in ["kv", "json", "rel"] {
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
+                for engine in [None, Some("kv"), Some("json"), Some("rel")] {
                     for (domain, expected) in [(name.as_str(), 200), ("ghost", 404)] {
-                        let grant = json!({ "domain": domain, "access": "read", "store_type": store_type }).to_string();
+                        let grant = json!({ "domain": domain, "access": "read", "engine": engine }).to_string();
                         let (status, body) =
                             request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await;
-                        assert_eq!(status, expected, "{store_type} {domain}: {}", String::from_utf8_lossy(&body));
+                        assert_eq!(status, expected, "{engine:?} {domain}: {}", String::from_utf8_lossy(&body));
                     }
                 }
             },
@@ -2348,16 +2440,12 @@ mod tests {
         let source = (&mut archive, &mut expiries, &mut users, &names);
         with_tuned_server(with_shards(2), |addr| async move {
             let (archive, expiries, users, names) = source;
-            // The default domains would make the restore wait for their purge.
-            for path in ["/store-api/domains/default", "/store-api/json/domains/default"] {
-                let delete = format!("DELETE {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-                assert_eq!(request(addr, &delete).await.0, 202, "{path}");
-            }
+            // Out of the archive: the targets have a default domain of their own.
+            let delete = "DELETE /store-api/domains/default HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+            assert_eq!(request(addr, delete).await.0, 202);
             for name in names {
                 let create = json!({ "name": name }).to_string();
-                for path in ["/store-api/domains", "/store-api/json/domains"] {
-                    assert_eq!(request(addr, &with_body("POST", path, &create)).await.0, 201, "{path}");
-                }
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
                 let kv = format!("/store-api/kv/{name}/keys");
                 assert_eq!(request(addr, &with_body("PUT", &format!("{kv}/k"), &format!("clé {name}"))).await.0, 200);
                 assert_eq!(request(addr, &with_body("PUT", &format!("{kv}/session?ttl=86400"), "tok")).await.0, 200);
@@ -2374,8 +2462,13 @@ mod tests {
             }
             let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
             assert_eq!(request(addr, &user).await.0, 201);
-            let grant = json!({ "domain": names[1], "access": "read", "store_type": "json" }).to_string();
-            assert_eq!(request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await.0, 200);
+            for grant in [
+                json!({ "domain": names[1], "access": "read", "engine": "json" }),
+                json!({ "domain": names[0], "access": "write" }),
+            ] {
+                let grant = grant.to_string();
+                assert_eq!(request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await.0, 200);
+            }
             *users = serde_json::from_slice(&request(addr, &get("/store-api/auth/users")).await.1).unwrap();
 
             let start = json!({ "scope": "all", "include_auth": true }).to_string();
@@ -2459,6 +2552,123 @@ mod tests {
                 assert_eq!(shard_statuses(&body), json!([{ "id": 0, "status": "ok" }, { "id": 1, "status": "ok" }]));
                 let body = serde_json::from_slice::<Value>(&body).unwrap();
                 assert_eq!((&body["status"], &body["domain_count"]), (&json!("ok"), &json!(3)));
+            },
+        );
+    }
+
+    /// Runs `client` against a server on `cfg`, then shuts it down.
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn serve_on<F, Fut, T>(cfg: LuraConfig, dir: &Path, client: F) -> T
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let server = Server::start(Arc::new(cfg), &dir.join("luradb.toml")).unwrap();
+        let addr = server.http_addr.expect("HTTP listener enabled");
+        let out = tokio::runtime::Runtime::new().unwrap().block_on(client(addr));
+        server.shutdown().unwrap();
+        out
+    }
+
+    fn delete_request(path: &str) -> String {
+        format!("DELETE {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+    }
+
+    // An engine that is off keeps the domains' life cycle: a domain created
+    // while the relational engine is off gets its relational part at the
+    // first start with it on; one deleted while the JSON engine is off keeps
+    // its name taken until a start with it on has purged its documents.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the client runs on its own tokio runtime")]
+    fn a_disabled_engine_catches_up_at_the_next_start_with_it_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = |json: bool, rel: bool| {
+            let mut cfg = test_config(dir.path());
+            (cfg.json.enabled, cfg.rel.enabled) = (json, rel);
+            cfg
+        };
+        serve_on(config(true, false), dir.path(), |addr| async move {
+            for name in ["made", "gone"] {
+                let create = json!({ "name": name }).to_string();
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201, "{name}");
+            }
+            assert_eq!(request(addr, &with_body("PUT", "/store-api/json/gone/documents/d", "{}")).await.0, 201);
+        });
+        serve_on(config(true, true), dir.path(), |addr| async move {
+            let create = with_body("POST", "/store-api/rel/made/sql", &sql_body("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+            let (status, body) = request(addr, &create).await;
+            assert_eq!(status, 200, "the relational part is there: {}", String::from_utf8_lossy(&body));
+        });
+        serve_on(config(false, true), dir.path(), |addr| async move {
+            assert_eq!(request(addr, &delete_request("/store-api/domains/gone")).await.0, 202);
+            let (status, body) = request(addr, &with_body("POST", "/store-api/domains", r#"{"name": "gone"}"#)).await;
+            assert_eq!((status, body.as_slice()), (409, b"409 Conflict: domain 'gone' is being deleted".as_slice()));
+        });
+        serve_on(config(true, true), dir.path(), |addr| async move {
+            // Upper bound against hanging only.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while request(addr, &get("/store-api/domains/gone")).await.0 != 404 {
+                assert!(std::time::Instant::now() < deadline, "the JSON part of gone is never purged");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(request(addr, &with_body("POST", "/store-api/domains", r#"{"name": "gone"}"#)).await.0, 201);
+            assert_eq!(request(addr, &get("/store-api/json/gone/documents/d")).await.0, 404, "the documents were purged");
+        });
+    }
+
+    // With `domains.max_name_length = 80`, a name of 80 characters works in
+    // every engine and takes permissions on each engine and on the whole
+    // domain; one of 81 does not, and user names stay at 50 at most.
+    #[test]
+    fn a_longer_name_limit_holds_in_every_engine() {
+        with_tuned_server(
+            |cfg| {
+                cfg.domains.max_name_length = 80;
+                (cfg.json.enabled, cfg.rel.enabled) = (true, true);
+            },
+            |addr| async move {
+                let name = "n".repeat(80);
+                let create = json!({ "name": name }).to_string();
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &create)).await.0, 201);
+                assert_eq!(request(addr, &with_body("PUT", &format!("/store-api/kv/{name}/keys/k"), "clé")).await.0, 200);
+                let put = with_body("PUT", &format!("/store-api/json/{name}/documents/d"), r#"{"n": 1}"#);
+                assert_eq!(request(addr, &put).await.0, 201);
+                let sql = with_body("POST", &format!("/store-api/rel/{name}/sql"), &sql_body("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+                assert_eq!(request(addr, &sql).await.0, 200);
+                let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "ines" }).to_string());
+                assert_eq!(request(addr, &user).await.0, 201);
+                for engine in [Some("kv"), Some("json"), Some("rel"), None] {
+                    let grant = json!({ "domain": name, "access": "read", "engine": engine }).to_string();
+                    let (status, body) = request(addr, &with_body("POST", "/store-api/auth/users/ines/permissions", &grant)).await;
+                    assert_eq!(status, 200, "{engine:?}: {}", String::from_utf8_lossy(&body));
+                }
+                let user = with_body("POST", "/store-api/auth/users", &json!({ "name": "u".repeat(51) }).to_string());
+                assert_eq!(request(addr, &user).await.0, 400);
+                let longer = json!({ "name": "n".repeat(81) }).to_string();
+                let (status, body) = request(addr, &with_body("POST", "/store-api/domains", &longer)).await;
+                assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+                assert!(String::from_utf8_lossy(&body).ends_with("1 to 80 characters"));
+            },
+        );
+    }
+
+    // `domains.default_domain` names the default domain of every engine.
+    #[test]
+    fn the_configured_default_domain_exists_in_every_engine() {
+        with_tuned_server(
+            |cfg| {
+                cfg.domains.default_domain = "main".to_string();
+                (cfg.json.enabled, cfg.rel.enabled) = (true, true);
+            },
+            |addr| async move {
+                let (status, body) = request(addr, &get("/store-api/domains")).await;
+                assert_eq!(status, 200);
+                let names: Vec<Value> = serde_json::from_slice::<Vec<Value>>(&body).unwrap().iter().map(|d| d["name"].clone()).collect();
+                assert_eq!(names, [json!("main")]);
+                assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/main/keys/k", "v")).await.0, 200);
+                assert_eq!(request(addr, &with_body("PUT", "/store-api/json/main/documents/d", "{}")).await.0, 201);
+                let sql = with_body("POST", "/store-api/rel/main/sql", &sql_body("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+                assert_eq!(request(addr, &sql).await.0, 200);
             },
         );
     }

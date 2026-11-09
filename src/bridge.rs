@@ -1029,7 +1029,7 @@ mod tests {
             .route("/store-api/kv/{domain}/keys/{key}", get(answer).put(answer))
             .route("/store-api/kv/{domain}/keys", get(answer))
             .route("/store-api/domains", get(answer).post(answer))
-            .route("/store-api/json/domains/{name}", get(answer).delete(answer))
+            .route("/store-api/domains/{name}", get(answer).delete(answer))
     }
 
     /// `serve_engine` with `router` on a thread named `name`.
@@ -1091,9 +1091,8 @@ mod tests {
         assert_eq!(call(Method::GET, format!("/store-api/kv/{b}/keys/k")).await, format!("s1 {caller}"));
         assert_eq!(call(Method::POST, "/store-api/domains".to_string()).await, "s0 test-control");
         assert_eq!(call(Method::GET, "/store-api/domains".to_string()).await, "s0 test-reader");
-        // Auth sees no domain in a JSON or relational domain's management path; routing does.
-        assert_eq!(call(Method::GET, format!("/store-api/json/domains/{b}")).await, "s1 test-reader");
-        assert_eq!(call(Method::DELETE, format!("/store-api/json/domains/{b}")).await, "s1 test-shard-1");
+        assert_eq!(call(Method::GET, format!("/store-api/domains/{b}")).await, "s1 test-reader");
+        assert_eq!(call(Method::DELETE, format!("/store-api/domains/{b}")).await, "s1 test-shard-1");
 
         drop((ship, shard0, shard1));
         reader.join().unwrap();

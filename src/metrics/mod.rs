@@ -116,7 +116,6 @@ pub struct SystemMetrics {
     /// label value — same flat-counter style as the fields above.
     pub rel_cross_engine_expand_lookups_kv_total: AtomicU64,
     pub rel_cross_engine_expand_lookups_json_total: AtomicU64,
-    pub rel_cross_engine_swept_cells_total: AtomicU64,
     pub rel_cross_engine_write_validations_kv_total: AtomicU64,
     pub rel_cross_engine_write_validations_json_total: AtomicU64,
     /// Domain-purger counters: tombstoned data keys (both
@@ -162,7 +161,6 @@ impl Default for SystemMetrics {
             rel_ddl_view_ops_drop_view_total: AtomicU64::new(0),
             rel_cross_engine_expand_lookups_kv_total: AtomicU64::new(0),
             rel_cross_engine_expand_lookups_json_total: AtomicU64::new(0),
-            rel_cross_engine_swept_cells_total: AtomicU64::new(0),
             rel_cross_engine_write_validations_kv_total: AtomicU64::new(0),
             rel_cross_engine_write_validations_json_total: AtomicU64::new(0),
             rel_purged_keys_total: AtomicU64::new(0),
@@ -407,11 +405,6 @@ impl MetricsStore {
             _ => return,
         };
         counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Adds `n` physically nulled link cells (sweep progress).
-    pub fn record_rel_cross_engine_swept_cells(&self, n: u64) {
-        self.system.rel_cross_engine_swept_cells_total.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Counts one link existence check in the write path by `{engine}`.

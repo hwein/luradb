@@ -1006,7 +1006,7 @@ mod tests {
     fn test_get_backup_ignores_running_restore_job() {
         crate::core::engine_runtime::block_on(async {
             let (state, _dir) = make_slow_state().await;
-            state.control.create_domain(crate::control::Engine::Kv, "shop", false).await.unwrap();
+            state.control.create_domain("shop", Default::default()).await.unwrap();
             let store = state.registry.store("shop").await.unwrap();
             for i in 0..3 {
                 store.put(format!("order:{i}").as_bytes(), b"v").await.unwrap();
@@ -1074,7 +1074,7 @@ mod tests {
             let detail = wait_for_backup_completion(&app, &id).await;
             assert_eq!(detail["state"], json!("complete"), "{detail}");
             assert_eq!(detail["scope"], json!("kv:default"));
-            assert_eq!(detail["format_version"], json!(2));
+            assert_eq!(detail["format_version"], json!(3));
             assert_eq!(detail["shards"], json!(1));
             assert!(detail["lsn_cut"]["kv"].as_u64().unwrap() >= 1, "{detail}");
             assert_eq!(detail["lsn_cut"]["json"], json!(0));
@@ -1178,7 +1178,7 @@ mod tests {
             let uploaded_id = value["id"].as_str().unwrap().to_string();
             assert!(uploaded_id.ends_with("_upload"), "got id '{uploaded_id}'");
             assert_ne!(uploaded_id, source_id, "the server must assign a fresh id, not adopt the manifest's own id");
-            assert_eq!(value["format_version"], json!(2));
+            assert_eq!(value["format_version"], json!(3));
 
             let (status, list_body) = request(&app, Method::GET, "/store-api/backups", None, None).await;
             assert_eq!(status, StatusCode::OK);
@@ -1297,7 +1297,7 @@ mod tests {
     fn test_restore_roundtrip_with_remap() {
         crate::core::engine_runtime::block_on(async {
             let (state, _dir) = make_state(Some(enabled_backup_config()), false).await;
-            state.control.create_domain(crate::control::Engine::Kv, "shop", false).await.unwrap();
+            state.control.create_domain("shop", Default::default()).await.unwrap();
             let store = state.registry.store("shop").await.unwrap();
             store.put(b"order:1", b"hello").await.unwrap();
             let app = crate::api::router_inline(state, Arc::new(vec![]));

@@ -4,6 +4,46 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
+### Changed
+
+- **BREAKING** API: with `server.swagger_enabled = true`, the Swagger UI, its assets and `/api-docs/openapi.json` are served without an API key also when `auth.enabled = true`; the API calls made from the UI still need one.
+- Default of `lsm.max_key_length` raised from 256 to 512; a `domains.max_user_key_length` that does not fit into `lsm.max_key_length` minus the 19-byte internal domain prefix is capped with a startup warning (256/256 → 237-byte keys).
+- **BREAKING** API: Table import suffixes column names that are LuraSQL keywords with `_` and rejects a keyword as table name.
+- **BREAKING** API: one domain API for every engine: `POST`, `GET` and `DELETE /store-api/domains…` create, list, describe and delete a domain that holds keys, documents and tables alike; the domain endpoints under `/store-api/json/` and `/store-api/rel/` are removed.
+- **BREAKING** API: `require_conditional_writes` of a domain is an object `{"kv": bool, "json": bool}` in requests and responses; `document_count` is gone from the domain object.
+- **BREAKING** API: a domain that is being deleted answers 410 on its key-value routes instead of 404; the domain list shows active domains only.
+- **BREAKING** API: `domain_created`, `domain_deleted` and `domain_purged` come once per domain and carry no `engine` field; a restore with `replace` sends no domain events.
+- **BREAKING** API: the MCP tools `list_domains`, `describe_domain` and `create_domain` take no `engine`; `unavailable_engines` is gone from `list_domains`.
+- **BREAKING** API: the domain name rule of `[domains]` (`max_name_length`, default 50) applies to every engine; the name `domains` is allowed.
+- **BREAKING** API: a restore with `replace` replaces only the engines the archive holds and keeps the domain and its permissions.
+- **BREAKING** API: `domains.default_domain` names the default domain of every engine.
+- **BREAKING** API: permissions name their engine with `engine` instead of `store_type`; a permission without `engine` covers the whole domain (keys, documents and tables), and a request with `store_type` answers 400.
+- **BREAKING** API: a user holds either a permission on the whole domain or permissions on engines: one on the whole domain replaces the user's engine permissions on that domain, one on an engine splits a whole-domain permission into one per engine first.
+- **BREAKING** API: `DELETE /store-api/auth/users/{name}/permissions/{domain}` without `engine` removes every permission of the user on the domain instead of the key-value one; `GET /store-api/auth/users` lists `engine` instead of `store_type`, absent for whole-domain permissions.
+- **BREAKING** API: deleting a domain deletes the permissions on it; a restore with `replace` keeps them.
+- The first start after the update merges the domains of the three engines into one domain per name.
+- Backup archive format 3: domain lines carry `require_conditional_writes`; archives of formats 1 to 3 restore.
+- `json.lsm.max_key_length` and `rel.lsm.max_key_length` are raised with a warning instead of a startup error when too short for `domains.max_name_length`; `domains.max_name_length` above 438 is a startup error.
+
+### Fixed
+
+- Startup rejects zero intervals, zero channel capacities, an invalid `server.swagger_url`, an unknown `log.rotation` and an unusable `log.path` instead of hanging or panicking.
+- **BREAKING** API: with `rel.enabled = false` the relational endpoints answer 503 as documented instead of 404.
+- A backup schedule runs at most once per cron minute, also when the timer wakes early.
+- **BREAKING** API: `lsm.max_value_size` now applies to single-key KV writes (413); deleting by prefix no longer fails with 500 for keys near the length limit.
+- LuraSQL rejects `DISTINCT`, `GROUP BY`, `HAVING`, `UNION`, `EXCEPT`, `INTERSECT` and join types other than `LEFT JOIN` with a clear 400 instead of a misleading error.
+- Startup rejects a `server.swagger_url` that would shadow the API or crash the router (/, /store-api, /health, /version, /api-docs/openapi.json, path placeholders) instead of starting a server that answers 404 to every request.
+- Scheduled backups resume after the system clock is set back by more than five minutes, with a warning in the log, instead of staying silent until the clock catches up.
+- `require_conditional_writes` of a domain survives backup and restore.
+
+### Removed
+
+- Config keys `storage.db_path`, `buffer_pool.pool_size` and `rate_limit.default_max_storage_bytes`; the server no longer creates the empty `luradb.db` page file. A `luradb.toml` that still sets them starts with a warning per key.
+- **BREAKING** API: GET /store-api/config no longer reports these three keys.
+- The background sweep that set links to a purged key-value or JSON part to NULL in stored rows (`rel.cross_engine_sweep_interval_secs`, `rel.cross_engine_sweep_batch_size`); such links still read as NULL while the part is purged and keep their stored value.
+
 ## [0.5.1] - 2026-11-03
 
 ### Added
@@ -245,7 +285,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.5.1...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/hwein/luradb/compare/v0.5.1...v0.7.0
 [0.5.1]: https://github.com/hwein/luradb/compare/v0.4.0...v0.5.1
 [0.4.0]: https://github.com/hwein/luradb/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hwein/luradb/compare/v0.3.0...v0.3.1

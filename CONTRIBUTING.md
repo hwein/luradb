@@ -37,7 +37,7 @@ differently) — "it would make me happy" is not a benefit.
   behavior, and relevant logs.
 - **Feature contributions** — open a PR (see Code contributions & CLA) and
   argue the feature bar from Project philosophy & scope in writing.
-- **Documentation fixes** — open a PR.
+- **Documentation fixes** — open a PR here for the README and the files in this repository; the handbook at <https://docs.luradb.org> lives in [hwein/luradb-docs](https://github.com/hwein/luradb-docs), so changes to it go there.
 
 The maintainer does not hold design discussions. The written case for the
 feature bar above belongs in the PR description (or an issue it links

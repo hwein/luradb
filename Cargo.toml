@@ -1,6 +1,6 @@
 [package]
 name = "luradb"
-version = "0.5.1"
+version = "0.7.0"
 edition = "2021"
 authors = ["Heiko Wein"]
 description = "LuraDB: A Linux-first, REST-native multi-model database"
@@ -93,6 +93,11 @@ manual_async_fn = "allow"
 # write paths) take their context as plain parameters; a parameter struct
 # would add churn without helping any call site.
 too_many_arguments = "allow"
+
+# Mutation test runs only: without debug info, each mutant rebuilds faster.
+[profile.mutants]
+inherits = "test"
+debug = "none"
 
 [package.metadata.deb]
 maintainer = "Heiko Wein <heiko.wein.hw@gmail.com>"

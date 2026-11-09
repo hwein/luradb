@@ -14,7 +14,7 @@
 use crate::control::{ControlPlane, Engine};
 use crate::core::coop::{on_give_up, YieldEvery};
 use crate::core::events::Resume;
-use crate::engines::lsm::engine::{BatchOp, LsmStorageEngine};
+use crate::engines::lsm::engine::{BatchOp, LsmEngineConfig, LsmStorageEngine};
 use crate::engines::lsm::rate_limiter::{DomainQuota, RateLimiter};
 use crate::engines::lsm::reader::{GetResult, Snapshot};
 use crate::engines::lsm::watcher::{WalEvent, WatchMessage};
@@ -91,12 +91,11 @@ async fn count_and_release(keys: Vec<Vec<u8>>, coop: &mut YieldEvery) -> u64 {
 
 /// Configuration for the domain management layer.
 pub struct DomainConfig {
-    pub max_name_length: usize,
     pub max_user_key_length: usize,
+    pub max_value_size: usize,
     pub default_domain: String,
     pub default_read_iops: u32,
     pub default_write_iops: u32,
-    pub default_max_storage_bytes: u64,
     pub purger_batch_size: usize,
     pub purger_interval_secs: u64,
     pub max_bulk_delete_keys: usize,
@@ -105,12 +104,11 @@ pub struct DomainConfig {
 impl Default for DomainConfig {
     fn default() -> Self {
         Self {
-            max_name_length: 50,
             max_user_key_length: 256,
+            max_value_size: LsmEngineConfig::default().max_value_size,
             default_domain: "default".to_string(),
             default_read_iops: 1000,
             default_write_iops: 500,
-            default_max_storage_bytes: 0,
             purger_batch_size: 100,
             purger_interval_secs: 5,
             max_bulk_delete_keys: 10_000,
@@ -148,24 +146,17 @@ pub(crate) fn fnv64(data: &[u8]) -> u64 {
     h
 }
 
-fn generate_prefix(name: &str) -> Vec<u8> {
-    format!("d:{:016x}:", fnv64(name.as_bytes())).into_bytes()
+/// Length of the internal key prefix `d:<16 hex>:` every domain key carries.
+pub const DOMAIN_KEY_PREFIX_LEN: usize = 19;
+
+/// Longest user key the domain layer accepts: the prefixed key must fit
+/// `lsm.max_key_length`, otherwise accepted keys fail in the engine (500).
+pub(crate) fn effective_user_key_limit(max_user_key_length: usize, lsm_max_key_length: usize) -> usize {
+    max_user_key_length.min(lsm_max_key_length.saturating_sub(DOMAIN_KEY_PREFIX_LEN))
 }
 
-fn validate_domain_name(name: &str, max_len: usize) -> Result<()> {
-    anyhow::ensure!(!name.is_empty(), "400 Bad Request: Domain name must not be empty");
-    anyhow::ensure!(
-        name.len() <= max_len,
-        "400 Bad Request: Domain name '{}' exceeds maximum of {} characters",
-        name,
-        max_len
-    );
-    anyhow::ensure!(
-        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-        "400 Bad Request: Domain name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
-        name
-    );
-    Ok(())
+fn generate_prefix(name: &str) -> Vec<u8> {
+    format!("d:{:016x}:", fnv64(name.as_bytes())).into_bytes()
 }
 
 fn sys_key(name: &str) -> Vec<u8> {
@@ -261,25 +252,12 @@ pub struct DomainRegistry {
 }
 
 impl DomainRegistry {
-    /// Recovers the registry from the engine, then creates the default domain
-    /// if it is missing in any state.
+    /// Recovers the registry from the engine.
     pub async fn recover(
         engine: Arc<LsmStorageEngine>,
         config: DomainConfig,
         metrics: Arc<MetricsStore>,
     ) -> Result<Self> {
-        Self::recover_on_shard(engine, config, metrics, true).await
-    }
-
-    /// [`Self::recover`] on a data shard: only the shard that `owns_default`
-    /// creates the default domain.
-    pub async fn recover_on_shard(
-        engine: Arc<LsmStorageEngine>,
-        config: DomainConfig,
-        metrics: Arc<MetricsStore>,
-        owns_default: bool,
-    ) -> Result<Self> {
-        let default_domain = config.default_domain.clone();
         let registry = Self {
             domains: RwLock::new(HashMap::new()),
             runtimes: RwLock::new(HashMap::new()),
@@ -289,20 +267,21 @@ impl DomainRegistry {
             control: OnceLock::new(),
         };
         registry.load_from_engine().await?;
-        // Check in any state: creating over a Deleting default would 409 and
-        // abort every boot. The purger finalizes it; the next recover() then
-        // recreates it.
-        let default_state = registry.domains.read().get(&default_domain).map(|d| d.state.clone());
-        match default_state {
-            None if !owns_default => {}
-            None => {
-                registry.create_domain(&default_domain).await?;
-            }
-            Some(DomainState::Deleting) => tracing::warn!(
-                "[DomainRegistry] default domain is Deleting at startup; \
-                 it will be recreated on the first start after the purge finishes"
-            ),
-            Some(DomainState::Active) => {}
+        Ok(registry)
+    }
+
+    /// Tests only: [`Self::recover`], then the default domain unless it
+    /// exists in any state, as a start creates it.
+    #[cfg(test)]
+    pub(crate) async fn recover_with_default(
+        engine: Arc<LsmStorageEngine>,
+        config: DomainConfig,
+        metrics: Arc<MetricsStore>,
+    ) -> Result<Self> {
+        let registry = Self::recover(engine, config, metrics).await?;
+        let name = registry.config.default_domain.clone();
+        if registry.get_domain_any(&name).is_none() {
+            registry.create_domain(&name).await?;
         }
         Ok(registry)
     }
@@ -334,7 +313,6 @@ impl DomainRegistry {
         DomainRuntime::new(DomainQuota {
             read_iops: self.config.default_read_iops,
             write_iops: self.config.default_write_iops,
-            max_storage_bytes: self.config.default_max_storage_bytes,
         })
     }
 
@@ -367,15 +345,16 @@ impl DomainRegistry {
     }
 
     /// Creates a new domain. Returns `Err` (409-style) if the name already exists.
+    #[cfg(test)]
     pub(crate) async fn create_domain(&self, name: &str) -> Result<Domain> {
         self.create_domain_with(name, false).await
     }
 
-    /// [`Self::create_domain`] with the domain's
-    /// [`Domain::require_conditional_writes`] setting. The check and the
-    /// insert span an await: callers must not run two lifecycle changes at once.
+    /// Creates a new domain with its [`Domain::require_conditional_writes`]
+    /// setting; `Err` (409-style) if the name already exists. The check and
+    /// the insert span an await: callers must not run two lifecycle changes
+    /// at once.
     pub(crate) async fn create_domain_with(&self, name: &str, require_conditional_writes: bool) -> Result<Domain> {
-        validate_domain_name(name, self.config.max_name_length)?;
         if self.domains.read().contains_key(name) {
             return Err(anyhow!("409 Conflict: Domain '{}' already exists", name));
         }
@@ -417,6 +396,11 @@ impl DomainRegistry {
             return Ok(Some(domain));
         }
         Ok(None)
+    }
+
+    /// Looks up a domain in any state.
+    pub fn get_domain_any(&self, name: &str) -> Option<Domain> {
+        self.domains.read().get(name).cloned()
     }
 
     /// Lists all **active** domains.
@@ -468,10 +452,8 @@ impl DomainRegistry {
     /// Finalises a purged domain: removes metadata from engine and cache.
     pub(crate) async fn finalize_domain_deletion(&self, name: &str) -> Result<()> {
         self.engine.write_tombstone(&sys_key(name)).await?;
-        // Metrics window, then runtime, then domain: a create_domain that
-        // passed the domains check can then neither lose its freshly
-        // inserted runtime nor cache the window removed after it.
-        self.metrics.remove_domain(name);
+        // Runtime, then domain: a create_domain that passed the domains check
+        // cannot lose its freshly inserted runtime.
         self.runtimes.write().remove(name);
         self.domains.write().remove(name);
         Ok(())
@@ -503,6 +485,7 @@ impl DomainRegistry {
             engine: Arc::clone(&self.engine),
             runtime,
             max_user_key_len: self.config.max_user_key_length,
+            max_value_size: self.config.max_value_size,
             max_bulk_delete_keys: self.config.max_bulk_delete_keys,
             metrics: Arc::clone(&self.metrics),
         })
@@ -523,6 +506,7 @@ pub struct DomainStore {
     engine: Arc<LsmStorageEngine>,
     runtime: Arc<DomainRuntime>,
     max_user_key_len: usize,
+    max_value_size: usize,
     max_bulk_delete_keys: usize,
     metrics: Arc<MetricsStore>,
 }
@@ -651,8 +635,9 @@ impl DomainStore {
     /// visible version; otherwise fails with [`PreconditionFailed`] and
     /// writes nothing. A domain that requires conditional writes rejects one
     /// without preconditions with [`PreconditionRequired`], after key
-    /// validation and the rate limit; the shorthands such as [`Self::put`]
-    /// never do. Check and write run under the key's write lock, so no
+    /// validation, the value size check (puts only) and the rate limit; the
+    /// shorthands such as [`Self::put`] never do. Check and write run under
+    /// the key's write lock, so no
     /// other single-key write of the domain falls in between —
     /// [`Self::delete_by_prefix`] takes no key lock.
     pub async fn write(&self, key: &[u8], op: KeyWrite<'_>, preconditions: &[Precondition]) -> Result<()> {
@@ -667,6 +652,14 @@ impl DomainStore {
         require_preconditions: bool,
     ) -> Result<()> {
         self.validate_user_key(key)?;
+        if let KeyWrite::Put { value, .. } = &op {
+            anyhow::ensure!(
+                value.len() <= self.max_value_size,
+                "413 Payload Too Large: value of {} bytes exceeds lsm.max_value_size ({} bytes)",
+                value.len(),
+                self.max_value_size
+            );
+        }
         if !self.runtime.rate_limiter.check_write() {
             self.metrics.record_rate_limit_rejection(&self.domain.name);
             return Err(anyhow!("429 Too Many Requests: write rate limit exceeded"));
@@ -1114,7 +1107,8 @@ mod tests {
         engine.hooks = hooks;
         let engine = Arc::new(engine);
         let metrics = MetricsStore::new(MetricsConfig::default());
-        let registry = Arc::new(DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap());
+        let registry =
+            Arc::new(DomainRegistry::recover_with_default(Arc::clone(&engine), DomainConfig::default(), metrics).await.unwrap());
         (engine, registry, dir)
     }
 
@@ -1231,31 +1225,18 @@ mod tests {
         })
     }
 
-    // 5. Invalid domain names → 400-prefixed error, no domain created.
+    // The start creates the default domain, not the recovery.
     #[test]
-    fn test_invalid_domain_name_rejected() {
+    fn test_recover_creates_no_domain() {
         crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let before = registry.list_domains().await.unwrap().len();
-            let long = "a".repeat(DomainConfig::default().max_name_length + 1);
-            for bad in ["", long.as_str(), "bad name!", "bad/slash"] {
-                let err = registry.create_domain(bad).await.unwrap_err().to_string();
-                assert!(err.starts_with("400 Bad Request: Domain name"), "{bad:?}: {err}");
-                assert!(registry.get_domain(bad).await.unwrap().is_none(), "{bad:?}");
-            }
-            assert_eq!(registry.list_domains().await.unwrap().len(), before);
-        })
-    }
-
-    // 6. Default domain exists after recovery.
-    #[test]
-    fn test_default_domain_exists_after_recovery() {
-        crate::core::engine_runtime::block_on(async {
-            let (registry, _dir) = make_registry().await;
-            let default_name = DomainConfig::default().default_domain;
-            let default = registry.get_domain(&default_name).await.unwrap();
-            assert!(default.is_some());
-            assert_eq!(default.unwrap().name, default_name);
+            let (engine, _, _dir) = make_setup().await;
+            let metrics = MetricsStore::new(MetricsConfig::default());
+            let empty = tempfile::TempDir::new().unwrap();
+            let fresh = reopen_engine(&empty).await;
+            let registry = DomainRegistry::recover(fresh, DomainConfig::default(), Arc::clone(&metrics)).await.unwrap();
+            assert!(registry.list_domains().await.unwrap().is_empty());
+            let registry = DomainRegistry::recover(engine, DomainConfig::default(), metrics).await.unwrap();
+            assert_eq!(registry.list_domains().await.unwrap().len(), 1, "the setup's default domain");
         })
     }
 
@@ -1280,6 +1261,18 @@ mod tests {
             assert_eq!(p1, p2);
             assert_ne!(generate_prefix("myapp"), generate_prefix("myapp2"));
         })
+    }
+
+    #[test]
+    fn test_domain_key_prefix_len_matches_generated_prefix() {
+        assert_eq!(generate_prefix("any-name").len(), DOMAIN_KEY_PREFIX_LEN);
+    }
+
+    #[test]
+    fn test_effective_user_key_limit_leaves_room_for_the_prefix() {
+        assert_eq!(effective_user_key_limit(256, 256), 237);
+        assert_eq!(effective_user_key_limit(256, 512), 256);
+        assert_eq!(effective_user_key_limit(100, 512), 100);
     }
 
     // Test: Domain in Deleting state → store() returns 410.
@@ -1407,38 +1400,6 @@ mod tests {
             tick.await.unwrap().unwrap();
             assert_eq!(engine.scan_keys(&key).await.unwrap(), [key]);
             assert!(registry.list_deleting_domains().iter().any(|d| d.name == "doomed"), "must not be finalized");
-        })
-    }
-
-    // Regression: recover() must not 409 (boot loop) when the default domain
-    // is still in Deleting state at startup (pendant of the JSON registry fix).
-    #[test]
-    fn test_recover_survives_deleting_default_domain() {
-        crate::core::engine_runtime::block_on(async {
-            let (engine, registry, _dir) = make_setup().await;
-            registry.delete_domain("default").await.unwrap();
-
-            // Simulated restart before the purge finished: recover must succeed
-            // and keep the default domain invisible (still Deleting).
-            let metrics = MetricsStore::new(MetricsConfig::default());
-            let registry2 = Arc::new(
-                DomainRegistry::recover(Arc::clone(&engine), DomainConfig::default(), metrics)
-                    .await
-                    .expect("recover must survive a Deleting default domain"),
-            );
-            assert!(registry2.get_domain("default").await.unwrap().is_none());
-
-            // After the purger finalized it, the next recover recreates it as Active.
-            let cfg = DomainConfig::default();
-            let purger = DomainPurger::new(Arc::clone(&engine), Arc::clone(&registry2), cfg.purger_batch_size);
-            purger.purge_tick().await.unwrap();
-            purger.purge_tick().await.unwrap();
-
-            let metrics = MetricsStore::new(MetricsConfig::default());
-            let registry3 = DomainRegistry::recover(engine, DomainConfig::default(), metrics)
-                .await
-                .unwrap();
-            assert!(registry3.get_domain("default").await.unwrap().is_some());
         })
     }
 
@@ -1657,11 +1618,11 @@ mod tests {
     }
 
     // Test 5: a tiny wal_event_channel_capacity plus a non-draining
-    // receiver must eventually lag (tokio::broadcast's own detection) --
-    // proves watch_from actually wires the configured capacity through
-    // rather than a hardcoded value. The Lagged-to-reset(lagged) mapping
-    // itself is unit-tested at the kv.rs handler level (pure function, no
-    // timing dependency).
+    // receiver must eventually lag -- proves watch_from wires the configured
+    // capacity through rather than a hardcoded value. Whether this channel
+    // overflows (Lagged) or the relay task falls behind on the engine channel
+    // and reports a Gap depends on when the relay task runs; both become the
+    // same reset(lagged) at the kv.rs handler level.
     #[test]
     fn test_watch_slow_client_channel_lags_when_capacity_exceeded() {
         crate::core::engine_runtime::block_on(async {
@@ -1677,17 +1638,19 @@ mod tests {
                 store.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
             }
 
-            let mut saw_lag = false;
-            for _ in 0..10 {
-                match rx.recv().await {
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        saw_lag = true;
-                        break;
+            let lagged = async {
+                for _ in 0..10 {
+                    match rx.recv().await {
+                        Err(broadcast::error::RecvError::Lagged(_)) | Ok(WatchMessage::Gap) => return true,
+                        Ok(WatchMessage::Event(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return false,
                     }
-                    Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-            }
+                false
+            };
+            let saw_lag = compio::time::timeout(std::time::Duration::from_secs(30), lagged)
+                .await
+                .expect("the receiver neither lagged nor saw a gap");
             assert!(saw_lag, "a burst past channel capacity must eventually lag a non-draining receiver");
         })
     }

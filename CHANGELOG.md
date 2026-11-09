@@ -4,6 +4,11 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **BREAKING** Startup rejects a domains.default_domain that is not a valid domain name instead of creating that domain.
+- A domains.max_name_length below 7, the length of the default domain name, is raised to 7 with a startup warning.
+
 ## [0.7.1] - 2026-11-09
 
 ### Security

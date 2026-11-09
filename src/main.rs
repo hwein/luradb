@@ -84,6 +84,7 @@ fn run() -> anyhow::Result<()> {
     }
     let config_path = resolve_config_path(cli.config, |p| p.exists());
     let (mut config, unknown_keys) = LuraConfig::load(&config_path)?;
+    let raised_name_length = config.raise_name_length();
     let raised_key_lengths = config.raise_key_lengths();
     let config = Arc::new(config);
     config.server.validate()?;
@@ -123,7 +124,7 @@ fn run() -> anyhow::Result<()> {
     for key in &unknown_keys {
         tracing::warn!("unknown config key '{key}' is ignored");
     }
-    for warning in &raised_key_lengths {
+    for warning in raised_name_length.iter().chain(&raised_key_lengths) {
         tracing::warn!("{warning}");
     }
     // `config.auth.validate` already rejected a non-loopback bind above,

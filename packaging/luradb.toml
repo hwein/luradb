@@ -186,10 +186,13 @@ batch_size = 500
 # Longest domain name in characters ([a-zA-Z0-9_-]), in every engine. At most 438, so
 # that the name fits the keys of the system store; json.lsm.max_key_length and
 # rel.lsm.max_key_length are raised at the start, with a warning, to take it.
+# At least 7, the length of `default`; a smaller value is raised with a warning
+# and has no effect.
 max_name_length = 50
 # Longest key a client may use in the key-value engine, in bytes.
 max_user_key_length = 256
-# Domain created in every engine at a start if it is missing.
+# Domain created in every engine at a start if it is missing. Must be a valid
+# domain name, else the start is refused.
 default_domain = "default"
 # Keys removed per step while a deleted domain is purged in the background.
 purger_batch_size = 100

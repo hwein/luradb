@@ -234,11 +234,11 @@ domain (`domain:<name>`) or one engine of one domain (`kv:<name>`,
 `replace` it empties and refills exactly the engines the archive holds and
 keeps the domain and its permissions.
 
-KVREF and JSONREF columns link to the KV and JSON domain of the same name.
-They resolve after a restore when that domain is restored too or already
-exists; otherwise they read as missing and are cleared, as after deleting
-that domain. A restore under a new name (`into_domain`) links them to the
-domains of the new name.
+KVREF and JSONREF columns point to keys and documents of the same domain.
+After a restore they resolve when those keys and documents were restored too
+or already exist; otherwise they count as missing and keep their stored value.
+A restore under a new name (`into_domain`) points them to the keys and
+documents under the new name.
 
 ## License
 

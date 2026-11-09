@@ -11,6 +11,9 @@ use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
+/// The length of the name `default`: the least `domains.max_name_length` that takes it.
+const MIN_NAME_LENGTH: usize = 7;
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LuraConfig {
@@ -59,6 +62,20 @@ impl LuraConfig {
             config.storage.system_dir = parent.join("luradb_sys").to_string_lossy().into_owned();
         }
         Ok((config, unknown_keys(keys, &known_keys())))
+    }
+
+    /// Raises `domains.max_name_length` to the length of the name `default`;
+    /// returns a warning when it did.
+    pub fn raise_name_length(&mut self) -> Option<String> {
+        let old = self.domains.max_name_length;
+        if old >= MIN_NAME_LENGTH {
+            return None;
+        }
+        self.domains.max_name_length = MIN_NAME_LENGTH;
+        Some(format!(
+            "domains.max_name_length ({old}) is raised to {MIN_NAME_LENGTH}, the length of the name \
+             \"default\"; a shorter limit has no effect"
+        ))
     }
 
     /// Raises `json.lsm.max_key_length` and `rel.lsm.max_key_length` to the
@@ -815,6 +832,13 @@ impl DomainsConfig {
         anyhow::ensure!(
             self.max_name_length <= max,
             "domains.max_name_length = {} exceeds the maximum of {max}",
+            self.max_name_length
+        );
+        anyhow::ensure!(
+            crate::control::domains::is_valid_name(&self.default_domain, self.max_name_length),
+            "invalid config: domains.default_domain ('{}') is not a valid domain name: allowed are \
+             [a-zA-Z0-9_-], 1 to {} characters",
+            self.default_domain,
             self.max_name_length
         );
         check_min("domains.purger_interval_secs", self.purger_interval_secs, 1)
@@ -3248,6 +3272,55 @@ mod tests {
         let config = parse("[json.lsm]\nmax_value_size = 4095\n");
         assert_invalid(config.json.validate(), "json.lsm.max_value_size (4095)", "at least 4096");
         assert!(parse("[json.lsm]\nmax_value_size = 4096\n").json.validate().is_ok());
+    }
+
+    // A name limit below 7, the length of `default`, is raised with a warning.
+    #[test]
+    fn test_domains_max_name_length_below_7_is_raised() {
+        let parse = |toml: &str| -> LuraConfig { toml::from_str(toml).unwrap() };
+        for (old, toml) in [(5, "[domains]\nmax_name_length = 5\n"), (0, "[domains]\nmax_name_length = 0\n")] {
+            let mut config = parse(toml);
+            assert_eq!(
+                config.raise_name_length(),
+                Some(format!(
+                    "domains.max_name_length ({old}) is raised to 7, the length of the name \"default\"; \
+                     a shorter limit has no effect"
+                ))
+            );
+            assert_eq!(config.domains.max_name_length, 7);
+        }
+        for (value, toml) in [(7, "[domains]\nmax_name_length = 7\n"), (50, "")] {
+            let mut config = parse(toml);
+            assert_eq!(config.raise_name_length(), None);
+            assert_eq!(config.domains.max_name_length, value);
+        }
+    }
+
+    // The default domain is created at the start, so its name must be valid
+    // under the effective name limit.
+    #[test]
+    fn test_domains_default_domain_must_be_a_valid_name() {
+        let parse = |toml: &str| -> LuraConfig { toml::from_str(toml).unwrap() };
+        let err = parse("[domains]\ndefault_domain = \"bad name!\"\n").domains.validate().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid config: domains.default_domain ('bad name!') is not a valid domain name: \
+             allowed are [a-zA-Z0-9_-], 1 to 50 characters"
+        );
+        let long = "n".repeat(51);
+        let err = parse(&format!("[domains]\ndefault_domain = \"{long}\"\n")).domains.validate().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid config: domains.default_domain ('{long}') is not a valid domain name: \
+                 allowed are [a-zA-Z0-9_-], 1 to 50 characters"
+            )
+        );
+        assert!(parse("[domains]\ndefault_domain = \"main\"\n").domains.validate().is_ok());
+        assert!(parse("").domains.validate().is_ok());
+        let mut config = parse("[domains]\nmax_name_length = 5\n");
+        config.raise_name_length();
+        assert!(config.domains.validate().is_ok());
     }
 
     // A domain name must fit the permission key of the longest user name in

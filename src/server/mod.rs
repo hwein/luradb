@@ -2673,6 +2673,36 @@ mod tests {
         );
     }
 
+    // A name limit of 5 is raised to 7 before the start: `default` exists in
+    // every engine, and the limit of the name check is 7.
+    #[test]
+    fn a_name_limit_below_7_works_as_7() {
+        with_tuned_server(
+            |cfg| {
+                cfg.domains.max_name_length = 5;
+                (cfg.json.enabled, cfg.rel.enabled) = (true, true);
+                cfg.raise_name_length();
+                cfg.raise_key_lengths();
+            },
+            |addr| async move {
+                let (status, body) = request(addr, &get("/store-api/domains")).await;
+                assert_eq!(status, 200);
+                let names: Vec<Value> = serde_json::from_slice::<Vec<Value>>(&body).unwrap().iter().map(|d| d["name"].clone()).collect();
+                assert_eq!(names, [json!("default")]);
+                assert_eq!(request(addr, &with_body("PUT", "/store-api/kv/default/keys/k", "v")).await.0, 200);
+                assert_eq!(request(addr, &with_body("PUT", "/store-api/json/default/documents/d", "{}")).await.0, 201);
+                let sql = with_body("POST", "/store-api/rel/default/sql", &sql_body("CREATE TABLE t (id INTEGER PRIMARY KEY)"));
+                assert_eq!(request(addr, &sql).await.0, 200);
+                let seven = json!({ "name": "n".repeat(7) }).to_string();
+                assert_eq!(request(addr, &with_body("POST", "/store-api/domains", &seven)).await.0, 201);
+                let eight = json!({ "name": "n".repeat(8) }).to_string();
+                let (status, body) = request(addr, &with_body("POST", "/store-api/domains", &eight)).await;
+                assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+                assert!(String::from_utf8_lossy(&body).ends_with("1 to 7 characters"));
+            },
+        );
+    }
+
     // While disk space runs short, /health stays 200 with status `degraded`
     // and gives the states in `resources`, without volume, path or number;
     // the metrics carry the full report.

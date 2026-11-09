@@ -4,6 +4,10 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- Upgraded rmcp to 3.9, resolving RUSTSEC-2026-0462.
+
 ## [0.7.0] - 2026-11-09
 
 ### Changed

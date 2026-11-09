@@ -4,6 +4,8 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
 ### Changed
 
 - **BREAKING** API: with `server.swagger_enabled = true`, the Swagger UI, its assets and `/api-docs/openapi.json` are served without an API key also when `auth.enabled = true`; the API calls made from the UI still need one.
@@ -283,7 +285,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.5.1...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/hwein/luradb/compare/v0.5.1...v0.7.0
 [0.5.1]: https://github.com/hwein/luradb/compare/v0.4.0...v0.5.1
 [0.4.0]: https://github.com/hwein/luradb/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hwein/luradb/compare/v0.3.0...v0.3.1

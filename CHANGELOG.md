@@ -4,6 +4,8 @@ All notable changes to LuraDB are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-09
+
 ### Security
 
 - Upgraded rmcp to 3.9, resolving RUSTSEC-2026-0462.
@@ -289,7 +291,8 @@ All notable changes to LuraDB are documented in this file.
 
 - Removed the unmaintained `bincode` 1.x dependency (declared but unused) and dropped `proc-macro-error` by upgrading utoipa to 5 — resolves the RUSTSEC-2025-0141 and RUSTSEC-2024-0370 scan exceptions.
 
-[unreleased]: https://github.com/hwein/luradb/compare/v0.7.0...HEAD
+[unreleased]: https://github.com/hwein/luradb/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/hwein/luradb/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/hwein/luradb/compare/v0.5.1...v0.7.0
 [0.5.1]: https://github.com/hwein/luradb/compare/v0.4.0...v0.5.1
 [0.4.0]: https://github.com/hwein/luradb/compare/v0.3.1...v0.4.0

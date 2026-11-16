@@ -5,10 +5,6 @@
 
 #
 
-**Handbook:** <https://docs.luradb.org> — install, operate and use LuraDB, with the configuration reference and the REST API.
-
-The handbook is available to agents as one text file: <https://docs.luradb.org/llms-full.txt>.
-
 LuraDB is a Linux-first, REST-native multi-model database built on io_uring.
 One small, fast process covers the three shapes of data a typical backend
 needs: a key-value store (TTLs, watches), JSON documents (indexes, queries),
@@ -251,3 +247,8 @@ years after publication. See [LICENSE.md](LICENSE.md) for the full text.
 Found a vulnerability? See [SECURITY.md](SECURITY.md) — please do not open
 a public issue. For bug reports, feature proposals and code contributions,
 see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Handbook
+<https://docs.luradb.org> — install, operate and use LuraDB, with the configuration reference and the REST API.
+
+The handbook is available to agents as one text file: <https://docs.luradb.org/llms-full.txt>.

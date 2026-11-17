@@ -14,7 +14,10 @@ yanked = "deny"
 unmaintained = "all"
 # Exceptions only for advisories without an available fix (or not relevant to
 # our usage profile), each with `reason` and a `# review by YYYY-MM-DD` note.
-ignore = []
+ignore = [
+    # review by 2027-02-17 (or earlier when an rmcp release drops chrono)
+    { id = "RUSTSEC-2026-0543", reason = "chrono is flagged as unmaintained only (informational, no vulnerability, no patched release); it is a transitive dependency of rmcp and is not used by LuraDB directly" },
+]
 
 [licenses]
 allow = [

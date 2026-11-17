@@ -4,4 +4,7 @@
 # Companion file: deny.toml (cargo-deny policy). Advisory exceptions needed by
 # both tools must be kept in sync between the two files.
 #
-# No exceptions currently in force.
+# review by 2027-02-17 (or earlier when an rmcp release drops chrono)
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono is flagged as unmaintained only (informational, no vulnerability, no patched release); it is a transitive dependency of rmcp and is not used by LuraDB directly"

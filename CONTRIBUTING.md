@@ -85,7 +85,7 @@ that.
 
 ## 5. What happens to your PR
 
-CI (tests, cargo-deny, Sonar) must be green and the CLA signed; then the
+CI (tests, cargo-deny) must be green and the CLA signed; then the
 maintainer reads it and decides.
 
 LuraDB is a spare-time project: there are no response-time guarantees, no

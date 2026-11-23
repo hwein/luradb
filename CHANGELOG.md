@@ -12,6 +12,7 @@ All notable changes to LuraDB are documented in this file.
 ### Security
 
 - Upgraded rustix to 1.1.6, resolving RUSTSEC-2026-0486.
+- Upgraded url to 2.5.9, resolving RUSTSEC-2026-0592.
 
 ## [0.7.1] - 2026-11-09
 
